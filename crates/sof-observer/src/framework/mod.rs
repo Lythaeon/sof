@@ -9,7 +9,8 @@ pub mod plugin;
 
 pub use events::{
     ClusterNodeInfo, ClusterTopologyEvent, ControlPlaneSource, DatasetEvent, LeaderScheduleEntry,
-    LeaderScheduleEvent, RawPacketEvent, ShredEvent, TransactionEvent,
+    LeaderScheduleEvent, ObservedRecentBlockhashEvent, RawPacketEvent, ShredEvent,
+    TransactionEvent,
 };
 pub use host::{PluginDispatchMode, PluginHost, PluginHostBuilder};
 pub use plugin::ObserverPlugin;

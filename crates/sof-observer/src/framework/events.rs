@@ -58,6 +58,17 @@ pub struct TransactionEvent {
     pub kind: TxKind,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+/// Runtime event emitted when a newer observed recent blockhash is detected.
+pub struct ObservedRecentBlockhashEvent {
+    /// Slot where this recent blockhash was observed.
+    pub slot: u64,
+    /// Observed recent blockhash bytes.
+    pub recent_blockhash: [u8; 32],
+    /// Number of decoded transactions in the dataset that produced this observation.
+    pub dataset_tx_count: u64,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 /// Topology/leader event source.
 pub enum ControlPlaneSource {

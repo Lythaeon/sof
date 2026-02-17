@@ -101,6 +101,7 @@ async fn main() -> Result<(), sof::runtime::RuntimeError> {
 - `on_shred`: every packet that produced a parsed shred header.
 - `on_dataset`: every contiguous reconstructed dataset.
 - `on_transaction`: every decoded transaction from reconstructed datasets.
+- `on_recent_blockhash`: deduplicated observed recent blockhash updates from decoded datasets.
 - `on_cluster_topology`: near-real-time (~250ms) gossip topology diffs plus periodic snapshots (gossip-bootstrap mode).
 - `on_leader_schedule`: event-driven leader diffs emitted when slot-leader mappings change from live data (gossip-bootstrap mode).
 

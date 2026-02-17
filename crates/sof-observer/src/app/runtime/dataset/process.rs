@@ -52,8 +52,12 @@ pub(super) fn process_completed_dataset(
     let plugin_hooks_enabled = !context.plugin_host.is_empty();
 
     let mut tx_count: u64 = 0;
+    let mut observed_recent_blockhash: Option<[u8; 32]> = None;
     for entry in entries {
         for tx in entry.transactions {
+            if observed_recent_blockhash.is_none() {
+                observed_recent_blockhash = Some(tx.message.recent_blockhash().to_bytes());
+            }
             let kind = classify_tx_kind(&tx);
             let signature = tx.signatures.first().cloned();
             tx_count = tx_count.saturating_add(1);
@@ -74,6 +78,16 @@ pub(super) fn process_completed_dataset(
                 let _ = context.tx_event_drop_count.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    if plugin_hooks_enabled && let Some(recent_blockhash) = observed_recent_blockhash {
+        context
+            .plugin_host
+            .on_recent_blockhash(ObservedRecentBlockhashEvent {
+                slot,
+                recent_blockhash,
+                dataset_tx_count: tx_count,
+            });
     }
 
     if plugin_hooks_enabled {

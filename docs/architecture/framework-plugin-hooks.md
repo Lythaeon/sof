@@ -13,6 +13,7 @@ custom logic without forking the runtime.
   - `ShredEvent`
   - `DatasetEvent`
   - `TransactionEvent`
+  - `ObservedRecentBlockhashEvent`
   - `LeaderScheduleEvent`
 - Host/runtime wiring:
   - `PluginDispatchMode`
@@ -27,8 +28,9 @@ Callbacks are invoked in this order as data flows through runtime:
 2. `on_shred`
 3. `on_dataset`
 4. `on_transaction`
-5. `on_cluster_topology` (near-real-time, gossip-bootstrap only)
-6. `on_leader_schedule` (near-real-time, gossip-bootstrap only)
+5. `on_recent_blockhash`
+6. `on_cluster_topology` (near-real-time, gossip-bootstrap only)
+7. `on_leader_schedule` (near-real-time, gossip-bootstrap only)
 
 Detailed behavior:
 
@@ -44,6 +46,9 @@ Detailed behavior:
 - `on_transaction`:
   - Fires for each decoded transaction inside a dataset.
   - Includes slot, optional signature, tx payload, and SOF `TxKind`.
+- `on_recent_blockhash`:
+  - Fires when runtime observes a newer recent blockhash from decoded datasets.
+  - Deduplicated by slot/hash in `PluginHost` to avoid per-transaction hook volume.
 - `on_cluster_topology`:
   - Fires on meaningful cluster node diffs (added/removed/updated), polled about every 250ms.
   - Emits periodic snapshots for full state reconciliation.

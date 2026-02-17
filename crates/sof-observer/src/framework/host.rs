@@ -2,7 +2,7 @@ use std::{
     any::Any,
     future::Future,
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     thread,
@@ -12,8 +12,8 @@ use tokio::sync::{Semaphore, mpsc};
 
 use crate::framework::{
     events::{
-        ClusterTopologyEvent, DatasetEvent, LeaderScheduleEvent, RawPacketEvent, ShredEvent,
-        TransactionEvent,
+        ClusterTopologyEvent, DatasetEvent, LeaderScheduleEvent, ObservedRecentBlockhashEvent,
+        RawPacketEvent, ShredEvent, TransactionEvent,
     },
     plugin::ObserverPlugin,
 };
@@ -181,8 +181,18 @@ impl PluginHostBuilder {
         PluginHost {
             plugins,
             dispatcher,
+            latest_observed_recent_blockhash: Arc::new(RwLock::new(None)),
         }
     }
+}
+
+/// Internal snapshot for latest observed recent blockhash state.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct ObservedRecentBlockhashState {
+    /// Slot where the recent blockhash was most recently observed.
+    slot: u64,
+    /// Observed recent blockhash bytes.
+    recent_blockhash: [u8; 32],
 }
 
 #[derive(Clone)]
@@ -255,6 +265,8 @@ enum PluginDispatchEvent {
     Dataset(DatasetEvent),
     /// Decoded transaction callback payload.
     Transaction(TransactionEvent),
+    /// Observed recent blockhash callback payload.
+    ObservedRecentBlockhash(ObservedRecentBlockhashEvent),
     /// Cluster topology callback payload.
     ClusterTopology(ClusterTopologyEvent),
     /// Leader schedule callback payload.
@@ -339,6 +351,18 @@ async fn dispatch_event(
                 dispatch_mode,
                 |plugin, hook_event| async move {
                     plugin.on_transaction(hook_event).await;
+                },
+            )
+            .await
+        }
+        PluginDispatchEvent::ObservedRecentBlockhash(event) => {
+            dispatch_hook_event(
+                plugins,
+                "on_recent_blockhash",
+                event,
+                dispatch_mode,
+                |plugin, hook_event| async move {
+                    plugin.on_recent_blockhash(hook_event).await;
                 },
             )
             .await
@@ -447,6 +471,8 @@ pub struct PluginHost {
     plugins: Arc<[Arc<dyn ObserverPlugin>]>,
     /// Optional async dispatcher state (absent when no plugins are registered).
     dispatcher: Option<PluginDispatcher>,
+    /// Latest observed recent blockhash snapshot.
+    latest_observed_recent_blockhash: Arc<RwLock<Option<ObservedRecentBlockhashState>>>,
 }
 
 impl Default for PluginHost {
@@ -454,6 +480,7 @@ impl Default for PluginHost {
         Self {
             plugins: Arc::from(Vec::<Arc<dyn ObserverPlugin>>::new()),
             dispatcher: None,
+            latest_observed_recent_blockhash: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -491,6 +518,19 @@ impl PluginHost {
         self.plugins.iter().map(|plugin| plugin.name()).collect()
     }
 
+    /// Returns latest observed recent blockhash snapshot from live runtime data.
+    #[must_use]
+    pub fn latest_observed_recent_blockhash(&self) -> Option<(u64, [u8; 32])> {
+        self.latest_observed_recent_blockhash
+            .read()
+            .ok()
+            .and_then(|guard| {
+                guard
+                    .as_ref()
+                    .map(|state| (state.slot, state.recent_blockhash))
+            })
+    }
+
     /// Enqueues raw packet hook to registered plugins.
     pub fn on_raw_packet(&self, event: RawPacketEvent) {
         if let Some(dispatcher) = &self.dispatcher {
@@ -516,6 +556,48 @@ impl PluginHost {
     pub fn on_transaction(&self, event: TransactionEvent) {
         if let Some(dispatcher) = &self.dispatcher {
             dispatcher.dispatch("on_transaction", PluginDispatchEvent::Transaction(event));
+        }
+    }
+
+    /// Updates latest observed recent blockhash and enqueues hook when hash changed.
+    pub fn on_recent_blockhash(&self, event: ObservedRecentBlockhashEvent) {
+        let should_emit = self
+            .latest_observed_recent_blockhash
+            .write()
+            .ok()
+            .is_some_and(|mut guard| match guard.as_mut() {
+                None => {
+                    *guard = Some(ObservedRecentBlockhashState {
+                        slot: event.slot,
+                        recent_blockhash: event.recent_blockhash,
+                    });
+                    true
+                }
+                Some(current) if event.slot < current.slot => false,
+                Some(current)
+                    if event.slot == current.slot
+                        && event.recent_blockhash == current.recent_blockhash =>
+                {
+                    false
+                }
+                Some(current)
+                    if event.slot > current.slot
+                        && event.recent_blockhash == current.recent_blockhash =>
+                {
+                    current.slot = event.slot;
+                    false
+                }
+                Some(current) => {
+                    current.slot = event.slot;
+                    current.recent_blockhash = event.recent_blockhash;
+                    true
+                }
+            });
+        if should_emit && let Some(dispatcher) = &self.dispatcher {
+            dispatcher.dispatch(
+                "on_recent_blockhash",
+                PluginDispatchEvent::ObservedRecentBlockhash(event),
+            );
         }
     }
 
@@ -626,6 +708,22 @@ mod tests {
         }
 
         async fn on_dataset(&self, _event: DatasetEvent) {
+            self.counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecentBlockhashCounterPlugin {
+        counter: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ObserverPlugin for RecentBlockhashCounterPlugin {
+        fn name(&self) -> &'static str {
+            "recent-blockhash-counter-plugin"
+        }
+
+        async fn on_recent_blockhash(&self, _event: ObservedRecentBlockhashEvent) {
             self.counter.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -756,6 +854,52 @@ mod tests {
             Duration::from_secs(5)
         ));
         assert_eq!(host.dropped_event_count(), 0);
+    }
+
+    #[test]
+    fn recent_blockhash_hook_is_deduplicated_and_stateful() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let host = PluginHostBuilder::new()
+            .add_plugin(RecentBlockhashCounterPlugin {
+                counter: Arc::clone(&counter),
+            })
+            .build();
+
+        host.on_recent_blockhash(ObservedRecentBlockhashEvent {
+            slot: 10,
+            recent_blockhash: [1_u8; 32],
+            dataset_tx_count: 8,
+        });
+        host.on_recent_blockhash(ObservedRecentBlockhashEvent {
+            slot: 10,
+            recent_blockhash: [1_u8; 32],
+            dataset_tx_count: 8,
+        });
+        host.on_recent_blockhash(ObservedRecentBlockhashEvent {
+            slot: 11,
+            recent_blockhash: [1_u8; 32],
+            dataset_tx_count: 9,
+        });
+        host.on_recent_blockhash(ObservedRecentBlockhashEvent {
+            slot: 11,
+            recent_blockhash: [2_u8; 32],
+            dataset_tx_count: 9,
+        });
+        host.on_recent_blockhash(ObservedRecentBlockhashEvent {
+            slot: 9,
+            recent_blockhash: [3_u8; 32],
+            dataset_tx_count: 4,
+        });
+
+        assert!(wait_until_counter(
+            counter.as_ref(),
+            2,
+            Duration::from_secs(2)
+        ));
+        assert_eq!(
+            host.latest_observed_recent_blockhash(),
+            Some((11, [2_u8; 32]))
+        );
     }
 
     fn wait_until_counter(counter: &AtomicUsize, expected: usize, timeout: Duration) -> bool {

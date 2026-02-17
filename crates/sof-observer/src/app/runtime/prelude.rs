@@ -33,7 +33,8 @@ pub(super) use crate::repair::MissingShredRequestKind;
 pub(super) use crate::{
     event::{TxKind, TxObservedEvent},
     framework::{
-        DatasetEvent, PluginHost, PluginHostBuilder, RawPacketEvent, ShredEvent, TransactionEvent,
+        DatasetEvent, ObservedRecentBlockhashEvent, PluginHost, PluginHostBuilder, RawPacketEvent,
+        ShredEvent, TransactionEvent,
     },
     ingest::{self, RawPacketBatch},
     reassembly::dataset::DataSetReassembler,

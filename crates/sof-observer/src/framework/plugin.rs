@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 
 use crate::framework::events::{
-    ClusterTopologyEvent, DatasetEvent, LeaderScheduleEvent, RawPacketEvent, ShredEvent,
-    TransactionEvent,
+    ClusterTopologyEvent, DatasetEvent, LeaderScheduleEvent, ObservedRecentBlockhashEvent,
+    RawPacketEvent, ShredEvent, TransactionEvent,
 };
 
 /// Extension point for SOF runtime event hooks.
@@ -29,6 +29,9 @@ pub trait ObserverPlugin: Send + Sync + 'static {
 
     /// Called for each decoded transaction emitted from a dataset.
     async fn on_transaction(&self, _event: TransactionEvent) {}
+
+    /// Called when a newer observed recent blockhash is detected.
+    async fn on_recent_blockhash(&self, _event: ObservedRecentBlockhashEvent) {}
 
     /// Called on low-frequency cluster topology diffs/snapshots (gossip-bootstrap mode).
     async fn on_cluster_topology(&self, _event: ClusterTopologyEvent) {}
