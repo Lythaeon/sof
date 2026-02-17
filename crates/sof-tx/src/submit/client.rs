@@ -11,7 +11,7 @@ use solana_transaction::versioned::VersionedTransaction;
 
 use super::{
     DirectSubmitConfig, DirectSubmitTransport, RpcSubmitConfig, RpcSubmitTransport, SignedTx,
-    SubmitError, SubmitMode, SubmitResult,
+    SubmitError, SubmitMode, SubmitReliability, SubmitResult,
 };
 use crate::{
     builder::TxBuilder,
@@ -106,7 +106,14 @@ impl TxSubmitClient {
     /// Sets direct submit tuning.
     #[must_use]
     pub const fn with_direct_config(mut self, config: DirectSubmitConfig) -> Self {
-        self.direct_config = config;
+        self.direct_config = config.normalized();
+        self
+    }
+
+    /// Sets direct/hybrid reliability profile.
+    #[must_use]
+    pub const fn with_reliability(mut self, reliability: SubmitReliability) -> Self {
+        self.direct_config = DirectSubmitConfig::from_reliability(reliability);
         self
     }
 
@@ -242,8 +249,9 @@ impl TxSubmitClient {
         if targets.is_empty() {
             return Err(SubmitError::NoDirectTargets);
         }
+        let direct_config = self.direct_config.clone().normalized();
         let target = direct
-            .submit_direct(&tx_bytes, &targets, self.policy, &self.direct_config)
+            .submit_direct(&tx_bytes, &targets, self.policy, &direct_config)
             .await
             .map_err(|source| SubmitError::Direct { source })?;
         Ok(SubmitResult {
@@ -271,19 +279,23 @@ impl TxSubmitClient {
             .as_ref()
             .ok_or(SubmitError::MissingRpcTransport)?;
 
+        let direct_config = self.direct_config.clone().normalized();
         let targets = select_targets(self.leader_provider.as_ref(), &self.backups, self.policy);
-        if !targets.is_empty()
-            && let Ok(target) = direct
-                .submit_direct(&tx_bytes, &targets, self.policy, &self.direct_config)
-                .await
-        {
-            return Ok(SubmitResult {
-                signature,
-                mode,
-                direct_target: Some(target),
-                rpc_signature: None,
-                used_rpc_fallback: false,
-            });
+        if !targets.is_empty() {
+            for _ in 0..direct_config.hybrid_direct_attempts {
+                if let Ok(target) = direct
+                    .submit_direct(&tx_bytes, &targets, self.policy, &direct_config)
+                    .await
+                {
+                    return Ok(SubmitResult {
+                        signature,
+                        mode,
+                        direct_target: Some(target),
+                        rpc_signature: None,
+                        used_rpc_fallback: false,
+                    });
+                }
+            }
         }
 
         let rpc_signature = rpc

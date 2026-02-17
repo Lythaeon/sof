@@ -17,5 +17,5 @@ pub use direct::UdpDirectTransport;
 pub use rpc::JsonRpcTransport;
 pub use types::{
     DirectSubmitConfig, DirectSubmitTransport, RpcSubmitConfig, RpcSubmitTransport, SignedTx,
-    SubmitError, SubmitMode, SubmitResult, SubmitTransportError,
+    SubmitError, SubmitMode, SubmitReliability, SubmitResult, SubmitTransportError,
 };

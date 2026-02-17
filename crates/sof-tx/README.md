@@ -33,7 +33,7 @@ cargo add sof-tx
 use std::sync::Arc;
 
 use sof_tx::{
-    SubmitMode, TxBuilder, TxSubmitClient,
+    SubmitMode, SubmitReliability, TxBuilder, TxSubmitClient,
     providers::{LeaderProvider, LeaderTarget, RecentBlockhashProvider, StaticLeaderProvider, StaticRecentBlockhashProvider},
     submit::{JsonRpcTransport, UdpDirectTransport},
 };
@@ -50,6 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let leader_provider = Arc::new(StaticLeaderProvider::new(None, Vec::new()));
 
     let client = TxSubmitClient::new(blockhash_provider, leader_provider)
+        .with_reliability(SubmitReliability::Balanced)
         .with_rpc_transport(Arc::new(JsonRpcTransport::new("https://api.mainnet-beta.solana.com")?))
         .with_direct_transport(Arc::new(UdpDirectTransport));
 
@@ -146,6 +147,16 @@ Thanks in advance for supporting continued SDK development.
 - `RpcOnly`: maximum compatibility.
 - `DirectOnly`: lowest path latency when leader targets are reliable.
 - `Hybrid`: practical default for latency + fallback resilience.
+
+## Reliability Profiles
+
+Direct and hybrid modes include built-in reliability defaults through `SubmitReliability`.
+
+- `LowLatency`: minimal retries for fastest failover (`direct_target_rounds=1`, `hybrid_direct_attempts=1`)
+- `Balanced` (default): extra direct retries before fallback (`direct_target_rounds=2`, `hybrid_direct_attempts=2`)
+- `HighReliability`: most direct retrying (`direct_target_rounds=3`, `hybrid_direct_attempts=3`)
+
+Use `TxSubmitClient::with_reliability(...)` for presets, or `with_direct_config(...)` for full control.
 
 ## Feature Model
 

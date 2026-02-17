@@ -19,6 +19,18 @@ pub enum SubmitMode {
     Hybrid,
 }
 
+/// Reliability profile for direct and hybrid submission behavior.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub enum SubmitReliability {
+    /// Fastest path with minimal retrying.
+    LowLatency,
+    /// Balanced latency and retry behavior.
+    #[default]
+    Balanced,
+    /// Aggressive retrying before giving up.
+    HighReliability,
+}
+
 /// Signed transaction payload variants accepted by submit APIs.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum SignedTx {
@@ -53,14 +65,63 @@ pub struct DirectSubmitConfig {
     pub per_target_timeout: Duration,
     /// Global send budget for one submission.
     pub global_timeout: Duration,
+    /// Number of rounds to iterate across selected direct targets.
+    pub direct_target_rounds: usize,
+    /// Number of direct submit attempts in `Hybrid` mode before RPC fallback.
+    pub hybrid_direct_attempts: usize,
+}
+
+impl DirectSubmitConfig {
+    /// Builds a direct-submit config from a reliability profile.
+    #[must_use]
+    pub const fn from_reliability(reliability: SubmitReliability) -> Self {
+        match reliability {
+            SubmitReliability::LowLatency => Self {
+                per_target_timeout: Duration::from_millis(200),
+                global_timeout: Duration::from_millis(700),
+                direct_target_rounds: 1,
+                hybrid_direct_attempts: 1,
+            },
+            SubmitReliability::Balanced => Self {
+                per_target_timeout: Duration::from_millis(300),
+                global_timeout: Duration::from_millis(1_200),
+                direct_target_rounds: 2,
+                hybrid_direct_attempts: 2,
+            },
+            SubmitReliability::HighReliability => Self {
+                per_target_timeout: Duration::from_millis(450),
+                global_timeout: Duration::from_millis(2_200),
+                direct_target_rounds: 3,
+                hybrid_direct_attempts: 3,
+            },
+        }
+    }
+
+    /// Returns this config with minimum valid retry counters.
+    #[must_use]
+    pub const fn normalized(self) -> Self {
+        let direct_target_rounds = if self.direct_target_rounds == 0 {
+            1
+        } else {
+            self.direct_target_rounds
+        };
+        let hybrid_direct_attempts = if self.hybrid_direct_attempts == 0 {
+            1
+        } else {
+            self.hybrid_direct_attempts
+        };
+        Self {
+            per_target_timeout: self.per_target_timeout,
+            global_timeout: self.global_timeout,
+            direct_target_rounds,
+            hybrid_direct_attempts,
+        }
+    }
 }
 
 impl Default for DirectSubmitConfig {
     fn default() -> Self {
-        Self {
-            per_target_timeout: Duration::from_millis(300),
-            global_timeout: Duration::from_millis(1_200),
-        }
+        Self::from_reliability(SubmitReliability::default())
     }
 }
 

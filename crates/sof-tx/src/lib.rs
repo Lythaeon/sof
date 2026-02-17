@@ -18,6 +18,6 @@ pub use providers::{LeaderProvider, LeaderTarget, RecentBlockhashProvider};
 pub use routing::{RoutingPolicy, SignatureDeduper};
 pub use signing::SignerRef;
 pub use submit::{
-    DirectSubmitConfig, RpcSubmitConfig, SignedTx, SubmitError, SubmitMode, SubmitResult,
-    SubmitTransportError, TxSubmitClient,
+    DirectSubmitConfig, RpcSubmitConfig, SignedTx, SubmitError, SubmitMode, SubmitReliability,
+    SubmitResult, SubmitTransportError, TxSubmitClient,
 };

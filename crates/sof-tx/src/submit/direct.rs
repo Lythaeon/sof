@@ -21,6 +21,7 @@ impl DirectSubmitTransport for UdpDirectTransport {
         policy: RoutingPolicy,
         config: &DirectSubmitConfig,
     ) -> Result<LeaderTarget, SubmitTransportError> {
+        let config = config.clone().normalized();
         if targets.is_empty() {
             return Err(SubmitTransportError::Config {
                 message: "no targets provided".to_owned(),
@@ -39,22 +40,24 @@ impl DirectSubmitTransport for UdpDirectTransport {
             .ok_or_else(|| SubmitTransportError::Failure {
                 message: "failed to calculate direct-submit deadline".to_owned(),
             })?;
-        for chunk in targets.chunks(policy.normalized().max_parallel_sends) {
-            for target in chunk {
-                let now = Instant::now();
-                if now >= deadline {
-                    return Err(SubmitTransportError::Failure {
-                        message: "global direct-submit timeout exceeded".to_owned(),
-                    });
-                }
-                let remaining = deadline.saturating_duration_since(now);
-                let per_target = remaining.min(config.per_target_timeout);
-                let send_result =
-                    timeout(per_target, socket.send_to(tx_bytes, target.tpu_addr)).await;
-                match send_result {
-                    Ok(Ok(_bytes_sent)) => return Ok(target.clone()),
-                    Ok(Err(_send_error)) => {}
-                    Err(_elapsed) => {}
+        for _round in 0..config.direct_target_rounds {
+            for chunk in targets.chunks(policy.normalized().max_parallel_sends) {
+                for target in chunk {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(SubmitTransportError::Failure {
+                            message: "global direct-submit timeout exceeded".to_owned(),
+                        });
+                    }
+                    let remaining = deadline.saturating_duration_since(now);
+                    let per_target = remaining.min(config.per_target_timeout);
+                    let send_result =
+                        timeout(per_target, socket.send_to(tx_bytes, target.tpu_addr)).await;
+                    match send_result {
+                        Ok(Ok(_bytes_sent)) => return Ok(target.clone()),
+                        Ok(Err(_send_error)) => {}
+                        Err(_elapsed) => {}
+                    }
                 }
             }
         }
