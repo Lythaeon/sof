@@ -178,3 +178,14 @@ workspace = false
 install_crate = "cargo-fuzz"
 command = "cargo"
 args = ["+nightly", "fuzz", "${@}"]
+cwd = "crates/sof-observer"
+
+[tasks.fuzz-smoke]
+description = "Run bounded fuzz smoke suite across all SOF fuzz targets"
+workspace = false
+install_crate = "cargo-fuzz"
+command = "bash"
+args = [
+    "-lc",
+    "set -euo pipefail; cd crates/sof-observer; for target in parse_wire verify_packet dataset_reassembly slot_reassembly shred_fec_recover plugin_dispatch_events runtime_setup_builder verify_leader_diff; do echo \"== fuzz smoke: ${target} ==\"; cargo +nightly fuzz run \"${target}\" -- -runs=32; done",
+]

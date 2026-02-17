@@ -29,3 +29,21 @@ jobs:
 
       - name: Build and verify publishable crate archive
         run: cargo package -p sof --locked
+
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust CI toolchain and tools
+        uses: ./.github/actions/rust-ci-setup
+        with:
+          cargo-tools: cargo-make,cargo-nextest,cargo-fuzz
+
+      - name: Install Rust nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Run bounded fuzz smoke suite
+        run: cargo make fuzz-smoke

@@ -161,6 +161,15 @@ Reference docs:
 - Keep tests deterministic and fast.
 - If you touch parser/reassembly invariants, expand edge-case coverage (including fuzz-oriented cases where applicable).
 
+Fuzzing workflow:
+
+- Fuzz targets and corpora are in `crates/sof-observer/fuzz/`.
+- Run bounded fuzz smoke locally with `cargo make fuzz-smoke`.
+- For deeper campaigns, run `cd crates/sof-observer && cargo +nightly fuzz run <target>`.
+- When fuzz finds a crash, reproduce it from `artifacts/<target>/crash-*`, then add:
+  - a deterministic regression test in the owning module, and
+  - a minimized corpus seed in `crates/sof-observer/fuzz/corpus/<target>/`.
+
 Reference:
 
 - `docs/architecture/ard/0002-testing-strategy-and-quality-gates.md`

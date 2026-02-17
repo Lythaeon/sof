@@ -1,0 +1,72 @@
+[package]
+name = "sof-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+sof = { package = "sof", path = ".." }
+solana-pubkey = "3.0.0"
+
+[[bin]]
+name = "parse_wire"
+path = "fuzz_targets/parse_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "verify_packet"
+path = "fuzz_targets/verify_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dataset_reassembly"
+path = "fuzz_targets/dataset_reassembly.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "slot_reassembly"
+path = "fuzz_targets/slot_reassembly.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "shred_fec_recover"
+path = "fuzz_targets/shred_fec_recover.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "plugin_dispatch_events"
+path = "fuzz_targets/plugin_dispatch_events.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "runtime_setup_builder"
+path = "fuzz_targets/runtime_setup_builder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "verify_leader_diff"
+path = "fuzz_targets/verify_leader_diff.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
