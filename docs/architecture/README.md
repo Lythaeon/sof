@@ -18,6 +18,7 @@ Runtime playbooks are in `docs/operations/`.
 - ADR-0003: `adr/0003-type-driven-design-and-error-model.md`
 - ADR-0004: `adr/0004-static-dispatch-and-performance-layout.md`
 - ADR-0005: `adr/0005-testing-strategy-tdd-and-fuzzing.md`
+- ADR-0006: `adr/0006-transaction-sdk-and-dual-submit-routing.md` (Proposed)
 - Framework Hooks: `framework-plugin-hooks.md`
 - Runtime Bootstrap Modes: `runtime-bootstrap-modes.md`
 - ARD-0001: `ard/0001-project-structure-and-code-goals.md`
