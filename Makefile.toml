@@ -187,5 +187,5 @@ install_crate = "cargo-fuzz"
 command = "bash"
 args = [
     "-lc",
-    "set -euo pipefail; cd crates/sof-observer; for target in parse_wire verify_packet dataset_reassembly slot_reassembly shred_fec_recover plugin_dispatch_events runtime_setup_builder verify_leader_diff; do echo \"== fuzz smoke: ${target} ==\"; cargo +nightly fuzz run \"${target}\" -- -runs=32; done",
+    "set -euo pipefail; cd crates/sof-observer; target_args=(); if [[ -n \"${SOF_FUZZ_TARGET:-}\" ]]; then target_args=(--target \"${SOF_FUZZ_TARGET}\"); fi; for target in parse_wire verify_packet dataset_reassembly slot_reassembly shred_fec_recover plugin_dispatch_events runtime_setup_builder verify_leader_diff; do echo \"== fuzz smoke: ${target} ==\"; cargo +nightly fuzz run \"${target_args[@]}\" \"${target}\" -- -runs=32; done",
 ]
