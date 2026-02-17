@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     time::{Duration, Instant},
 };
 
@@ -15,10 +15,20 @@ use super::{
     types::{ShredKind, VerifyStatus},
 };
 
+#[derive(Debug, Default)]
+pub struct SlotLeaderDiff {
+    pub added: Vec<(u64, [u8; 32])>,
+    pub updated: Vec<(u64, [u8; 32])>,
+    pub removed_slots: Vec<u64>,
+}
+
 #[derive(Debug)]
 pub struct ShredVerifier {
     known_pubkeys: Vec<[u8; 32]>,
     slot_leaders: HashMap<u64, [u8; 32]>,
+    pending_added_slot_leaders: HashMap<u64, [u8; 32]>,
+    pending_updated_slot_leaders: HashMap<u64, [u8; 32]>,
+    pending_removed_slots: HashSet<u64>,
     latest_slot: u64,
     has_latest_slot: bool,
     slot_leader_window: u64,
@@ -36,6 +46,9 @@ impl ShredVerifier {
         Self {
             known_pubkeys: Vec::new(),
             slot_leaders: HashMap::new(),
+            pending_added_slot_leaders: HashMap::new(),
+            pending_updated_slot_leaders: HashMap::new(),
+            pending_removed_slots: HashSet::new(),
             latest_slot: 0,
             has_latest_slot: false,
             slot_leader_window,
@@ -61,7 +74,8 @@ impl ShredVerifier {
         };
         let mut has_latest = self.has_latest_slot;
         for (slot, pubkey) in leaders {
-            let _ = self.slot_leaders.insert(slot, pubkey);
+            let previous = self.slot_leaders.insert(slot, pubkey);
+            self.record_slot_leader_change(slot, pubkey, previous);
             if !has_latest || slot > latest {
                 latest = slot;
                 has_latest = true;
@@ -70,6 +84,37 @@ impl ShredVerifier {
         self.latest_slot = latest;
         self.has_latest_slot = has_latest;
         self.evict_old_slot_leaders();
+    }
+
+    #[must_use]
+    pub fn slot_leaders_snapshot(&self) -> Vec<(u64, [u8; 32])> {
+        let mut leaders: Vec<(u64, [u8; 32])> = self
+            .slot_leaders
+            .iter()
+            .map(|(slot, pubkey)| (*slot, *pubkey))
+            .collect();
+        leaders.sort_unstable_by_key(|(slot, _)| *slot);
+        leaders
+    }
+
+    #[must_use]
+    pub fn slot_leader_for_slot(&self, slot: u64) -> Option<[u8; 32]> {
+        self.slot_leaders.get(&slot).copied()
+    }
+
+    #[must_use]
+    pub fn take_slot_leader_diff(&mut self) -> SlotLeaderDiff {
+        let mut added: Vec<(u64, [u8; 32])> = self.pending_added_slot_leaders.drain().collect();
+        let mut updated: Vec<(u64, [u8; 32])> = self.pending_updated_slot_leaders.drain().collect();
+        let mut removed_slots: Vec<u64> = self.pending_removed_slots.drain().collect();
+        added.sort_unstable_by_key(|(slot, _)| *slot);
+        updated.sort_unstable_by_key(|(slot, _)| *slot);
+        removed_slots.sort_unstable();
+        SlotLeaderDiff {
+            added,
+            updated,
+            removed_slots,
+        }
     }
 
     pub fn verify_packet(&mut self, packet: &[u8], now: Instant) -> VerifyStatus {
@@ -148,7 +193,8 @@ impl ShredVerifier {
     }
 
     fn remember_slot_leader(&mut self, slot: u64, pubkey: [u8; 32]) {
-        let _ = self.slot_leaders.insert(slot, pubkey);
+        let previous = self.slot_leaders.insert(slot, pubkey);
+        self.record_slot_leader_change(slot, pubkey, previous);
         if !self.has_latest_slot || slot > self.latest_slot {
             self.latest_slot = slot;
             self.has_latest_slot = true;
@@ -156,11 +202,46 @@ impl ShredVerifier {
         self.evict_old_slot_leaders();
     }
 
+    fn record_slot_leader_change(
+        &mut self,
+        slot: u64,
+        leader: [u8; 32],
+        previous: Option<[u8; 32]>,
+    ) {
+        match previous {
+            None => {
+                let _ = self.pending_added_slot_leaders.insert(slot, leader);
+                let _ = self.pending_updated_slot_leaders.remove(&slot);
+            }
+            Some(previous_leader) if previous_leader != leader => {
+                if let Some(pending_added) = self.pending_added_slot_leaders.get_mut(&slot) {
+                    *pending_added = leader;
+                } else {
+                    let _ = self.pending_updated_slot_leaders.insert(slot, leader);
+                }
+            }
+            Some(_) => {}
+        }
+        let _ = self.pending_removed_slots.remove(&slot);
+    }
+
     fn evict_old_slot_leaders(&mut self) {
         if !self.has_latest_slot {
             return;
         }
         let floor = self.latest_slot.saturating_sub(self.slot_leader_window);
-        self.slot_leaders.retain(|slot, _| *slot >= floor);
+        let mut removed_slots = Vec::new();
+        self.slot_leaders.retain(|slot, _| {
+            let keep = *slot >= floor;
+            if !keep {
+                removed_slots.push(*slot);
+            }
+            keep
+        });
+        for slot in removed_slots {
+            let _ = self.pending_added_slot_leaders.remove(&slot);
+            let _ = self.pending_updated_slot_leaders.remove(&slot);
+            let _ = self.pending_removed_slots.insert(slot);
+        }
     }
 }

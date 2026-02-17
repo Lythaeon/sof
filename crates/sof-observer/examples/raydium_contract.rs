@@ -6,6 +6,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
+use async_trait::async_trait;
 use sof::framework::{Plugin, PluginHost, TransactionEvent};
 use solana_pubkey::Pubkey;
 use thiserror::Error;
@@ -60,19 +61,20 @@ impl RaydiumProgramsTouched {
     }
 }
 
+#[async_trait]
 impl Plugin for RaydiumTxFilterLoggerPlugin {
     fn name(&self) -> &'static str {
         "raydium-tx-filter-logger"
     }
 
-    fn on_transaction(&self, event: TransactionEvent<'_>) {
-        let Some(touched) = classify_raydium_transaction(event) else {
+    async fn on_transaction(&self, event: TransactionEvent) {
+        let Some(touched) = classify_raydium_transaction(&event) else {
             return;
         };
 
         let signature = event
             .signature
-            .map(ToString::to_string)
+            .map(|signature| signature.to_string())
             .unwrap_or_else(|| MISSING_SIGNATURE_LABEL.to_owned());
         let seen = RAYDIUM_TX_COUNT
             .fetch_add(1, Ordering::Relaxed)
@@ -102,7 +104,7 @@ impl Plugin for RaydiumTxFilterLoggerPlugin {
     }
 }
 
-fn classify_raydium_transaction(event: TransactionEvent<'_>) -> Option<RaydiumProgramsTouched> {
+fn classify_raydium_transaction(event: &TransactionEvent) -> Option<RaydiumProgramsTouched> {
     let message = &event.tx.message;
     let keys = message.static_account_keys();
     let raydium_launchlab = raydium_launchlab_pubkey()?;

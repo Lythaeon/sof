@@ -190,6 +190,15 @@ impl RuntimeSetup {
         self.with_env("SOF_LOG_DATASET_RECONSTRUCTION", enabled.to_string())
     }
 
+    /// Sets `SOF_LIVE_SHREDS_ENABLED`.
+    ///
+    /// When false, runtime keeps control-plane hooks active but skips live
+    /// shred data-plane processing (`on_raw_packet`, `on_shred`, datasets, txs).
+    #[must_use]
+    pub fn with_live_shreds_enabled(self, enabled: bool) -> Self {
+        self.with_env("SOF_LIVE_SHREDS_ENABLED", enabled.to_string())
+    }
+
     /// Sets `SOF_VERIFY_SHREDS`.
     #[must_use]
     pub fn with_verify_shreds(self, enabled: bool) -> Self {

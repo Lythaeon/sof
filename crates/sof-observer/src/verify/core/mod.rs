@@ -8,4 +8,4 @@ mod verifier;
 mod tests;
 
 pub use types::VerifyStatus;
-pub use verifier::ShredVerifier;
+pub use verifier::{ShredVerifier, SlotLeaderDiff};

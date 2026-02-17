@@ -1,9 +1,15 @@
-use crate::framework::events::{DatasetEvent, RawPacketEvent, ShredEvent, TransactionEvent};
+use async_trait::async_trait;
+
+use crate::framework::events::{
+    ClusterTopologyEvent, DatasetEvent, LeaderScheduleEvent, RawPacketEvent, ShredEvent,
+    TransactionEvent,
+};
 
 /// Extension point for SOF runtime event hooks.
 ///
-/// A plugin is executed synchronously on runtime hot paths. Keep callbacks non-blocking
-/// and low-allocation. If expensive work is needed, enqueue to your own worker.
+/// Plugins are executed asynchronously by the plugin host worker, decoupled from ingest hot paths.
+/// Keep callbacks lightweight and use bounded work queues for any expensive downstream processing.
+#[async_trait]
 pub trait ObserverPlugin: Send + Sync + 'static {
     /// Stable plugin identifier used in startup logs and diagnostics.
     ///
@@ -13,14 +19,20 @@ pub trait ObserverPlugin: Send + Sync + 'static {
     }
 
     /// Called for every UDP packet before shred parsing.
-    fn on_raw_packet(&self, _event: RawPacketEvent<'_>) {}
+    async fn on_raw_packet(&self, _event: RawPacketEvent) {}
 
     /// Called for every packet that produced a valid parsed shred header.
-    fn on_shred(&self, _event: ShredEvent<'_>) {}
+    async fn on_shred(&self, _event: ShredEvent) {}
 
     /// Called when a contiguous shred dataset is reconstructed.
-    fn on_dataset(&self, _event: DatasetEvent) {}
+    async fn on_dataset(&self, _event: DatasetEvent) {}
 
     /// Called for each decoded transaction emitted from a dataset.
-    fn on_transaction(&self, _event: TransactionEvent<'_>) {}
+    async fn on_transaction(&self, _event: TransactionEvent) {}
+
+    /// Called on low-frequency cluster topology diffs/snapshots (gossip-bootstrap mode).
+    async fn on_cluster_topology(&self, _event: ClusterTopologyEvent) {}
+
+    /// Called on event-driven leader-schedule diffs/snapshots.
+    async fn on_leader_schedule(&self, _event: LeaderScheduleEvent) {}
 }

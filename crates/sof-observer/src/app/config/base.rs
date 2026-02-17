@@ -98,6 +98,10 @@ pub fn read_log_dataset_reconstruction() -> bool {
     read_bool_env("SOF_LOG_DATASET_RECONSTRUCTION", false)
 }
 
+pub fn read_live_shreds_enabled() -> bool {
+    read_bool_env("SOF_LIVE_SHREDS_ENABLED", true)
+}
+
 #[cfg(feature = "gossip-bootstrap")]
 pub fn read_log_repair_peer_traffic() -> bool {
     read_bool_env("SOF_LOG_REPAIR_PEER_TRAFFIC", false)

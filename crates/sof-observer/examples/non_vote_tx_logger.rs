@@ -3,6 +3,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use async_trait::async_trait;
 use sof::{
     event::TxKind,
     framework::{DatasetEvent, Plugin, PluginHost, ShredEvent, TransactionEvent},
@@ -22,12 +23,13 @@ const MISSING_SIGNATURE_LABEL: &str = "NO_SIGNATURE";
 #[derive(Debug, Clone, Copy, Default)]
 struct NonVoteTxLoggerPlugin;
 
+#[async_trait]
 impl Plugin for NonVoteTxLoggerPlugin {
     fn name(&self) -> &'static str {
         "non-vote-tx-logger"
     }
 
-    fn on_dataset(&self, event: DatasetEvent) {
+    async fn on_dataset(&self, event: DatasetEvent) {
         let seen = DATASET_COUNT
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
@@ -40,7 +42,7 @@ impl Plugin for NonVoteTxLoggerPlugin {
         }
     }
 
-    fn on_shred(&self, event: ShredEvent<'_>) {
+    async fn on_shred(&self, event: ShredEvent) {
         let seen = SHRED_COUNT
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
@@ -53,7 +55,7 @@ impl Plugin for NonVoteTxLoggerPlugin {
         }
     }
 
-    fn on_transaction(&self, event: TransactionEvent<'_>) {
+    async fn on_transaction(&self, event: TransactionEvent) {
         if event.kind == TxKind::VoteOnly {
             let seen = VOTE_TX_COUNT
                 .fetch_add(1, Ordering::Relaxed)
@@ -70,7 +72,7 @@ impl Plugin for NonVoteTxLoggerPlugin {
 
         let signature = event
             .signature
-            .map(ToString::to_string)
+            .map(|signature| signature.to_string())
             .unwrap_or_else(|| MISSING_SIGNATURE_LABEL.to_owned());
 
         tracing::info!(

@@ -49,22 +49,25 @@ pub(super) fn process_completed_dataset(
             .dataset_tail_skip_count
             .fetch_add(u64::from(skipped_prefix_shreds), Ordering::Relaxed);
     }
+    let plugin_hooks_enabled = !context.plugin_host.is_empty();
 
     let mut tx_count: u64 = 0;
     for entry in entries {
         for tx in entry.transactions {
             let kind = classify_tx_kind(&tx);
-            let signature = tx.signatures.first().cloned().unwrap_or_default();
+            let signature = tx.signatures.first().cloned();
             tx_count = tx_count.saturating_add(1);
-            context.plugin_host.on_transaction(TransactionEvent {
-                slot,
-                signature: tx.signatures.first(),
-                tx: &tx,
-                kind,
-            });
+            if plugin_hooks_enabled {
+                context.plugin_host.on_transaction(TransactionEvent {
+                    slot,
+                    signature,
+                    tx: Arc::new(tx),
+                    kind,
+                });
+            }
             let event = TxObservedEvent {
                 slot,
-                signature,
+                signature: signature.unwrap_or_default(),
                 kind,
             };
             if context.tx_event_tx.try_send(event).is_err() {
@@ -73,15 +76,17 @@ pub(super) fn process_completed_dataset(
         }
     }
 
-    context.plugin_host.on_dataset(DatasetEvent {
-        slot,
-        start_index: effective_start_index,
-        end_index,
-        last_in_slot,
-        shreds: serialized_shreds.len(),
-        payload_len: payload.len(),
-        tx_count,
-    });
+    if plugin_hooks_enabled {
+        context.plugin_host.on_dataset(DatasetEvent {
+            slot,
+            start_index: effective_start_index,
+            end_index,
+            last_in_slot,
+            shreds: serialized_shreds.len(),
+            payload_len: payload.len(),
+            tx_count,
+        });
+    }
 
     if context.log_dataset_reconstruction {
         tracing::info!(

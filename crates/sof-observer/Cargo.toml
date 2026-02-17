@@ -43,6 +43,7 @@ arcshift = "0.4.2"
 core_affinity = "0.8"
 nix = { version = "0.30", features = ["net", "uio"] }
 crossbeam-queue = "0.3"
+async-trait = "0.1"
 
 [[example]]
 name = "non_vote_tx_logger"
@@ -63,3 +64,7 @@ path = "examples/observer_with_non_vote_plugin.rs"
 [[example]]
 name = "observer_with_multiple_plugins"
 path = "examples/observer_with_multiple_plugins.rs"
+
+[[example]]
+name = "tpu_leader_logger"
+path = "examples/tpu_leader_logger.rs"

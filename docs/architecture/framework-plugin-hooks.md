@@ -8,11 +8,14 @@ custom logic without forking the runtime.
 - Trait:
   - `ObserverPlugin` (also re-exported as `Plugin`)
 - Event payloads:
+  - `ClusterTopologyEvent`
   - `RawPacketEvent`
   - `ShredEvent`
   - `DatasetEvent`
   - `TransactionEvent`
+  - `LeaderScheduleEvent`
 - Host/runtime wiring:
+  - `PluginDispatchMode`
   - `PluginHost`
   - `PluginHostBuilder`
 
@@ -24,6 +27,8 @@ Callbacks are invoked in this order as data flows through runtime:
 2. `on_shred`
 3. `on_dataset`
 4. `on_transaction`
+5. `on_cluster_topology` (near-real-time, gossip-bootstrap only)
+6. `on_leader_schedule` (near-real-time, gossip-bootstrap only)
 
 Detailed behavior:
 
@@ -39,15 +44,25 @@ Detailed behavior:
 - `on_transaction`:
   - Fires for each decoded transaction inside a dataset.
   - Includes slot, optional signature, tx payload, and SOF `TxKind`.
+- `on_cluster_topology`:
+  - Fires on meaningful cluster node diffs (added/removed/updated), polled about every 250ms.
+  - Emits periodic snapshots for full state reconciliation.
+  - Includes gossip/tpu/tvu/rpc endpoints when advertised.
+- `on_leader_schedule`:
+  - Fires on meaningful leader-assignment diffs (added/removed/updated), event-driven from live slot-leader updates.
+  - No polling loop is used for leader emission.
+  - Requires live shred processing (`SOF_LIVE_SHREDS_ENABLED=true`) and shred verification (`SOF_VERIFY_SHREDS=true`).
+  - `snapshot_leaders` remains in the event schema for compatibility and is typically empty.
 
 ## Host Construction
 
 Preferred host creation:
 
 ```rust
-use sof::framework::PluginHost;
+use sof::framework::{PluginDispatchMode, PluginHost};
 
 let host = PluginHost::builder()
+    .with_dispatch_mode(PluginDispatchMode::BoundedConcurrent(8))
     .add_plugin(MyPlugin)
     .build();
 ```
@@ -67,42 +82,13 @@ Builder aliases kept for compatibility:
 
 ## Runtime Wiring
 
-The packaged runtime executes hooks directly on hot paths:
+The packaged runtime dispatches hooks asynchronously using a bounded queue:
 
-- packet ingress loop (`on_raw_packet`, `on_shred`)
-- dataset workers (`on_dataset`, `on_transaction`)
+- packet ingress and dataset workers enqueue events using non-blocking `try_send`
+- a dedicated plugin dispatch worker executes async hook callbacks
+- dispatch mode defaults to `Sequential` and can be set to `BoundedConcurrent(N)`
 - plugin panics are isolated per hook dispatch; SOF logs the panic and continues
-
-This keeps the engine reusable while preserving low-latency ingest behavior.
-
-## Thread-Safety And Locking Model
-
-SOF runtime internals prefer actor-style ownership over shared mutable locking:
-
-- bounded channels for cross-task handoff
-- atomics for counters/flags
-- lock-free queues for dataset work dispatch
-
-This minimizes lock contention on ingest hot paths.
-
-Plugin callbacks, however, may be invoked concurrently from different runtime tasks. Because of
-that, plugins must treat internal shared state as concurrent state.
-
-Recommended plugin patterns:
-
-- high-rate counters/flags: `Arc<AtomicU64>` / `Arc<AtomicBool>`
-- low-rate mutable maps/sets/config snapshots: `Arc<std::sync::Mutex<T>>` or `Arc<std::sync::RwLock<T>>`
-- expensive or blocking work: offload via bounded channel to a dedicated worker task
-
-Avoid taking long-lived locks inside hook bodies.
-
-## Performance Rules For Plugin Authors
-
-- Keep hook handlers non-blocking.
-- Avoid external network/database calls on hook threads.
-- Use bounded channels to offload expensive processing.
-- Prefer minimal-copy reads from event payloads.
-- Use sampling/throttling when emitting logs on high-volume hooks.
+- when the queue is full, hook events are dropped to protect ingest latency
 
 To run the packaged runtime entrypoint:
 

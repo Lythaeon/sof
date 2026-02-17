@@ -22,6 +22,11 @@ pub(super) use super::super::state::{
     OutstandingRepairRequests, RecentShredCache, SlotCoverageWindow, note_latest_shred_slot,
 };
 #[cfg(feature = "gossip-bootstrap")]
+pub(super) use crate::framework::{
+    ClusterNodeInfo, ClusterTopologyEvent, ControlPlaneSource, LeaderScheduleEntry,
+    LeaderScheduleEvent,
+};
+#[cfg(feature = "gossip-bootstrap")]
 pub(super) use crate::repair::MissingShredRequest;
 #[cfg(feature = "gossip-bootstrap")]
 pub(super) use crate::repair::MissingShredRequestKind;

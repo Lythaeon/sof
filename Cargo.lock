@@ -5231,6 +5231,7 @@ name = "sof"
 version = "0.1.0"
 dependencies = [
  "arcshift",
+ "async-trait",
  "bincode",
  "core_affinity",
  "crossbeam-queue",

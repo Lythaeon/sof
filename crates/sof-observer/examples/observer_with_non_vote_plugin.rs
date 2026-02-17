@@ -1,6 +1,7 @@
 //! SOF runtime example with one non-vote transaction plugin.
 #![doc(hidden)]
 
+use async_trait::async_trait;
 use sof::{
     event::TxKind,
     framework::{Plugin, PluginHost, TransactionEvent},
@@ -10,18 +11,19 @@ use thiserror::Error;
 #[derive(Clone, Copy, Debug, Default)]
 struct NonVoteTxLoggerPlugin;
 
+#[async_trait]
 impl Plugin for NonVoteTxLoggerPlugin {
     fn name(&self) -> &'static str {
         "non-vote-tx-logger"
     }
 
-    fn on_transaction(&self, event: TransactionEvent<'_>) {
+    async fn on_transaction(&self, event: TransactionEvent) {
         if event.kind == TxKind::VoteOnly {
             return;
         }
         let signature = event
             .signature
-            .map(ToString::to_string)
+            .map(|signature| signature.to_string())
             .unwrap_or_else(|| "NO_SIGNATURE".to_owned());
         tracing::info!(
             slot = event.slot,

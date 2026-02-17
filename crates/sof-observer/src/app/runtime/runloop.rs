@@ -25,6 +25,9 @@ const INITIAL_DEBUG_SAMPLE_LOG_LIMIT: u64 = 5;
 #[cfg(feature = "gossip-bootstrap")]
 const INITIAL_REPAIR_TRAFFIC_LOG_LIMIT: u64 = 8;
 const SUBSTANTIAL_DATASET_MIN_SHREDS: usize = 2;
+const CONTROL_PLANE_EVENT_TICK_MS: u64 = 250;
+#[cfg(feature = "gossip-bootstrap")]
+const CONTROL_PLANE_EVENT_SNAPSHOT_SECS: u64 = 30;
 
 pub(super) async fn run_async_with_plugin_host(
     plugin_host: PluginHost,
@@ -76,7 +79,8 @@ pub(super) async fn run_async_with_plugin_host(
         },
         &dataset_worker_shared,
     );
-    if !plugin_host.is_empty() {
+    let plugin_hooks_enabled = !plugin_host.is_empty();
+    if plugin_hooks_enabled {
         tracing::info!(plugins = ?plugin_host.plugin_names(), "observer plugins enabled");
     }
     let relay_listen_addr = read_relay_listen_addr()
@@ -111,16 +115,22 @@ pub(super) async fn run_async_with_plugin_host(
         );
     }
     let verify_enabled = read_verify_shreds();
+    let live_shreds_enabled = read_live_shreds_enabled();
+    if !live_shreds_enabled && verify_enabled {
+        tracing::warn!("SOF_VERIFY_SHREDS=true ignored because SOF_LIVE_SHREDS_ENABLED=false");
+    }
+    let verify_enabled = live_shreds_enabled && verify_enabled;
     let verify_strict_unknown = read_verify_strict_unknown();
     let verify_recovered_shreds = read_verify_recovered_shreds();
     let dedupe_capacity = read_shred_dedupe_capacity();
     let dedupe_ttl_ms = read_shred_dedupe_ttl_ms();
     let mut dedupe_cache = (dedupe_capacity > 0 && dedupe_ttl_ms > 0)
         .then(|| RecentShredCache::new(dedupe_capacity, Duration::from_millis(dedupe_ttl_ms)));
+    let verify_slot_leader_window = read_verify_slot_leader_window();
     let mut shred_verifier = verify_enabled.then(|| {
         ShredVerifier::new(
             read_verify_signature_cache_entries(),
-            read_verify_slot_leader_window(),
+            verify_slot_leader_window,
             Duration::from_millis(read_verify_unknown_retry_ms()),
         )
     });
@@ -146,6 +156,8 @@ pub(super) async fn run_async_with_plugin_host(
                     .map(|(slot, _)| *slot)
                     .unwrap_or_default();
                 verifier.set_slot_leaders(slot_leaders);
+                // Suppress bootstrap burst; emit only live, event-driven updates afterwards.
+                drop(verifier.take_slot_leader_diff());
                 tracing::info!(
                     rpc_url = %rpc_url,
                     slot_start = start_slot,
@@ -171,7 +183,13 @@ pub(super) async fn run_async_with_plugin_host(
     );
 
     #[cfg(feature = "gossip-bootstrap")]
-    let repair_enabled = read_repair_enabled();
+    let repair_enabled_configured = read_repair_enabled();
+    #[cfg(feature = "gossip-bootstrap")]
+    if !live_shreds_enabled && repair_enabled_configured {
+        tracing::warn!("SOF_REPAIR_ENABLED=true ignored because SOF_LIVE_SHREDS_ENABLED=false");
+    }
+    #[cfg(feature = "gossip-bootstrap")]
+    let repair_enabled = live_shreds_enabled && repair_enabled_configured;
     #[cfg(not(feature = "gossip-bootstrap"))]
     let repair_enabled = false;
     #[cfg(feature = "gossip-bootstrap")]
@@ -477,11 +495,15 @@ pub(super) async fn run_async_with_plugin_host(
     #[cfg(feature = "gossip-bootstrap")]
     let mut repair_source_hint_last_flush = Instant::now();
     let mut latest_shred_slot: Option<u64> = None;
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut emitted_slot_leaders: HashMap<u64, [u8; 32]> = HashMap::new();
     let mut coverage_window = SlotCoverageWindow::new(read_coverage_window_slots());
     let mut telemetry_tick = interval(Duration::from_secs(TELEMETRY_INTERVAL_SECS));
     let mut repair_tick = interval(Duration::from_millis(read_repair_tick_ms()));
+    let mut control_plane_tick = interval(Duration::from_millis(CONTROL_PLANE_EVENT_TICK_MS));
     let mut logged_waiting_for_packets = false;
     tracing::info!(
+        live_shreds_enabled,
         verify_enabled,
         verify_recovered_shreds,
         verify_strict_unknown,
@@ -501,6 +523,12 @@ pub(super) async fn run_async_with_plugin_host(
     }
     telemetry_tick.tick().await;
     repair_tick.tick().await;
+    control_plane_tick.tick().await;
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut topology_tracker = ClusterTopologyTracker::new(
+        Duration::from_millis(CONTROL_PLANE_EVENT_TICK_MS),
+        Duration::from_secs(CONTROL_PLANE_EVENT_SNAPSHOT_SECS),
+    );
 
     loop {
         tokio::select! {
@@ -512,10 +540,12 @@ pub(super) async fn run_async_with_plugin_host(
                 let observed_at = Instant::now();
                 let source_addr = packet.source;
                 let packet_bytes = packet.bytes;
-                plugin_host.on_raw_packet(RawPacketEvent {
-                    source: source_addr,
-                    bytes: &packet_bytes,
-                });
+                if plugin_hooks_enabled {
+                    plugin_host.on_raw_packet(RawPacketEvent {
+                        source: source_addr,
+                        bytes: Arc::from(packet_bytes.as_slice()),
+                    });
+                }
                 if let Some(packet_bus) = &relay_bus
                     && packet_bus.send(packet_bytes.clone()).is_err()
                 {
@@ -529,6 +559,9 @@ pub(super) async fn run_async_with_plugin_host(
                         "ingress traffic detected"
                     );
                     logged_waiting_for_packets = false;
+                }
+                if !live_shreds_enabled {
+                    continue;
                 }
                 #[cfg(feature = "gossip-bootstrap")]
                 if repair_driver_enabled
@@ -596,11 +629,18 @@ pub(super) async fn run_async_with_plugin_host(
                         continue;
                     }
                 };
-                plugin_host.on_shred(ShredEvent {
-                    source: source_addr,
-                    packet: &packet_bytes,
-                    parsed: &parsed_shred,
-                });
+                #[cfg(feature = "gossip-bootstrap")]
+                let parsed_slot = match &parsed_shred {
+                    ParsedShredHeader::Data(data) => data.common.slot,
+                    ParsedShredHeader::Code(code) => code.common.slot,
+                };
+                if plugin_hooks_enabled {
+                    plugin_host.on_shred(ShredEvent {
+                        source: source_addr,
+                        packet: Arc::from(packet_bytes.as_slice()),
+                        parsed: Arc::new(parsed_shred.clone()),
+                    });
+                }
                 if let Some(cache) = dedupe_cache.as_mut()
                     && cache.is_recent_duplicate(&packet_bytes, &parsed_shred, observed_at)
                 {
@@ -633,6 +673,24 @@ pub(super) async fn run_async_with_plugin_host(
                         verify_dropped_count = verify_dropped_count.saturating_add(1);
                         continue;
                     }
+                }
+                #[cfg(feature = "gossip-bootstrap")]
+                if plugin_hooks_enabled
+                    && let Some(verifier) = shred_verifier.as_mut()
+                {
+                    emit_leader_schedule_diff_event(
+                        &plugin_host,
+                        verifier,
+                        latest_shred_slot,
+                        &mut emitted_slot_leaders,
+                    );
+                    emit_observed_slot_leader_event(
+                        &plugin_host,
+                        verifier,
+                        parsed_slot,
+                        &mut emitted_slot_leaders,
+                        verify_slot_leader_window,
+                    );
                 }
                 #[cfg(feature = "gossip-bootstrap")]
                 if repair_driver_enabled {
@@ -1229,6 +1287,22 @@ pub(super) async fn run_async_with_plugin_host(
                     }
                 }
             }
+            _ = control_plane_tick.tick() => {
+                #[cfg(feature = "gossip-bootstrap")]
+                if plugin_hooks_enabled
+                    && let Some(gossip_runtime) = runtime.gossip_runtime.as_ref()
+                {
+                    let now = Instant::now();
+                    if let Some(topology_event) = topology_tracker.maybe_build_event(
+                        gossip_runtime.cluster_info.as_ref(),
+                        latest_shred_slot,
+                        runtime.active_gossip_entrypoint.clone(),
+                        now,
+                    ) {
+                        plugin_host.on_cluster_topology(topology_event);
+                    }
+                }
+            }
             _ = telemetry_tick.tick() => {
                 if packet_count == 0 && !logged_waiting_for_packets {
                     tracing::info!(
@@ -1532,4 +1606,236 @@ pub(super) async fn run_async_with_plugin_host(
     dataset_worker_pool.shutdown().await;
     drop(runtime);
     Ok(())
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+/// Tracks cluster topology snapshots and emits low-frequency diff/snapshot events.
+struct ClusterTopologyTracker {
+    last_nodes: HashMap<Pubkey, ClusterNodeInfo>,
+    last_polled_at: Option<Instant>,
+    last_snapshot_at: Option<Instant>,
+    poll_interval: Duration,
+    snapshot_interval: Duration,
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+impl ClusterTopologyTracker {
+    fn new(poll_interval: Duration, snapshot_interval: Duration) -> Self {
+        Self {
+            last_nodes: HashMap::new(),
+            last_polled_at: None,
+            last_snapshot_at: None,
+            poll_interval,
+            snapshot_interval,
+        }
+    }
+
+    fn maybe_build_event(
+        &mut self,
+        cluster_info: &ClusterInfo,
+        latest_slot: Option<u64>,
+        active_entrypoint: Option<String>,
+        now: Instant,
+    ) -> Option<ClusterTopologyEvent> {
+        if !self.should_poll(now) {
+            return None;
+        }
+        self.last_polled_at = Some(now);
+
+        let mut current_nodes: HashMap<Pubkey, ClusterNodeInfo> = HashMap::new();
+        for (contact_info, _) in cluster_info.all_peers() {
+            let node = cluster_node_info_from_contact(&contact_info);
+            let _ = current_nodes.insert(node.pubkey, node);
+        }
+
+        let mut added_nodes = Vec::new();
+        let mut updated_nodes = Vec::new();
+        let mut removed_pubkeys = Vec::new();
+
+        for (pubkey, node) in &current_nodes {
+            match self.last_nodes.get(pubkey) {
+                None => added_nodes.push(node.clone()),
+                Some(previous) if previous != node => updated_nodes.push(node.clone()),
+                Some(_) => {}
+            }
+        }
+        for pubkey in self.last_nodes.keys() {
+            if !current_nodes.contains_key(pubkey) {
+                removed_pubkeys.push(*pubkey);
+            }
+        }
+
+        sort_cluster_nodes(&mut added_nodes);
+        sort_cluster_nodes(&mut updated_nodes);
+        removed_pubkeys.sort_unstable_by_key(Pubkey::to_bytes);
+
+        let emit_snapshot = self
+            .last_snapshot_at
+            .is_none_or(|last| now.saturating_duration_since(last) >= self.snapshot_interval);
+        if added_nodes.is_empty()
+            && updated_nodes.is_empty()
+            && removed_pubkeys.is_empty()
+            && !emit_snapshot
+        {
+            return None;
+        }
+
+        if emit_snapshot {
+            self.last_snapshot_at = Some(now);
+        }
+        let snapshot_nodes = if emit_snapshot {
+            let mut nodes: Vec<ClusterNodeInfo> = current_nodes.values().cloned().collect();
+            sort_cluster_nodes(&mut nodes);
+            nodes
+        } else {
+            Vec::new()
+        };
+
+        self.last_nodes = current_nodes;
+        Some(ClusterTopologyEvent {
+            source: ControlPlaneSource::GossipBootstrap,
+            slot: latest_slot,
+            epoch: None,
+            active_entrypoint,
+            total_nodes: self.last_nodes.len(),
+            added_nodes,
+            removed_pubkeys,
+            updated_nodes,
+            snapshot_nodes,
+        })
+    }
+
+    fn should_poll(&self, now: Instant) -> bool {
+        self.last_polled_at
+            .is_none_or(|last| now.saturating_duration_since(last) >= self.poll_interval)
+    }
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+fn emit_leader_schedule_diff_event(
+    plugin_host: &PluginHost,
+    verifier: &mut ShredVerifier,
+    latest_slot: Option<u64>,
+    emitted_slot_leaders: &mut HashMap<u64, [u8; 32]>,
+) {
+    let diff = verifier.take_slot_leader_diff();
+    if diff.added.is_empty() && diff.updated.is_empty() && diff.removed_slots.is_empty() {
+        return;
+    }
+
+    let mut added_leaders: Vec<LeaderScheduleEntry> = diff
+        .added
+        .into_iter()
+        .map(|(slot, leader)| LeaderScheduleEntry {
+            slot,
+            leader: Pubkey::new_from_array(leader),
+        })
+        .collect();
+    let mut updated_leaders: Vec<LeaderScheduleEntry> = diff
+        .updated
+        .into_iter()
+        .map(|(slot, leader)| LeaderScheduleEntry {
+            slot,
+            leader: Pubkey::new_from_array(leader),
+        })
+        .collect();
+    let mut removed_slots = diff.removed_slots;
+
+    sort_leader_entries(&mut added_leaders);
+    sort_leader_entries(&mut updated_leaders);
+    removed_slots.sort_unstable();
+    for entry in &added_leaders {
+        let _ = emitted_slot_leaders.insert(entry.slot, entry.leader.to_bytes());
+    }
+    for entry in &updated_leaders {
+        let _ = emitted_slot_leaders.insert(entry.slot, entry.leader.to_bytes());
+    }
+    for slot in &removed_slots {
+        let _ = emitted_slot_leaders.remove(slot);
+    }
+
+    let event_slot = added_leaders
+        .last()
+        .map(|entry| entry.slot)
+        .or_else(|| updated_leaders.last().map(|entry| entry.slot))
+        .or_else(|| removed_slots.last().copied())
+        .or(latest_slot);
+
+    plugin_host.on_leader_schedule(LeaderScheduleEvent {
+        source: ControlPlaneSource::GossipBootstrap,
+        slot: event_slot,
+        epoch: None,
+        added_leaders,
+        removed_slots,
+        updated_leaders,
+        snapshot_leaders: Vec::new(),
+    });
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+fn emit_observed_slot_leader_event(
+    plugin_host: &PluginHost,
+    verifier: &ShredVerifier,
+    observed_slot: u64,
+    emitted_slot_leaders: &mut HashMap<u64, [u8; 32]>,
+    slot_leader_window: u64,
+) {
+    let Some(leader_bytes) = verifier.slot_leader_for_slot(observed_slot) else {
+        return;
+    };
+    let previous = emitted_slot_leaders.insert(observed_slot, leader_bytes);
+    let leader = Pubkey::new_from_array(leader_bytes);
+    let (added_leaders, updated_leaders) = match previous {
+        None => (
+            vec![LeaderScheduleEntry {
+                slot: observed_slot,
+                leader,
+            }],
+            Vec::new(),
+        ),
+        Some(previous_leader) if previous_leader != leader_bytes => (
+            Vec::new(),
+            vec![LeaderScheduleEntry {
+                slot: observed_slot,
+                leader,
+            }],
+        ),
+        Some(_) => return,
+    };
+
+    let floor = observed_slot.saturating_sub(slot_leader_window);
+    emitted_slot_leaders.retain(|slot, _| *slot >= floor);
+
+    plugin_host.on_leader_schedule(LeaderScheduleEvent {
+        source: ControlPlaneSource::GossipBootstrap,
+        slot: Some(observed_slot),
+        epoch: None,
+        added_leaders,
+        removed_slots: Vec::new(),
+        updated_leaders,
+        snapshot_leaders: Vec::new(),
+    });
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+fn cluster_node_info_from_contact(contact_info: &ContactInfo) -> ClusterNodeInfo {
+    ClusterNodeInfo {
+        pubkey: *contact_info.pubkey(),
+        wallclock: contact_info.wallclock(),
+        shred_version: contact_info.shred_version(),
+        gossip: contact_info.gossip(),
+        tpu: contact_info.tpu(solana_gossip::contact_info::Protocol::UDP),
+        tvu: contact_info.tvu(solana_gossip::contact_info::Protocol::UDP),
+        rpc: contact_info.rpc(),
+    }
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+fn sort_cluster_nodes(nodes: &mut [ClusterNodeInfo]) {
+    nodes.sort_unstable_by_key(|node| node.pubkey.to_bytes());
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+fn sort_leader_entries(entries: &mut [LeaderScheduleEntry]) {
+    entries.sort_unstable_by_key(|entry| entry.slot);
 }

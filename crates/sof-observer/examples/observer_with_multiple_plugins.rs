@@ -1,6 +1,7 @@
 //! SOF runtime example with transaction and dataset plugins.
 #![doc(hidden)]
 
+use async_trait::async_trait;
 use sof::{
     event::TxKind,
     framework::{DatasetEvent, Plugin, PluginHost, TransactionEvent},
@@ -10,19 +11,20 @@ use thiserror::Error;
 #[derive(Debug, Clone, Copy, Default)]
 struct NonVoteTxLoggerPlugin;
 
+#[async_trait]
 impl Plugin for NonVoteTxLoggerPlugin {
     fn name(&self) -> &'static str {
         "non-vote-tx-logger"
     }
 
-    fn on_transaction(&self, event: TransactionEvent<'_>) {
+    async fn on_transaction(&self, event: TransactionEvent) {
         if event.kind == TxKind::VoteOnly {
             return;
         }
 
         let signature = event
             .signature
-            .map(ToString::to_string)
+            .map(|signature| signature.to_string())
             .unwrap_or_else(|| "NO_SIGNATURE".to_owned());
 
         tracing::info!(
@@ -37,12 +39,13 @@ impl Plugin for NonVoteTxLoggerPlugin {
 #[derive(Debug, Clone, Copy, Default)]
 struct DatasetLoggerPlugin;
 
+#[async_trait]
 impl Plugin for DatasetLoggerPlugin {
     fn name(&self) -> &'static str {
         "dataset-logger"
     }
 
-    fn on_dataset(&self, event: DatasetEvent) {
+    async fn on_dataset(&self, event: DatasetEvent) {
         tracing::info!(
             slot = event.slot,
             start = event.start_index,
