@@ -5261,6 +5261,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "sof-tx"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "bincode",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "solana-compute-budget-interface",
+ "solana-keypair",
+ "solana-message",
+ "solana-pubkey 3.0.0",
+ "solana-signature",
+ "solana-signer",
+ "solana-system-interface 3.0.0",
+ "solana-transaction",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "solana-account"
 version = "3.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

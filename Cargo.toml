@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/sof-observer"]
+members = ["crates/sof-observer", "crates/sof-tx"]
 
 [workspace.package]
 edition = "2024"

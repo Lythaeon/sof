@@ -11,6 +11,11 @@ These docs apply to the `sof-observer` workspace and crate layout.
 
 Runtime playbooks are in `docs/operations/`.
 
+User-facing crate docs:
+
+- Observer runtime crate: `crates/sof-observer/README.md`
+- Transaction SDK crate: `crates/sof-tx/README.md`
+
 ## Current Artifact Index
 
 - ADR-0001: `adr/0001-hexagonal-vertical-slices-and-type-driven-design.md`
