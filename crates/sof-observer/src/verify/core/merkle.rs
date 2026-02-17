@@ -1,5 +1,4 @@
 use sha2::{Digest, Sha256};
-use solana_signature::Signature;
 
 use crate::protocol::shred_wire::{
     OFFSET_CODE_NUM_DATA, OFFSET_CODE_POSITION, SIZE_OF_CODING_SHRED_HEADERS,
@@ -14,15 +13,6 @@ use super::{
 
 const MERKLE_HASH_PREFIX_LEAF: &[u8] = b"\x00SOLANA_MERKLE_SHREDS_LEAF";
 const MERKLE_HASH_PREFIX_NODE: &[u8] = b"\x01SOLANA_MERKLE_SHREDS_NODE";
-
-pub(super) fn verify_signature(
-    signature: [u8; SIZE_OF_SIGNATURE],
-    pubkey: [u8; 32],
-    merkle_root: [u8; SIZE_OF_MERKLE_ROOT],
-) -> bool {
-    let signature = Signature::from(signature);
-    signature.verify(&pubkey, &merkle_root)
-}
 
 pub(super) fn compute_merkle_root(
     shred: &[u8],

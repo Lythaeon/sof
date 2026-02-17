@@ -5,7 +5,10 @@ use crate::protocol::shred_wire::SIZE_OF_SIGNATURE;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum SignatureCacheEntry {
-    Known([u8; 32]),
+    Known {
+        pubkey: [u8; 32],
+        merkle_root: [u8; 32],
+    },
     Unknown(Instant),
 }
 

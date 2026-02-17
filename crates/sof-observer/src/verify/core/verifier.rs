@@ -3,17 +3,25 @@ use std::{
     time::{Duration, Instant},
 };
 
+use ed25519_dalek::{Signature as DalekSignature, VerifyingKey};
+
 use crate::protocol::shred_wire::{
     OFFSET_FEC_SET_INDEX, OFFSET_INDEX, OFFSET_SLOT, SIZE_OF_CODING_SHRED_PAYLOAD,
-    SIZE_OF_DATA_SHRED_PAYLOAD,
+    SIZE_OF_DATA_SHRED_PAYLOAD, SIZE_OF_SIGNATURE,
 };
 
 use super::{
     cache::{SignatureCache, SignatureCacheEntry},
-    merkle::{compute_merkle_root, verify_signature},
+    merkle::compute_merkle_root,
     packet::{parse_signature, parse_variant, read_u32_le, read_u64_le},
     types::{ShredKind, VerifyStatus},
 };
+
+#[derive(Debug, Clone)]
+struct PreparedPubkeyVerifier {
+    pubkey: [u8; 32],
+    verifying_key: VerifyingKey,
+}
 
 #[derive(Debug, Default)]
 pub struct SlotLeaderDiff {
@@ -24,7 +32,7 @@ pub struct SlotLeaderDiff {
 
 #[derive(Debug)]
 pub struct ShredVerifier {
-    known_pubkeys: Vec<[u8; 32]>,
+    known_pubkey_verifiers: Vec<PreparedPubkeyVerifier>,
     slot_leaders: HashMap<u64, [u8; 32]>,
     pending_added_slot_leaders: HashMap<u64, [u8; 32]>,
     pending_updated_slot_leaders: HashMap<u64, [u8; 32]>,
@@ -44,7 +52,7 @@ impl ShredVerifier {
         unknown_retry: Duration,
     ) -> Self {
         Self {
-            known_pubkeys: Vec::new(),
+            known_pubkey_verifiers: Vec::new(),
             slot_leaders: HashMap::new(),
             pending_added_slot_leaders: HashMap::new(),
             pending_updated_slot_leaders: HashMap::new(),
@@ -60,7 +68,17 @@ impl ShredVerifier {
     pub fn set_known_pubkeys(&mut self, mut pubkeys: Vec<[u8; 32]>) {
         pubkeys.sort_unstable();
         pubkeys.dedup();
-        self.known_pubkeys = pubkeys;
+        let mut known_pubkey_verifiers = Vec::with_capacity(pubkeys.len());
+        for pubkey in pubkeys {
+            let Ok(verifying_key) = VerifyingKey::from_bytes(&pubkey) else {
+                continue;
+            };
+            known_pubkey_verifiers.push(PreparedPubkeyVerifier {
+                pubkey,
+                verifying_key,
+            });
+        }
+        self.known_pubkey_verifiers = known_pubkey_verifiers;
     }
 
     pub fn set_slot_leaders<I>(&mut self, leaders: I)
@@ -140,46 +158,62 @@ impl ShredVerifier {
         let Some(signature_bytes) = parse_signature(shred) else {
             return VerifyStatus::Malformed;
         };
+        let slot_leader = self.slot_leaders.get(&slot).copied();
+        let had_slot_leader = slot_leader.is_some();
+
+        // Unknown-leader retries can be dropped before Merkle work when a slot
+        // leader is still unavailable.
+        if !had_slot_leader
+            && let Some(SignatureCacheEntry::Unknown(last_checked)) =
+                self.signature_cache.get(&signature_bytes)
+            && now.saturating_duration_since(last_checked) < self.unknown_retry
+        {
+            return VerifyStatus::UnknownLeader;
+        }
+
         let Some(merkle_root) = compute_merkle_root(shred, variant, index, fec_set_index) else {
             return VerifyStatus::InvalidMerkle;
         };
-
-        let mut had_slot_leader = false;
-        if let Some(leader) = self.slot_leaders.get(&slot).copied() {
-            had_slot_leader = true;
-            if verify_signature(signature_bytes, leader, merkle_root) {
-                return VerifyStatus::Verified;
-            }
-        }
+        let signature = DalekSignature::from_bytes(&signature_bytes);
 
         if let Some(entry) = self.signature_cache.get(&signature_bytes) {
             match entry {
-                SignatureCacheEntry::Known(pubkey) => {
-                    if verify_signature(signature_bytes, pubkey, merkle_root) {
+                SignatureCacheEntry::Known {
+                    pubkey,
+                    merkle_root: cached_merkle_root,
+                } => {
+                    if cached_merkle_root == merkle_root {
                         self.remember_slot_leader(slot, pubkey);
+                        return VerifyStatus::Verified;
+                    }
+                    if verify_signature_for_pubkey(&signature, pubkey, &merkle_root) {
+                        self.remember_slot_leader(slot, pubkey);
+                        self.cache_known_signature(signature_bytes, pubkey, merkle_root);
                         return VerifyStatus::Verified;
                     }
                     self.signature_cache.remove(&signature_bytes);
                 }
                 SignatureCacheEntry::Unknown(last_checked) => {
-                    if now.saturating_duration_since(last_checked) < self.unknown_retry {
+                    if !had_slot_leader
+                        && now.saturating_duration_since(last_checked) < self.unknown_retry
+                    {
                         return VerifyStatus::UnknownLeader;
                     }
                 }
             }
         }
 
-        let mut matched_pubkey: Option<[u8; 32]> = None;
-        for pubkey in &self.known_pubkeys {
-            if verify_signature(signature_bytes, *pubkey, merkle_root) {
-                matched_pubkey = Some(*pubkey);
-                break;
-            }
+        if let Some(leader) = slot_leader
+            && verify_signature_for_pubkey(&signature, leader, &merkle_root)
+        {
+            self.cache_known_signature(signature_bytes, leader, merkle_root);
+            return VerifyStatus::Verified;
         }
+
+        let matched_pubkey = self.verify_known_pubkeys_ranked(&signature, &merkle_root);
         if let Some(pubkey) = matched_pubkey {
             self.remember_slot_leader(slot, pubkey);
-            self.signature_cache
-                .insert(signature_bytes, SignatureCacheEntry::Known(pubkey));
+            self.cache_known_signature(signature_bytes, pubkey, merkle_root);
             return VerifyStatus::Verified;
         }
 
@@ -190,6 +224,44 @@ impl ShredVerifier {
         } else {
             VerifyStatus::UnknownLeader
         }
+    }
+
+    fn verify_known_pubkeys_ranked(
+        &mut self,
+        signature: &DalekSignature,
+        merkle_root: &[u8; 32],
+    ) -> Option<[u8; 32]> {
+        let match_index = self.known_pubkey_verifiers.iter().position(|entry| {
+            verify_signature_with_key(signature, &entry.verifying_key, merkle_root)
+        });
+        let index = match_index?;
+        let pubkey = self
+            .known_pubkey_verifiers
+            .get(index)
+            .map(|entry| entry.pubkey)?;
+        if index > 0
+            && let Some(prefix) = self.known_pubkey_verifiers.get_mut(..=index)
+        {
+            // Keep recently matched keys at the front to reduce average
+            // candidate scans for active leaders.
+            prefix.rotate_right(1);
+        }
+        Some(pubkey)
+    }
+
+    fn cache_known_signature(
+        &mut self,
+        signature_bytes: [u8; SIZE_OF_SIGNATURE],
+        pubkey: [u8; 32],
+        merkle_root: [u8; 32],
+    ) {
+        self.signature_cache.insert(
+            signature_bytes,
+            SignatureCacheEntry::Known {
+                pubkey,
+                merkle_root,
+            },
+        );
     }
 
     fn remember_slot_leader(&mut self, slot: u64, pubkey: [u8; 32]) {
@@ -244,4 +316,23 @@ impl ShredVerifier {
             let _ = self.pending_removed_slots.insert(slot);
         }
     }
+}
+
+fn verify_signature_for_pubkey(
+    signature: &DalekSignature,
+    pubkey: [u8; 32],
+    merkle_root: &[u8; 32],
+) -> bool {
+    let Ok(verifying_key) = VerifyingKey::from_bytes(&pubkey) else {
+        return false;
+    };
+    verify_signature_with_key(signature, &verifying_key, merkle_root)
+}
+
+fn verify_signature_with_key(
+    signature: &DalekSignature,
+    verifying_key: &VerifyingKey,
+    merkle_root: &[u8; 32],
+) -> bool {
+    verifying_key.verify_strict(merkle_root, signature).is_ok()
 }
