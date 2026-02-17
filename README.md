@@ -11,16 +11,28 @@ SOF is a lightweight Solana observer engine for low-latency shred ingestion and 
 
 ## Quick start
 
-`sof` is library-first. The fastest way to see it running is the packaged runtime example:
+Pick the path you want and run one command.
 
 ```bash
-RUST_LOG=info cargo run --release -p sof --example observer_runtime
+cargo run --release -p sof --example observer_runtime
 ```
 
-With gossip bootstrap:
+Run with gossip bootstrap:
 
 ```bash
 cargo run --release -p sof --example observer_runtime --features gossip-bootstrap
+```
+
+Run a ready-made plugin example (TPU leader logger):
+
+```bash
+cargo run --release -p sof --example tpu_leader_logger --features gossip-bootstrap
+```
+
+Optional verbose logs:
+
+```bash
+RUST_LOG=info cargo run --release -p sof --example observer_runtime --features gossip-bootstrap
 ```
 
 ## Build and verify locally
