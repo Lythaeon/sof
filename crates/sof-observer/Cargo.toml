@@ -5,7 +5,9 @@ edition.workspace = true
 description = "Solana Observer Framework for low-latency shred ingestion and plugin-driven transaction observation"
 license = "Apache-2.0 OR MIT"
 documentation = "https://docs.rs/sof"
-readme = "../../README.md"
+readme = "README.md"
+repository = "https://github.com/Lythaeon/sof"
+homepage = "https://github.com/Lythaeon/sof"
 keywords = ["solana", "observer", "shreds", "plugins", "ingestion"]
 categories = ["network-programming", "cryptography::cryptocurrencies"]
 
