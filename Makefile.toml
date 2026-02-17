@@ -1,0 +1,180 @@
+[tasks.build]
+description = "Build all projects"
+workspace = false
+command = "cargo"
+args = ["build", "--all-features", "${@}"]
+dependencies = ["clean"]
+
+[tasks.format]
+description = "Format code using rustfmt"
+workspace = false
+command = "cargo"
+args = ["fmt", "--all"]
+
+[tasks.format-check]
+description = "Verify code formatting with rustfmt"
+workspace = false
+command = "cargo"
+args = ["fmt", "--check", "--all"]
+
+[tasks.clean]
+description = "Remove build artifacts"
+command = "cargo"
+args = ["clean", "${@}"]
+
+[tasks.bacon]
+description = "Live code checking with bacon"
+workspace = false
+install_crate = "bacon"
+command = "bacon"
+args = ["${@}", "check-all"]
+
+[tasks.audit]
+description = "Security audit for dependencies"
+workspace = false
+install_crate = "cargo-audit"
+command = "cargo"
+args = ["audit", "${@}"]
+
+[tasks.build-prod]
+description = "Build optimized release binaries"
+workspace = false
+command = "cargo"
+args = ["build", "--release", "${@}"]
+dependencies = ["clean"]
+
+[tasks.check]
+description = "Quick compilation check without building"
+workspace = false
+command = "cargo"
+args = ["check", "--workspace", "--all", "${@}"]
+
+[tasks.test]
+description = "Run tests using cargo-nextest (default feature set)"
+workspace = false
+install_crate = "cargo-nextest@0.9.123"
+install_crate_args = ["--locked"]
+command = "cargo"
+args = ["nextest", "run", "--workspace", "--no-tests=pass", "${@}"]
+
+[tasks.test-all-features]
+description = "Run tests using cargo-nextest across all features"
+workspace = false
+install_crate = "cargo-nextest@0.9.123"
+install_crate_args = ["--locked"]
+command = "cargo"
+args = [
+    "nextest",
+    "run",
+    "--workspace",
+    "--all-features",
+    "--no-tests=pass",
+    "${@}",
+]
+
+[tasks.test-matrix]
+description = "Run tests across default and all-features profiles"
+workspace = false
+dependencies = ["test", "test-all-features"]
+
+[tasks.ci]
+description = "Run core contributor checks (format, architecture boundaries, clippy matrix, test matrix)"
+workspace = false
+dependencies = ["format-check", "arch-check", "clippy-matrix", "test-matrix"]
+
+[tasks.ci-full]
+description = "Run core contributor checks plus dependency policy checks"
+workspace = false
+dependencies = ["ci", "deny"]
+
+[tasks.clippy]
+description = "Run clippy with strict rules on all targets and all features"
+workspace = false
+command = "cargo"
+args = [
+    "clippy",
+    "--workspace",
+    "--all-targets",
+    "--all-features",
+    "--locked",
+    "${@}",
+    "--",
+    "-D",
+    "warnings",
+]
+
+[tasks.clippy-no-default-features]
+description = "Run clippy with strict rules on all targets without optional features"
+workspace = false
+command = "cargo"
+args = [
+    "clippy",
+    "--workspace",
+    "--all-targets",
+    "--no-default-features",
+    "--locked",
+    "${@}",
+    "--",
+    "-D",
+    "warnings",
+]
+
+[tasks.clippy-matrix]
+description = "Run strict clippy across both feature profiles"
+workspace = false
+dependencies = ["clippy", "clippy-no-default-features"]
+
+[tasks.arch-check]
+description = "Enforce ARD slice dependency boundaries"
+workspace = false
+command = "bash"
+args = ["scripts/arch-check.sh"]
+
+
+[tasks.udeps]
+description = "Find unused dependencies (requires nightly)"
+workspace = false
+install_crate = "cargo-udeps"
+command = "cargo"
+args = ["+nightly", "udeps"]
+
+[tasks.bloat]
+description = "Analyze binary size and bloat"
+workspace = false
+install_crate = "cargo-bloat"
+command = "cargo"
+args = ["bloat", "--release", "${@}"]
+
+[tasks.expand]
+description = "Expand macros to see generated code"
+workspace = false
+install_crate = "cargo-expand"
+command = "cargo"
+args = ["expand", "${@}"]
+
+[tasks.deny]
+description = "Check licenses and security advisories"
+workspace = false
+install_crate = "cargo-deny"
+command = "cargo"
+args = ["deny", "check"]
+
+[tasks.tarpaulin]
+description = "Generate code coverage report"
+workspace = false
+install_crate = "cargo-tarpaulin"
+command = "cargo"
+args = ["tarpaulin", "--exclude-files", "task/*", "${@}"]
+
+[tasks.sqlx]
+description = "Run SQLx CLI commands (migrations, etc.)"
+install_crate = "sqlx-cli"
+command = "sqlx"
+args = ["${@}"]
+
+[tasks.fuzz]
+description = "Run fuzzing tests on specified targets"
+workspace = false
+install_crate = "cargo-fuzz"
+command = "cargo"
+args = ["+nightly", "fuzz", "${@}"]

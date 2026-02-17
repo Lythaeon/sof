@@ -1,0 +1,65 @@
+[package]
+name = "sof"
+version = "0.1.0"
+edition.workspace = true
+description = "Solana Observer Framework for low-latency shred ingestion and plugin-driven transaction observation"
+license = "Apache-2.0 OR MIT"
+documentation = "https://docs.rs/sof"
+readme = "../../README.md"
+keywords = ["solana", "observer", "shreds", "plugins", "ingestion"]
+categories = ["network-programming", "cryptography::cryptocurrencies"]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+gossip-bootstrap = ["dep:solana-gossip"]
+
+[dependencies]
+solana-gossip = { version = "3.1.8", optional = true, features = ["agave-unstable-api"] }
+solana-entry = { version = "3.1.8", features = ["agave-unstable-api"] }
+solana-keypair = "3.0.1"
+solana-net-utils = "3.1.8"
+solana-pubkey = "3.0.0"
+solana-sdk-ids = "3.1.0"
+solana-signature = { version = "3.1.0", features = ["serde"] }
+solana-signer = "3.0.0"
+solana-streamer = "3.1.8"
+solana-transaction = "3.0.2"
+reed-solomon-erasure = { version = "6.0.0", features = ["simd-accel"] }
+thiserror = "2.0"
+tokio = { version = "1.48", features = ["io-util", "macros", "rt-multi-thread", "net", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+wincode = "=0.1.2"
+socket2 = "0.5"
+bincode = "1.3.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+sha2 = "0.10"
+arcshift = "0.4.2"
+core_affinity = "0.8"
+nix = { version = "0.30", features = ["net", "uio"] }
+crossbeam-queue = "0.3"
+
+[[example]]
+name = "non_vote_tx_logger"
+path = "examples/non_vote_tx_logger.rs"
+
+[[example]]
+name = "raydium_contract"
+path = "examples/raydium_contract.rs"
+
+[[example]]
+name = "observer_runtime"
+path = "examples/observer_runtime.rs"
+
+[[example]]
+name = "observer_with_non_vote_plugin"
+path = "examples/observer_with_non_vote_plugin.rs"
+
+[[example]]
+name = "observer_with_multiple_plugins"
+path = "examples/observer_with_multiple_plugins.rs"

@@ -1,0 +1,28 @@
+name: Rust CI Setup
+description: Install Rust toolchain, cache cargo artifacts, and install CI cargo tools.
+
+inputs:
+  rust-components:
+    description: Comma-separated rustup components to install.
+    required: false
+    default: rustfmt,clippy
+  cargo-tools:
+    description: Comma-separated cargo-installable tools for CI.
+    required: false
+    default: cargo-make,cargo-nextest
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: ${{ inputs.rust-components }}
+
+    - name: Cache cargo artifacts
+      uses: Swatinem/rust-cache@v2
+
+    - name: Install cargo tools
+      uses: taiki-e/install-action@v2
+      with:
+        tool: ${{ inputs.cargo-tools }}
