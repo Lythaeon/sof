@@ -130,6 +130,17 @@ async fn send_presigned(
 }
 ```
 
+## Developer Tip
+
+`TxBuilder::tip_developer()` adds a developer-support transfer instruction using a default tip of `5000` lamports.
+
+- default amount: `5000` lamports (`DEFAULT_DEVELOPER_TIP_LAMPORTS`)
+- default recipient: `G3WHMVjx7Cb3MFhBAHe52zw8yhbHodWnas5gYLceaqze`
+- custom amount: `tip_developer_lamports(...)`
+- custom recipient + amount: `tip_to(...)`
+
+Thanks in advance for supporting continued SDK development.
+
 ## Mode Guidance
 
 - `RpcOnly`: maximum compatibility.
