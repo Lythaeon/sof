@@ -18,6 +18,12 @@ It provides:
 cargo add sof-tx
 ```
 
+Enable SOF runtime adapters when you want provider values from live `sof` plugin events:
+
+```toml
+sof-tx = { version = "0.1", features = ["sof-adapters"] }
+```
+
 ## Core Types
 
 - `TxBuilder`: compose transaction instructions and signing inputs.
@@ -26,6 +32,65 @@ cargo add sof-tx
 - `SignedTx`: submit externally signed transaction bytes.
 - `RoutingPolicy`: leader/backup fanout controls.
 - `LeaderProvider` and `RecentBlockhashProvider`: provider boundaries.
+
+## SOF Adapter Layer
+
+With `sof-adapters` enabled, `PluginHostTxProviderAdapter` can be:
+
+- registered as a SOF plugin to ingest blockhash/leader/topology events, and
+- passed directly into `TxSubmitClient` as both providers.
+
+```rust
+use std::sync::Arc;
+
+use sof::framework::{ObserverPlugin, PluginHost};
+use sof_tx::{
+    SubmitMode, SubmitReliability, TxBuilder, TxSubmitClient,
+    adapters::PluginHostTxProviderAdapter,
+    submit::{JsonRpcTransport, UdpDirectTransport},
+};
+use solana_keypair::Keypair;
+use solana_signer::Signer;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let adapter = Arc::new(PluginHostTxProviderAdapter::default());
+    let host = PluginHost::builder()
+        .add_shared_plugin(adapter.clone() as Arc<dyn ObserverPlugin>)
+        .build();
+
+    // If SOF runtime was already running, optionally seed from host snapshots.
+    adapter.prime_from_plugin_host(&host);
+
+    let client = TxSubmitClient::new(adapter.clone(), adapter.clone())
+        .with_reliability(SubmitReliability::Balanced)
+        .with_rpc_transport(Arc::new(JsonRpcTransport::new("https://api.mainnet-beta.solana.com")?))
+        .with_direct_transport(Arc::new(UdpDirectTransport));
+
+    let payer = Keypair::new();
+    let recipient = Keypair::new();
+    let builder = TxBuilder::new(payer.pubkey())
+        .with_compute_unit_limit(450_000)
+        .with_priority_fee_micro_lamports(100_000)
+        .add_instruction(solana_system_interface::instruction::transfer(
+            &payer.pubkey(),
+            &recipient.pubkey(),
+            1,
+        ));
+
+    let _ = client
+        .submit_builder(builder, &[&payer], SubmitMode::Hybrid)
+        .await?;
+
+    Ok(())
+}
+```
+
+Direct submit needs TPU endpoints for scheduled leaders. The adapter gets these from
+`on_cluster_topology` events, or you can inject them manually with:
+
+- `set_leader_tpu_addr(pubkey, tpu_addr)`
+- `remove_leader_tpu_addr(pubkey)`
 
 ## Quickstart
 

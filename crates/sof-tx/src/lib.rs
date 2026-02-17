@@ -2,6 +2,9 @@
 
 //! Transaction SDK for building, signing, routing, and submitting Solana transactions.
 
+#[cfg(feature = "sof-adapters")]
+/// Optional adapters bridging SOF runtime signals into transaction SDK providers.
+pub mod adapters;
 /// Transaction/message builder helpers.
 pub mod builder;
 /// Leader/blockhash provider traits and simple provider adapters.
