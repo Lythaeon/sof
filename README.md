@@ -20,9 +20,6 @@ RUST_LOG=info cargo run --release -p sof --example observer_runtime
 With gossip bootstrap:
 
 ```bash
-SOF_GOSSIP_ENTRYPOINT=entrypoint.mainnet-beta.solana.com:8001 \
-SOF_PORT_RANGE=12000-12100 \
-RUST_LOG=info \
 cargo run --release -p sof --example observer_runtime --features gossip-bootstrap
 ```
 
