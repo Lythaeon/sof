@@ -95,9 +95,9 @@ Notes:
   (default `16`, set `0` to disable).
 - `SOF_REPAIR_OUTSTANDING_TIMEOUT_MS` controls how long a sent repair request
   stays deduplicated in-flight before retry (default `150`).
-- Agave-aligned repair defaults for observer mode:
+- Agave-aligned repair recommendations for observer mode (overrides):
   - `SOF_REPAIR_SETTLE_MS=250` (defer missing-shred requests to allow turbine propagation);
-  - `SOF_REPAIR_MIN_SLOT_LAG=8` (do not immediately issue `WindowIndex` repairs at slot tip);
+  - `SOF_REPAIR_MIN_SLOT_LAG=8` (default is `4`; raise to reduce tip-chasing repairs);
   - `SOF_REPAIR_MAX_REQUESTS_PER_TICK=64` and `SOF_REPAIR_PER_SLOT_CAP=16`
     to reduce repair bursts.
 

@@ -1,6 +1,6 @@
 # Framework Plugin Hooks
 
-`sof-observer` exposes a plugin framework in `sof_observer::framework` so consumers can run
+`sof-observer` exposes a plugin framework in `sof::framework` so consumers can run
 custom logic without forking the runtime.
 
 ## Public API Surface
@@ -24,6 +24,8 @@ custom logic without forking the runtime.
 
 ## Hook Semantics
 
+Current hook count: `7` (must stay in sync with `sof::framework::ObserverPlugin`).
+
 Callbacks are invoked in this order as data flows through runtime:
 
 1. `on_raw_packet`
@@ -32,7 +34,7 @@ Callbacks are invoked in this order as data flows through runtime:
 4. `on_transaction`
 5. `on_recent_blockhash`
 6. `on_cluster_topology` (near-real-time, gossip-bootstrap only)
-7. `on_leader_schedule` (near-real-time, gossip-bootstrap only)
+7. `on_leader_schedule` (event-driven, gossip-bootstrap only)
 
 Detailed behavior:
 
@@ -99,17 +101,17 @@ The packaged runtime dispatches hooks asynchronously using a bounded queue:
 
 To run the packaged runtime entrypoint:
 
-- Path: `examples/runtime/observer_runtime.rs`
+- Path: `crates/sof-observer/examples/observer_runtime.rs`
 - Run: `cargo run --release -p sof --example observer_runtime`
 
 To run the packaged runtime with a plugin attached:
 
-- Path: `examples/runtime/observer_with_non_vote_plugin.rs`
+- Path: `crates/sof-observer/examples/observer_with_non_vote_plugin.rs`
 - Run: `cargo run --release -p sof --example observer_with_non_vote_plugin`
 
 To run multiple plugins in one host:
 
-- Path: `examples/runtime/observer_with_multiple_plugins.rs`
+- Path: `crates/sof-observer/examples/observer_with_multiple_plugins.rs`
 - Run: `cargo run --release -p sof --example observer_with_multiple_plugins`
 
 ## Example Plugin
@@ -117,14 +119,14 @@ To run multiple plugins in one host:
 Raydium transaction filter logger:
 
 - Path: `crates/sof-observer/examples/raydium_contract.rs`
-- Run (gossip bootstrap): `SOF_GOSSIP_ENTRYPOINT=entrypoint.mainnet-beta.solana.com:8001 SOF_PORT_RANGE=12000-12100 RUST_LOG=info cargo run --release -p sof --example raydium_contract --features gossip-bootstrap`
+- Run (gossip bootstrap): `cargo run --release -p sof --example raydium_contract --features gossip-bootstrap`
 - Filters transactions by Raydium program IDs (LaunchLab, CPMM, Legacy V4, Stable Swap, CLMM, Burn & Earn, AMM Routing, Staking, Farm Staking, Ecosystem Farm) and logs only matching transactions.
 - Each matching log includes which Raydium program families were touched (`cpmm`, `v4`, `clmm`).
 
 Additional example:
 
 - Path: `crates/sof-observer/examples/non_vote_tx_logger.rs`
-- Run (gossip bootstrap): `SOF_GOSSIP_ENTRYPOINT=entrypoint.mainnet-beta.solana.com:8001 SOF_PORT_RANGE=12000-12100 RUST_LOG=info cargo run --release -p sof --example non_vote_tx_logger --features gossip-bootstrap`
+- Run (gossip bootstrap): `cargo run --release -p sof --example non_vote_tx_logger --features gossip-bootstrap`
 - Progress-log cadence in the example is intentionally throttled:
   dataset every `200`, shreds every `10_000`, vote-only tx every `500` (plus first seen).
 - Missing transaction signatures are rendered as `NO_SIGNATURE` for consistent logs.

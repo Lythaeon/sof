@@ -104,7 +104,7 @@ async fn main() -> Result<(), sof::runtime::RuntimeError> {
 }
 ```
 
-### Hook lifecycle
+### Hook lifecycle (current: 7 hooks)
 
 - `on_raw_packet`: every UDP packet before shred parsing.
 - `on_shred`: every packet that produced a parsed shred header.
@@ -113,6 +113,8 @@ async fn main() -> Result<(), sof::runtime::RuntimeError> {
 - `on_recent_blockhash`: deduplicated observed recent blockhash updates from decoded datasets.
 - `on_cluster_topology`: near-real-time (~250ms) gossip topology diffs plus periodic snapshots (gossip-bootstrap mode).
 - `on_leader_schedule`: event-driven leader diffs emitted when slot-leader mappings change from live data (gossip-bootstrap mode).
+
+This list must stay in sync with `sof::framework::ObserverPlugin`.
 
 ### API notes
 

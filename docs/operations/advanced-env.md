@@ -76,7 +76,7 @@ For most deployments, keep defaults and set only:
 | `SOF_GOSSIP_RUNTIME_SWITCH_SUSTAIN_MS` | `1500` | Sustained-traffic threshold controls switch confidence. |
 | `SOF_GOSSIP_RUNTIME_SWITCH_NO_TRAFFIC_GRACE_MS` | `120000` | Grace period influences sensitivity to transient outages. |
 | `SOF_GOSSIP_RUNTIME_SWITCH_STABILIZE_MS` | `1000` | Low values increase false positive readiness. |
-| `SOF_GOSSIP_RUNTIME_SWITCH_STABILIZE_MIN_PACKETS` | `16` | Packet threshold influences switch acceptance quality. |
+| `SOF_GOSSIP_RUNTIME_SWITCH_STABILIZE_MIN_PACKETS` | `8` | Packet threshold influences switch acceptance quality. |
 | `SOF_GOSSIP_RUNTIME_SWITCH_STABILIZE_MAX_WAIT_MS` | `8000` | Max wait impacts startup/switch latency. |
 | `SOF_GOSSIP_RUNTIME_SWITCH_PEER_CANDIDATES` | `64` | Too low misses good peers; too high adds overhead. |
 
