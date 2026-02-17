@@ -134,22 +134,14 @@ Runnable plugin+runtime examples:
 With gossip bootstrap:
 
 ```bash
-SOF_GOSSIP_ENTRYPOINT=entrypoint.mainnet-beta.solana.com:8001 \
-SOF_PORT_RANGE=12000-12100 \
-RUST_LOG=info \
 cargo run --release -p sof --example observer_with_non_vote_plugin --features gossip-bootstrap
 ```
 
 More plugin+runtime examples:
 
-- `SOF_GOSSIP_ENTRYPOINT=entrypoint.mainnet-beta.solana.com:8001 SOF_PORT_RANGE=12000-12100 RUST_LOG=info cargo run --release -p sof --example non_vote_tx_logger --features gossip-bootstrap`
-- `SOF_GOSSIP_ENTRYPOINT=entrypoint.mainnet-beta.solana.com:8001 SOF_PORT_RANGE=12000-12100 RUST_LOG=info cargo run --release -p sof --example raydium_contract --features gossip-bootstrap`
-- `SOF_GOSSIP_ENTRYPOINT=entrypoint.mainnet-beta.solana.com:8001 SOF_PORT_RANGE=12000-12100 RUST_LOG=info cargo run --release -p sof --example tpu_leader_logger --features gossip-bootstrap`
-
-You can also run both examples without extra env vars:
-
 - `cargo run --release -p sof --example non_vote_tx_logger --features gossip-bootstrap`
 - `cargo run --release -p sof --example raydium_contract --features gossip-bootstrap`
+- `cargo run --release -p sof --example tpu_leader_logger --features gossip-bootstrap`
 
 Default logging is `info,solana_metrics=off,solana_streamer=warn,solana_gossip=off` when `RUST_LOG` is unset.
 If your shell exports `RUST_LOG=warn`, plugin `info` logs will be hidden.
