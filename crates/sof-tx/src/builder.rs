@@ -13,7 +13,7 @@ pub const DEFAULT_DEVELOPER_TIP_LAMPORTS: u64 = 5_000;
 
 /// Default developer tip recipient used by [`TxBuilder::tip_developer`].
 pub const DEFAULT_DEVELOPER_TIP_RECIPIENT: Pubkey =
-    Pubkey::from_str_const("So11111111111111111111111111111111111111112");
+    Pubkey::from_str_const("G3WHMVjx7Cb3MFhBAHe52zw8yhbHodWnas5gYLceaqze");
 
 /// Builder-layer errors.
 #[derive(Debug, Error)]
