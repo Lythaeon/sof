@@ -5235,6 +5235,7 @@ dependencies = [
  "bincode",
  "core_affinity",
  "crossbeam-queue",
+ "ed25519-dalek 2.2.0",
  "nix",
  "reed-solomon-erasure",
  "reqwest 0.12.28",
