@@ -109,6 +109,9 @@ async fn main() -> Result<(), sof::runtime::RuntimeError> {
 
 - `Plugin` is an alias of `ObserverPlugin`. Both are valid.
 - `Plugin::name()` is optional; default is `core::any::type_name::<Self>()`.
+- Global observed-state reads on `PluginHost`:
+  - `latest_observed_recent_blockhash()`
+  - `latest_observed_tpu_leader()`
 - Builder methods:
   - Preferred: `add_plugin`, `add_shared_plugin`, `add_plugins`, `add_shared_plugins`.
   - Compatibility aliases: `with_plugin`, `with_plugin_arc`, `with_plugins`, `with_plugin_arcs`.

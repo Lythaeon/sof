@@ -19,6 +19,8 @@ custom logic without forking the runtime.
   - `PluginDispatchMode`
   - `PluginHost`
   - `PluginHostBuilder`
+  - `PluginHost::latest_observed_recent_blockhash`
+  - `PluginHost::latest_observed_tpu_leader`
 
 ## Hook Semantics
 

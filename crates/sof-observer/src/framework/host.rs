@@ -8,12 +8,13 @@ use std::{
     thread,
 };
 
+use solana_pubkey::Pubkey;
 use tokio::sync::{Semaphore, mpsc};
 
 use crate::framework::{
     events::{
-        ClusterTopologyEvent, DatasetEvent, LeaderScheduleEvent, ObservedRecentBlockhashEvent,
-        RawPacketEvent, ShredEvent, TransactionEvent,
+        ClusterTopologyEvent, DatasetEvent, LeaderScheduleEntry, LeaderScheduleEvent,
+        ObservedRecentBlockhashEvent, RawPacketEvent, ShredEvent, TransactionEvent,
     },
     plugin::ObserverPlugin,
 };
@@ -182,6 +183,7 @@ impl PluginHostBuilder {
             plugins,
             dispatcher,
             latest_observed_recent_blockhash: Arc::new(RwLock::new(None)),
+            latest_observed_tpu_leader: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -193,6 +195,15 @@ struct ObservedRecentBlockhashState {
     slot: u64,
     /// Observed recent blockhash bytes.
     recent_blockhash: [u8; 32],
+}
+
+/// Internal snapshot for latest observed TPU leader state.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct ObservedTpuLeaderState {
+    /// Slot for the latest observed TPU leader.
+    slot: u64,
+    /// TPU leader identity.
+    leader: Pubkey,
 }
 
 #[derive(Clone)]
@@ -473,6 +484,8 @@ pub struct PluginHost {
     dispatcher: Option<PluginDispatcher>,
     /// Latest observed recent blockhash snapshot.
     latest_observed_recent_blockhash: Arc<RwLock<Option<ObservedRecentBlockhashState>>>,
+    /// Latest observed TPU leader snapshot.
+    latest_observed_tpu_leader: Arc<RwLock<Option<ObservedTpuLeaderState>>>,
 }
 
 impl Default for PluginHost {
@@ -481,6 +494,7 @@ impl Default for PluginHost {
             plugins: Arc::from(Vec::<Arc<dyn ObserverPlugin>>::new()),
             dispatcher: None,
             latest_observed_recent_blockhash: Arc::new(RwLock::new(None)),
+            latest_observed_tpu_leader: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -528,6 +542,20 @@ impl PluginHost {
                 guard
                     .as_ref()
                     .map(|state| (state.slot, state.recent_blockhash))
+            })
+    }
+
+    /// Returns latest observed TPU leader from leader-schedule events.
+    #[must_use]
+    pub fn latest_observed_tpu_leader(&self) -> Option<LeaderScheduleEntry> {
+        self.latest_observed_tpu_leader
+            .read()
+            .ok()
+            .and_then(|guard| {
+                guard.as_ref().map(|state| LeaderScheduleEntry {
+                    slot: state.slot,
+                    leader: state.leader,
+                })
             })
     }
 
@@ -613,6 +641,33 @@ impl PluginHost {
 
     /// Enqueues leader-schedule diff/snapshot hook to registered plugins.
     pub fn on_leader_schedule(&self, event: LeaderScheduleEvent) {
+        if let Some(newest_entry) = event
+            .added_leaders
+            .iter()
+            .chain(event.updated_leaders.iter())
+            .chain(event.snapshot_leaders.iter())
+            .copied()
+            .max_by_key(|entry| entry.slot)
+            && let Ok(mut guard) = self.latest_observed_tpu_leader.write()
+        {
+            match guard.as_mut() {
+                None => {
+                    *guard = Some(ObservedTpuLeaderState {
+                        slot: newest_entry.slot,
+                        leader: newest_entry.leader,
+                    });
+                }
+                Some(current)
+                    if newest_entry.slot > current.slot
+                        || (newest_entry.slot == current.slot
+                            && newest_entry.leader != current.leader) =>
+                {
+                    current.slot = newest_entry.slot;
+                    current.leader = newest_entry.leader;
+                }
+                Some(_) => {}
+            }
+        }
         if let Some(dispatcher) = &self.dispatcher {
             dispatcher.dispatch(
                 "on_leader_schedule",
@@ -899,6 +954,73 @@ mod tests {
         assert_eq!(
             host.latest_observed_recent_blockhash(),
             Some((11, [2_u8; 32]))
+        );
+    }
+
+    #[test]
+    fn latest_observed_tpu_leader_is_stateful() {
+        let host = PluginHostBuilder::new().build();
+        let leader_a = Pubkey::new_from_array([7_u8; 32]);
+        let leader_b = Pubkey::new_from_array([8_u8; 32]);
+
+        host.on_leader_schedule(LeaderScheduleEvent {
+            source: crate::framework::ControlPlaneSource::GossipBootstrap,
+            slot: Some(100),
+            epoch: None,
+            added_leaders: vec![LeaderScheduleEntry {
+                slot: 100,
+                leader: leader_a,
+            }],
+            removed_slots: Vec::new(),
+            updated_leaders: Vec::new(),
+            snapshot_leaders: Vec::new(),
+        });
+        assert_eq!(
+            host.latest_observed_tpu_leader(),
+            Some(LeaderScheduleEntry {
+                slot: 100,
+                leader: leader_a,
+            })
+        );
+
+        host.on_leader_schedule(LeaderScheduleEvent {
+            source: crate::framework::ControlPlaneSource::GossipBootstrap,
+            slot: Some(99),
+            epoch: None,
+            added_leaders: vec![LeaderScheduleEntry {
+                slot: 99,
+                leader: leader_b,
+            }],
+            removed_slots: Vec::new(),
+            updated_leaders: Vec::new(),
+            snapshot_leaders: Vec::new(),
+        });
+        assert_eq!(
+            host.latest_observed_tpu_leader(),
+            Some(LeaderScheduleEntry {
+                slot: 100,
+                leader: leader_a,
+            })
+        );
+
+        host.on_leader_schedule(LeaderScheduleEvent {
+            source: crate::framework::ControlPlaneSource::GossipBootstrap,
+            slot: Some(100),
+            epoch: None,
+            added_leaders: Vec::new(),
+            removed_slots: Vec::new(),
+            updated_leaders: vec![LeaderScheduleEntry {
+                slot: 100,
+                leader: leader_b,
+            }],
+            snapshot_leaders: Vec::new(),
+        });
+        assert_eq!(
+            host.latest_observed_tpu_leader(),
+            Some(LeaderScheduleEntry {
+                slot: 100,
+                leader: leader_b,
+            })
         );
     }
 
