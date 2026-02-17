@@ -1,0 +1,7 @@
+artifacts
+coverage
+target
+Cargo.lock
+corpus/**
+!corpus/**/
+!corpus/**/seed_*
