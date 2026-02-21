@@ -36,3 +36,4 @@ solana-transaction = { version = "3.0.2", features = ["bincode"] }
 sof = { version = "0.1.0", path = "../sof-observer", default-features = false, optional = true }
 thiserror = "2.0"
 tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
+arcshift = "0.4.2"

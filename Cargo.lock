@@ -5264,6 +5264,7 @@ dependencies = [
 name = "sof-tx"
 version = "0.1.0"
 dependencies = [
+ "arcshift",
  "async-trait",
  "base64 0.22.1",
  "bincode",

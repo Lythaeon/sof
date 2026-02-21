@@ -1,7 +1,7 @@
 //! Submission client implementation and mode orchestration.
 
 use std::{
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -30,7 +30,7 @@ pub struct TxSubmitClient {
     /// Direct routing policy.
     policy: RoutingPolicy,
     /// Signature dedupe window.
-    deduper: Mutex<SignatureDeduper>,
+    deduper: SignatureDeduper,
     /// Optional RPC transport.
     rpc_transport: Option<Arc<dyn RpcSubmitTransport>>,
     /// Optional direct transport.
@@ -53,7 +53,7 @@ impl TxSubmitClient {
             leader_provider,
             backups: Vec::new(),
             policy: RoutingPolicy::default(),
-            deduper: Mutex::new(SignatureDeduper::new(Duration::from_secs(10))),
+            deduper: SignatureDeduper::new(Duration::from_secs(10)),
             rpc_transport: None,
             direct_transport: None,
             rpc_config: RpcSubmitConfig::default(),
@@ -78,7 +78,7 @@ impl TxSubmitClient {
     /// Sets dedupe TTL.
     #[must_use]
     pub fn with_dedupe_ttl(mut self, ttl: Duration) -> Self {
-        self.deduper = Mutex::new(SignatureDeduper::new(ttl));
+        self.deduper = SignatureDeduper::new(ttl);
         self
     }
 
@@ -124,7 +124,7 @@ impl TxSubmitClient {
     /// Returns [`SubmitError`] when blockhash lookup, signing, dedupe, routing, or submission
     /// fails.
     pub async fn submit_builder<T>(
-        &self,
+        &mut self,
         builder: TxBuilder,
         signers: &T,
         mode: SubmitMode,
@@ -148,7 +148,7 @@ impl TxSubmitClient {
     ///
     /// Returns [`SubmitError`] when encoding, dedupe, routing, or submission fails.
     pub async fn submit_transaction(
-        &self,
+        &mut self,
         tx: VersionedTransaction,
         mode: SubmitMode,
     ) -> Result<SubmitResult, SubmitError> {
@@ -164,7 +164,7 @@ impl TxSubmitClient {
     ///
     /// Returns [`SubmitError`] when decoding, dedupe, routing, or submission fails.
     pub async fn submit_signed(
-        &self,
+        &mut self,
         signed_tx: SignedTx,
         mode: SubmitMode,
     ) -> Result<SubmitResult, SubmitError> {
@@ -180,7 +180,7 @@ impl TxSubmitClient {
 
     /// Submits raw tx bytes after dedupe check.
     async fn submit_bytes(
-        &self,
+        &mut self,
         tx_bytes: Vec<u8>,
         signature: Option<Signature>,
         mode: SubmitMode,
@@ -194,16 +194,10 @@ impl TxSubmitClient {
     }
 
     /// Applies signature dedupe policy.
-    fn enforce_dedupe(&self, signature: Option<Signature>) -> Result<(), SubmitError> {
+    fn enforce_dedupe(&mut self, signature: Option<Signature>) -> Result<(), SubmitError> {
         if let Some(signature) = signature {
             let now = Instant::now();
-            let mut deduper =
-                self.deduper
-                    .lock()
-                    .map_err(|poisoned| SubmitError::InternalSync {
-                        message: poisoned.to_string(),
-                    })?;
-            if !deduper.check_and_insert(signature, now) {
+            if !self.deduper.check_and_insert(signature, now) {
                 return Err(SubmitError::DuplicateSignature);
             }
         }
