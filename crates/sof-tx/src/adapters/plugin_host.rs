@@ -3,8 +3,9 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     net::SocketAddr,
-    sync::{Arc, RwLock},
 };
+
+use arcshift::ArcShift;
 
 use async_trait::async_trait;
 use sof::framework::{
@@ -48,6 +49,9 @@ impl Default for PluginHostTxProviderAdapterConfig {
     }
 }
 
+/// A boxed closure utilized to sequentially apply updates to `AdapterState` lock-free.
+type AdapterUpdateFn = Box<dyn FnOnce(&mut AdapterState) + Send>;
+
 /// Shared adapter that can be registered as a SOF plugin and used as tx providers.
 ///
 /// This type ingests SOF control-plane hooks (`on_recent_blockhash`, `on_cluster_topology`,
@@ -56,7 +60,9 @@ impl Default for PluginHostTxProviderAdapterConfig {
 #[derive(Debug, Clone)]
 pub struct PluginHostTxProviderAdapter {
     /// Shared mutable adapter state updated by plugin callbacks.
-    inner: Arc<RwLock<AdapterState>>,
+    state: ArcShift<AdapterState>,
+    /// Serialize updates without locks.
+    update_tx: tokio::sync::mpsc::UnboundedSender<AdapterUpdateFn>,
     /// Adapter configuration.
     config: PluginHostTxProviderAdapterConfig,
 }
@@ -65,8 +71,21 @@ impl PluginHostTxProviderAdapter {
     /// Creates a new adapter with the provided config.
     #[must_use]
     pub fn new(config: PluginHostTxProviderAdapterConfig) -> Self {
+        let state = ArcShift::new(AdapterState::default());
+        let (update_tx, mut update_rx) = tokio::sync::mpsc::unbounded_channel::<AdapterUpdateFn>();
+
+        let mut worker_state = state.clone();
+        tokio::spawn(async move {
+            while let Some(apply) = update_rx.recv().await {
+                let mut current = worker_state.get().clone();
+                apply(&mut current);
+                worker_state.update(current);
+            }
+        });
+
         Self {
-            inner: Arc::new(RwLock::new(AdapterState::default())),
+            state,
+            update_tx,
             config: config.normalized(),
         }
     }
@@ -75,29 +94,33 @@ impl PluginHostTxProviderAdapter {
     ///
     /// This is useful when attaching the adapter after runtime state has already started
     /// accumulating.
-    pub fn prime_from_plugin_host(&self, host: &PluginHost) {
-        self.with_state_write(|state| {
-            if let Some((_slot, recent_blockhash)) = host.latest_observed_recent_blockhash() {
+    pub fn prime_from_plugin_host(&self, host: &mut PluginHost) {
+        let blockhash_opt = host.latest_observed_recent_blockhash();
+        let leader_opt = host.latest_observed_tpu_leader();
+        let max_leader_slots = self.config.max_leader_slots;
+
+        self.with_state_write(move |state| {
+            if let Some((_slot, recent_blockhash)) = blockhash_opt {
                 state.latest_recent_blockhash = Some(recent_blockhash);
             }
-            if let Some(entry) = host.latest_observed_tpu_leader() {
+            if let Some(entry) = leader_opt {
                 state.upsert_leader(entry);
                 state.advance_cursor(entry.slot);
-                cap_leader_slots(state, self.config.max_leader_slots);
+                cap_leader_slots(state, max_leader_slots);
             }
         });
     }
 
     /// Inserts or updates one TPU address mapping for a leader identity.
     pub fn set_leader_tpu_addr(&self, identity: Pubkey, tpu_addr: SocketAddr) {
-        self.with_state_write(|state| {
+        self.with_state_write(move |state| {
             let _ = state.tpu_by_identity.insert(identity, tpu_addr);
         });
     }
 
     /// Removes one TPU address mapping for a leader identity.
     pub fn remove_leader_tpu_addr(&self, identity: Pubkey) {
-        self.with_state_write(|state| {
+        self.with_state_write(move |state| {
             let _ = state.tpu_by_identity.remove(&identity);
         });
     }
@@ -110,19 +133,28 @@ impl PluginHostTxProviderAdapter {
         if requested == 0 {
             return Vec::new();
         }
-        self.inner.read().ok().map_or_else(Vec::new, |state| {
-            collect_leader_targets_from_state(&state, requested)
-        })
+        collect_leader_targets_from_state(&self.state.shared_get(), requested)
     }
 
     /// Updates adapter state behind write lock when available.
-    fn with_state_write<F>(&self, mut apply: F)
+    fn with_state_write<F>(&self, apply: F) -> tokio::sync::oneshot::Receiver<()>
     where
-        F: FnMut(&mut AdapterState),
+        F: FnOnce(&mut AdapterState) + Send + 'static,
     {
-        if let Ok(mut state) = self.inner.write() {
-            apply(&mut state);
-        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.update_tx
+            .send(Box::new(move |state| {
+                apply(state);
+                tx.send(()).ok();
+            }))
+            .ok();
+        rx
+    }
+
+    /// Flushes all currently queued updates.
+    #[cfg(test)]
+    pub async fn flush(&self) {
+        self.with_state_write(|_| {}).await.ok();
     }
 }
 
@@ -134,10 +166,7 @@ impl Default for PluginHostTxProviderAdapter {
 
 impl RecentBlockhashProvider for PluginHostTxProviderAdapter {
     fn latest_blockhash(&self) -> Option<[u8; 32]> {
-        self.inner
-            .read()
-            .ok()
-            .and_then(|state| state.latest_recent_blockhash)
+        self.state.shared_get().latest_recent_blockhash
     }
 }
 
@@ -161,26 +190,33 @@ impl ObserverPlugin for PluginHostTxProviderAdapter {
     }
 
     async fn on_recent_blockhash(&self, event: ObservedRecentBlockhashEvent) {
-        self.with_state_write(|state| {
+        self.with_state_write(move |state| {
             state.latest_recent_blockhash = Some(event.recent_blockhash);
-        });
+        })
+        .await
+        .ok();
     }
 
     async fn on_cluster_topology(&self, event: ClusterTopologyEvent) {
-        self.with_state_write(|state| {
+        self.with_state_write(move |state| {
             apply_cluster_topology(state, &event);
-        });
+        })
+        .await
+        .ok();
     }
 
     async fn on_leader_schedule(&self, event: LeaderScheduleEvent) {
-        self.with_state_write(|state| {
-            apply_leader_schedule(state, &event, self.config.max_leader_slots);
-        });
+        let max_leader_slots = self.config.max_leader_slots;
+        self.with_state_write(move |state| {
+            apply_leader_schedule(state, &event, max_leader_slots);
+        })
+        .await
+        .ok();
     }
 }
 
 /// Mutable adapter state populated from SOF plugin hooks.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct AdapterState {
     /// Most recent observed blockhash.
     latest_recent_blockhash: Option<[u8; 32]>,
@@ -477,6 +513,7 @@ mod tests {
         adapter.set_leader_tpu_addr(leader_a, addr(9011));
         adapter.set_leader_tpu_addr(leader_b, addr(9012));
         adapter.set_leader_tpu_addr(leader_c, addr(9013));
+        adapter.flush().await;
 
         adapter
             .on_leader_schedule(leader_snapshot(
@@ -508,9 +545,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn adapter_can_be_primed_from_plugin_host_state() {
-        let host = PluginHost::builder().build();
+    #[tokio::test]
+    async fn adapter_can_be_primed_from_plugin_host_state() {
+        let mut host = PluginHost::builder().build();
         let leader = Pubkey::new_unique();
         host.on_recent_blockhash(ObservedRecentBlockhashEvent {
             slot: 42,
@@ -528,11 +565,13 @@ mod tests {
         });
 
         let adapter = PluginHostTxProviderAdapter::default();
-        adapter.prime_from_plugin_host(&host);
+        adapter.prime_from_plugin_host(&mut host);
+        adapter.flush().await;
         assert_eq!(adapter.latest_blockhash(), Some([11_u8; 32]));
         assert_eq!(adapter.current_leader(), None);
 
         adapter.set_leader_tpu_addr(leader, addr(9021));
+        adapter.flush().await;
         assert_eq!(
             adapter.current_leader(),
             Some(LeaderTarget::new(Some(leader), addr(9021)))

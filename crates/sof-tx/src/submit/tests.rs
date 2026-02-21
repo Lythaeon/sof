@@ -2,7 +2,10 @@
 
 use std::{
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -24,7 +27,7 @@ struct MockRpcTransport {
     /// Return value to use.
     result: Result<String, SubmitTransportError>,
     /// Number of submit calls.
-    calls: Mutex<u64>,
+    calls: AtomicU64,
 }
 
 #[async_trait]
@@ -34,9 +37,7 @@ impl RpcSubmitTransport for MockRpcTransport {
         _tx_bytes: &[u8],
         _config: &RpcSubmitConfig,
     ) -> Result<String, SubmitTransportError> {
-        if let Ok(mut calls) = self.calls.lock() {
-            *calls = calls.saturating_add(1);
-        }
+        self.calls.fetch_add(1, Ordering::Relaxed);
         self.result.clone()
     }
 }
@@ -47,7 +48,7 @@ struct MockDirectTransport {
     /// Return value to use.
     result: Result<LeaderTarget, SubmitTransportError>,
     /// Number of submit calls.
-    calls: Mutex<u64>,
+    calls: AtomicU64,
 }
 
 #[async_trait]
@@ -59,9 +60,7 @@ impl DirectSubmitTransport for MockDirectTransport {
         _policy: RoutingPolicy,
         _config: &DirectSubmitConfig,
     ) -> Result<LeaderTarget, SubmitTransportError> {
-        if let Ok(mut calls) = self.calls.lock() {
-            *calls = calls.saturating_add(1);
-        }
+        self.calls.fetch_add(1, Ordering::Relaxed);
         self.result.clone()
     }
 }
@@ -72,7 +71,7 @@ struct SequencedDirectTransport {
     /// Ordered responses per call.
     results: Vec<Result<LeaderTarget, SubmitTransportError>>,
     /// Number of submit calls.
-    calls: Mutex<u64>,
+    calls: AtomicU64,
 }
 
 #[async_trait]
@@ -84,11 +83,8 @@ impl DirectSubmitTransport for SequencedDirectTransport {
         _policy: RoutingPolicy,
         _config: &DirectSubmitConfig,
     ) -> Result<LeaderTarget, SubmitTransportError> {
-        let mut call_index = 0_usize;
-        if let Ok(mut calls) = self.calls.lock() {
-            *calls = calls.saturating_add(1);
-            call_index = calls.saturating_sub(1) as usize;
-        }
+        let calls = self.calls.fetch_add(1, Ordering::Relaxed);
+        let call_index = calls as usize;
         let response = self
             .results
             .get(call_index)
@@ -141,13 +137,13 @@ fn target(port: u16) -> LeaderTarget {
 async fn rpc_only_uses_rpc_transport() {
     let rpc = Arc::new(MockRpcTransport {
         result: Ok("rpc-signature".to_owned()),
-        calls: Mutex::new(0),
+        calls: AtomicU64::new(0),
     });
     let direct = Arc::new(MockDirectTransport {
         result: Ok(target(9001)),
-        calls: Mutex::new(0),
+        calls: AtomicU64::new(0),
     });
-    let client = TxSubmitClient::new(
+    let mut client = TxSubmitClient::new(
         Arc::new(StaticRecentBlockhashProvider::new(Some([9_u8; 32]))),
         Arc::new(StaticLeaderProvider::new(Some(target(9001)), Vec::new())),
     )
@@ -170,8 +166,8 @@ async fn rpc_only_uses_rpc_transport() {
         assert!(!result.used_rpc_fallback);
     }
 
-    let rpc_calls = rpc.calls.lock().map(|calls| *calls).unwrap_or_default();
-    let direct_calls = direct.calls.lock().map(|calls| *calls).unwrap_or_default();
+    let rpc_calls = rpc.calls.load(Ordering::Relaxed);
+    let direct_calls = direct.calls.load(Ordering::Relaxed);
     assert_eq!(rpc_calls, 1);
     assert_eq!(direct_calls, 0);
 }
@@ -180,14 +176,14 @@ async fn rpc_only_uses_rpc_transport() {
 async fn direct_only_uses_direct_transport() {
     let rpc = Arc::new(MockRpcTransport {
         result: Ok("rpc-signature".to_owned()),
-        calls: Mutex::new(0),
+        calls: AtomicU64::new(0),
     });
     let direct_target = target(9011);
     let direct = Arc::new(MockDirectTransport {
         result: Ok(direct_target.clone()),
-        calls: Mutex::new(0),
+        calls: AtomicU64::new(0),
     });
-    let client = TxSubmitClient::new(
+    let mut client = TxSubmitClient::new(
         Arc::new(StaticRecentBlockhashProvider::new(Some([10_u8; 32]))),
         Arc::new(StaticLeaderProvider::new(
             Some(direct_target.clone()),
@@ -212,8 +208,8 @@ async fn direct_only_uses_direct_transport() {
         assert!(!result.used_rpc_fallback);
     }
 
-    let rpc_calls = rpc.calls.lock().map(|calls| *calls).unwrap_or_default();
-    let direct_calls = direct.calls.lock().map(|calls| *calls).unwrap_or_default();
+    let rpc_calls = rpc.calls.load(Ordering::Relaxed);
+    let direct_calls = direct.calls.load(Ordering::Relaxed);
     assert_eq!(rpc_calls, 0);
     assert_eq!(direct_calls, 1);
 }
@@ -222,15 +218,15 @@ async fn direct_only_uses_direct_transport() {
 async fn hybrid_falls_back_to_rpc_when_direct_fails() {
     let rpc = Arc::new(MockRpcTransport {
         result: Ok("rpc-fallback-signature".to_owned()),
-        calls: Mutex::new(0),
+        calls: AtomicU64::new(0),
     });
     let direct = Arc::new(MockDirectTransport {
         result: Err(SubmitTransportError::Failure {
             message: "direct failed".to_owned(),
         }),
-        calls: Mutex::new(0),
+        calls: AtomicU64::new(0),
     });
-    let client = TxSubmitClient::new(
+    let mut client = TxSubmitClient::new(
         Arc::new(StaticRecentBlockhashProvider::new(Some([11_u8; 32]))),
         Arc::new(StaticLeaderProvider::new(Some(target(9021)), Vec::new())),
     )
@@ -255,8 +251,8 @@ async fn hybrid_falls_back_to_rpc_when_direct_fails() {
         assert!(result.used_rpc_fallback);
     }
 
-    let rpc_calls = rpc.calls.lock().map(|calls| *calls).unwrap_or_default();
-    let direct_calls = direct.calls.lock().map(|calls| *calls).unwrap_or_default();
+    let rpc_calls = rpc.calls.load(Ordering::Relaxed);
+    let direct_calls = direct.calls.load(Ordering::Relaxed);
     assert_eq!(rpc_calls, 1);
     assert_eq!(direct_calls, 2);
 }
@@ -265,7 +261,7 @@ async fn hybrid_falls_back_to_rpc_when_direct_fails() {
 async fn hybrid_uses_second_direct_attempt_before_rpc() {
     let rpc = Arc::new(MockRpcTransport {
         result: Ok("rpc-fallback-signature".to_owned()),
-        calls: Mutex::new(0),
+        calls: AtomicU64::new(0),
     });
     let direct_target = target(9031);
     let direct = Arc::new(SequencedDirectTransport {
@@ -275,9 +271,9 @@ async fn hybrid_uses_second_direct_attempt_before_rpc() {
             }),
             Ok(direct_target.clone()),
         ],
-        calls: Mutex::new(0),
+        calls: AtomicU64::new(0),
     });
-    let client = TxSubmitClient::new(
+    let mut client = TxSubmitClient::new(
         Arc::new(StaticRecentBlockhashProvider::new(Some([13_u8; 32]))),
         Arc::new(StaticLeaderProvider::new(
             Some(direct_target.clone()),
@@ -302,8 +298,8 @@ async fn hybrid_uses_second_direct_attempt_before_rpc() {
         assert!(!result.used_rpc_fallback);
     }
 
-    let rpc_calls = rpc.calls.lock().map(|calls| *calls).unwrap_or_default();
-    let direct_calls = direct.calls.lock().map(|calls| *calls).unwrap_or_default();
+    let rpc_calls = rpc.calls.load(Ordering::Relaxed);
+    let direct_calls = direct.calls.load(Ordering::Relaxed);
     assert_eq!(direct_calls, 2);
     assert_eq!(rpc_calls, 0);
 }
@@ -312,15 +308,15 @@ async fn hybrid_uses_second_direct_attempt_before_rpc() {
 async fn low_latency_reliability_uses_single_hybrid_attempt() {
     let rpc = Arc::new(MockRpcTransport {
         result: Ok("rpc-fallback-signature".to_owned()),
-        calls: Mutex::new(0),
+        calls: AtomicU64::new(0),
     });
     let direct = Arc::new(MockDirectTransport {
         result: Err(SubmitTransportError::Failure {
             message: "direct failed".to_owned(),
         }),
-        calls: Mutex::new(0),
+        calls: AtomicU64::new(0),
     });
-    let client = TxSubmitClient::new(
+    let mut client = TxSubmitClient::new(
         Arc::new(StaticRecentBlockhashProvider::new(Some([14_u8; 32]))),
         Arc::new(StaticLeaderProvider::new(Some(target(9041)), Vec::new())),
     )
@@ -346,8 +342,8 @@ async fn low_latency_reliability_uses_single_hybrid_attempt() {
         assert!(result.used_rpc_fallback);
     }
 
-    let rpc_calls = rpc.calls.lock().map(|calls| *calls).unwrap_or_default();
-    let direct_calls = direct.calls.lock().map(|calls| *calls).unwrap_or_default();
+    let rpc_calls = rpc.calls.load(Ordering::Relaxed);
+    let direct_calls = direct.calls.load(Ordering::Relaxed);
     assert_eq!(direct_calls, 1);
     assert_eq!(rpc_calls, 1);
 }
@@ -356,9 +352,9 @@ async fn low_latency_reliability_uses_single_hybrid_attempt() {
 async fn duplicate_signature_is_suppressed() {
     let rpc = Arc::new(MockRpcTransport {
         result: Ok("rpc-signature".to_owned()),
-        calls: Mutex::new(0),
+        calls: AtomicU64::new(0),
     });
-    let client = TxSubmitClient::new(
+    let mut client = TxSubmitClient::new(
         Arc::new(StaticRecentBlockhashProvider::new(Some([12_u8; 32]))),
         Arc::new(StaticLeaderProvider::new(None, Vec::new())),
     )
