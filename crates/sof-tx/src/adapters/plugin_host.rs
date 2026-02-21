@@ -199,7 +199,7 @@ impl AdapterState {
     }
 
     /// Advances slot cursor when the provided slot is newer.
-    fn advance_cursor(&mut self, slot: u64) {
+    const fn advance_cursor(&mut self, slot: u64) {
         match self.leader_slot_cursor {
             Some(current) if slot < current => {}
             Some(_) | None => {
@@ -332,14 +332,14 @@ fn collect_leader_targets_from_state(state: &AdapterState, requested: usize) -> 
 }
 
 /// Appends mapped leader targets from an iterator until capacity is reached.
-fn append_targets<'a, I>(
+fn append_targets<'leader, I>(
     selected: &mut Vec<LeaderTarget>,
     seen_addrs: &mut HashSet<SocketAddr>,
     state: &AdapterState,
     leaders: I,
     requested: usize,
 ) where
-    I: Iterator<Item = &'a Pubkey>,
+    I: Iterator<Item = &'leader Pubkey>,
 {
     for leader in leaders {
         if selected.len() >= requested {
