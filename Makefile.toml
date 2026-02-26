@@ -3,7 +3,8 @@ description = "Build all projects"
 workspace = false
 command = "cargo"
 args = ["build", "--all-features", "${@}"]
-dependencies = ["clean"]
+dependencies = []
+
 
 [tasks.format]
 description = "Format code using rustfmt"
@@ -41,7 +42,8 @@ description = "Build optimized release binaries"
 workspace = false
 command = "cargo"
 args = ["build", "--release", "${@}"]
-dependencies = ["clean"]
+dependencies = []
+
 
 [tasks.check]
 description = "Quick compilation check without building"

@@ -49,6 +49,8 @@ runs:
 
     - name: Cache cargo artifacts
       uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: "sof-shared-cache"
 
     - name: Install cargo tools
       uses: taiki-e/install-action@v2
