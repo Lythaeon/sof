@@ -1,6 +1,6 @@
 [package]
 name = "sof"
-version = "0.4.1"
+version = "0.5.0"
 edition.workspace = true
 description = "Solana Observer Framework for low-latency shred ingestion and plugin-driven transaction observation"
 license = "Apache-2.0 OR MIT"

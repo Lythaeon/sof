@@ -39,6 +39,9 @@ To run a bounded live profile sweep and rank candidate settings on your host:
 | `SOF_DATASET_ATTEMPT_SUCCESS_TTL_MS` | `30000` | Too high can suppress legitimate retries. |
 | `SOF_DATASET_ATTEMPT_FAILURE_TTL_MS` | `3000` | Too low can cause retry storms. |
 | `SOF_DATASET_TAIL_MIN_SHREDS` | `2` | Affects reconstruction completeness heuristics. |
+| `SOF_RUNTIME_EXTENSION_QUEUE_DEPTH_WARN` | `4096` | Warn threshold for aggregate runtime-extension queue depth; tune to your expected extension fanout and burst profile. Set `0` to disable queue-depth pressure warnings. |
+| `SOF_RUNTIME_EXTENSION_DISPATCH_LAG_WARN_US` | `50000` | Warn threshold for maximum runtime-extension dispatch lag in microseconds; lower values increase sensitivity to extension callback stalls. Set `0` to disable lag warnings. |
+| `SOF_RUNTIME_EXTENSION_DROP_WARN_DELTA` | `100` | Warn threshold for dropped runtime-extension events per telemetry interval; useful for catching sustained extension overload before ingest impact. Set `0` to disable drop-delta warnings. |
 | `SOF_COVERAGE_WINDOW_SLOTS` | `256` | Impacts coverage stats memory/cadence. |
 | `SOF_FORK_WINDOW_SLOTS` | `2048` | Bounded in-memory slot graph used for local canonical/reorg tracking; lower values reduce memory but can shorten reorg context. |
 | `SOF_TX_CONFIRMED_DEPTH_SLOTS` | `32` | Local slot-depth threshold used to tag tx events as `confirmed`; lower values are faster but less conservative. |

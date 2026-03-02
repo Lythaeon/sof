@@ -17,7 +17,7 @@ cargo add sof
 Optional gossip bootstrap support at compile time:
 
 ```toml
-sof = { version = "0.4.1", features = ["gossip-bootstrap"] }
+sof = { version = "0.5.0", features = ["gossip-bootstrap"] }
 ```
 
 ## Quick Start
