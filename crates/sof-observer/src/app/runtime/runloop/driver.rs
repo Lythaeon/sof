@@ -666,14 +666,23 @@ pub(in crate::app::runtime) async fn run_async_with_hosts(
                 let observed_at = Instant::now();
                 let source_addr = packet.source;
                 let packet_bytes = packet.bytes;
-                if plugin_hooks_enabled {
+                let shared_observer_packet = (plugin_hooks_enabled || extension_hooks_enabled)
+                    .then(|| Arc::<[u8]>::from(packet_bytes.as_slice()));
+                if plugin_hooks_enabled
+                    && let Some(shared_packet) = shared_observer_packet.as_ref()
+                {
                     plugin_host.on_raw_packet(RawPacketEvent {
                         source: source_addr,
-                        bytes: Arc::from(packet_bytes.as_slice()),
+                        bytes: Arc::clone(shared_packet),
                     });
                 }
-                if extension_hooks_enabled {
-                    extension_host.on_observer_packet(source_addr, &packet_bytes);
+                if extension_hooks_enabled
+                    && let Some(shared_packet) = shared_observer_packet.as_ref()
+                {
+                    extension_host.on_observer_packet_shared(
+                        source_addr,
+                        Arc::clone(shared_packet),
+                    );
                 }
                 packet_count = packet_count.saturating_add(1);
                 if logged_waiting_for_packets {
