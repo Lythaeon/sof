@@ -26,6 +26,7 @@ impl GossipRepairClient {
             socket,
             keypair,
             peers_by_slot: HashMap::new(),
+            sticky_peer_by_slot: HashMap::new(),
             peer_cache_ttl: config.peer_cache_ttl,
             peer_cache_capacity: config.peer_cache_capacity.max(1),
             active_peer_count: config.active_peer_count.max(1),
@@ -282,7 +283,7 @@ impl GossipRepairClient {
         }
         let sampled_indexes = self.sample_peer_indexes(&peers, slot, index);
         let now = Instant::now();
-        sampled_indexes
+        let best_sampled = sampled_indexes
             .into_iter()
             .filter_map(|candidate_index| {
                 peers
@@ -290,16 +291,34 @@ impl GossipRepairClient {
                     .copied()
                     .map(|peer| (candidate_index, peer))
             })
-            .max_by_key(|(_, peer)| {
-                (
-                    self.score_for(peer.pubkey),
-                    self.weight_for(peer.pubkey),
-                    self.last_request_age_ms(now, peer.addr),
-                    peer.stake_lamports,
-                    peer.pubkey.to_bytes(),
-                )
-            })
-            .map(|(_, peer)| peer)
+            .max_by_key(|(_, peer)| self.peer_selection_rank(now, *peer))
+            .map(|(_, peer)| peer)?;
+
+        let sticky_peer = self.sticky_peer_by_slot.get(&slot).and_then(|sticky| {
+            peers
+                .iter()
+                .copied()
+                .find(|peer| peer.pubkey == sticky.peer.pubkey && peer.addr == sticky.peer.addr)
+                .map(|peer| (peer, now.saturating_duration_since(sticky.selected_at)))
+        });
+
+        let selected = sticky_peer.map_or(best_sampled, |(sticky, sticky_age)| {
+            let sticky_score = self.score_for(sticky.pubkey);
+            let best_score = self.score_for(best_sampled.pubkey);
+            if should_keep_sticky_peer(sticky_age, sticky_score, best_score) {
+                sticky
+            } else {
+                best_sampled
+            }
+        });
+        let _ = self.sticky_peer_by_slot.insert(
+            slot,
+            StickyRepairPeer {
+                peer: selected,
+                selected_at: now,
+            },
+        );
+        Some(selected)
     }
 
     fn refresh_peers(&mut self, slot: u64) {
@@ -307,6 +326,10 @@ impl GossipRepairClient {
         self.refresh_stake_map();
         self.peers_by_slot
             .retain(|_, cached| cached.updated_at.elapsed() < self.peer_cache_ttl);
+        self.sticky_peer_by_slot.retain(|slot_key, sticky| {
+            self.peers_by_slot.contains_key(slot_key)
+                && sticky.selected_at.elapsed() < self.peer_cache_ttl
+        });
         if self.peers_by_slot.len() > self.peer_cache_capacity {
             let mut keys: Vec<_> = self.peers_by_slot.keys().copied().collect();
             keys.sort_unstable_by_key(|key| {
@@ -321,6 +344,7 @@ impl GossipRepairClient {
                 .saturating_sub(self.peer_cache_capacity);
             for key in keys.into_iter().take(overflow) {
                 let _ = self.peers_by_slot.remove(&key);
+                let _ = self.sticky_peer_by_slot.remove(&key);
             }
         }
         let should_refresh = self
@@ -465,6 +489,20 @@ impl GossipRepairClient {
             .copied()
             .unwrap_or_default()
             .rank()
+    }
+
+    fn peer_selection_rank(
+        &self,
+        now: Instant,
+        peer: RepairPeer,
+    ) -> (i64, u64, u64, u64, [u8; 32]) {
+        (
+            self.score_for(peer.pubkey),
+            self.weight_for(peer.pubkey),
+            self.last_request_age_ms(now, peer.addr),
+            peer.stake_lamports,
+            peer.pubkey.to_bytes(),
+        )
     }
 
     fn weight_for(&self, pubkey: Pubkey) -> u64 {
@@ -626,9 +664,48 @@ fn canonical_shred_len(parsed: &ParsedShredHeader) -> usize {
     }
 }
 
+fn should_keep_sticky_peer(sticky_age: Duration, sticky_score: i64, best_score: i64) -> bool {
+    if sticky_age > Duration::from_millis(REPAIR_PEER_STICKINESS_MS) {
+        return false;
+    }
+    best_score.saturating_sub(sticky_score) < REPAIR_PEER_SWITCH_SCORE_MARGIN
+}
+
 const fn mix_seed(seed: u64) -> u64 {
     let mut z = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     z ^ (z >> 31)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sticky_peer_is_kept_within_window_when_score_gap_is_small() {
+        assert!(should_keep_sticky_peer(
+            Duration::from_millis(REPAIR_PEER_STICKINESS_MS),
+            1_000,
+            1_050,
+        ));
+    }
+
+    #[test]
+    fn sticky_peer_is_not_kept_after_window_expires() {
+        assert!(!should_keep_sticky_peer(
+            Duration::from_millis(REPAIR_PEER_STICKINESS_MS.saturating_add(1)),
+            1_000,
+            1_020,
+        ));
+    }
+
+    #[test]
+    fn sticky_peer_is_not_kept_when_score_gap_is_large() {
+        assert!(!should_keep_sticky_peer(
+            Duration::from_millis(REPAIR_PEER_STICKINESS_MS),
+            1_000,
+            1_000 + REPAIR_PEER_SWITCH_SCORE_MARGIN,
+        ));
+    }
 }

@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use crate::framework::PluginHost;
+use crate::framework::{PluginHost, RuntimeExtensionHost};
 use thiserror::Error;
 
 /// Public runtime error surface for packaged SOF entrypoints.
@@ -404,6 +404,32 @@ pub fn run_with_plugin_host(plugin_host: PluginHost) -> Result<(), RuntimeError>
     Ok(crate::app::runtime::run_with_plugin_host(plugin_host)?)
 }
 
+/// Runs the packaged observer runtime with a custom runtime extension host.
+///
+/// # Errors
+/// Returns any runtime initialization or shutdown error from the underlying observer runtime.
+pub fn run_with_extension_host(extension_host: RuntimeExtensionHost) -> Result<(), RuntimeError> {
+    crate::runtime_env::clear_runtime_env_overrides();
+    Ok(crate::app::runtime::run_with_extension_host(
+        extension_host,
+    )?)
+}
+
+/// Runs the packaged observer runtime with explicit plugin and runtime extension hosts.
+///
+/// # Errors
+/// Returns any runtime initialization or shutdown error from the underlying observer runtime.
+pub fn run_with_hosts(
+    plugin_host: PluginHost,
+    extension_host: RuntimeExtensionHost,
+) -> Result<(), RuntimeError> {
+    crate::runtime_env::clear_runtime_env_overrides();
+    Ok(crate::app::runtime::run_with_hosts(
+        plugin_host,
+        extension_host,
+    )?)
+}
+
 /// Runs the packaged observer runtime with explicit code-driven setup overrides.
 ///
 /// # Errors
@@ -425,6 +451,36 @@ pub fn run_with_plugin_host_and_setup(
     Ok(crate::app::runtime::run_with_plugin_host(plugin_host)?)
 }
 
+/// Runs the packaged observer runtime with a custom runtime extension host and setup overrides.
+///
+/// # Errors
+/// Returns any runtime initialization or shutdown error from the underlying observer runtime.
+pub fn run_with_extension_host_and_setup(
+    extension_host: RuntimeExtensionHost,
+    setup: &RuntimeSetup,
+) -> Result<(), RuntimeError> {
+    setup.apply();
+    Ok(crate::app::runtime::run_with_extension_host(
+        extension_host,
+    )?)
+}
+
+/// Runs the packaged observer runtime with explicit hosts and setup overrides.
+///
+/// # Errors
+/// Returns any runtime initialization or shutdown error from the underlying observer runtime.
+pub fn run_with_hosts_and_setup(
+    plugin_host: PluginHost,
+    extension_host: RuntimeExtensionHost,
+    setup: &RuntimeSetup,
+) -> Result<(), RuntimeError> {
+    setup.apply();
+    Ok(crate::app::runtime::run_with_hosts(
+        plugin_host,
+        extension_host,
+    )?)
+}
+
 /// Async variant of [`run`], for callers that already own a Tokio runtime.
 ///
 /// # Errors
@@ -441,6 +497,29 @@ pub async fn run_async() -> Result<(), RuntimeError> {
 pub async fn run_async_with_plugin_host(plugin_host: PluginHost) -> Result<(), RuntimeError> {
     crate::runtime_env::clear_runtime_env_overrides();
     Ok(crate::app::runtime::run_async_with_plugin_host(plugin_host).await?)
+}
+
+/// Async variant of [`run_with_extension_host`].
+///
+/// # Errors
+/// Returns any runtime initialization or shutdown error from the underlying observer runtime.
+pub async fn run_async_with_extension_host(
+    extension_host: RuntimeExtensionHost,
+) -> Result<(), RuntimeError> {
+    crate::runtime_env::clear_runtime_env_overrides();
+    Ok(crate::app::runtime::run_async_with_extension_host(extension_host).await?)
+}
+
+/// Async variant of [`run_with_hosts`].
+///
+/// # Errors
+/// Returns any runtime initialization or shutdown error from the underlying observer runtime.
+pub async fn run_async_with_hosts(
+    plugin_host: PluginHost,
+    extension_host: RuntimeExtensionHost,
+) -> Result<(), RuntimeError> {
+    crate::runtime_env::clear_runtime_env_overrides();
+    Ok(crate::app::runtime::run_async_with_hosts(plugin_host, extension_host).await?)
 }
 
 /// Async variant of [`run_with_setup`], for callers that already own a Tokio runtime.
@@ -462,4 +541,29 @@ pub async fn run_async_with_plugin_host_and_setup(
 ) -> Result<(), RuntimeError> {
     setup.apply();
     Ok(crate::app::runtime::run_async_with_plugin_host(plugin_host).await?)
+}
+
+/// Async variant of [`run_with_extension_host_and_setup`].
+///
+/// # Errors
+/// Returns any runtime initialization or shutdown error from the underlying observer runtime.
+pub async fn run_async_with_extension_host_and_setup(
+    extension_host: RuntimeExtensionHost,
+    setup: &RuntimeSetup,
+) -> Result<(), RuntimeError> {
+    setup.apply();
+    Ok(crate::app::runtime::run_async_with_extension_host(extension_host).await?)
+}
+
+/// Async variant of [`run_with_hosts_and_setup`].
+///
+/// # Errors
+/// Returns any runtime initialization or shutdown error from the underlying observer runtime.
+pub async fn run_async_with_hosts_and_setup(
+    plugin_host: PluginHost,
+    extension_host: RuntimeExtensionHost,
+    setup: &RuntimeSetup,
+) -> Result<(), RuntimeError> {
+    setup.apply();
+    Ok(crate::app::runtime::run_async_with_hosts(plugin_host, extension_host).await?)
 }

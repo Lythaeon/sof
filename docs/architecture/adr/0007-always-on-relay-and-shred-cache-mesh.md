@@ -149,10 +149,12 @@ Implemented interoperability details:
 7. Repair peer selection follows Agave-style bounded sampling:
    - candidate peers are discovered from gossip repair/tvu metadata,
    - per-request peer choice uses a stake-weighted sampled subset (default size `10`),
-   - local health scoring (RTT/send/source-hit) still ranks peers inside sampled candidates.
+   - local health scoring (RTT/send/source-hit) still ranks peers inside sampled candidates,
+   - short stickiness and switch-margin hysteresis are applied to reduce latency-chasing churn.
 8. Repair serve path now applies a bounded response-byte budget (`12_000_000` bytes/sec default) to load-shed under pressure.
 9. Runtime defaults keep repair pressure low (`SOF_REPAIR_MAX_REQUESTS_PER_TICK=4`, hard cap `24`) so live stream intake remains first priority.
 10. Runtime relay fanout is hard-capped (`SOF_UDP_RELAY_FANOUT <= 200`) to avoid retransmit amplification.
+11. Shared relay cache entries are stored as shared byte slices (`Arc<[u8]>`) and repair serving uses shared query paths to avoid unnecessary packet clones on the hot serve path.
 
 Peer discovery policy:
 

@@ -1,6 +1,6 @@
 [package]
 name = "sof"
-version = "0.3.0"
+version = "0.4.0"
 edition.workspace = true
 description = "Solana Observer Framework for low-latency shred ingestion and plugin-driven transaction observation"
 license = "Apache-2.0 OR MIT"
@@ -48,6 +48,8 @@ nix = { version = "0.30", features = ["net", "uio"] }
 crossbeam-queue = "0.3"
 crossbeam-skiplist = "0.1"
 async-trait = "0.1"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 
 [[example]]
 name = "non_vote_tx_logger"
@@ -72,3 +74,23 @@ path = "examples/observer_with_multiple_plugins.rs"
 [[example]]
 name = "tpu_leader_logger"
 path = "examples/tpu_leader_logger.rs"
+
+[[example]]
+name = "runtime_extension_observer_ingress"
+path = "examples/runtime_extension_observer_ingress.rs"
+
+[[example]]
+name = "runtime_extension_udp_listener"
+path = "examples/runtime_extension_udp_listener.rs"
+
+[[example]]
+name = "runtime_extension_shared_stream"
+path = "examples/runtime_extension_shared_stream.rs"
+
+[[example]]
+name = "runtime_extension_with_plugins"
+path = "examples/runtime_extension_with_plugins.rs"
+
+[[example]]
+name = "runtime_extension_websocket_connector"
+path = "examples/runtime_extension_websocket_connector.rs"

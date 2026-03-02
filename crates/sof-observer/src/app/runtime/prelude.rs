@@ -35,7 +35,8 @@ pub(super) use crate::{
     event::{TxCommitmentStatus, TxKind, TxObservedEvent},
     framework::{
         DatasetEvent, ObservedRecentBlockhashEvent, PluginHost, PluginHostBuilder, RawPacketEvent,
-        ReorgEvent, ShredEvent, SlotStatusEvent, TransactionEvent,
+        ReorgEvent, RuntimeExtensionHost, RuntimeExtensionHostBuilder, ShredEvent, SlotStatusEvent,
+        TransactionEvent,
     },
     ingest::{self, RawPacketBatch},
     reassembly::dataset::DataSetReassembler,

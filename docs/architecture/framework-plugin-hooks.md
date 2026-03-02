@@ -3,6 +3,12 @@
 `sof-observer` exposes a plugin framework in `sof::framework` so consumers can run
 custom logic without forking the runtime.
 
+`ObserverPlugin` is separate from `RuntimeExtension`:
+
+1. `ObserverPlugin` is the event-hook system documented on this page.
+2. `RuntimeExtension` is a distinct runtime capability/resource/filter system documented by ADR-0008 and `runtime-extension-hooks.md`.
+3. Neither system is a migration path for the other.
+
 ## Public API Surface
 
 - Trait:

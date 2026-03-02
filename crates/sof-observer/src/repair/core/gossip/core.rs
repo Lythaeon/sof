@@ -50,6 +50,10 @@ const REPAIR_PEER_WEIGHT_MAX: i64 = 100_000;
 const REPAIR_PEER_RTT_EMA_PREV_WEIGHT: u64 = 7;
 #[cfg(feature = "gossip-bootstrap")]
 const REPAIR_PEER_RTT_EMA_TOTAL_WEIGHT: u64 = 8;
+#[cfg(feature = "gossip-bootstrap")]
+const REPAIR_PEER_STICKINESS_MS: u64 = 750;
+#[cfg(feature = "gossip-bootstrap")]
+const REPAIR_PEER_SWITCH_SCORE_MARGIN: i64 = 64;
 
 #[derive(Debug, Error)]
 pub enum GossipRepairClientError {
@@ -126,6 +130,13 @@ struct RepairPeer {
     pubkey: Pubkey,
     addr: std::net::SocketAddr,
     stake_lamports: u64,
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+#[derive(Debug, Clone, Copy)]
+struct StickyRepairPeer {
+    peer: RepairPeer,
+    selected_at: Instant,
 }
 
 #[cfg(feature = "gossip-bootstrap")]
@@ -249,6 +260,7 @@ pub struct GossipRepairClient {
     socket: UdpSocket,
     keypair: std::sync::Arc<Keypair>,
     peers_by_slot: HashMap<u64, CachedPeers>,
+    sticky_peer_by_slot: HashMap<u64, StickyRepairPeer>,
     peer_cache_ttl: Duration,
     peer_cache_capacity: usize,
     active_peer_count: usize,

@@ -18,6 +18,7 @@ This folder contains architecture and operations documentation for the SOF works
 
 - `architecture/README.md`: ADR/ARD index and scope.
 - `architecture/framework-plugin-hooks.md`: plugin hook contracts and semantics.
+- `architecture/runtime-extension-hooks.md`: runtime extension capabilities, resources, and filter semantics.
 - `architecture/runtime-bootstrap-modes.md`: runtime capability profiles and source selection.
 
 ## Operations

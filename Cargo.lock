@@ -5238,7 +5238,7 @@ dependencies = [
 
 [[package]]
 name = "sof"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arcshift",
  "async-trait",
@@ -5247,6 +5247,7 @@ dependencies = [
  "crossbeam-queue",
  "crossbeam-skiplist",
  "ed25519-dalek 2.2.0",
+ "futures-util",
  "nix",
  "reed-solomon-erasure",
  "reqwest 0.12.28",
@@ -5266,6 +5267,7 @@ dependencies = [
  "solana-transaction",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
  "wincode 0.1.2",
@@ -5273,7 +5275,7 @@ dependencies = [
 
 [[package]]
 name = "sof-tx"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arcshift",
  "async-trait",
