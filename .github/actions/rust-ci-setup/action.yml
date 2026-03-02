@@ -2,6 +2,10 @@ name: Rust CI Setup
 description: Install Rust toolchain, cache cargo artifacts, and install CI cargo tools.
 
 inputs:
+  install-rust-toolchain:
+    description: Whether to install the Rust toolchain in this action.
+    required: false
+    default: "true"
   rust-components:
     description: Comma-separated rustup components to install.
     required: false
@@ -43,6 +47,7 @@ runs:
         fi
 
     - name: Install Rust toolchain
+      if: ${{ inputs.install-rust-toolchain == 'true' }}
       uses: dtolnay/rust-toolchain@stable
       with:
         components: ${{ inputs.rust-components }}
