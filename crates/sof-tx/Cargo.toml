@@ -1,6 +1,6 @@
 [package]
 name = "sof-tx"
-version = "0.2.0"
+version = "0.3.0"
 edition.workspace = true
 description = "SOF transaction SDK for building and submitting Solana transactions"
 license = "Apache-2.0 OR MIT"
@@ -33,7 +33,7 @@ solana-signature = "3.1.0"
 solana-signer = "3.0.0"
 solana-system-interface = { version = "3.0.0", features = ["bincode"] }
 solana-transaction = { version = "3.0.2", features = ["bincode"] }
-sof = { version = "0.2.0", path = "../sof-observer", default-features = false, optional = true }
+sof = { version = "0.3.0", path = "../sof-observer", default-features = false, optional = true }
 thiserror = "2.0"
 tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
 arcshift = "0.4.2"
