@@ -48,7 +48,11 @@ jobs:
         run: |
           set -euo pipefail
           tag_version="${GITHUB_REF_NAME#v}"
+          matched_count=0
           published_count=0
+          already_published_count=0
+          skipped_count=0
+          failed_count=0
 
           # Define crates in dependency order
           crates=("sof" "sof-tx")
@@ -56,27 +60,63 @@ jobs:
           for pkg in "${crates[@]}"; do
             crate_version="$(cargo pkgid -p "$pkg" | sed -E 's/.*@(.+)$/\1/')"
             
-            if [[ "${crate_version}" == "${tag_version}" ]]; then
-              echo ">>> Target matches: $pkg v${crate_version}. Dry-running..."
-              cargo publish -p "$pkg" --locked --dry-run
-              
-              echo ">>> Publishing $pkg v${crate_version} to crates.io..."
-              cargo publish -p "$pkg" --locked
-              
-              published_count=$((published_count + 1))
-              
-              # If we just published the core crate and there are more to go, 
-              # sleep to allow crates.io indexing
-              if [[ "$pkg" == "sof" ]]; then
-                 echo "Waiting for crates.io indexing..."
-                 sleep 30
-              fi
-            else
+            if [[ "${crate_version}" != "${tag_version}" ]]; then
               echo ">>> Skipping $pkg: version (${crate_version}) does not match tag (${tag_version})"
+              skipped_count=$((skipped_count + 1))
+              continue
+            fi
+
+            matched_count=$((matched_count + 1))
+            echo ">>> Target matches: $pkg v${crate_version}. Dry-running..."
+            set +e
+            dry_run_output="$(cargo publish -p "$pkg" --locked --dry-run 2>&1)"
+            dry_run_rc=$?
+            set -e
+            echo "${dry_run_output}"
+            if [[ ${dry_run_rc} -ne 0 ]]; then
+              echo ">>> FAILED dry-run for $pkg v${crate_version}"
+              failed_count=$((failed_count + 1))
+              continue
+            fi
+
+            echo ">>> Publishing $pkg v${crate_version} to crates.io..."
+            set +e
+            publish_output="$(cargo publish -p "$pkg" --locked 2>&1)"
+            publish_rc=$?
+            set -e
+            echo "${publish_output}"
+            if [[ ${publish_rc} -eq 0 ]]; then
+              echo ">>> Published $pkg v${crate_version}"
+              published_count=$((published_count + 1))
+            elif echo "${publish_output}" | grep -Eqi "already uploaded|already exists|previously uploaded"; then
+              echo ">>> Already published $pkg v${crate_version}"
+              already_published_count=$((already_published_count + 1))
+            else
+              echo ">>> FAILED publish for $pkg v${crate_version}"
+              failed_count=$((failed_count + 1))
+            fi
+
+            # If we just processed the core crate and there are more to go,
+            # sleep to allow crates.io indexing before downstream publish.
+            if [[ "$pkg" == "sof" ]]; then
+              echo "Waiting for crates.io indexing..."
+              sleep 30
             fi
           done
 
-          if [[ $published_count -eq 0 ]]; then
+          echo "=== Publish summary ==="
+          echo "matched=${matched_count}"
+          echo "published=${published_count}"
+          echo "already_published=${already_published_count}"
+          echo "skipped=${skipped_count}"
+          echo "failed=${failed_count}"
+
+          if [[ ${matched_count} -eq 0 ]]; then
             echo "Error: No crates found with version matching tag ${tag_version}"
+            exit 1
+          fi
+
+          if [[ ${failed_count} -gt 0 ]]; then
+            echo "Error: one or more crate publish steps failed"
             exit 1
           fi
