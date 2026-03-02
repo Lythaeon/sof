@@ -103,6 +103,10 @@ pub(in crate::app::runtime) async fn run_async_with_hosts(
             "runtime extensions startup completed"
         );
     }
+    let extension_queue_depth_warn = read_runtime_extension_queue_depth_warn();
+    let extension_dispatch_lag_warn_us = read_runtime_extension_dispatch_lag_warn_us();
+    let extension_drop_warn_delta = read_runtime_extension_drop_warn_delta();
+    let mut extension_last_dropped_events = 0_u64;
     let relay_cache_window_ms = read_relay_cache_window_ms();
     let relay_cache_max_shreds = read_relay_cache_max_shreds();
     let relay_cache = (relay_cache_window_ms > 0 && relay_cache_max_shreds > 0).then(|| {
@@ -1894,6 +1898,13 @@ pub(in crate::app::runtime) async fn run_async_with_hosts(
                 } else {
                     current_unix_ms().saturating_sub(ingest_last_packet_unix_ms)
                 };
+                let extension_dispatch = if extension_hooks_enabled {
+                    collect_extension_dispatch_telemetry(
+                        extension_host.dispatch_metrics_by_extension(),
+                    )
+                } else {
+                    ExtensionDispatchTelemetrySnapshot::default()
+                };
                 tracing::info!(
                     packets = packet_count,
                     source_8899_packets = source_port_8899_packets,
@@ -1962,6 +1973,15 @@ pub(in crate::app::runtime) async fn run_async_with_hosts(
                     dedupe_entries = dedupe_cache.as_ref().map_or(0, RecentShredCache::len),
                     dedupe_drops = dedupe_drop_count,
                     tx_event_drops = tx_event_drop_count.load(Ordering::Relaxed),
+                    runtime_extension_active = extension_dispatch.active_extensions,
+                    runtime_extension_dispatched = extension_dispatch.dispatched_events,
+                    runtime_extension_dropped = extension_dispatch.dropped_events,
+                    runtime_extension_queue_depth = extension_dispatch.queue_depth,
+                    runtime_extension_max_queue_depth = extension_dispatch.max_queue_depth,
+                    runtime_extension_max_avg_dispatch_lag_us =
+                        extension_dispatch.max_avg_dispatch_lag_us,
+                    runtime_extension_max_dispatch_lag_us =
+                        extension_dispatch.max_dispatch_lag_us,
                     dataset_decode_failures = dataset_decode_fail_count.load(Ordering::Relaxed),
                     dataset_tail_skips = dataset_tail_skip_count.load(Ordering::Relaxed),
                     dataset_duplicate_drops = dataset_duplicate_drop_count.load(Ordering::Relaxed),
@@ -2087,6 +2107,37 @@ pub(in crate::app::runtime) async fn run_async_with_hosts(
                     window_recovered_data = coverage.recovered_data_shreds,
                     "ingest telemetry"
                 );
+                if extension_hooks_enabled {
+                    let dropped_delta = extension_dispatch
+                        .dropped_events
+                        .saturating_sub(extension_last_dropped_events);
+                    extension_last_dropped_events = extension_dispatch.dropped_events;
+                    let queue_depth_over_limit = extension_queue_depth_warn > 0
+                        && extension_dispatch.queue_depth >= extension_queue_depth_warn;
+                    let lag_over_limit = extension_dispatch_lag_warn_us > 0
+                        && extension_dispatch.max_dispatch_lag_us
+                            >= extension_dispatch_lag_warn_us;
+                    let dropped_delta_over_limit = extension_drop_warn_delta > 0
+                        && dropped_delta >= extension_drop_warn_delta;
+                    if queue_depth_over_limit || lag_over_limit || dropped_delta_over_limit {
+                        tracing::warn!(
+                            runtime_extension_active = extension_dispatch.active_extensions,
+                            runtime_extension_dispatched = extension_dispatch.dispatched_events,
+                            runtime_extension_dropped = extension_dispatch.dropped_events,
+                            runtime_extension_dropped_delta = dropped_delta,
+                            runtime_extension_queue_depth = extension_dispatch.queue_depth,
+                            runtime_extension_max_queue_depth = extension_dispatch.max_queue_depth,
+                            runtime_extension_max_avg_dispatch_lag_us =
+                                extension_dispatch.max_avg_dispatch_lag_us,
+                            runtime_extension_max_dispatch_lag_us =
+                                extension_dispatch.max_dispatch_lag_us,
+                            queue_depth_warn = extension_queue_depth_warn,
+                            dispatch_lag_warn_us = extension_dispatch_lag_warn_us,
+                            drop_warn_delta = extension_drop_warn_delta,
+                            "runtime extension dispatch pressure detected"
+                        );
+                    }
+                }
             }
             maybe_event = runtime.tx_event_rx.recv() => {
                 let Some(event) = maybe_event else {
@@ -2123,6 +2174,42 @@ pub(in crate::app::runtime) async fn run_async_with_hosts(
     }
     drop(runtime);
     Ok(())
+}
+
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+struct ExtensionDispatchTelemetrySnapshot {
+    active_extensions: u64,
+    dispatched_events: u64,
+    dropped_events: u64,
+    queue_depth: u64,
+    max_queue_depth: u64,
+    max_avg_dispatch_lag_us: u64,
+    max_dispatch_lag_us: u64,
+}
+
+fn collect_extension_dispatch_telemetry(
+    metrics: Vec<RuntimeExtensionDispatchMetrics>,
+) -> ExtensionDispatchTelemetrySnapshot {
+    let active_extensions = u64::try_from(metrics.len()).unwrap_or(u64::MAX);
+    let mut snapshot = ExtensionDispatchTelemetrySnapshot {
+        active_extensions,
+        ..ExtensionDispatchTelemetrySnapshot::default()
+    };
+    for metric in metrics {
+        snapshot.dispatched_events = snapshot
+            .dispatched_events
+            .saturating_add(metric.dispatched_events);
+        snapshot.dropped_events = snapshot
+            .dropped_events
+            .saturating_add(metric.dropped_events);
+        snapshot.queue_depth = snapshot.queue_depth.saturating_add(metric.queue_depth);
+        snapshot.max_queue_depth = snapshot.max_queue_depth.max(metric.max_queue_depth);
+        snapshot.max_avg_dispatch_lag_us = snapshot
+            .max_avg_dispatch_lag_us
+            .max(metric.avg_dispatch_lag_us);
+        snapshot.max_dispatch_lag_us = snapshot.max_dispatch_lag_us.max(metric.max_dispatch_lag_us);
+    }
+    snapshot
 }
 
 const fn derive_parent_slot(slot: u64, parent_offset: u16) -> Option<u64> {
@@ -2244,5 +2331,50 @@ fn collect_udp_relay_peers(
     UdpRelayPeers {
         total_candidates,
         selected_peers,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extension_dispatch_telemetry_aggregates_totals_and_maxima() {
+        let metrics = vec![
+            RuntimeExtensionDispatchMetrics {
+                extension: "ext-a",
+                dropped_events: 2,
+                queue_depth: 5,
+                max_queue_depth: 7,
+                dispatched_events: 10,
+                avg_dispatch_lag_us: 200,
+                max_dispatch_lag_us: 900,
+            },
+            RuntimeExtensionDispatchMetrics {
+                extension: "ext-b",
+                dropped_events: 1,
+                queue_depth: 4,
+                max_queue_depth: 8,
+                dispatched_events: 11,
+                avg_dispatch_lag_us: 300,
+                max_dispatch_lag_us: 700,
+            },
+        ];
+
+        let snapshot = collect_extension_dispatch_telemetry(metrics);
+
+        assert_eq!(snapshot.active_extensions, 2);
+        assert_eq!(snapshot.dispatched_events, 21);
+        assert_eq!(snapshot.dropped_events, 3);
+        assert_eq!(snapshot.queue_depth, 9);
+        assert_eq!(snapshot.max_queue_depth, 8);
+        assert_eq!(snapshot.max_avg_dispatch_lag_us, 300);
+        assert_eq!(snapshot.max_dispatch_lag_us, 900);
+    }
+
+    #[test]
+    fn extension_dispatch_telemetry_handles_empty_metrics() {
+        let snapshot = collect_extension_dispatch_telemetry(Vec::new());
+        assert_eq!(snapshot, ExtensionDispatchTelemetrySnapshot::default());
     }
 }
