@@ -2,7 +2,7 @@ use async_trait::async_trait;
 
 use crate::framework::events::{
     ClusterTopologyEvent, DatasetEvent, LeaderScheduleEvent, ObservedRecentBlockhashEvent,
-    RawPacketEvent, ShredEvent, TransactionEvent,
+    RawPacketEvent, ReorgEvent, ShredEvent, SlotStatusEvent, TransactionEvent,
 };
 
 /// Extension point for SOF runtime event hooks.
@@ -29,6 +29,12 @@ pub trait ObserverPlugin: Send + Sync + 'static {
 
     /// Called for each decoded transaction emitted from a dataset.
     async fn on_transaction(&self, _event: TransactionEvent) {}
+
+    /// Called when local slot status transitions (processed/confirmed/finalized/orphaned).
+    async fn on_slot_status(&self, _event: SlotStatusEvent) {}
+
+    /// Called when local canonical tip switches to a different branch.
+    async fn on_reorg(&self, _event: ReorgEvent) {}
 
     /// Called when a newer observed recent blockhash is detected.
     async fn on_recent_blockhash(&self, _event: ObservedRecentBlockhashEvent) {}

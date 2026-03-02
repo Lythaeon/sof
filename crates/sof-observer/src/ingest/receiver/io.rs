@@ -1,25 +1,4 @@
 use super::*;
-use thiserror::Error;
-
-#[derive(Debug, Error)]
-pub(super) enum TcpRelayReceiverError {
-    #[error("failed to read tcp relay frame length from {remote_addr}: {source}")]
-    ReadFrameLength {
-        remote_addr: SocketAddr,
-        source: std::io::Error,
-    },
-    #[error("invalid tcp relay frame size {len} from {remote_addr}; expected 1..={max_frame_size}")]
-    InvalidFrameSize {
-        remote_addr: SocketAddr,
-        len: usize,
-        max_frame_size: usize,
-    },
-    #[error("failed to read tcp relay frame payload from {remote_addr}: {source}")]
-    ReadFramePayload {
-        remote_addr: SocketAddr,
-        source: std::io::Error,
-    },
-}
 
 pub(super) struct UdpReceive {
     pub(super) len: usize,
@@ -115,59 +94,6 @@ pub(super) fn flush_batch(
         Err(mpsc::error::TrySendError::Full(_)) | Err(mpsc::error::TrySendError::Closed(_)) => {
             if let Some(telemetry) = telemetry {
                 telemetry.record_dropped_batch(packet_count);
-            }
-        }
-    }
-}
-
-pub(super) async fn run_tcp_relay_receiver(
-    remote_addr: SocketAddr,
-    tx: mpsc::Sender<RawPacketBatch>,
-) -> Result<(), TcpRelayReceiverError> {
-    const MAX_FRAME_SIZE: usize = 4096;
-    loop {
-        match tokio::net::TcpStream::connect(remote_addr).await {
-            Ok(mut stream) => {
-                tracing::info!(remote = %remote_addr, "connected to tcp relay");
-                let mut len_buf = [0_u8; 2];
-                loop {
-                    stream.read_exact(&mut len_buf).await.map_err(|source| {
-                        TcpRelayReceiverError::ReadFrameLength {
-                            remote_addr,
-                            source,
-                        }
-                    })?;
-                    let len = u16::from_be_bytes(len_buf) as usize;
-                    if len == 0 || len > MAX_FRAME_SIZE {
-                        return Err(TcpRelayReceiverError::InvalidFrameSize {
-                            remote_addr,
-                            len,
-                            max_frame_size: MAX_FRAME_SIZE,
-                        });
-                    }
-                    let mut bytes = vec![0_u8; len];
-                    stream.read_exact(&mut bytes).await.map_err(|source| {
-                        TcpRelayReceiverError::ReadFramePayload {
-                            remote_addr,
-                            source,
-                        }
-                    })?;
-                    let packet = RawPacket {
-                        source: remote_addr,
-                        bytes,
-                    };
-                    if tx.try_send(vec![packet]).is_err() {
-                        // Backpressure/drop on relay ingress.
-                    }
-                }
-            }
-            Err(error) => {
-                tracing::warn!(
-                    remote = %remote_addr,
-                    error = %error,
-                    "failed to connect to tcp relay; retrying"
-                );
-                sleep(Duration::from_secs(2)).await;
             }
         }
     }

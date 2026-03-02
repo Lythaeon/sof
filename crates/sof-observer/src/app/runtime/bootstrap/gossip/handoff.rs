@@ -209,9 +209,12 @@ pub(super) enum GossipBootstrapStartError {
     /// `SOF_SHRED_VERSION` resolved to zero, which is invalid.
     #[error("shred version resolved to 0; set SOF_SHRED_VERSION explicitly")]
     ZeroShredVersion,
-    /// RPC fallback for shred version discovery failed.
-    #[error("failed to resolve shred version from RPC `{rpc_url}`: {reason}")]
-    RpcShredVersion { rpc_url: String, reason: String },
+    /// Entrypoint shred-version discovery failed.
+    #[error("failed to resolve shred version from entrypoint {entrypoint}: {reason}")]
+    DiscoveryShredVersion {
+        entrypoint: SocketAddr,
+        reason: String,
+    },
     /// Port-range parsing failed.
     #[error(transparent)]
     PortRange(#[from] PortRangeParseError),
@@ -254,94 +257,6 @@ pub(super) enum GossipBootstrapStartError {
 }
 
 #[cfg(feature = "gossip-bootstrap")]
-fn parse_cluster_node_shred_version(value: &serde_json::Value) -> Option<u16> {
-    if let Some(version) = value.as_u64() {
-        return u16::try_from(version).ok();
-    }
-    value.as_str()?.parse::<u16>().ok()
-}
-
-#[cfg(feature = "gossip-bootstrap")]
-async fn resolve_shred_version_from_rpc() -> Result<u16, GossipBootstrapStartError> {
-    let rpc_url = read_rpc_url();
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|source| GossipBootstrapStartError::RpcShredVersion {
-            rpc_url: rpc_url.clone(),
-            reason: format!("failed to build rpc client: {source}"),
-        })?;
-    let payload = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getClusterNodes",
-        "params": [],
-    });
-    let response = client
-        .post(&rpc_url)
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|source| GossipBootstrapStartError::RpcShredVersion {
-            rpc_url: rpc_url.clone(),
-            reason: format!("rpc request failed: {source}"),
-        })?;
-    let status = response.status();
-    let response = response.error_for_status().map_err(|source| {
-        GossipBootstrapStartError::RpcShredVersion {
-            rpc_url: rpc_url.clone(),
-            reason: format!("rpc status {status}: {source}"),
-        }
-    })?;
-    let body: serde_json::Value =
-        response
-            .json()
-            .await
-            .map_err(|source| GossipBootstrapStartError::RpcShredVersion {
-                rpc_url: rpc_url.clone(),
-                reason: format!("invalid rpc json: {source}"),
-            })?;
-    if let Some(error) = body.get("error") {
-        return Err(GossipBootstrapStartError::RpcShredVersion {
-            rpc_url,
-            reason: format!("rpc returned error payload: {error}"),
-        });
-    }
-    let nodes = body
-        .get("result")
-        .and_then(|value| value.as_array())
-        .ok_or_else(|| GossipBootstrapStartError::RpcShredVersion {
-            rpc_url: rpc_url.clone(),
-            reason: "rpc returned no cluster node result array".to_owned(),
-        })?;
-    let mut counts: HashMap<u16, usize> = HashMap::new();
-    for node in nodes {
-        let Some(shred_value) = node.get("shredVersion") else {
-            continue;
-        };
-        let Some(shred_version) = parse_cluster_node_shred_version(shred_value) else {
-            continue;
-        };
-        if shred_version == 0 {
-            continue;
-        }
-        *counts.entry(shred_version).or_default() = counts
-            .get(&shred_version)
-            .copied()
-            .unwrap_or(0)
-            .saturating_add(1);
-    }
-    counts
-        .into_iter()
-        .max_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)))
-        .map(|(shred_version, _)| shred_version)
-        .ok_or_else(|| GossipBootstrapStartError::RpcShredVersion {
-            rpc_url,
-            reason: "rpc did not expose any non-zero shredVersion values".to_owned(),
-        })
-}
-
-#[cfg(feature = "gossip-bootstrap")]
 async fn resolve_shred_version(
     discovery_entrypoint: SocketAddr,
 ) -> Result<u16, GossipBootstrapStartError> {
@@ -358,22 +273,11 @@ async fn resolve_shred_version(
             .map_err(|source| GossipBootstrapStartError::DiscoveryTaskJoin { source })?;
     match discovery_result {
         Ok(shred_version) if shred_version > 0 => Ok(shred_version),
-        Ok(shred_version) => {
-            tracing::warn!(
-                entrypoint = %discovery_entrypoint,
-                shred_version,
-                "entrypoint shred probe returned invalid value; falling back to RPC"
-            );
-            resolve_shred_version_from_rpc().await
-        }
-        Err(source) => {
-            tracing::warn!(
-                entrypoint = %discovery_entrypoint,
-                error = %source,
-                "entrypoint shred probe failed; falling back to RPC"
-            );
-            resolve_shred_version_from_rpc().await
-        }
+        Ok(_) => Err(GossipBootstrapStartError::ZeroShredVersion),
+        Err(reason) => Err(GossipBootstrapStartError::DiscoveryShredVersion {
+            entrypoint: discovery_entrypoint,
+            reason,
+        }),
     }
 }
 
@@ -498,13 +402,20 @@ async fn start_gossip_bootstrapped_receiver(
         SocketAddrSpace::Unspecified,
     );
     cluster_info.set_entrypoint(ContactInfo::new_gossip_entry_point(&entrypoint));
+    let gossip_validators = read_gossip_validators();
+    if let Some(validators) = gossip_validators.as_ref() {
+        tracing::info!(
+            validator_count = validators.len(),
+            "gossip validator allowlist enabled"
+        );
+    }
     let cluster_info = Arc::new(cluster_info);
     let exit = Arc::new(AtomicBool::new(false));
     let gossip_service = GossipService::new(
         &cluster_info,
         None,
         node.sockets.gossip.clone(),
-        None,
+        gossip_validators,
         true,
         None,
         exit.clone(),
@@ -558,9 +469,16 @@ async fn start_gossip_bootstrapped_receiver(
             cluster_info.clone(),
             repair_sender_socket,
             cluster_info.keypair(),
-            Duration::from_millis(read_repair_peer_cache_ttl_ms()),
-            read_repair_peer_cache_capacity(),
-            read_repair_active_peers(),
+            crate::repair::GossipRepairClientConfig {
+                peer_cache_ttl: Duration::from_millis(read_repair_peer_cache_ttl_ms()),
+                peer_cache_capacity: read_repair_peer_cache_capacity(),
+                active_peer_count: read_repair_active_peers(),
+                peer_sample_size: read_repair_peer_sample_size(),
+                serve_max_bytes_per_sec: read_repair_serve_max_bytes_per_sec(),
+                serve_unstaked_max_bytes_per_sec: read_repair_serve_unstaked_max_bytes_per_sec(),
+                serve_max_requests_per_peer_per_sec:
+                    read_repair_serve_max_requests_per_peer_per_sec(),
+            },
         ))
     } else {
         None

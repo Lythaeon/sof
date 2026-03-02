@@ -95,6 +95,7 @@ pub(in crate::app::runtime) struct DatasetWorkerConfig {
 pub(in crate::app::runtime) struct DatasetWorkerShared {
     pub(in crate::app::runtime) plugin_host: PluginHost,
     pub(in crate::app::runtime) tx_event_tx: mpsc::Sender<TxObservedEvent>,
+    pub(in crate::app::runtime) tx_commitment_tracker: Arc<CommitmentSlotTracker>,
     pub(in crate::app::runtime) tx_event_drop_count: Arc<AtomicU64>,
     pub(in crate::app::runtime) dataset_decode_fail_count: Arc<AtomicU64>,
     pub(in crate::app::runtime) dataset_tail_skip_count: Arc<AtomicU64>,
@@ -117,6 +118,7 @@ pub(in crate::app::runtime) fn spawn_dataset_workers(
         let queue = DatasetDispatchQueue::new(queue_capacity);
         let worker_queue = queue.clone();
         let tx_event_tx = shared.tx_event_tx.clone();
+        let tx_commitment_tracker = shared.tx_commitment_tracker.clone();
         let tx_event_drop_count = shared.tx_event_drop_count.clone();
         let dataset_decode_fail_count = shared.dataset_decode_fail_count.clone();
         let dataset_tail_skip_count = shared.dataset_tail_skip_count.clone();
@@ -160,6 +162,7 @@ pub(in crate::app::runtime) fn spawn_dataset_workers(
                         &process::DatasetProcessContext {
                             plugin_host: &plugin_host,
                             tx_event_tx: &tx_event_tx,
+                            tx_commitment_tracker: tx_commitment_tracker.as_ref(),
                             tx_event_drop_count: tx_event_drop_count.as_ref(),
                             dataset_decode_fail_count: dataset_decode_fail_count.as_ref(),
                             dataset_tail_skip_count: dataset_tail_skip_count.as_ref(),

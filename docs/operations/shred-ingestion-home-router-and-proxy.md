@@ -9,38 +9,21 @@ Receive live Solana shreds into `sof-observer` and see non-zero ingest telemetry
 ## Recommended Path (Proxy/Tunnel First)
 Use this when running from home NAT/firewall. It avoids relying on turbine selecting your residential public endpoint.
 
-### 1. Edge host (public VPS): run gossip receiver + TCP relay server
-Run `sof-observer` on a public host where UDP gossip/tvu is reachable:
+### 1. Edge host (public VPS): run gossip receiver
+Run `sof-observer` on a public host where UDP gossip/TVU is reachable:
 
 ```bash
 SOF_GOSSIP_ENTRYPOINT=85.195.118.195:8001 \
 SOF_PORT_RANGE=12000-12100 \
-SOF_SHRED_VERSION=50093 \
-SOF_RELAY_LISTEN=0.0.0.0:31001 \
 RUST_LOG=info \
 cargo run --release -p sof --example observer_runtime --features gossip-bootstrap
 ```
 
 Expected:
 - gossip stats show many nodes (`num_nodes` in the hundreds)
-- relay server log: `tcp relay server listening`
 
-### 2. Home host (behind router/firewall): run TCP relay client
-Connect outbound to your edge host:
-
-```bash
-SOF_RELAY_CONNECT=<EDGE_PUBLIC_IP>:31001 \
-RUST_LOG=info \
-cargo run --release -p sof --example observer_runtime
-```
-
-This repo no longer ships wrapper scripts for this path; use the explicit command above.
-
-Expected telemetry every ~5s:
-- `ingest telemetry packets=... data=... code=...`
-
-### 3. Optional: run SOF as a plain local UDP sink
-If you already have an external shred proxy, bind to localhost (or LAN IP) and just listen:
+### 2. Home host (behind router/firewall): run local UDP sink
+Run SOF as a plain local UDP listener:
 
 ```bash
 SOF_BIND=127.0.0.1:20001 RUST_LOG=info cargo run --release -p sof --example observer_runtime
@@ -49,12 +32,12 @@ SOF_BIND=127.0.0.1:20001 RUST_LOG=info cargo run --release -p sof --example obse
 Expected telemetry every ~5s:
 - `ingest telemetry packets=... data=... code=...`
 
-### 4. Feed shreds from an upstream proxy/relay
+### 3. Feed shreds from an upstream proxy/relay
 Point your proxy to send UDP shreds to `127.0.0.1:20001` (or your chosen bind address).
 
 For Jito-style proxy setups, configure destination to this listener and keep source connectivity outbound from your machine/VPS. You do not need direct inbound internet traffic to your home host for this mode.
 
-### 5. Validate against live slot
+### 4. Validate against live slot
 In another shell:
 
 ```bash
@@ -80,26 +63,20 @@ Allow the same UDP range on the host.
 ```bash
 SOF_GOSSIP_ENTRYPOINT=85.195.118.195:8001 \
 SOF_PORT_RANGE=12000-12100 \
-SOF_SHRED_VERSION=50093 \
-SOF_REPAIR_SEED_SLOTS=16 \
 RUST_LOG=info \
 cargo run --release -p sof --example observer_runtime --features gossip-bootstrap
 ```
 
 Notes:
-- `SOF_SHRED_VERSION` should match current cluster value (mainnet seen as `50093` in this session).
+- `SOF_SHRED_VERSION` is optional; leave it unset unless you intentionally override cluster autodetection.
 - `SOF_GOSSIP_ENTRYPOINT` mode requires the `gossip-bootstrap` feature.
 - If `tvu_peers=0` and telemetry stays zero, your endpoint is still not selected/reachable for turbine.
-- `SOF_REPAIR_SEED_SLOTS` bootstraps repair by issuing `HighestWindowIndex`
-  probes for the most recent slots from one startup `getSlot` RPC call
-  (default `16`, set `0` to disable).
 - `SOF_REPAIR_OUTSTANDING_TIMEOUT_MS` controls how long a sent repair request
   stays deduplicated in-flight before retry (default `150`).
-- Agave-aligned repair recommendations for observer mode (overrides):
-  - `SOF_REPAIR_SETTLE_MS=250` (defer missing-shred requests to allow turbine propagation);
-  - `SOF_REPAIR_MIN_SLOT_LAG=8` (default is `4`; raise to reduce tip-chasing repairs);
-  - `SOF_REPAIR_MAX_REQUESTS_PER_TICK=64` and `SOF_REPAIR_PER_SLOT_CAP=16`
-    to reduce repair bursts.
+- Stream-first repair recommendations for home/router mode:
+  - keep defaults first (`SOF_REPAIR_MAX_REQUESTS_PER_TICK=4`, `SOF_REPAIR_PER_SLOT_CAP=16`);
+  - if repairs dominate traffic, increase `SOF_REPAIR_MIN_SLOT_LAG` (for example `8`);
+  - avoid large request-rate overrides because they can increase network load without improving live stream quality.
 
 ## Tunnel Alternative
 Run a small relay on a public VPS and tunnel UDP into home:

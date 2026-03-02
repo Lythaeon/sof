@@ -14,6 +14,10 @@ pub(crate) enum RepairCommand {
         packet: Vec<u8>,
         from_addr: SocketAddr,
     },
+    HandleServeRequest {
+        packet: Vec<u8>,
+        from_addr: SocketAddr,
+    },
 }
 
 #[cfg(feature = "gossip-bootstrap")]
@@ -33,6 +37,14 @@ pub(crate) enum RepairOutcome {
         source: SocketAddr,
     },
     ResponsePingError {
+        source: SocketAddr,
+        error: String,
+    },
+    ServeRequestHandled {
+        source: SocketAddr,
+        request: crate::repair::ServedRepairRequest,
+    },
+    ServeRequestError {
         source: SocketAddr,
         error: String,
     },
@@ -122,6 +134,7 @@ pub(crate) fn flush_repair_source_hints(
 #[cfg(feature = "gossip-bootstrap")]
 pub(crate) fn spawn_repair_driver(
     mut repair_client: crate::repair::GossipRepairClient,
+    relay_cache: Option<SharedRelayCache>,
 ) -> (
     mpsc::Sender<RepairCommand>,
     mpsc::Receiver<RepairOutcome>,
@@ -191,6 +204,36 @@ pub(crate) fn spawn_repair_driver(
                                 }
                             }
                         }
+                        RepairCommand::HandleServeRequest { packet, from_addr } => {
+                            match repair_client
+                                .maybe_serve_repair_request(&packet, from_addr, relay_cache.as_ref())
+                                .await
+                            {
+                                Ok(Some(request)) => {
+                                    if result_tx
+                                        .try_send(RepairOutcome::ServeRequestHandled {
+                                            source: from_addr,
+                                            request,
+                                        })
+                                        .is_err()
+                                    {
+                                        // Receiver dropped; drop outcome.
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    if result_tx
+                                        .try_send(RepairOutcome::ServeRequestError {
+                                            source: from_addr,
+                                            error: error.to_string(),
+                                        })
+                                        .is_err()
+                                    {
+                                        // Receiver dropped; drop outcome.
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 _ = refresh_tick.tick() => {
@@ -205,6 +248,7 @@ pub(crate) fn spawn_repair_driver(
 #[cfg(feature = "gossip-bootstrap")]
 pub(crate) fn replace_repair_driver(
     repair_client: crate::repair::GossipRepairClient,
+    relay_cache: Option<SharedRelayCache>,
     repair_command_tx: &mut Option<mpsc::Sender<RepairCommand>>,
     repair_result_rx: &mut Option<mpsc::Receiver<RepairOutcome>>,
     repair_peer_snapshot: &mut Option<ArcShift<crate::repair::RepairPeerSnapshot>>,
@@ -216,7 +260,8 @@ pub(crate) fn replace_repair_driver(
     if let Some(handle) = repair_driver_handle.take() {
         handle.abort();
     }
-    let (command_tx, result_rx, peer_snapshot, driver_handle) = spawn_repair_driver(repair_client);
+    let (command_tx, result_rx, peer_snapshot, driver_handle) =
+        spawn_repair_driver(repair_client, relay_cache);
     *repair_command_tx = Some(command_tx);
     *repair_result_rx = Some(result_rx);
     *repair_peer_snapshot = Some(peer_snapshot);

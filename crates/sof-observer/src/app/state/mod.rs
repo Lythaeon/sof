@@ -1,10 +1,14 @@
+mod commitment;
 mod coverage;
 mod dedupe;
+mod fork;
 mod latest;
 mod repair;
 
+pub use commitment::CommitmentSlotTracker;
 pub use coverage::SlotCoverageWindow;
 pub use dedupe::RecentShredCache;
+pub use fork::{ForkTracker, ForkTrackerUpdate};
 pub use latest::note_latest_shred_slot;
 pub use repair::OutstandingRepairRequests;
 

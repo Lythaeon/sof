@@ -135,8 +135,7 @@ async fn main() -> Result<(), TpuLeaderLoggerExampleError> {
         .build();
     let setup = RuntimeSetup::new()
         .with_repair_enabled(false)
-        .with_verify_shreds(true)
-        .with_verify_rpc_slot_leaders(true);
+        .with_verify_shreds(true);
     tracing::info!(plugins = ?host.plugin_names(), "starting SOF runtime with plugin host");
     Ok(sof::runtime::run_async_with_plugin_host_and_setup(host, &setup).await?)
 }

@@ -9,6 +9,12 @@ This folder captures two complementary architecture artifacts:
 
 These docs apply to the `sof-observer` workspace and crate layout.
 
+Network contribution model:
+
+- SOF is an active relay client by default, not a passive observer-only consumer.
+- In architecture docs, "relay tier" refers to SOF nodes that receive, cache, and re-serve recent shreds within strict bounds.
+- See ADR-0007 for the bounded relay/repair policy details.
+
 Runtime playbooks are in `docs/operations/`.
 
 User-facing crate docs:
@@ -23,7 +29,8 @@ User-facing crate docs:
 - ADR-0003: `adr/0003-type-driven-design-and-error-model.md`
 - ADR-0004: `adr/0004-static-dispatch-and-performance-layout.md`
 - ADR-0005: `adr/0005-testing-strategy-tdd-and-fuzzing.md`
-- ADR-0006: `adr/0006-transaction-sdk-and-dual-submit-routing.md` (Proposed)
+- ADR-0006: `adr/0006-transaction-sdk-and-dual-submit-routing.md` (Implemented)
+- ADR-0007: `adr/0007-always-on-relay-and-shred-cache-mesh.md` (Implemented)
 - Framework Hooks: `framework-plugin-hooks.md`
 - Runtime Bootstrap Modes: `runtime-bootstrap-modes.md`
 - ARD-0001: `ard/0001-project-structure-and-code-goals.md`

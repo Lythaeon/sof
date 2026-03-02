@@ -1,6 +1,6 @@
 # ADR-0006: Transaction SDK and Dual Submit Routing
 
-- Status: Proposed
+- Status: Implemented
 - Date: 2026-02-17
 - Decision makers: `sof-observer` maintainers
 - Related: `docs/architecture/framework-plugin-hooks.md`, `docs/architecture/runtime-bootstrap-modes.md`

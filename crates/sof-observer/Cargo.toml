@@ -46,6 +46,7 @@ arcshift = "0.4.2"
 core_affinity = "0.8"
 nix = { version = "0.30", features = ["net", "uio"] }
 crossbeam-queue = "0.3"
+crossbeam-skiplist = "0.1"
 async-trait = "0.1"
 
 [[example]]

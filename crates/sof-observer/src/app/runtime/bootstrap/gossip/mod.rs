@@ -10,7 +10,6 @@ pub(crate) use switch::maybe_switch_gossip_runtime;
 
 #[cfg(feature = "gossip-bootstrap")]
 use super::relay::resolve_socket_addr;
-use super::relay::{maybe_start_relay_server, read_relay_connect_addrs};
 use super::*;
 #[cfg(feature = "gossip-bootstrap")]
 use entrypoints::{

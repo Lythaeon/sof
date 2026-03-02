@@ -7,10 +7,11 @@ pub mod host;
 /// Plugin trait implemented by user extensions.
 pub mod plugin;
 
+pub use crate::event::{ForkSlotStatus, TxCommitmentStatus};
 pub use events::{
     ClusterNodeInfo, ClusterTopologyEvent, ControlPlaneSource, DatasetEvent, LeaderScheduleEntry,
-    LeaderScheduleEvent, ObservedRecentBlockhashEvent, RawPacketEvent, ShredEvent,
-    TransactionEvent,
+    LeaderScheduleEvent, ObservedRecentBlockhashEvent, RawPacketEvent, ReorgEvent, ShredEvent,
+    SlotStatusEvent, TransactionEvent,
 };
 pub use host::{PluginDispatchMode, PluginHost, PluginHostBuilder};
 pub use plugin::ObserverPlugin;

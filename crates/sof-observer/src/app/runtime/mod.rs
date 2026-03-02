@@ -3,7 +3,6 @@ mod dataset;
 mod entrypoints;
 mod logging;
 mod prelude;
-mod rpc;
 mod runloop;
 #[cfg(test)]
 mod tests;
@@ -25,4 +24,3 @@ use bootstrap::repair::{
     stop_repair_driver,
 };
 use dataset::*;
-use rpc::*;

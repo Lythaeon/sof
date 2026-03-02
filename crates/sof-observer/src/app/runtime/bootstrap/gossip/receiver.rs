@@ -3,8 +3,6 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub(crate) enum ReceiverBootstrapError {
-    #[error("relay runtime bootstrap failed: {reason}")]
-    RelayRuntime { reason: String },
     #[error("bind address configuration failed: {reason}")]
     BindAddress { reason: String },
     #[cfg(feature = "gossip-bootstrap")]
@@ -22,29 +20,10 @@ pub(crate) enum ReceiverBootstrapError {
 
 pub(crate) async fn start_receiver(
     tx: mpsc::Sender<RawPacketBatch>,
-    relay_bus: Option<broadcast::Sender<Vec<u8>>>,
-    relay_listen_addr: Option<SocketAddr>,
     tx_event_rx: mpsc::Receiver<TxObservedEvent>,
 ) -> Result<ReceiverRuntime, ReceiverBootstrapError> {
     let log_startup_steps = read_log_startup_steps();
-    let relay_server_handle =
-        maybe_start_relay_server(relay_bus, relay_listen_addr).map_err(|source| {
-            ReceiverBootstrapError::RelayRuntime {
-                reason: source.to_string(),
-            }
-        })?;
     let mut static_receiver_handles = Vec::new();
-    let relay_connect_addrs =
-        read_relay_connect_addrs().map_err(|source| ReceiverBootstrapError::RelayRuntime {
-            reason: source.to_string(),
-        })?;
-    if relay_connect_addrs.is_empty() {
-        tracing::info!("no SOF_RELAY_CONNECT upstreams configured");
-    }
-    for remote in relay_connect_addrs {
-        tracing::info!(remote = %remote, "starting tcp relay client feed");
-        static_receiver_handles.push(ingest::spawn_tcp_relay_receiver(remote, tx.clone()));
-    }
     #[cfg(feature = "gossip-bootstrap")]
     let mut gossip_receiver_handles = Vec::new();
     #[cfg(not(feature = "gossip-bootstrap"))]
@@ -225,7 +204,6 @@ pub(crate) async fn start_receiver(
     tracing::info!(
         static_receivers = static_receiver_handles.len(),
         gossip_receivers = gossip_receiver_handles.len(),
-        relay_server = relay_listen_addr.is_some(),
         "receiver bootstrap complete; waiting for traffic"
     );
 
@@ -234,7 +212,6 @@ pub(crate) async fn start_receiver(
         gossip_receiver_handles,
         #[cfg(feature = "gossip-bootstrap")]
         gossip_runtime,
-        relay_server_handle,
         #[cfg(feature = "gossip-bootstrap")]
         gossip_identity,
         #[cfg(feature = "gossip-bootstrap")]

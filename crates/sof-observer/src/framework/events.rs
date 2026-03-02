@@ -4,7 +4,10 @@ use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 
-use crate::{event::TxKind, shred::wire::ParsedShredHeader};
+use crate::{
+    event::{ForkSlotStatus, TxCommitmentStatus, TxKind},
+    shred::wire::ParsedShredHeader,
+};
 
 #[derive(Debug, Clone)]
 /// Runtime event emitted for each ingress UDP packet before parsing.
@@ -50,12 +53,56 @@ pub struct DatasetEvent {
 pub struct TransactionEvent {
     /// Slot containing this transaction.
     pub slot: u64,
+    /// Commitment status for this transaction slot when event was emitted.
+    pub commitment_status: TxCommitmentStatus,
+    /// Latest observed confirmed slot watermark when event was emitted.
+    pub confirmed_slot: Option<u64>,
+    /// Latest observed finalized slot watermark when event was emitted.
+    pub finalized_slot: Option<u64>,
     /// Transaction signature if present.
     pub signature: Option<Signature>,
     /// Decoded Solana transaction object.
     pub tx: Arc<VersionedTransaction>,
     /// SOF transaction kind classification.
     pub kind: TxKind,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+/// Runtime event emitted when local canonical classification for one slot changes.
+pub struct SlotStatusEvent {
+    /// Slot number whose status changed.
+    pub slot: u64,
+    /// Parent slot when known from data shreds.
+    pub parent_slot: Option<u64>,
+    /// Previous status for this slot (None when first tracked).
+    pub previous_status: Option<ForkSlotStatus>,
+    /// New status for this slot.
+    pub status: ForkSlotStatus,
+    /// Current canonical tip slot after applying this transition.
+    pub tip_slot: Option<u64>,
+    /// Current confirmed slot watermark.
+    pub confirmed_slot: Option<u64>,
+    /// Current finalized slot watermark.
+    pub finalized_slot: Option<u64>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+/// Runtime event emitted when local canonical tip switches to a different fork branch.
+pub struct ReorgEvent {
+    /// Previous local canonical tip slot.
+    pub old_tip: u64,
+    /// New local canonical tip slot.
+    pub new_tip: u64,
+    /// Lowest common ancestor between old and new tips when known.
+    pub common_ancestor: Option<u64>,
+    /// Slots detached from previous canonical branch (tip down to ancestor-exclusive).
+    pub detached_slots: Vec<u64>,
+    /// Slots attached from new canonical branch (ancestor-exclusive up to tip).
+    pub attached_slots: Vec<u64>,
+    /// Confirmed slot watermark after the switch.
+    pub confirmed_slot: Option<u64>,
+    /// Finalized slot watermark after the switch.
+    pub finalized_slot: Option<u64>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]

@@ -1,5 +1,6 @@
 mod bind;
 pub(super) mod gossip;
+#[cfg(feature = "gossip-bootstrap")]
 pub(super) mod relay;
 pub(super) mod repair;
 mod runtime;

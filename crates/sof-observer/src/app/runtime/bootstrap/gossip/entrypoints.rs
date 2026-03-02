@@ -1,6 +1,8 @@
 #[cfg(feature = "gossip-bootstrap")]
 use super::*;
 #[cfg(feature = "gossip-bootstrap")]
+use std::net::ToSocketAddrs;
+#[cfg(feature = "gossip-bootstrap")]
 use thiserror::Error;
 
 #[cfg(feature = "gossip-bootstrap")]
