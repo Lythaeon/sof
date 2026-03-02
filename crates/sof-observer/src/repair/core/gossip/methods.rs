@@ -291,9 +291,7 @@ impl GossipRepairClient {
                     .copied()
                     .map(|peer| (candidate_index, peer))
             })
-            .max_by_key(|(_, peer)| {
-                self.peer_selection_rank(now, *peer)
-            })
+            .max_by_key(|(_, peer)| self.peer_selection_rank(now, *peer))
             .map(|(_, peer)| peer)?;
 
         let sticky_peer = self.sticky_peer_by_slot.get(&slot).and_then(|sticky| {
@@ -328,8 +326,8 @@ impl GossipRepairClient {
         self.refresh_stake_map();
         self.peers_by_slot
             .retain(|_, cached| cached.updated_at.elapsed() < self.peer_cache_ttl);
-        self.sticky_peer_by_slot.retain(|slot, sticky| {
-            self.peers_by_slot.contains_key(slot)
+        self.sticky_peer_by_slot.retain(|slot_key, sticky| {
+            self.peers_by_slot.contains_key(slot_key)
                 && sticky.selected_at.elapsed() < self.peer_cache_ttl
         });
         if self.peers_by_slot.len() > self.peer_cache_capacity {

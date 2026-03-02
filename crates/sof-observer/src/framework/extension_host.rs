@@ -1,3 +1,5 @@
+#![allow(clippy::missing_docs_in_private_items, clippy::too_many_arguments)]
+
 #[cfg(test)]
 use std::str::FromStr;
 use std::{
@@ -64,7 +66,7 @@ pub struct RuntimeExtensionStartupReport {
 }
 
 impl RuntimeExtensionStartupReport {
-    fn empty(discovered_extensions: usize) -> Self {
+    const fn empty(discovered_extensions: usize) -> Self {
         Self {
             discovered_extensions,
             active_extensions: 0,
@@ -208,14 +210,14 @@ impl RuntimeExtensionHostBuilder {
 
     /// Sets startup timeout for `RuntimeExtension::on_startup`.
     #[must_use]
-    pub fn with_startup_timeout(mut self, timeout: Duration) -> Self {
+    pub const fn with_startup_timeout(mut self, timeout: Duration) -> Self {
         self.startup_timeout = timeout;
         self
     }
 
     /// Sets shutdown timeout for `RuntimeExtension::on_shutdown`.
     #[must_use]
-    pub fn with_shutdown_timeout(mut self, timeout: Duration) -> Self {
+    pub const fn with_shutdown_timeout(mut self, timeout: Duration) -> Self {
         self.shutdown_timeout = timeout;
         self
     }
@@ -229,7 +231,7 @@ impl RuntimeExtensionHostBuilder {
 
     /// Enables or disables strict validation for explicit extension names.
     #[must_use]
-    pub fn with_require_explicit_extension_names(mut self, require: bool) -> Self {
+    pub const fn with_require_explicit_extension_names(mut self, require: bool) -> Self {
         self.require_explicit_extension_names = require;
         self
     }
@@ -334,7 +336,7 @@ struct QueuedRuntimePacketEvent {
 
 impl ExtensionDispatcher {
     fn spawn(
-        extension: Arc<dyn RuntimeExtension>,
+        extension: &Arc<dyn RuntimeExtension>,
         extension_name: &'static str,
         queue_capacity: usize,
     ) -> Self {
@@ -345,7 +347,7 @@ impl ExtensionDispatcher {
         let dispatched_events = Arc::new(AtomicU64::new(0));
         let total_dispatch_lag_us = Arc::new(AtomicU64::new(0));
         let max_dispatch_lag_us = Arc::new(AtomicU64::new(0));
-        let worker_extension = Arc::clone(&extension);
+        let worker_extension = Arc::clone(extension);
         let worker_queue_depth = Arc::clone(&queue_depth);
         let worker_dispatched_events = Arc::clone(&dispatched_events);
         let worker_total_dispatch_lag_us = Arc::clone(&total_dispatch_lag_us);
@@ -429,7 +431,9 @@ impl ExtensionDispatcher {
         let avg_dispatch_lag_us = if dispatched_events == 0 {
             0
         } else {
-            total_dispatch_lag_us / dispatched_events
+            total_dispatch_lag_us
+                .checked_div(dispatched_events)
+                .unwrap_or_default()
         };
         RuntimeExtensionDispatchMetrics {
             extension: extension_name,
@@ -685,7 +689,7 @@ impl RuntimeExtensionHost {
                 capabilities: validated.capabilities,
                 subscriptions: Arc::from(validated.subscriptions),
                 dispatcher: ExtensionDispatcher::spawn(
-                    extension,
+                    &extension,
                     extension_name,
                     self.inner.event_queue_capacity,
                 ),
@@ -738,7 +742,7 @@ impl RuntimeExtensionHost {
             bytes: Arc::from(bytes),
             observed_unix_ms: current_unix_ms(),
         };
-        self.dispatch_runtime_packet(event);
+        self.dispatch_runtime_packet(&event);
     }
 
     /// Emits one extension-resource packet into runtime extension dispatch.
@@ -751,7 +755,7 @@ impl RuntimeExtensionHost {
             bytes,
             observed_unix_ms: current_unix_ms(),
         };
-        self.dispatch_runtime_packet(event);
+        self.dispatch_runtime_packet(&event);
     }
 
     /// Runs shutdown hooks and force-cancels lingering extension tasks afterwards.
@@ -793,7 +797,7 @@ impl RuntimeExtensionHost {
         }
     }
 
-    fn dispatch_runtime_packet(&self, event: RuntimePacketEvent) {
+    fn dispatch_runtime_packet(&self, event: &RuntimePacketEvent) {
         let Some(active_extensions) = self.inner.runtime_state.read().ok().and_then(|guard| {
             guard
                 .as_ref()
@@ -802,13 +806,13 @@ impl RuntimeExtensionHost {
             return;
         };
         for extension in active_extensions.iter() {
-            if !extension_can_observe_event(extension, &event) {
+            if !extension_can_observe_event(extension, event) {
                 continue;
             }
             if !extension
                 .subscriptions
                 .iter()
-                .any(|subscription| subscription.matches(&event))
+                .any(|subscription| subscription.matches(event))
             {
                 continue;
             }
@@ -897,7 +901,9 @@ async fn spawn_udp_listener(
                         local_addr,
                         remote_addr: Some(remote_addr),
                     };
-                    host.emit_extension_packet(source, Arc::from(&buffer[..len]));
+                    if let Some(payload) = buffer.get(..len) {
+                        host.emit_extension_packet(source, Arc::from(payload));
+                    }
                 }
                 Err(error) => {
                     if error.kind() != ErrorKind::Interrupted {
@@ -1056,7 +1062,9 @@ async fn read_tcp_stream_packets(
                     local_addr,
                     remote_addr,
                 };
-                host.emit_extension_packet(source, Arc::from(&buffer[..len]));
+                if let Some(payload) = buffer.get(..len) {
+                    host.emit_extension_packet(source, Arc::from(payload));
+                }
             }
             Err(error) => {
                 if error.kind() != ErrorKind::Interrupted {
@@ -1822,7 +1830,11 @@ mod tests {
         let tcp_server_addr = tcp_server.local_addr().expect("tcp local addr");
         let tcp_server_task = tokio::spawn(async move {
             if let Ok((mut stream, _)) = tcp_server.accept().await {
-                let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, b"tcp").await;
+                assert!(
+                    tokio::io::AsyncWriteExt::write_all(&mut stream, b"tcp")
+                        .await
+                        .is_ok()
+                );
             }
         });
 
@@ -1834,7 +1846,7 @@ mod tests {
             if let Ok((stream, _)) = ws_server.accept().await
                 && let Ok(mut websocket) = tokio_tungstenite::accept_async(stream).await
             {
-                let _ = websocket.send(Message::Text("ws".into())).await;
+                assert!(websocket.send(Message::Text("ws".into())).await.is_ok());
             }
         });
 
@@ -1897,8 +1909,8 @@ mod tests {
         let report = host.startup().await;
         assert_eq!(report.active_extensions, 1);
         assert_eq!(report.failed_extensions, 0);
-        let _ = tcp_server_task.await;
-        let _ = ws_server_task.await;
+        assert!(tcp_server_task.await.is_ok());
+        assert!(ws_server_task.await.is_ok());
         host.shutdown().await;
     }
 }

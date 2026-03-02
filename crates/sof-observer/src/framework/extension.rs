@@ -36,21 +36,16 @@ impl ExtensionCapability {
 }
 
 /// Visibility policy for extension-owned packet streams.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub enum ExtensionStreamVisibility {
     /// Stream is visible only to the owning extension.
+    #[default]
     Private,
     /// Stream is visible to other extensions that subscribe to this tag.
     Shared {
         /// Shared stream namespace used by cross-extension subscriptions.
         tag: String,
     },
-}
-
-impl Default for ExtensionStreamVisibility {
-    fn default() -> Self {
-        Self::Private
-    }
 }
 
 /// Declarative UDP listener resource requested at startup.
@@ -315,6 +310,7 @@ pub struct ExtensionShutdownContext {
 #[derive(Debug, Clone, Error, Eq, PartialEq)]
 #[error("{reason}")]
 pub struct ExtensionStartupError {
+    /// Human-readable startup failure reason.
     reason: String,
 }
 

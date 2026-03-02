@@ -110,12 +110,19 @@ async fn main() -> Result<(), RuntimeExtensionWebSocketConnectorExampleError> {
                     tracing::warn!("websocket demo handshake failed");
                     return;
                 };
-                let _ = websocket
+                if let Err(error) = websocket
                     .send(Message::Text("runtime-extension-ws-text".into()))
-                    .await;
-                let _ = websocket
+                    .await
+                {
+                    tracing::warn!(error = %error, "websocket demo text send failed");
+                    return;
+                }
+                if let Err(error) = websocket
                     .send(Message::Binary(vec![1_u8, 2_u8, 3_u8, 4_u8].into()))
-                    .await;
+                    .await
+                {
+                    tracing::warn!(error = %error, "websocket demo binary send failed");
+                }
             });
         }
     });
