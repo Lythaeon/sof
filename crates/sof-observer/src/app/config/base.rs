@@ -179,3 +179,21 @@ pub fn read_tx_finalized_depth_slots() -> u64 {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(150)
 }
+
+pub fn read_runtime_extension_queue_depth_warn() -> u64 {
+    read_env_var("SOF_RUNTIME_EXTENSION_QUEUE_DEPTH_WARN")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(4_096)
+}
+
+pub fn read_runtime_extension_dispatch_lag_warn_us() -> u64 {
+    read_env_var("SOF_RUNTIME_EXTENSION_DISPATCH_LAG_WARN_US")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(50_000)
+}
+
+pub fn read_runtime_extension_drop_warn_delta() -> u64 {
+    read_env_var("SOF_RUNTIME_EXTENSION_DROP_WARN_DELTA")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(100)
+}

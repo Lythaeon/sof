@@ -723,6 +723,14 @@ impl RuntimeExtensionHost {
 
     /// Emits one observer ingress packet into runtime extension dispatch.
     pub fn on_observer_packet(&self, source: SocketAddr, bytes: &[u8]) {
+        self.on_observer_packet_shared(source, Arc::from(bytes));
+    }
+
+    /// Emits one observer ingress packet with shared payload ownership.
+    ///
+    /// Use this when ingress already owns packet bytes behind `Arc<[u8]>` to
+    /// avoid an additional payload allocation.
+    pub fn on_observer_packet_shared(&self, source: SocketAddr, bytes: Arc<[u8]>) {
         if bytes.is_empty() {
             return;
         }
@@ -739,7 +747,7 @@ impl RuntimeExtensionHost {
         };
         let event = RuntimePacketEvent {
             source: source_meta,
-            bytes: Arc::from(bytes),
+            bytes,
             observed_unix_ms: current_unix_ms(),
         };
         self.dispatch_runtime_packet(&event);
