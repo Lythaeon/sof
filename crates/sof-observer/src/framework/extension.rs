@@ -332,8 +332,18 @@ impl ExtensionStartupError {
 #[async_trait]
 pub trait RuntimeExtension: Send + Sync + 'static {
     /// Stable extension identifier used in startup logs and diagnostics.
+    ///
+    /// Production extensions should override this with a stable literal identifier.
+    /// The default value uses Rust type names and can change when refactoring.
     fn name(&self) -> &'static str {
         core::any::type_name::<Self>()
+    }
+
+    /// Returns true when `name()` is overridden with a stable identifier.
+    ///
+    /// Hosts may use this for startup validation in hardened environments.
+    fn has_explicit_name(&self) -> bool {
+        self.name() != core::any::type_name::<Self>()
     }
 
     /// Called once during runtime startup to request capabilities, resources, and subscriptions.

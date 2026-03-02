@@ -8,7 +8,7 @@ use std::{
         Arc, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use futures_util::{SinkExt, StreamExt};
@@ -74,6 +74,25 @@ impl RuntimeExtensionStartupReport {
     }
 }
 
+/// Runtime dispatch telemetry snapshot for one active extension.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RuntimeExtensionDispatchMetrics {
+    /// Extension identifier.
+    pub extension: &'static str,
+    /// Number of events dropped due to queue pressure or closed dispatcher.
+    pub dropped_events: u64,
+    /// Current in-memory dispatch queue depth.
+    pub queue_depth: u64,
+    /// Maximum observed queue depth since startup.
+    pub max_queue_depth: u64,
+    /// Number of events delivered to `on_packet_received`.
+    pub dispatched_events: u64,
+    /// Mean queue wait time before callback dispatch in microseconds.
+    pub avg_dispatch_lag_us: u64,
+    /// Maximum queue wait time before callback dispatch in microseconds.
+    pub max_dispatch_lag_us: u64,
+}
+
 /// Capability allowlist used by runtime extension startup validation.
 #[derive(Debug, Clone)]
 pub struct RuntimeExtensionCapabilityPolicy {
@@ -95,10 +114,38 @@ impl RuntimeExtensionCapabilityPolicy {
         Self::default()
     }
 
+    /// Returns a policy that denies all capabilities.
+    #[must_use]
+    pub fn deny_all() -> Self {
+        Self {
+            allowed: HashSet::new(),
+        }
+    }
+
+    /// Returns a hardened baseline policy.
+    ///
+    /// This allows observer ingress and local bind capabilities while denying
+    /// outbound connector capabilities unless explicitly enabled.
+    #[must_use]
+    pub fn production_defaults() -> Self {
+        Self::deny_all()
+            .with(ExtensionCapability::BindUdp)
+            .with(ExtensionCapability::BindTcp)
+            .with(ExtensionCapability::ObserveObserverIngress)
+            .with(ExtensionCapability::ObserveSharedExtensionStream)
+    }
+
     /// Returns true if this policy allows the provided capability.
     #[must_use]
     pub fn allows(&self, capability: ExtensionCapability) -> bool {
         self.allowed.contains(&capability)
+    }
+
+    /// Adds one capability to the allowlist.
+    #[must_use]
+    pub fn with(mut self, capability: ExtensionCapability) -> Self {
+        self.allowed.insert(capability);
+        self
     }
 
     /// Removes one capability from the allowlist.
@@ -116,6 +163,7 @@ pub struct RuntimeExtensionHostBuilder {
     startup_timeout: Duration,
     shutdown_timeout: Duration,
     capability_policy: RuntimeExtensionCapabilityPolicy,
+    require_explicit_extension_names: bool,
 }
 
 impl Default for RuntimeExtensionHostBuilder {
@@ -126,6 +174,7 @@ impl Default for RuntimeExtensionHostBuilder {
             startup_timeout: Duration::from_secs(DEFAULT_STARTUP_TIMEOUT_SECS),
             shutdown_timeout: Duration::from_secs(DEFAULT_SHUTDOWN_TIMEOUT_SECS),
             capability_policy: RuntimeExtensionCapabilityPolicy::default(),
+            require_explicit_extension_names: false,
         }
     }
 }
@@ -135,6 +184,19 @@ impl RuntimeExtensionHostBuilder {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a hardened builder profile for production environments.
+    ///
+    /// Enables a restrictive capability policy and requires extensions to
+    /// override `RuntimeExtension::name` with a stable identifier.
+    #[must_use]
+    pub fn production_defaults() -> Self {
+        Self {
+            capability_policy: RuntimeExtensionCapabilityPolicy::production_defaults(),
+            require_explicit_extension_names: true,
+            ..Self::default()
+        }
     }
 
     /// Sets bounded async event queue capacity for extension packet dispatch.
@@ -165,6 +227,13 @@ impl RuntimeExtensionHostBuilder {
         self
     }
 
+    /// Enables or disables strict validation for explicit extension names.
+    #[must_use]
+    pub fn with_require_explicit_extension_names(mut self, require: bool) -> Self {
+        self.require_explicit_extension_names = require;
+        self
+    }
+
     /// Adds one extension value by storing it behind `Arc`.
     #[must_use]
     pub fn add_extension<E>(mut self, extension: E) -> Self
@@ -192,6 +261,7 @@ impl RuntimeExtensionHostBuilder {
                 startup_timeout: self.startup_timeout,
                 shutdown_timeout: self.shutdown_timeout,
                 capability_policy: self.capability_policy,
+                require_explicit_extension_names: self.require_explicit_extension_names,
                 runtime_state: RwLock::new(None),
             }),
         }
@@ -204,6 +274,7 @@ struct RuntimeExtensionHostInner {
     startup_timeout: Duration,
     shutdown_timeout: Duration,
     capability_policy: RuntimeExtensionCapabilityPolicy,
+    require_explicit_extension_names: bool,
     runtime_state: RwLock<Option<RuntimeExtensionRuntimeState>>,
 }
 
@@ -225,6 +296,10 @@ impl ActiveRuntimeExtension {
         self.dispatcher.dropped_count()
     }
 
+    fn dispatch_metrics_snapshot(&self) -> RuntimeExtensionDispatchMetrics {
+        self.dispatcher.metrics_snapshot(self.name)
+    }
+
     fn push_resource_handle(&self, handle: JoinHandle<()>) {
         if let Ok(mut guard) = self.resource_handles.lock() {
             guard.push(handle);
@@ -242,9 +317,19 @@ impl ActiveRuntimeExtension {
 
 #[derive(Clone)]
 struct ExtensionDispatcher {
-    tx: mpsc::Sender<RuntimePacketEvent>,
+    tx: mpsc::Sender<QueuedRuntimePacketEvent>,
     dropped_events: Arc<AtomicU64>,
+    queue_depth: Arc<AtomicU64>,
+    max_queue_depth: Arc<AtomicU64>,
+    dispatched_events: Arc<AtomicU64>,
+    total_dispatch_lag_us: Arc<AtomicU64>,
+    max_dispatch_lag_us: Arc<AtomicU64>,
     worker: Arc<Mutex<Option<JoinHandle<()>>>>,
+}
+
+struct QueuedRuntimePacketEvent {
+    event: RuntimePacketEvent,
+    queued_at: Instant,
 }
 
 impl ExtensionDispatcher {
@@ -253,14 +338,32 @@ impl ExtensionDispatcher {
         extension_name: &'static str,
         queue_capacity: usize,
     ) -> Self {
-        let (tx, mut rx) = mpsc::channel::<RuntimePacketEvent>(queue_capacity.max(1));
+        let (tx, mut rx) = mpsc::channel::<QueuedRuntimePacketEvent>(queue_capacity.max(1));
         let dropped_events = Arc::new(AtomicU64::new(0));
+        let queue_depth = Arc::new(AtomicU64::new(0));
+        let max_queue_depth = Arc::new(AtomicU64::new(0));
+        let dispatched_events = Arc::new(AtomicU64::new(0));
+        let total_dispatch_lag_us = Arc::new(AtomicU64::new(0));
+        let max_dispatch_lag_us = Arc::new(AtomicU64::new(0));
         let worker_extension = Arc::clone(&extension);
+        let worker_queue_depth = Arc::clone(&queue_depth);
+        let worker_dispatched_events = Arc::clone(&dispatched_events);
+        let worker_total_dispatch_lag_us = Arc::clone(&total_dispatch_lag_us);
+        let worker_max_dispatch_lag_us = Arc::clone(&max_dispatch_lag_us);
         let worker = tokio::spawn(async move {
-            while let Some(event) = rx.recv().await {
+            while let Some(queued_event) = rx.recv().await {
+                worker_queue_depth.fetch_sub(1, Ordering::Relaxed);
+                let queue_lag_us =
+                    u64::try_from(queued_event.queued_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+                worker_dispatched_events.fetch_add(1, Ordering::Relaxed);
+                worker_total_dispatch_lag_us.fetch_add(queue_lag_us, Ordering::Relaxed);
+                record_max_atomic(&worker_max_dispatch_lag_us, queue_lag_us);
+
                 let callback_extension = Arc::clone(&worker_extension);
                 let callback_result = tokio::spawn(async move {
-                    callback_extension.on_packet_received(event).await;
+                    callback_extension
+                        .on_packet_received(queued_event.event)
+                        .await;
                 })
                 .await;
                 if let Err(error) = callback_result {
@@ -284,17 +387,33 @@ impl ExtensionDispatcher {
         Self {
             tx,
             dropped_events,
+            queue_depth,
+            max_queue_depth,
+            dispatched_events,
+            total_dispatch_lag_us,
+            max_dispatch_lag_us,
             worker: Arc::new(Mutex::new(Some(worker))),
         }
     }
 
     fn dispatch(&self, extension_name: &'static str, event: RuntimePacketEvent) {
-        match self.tx.try_send(event) {
+        let queued_event = QueuedRuntimePacketEvent {
+            event,
+            queued_at: Instant::now(),
+        };
+        let queue_depth = self
+            .queue_depth
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        record_max_atomic(&self.max_queue_depth, queue_depth);
+        match self.tx.try_send(queued_event) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
+                self.queue_depth.fetch_sub(1, Ordering::Relaxed);
                 self.record_drop(extension_name, "queue full");
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.queue_depth.fetch_sub(1, Ordering::Relaxed);
                 self.record_drop(extension_name, "queue closed");
             }
         }
@@ -302,6 +421,25 @@ impl ExtensionDispatcher {
 
     fn dropped_count(&self) -> u64 {
         self.dropped_events.load(Ordering::Relaxed)
+    }
+
+    fn metrics_snapshot(&self, extension_name: &'static str) -> RuntimeExtensionDispatchMetrics {
+        let dispatched_events = self.dispatched_events.load(Ordering::Relaxed);
+        let total_dispatch_lag_us = self.total_dispatch_lag_us.load(Ordering::Relaxed);
+        let avg_dispatch_lag_us = if dispatched_events == 0 {
+            0
+        } else {
+            total_dispatch_lag_us / dispatched_events
+        };
+        RuntimeExtensionDispatchMetrics {
+            extension: extension_name,
+            dropped_events: self.dropped_events.load(Ordering::Relaxed),
+            queue_depth: self.queue_depth.load(Ordering::Relaxed),
+            max_queue_depth: self.max_queue_depth.load(Ordering::Relaxed),
+            dispatched_events,
+            avg_dispatch_lag_us,
+            max_dispatch_lag_us: self.max_dispatch_lag_us.load(Ordering::Relaxed),
+        }
     }
 
     fn abort_worker(&self) {
@@ -322,6 +460,7 @@ impl ExtensionDispatcher {
                 extension = extension_name,
                 reason,
                 dropped,
+                queue_depth = self.queue_depth.load(Ordering::Relaxed),
                 "dropping runtime extension packet event to protect ingest hot path"
             );
         }
@@ -345,6 +484,12 @@ impl RuntimeExtensionHost {
     #[must_use]
     pub fn builder() -> RuntimeExtensionHostBuilder {
         RuntimeExtensionHostBuilder::new()
+    }
+
+    /// Starts a hardened host builder profile for production environments.
+    #[must_use]
+    pub fn production_builder() -> RuntimeExtensionHostBuilder {
+        RuntimeExtensionHostBuilder::production_defaults()
     }
 
     /// Returns true when no extensions are registered.
@@ -426,6 +571,25 @@ impl RuntimeExtensionHost {
             .unwrap_or_default()
     }
 
+    /// Returns dispatch telemetry snapshots per active runtime extension.
+    #[must_use]
+    pub fn dispatch_metrics_by_extension(&self) -> Vec<RuntimeExtensionDispatchMetrics> {
+        self.inner
+            .runtime_state
+            .read()
+            .ok()
+            .and_then(|guard| {
+                guard.as_ref().map(|state| {
+                    state
+                        .active_extensions
+                        .iter()
+                        .map(|extension| extension.dispatch_metrics_snapshot())
+                        .collect()
+                })
+            })
+            .unwrap_or_default()
+    }
+
     /// Runs startup hooks, validates manifests, and provisions extension resources.
     pub async fn startup(&self) -> RuntimeExtensionStartupReport {
         if let Ok(guard) = self.inner.runtime_state.read()
@@ -441,10 +605,41 @@ impl RuntimeExtensionHost {
 
         let mut report = RuntimeExtensionStartupReport::empty(self.inner.extensions.len());
         let mut active_extensions: Vec<Arc<ActiveRuntimeExtension>> = Vec::new();
+        let mut seen_extension_names = HashSet::<&'static str>::new();
 
         for extension in self.inner.extensions.iter() {
             let extension = Arc::clone(extension);
             let extension_name = extension.name();
+            let has_explicit_name = extension.has_explicit_name();
+
+            if !has_explicit_name {
+                let concrete_type_name = std::any::type_name_of_val(extension.as_ref());
+                tracing::warn!(
+                    extension = extension_name,
+                    concrete_type = concrete_type_name,
+                    "runtime extension uses implicit type-name identifier; override `name()` with a stable literal for telemetry/filter durability"
+                );
+                if self.inner.require_explicit_extension_names {
+                    report.failures.push(RuntimeExtensionStartupFailure {
+                        extension: extension_name,
+                        reason:
+                            "runtime policy requires explicit stable extension names; override RuntimeExtension::name"
+                                .to_owned(),
+                    });
+                    continue;
+                }
+            }
+
+            if !seen_extension_names.insert(extension_name) {
+                report.failures.push(RuntimeExtensionStartupFailure {
+                    extension: extension_name,
+                    reason: format!(
+                        "duplicate extension name `{extension_name}`; extension names must be unique"
+                    ),
+                });
+                continue;
+            }
+
             let startup_context = ExtensionStartupContext { extension_name };
             let manifest_result = timeout(
                 self.inner.startup_timeout,
@@ -1119,6 +1314,16 @@ fn validate_manifest(
     })
 }
 
+fn record_max_atomic(target: &AtomicU64, value: u64) {
+    let mut observed = target.load(Ordering::Relaxed);
+    while value > observed {
+        match target.compare_exchange_weak(observed, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(actual) => observed = actual,
+        }
+    }
+}
+
 fn current_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1196,6 +1401,25 @@ mod tests {
         }
     }
 
+    struct ImplicitNameExtension;
+
+    #[async_trait]
+    impl RuntimeExtension for ImplicitNameExtension {
+        async fn on_startup(
+            &self,
+            _ctx: ExtensionStartupContext,
+        ) -> Result<ExtensionManifest, crate::framework::extension::ExtensionStartupError> {
+            Ok(ExtensionManifest {
+                capabilities: vec![ExtensionCapability::ObserveObserverIngress],
+                resources: Vec::new(),
+                subscriptions: vec![PacketSubscription {
+                    source_kind: Some(RuntimePacketSourceKind::ObserverIngress),
+                    ..PacketSubscription::default()
+                }],
+            })
+        }
+    }
+
     #[tokio::test]
     async fn startup_failure_isolated_per_extension() {
         let ok_counter = Arc::new(AtomicUsize::new(0));
@@ -1257,6 +1481,53 @@ mod tests {
         let report = host.startup().await;
         assert_eq!(report.active_extensions, 0);
         assert_eq!(report.failed_extensions, 1);
+    }
+
+    #[tokio::test]
+    async fn production_defaults_deny_outbound_connectors() {
+        let host = RuntimeExtensionHost::production_builder()
+            .add_extension(CounterExtension {
+                name: "connect-tcp-extension",
+                startup_manifest: ExtensionManifest {
+                    capabilities: vec![ExtensionCapability::ConnectTcp],
+                    resources: vec![ExtensionResourceSpec::TcpConnector(
+                        crate::framework::extension::TcpConnectorSpec {
+                            resource_id: "tcp-outbound".to_owned(),
+                            remote_addr: SocketAddr::from_str("127.0.0.1:9").expect("valid addr"),
+                            visibility:
+                                crate::framework::extension::ExtensionStreamVisibility::Private,
+                            read_buffer_bytes: 128,
+                        },
+                    )],
+                    subscriptions: Vec::new(),
+                },
+                packet_count: Arc::new(AtomicUsize::new(0)),
+                shutdown_wait: Duration::ZERO,
+                shutdown_called: Arc::new(AtomicBool::new(false)),
+            })
+            .build();
+
+        let report = host.startup().await;
+        assert_eq!(report.active_extensions, 0);
+        assert_eq!(report.failed_extensions, 1);
+        assert!(report.failures[0].reason.contains("not allowed"));
+    }
+
+    #[tokio::test]
+    async fn strict_name_policy_rejects_implicit_type_name_extensions() {
+        let host = RuntimeExtensionHost::builder()
+            .with_require_explicit_extension_names(true)
+            .add_extension(ImplicitNameExtension)
+            .build();
+
+        let report = host.startup().await;
+        assert_eq!(report.active_extensions, 0);
+        assert_eq!(report.failed_extensions, 1);
+        assert!(
+            report.failures[0]
+                .reason
+                .contains("requires explicit stable extension names")
+        );
     }
 
     #[tokio::test]
@@ -1503,6 +1774,13 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(350)).await;
         assert!(counter.load(Ordering::Relaxed) < 16);
         assert!(host.dropped_event_count() > 0);
+
+        let metrics = host.dispatch_metrics_by_extension();
+        assert_eq!(metrics.len(), 1);
+        assert!(metrics[0].dropped_events > 0);
+        assert!(metrics[0].max_queue_depth >= 1);
+        assert_eq!(metrics[0].queue_depth, 0);
+        assert!(metrics[0].dispatched_events >= 1);
     }
 
     #[tokio::test]

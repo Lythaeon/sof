@@ -25,8 +25,8 @@ pub use extension::{
     UdpListenerSpec, WsConnectorSpec,
 };
 pub use extension_host::{
-    RuntimeExtensionCapabilityPolicy, RuntimeExtensionHost, RuntimeExtensionHostBuilder,
-    RuntimeExtensionStartupFailure, RuntimeExtensionStartupReport,
+    RuntimeExtensionCapabilityPolicy, RuntimeExtensionDispatchMetrics, RuntimeExtensionHost,
+    RuntimeExtensionHostBuilder, RuntimeExtensionStartupFailure, RuntimeExtensionStartupReport,
 };
 pub use host::{PluginDispatchMode, PluginHost, PluginHostBuilder};
 pub use plugin::ObserverPlugin;
