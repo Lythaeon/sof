@@ -17,7 +17,7 @@ cargo add sof
 Optional gossip bootstrap support at compile time:
 
 ```toml
-sof = { version = "0.3", features = ["gossip-bootstrap"] }
+sof = { version = "0.4", features = ["gossip-bootstrap"] }
 ```
 
 ## Quick Start
@@ -88,6 +88,44 @@ async fn main() -> Result<(), sof::runtime::RuntimeError> {
 }
 ```
 
+## RuntimeExtension Quickstart
+
+```rust
+use async_trait::async_trait;
+use sof::framework::{
+    ExtensionCapability, ExtensionManifest, ExtensionStartupContext, PacketSubscription,
+    RuntimeExtension, RuntimeExtensionHost, RuntimePacketSourceKind,
+};
+
+#[derive(Debug, Clone, Copy)]
+struct IngressExtension;
+
+#[async_trait]
+impl RuntimeExtension for IngressExtension {
+    async fn on_startup(
+        &self,
+        _ctx: ExtensionStartupContext,
+    ) -> Result<ExtensionManifest, sof::framework::extension::ExtensionStartupError> {
+        Ok(ExtensionManifest {
+            capabilities: vec![ExtensionCapability::ObserveObserverIngress],
+            resources: Vec::new(),
+            subscriptions: vec![PacketSubscription {
+                source_kind: Some(RuntimePacketSourceKind::ObserverIngress),
+                ..PacketSubscription::default()
+            }],
+        })
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), sof::runtime::RuntimeError> {
+    let host = RuntimeExtensionHost::builder()
+        .add_extension(IngressExtension)
+        .build();
+    sof::runtime::run_async_with_extension_host(host).await
+}
+```
+
 ## Plugin Hooks
 
 Current hook set:
@@ -121,6 +159,9 @@ These commitment fields are derived from local shred-stream slot progress (depth
 
 - Hooks are dispatched off the ingest hot path through a bounded queue.
 - Queue pressure drops hook events instead of stalling ingest.
+- `RuntimeExtension` WebSocket connectors support full `ws://` / `wss://` handshake + frame decoding.
+- WebSocket close frames emit `RuntimePacketEventClass::ConnectionClosed` in `on_packet_received`.
+- WebSocket packet events expose `websocket_frame_type` (`Text`/`Binary`/`Ping`/`Pong`) for startup-time filtering and runtime routing.
 - In gossip mode, SOF runs as an active bounded relay client by default (UDP relay + repair serve), not as an observer-only passive consumer.
 - `SOF_LIVE_SHREDS_ENABLED=false` enables control-plane-only mode.
 
@@ -132,6 +173,11 @@ These commitment fields are derived from local shred-stream slot progress (depth
 - `non_vote_tx_logger`
 - `raydium_contract`
 - `tpu_leader_logger`
+- `runtime_extension_observer_ingress`
+- `runtime_extension_udp_listener`
+- `runtime_extension_shared_stream`
+- `runtime_extension_with_plugins`
+- `runtime_extension_websocket_connector`
 
 Run any example:
 

@@ -27,8 +27,9 @@ const CONTROL_PLANE_EVENT_TICK_MS: u64 = 250;
 #[cfg(feature = "gossip-bootstrap")]
 const CONTROL_PLANE_EVENT_SNAPSHOT_SECS: u64 = 30;
 
-pub(in crate::app::runtime) async fn run_async_with_plugin_host(
+pub(in crate::app::runtime) async fn run_async_with_hosts(
     plugin_host: PluginHost,
+    extension_host: RuntimeExtensionHost,
 ) -> Result<(), RuntimeRunloopError> {
     init_tracing();
     let log_startup_steps = read_log_startup_steps();
@@ -90,6 +91,17 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
     let plugin_hooks_enabled = !plugin_host.is_empty();
     if plugin_hooks_enabled {
         tracing::info!(plugins = ?plugin_host.plugin_names(), "observer plugins enabled");
+    }
+    let extension_hooks_enabled = !extension_host.is_empty();
+    if extension_hooks_enabled {
+        let startup_report = extension_host.startup().await;
+        tracing::info!(
+            registered_extensions = startup_report.discovered_extensions,
+            active_extensions = startup_report.active_extensions,
+            failed_extensions = startup_report.failed_extensions,
+            extension_failures = ?startup_report.failures,
+            "runtime extensions startup completed"
+        );
     }
     let relay_cache_window_ms = read_relay_cache_window_ms();
     let relay_cache_max_shreds = read_relay_cache_max_shreds();
@@ -659,6 +671,9 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
                         source: source_addr,
                         bytes: Arc::from(packet_bytes.as_slice()),
                     });
+                }
+                if extension_hooks_enabled {
+                    extension_host.on_observer_packet(source_addr, &packet_bytes);
                 }
                 packet_count = packet_count.saturating_add(1);
                 if logged_waiting_for_packets {
@@ -2094,6 +2109,9 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
         }
     }
     dataset_worker_pool.shutdown().await;
+    if extension_hooks_enabled {
+        extension_host.shutdown().await;
+    }
     drop(runtime);
     Ok(())
 }

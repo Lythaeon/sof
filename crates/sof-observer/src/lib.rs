@@ -15,7 +15,9 @@
 //!
 //! External users should start from:
 //! - [`crate::runtime`] to run the packaged observer loop.
-//! - [`crate::framework`] to build plugins and attach a [`crate::framework::PluginHost`].
+//! - [`crate::framework`] to build observers using either:
+//!   - [`crate::framework::ObserverPlugin`] + [`crate::framework::PluginHost`], or
+//!   - [`crate::framework::RuntimeExtension`] + [`crate::framework::RuntimeExtensionHost`].
 
 #[doc(hidden)]
 mod app;

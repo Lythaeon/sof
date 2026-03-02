@@ -146,6 +146,10 @@ Repairs are stream-first by default: SOF keeps repair request budgets at `0` whi
 | `SOF_REPAIR_RESULT_QUEUE` | `16384` | Same risk as command queue for downstream processing. |
 | `SOF_REPAIR_PEER_REFRESH_MS` | `1000` | Refresh cadence trades freshness for background overhead. |
 
+Additional implemented behavior (not env-tunable in current release):
+
+- repair peer selection applies a short sticky window with score-margin hysteresis to reduce rapid peer churn while still allowing fast failover when a clearly better peer appears.
+
 ## Ingest hot-path controls
 
 | Variable | Default | Why this is advanced |

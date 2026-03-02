@@ -46,7 +46,7 @@ struct CachedShredKey {
 #[derive(Debug, Clone)]
 struct CachedShred {
     seen_at: Instant,
-    bytes: Vec<u8>,
+    bytes: Arc<[u8]>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -106,7 +106,7 @@ impl RecentShredRingBuffer {
             key,
             CachedShred {
                 seen_at: now,
-                bytes: packet.to_vec(),
+                bytes: Arc::from(packet),
             },
         );
         self.order.push_back((now, key));
@@ -146,7 +146,7 @@ impl RecentShredRingBuffer {
             });
         }
 
-        let mut matches: Vec<(u32, Vec<u8>)> = self
+        let mut matches: Vec<(u32, Arc<[u8]>)> = self
             .entries
             .iter()
             .filter(|(key, _)| {
@@ -169,7 +169,7 @@ impl RecentShredRingBuffer {
                 break;
             }
             response_bytes = next_bytes;
-            response.push(bytes);
+            response.push(bytes.as_ref().to_vec());
         }
 
         Ok(response)
@@ -180,7 +180,7 @@ impl RecentShredRingBuffer {
         let mut evicted = 0usize;
         self.evict(now, &mut evicted);
         self.entries.iter().find_map(|(key, entry)| {
-            (key.slot == slot && key.index == index).then(|| entry.bytes.clone())
+            (key.slot == slot && key.index == index).then(|| entry.bytes.as_ref().to_vec())
         })
     }
 
@@ -197,7 +197,7 @@ impl RecentShredRingBuffer {
             .iter()
             .filter(|(key, _)| key.slot == slot && key.index > min_index_exclusive)
             .max_by_key(|(key, entry)| (key.index, entry.seen_at))
-            .map(|(key, entry)| (key.index, entry.bytes.clone()))
+            .map(|(key, entry)| (key.index, entry.bytes.as_ref().to_vec()))
     }
 
     fn evict(&mut self, now: Instant, evicted: &mut usize) {
@@ -283,7 +283,7 @@ impl SharedRelayCache {
             key,
             CachedShred {
                 seen_at: now,
-                bytes: packet.to_vec(),
+                bytes: Arc::from(packet),
             },
         );
         self.order.insert((now, key), ());
@@ -313,6 +313,21 @@ impl SharedRelayCache {
         limits: RelayRangeLimits,
         now: Instant,
     ) -> Result<Vec<Vec<u8>>, RelayRangeQueryError> {
+        self.query_range_shared(request, limits, now)
+            .map(|response| {
+                response
+                    .into_iter()
+                    .map(|bytes| bytes.as_ref().to_vec())
+                    .collect()
+            })
+    }
+
+    pub fn query_range_shared(
+        &self,
+        request: RelayRangeRequest,
+        limits: RelayRangeLimits,
+        now: Instant,
+    ) -> Result<Vec<Arc<[u8]>>, RelayRangeQueryError> {
         let _ = self.evict(now);
         if request.start_index > request.end_index {
             return Err(RelayRangeQueryError::InvalidRange {
@@ -331,7 +346,7 @@ impl SharedRelayCache {
             });
         }
 
-        let mut response = Vec::new();
+        let mut response: Vec<Arc<[u8]>> = Vec::new();
         let mut response_bytes = 0usize;
         let start = slot_index_range_start(request.slot, request.start_index);
         let end = slot_index_range_end(request.slot, request.end_index);
@@ -356,11 +371,17 @@ impl SharedRelayCache {
 
     #[must_use]
     pub fn query_exact(&self, slot: u64, index: u32, now: Instant) -> Option<Vec<u8>> {
+        self.query_exact_shared(slot, index, now)
+            .map(|bytes| bytes.as_ref().to_vec())
+    }
+
+    #[must_use]
+    pub fn query_exact_shared(&self, slot: u64, index: u32, now: Instant) -> Option<Arc<[u8]>> {
         let _ = self.evict(now);
         let start = slot_index_range_start(slot, index);
         let end = slot_index_range_end(slot, index);
         let mut latest_seen_at: Option<Instant> = None;
-        let mut latest_bytes: Option<Vec<u8>> = None;
+        let mut latest_bytes: Option<Arc<[u8]>> = None;
         for entry in self.slot_index.range(start..=end) {
             let key = entry.key().2;
             let Some(cached) = self.entries.get(&key) else {
@@ -382,13 +403,24 @@ impl SharedRelayCache {
         min_index_exclusive: u32,
         now: Instant,
     ) -> Option<(u32, Vec<u8>)> {
+        self.query_highest_above_shared(slot, min_index_exclusive, now)
+            .map(|(index, bytes)| (index, bytes.as_ref().to_vec()))
+    }
+
+    #[must_use]
+    pub fn query_highest_above_shared(
+        &self,
+        slot: u64,
+        min_index_exclusive: u32,
+        now: Instant,
+    ) -> Option<(u32, Arc<[u8]>)> {
         let _ = self.evict(now);
         let start_index = min_index_exclusive.saturating_add(1);
         let start = slot_index_range_start(slot, start_index);
         let end = slot_index_range_end(slot, u32::MAX);
         let mut best_index: Option<u32> = None;
         let mut best_seen_at: Option<Instant> = None;
-        let mut best_bytes: Option<Vec<u8>> = None;
+        let mut best_bytes: Option<Arc<[u8]>> = None;
         for entry in self.slot_index.range(start..=end).rev() {
             let (_, index, key) = *entry.key();
             if let Some(current_best_index) = best_index
