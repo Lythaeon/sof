@@ -58,7 +58,7 @@ jobs:
           crates=("sof" "sof-tx")
 
           for pkg in "${crates[@]}"; do
-            crate_version="$(cargo pkgid -p "$pkg" | sed -E 's/.*@(.+)$/\1/')"
+            crate_version="$(cargo pkgid -p "$pkg" | awk -F'[#@]' '{print $NF}')"
             
             if [[ "${crate_version}" != "${tag_version}" ]]; then
               echo ">>> Skipping $pkg: version (${crate_version}) does not match tag (${tag_version})"
