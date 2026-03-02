@@ -221,11 +221,11 @@ impl GossipRepairClient {
         }
         let response = match (relay_cache, request.kind) {
             (Some(cache), ParsedRepairRequestKind::WindowIndex) => cache
-                .query_exact_shared(request.slot, requested_index, now)
+                .query_exact(request.slot, requested_index, now)
                 .and_then(|bytes| build_repair_response_payload(&bytes, request.nonce))
                 .map(|payload| (requested_index, payload)),
             (Some(cache), ParsedRepairRequestKind::HighestWindowIndex) => cache
-                .query_highest_above_shared(request.slot, requested_index, now)
+                .query_highest_above(request.slot, requested_index, now)
                 .and_then(|(index, bytes)| {
                     build_repair_response_payload(&bytes, request.nonce)
                         .map(|payload| (index, payload))

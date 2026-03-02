@@ -124,7 +124,7 @@ impl RecentShredRingBuffer {
         request: RelayRangeRequest,
         limits: RelayRangeLimits,
         now: Instant,
-    ) -> Result<Vec<Vec<u8>>, RelayRangeQueryError> {
+    ) -> Result<Vec<Arc<[u8]>>, RelayRangeQueryError> {
         let mut evicted = 0usize;
         self.evict(now, &mut evicted);
 
@@ -158,7 +158,7 @@ impl RecentShredRingBuffer {
             .collect();
         matches.sort_unstable_by_key(|(index, _)| *index);
 
-        let mut response = Vec::new();
+        let mut response: Vec<Arc<[u8]>> = Vec::new();
         let mut response_bytes = 0usize;
         for (_, bytes) in matches {
             if response.len() >= limits.max_response_shreds {
@@ -169,18 +169,18 @@ impl RecentShredRingBuffer {
                 break;
             }
             response_bytes = next_bytes;
-            response.push(bytes.as_ref().to_vec());
+            response.push(bytes);
         }
 
         Ok(response)
     }
 
     #[must_use]
-    pub fn query_exact(&mut self, slot: u64, index: u32, now: Instant) -> Option<Vec<u8>> {
+    pub fn query_exact(&mut self, slot: u64, index: u32, now: Instant) -> Option<Arc<[u8]>> {
         let mut evicted = 0usize;
         self.evict(now, &mut evicted);
         self.entries.iter().find_map(|(key, entry)| {
-            (key.slot == slot && key.index == index).then(|| entry.bytes.as_ref().to_vec())
+            (key.slot == slot && key.index == index).then(|| entry.bytes.clone())
         })
     }
 
@@ -190,14 +190,14 @@ impl RecentShredRingBuffer {
         slot: u64,
         min_index_exclusive: u32,
         now: Instant,
-    ) -> Option<(u32, Vec<u8>)> {
+    ) -> Option<(u32, Arc<[u8]>)> {
         let mut evicted = 0usize;
         self.evict(now, &mut evicted);
         self.entries
             .iter()
             .filter(|(key, _)| key.slot == slot && key.index > min_index_exclusive)
             .max_by_key(|(key, entry)| (key.index, entry.seen_at))
-            .map(|(key, entry)| (key.index, entry.bytes.as_ref().to_vec()))
+            .map(|(key, entry)| (key.index, entry.bytes.clone()))
     }
 
     fn evict(&mut self, now: Instant, evicted: &mut usize) {
@@ -312,21 +312,6 @@ impl SharedRelayCache {
         request: RelayRangeRequest,
         limits: RelayRangeLimits,
         now: Instant,
-    ) -> Result<Vec<Vec<u8>>, RelayRangeQueryError> {
-        self.query_range_shared(request, limits, now)
-            .map(|response| {
-                response
-                    .into_iter()
-                    .map(|bytes| bytes.as_ref().to_vec())
-                    .collect()
-            })
-    }
-
-    pub fn query_range_shared(
-        &self,
-        request: RelayRangeRequest,
-        limits: RelayRangeLimits,
-        now: Instant,
     ) -> Result<Vec<Arc<[u8]>>, RelayRangeQueryError> {
         let _ = self.evict(now);
         if request.start_index > request.end_index {
@@ -370,13 +355,7 @@ impl SharedRelayCache {
     }
 
     #[must_use]
-    pub fn query_exact(&self, slot: u64, index: u32, now: Instant) -> Option<Vec<u8>> {
-        self.query_exact_shared(slot, index, now)
-            .map(|bytes| bytes.as_ref().to_vec())
-    }
-
-    #[must_use]
-    pub fn query_exact_shared(&self, slot: u64, index: u32, now: Instant) -> Option<Arc<[u8]>> {
+    pub fn query_exact(&self, slot: u64, index: u32, now: Instant) -> Option<Arc<[u8]>> {
         let _ = self.evict(now);
         let start = slot_index_range_start(slot, index);
         let end = slot_index_range_end(slot, index);
@@ -398,17 +377,6 @@ impl SharedRelayCache {
 
     #[must_use]
     pub fn query_highest_above(
-        &self,
-        slot: u64,
-        min_index_exclusive: u32,
-        now: Instant,
-    ) -> Option<(u32, Vec<u8>)> {
-        self.query_highest_above_shared(slot, min_index_exclusive, now)
-            .map(|(index, bytes)| (index, bytes.as_ref().to_vec()))
-    }
-
-    #[must_use]
-    pub fn query_highest_above_shared(
         &self,
         slot: u64,
         min_index_exclusive: u32,
@@ -618,8 +586,8 @@ mod tests {
             .query_range(request, limits, now)
             .expect("query succeeds");
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0], p1);
-        assert_eq!(result[1], p3);
+        assert_eq!(result[0].as_ref(), p1.as_slice());
+        assert_eq!(result[1].as_ref(), p3.as_slice());
     }
 
     #[test]
@@ -649,7 +617,8 @@ mod tests {
         let result = cache
             .query_range(request, limits, now)
             .expect("query succeeds");
-        assert_eq!(result, vec![p1]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].as_ref(), p1.as_slice());
     }
 
     #[test]
@@ -664,7 +633,7 @@ mod tests {
         let _ = cache.insert(&p2, &h2, now);
 
         let found = cache.query_exact(10, 2, now).expect("exact match");
-        assert_eq!(found, p2);
+        assert_eq!(found.as_ref(), p2.as_slice());
     }
 
     #[test]
@@ -685,7 +654,7 @@ mod tests {
             .query_highest_above(11, 6, now + Duration::from_millis(3))
             .expect("highest above threshold");
         assert_eq!(index, 9);
-        assert_eq!(found, p2);
+        assert_eq!(found.as_ref(), p2.as_slice());
     }
 
     #[test]
@@ -725,7 +694,7 @@ mod tests {
         let found = cache
             .query_exact(12, 42, now + Duration::from_millis(2))
             .expect("exact match");
-        assert_eq!(found, packet_new);
+        assert_eq!(found.as_ref(), packet_new.as_slice());
     }
 
     #[test]
@@ -762,7 +731,7 @@ mod tests {
             .query_highest_above(13, 6, now + Duration::from_millis(3))
             .expect("highest above threshold");
         assert_eq!(index, 9);
-        assert_eq!(found, packet_new_top);
+        assert_eq!(found.as_ref(), packet_new_top.as_slice());
     }
 
     fn build_data_shred_packet(
