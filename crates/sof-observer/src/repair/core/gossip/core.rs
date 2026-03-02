@@ -8,20 +8,23 @@ use arcshift::ArcShift;
 use bincode::Options;
 use serde::Deserialize;
 use solana_gossip::{cluster_info::ClusterInfo, contact_info::Protocol};
-use solana_keypair::{Keypair, signable::Signable};
+use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signature::SIGNATURE_BYTES;
 use thiserror::Error;
 use tokio::net::UdpSocket;
 
 use super::super::{
-    MissingShredRequestKind, RepairRequestError, build_repair_request, request::unix_timestamp_ms,
+    MissingShredRequestKind, ParseRepairRequestError, ParsedRepairRequestKind, RepairRequestError,
+    build_repair_request, parse_signed_repair_request, request::unix_timestamp_ms,
+    signed_repair_request_time_window_ms,
 };
 
 const REPAIR_PING_TOKEN_SIZE: usize = 32;
 const REPAIR_RESPONSE_SERIALIZED_PING_BYTES: usize =
     4 + 32 + REPAIR_PING_TOKEN_SIZE + SIGNATURE_BYTES;
 const REPAIR_PROTOCOL_PONG_VARIANT: u32 = 7;
+const SOL_LAMPORTS: u64 = 1_000_000_000;
 // Heuristic scoring weights for ranking repair peers.
 #[cfg(feature = "gossip-bootstrap")]
 const REPAIR_PEER_RANK_DEFAULT_WITHOUT_RTT: i64 = 1_000;
@@ -66,6 +69,36 @@ pub enum GossipRepairClientError {
         addr: std::net::SocketAddr,
         source: std::io::Error,
     },
+    #[error("failed to parse signed repair request: {source}")]
+    ParseSignedRepairRequest { source: ParseRepairRequestError },
+    #[error("repair request shred index out of u32 range: {shred_index}; {source}")]
+    RepairRequestIndexOutOfRange {
+        shred_index: u64,
+        source: std::num::TryFromIntError,
+    },
+    #[error("failed to send repair response packet to {addr}: {source}")]
+    SendRepairResponse {
+        addr: std::net::SocketAddr,
+        source: std::io::Error,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ServedRepairRequestKind {
+    WindowIndex,
+    HighestWindowIndex,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ServedRepairRequest {
+    pub kind: ServedRepairRequestKind,
+    pub slot: u64,
+    pub requested_index: u64,
+    pub served_index: Option<u32>,
+    pub rate_limited: bool,
+    pub rate_limited_by_peer: bool,
+    pub rate_limited_by_bytes: bool,
+    pub unstaked_sender: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,6 +125,7 @@ fn serialize_repair_pong(
 struct RepairPeer {
     pubkey: Pubkey,
     addr: std::net::SocketAddr,
+    stake_lamports: u64,
 }
 
 #[cfg(feature = "gossip-bootstrap")]
@@ -198,6 +232,18 @@ pub const fn is_repair_response_ping_packet(packet: &[u8]) -> bool {
 }
 
 #[cfg(feature = "gossip-bootstrap")]
+#[derive(Debug, Clone, Copy)]
+pub struct GossipRepairClientConfig {
+    pub peer_cache_ttl: Duration,
+    pub peer_cache_capacity: usize,
+    pub active_peer_count: usize,
+    pub peer_sample_size: usize,
+    pub serve_max_bytes_per_sec: usize,
+    pub serve_unstaked_max_bytes_per_sec: usize,
+    pub serve_max_requests_per_peer_per_sec: usize,
+}
+
+#[cfg(feature = "gossip-bootstrap")]
 pub struct GossipRepairClient {
     cluster_info: std::sync::Arc<ClusterInfo>,
     socket: UdpSocket,
@@ -206,10 +252,19 @@ pub struct GossipRepairClient {
     peer_cache_ttl: Duration,
     peer_cache_capacity: usize,
     active_peer_count: usize,
+    peer_sample_size: usize,
+    serve_max_bytes_per_sec: usize,
+    serve_unstaked_max_bytes_per_sec: usize,
+    serve_max_requests_per_peer_per_sec: usize,
     peer_scores: HashMap<Pubkey, RepairPeerScore>,
+    stake_by_pubkey: HashMap<Pubkey, u64>,
     addr_to_pubkey: HashMap<std::net::SocketAddr, Pubkey>,
     ip_to_pubkeys: HashMap<IpAddr, Vec<Pubkey>>,
     last_request_sent_at: HashMap<std::net::SocketAddr, Instant>,
+    serve_window_started: Instant,
+    serve_bytes_sent_in_window: usize,
+    serve_unstaked_bytes_sent_in_window: usize,
+    serve_requests_by_addr: HashMap<std::net::SocketAddr, usize>,
     peer_snapshot: ArcShift<RepairPeerSnapshot>,
     nonce_counter: u32,
     rr_counter: u64,

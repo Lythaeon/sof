@@ -72,21 +72,18 @@ fuzz_target!(|bytes: &[u8]| {
                 }
             }
             3 => {
-                if let Some(addr) = take_socket_addr(&mut input) {
-                    setup.with_relay_listen_addr(addr)
-                } else {
-                    setup
+                let count = usize::from(take_u8(&mut input).unwrap_or(0) % 4);
+                let mut validators = Vec::with_capacity(count);
+                for _ in 0..count {
+                    validators.push(
+                        take_string(&mut input, 64)
+                            .unwrap_or_else(|| "11111111111111111111111111111111".to_owned()),
+                    );
                 }
+                setup.with_gossip_validators(validators)
             }
             4 => {
-                let count = usize::from(take_u8(&mut input).unwrap_or(0) % 4);
-                let mut addrs = Vec::with_capacity(count);
-                for _ in 0..count {
-                    if let Some(addr) = take_socket_addr(&mut input) {
-                        addrs.push(addr);
-                    }
-                }
-                setup.with_relay_connect_addrs(addrs)
+                setup.with_udp_receiver_core(usize::from(take_u8(&mut input).unwrap_or(0)))
             }
             5 => {
                 let count = usize::from(take_u8(&mut input).unwrap_or(0) % 4);
@@ -117,10 +114,7 @@ fuzz_target!(|bytes: &[u8]| {
                 .with_dataset_queue_capacity(usize::from(take_u16(&mut input).unwrap_or(1)).max(1)),
             15 => setup
                 .with_fec_max_tracked_sets(usize::from(take_u16(&mut input).unwrap_or(1)).max(1)),
-            16 => setup.with_rpc_url(
-                take_string(&mut input, 96)
-                    .unwrap_or_else(|| "https://api.mainnet-beta.solana.com".to_owned()),
-            ),
+            16 => setup.with_log_all_txs(take_bool(&mut input)),
             17 => setup.with_log_all_txs(take_bool(&mut input)),
             18 => setup.with_log_non_vote_txs(take_bool(&mut input)),
             19 => setup.with_log_dataset_reconstruction(take_bool(&mut input)),
@@ -128,7 +122,7 @@ fuzz_target!(|bytes: &[u8]| {
             21 => setup.with_verify_shreds(take_bool(&mut input)),
             22 => setup.with_verify_strict_unknown(take_bool(&mut input)),
             23 => setup.with_verify_recovered_shreds(take_bool(&mut input)),
-            24 => setup.with_verify_rpc_slot_leaders(take_bool(&mut input)),
+            24 => setup.with_verify_slot_window(take_u64(&mut input).unwrap_or(1)),
             _ => setup
                 .with_verify_slot_window(take_u64(&mut input).unwrap_or(1))
                 .with_verify_signature_cache_entries(

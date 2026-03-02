@@ -1,10 +1,14 @@
 #[cfg(feature = "gossip-bootstrap")]
+use std::collections::HashSet;
+#[cfg(feature = "gossip-bootstrap")]
 use std::num::NonZeroUsize;
 #[cfg(feature = "gossip-bootstrap")]
 use std::num::ParseIntError;
 
 #[cfg(feature = "gossip-bootstrap")]
 use solana_net_utils::PortRange;
+#[cfg(feature = "gossip-bootstrap")]
+use solana_pubkey::Pubkey;
 #[cfg(feature = "gossip-bootstrap")]
 use thiserror::Error;
 
@@ -59,6 +63,8 @@ const DEFAULT_BOOTSTRAP_STABILIZE_MAX_WAIT_MS: u64 = 20_000;
 const DEFAULT_BOOTSTRAP_STABILIZE_MIN_PEERS: usize = 128;
 #[cfg(feature = "gossip-bootstrap")]
 const DEFAULT_RUNTIME_SWITCH_PEER_CANDIDATES: usize = 64;
+#[cfg(feature = "gossip-bootstrap")]
+const GOSSIP_VALIDATORS_MAX: usize = 2_048;
 
 fn parse_comma_separated_endpoints(value: &str) -> Vec<String> {
     value
@@ -182,8 +188,22 @@ pub fn read_gossip_entrypoint_probe_enabled() -> bool {
 }
 
 #[cfg(feature = "gossip-bootstrap")]
+pub fn read_gossip_validators() -> Option<HashSet<Pubkey>> {
+    let validators = read_env_var("SOF_GOSSIP_VALIDATORS")
+        .map(|value| {
+            parse_comma_separated_endpoints(&value)
+                .into_iter()
+                .take(GOSSIP_VALIDATORS_MAX)
+                .filter_map(|value| value.parse::<Pubkey>().ok())
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    (!validators.is_empty()).then_some(validators)
+}
+
+#[cfg(feature = "gossip-bootstrap")]
 pub fn read_gossip_runtime_switch_enabled() -> bool {
-    read_bool_env("SOF_GOSSIP_RUNTIME_SWITCH_ENABLED", true)
+    read_bool_env("SOF_GOSSIP_RUNTIME_SWITCH_ENABLED", false)
 }
 
 #[cfg(feature = "gossip-bootstrap")]

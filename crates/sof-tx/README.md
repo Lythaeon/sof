@@ -21,7 +21,7 @@ cargo add sof-tx
 Enable SOF runtime adapters when you want provider values from live `sof` plugin events:
 
 ```toml
-sof-tx = { version = "0.2", features = ["sof-adapters"] }
+sof-tx = { version = "0.3", features = ["sof-adapters"] }
 ```
 
 ## Core Types

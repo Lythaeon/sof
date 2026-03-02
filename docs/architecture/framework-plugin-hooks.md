@@ -13,6 +13,8 @@ custom logic without forking the runtime.
   - `ShredEvent`
   - `DatasetEvent`
   - `TransactionEvent`
+  - `SlotStatusEvent`
+  - `ReorgEvent`
   - `ObservedRecentBlockhashEvent`
   - `LeaderScheduleEvent`
 - Host/runtime wiring:
@@ -24,7 +26,7 @@ custom logic without forking the runtime.
 
 ## Hook Semantics
 
-Current hook count: `7` (must stay in sync with `sof::framework::ObserverPlugin`).
+Current hook count: `9` (must stay in sync with `sof::framework::ObserverPlugin`).
 
 Callbacks are invoked in this order as data flows through runtime:
 
@@ -32,9 +34,11 @@ Callbacks are invoked in this order as data flows through runtime:
 2. `on_shred`
 3. `on_dataset`
 4. `on_transaction`
-5. `on_recent_blockhash`
-6. `on_cluster_topology` (near-real-time, gossip-bootstrap only)
-7. `on_leader_schedule` (event-driven, gossip-bootstrap only)
+5. `on_slot_status`
+6. `on_reorg`
+7. `on_recent_blockhash`
+8. `on_cluster_topology` (near-real-time, gossip-bootstrap only)
+9. `on_leader_schedule` (event-driven, gossip-bootstrap only)
 
 Detailed behavior:
 
@@ -49,7 +53,15 @@ Detailed behavior:
   - Includes slot/index bounds, payload length, and tx count.
 - `on_transaction`:
   - Fires for each decoded transaction inside a dataset.
-  - Includes slot, optional signature, tx payload, and SOF `TxKind`.
+  - Includes slot, optional signature, tx payload, SOF `TxKind`, plus commitment tagging:
+    `commitment_status`, `confirmed_slot`, and `finalized_slot`.
+  - Commitment tagging is derived from local shred-stream slot depth progression (no RPC dependency).
+- `on_slot_status`:
+  - Fires when local slot classification changes (`processed` / `confirmed` / `finalized` / `orphaned`).
+  - Includes per-slot parent linkage when known and current canonical tip/commitment watermarks.
+- `on_reorg`:
+  - Fires when local canonical tip switches to a different branch.
+  - Includes old/new tips, common ancestor, detached branch segment, and attached branch segment.
 - `on_recent_blockhash`:
   - Fires when runtime observes a newer recent blockhash from decoded datasets.
   - Deduplicated by slot/hash in `PluginHost` to avoid per-transaction hook volume.

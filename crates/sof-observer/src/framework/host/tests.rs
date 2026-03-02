@@ -89,6 +89,27 @@ impl ObserverPlugin for RecentBlockhashCounterPlugin {
     }
 }
 
+#[derive(Clone)]
+struct ForkHookCounterPlugin {
+    slot_status_counter: Arc<AtomicUsize>,
+    reorg_counter: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ObserverPlugin for ForkHookCounterPlugin {
+    fn name(&self) -> &'static str {
+        "fork-hook-counter-plugin"
+    }
+
+    async fn on_slot_status(&self, _event: SlotStatusEvent) {
+        self.slot_status_counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    async fn on_reorg(&self, _event: ReorgEvent) {
+        self.reorg_counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 #[test]
 fn dispatch_continues_after_plugin_panic() {
     let counter = Arc::new(AtomicUsize::new(0));
@@ -261,6 +282,48 @@ fn recent_blockhash_hook_is_deduplicated_and_stateful() {
         host.latest_observed_recent_blockhash(),
         Some((11, [2_u8; 32]))
     );
+}
+
+#[test]
+fn fork_hooks_dispatch_to_plugins() {
+    let slot_status_counter = Arc::new(AtomicUsize::new(0));
+    let reorg_counter = Arc::new(AtomicUsize::new(0));
+    let host = PluginHostBuilder::new()
+        .add_plugin(ForkHookCounterPlugin {
+            slot_status_counter: Arc::clone(&slot_status_counter),
+            reorg_counter: Arc::clone(&reorg_counter),
+        })
+        .build();
+
+    host.on_slot_status(SlotStatusEvent {
+        slot: 42,
+        parent_slot: Some(41),
+        previous_status: Some(crate::framework::ForkSlotStatus::Processed),
+        status: crate::framework::ForkSlotStatus::Confirmed,
+        tip_slot: Some(42),
+        confirmed_slot: Some(41),
+        finalized_slot: Some(40),
+    });
+    host.on_reorg(ReorgEvent {
+        old_tip: 50,
+        new_tip: 60,
+        common_ancestor: Some(45),
+        detached_slots: vec![50, 49],
+        attached_slots: vec![59, 60],
+        confirmed_slot: Some(55),
+        finalized_slot: Some(52),
+    });
+
+    assert!(wait_until_counter(
+        slot_status_counter.as_ref(),
+        1,
+        Duration::from_secs(2),
+    ));
+    assert!(wait_until_counter(
+        reorg_counter.as_ref(),
+        1,
+        Duration::from_secs(2),
+    ));
 }
 
 #[test]

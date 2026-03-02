@@ -5,7 +5,6 @@ pub(in crate::app::runtime) struct ReceiverRuntime {
     pub(in crate::app::runtime) gossip_receiver_handles: Vec<JoinHandle<()>>,
     #[cfg(feature = "gossip-bootstrap")]
     pub(in crate::app::runtime) gossip_runtime: Option<GossipRuntime>,
-    pub(in crate::app::runtime) relay_server_handle: Option<JoinHandle<()>>,
     #[cfg(feature = "gossip-bootstrap")]
     pub(in crate::app::runtime) gossip_identity: Arc<Keypair>,
     #[cfg(feature = "gossip-bootstrap")]
@@ -47,9 +46,6 @@ impl Drop for ReceiverRuntime {
             handle.abort();
         }
         for handle in &self.gossip_receiver_handles {
-            handle.abort();
-        }
-        if let Some(handle) = self.relay_server_handle.take() {
             handle.abort();
         }
     }

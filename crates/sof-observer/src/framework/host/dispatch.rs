@@ -70,6 +70,10 @@ pub(super) enum PluginDispatchEvent {
     Dataset(DatasetEvent),
     /// Decoded transaction callback payload.
     Transaction(TransactionEvent),
+    /// Slot-status callback payload.
+    SlotStatus(SlotStatusEvent),
+    /// Canonical reorg callback payload.
+    Reorg(ReorgEvent),
     /// Observed recent blockhash callback payload.
     ObservedRecentBlockhash(ObservedRecentBlockhashEvent),
     /// Cluster topology callback payload.
@@ -156,6 +160,30 @@ async fn dispatch_event(
                 dispatch_mode,
                 |plugin, hook_event| async move {
                     plugin.on_transaction(hook_event).await;
+                },
+            )
+            .await
+        }
+        PluginDispatchEvent::SlotStatus(event) => {
+            dispatch_hook_event(
+                plugins,
+                "on_slot_status",
+                event,
+                dispatch_mode,
+                |plugin, hook_event| async move {
+                    plugin.on_slot_status(hook_event).await;
+                },
+            )
+            .await
+        }
+        PluginDispatchEvent::Reorg(event) => {
+            dispatch_hook_event(
+                plugins,
+                "on_reorg",
+                event,
+                dispatch_mode,
+                |plugin, hook_event| async move {
+                    plugin.on_reorg(hook_event).await;
                 },
             )
             .await

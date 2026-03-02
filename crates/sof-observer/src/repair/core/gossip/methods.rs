@@ -1,14 +1,19 @@
 use super::*;
+use crate::{
+    protocol::shred_wire::SIZE_OF_CODING_SHRED_PAYLOAD,
+    relay::SharedRelayCache,
+    shred::wire::{ParsedShredHeader, parse_shred_header},
+};
+use solana_keypair::signable::Signable;
 
 impl GossipRepairClient {
     pub fn new(
         cluster_info: std::sync::Arc<ClusterInfo>,
         socket: UdpSocket,
         keypair: std::sync::Arc<Keypair>,
-        peer_cache_ttl: Duration,
-        peer_cache_capacity: usize,
-        active_peer_count: usize,
+        config: GossipRepairClientConfig,
     ) -> Self {
+        let now = Instant::now();
         let peer_snapshot = ArcShift::new(RepairPeerSnapshot {
             updated_at_ms: unix_timestamp_ms(),
             total_candidates: 0,
@@ -21,13 +26,22 @@ impl GossipRepairClient {
             socket,
             keypair,
             peers_by_slot: HashMap::new(),
-            peer_cache_ttl,
-            peer_cache_capacity: peer_cache_capacity.max(1),
-            active_peer_count: active_peer_count.max(1),
+            peer_cache_ttl: config.peer_cache_ttl,
+            peer_cache_capacity: config.peer_cache_capacity.max(1),
+            active_peer_count: config.active_peer_count.max(1),
+            peer_sample_size: config.peer_sample_size.max(1),
+            serve_max_bytes_per_sec: config.serve_max_bytes_per_sec.max(1),
+            serve_unstaked_max_bytes_per_sec: config.serve_unstaked_max_bytes_per_sec.max(1),
+            serve_max_requests_per_peer_per_sec: config.serve_max_requests_per_peer_per_sec.max(1),
             peer_scores: HashMap::new(),
+            stake_by_pubkey: HashMap::new(),
             addr_to_pubkey: HashMap::new(),
             ip_to_pubkeys: HashMap::new(),
             last_request_sent_at: HashMap::new(),
+            serve_window_started: now,
+            serve_bytes_sent_in_window: 0,
+            serve_unstaked_bytes_sent_in_window: 0,
+            serve_requests_by_addr: HashMap::new(),
             peer_snapshot,
             nonce_counter: 1,
             rr_counter: 0,
@@ -161,40 +175,136 @@ impl GossipRepairClient {
         Ok(true)
     }
 
+    pub async fn maybe_serve_repair_request(
+        &mut self,
+        packet: &[u8],
+        from_addr: std::net::SocketAddr,
+        relay_cache: Option<&SharedRelayCache>,
+    ) -> Result<Option<ServedRepairRequest>, GossipRepairClientError> {
+        let Some(request) = parse_signed_repair_request(
+            packet,
+            self.cluster_info.id(),
+            unix_timestamp_ms(),
+            signed_repair_request_time_window_ms(),
+        )
+        .map_err(|source| GossipRepairClientError::ParseSignedRepairRequest { source })?
+        else {
+            return Ok(None);
+        };
+        let requested_index = u32::try_from(request.shred_index).map_err(|source| {
+            GossipRepairClientError::RepairRequestIndexOutOfRange {
+                shred_index: request.shred_index,
+                source,
+            }
+        })?;
+        let kind = match request.kind {
+            ParsedRepairRequestKind::WindowIndex => ServedRepairRequestKind::WindowIndex,
+            ParsedRepairRequestKind::HighestWindowIndex => {
+                ServedRepairRequestKind::HighestWindowIndex
+            }
+        };
+        let now = Instant::now();
+        let sender_stake_lamports = self.sender_stake_lamports(request.sender);
+        let unstaked_sender = sender_stake_lamports == 0;
+        if !self.reserve_serve_request_budget(from_addr, now) {
+            return Ok(Some(ServedRepairRequest {
+                kind,
+                slot: request.slot,
+                requested_index: request.shred_index,
+                served_index: None,
+                rate_limited: true,
+                rate_limited_by_peer: true,
+                rate_limited_by_bytes: false,
+                unstaked_sender,
+            }));
+        }
+        let response = match (relay_cache, request.kind) {
+            (Some(cache), ParsedRepairRequestKind::WindowIndex) => cache
+                .query_exact(request.slot, requested_index, now)
+                .and_then(|bytes| build_repair_response_payload(&bytes, request.nonce))
+                .map(|payload| (requested_index, payload)),
+            (Some(cache), ParsedRepairRequestKind::HighestWindowIndex) => cache
+                .query_highest_above(request.slot, requested_index, now)
+                .and_then(|(index, bytes)| {
+                    build_repair_response_payload(&bytes, request.nonce)
+                        .map(|payload| (index, payload))
+                }),
+            (None, _) => None,
+        };
+        if let Some((served_index, payload)) = response {
+            if !self.reserve_serve_bytes_budget(payload.len(), sender_stake_lamports, now) {
+                return Ok(Some(ServedRepairRequest {
+                    kind,
+                    slot: request.slot,
+                    requested_index: request.shred_index,
+                    served_index: None,
+                    rate_limited: true,
+                    rate_limited_by_peer: false,
+                    rate_limited_by_bytes: true,
+                    unstaked_sender,
+                }));
+            }
+            self.socket
+                .send_to(&payload, from_addr)
+                .await
+                .map_err(|source| GossipRepairClientError::SendRepairResponse {
+                    addr: from_addr,
+                    source,
+                })?;
+            return Ok(Some(ServedRepairRequest {
+                kind,
+                slot: request.slot,
+                requested_index: request.shred_index,
+                served_index: Some(served_index),
+                rate_limited: false,
+                rate_limited_by_peer: false,
+                rate_limited_by_bytes: false,
+                unstaked_sender,
+            }));
+        }
+        Ok(Some(ServedRepairRequest {
+            kind,
+            slot: request.slot,
+            requested_index: request.shred_index,
+            served_index: None,
+            rate_limited: false,
+            rate_limited_by_peer: false,
+            rate_limited_by_bytes: false,
+            unstaked_sender,
+        }))
+    }
+
     fn pick_peer(&mut self, slot: u64, index: u32) -> Option<RepairPeer> {
         self.refresh_peers(slot);
-        let peers = self.peers_by_slot.get(&slot)?.peers.as_slice();
+        let peers = self.peers_by_slot.get(&slot)?.peers.clone();
         if peers.is_empty() {
             return None;
         }
-        self.rr_counter = self.rr_counter.wrapping_add(1);
-        let seed = self
-            .rr_counter
-            .wrapping_add(slot)
-            .wrapping_add(u64::from(index));
-        let weights: Vec<u64> = peers
-            .iter()
-            .map(|peer| self.weight_for(peer.pubkey))
-            .collect();
-        let total_weight: u64 = weights.iter().copied().sum();
-        if total_weight == 0 {
-            let peer_len = u64::try_from(peers.len()).ok()?;
-            let reduced = seed.checked_rem(peer_len)?;
-            let idx = usize::try_from(reduced).ok()?;
-            return peers.get(idx).copied();
-        }
-        let mut target = seed.checked_rem(total_weight)?;
-        for (peer, weight) in peers.iter().zip(weights.iter().copied()) {
-            if target < weight {
-                return Some(*peer);
-            }
-            target = target.saturating_sub(weight);
-        }
-        peers.last().copied()
+        let sampled_indexes = self.sample_peer_indexes(&peers, slot, index);
+        let now = Instant::now();
+        sampled_indexes
+            .into_iter()
+            .filter_map(|candidate_index| {
+                peers
+                    .get(candidate_index)
+                    .copied()
+                    .map(|peer| (candidate_index, peer))
+            })
+            .max_by_key(|(_, peer)| {
+                (
+                    self.score_for(peer.pubkey),
+                    self.weight_for(peer.pubkey),
+                    self.last_request_age_ms(now, peer.addr),
+                    peer.stake_lamports,
+                    peer.pubkey.to_bytes(),
+                )
+            })
+            .map(|(_, peer)| peer)
     }
 
     fn refresh_peers(&mut self, slot: u64) {
         self.decay_peer_scores();
+        self.refresh_stake_map();
         self.peers_by_slot
             .retain(|_, cached| cached.updated_at.elapsed() < self.peer_cache_ttl);
         if self.peers_by_slot.len() > self.peer_cache_capacity {
@@ -281,6 +391,11 @@ impl GossipRepairClient {
             let peer = RepairPeer {
                 pubkey: *contact_info.pubkey(),
                 addr,
+                stake_lamports: self
+                    .stake_by_pubkey
+                    .get(contact_info.pubkey())
+                    .copied()
+                    .unwrap_or_default(),
             };
             if seen.insert((peer.pubkey, peer.addr)) {
                 peers.push(peer);
@@ -289,7 +404,7 @@ impl GossipRepairClient {
         if peers.is_empty() {
             let self_pubkey = self.cluster_info.id();
             let self_shred_version = self.cluster_info.my_shred_version();
-            for (contact_info, _) in self.cluster_info.all_peers() {
+            for (contact_info, stake_lamports) in self.cluster_info.all_peers() {
                 if contact_info.pubkey() == &self_pubkey
                     || contact_info.shred_version() != self_shred_version
                     || contact_info.tvu(Protocol::UDP).is_none()
@@ -302,6 +417,7 @@ impl GossipRepairClient {
                 let peer = RepairPeer {
                     pubkey: *contact_info.pubkey(),
                     addr,
+                    stake_lamports,
                 };
                 if seen.insert((peer.pubkey, peer.addr)) {
                     peers.push(peer);
@@ -359,9 +475,160 @@ impl GossipRepairClient {
             .weight()
     }
 
+    fn refresh_stake_map(&mut self) {
+        self.stake_by_pubkey.clear();
+        for (contact_info, stake_lamports) in self.cluster_info.all_peers() {
+            let _ = self
+                .stake_by_pubkey
+                .insert(*contact_info.pubkey(), stake_lamports);
+        }
+    }
+
+    fn sender_stake_lamports(&self, sender: Pubkey) -> u64 {
+        self.stake_by_pubkey
+            .get(&sender)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn reset_serve_window_if_needed(&mut self, now: Instant) {
+        if now.saturating_duration_since(self.serve_window_started) < Duration::from_secs(1) {
+            return;
+        }
+        self.serve_window_started = now;
+        self.serve_bytes_sent_in_window = 0;
+        self.serve_unstaked_bytes_sent_in_window = 0;
+        self.serve_requests_by_addr.clear();
+    }
+
+    fn reserve_serve_request_budget(
+        &mut self,
+        source_addr: std::net::SocketAddr,
+        now: Instant,
+    ) -> bool {
+        self.reset_serve_window_if_needed(now);
+        let requests = self.serve_requests_by_addr.entry(source_addr).or_default();
+        if *requests >= self.serve_max_requests_per_peer_per_sec {
+            return false;
+        }
+        *requests = requests.saturating_add(1);
+        true
+    }
+
+    fn reserve_serve_bytes_budget(
+        &mut self,
+        response_bytes: usize,
+        sender_stake_lamports: u64,
+        now: Instant,
+    ) -> bool {
+        self.reset_serve_window_if_needed(now);
+        let projected = self
+            .serve_bytes_sent_in_window
+            .saturating_add(response_bytes);
+        if projected > self.serve_max_bytes_per_sec {
+            return false;
+        }
+        if sender_stake_lamports == 0 {
+            let projected_unstaked = self
+                .serve_unstaked_bytes_sent_in_window
+                .saturating_add(response_bytes);
+            if projected_unstaked > self.serve_unstaked_max_bytes_per_sec {
+                return false;
+            }
+            self.serve_unstaked_bytes_sent_in_window = projected_unstaked;
+        }
+        self.serve_bytes_sent_in_window = projected;
+        true
+    }
+
+    fn sample_peer_indexes(&mut self, peers: &[RepairPeer], slot: u64, index: u32) -> Vec<usize> {
+        if peers.is_empty() {
+            return Vec::new();
+        }
+        self.rr_counter = self.rr_counter.wrapping_add(1);
+        let sample_size = self.peer_sample_size.min(peers.len()).max(1);
+        let mut seed = self
+            .rr_counter
+            .wrapping_add(slot)
+            .wrapping_add(u64::from(index));
+        let mut pool: Vec<(usize, u64)> = peers
+            .iter()
+            .enumerate()
+            .map(|(peer_index, peer)| {
+                (
+                    peer_index,
+                    peer.stake_lamports.saturating_div(SOL_LAMPORTS).max(1),
+                )
+            })
+            .collect();
+        let mut selected = Vec::with_capacity(sample_size);
+        while selected.len() < sample_size && !pool.is_empty() {
+            let total_weight = pool
+                .iter()
+                .fold(0_u64, |acc, (_, weight)| acc.saturating_add(*weight));
+            if total_weight == 0 {
+                for (peer_index, _) in pool {
+                    selected.push(peer_index);
+                    if selected.len() >= sample_size {
+                        break;
+                    }
+                }
+                break;
+            }
+            seed = mix_seed(seed);
+            let mut target = seed.checked_rem(total_weight).unwrap_or(0);
+            let mut picked_position = 0_usize;
+            for (position, (_, weight)) in pool.iter().enumerate() {
+                if target < *weight {
+                    picked_position = position;
+                    break;
+                }
+                target = target.saturating_sub(*weight);
+            }
+            let (peer_index, _) = pool.swap_remove(picked_position);
+            selected.push(peer_index);
+        }
+        selected
+    }
+
+    fn last_request_age_ms(&self, now: Instant, addr: std::net::SocketAddr) -> u64 {
+        self.last_request_sent_at
+            .get(&addr)
+            .copied()
+            .map(|sent_at| {
+                u64::try_from(now.saturating_duration_since(sent_at).as_millis())
+                    .unwrap_or(u64::MAX)
+            })
+            .unwrap_or(u64::MAX)
+    }
+
     fn next_nonce(&mut self) -> u32 {
         let nonce = self.nonce_counter;
         self.nonce_counter = self.nonce_counter.wrapping_add(1).max(1);
         nonce
     }
+}
+
+fn build_repair_response_payload(packet: &[u8], nonce: u32) -> Option<Vec<u8>> {
+    let parsed = parse_shred_header(packet).ok()?;
+    let shred_len = canonical_shred_len(&parsed);
+    let shred = packet.get(..shred_len)?;
+    let mut payload = Vec::with_capacity(shred_len.saturating_add(std::mem::size_of::<u32>()));
+    payload.extend_from_slice(shred);
+    payload.extend_from_slice(&nonce.to_le_bytes());
+    Some(payload)
+}
+
+fn canonical_shred_len(parsed: &ParsedShredHeader) -> usize {
+    match parsed {
+        ParsedShredHeader::Data(data) => usize::from(data.data_header.size),
+        ParsedShredHeader::Code(_) => SIZE_OF_CODING_SHRED_PAYLOAD,
+    }
+}
+
+const fn mix_seed(seed: u64) -> u64 {
+    let mut z = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }

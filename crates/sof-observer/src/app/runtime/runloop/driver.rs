@@ -7,10 +7,6 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub(in crate::app::runtime) enum RuntimeRunloopError {
-    #[error("failed to parse relay listen configuration: {source}")]
-    RelayListenConfiguration {
-        source: crate::app::config::RelayListenAddressError,
-    },
     #[error("receiver runtime bootstrap failed: {source}")]
     ReceiverBootstrap {
         source: bootstrap::gossip::ReceiverBootstrapError,
@@ -20,9 +16,7 @@ pub(in crate::app::runtime) enum RuntimeRunloopError {
 // Runtime coordination defaults kept local to the runloop for operational clarity.
 const RAW_PACKET_CHANNEL_CAPACITY: usize = 16_384;
 const TX_EVENT_CHANNEL_CAPACITY: usize = 65_536;
-const RELAY_BROADCAST_CAPACITY: usize = 4_096;
 const TELEMETRY_INTERVAL_SECS: u64 = 5;
-const REPAIR_SEED_SLOT_MAX: u64 = 1_024;
 const TURBINE_PRIMARY_SOURCE_PORT: u16 = 8_899;
 const TURBINE_SECONDARY_SOURCE_PORT: u16 = 8_900;
 const INITIAL_DEBUG_SAMPLE_LOG_LIMIT: u64 = 5;
@@ -62,9 +56,19 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
     let log_all_txs = read_log_all_txs();
     let log_non_vote_txs = read_log_non_vote_txs();
     let log_dataset_reconstruction = read_log_dataset_reconstruction();
+    let tx_confirmed_depth_slots = read_tx_confirmed_depth_slots();
+    let tx_finalized_depth_slots = read_tx_finalized_depth_slots().max(tx_confirmed_depth_slots);
+    let fork_window_slots = read_fork_window_slots();
+    let tx_commitment_tracker = Arc::new(CommitmentSlotTracker::new());
+    let mut fork_tracker = ForkTracker::new(
+        fork_window_slots,
+        tx_confirmed_depth_slots,
+        tx_finalized_depth_slots,
+    );
     let dataset_worker_shared = DatasetWorkerShared {
         plugin_host: plugin_host.clone(),
         tx_event_tx: tx_event_tx.clone(),
+        tx_commitment_tracker: tx_commitment_tracker.clone(),
         tx_event_drop_count: tx_event_drop_count.clone(),
         dataset_decode_fail_count: dataset_decode_fail_count.clone(),
         dataset_tail_skip_count: dataset_tail_skip_count.clone(),
@@ -87,18 +91,57 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
     if plugin_hooks_enabled {
         tracing::info!(plugins = ?plugin_host.plugin_names(), "observer plugins enabled");
     }
-    let relay_listen_addr = read_relay_listen_addr()
-        .map_err(|source| RuntimeRunloopError::RelayListenConfiguration { source })?;
-    let relay_bus =
-        relay_listen_addr.map(|_| broadcast::channel::<Vec<u8>>(RELAY_BROADCAST_CAPACITY).0);
+    let relay_cache_window_ms = read_relay_cache_window_ms();
+    let relay_cache_max_shreds = read_relay_cache_max_shreds();
+    let relay_cache = (relay_cache_window_ms > 0 && relay_cache_max_shreds > 0).then(|| {
+        SharedRelayCache::new(RecentShredRingBuffer::new(
+            relay_cache_max_shreds,
+            Duration::from_millis(relay_cache_window_ms),
+        ))
+    });
+    #[cfg(feature = "gossip-bootstrap")]
+    let udp_relay_enabled = read_udp_relay_enabled();
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let udp_relay_enabled = false;
+    #[cfg(feature = "gossip-bootstrap")]
+    let udp_relay_refresh_ms = read_udp_relay_refresh_ms();
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let udp_relay_refresh_ms = 0_u64;
+    #[cfg(feature = "gossip-bootstrap")]
+    let udp_relay_peer_candidates = read_udp_relay_peer_candidates();
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let udp_relay_peer_candidates = 0_usize;
+    #[cfg(feature = "gossip-bootstrap")]
+    let udp_relay_fanout = read_udp_relay_fanout();
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let udp_relay_fanout = 0_usize;
+    #[cfg(feature = "gossip-bootstrap")]
+    let udp_relay_max_sends_per_sec = read_udp_relay_max_sends_per_sec();
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let udp_relay_max_sends_per_sec = 0_u64;
+    #[cfg(feature = "gossip-bootstrap")]
+    let udp_relay_max_peers_per_ip = read_udp_relay_max_peers_per_ip();
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let udp_relay_max_peers_per_ip = 0_usize;
+    #[cfg(feature = "gossip-bootstrap")]
+    let udp_relay_require_turbine_source_ports = read_udp_relay_require_turbine_source_ports();
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let udp_relay_require_turbine_source_ports = false;
+    #[cfg(feature = "gossip-bootstrap")]
+    let udp_relay_send_error_backoff_ms = read_udp_relay_send_error_backoff_ms();
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let udp_relay_send_error_backoff_ms = 0_u64;
+    #[cfg(feature = "gossip-bootstrap")]
+    let udp_relay_send_error_backoff_threshold = read_udp_relay_send_error_backoff_threshold();
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let udp_relay_send_error_backoff_threshold = 0_u64;
     if log_startup_steps {
         tracing::info!(
             step = "receiver_bootstrap_begin",
-            relay_server_enabled = relay_listen_addr.is_some(),
             "starting receiver bootstrap"
         );
     }
-    let mut runtime = start_receiver(tx, relay_bus.clone(), relay_listen_addr, tx_event_rx)
+    let mut runtime = start_receiver(tx, tx_event_rx)
         .await
         .map_err(|source| RuntimeRunloopError::ReceiverBootstrap { source })?;
     if log_startup_steps {
@@ -138,47 +181,6 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
             Duration::from_millis(read_verify_unknown_retry_ms()),
         )
     });
-    if let Some(verifier) = shred_verifier.as_mut()
-        && read_verify_rpc_slot_leaders()
-    {
-        let rpc_url = read_rpc_url();
-        match load_slot_leaders_from_rpc(
-            &rpc_url,
-            read_verify_rpc_slot_leader_history_slots(),
-            read_verify_rpc_slot_leader_fetch_slots(),
-        )
-        .await
-        {
-            Ok(slot_leaders) => {
-                let loaded = slot_leaders.len();
-                let start_slot = slot_leaders
-                    .first()
-                    .map(|(slot, _)| *slot)
-                    .unwrap_or_default();
-                let end_slot = slot_leaders
-                    .last()
-                    .map(|(slot, _)| *slot)
-                    .unwrap_or_default();
-                verifier.set_slot_leaders(slot_leaders);
-                // Suppress bootstrap burst; emit only live, event-driven updates afterwards.
-                drop(verifier.take_slot_leader_diff());
-                tracing::info!(
-                    rpc_url = %rpc_url,
-                    slot_start = start_slot,
-                    slot_end = end_slot,
-                    loaded,
-                    "loaded slot leader map for shred verification"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(
-                    rpc_url = %rpc_url,
-                    error = %error,
-                    "failed to load slot leaders from rpc; continuing with gossip identity fallback"
-                );
-            }
-        }
-    }
     tracing::info!(
         verify_shreds = verify_enabled,
         verify_recovered_shreds,
@@ -214,7 +216,7 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
             },
             |repair_client| {
                 let (command_tx, result_rx, peer_snapshot, driver_handle) =
-                    spawn_repair_driver(repair_client);
+                    spawn_repair_driver(repair_client, relay_cache.clone());
                 (
                     Some(command_tx),
                     Some(result_rx),
@@ -235,6 +237,7 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
     let repair_min_slot_lag = read_repair_min_slot_lag();
     let repair_min_slot_lag_stalled = read_repair_min_slot_lag_stalled();
     let repair_tip_stall_ms = read_repair_tip_stall_ms();
+    let repair_stall_sustain_ms = read_repair_stall_sustain_ms();
     let repair_tip_probe_ahead_slots = read_repair_tip_probe_ahead_slots();
     let repair_per_slot_cap = read_repair_per_slot_cap();
     let repair_per_slot_cap_stalled = read_repair_per_slot_cap_stalled();
@@ -252,43 +255,6 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
     } else {
         None
     };
-    let mut repair_seed_slot: Option<u64> = None;
-    let mut repair_seed_slots: u64 = 0;
-    let mut repair_seed_failures: u64 = 0;
-    if repair_enabled && let Some(tracker) = missing_tracker.as_mut() {
-        let seed_slots = read_repair_seed_slots();
-        if seed_slots > 0 {
-            let rpc_url = read_rpc_url();
-            match load_current_slot_from_rpc(&rpc_url).await {
-                Ok(current_slot) => {
-                    let capped_seed_slots = seed_slots.min(REPAIR_SEED_SLOT_MAX);
-                    let start_slot =
-                        current_slot.saturating_sub(capped_seed_slots.saturating_sub(1));
-                    let seeded_at = Instant::now();
-                    for slot in start_slot..=current_slot {
-                        tracker.seed_highest_probe_slot(slot, seeded_at);
-                    }
-                    repair_seed_slot = Some(current_slot);
-                    repair_seed_slots = current_slot.saturating_sub(start_slot).saturating_add(1);
-                    tracing::info!(
-                        rpc_url = %rpc_url,
-                        current_slot,
-                        start_slot,
-                        seeded_slots = repair_seed_slots,
-                        "seeded repair tracker from rpc current slot"
-                    );
-                }
-                Err(error) => {
-                    repair_seed_failures = repair_seed_failures.saturating_add(1);
-                    tracing::warn!(
-                        rpc_url = %rpc_url,
-                        error = %error,
-                        "failed to seed repair tracker from rpc current slot"
-                    );
-                }
-            }
-        }
-    }
     let repair_max_requests_per_tick = read_repair_max_requests_per_tick();
     let repair_max_requests_per_tick_stalled = read_repair_max_requests_per_tick_stalled();
     let repair_max_highest_per_tick = read_repair_max_highest_per_tick();
@@ -328,6 +294,20 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
     let mut repair_dynamic_dataset_stalled = false;
     #[cfg(not(feature = "gossip-bootstrap"))]
     let repair_dynamic_dataset_stalled = false;
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut repair_stall_started_at: Option<Instant> = None;
+    #[cfg(feature = "gossip-bootstrap")]
+    let repair_stall_sustain = Duration::from_millis(repair_stall_sustain_ms);
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut repair_last_shred_count_snapshot: u64 = 0;
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut repair_dynamic_stream_progress = false;
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let repair_dynamic_stream_progress = false;
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut repair_dynamic_stream_healthy = false;
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let repair_dynamic_stream_healthy = false;
     let mut latest_shred_updated_at = Instant::now();
     let mut last_dataset_reconstructed_at = Instant::now();
     #[cfg(feature = "gossip-bootstrap")]
@@ -388,6 +368,45 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
     let mut parse_invalid_data_size_count: u64 = 0;
     let mut parse_invalid_coding_header_count: u64 = 0;
     let mut parse_other_count: u64 = 0;
+    let mut relay_cache_inserts: u64 = 0;
+    let mut relay_cache_replacements: u64 = 0;
+    let mut relay_cache_evictions: u64 = 0;
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut udp_relay_candidates: u64 = 0;
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let udp_relay_candidates: u64 = 0;
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut udp_relay_refreshes: u64 = 0;
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let udp_relay_refreshes: u64 = 0;
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut udp_relay_forwarded_packets: u64 = 0;
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let udp_relay_forwarded_packets: u64 = 0;
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut udp_relay_send_attempts: u64 = 0;
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let udp_relay_send_attempts: u64 = 0;
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut udp_relay_send_errors: u64 = 0;
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let udp_relay_send_errors: u64 = 0;
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut udp_relay_rate_limited_packets: u64 = 0;
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let udp_relay_rate_limited_packets: u64 = 0;
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut udp_relay_source_filtered_packets: u64 = 0;
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let udp_relay_source_filtered_packets: u64 = 0;
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut udp_relay_backoff_events: u64 = 0;
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let udp_relay_backoff_events: u64 = 0;
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut udp_relay_backoff_drops: u64 = 0;
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let udp_relay_backoff_drops: u64 = 0;
     let mut dedupe_drop_count: u64 = 0;
     let mut vote_only_count: u64 = 0;
     let mut mixed_count: u64 = 0;
@@ -472,6 +491,42 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
     #[cfg(not(feature = "gossip-bootstrap"))]
     let repair_ping_queue_drops: u64 = 0;
     #[cfg(feature = "gossip-bootstrap")]
+    let mut repair_serve_requests_enqueued: u64 = 0;
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let repair_serve_requests_enqueued: u64 = 0;
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut repair_serve_requests_handled: u64 = 0;
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let repair_serve_requests_handled: u64 = 0;
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut repair_serve_responses_sent: u64 = 0;
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let repair_serve_responses_sent: u64 = 0;
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut repair_serve_cache_misses: u64 = 0;
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let repair_serve_cache_misses: u64 = 0;
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut repair_serve_rate_limited: u64 = 0;
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let repair_serve_rate_limited: u64 = 0;
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut repair_serve_rate_limited_peer: u64 = 0;
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let repair_serve_rate_limited_peer: u64 = 0;
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut repair_serve_rate_limited_bytes: u64 = 0;
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let repair_serve_rate_limited_bytes: u64 = 0;
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut repair_serve_errors: u64 = 0;
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let repair_serve_errors: u64 = 0;
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut repair_serve_queue_drops: u64 = 0;
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let repair_serve_queue_drops: u64 = 0;
+    #[cfg(feature = "gossip-bootstrap")]
     let mut repair_source_hint_drops: u64 = 0;
     #[cfg(not(feature = "gossip-bootstrap"))]
     let repair_source_hint_drops: u64 = 0;
@@ -499,6 +554,9 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
     #[cfg(feature = "gossip-bootstrap")]
     let mut repair_source_hint_last_flush = Instant::now();
     let mut latest_shred_slot: Option<u64> = None;
+    let mut fork_status_transitions_total: u64 = 0;
+    let mut fork_reorg_count: u64 = 0;
+    let mut fork_orphaned_slots_total: u64 = 0;
     #[cfg(feature = "gossip-bootstrap")]
     let mut emitted_slot_leaders: HashMap<u64, [u8; 32]> = HashMap::new();
     let mut coverage_window = SlotCoverageWindow::new(read_coverage_window_slots());
@@ -517,6 +575,21 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
         dataset_attempt_cache_capacity,
         dedupe_capacity,
         dedupe_ttl_ms,
+        relay_cache_enabled = relay_cache.is_some(),
+        relay_cache_window_ms,
+        relay_cache_max_shreds,
+        udp_relay_enabled,
+        udp_relay_refresh_ms,
+        udp_relay_peer_candidates,
+        udp_relay_fanout,
+        udp_relay_max_sends_per_sec,
+        udp_relay_max_peers_per_ip,
+        udp_relay_require_turbine_source_ports,
+        udp_relay_send_error_backoff_ms,
+        udp_relay_send_error_backoff_threshold,
+        tx_confirmed_depth_slots,
+        tx_finalized_depth_slots,
+        fork_window_slots,
         "observer runtime initialized"
     );
     if log_startup_steps {
@@ -533,6 +606,43 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
         Duration::from_millis(CONTROL_PLANE_EVENT_TICK_MS),
         Duration::from_secs(CONTROL_PLANE_EVENT_SNAPSHOT_SECS),
     );
+    #[cfg(feature = "gossip-bootstrap")]
+    let udp_relay_refresh = Duration::from_millis(udp_relay_refresh_ms.max(250));
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut udp_relay_last_refresh = {
+        let now = Instant::now();
+        now.checked_sub(udp_relay_refresh).unwrap_or(now)
+    };
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut udp_relay_peers: Vec<SocketAddr> = Vec::new();
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut udp_relay_rr_cursor: usize = 0;
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut udp_relay_window_started = Instant::now();
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut udp_relay_sends_in_window: u64 = 0;
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut udp_relay_send_error_streak: u64 = 0;
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut udp_relay_backoff_until: Option<Instant> = None;
+    #[cfg(feature = "gossip-bootstrap")]
+    let udp_relay_socket: Option<std::net::UdpSocket> = if udp_relay_enabled {
+        match std::net::UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)) {
+            Ok(socket) => match socket.set_nonblocking(true) {
+                Ok(()) => Some(socket),
+                Err(error) => {
+                    tracing::warn!(error = %error, "failed to set nonblocking on udp relay socket");
+                    None
+                }
+            },
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to bind udp relay socket; disabling udp relay forwarding");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     loop {
         tokio::select! {
@@ -549,11 +659,6 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
                         source: source_addr,
                         bytes: Arc::from(packet_bytes.as_slice()),
                     });
-                }
-                if let Some(packet_bus) = &relay_bus
-                    && packet_bus.send(packet_bytes.clone()).is_err()
-                {
-                    // No active relay subscribers.
                 }
                 packet_count = packet_count.saturating_add(1);
                 if logged_waiting_for_packets {
@@ -587,18 +692,37 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
                             }
                         }
                     }
+                #[cfg(feature = "gossip-bootstrap")]
+                if repair_driver_enabled
+                    && crate::repair::is_supported_repair_request_packet(&packet_bytes)
+                    && let Some(command_tx) = repair_command_tx.as_ref()
+                {
+                    match command_tx.try_send(RepairCommand::HandleServeRequest {
+                        packet: packet_bytes.clone(),
+                        from_addr: source_addr,
+                    }) {
+                        Ok(()) => {
+                            repair_serve_requests_enqueued =
+                                repair_serve_requests_enqueued.saturating_add(1);
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            repair_serve_queue_drops = repair_serve_queue_drops.saturating_add(1);
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            repair_serve_errors = repair_serve_errors.saturating_add(1);
+                        }
+                    }
+                    continue;
+                }
                 match source_addr.port() {
                     TURBINE_PRIMARY_SOURCE_PORT => {
-                        source_port_8899_packets =
-                            source_port_8899_packets.saturating_add(1);
+                        source_port_8899_packets = source_port_8899_packets.saturating_add(1);
                     }
                     TURBINE_SECONDARY_SOURCE_PORT => {
-                        source_port_8900_packets =
-                            source_port_8900_packets.saturating_add(1);
+                        source_port_8900_packets = source_port_8900_packets.saturating_add(1);
                     }
                     _ => {
-                        source_port_other_packets =
-                            source_port_other_packets.saturating_add(1);
+                        source_port_other_packets = source_port_other_packets.saturating_add(1);
                     }
                 }
                 let parsed_shred = match parse_shred_header(&packet_bytes) {
@@ -638,18 +762,30 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
                     ParsedShredHeader::Data(data) => data.common.slot,
                     ParsedShredHeader::Code(code) => code.common.slot,
                 };
+                if let Some(cache) = dedupe_cache.as_mut()
+                    && cache.is_recent_duplicate(&packet_bytes, &parsed_shred, observed_at)
+                {
+                    dedupe_drop_count = dedupe_drop_count.saturating_add(1);
+                    continue;
+                }
+                if let Some(cache) = relay_cache.as_ref() {
+                    let outcome = cache.insert(&packet_bytes, &parsed_shred, observed_at);
+                    if outcome.inserted {
+                        relay_cache_inserts = relay_cache_inserts.saturating_add(1);
+                    }
+                    if outcome.replaced {
+                        relay_cache_replacements =
+                            relay_cache_replacements.saturating_add(1);
+                    }
+                    relay_cache_evictions = relay_cache_evictions
+                        .saturating_add(u64::try_from(outcome.evicted).unwrap_or(u64::MAX));
+                }
                 if plugin_hooks_enabled {
                     plugin_host.on_shred(ShredEvent {
                         source: source_addr,
                         packet: Arc::from(packet_bytes.as_slice()),
                         parsed: Arc::new(parsed_shred.clone()),
                     });
-                }
-                if let Some(cache) = dedupe_cache.as_mut()
-                    && cache.is_recent_duplicate(&packet_bytes, &parsed_shred, observed_at)
-                {
-                    dedupe_drop_count = dedupe_drop_count.saturating_add(1);
-                    continue;
                 }
                 if let Some(verifier) = shred_verifier.as_mut() {
                     let verify_status = verifier.verify_packet(&packet_bytes, observed_at);
@@ -676,6 +812,114 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
                     if !verify_status.is_accepted(verify_strict_unknown) {
                         verify_dropped_count = verify_dropped_count.saturating_add(1);
                         continue;
+                    }
+                }
+                #[cfg(feature = "gossip-bootstrap")]
+                if udp_relay_enabled
+                    && udp_relay_socket.is_some()
+                    && !udp_relay_peers.is_empty()
+                {
+                    let source_is_turbine = matches!(
+                        source_addr.port(),
+                        TURBINE_PRIMARY_SOURCE_PORT | TURBINE_SECONDARY_SOURCE_PORT
+                    );
+                    if udp_relay_require_turbine_source_ports && !source_is_turbine {
+                        udp_relay_source_filtered_packets =
+                            udp_relay_source_filtered_packets.saturating_add(1);
+                    } else if udp_relay_backoff_until
+                        .is_some_and(|backoff_until| observed_at < backoff_until)
+                    {
+                        udp_relay_backoff_drops = udp_relay_backoff_drops.saturating_add(1);
+                    } else {
+                        udp_relay_backoff_until = None;
+                        if observed_at.saturating_duration_since(udp_relay_window_started)
+                            >= Duration::from_secs(1)
+                        {
+                            udp_relay_window_started = observed_at;
+                            udp_relay_sends_in_window = 0;
+                        }
+                        let sends_remaining = udp_relay_max_sends_per_sec
+                            .saturating_sub(udp_relay_sends_in_window);
+                        if sends_remaining == 0 {
+                            udp_relay_rate_limited_packets =
+                                udp_relay_rate_limited_packets.saturating_add(1);
+                        } else if let Some(socket) = udp_relay_socket.as_ref() {
+                            let fanout = udp_relay_fanout
+                                .min(udp_relay_peers.len())
+                                .min(usize::try_from(sends_remaining).unwrap_or(usize::MAX));
+                            if fanout == 0 {
+                                udp_relay_rate_limited_packets =
+                                    udp_relay_rate_limited_packets.saturating_add(1);
+                            } else {
+                                let mut sent_any = false;
+                                let peers_len = udp_relay_peers.len();
+                                if udp_relay_rr_cursor >= peers_len {
+                                    udp_relay_rr_cursor = 0;
+                                }
+                                let mut cursor = udp_relay_rr_cursor;
+                                for _ in 0..fanout {
+                                    if udp_relay_sends_in_window >= udp_relay_max_sends_per_sec
+                                    {
+                                        udp_relay_rate_limited_packets =
+                                            udp_relay_rate_limited_packets.saturating_add(1);
+                                        break;
+                                    }
+                                    let Some(&peer) = udp_relay_peers.get(cursor) else {
+                                        break;
+                                    };
+                                    cursor = cursor.checked_add(1).unwrap_or(0);
+                                    if cursor >= peers_len {
+                                        cursor = 0;
+                                    }
+                                    if peer == source_addr {
+                                        continue;
+                                    }
+                                    udp_relay_send_attempts =
+                                        udp_relay_send_attempts.saturating_add(1);
+                                    match socket.send_to(packet_bytes.as_slice(), peer) {
+                                        Ok(_) => {
+                                            udp_relay_send_error_streak = 0;
+                                            udp_relay_sends_in_window =
+                                                udp_relay_sends_in_window.saturating_add(1);
+                                            sent_any = true;
+                                        }
+                                        Err(error) => {
+                                            udp_relay_send_errors =
+                                                udp_relay_send_errors.saturating_add(1);
+                                            udp_relay_send_error_streak =
+                                                udp_relay_send_error_streak.saturating_add(1);
+                                            if udp_relay_send_error_streak
+                                                >= udp_relay_send_error_backoff_threshold
+                                            {
+                                                udp_relay_backoff_events =
+                                                    udp_relay_backoff_events.saturating_add(1);
+                                                udp_relay_backoff_until = observed_at.checked_add(
+                                                    Duration::from_millis(
+                                                        udp_relay_send_error_backoff_ms,
+                                                    ),
+                                                );
+                                                udp_relay_send_error_streak = 0;
+                                                break;
+                                            }
+                                            if udp_relay_send_errors
+                                                <= INITIAL_DEBUG_SAMPLE_LOG_LIMIT
+                                            {
+                                                tracing::debug!(
+                                                    peer = %peer,
+                                                    error = %error,
+                                                    "udp relay send failed"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                udp_relay_rr_cursor = cursor;
+                                if sent_any {
+                                    udp_relay_forwarded_packets =
+                                        udp_relay_forwarded_packets.saturating_add(1);
+                                }
+                            }
+                        }
                     }
                 }
                 #[cfg(feature = "gossip-bootstrap")]
@@ -743,6 +987,19 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
                             &mut latest_shred_updated_at,
                             data.common.slot,
                             observed_at,
+                        );
+                        let fork_update = fork_tracker.observe_data_shred(
+                            data.common.slot,
+                            derive_parent_slot(data.common.slot, data.data_header.parent_offset),
+                        );
+                        apply_fork_update(
+                            &fork_update,
+                            tx_commitment_tracker.as_ref(),
+                            &plugin_host,
+                            plugin_hooks_enabled,
+                            &mut fork_status_transitions_total,
+                            &mut fork_reorg_count,
+                            &mut fork_orphaned_slots_total,
                         );
                         coverage_window.on_data_shred(data.common.slot);
                         if let Some(outstanding_repairs) = outstanding_repairs.as_mut()
@@ -816,6 +1073,16 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
                             &mut latest_shred_updated_at,
                             code.common.slot,
                             observed_at,
+                        );
+                        let fork_update = fork_tracker.observe_code_shred(code.common.slot);
+                        apply_fork_update(
+                            &fork_update,
+                            tx_commitment_tracker.as_ref(),
+                            &plugin_host,
+                            plugin_hooks_enabled,
+                            &mut fork_status_transitions_total,
+                            &mut fork_reorg_count,
+                            &mut fork_orphaned_slots_total,
                         );
                         coverage_window.on_code_shred(code.common.slot);
                         if let Some(outstanding_repairs) = outstanding_repairs.as_mut() {
@@ -893,6 +1160,19 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
                                 &mut latest_shred_updated_at,
                                 data.common.slot,
                                 observed_at,
+                            );
+                            let fork_update = fork_tracker.observe_recovered_data_shred(
+                                data.common.slot,
+                                derive_parent_slot(data.common.slot, data.data_header.parent_offset),
+                            );
+                            apply_fork_update(
+                                &fork_update,
+                                tx_commitment_tracker.as_ref(),
+                                &plugin_host,
+                                plugin_hooks_enabled,
+                                &mut fork_status_transitions_total,
+                                &mut fork_reorg_count,
+                                &mut fork_orphaned_slots_total,
                             );
                             coverage_window.on_recovered_data_shred(data.common.slot);
                             if let Some(outstanding_repairs) = outstanding_repairs.as_mut()
@@ -1043,6 +1323,61 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
                                 );
                             }
                         }
+                        RepairOutcome::ServeRequestHandled { source, request } => {
+                            repair_serve_requests_handled =
+                                repair_serve_requests_handled.saturating_add(1);
+                            if request.served_index.is_some() {
+                                repair_serve_responses_sent =
+                                    repair_serve_responses_sent.saturating_add(1);
+                            } else if request.rate_limited {
+                                repair_serve_rate_limited =
+                                    repair_serve_rate_limited.saturating_add(1);
+                                if request.rate_limited_by_peer {
+                                    repair_serve_rate_limited_peer =
+                                        repair_serve_rate_limited_peer.saturating_add(1);
+                                }
+                                if request.rate_limited_by_bytes {
+                                    repair_serve_rate_limited_bytes =
+                                        repair_serve_rate_limited_bytes.saturating_add(1);
+                                }
+                            } else {
+                                repair_serve_cache_misses =
+                                    repair_serve_cache_misses.saturating_add(1);
+                            }
+                            if log_repair_peer_traffic {
+                                let kind = match request.kind {
+                                    crate::repair::ServedRepairRequestKind::WindowIndex => {
+                                        "window_index"
+                                    }
+                                    crate::repair::ServedRepairRequestKind::HighestWindowIndex => {
+                                        "highest_window_index"
+                                    }
+                                };
+                                tracing::info!(
+                                    source = %source,
+                                    kind,
+                                    slot = request.slot,
+                                    requested_index = request.requested_index,
+                                    served_index = request.served_index.unwrap_or_default(),
+                                    served = request.served_index.is_some(),
+                                    rate_limited = request.rate_limited,
+                                    rate_limited_by_peer = request.rate_limited_by_peer,
+                                    rate_limited_by_bytes = request.rate_limited_by_bytes,
+                                    unstaked_sender = request.unstaked_sender,
+                                    "repair serve request processed"
+                                );
+                            }
+                        }
+                        RepairOutcome::ServeRequestError { source, error } => {
+                            repair_serve_errors = repair_serve_errors.saturating_add(1);
+                            if repair_serve_errors <= INITIAL_DEBUG_SAMPLE_LOG_LIMIT {
+                                tracing::warn!(
+                                    source = %source,
+                                    error = %error,
+                                    "failed to serve repair request"
+                                );
+                            }
+                        }
                     }
                 }
                 #[cfg(not(feature = "gossip-bootstrap"))]
@@ -1065,9 +1400,28 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
                         let dataset_stall_age_ms = duration_to_ms_u64(
                             tick_now.saturating_duration_since(last_dataset_reconstructed_at),
                         );
-                        let tip_stalled = latest_shred_age_ms >= repair_tip_stall_ms;
-                        let dataset_stalled = dataset_stall_age_ms >= repair_dataset_stall_ms;
-                        let stalled = tip_stalled || dataset_stalled;
+                        let observed_shreds = data_count.saturating_add(code_count);
+                        let stream_progress = observed_shreds > repair_last_shred_count_snapshot;
+                        repair_last_shred_count_snapshot = observed_shreds;
+                        repair_dynamic_stream_progress = stream_progress;
+                        let tip_stalled =
+                            latest_shred_age_ms >= repair_tip_stall_ms && !stream_progress;
+                        let dataset_stalled =
+                            dataset_stall_age_ms >= repair_dataset_stall_ms && !stream_progress;
+                        repair_dynamic_stream_healthy = stream_progress
+                            && latest_shred_age_ms < repair_tip_stall_ms
+                            && dataset_stall_age_ms < repair_dataset_stall_ms;
+                        let stall_observed = tip_stalled || dataset_stalled;
+                        if stall_observed {
+                            let _ = repair_stall_started_at.get_or_insert(tick_now);
+                        } else {
+                            repair_stall_started_at = None;
+                        }
+                        let stalled = repair_stall_started_at
+                            .map(|stalled_at| {
+                                tick_now.saturating_duration_since(stalled_at) >= repair_stall_sustain
+                            })
+                            .unwrap_or(false);
                         repair_dynamic_stalled = stalled;
                         repair_dynamic_dataset_stalled = dataset_stalled;
                         repair_dynamic_min_slot_lag = if stalled {
@@ -1075,17 +1429,24 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
                         } else {
                             repair_min_slot_lag
                         };
-                        repair_dynamic_max_requests_per_tick = if stalled {
+                        let repair_window_open = stall_observed || stalled;
+                        repair_dynamic_max_requests_per_tick = if !repair_window_open {
+                            0
+                        } else if stalled {
                             repair_max_requests_per_tick_stalled
                         } else {
                             repair_max_requests_per_tick
                         };
-                        repair_dynamic_max_highest_per_tick = if stalled {
+                        repair_dynamic_max_highest_per_tick = if !repair_window_open {
+                            0
+                        } else if stalled {
                             repair_max_highest_per_tick_stalled
                         } else {
                             repair_max_highest_per_tick
                         };
-                        repair_dynamic_max_forward_probe_per_tick = if stalled {
+                        repair_dynamic_max_forward_probe_per_tick = if !repair_window_open {
+                            0
+                        } else if stalled {
                             repair_max_forward_probe_per_tick_stalled
                         } else {
                             repair_max_forward_probe_per_tick
@@ -1220,6 +1581,7 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
                                     {
                                         replace_repair_driver(
                                             repair_client,
+                                            relay_cache.clone(),
                                             &mut repair_command_tx,
                                             &mut repair_result_rx,
                                             &mut repair_peer_snapshot,
@@ -1252,6 +1614,7 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
                                     {
                                         replace_repair_driver(
                                             repair_client,
+                                            relay_cache.clone(),
                                             &mut repair_command_tx,
                                             &mut repair_result_rx,
                                             &mut repair_peer_snapshot,
@@ -1269,6 +1632,7 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
                                     {
                                         replace_repair_driver(
                                             repair_client,
+                                            relay_cache.clone(),
                                             &mut repair_command_tx,
                                             &mut repair_result_rx,
                                             &mut repair_peer_snapshot,
@@ -1293,6 +1657,34 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
             }
             _ = control_plane_tick.tick() => {
                 #[cfg(feature = "gossip-bootstrap")]
+                {
+                    let now = Instant::now();
+                    if udp_relay_enabled
+                        && udp_relay_fanout > 0
+                        && now.saturating_duration_since(udp_relay_last_refresh)
+                            >= udp_relay_refresh
+                    {
+                        udp_relay_last_refresh = now;
+                        let peers = runtime
+                            .gossip_runtime
+                            .as_ref()
+                            .map(|gossip_runtime| {
+                                collect_udp_relay_peers(
+                                    gossip_runtime.cluster_info.as_ref(),
+                                    runtime.gossip_identity.pubkey(),
+                                    udp_relay_peer_candidates,
+                                    udp_relay_fanout,
+                                    udp_relay_max_peers_per_ip,
+                                )
+                            })
+                            .unwrap_or_default();
+                        udp_relay_candidates =
+                            u64::try_from(peers.total_candidates).unwrap_or(u64::MAX);
+                        udp_relay_peers = peers.selected_peers;
+                        udp_relay_refreshes = udp_relay_refreshes.saturating_add(1);
+                    }
+                }
+                #[cfg(feature = "gossip-bootstrap")]
                 if plugin_hooks_enabled
                     && let Some(gossip_runtime) = runtime.gossip_runtime.as_ref()
                 {
@@ -1310,7 +1702,7 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
             _ = telemetry_tick.tick() => {
                 if packet_count == 0 && !logged_waiting_for_packets {
                     tracing::info!(
-                        "waiting for ingress packets; check SOF_BIND / SOF_RELAY_CONNECT / SOF_GOSSIP_ENTRYPOINT configuration"
+                        "waiting for ingress packets; check SOF_BIND / SOF_GOSSIP_ENTRYPOINT configuration"
                     );
                     logged_waiting_for_packets = true;
                 }
@@ -1386,7 +1778,46 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
                     .unwrap_or(0_u64);
                 #[cfg(not(feature = "gossip-bootstrap"))]
                 let gossip_runtime_stall_age_ms = 0_u64;
+                #[cfg(feature = "gossip-bootstrap")]
+                let (
+                    udp_relay_peers_telemetry,
+                    udp_relay_refresh_ms_telemetry,
+                    udp_relay_peer_candidates_telemetry,
+                    udp_relay_fanout_telemetry,
+                    udp_relay_max_sends_per_sec_telemetry,
+                    udp_relay_max_peers_per_ip_telemetry,
+                    udp_relay_require_turbine_source_ports_telemetry,
+                    udp_relay_send_error_backoff_ms_telemetry,
+                    udp_relay_send_error_backoff_threshold_telemetry,
+                ) = (
+                    u64::try_from(udp_relay_peers.len()).unwrap_or(u64::MAX),
+                    udp_relay_refresh_ms,
+                    u64::try_from(udp_relay_peer_candidates).unwrap_or(u64::MAX),
+                    u64::try_from(udp_relay_fanout).unwrap_or(u64::MAX),
+                    udp_relay_max_sends_per_sec,
+                    u64::try_from(udp_relay_max_peers_per_ip).unwrap_or(u64::MAX),
+                    if udp_relay_require_turbine_source_ports {
+                        1
+                    } else {
+                        0
+                    },
+                    udp_relay_send_error_backoff_ms,
+                    udp_relay_send_error_backoff_threshold,
+                );
+                #[cfg(not(feature = "gossip-bootstrap"))]
+                let (
+                    udp_relay_peers_telemetry,
+                    udp_relay_refresh_ms_telemetry,
+                    udp_relay_peer_candidates_telemetry,
+                    udp_relay_fanout_telemetry,
+                    udp_relay_max_sends_per_sec_telemetry,
+                    udp_relay_max_peers_per_ip_telemetry,
+                    udp_relay_require_turbine_source_ports_telemetry,
+                    udp_relay_send_error_backoff_ms_telemetry,
+                    udp_relay_send_error_backoff_threshold_telemetry,
+                ) = (0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64);
                 let coverage = coverage_window.snapshot();
+                let fork_snapshot = fork_tracker.snapshot();
                 let dataset_jobs_enqueued = dataset_jobs_enqueued_count.load(Ordering::Relaxed);
                 let dataset_jobs_started = dataset_jobs_started_count.load(Ordering::Relaxed);
                 let dataset_jobs_completed = dataset_jobs_completed_count.load(Ordering::Relaxed);
@@ -1470,6 +1901,37 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
                     parse_invalid_data_size = parse_invalid_data_size_count,
                     parse_invalid_coding = parse_invalid_coding_header_count,
                     parse_other = parse_other_count,
+                    relay_cache_enabled = relay_cache.is_some(),
+                    relay_cache_window_ms = relay_cache_window_ms,
+                    relay_cache_max_shreds = relay_cache_max_shreds,
+                    relay_cache_entries = relay_cache.as_ref().map_or(0, SharedRelayCache::len),
+                    relay_cache_inserts = relay_cache_inserts,
+                    relay_cache_replacements = relay_cache_replacements,
+                    relay_cache_evictions = relay_cache_evictions,
+                    udp_relay_enabled = udp_relay_enabled,
+                    udp_relay_refresh_ms = udp_relay_refresh_ms_telemetry,
+                    udp_relay_peer_candidates = udp_relay_peer_candidates_telemetry,
+                    udp_relay_fanout = udp_relay_fanout_telemetry,
+                    udp_relay_max_sends_per_sec =
+                        udp_relay_max_sends_per_sec_telemetry,
+                    udp_relay_max_peers_per_ip = udp_relay_max_peers_per_ip_telemetry,
+                    udp_relay_require_turbine_source_ports =
+                        udp_relay_require_turbine_source_ports_telemetry,
+                    udp_relay_send_error_backoff_ms =
+                        udp_relay_send_error_backoff_ms_telemetry,
+                    udp_relay_send_error_backoff_threshold =
+                        udp_relay_send_error_backoff_threshold_telemetry,
+                    udp_relay_candidates = udp_relay_candidates,
+                    udp_relay_peers = udp_relay_peers_telemetry,
+                    udp_relay_refreshes = udp_relay_refreshes,
+                    udp_relay_forwarded_packets = udp_relay_forwarded_packets,
+                    udp_relay_send_attempts = udp_relay_send_attempts,
+                    udp_relay_send_errors = udp_relay_send_errors,
+                    udp_relay_rate_limited_packets =
+                        udp_relay_rate_limited_packets,
+                    udp_relay_source_filtered_packets = udp_relay_source_filtered_packets,
+                    udp_relay_backoff_events = udp_relay_backoff_events,
+                    udp_relay_backoff_drops = udp_relay_backoff_drops,
                     dedupe_enabled = dedupe_cache.is_some(),
                     dedupe_capacity = dedupe_capacity,
                     dedupe_ttl_ms = dedupe_ttl_ms,
@@ -1520,11 +1982,14 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
                     repair_outstanding_timeout_ms = repair_outstanding_timeout_ms,
                     repair_tip_stall_ms = repair_tip_stall_ms,
                     repair_dataset_stall_ms = repair_dataset_stall_ms,
+                    repair_stall_sustain_ms = repair_stall_sustain_ms,
                     repair_tip_probe_ahead_slots = repair_tip_probe_ahead_slots,
                     repair_min_slot_lag = repair_min_slot_lag,
                     repair_min_slot_lag_stalled = repair_min_slot_lag_stalled,
                     repair_dynamic_stalled = repair_dynamic_stalled,
                     repair_dynamic_dataset_stalled = repair_dynamic_dataset_stalled,
+                    repair_dynamic_stream_progress = repair_dynamic_stream_progress,
+                    repair_dynamic_stream_healthy = repair_dynamic_stream_healthy,
                     repair_dynamic_min_slot_lag = repair_dynamic_min_slot_lag,
                     repair_per_slot_cap = repair_per_slot_cap,
                     repair_per_slot_cap_stalled = repair_per_slot_cap_stalled,
@@ -1538,12 +2003,21 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
                     repair_max_forward_probe_per_tick = repair_max_forward_probe_per_tick,
                     repair_max_forward_probe_per_tick_stalled = repair_max_forward_probe_per_tick_stalled,
                     repair_dynamic_max_forward_probe_per_tick = repair_dynamic_max_forward_probe_per_tick,
-                    repair_seed_slot = repair_seed_slot.unwrap_or_default(),
-                    repair_seed_slots = repair_seed_slots,
-                    repair_seed_failures = repair_seed_failures,
+                    repair_seed_slot = 0,
+                    repair_seed_slots = 0,
+                    repair_seed_failures = 0,
                     repair_response_pings = repair_response_pings,
                     repair_response_ping_errors = repair_response_ping_errors,
                     repair_ping_queue_drops = repair_ping_queue_drops,
+                    repair_serve_requests_enqueued = repair_serve_requests_enqueued,
+                    repair_serve_requests_handled = repair_serve_requests_handled,
+                    repair_serve_responses_sent = repair_serve_responses_sent,
+                    repair_serve_cache_misses = repair_serve_cache_misses,
+                    repair_serve_rate_limited = repair_serve_rate_limited,
+                    repair_serve_rate_limited_peer = repair_serve_rate_limited_peer,
+                    repair_serve_rate_limited_bytes = repair_serve_rate_limited_bytes,
+                    repair_serve_errors = repair_serve_errors,
+                    repair_serve_queue_drops = repair_serve_queue_drops,
                     repair_source_hint_enqueued = repair_source_hint_enqueued,
                     repair_source_hint_drops = repair_source_hint_drops,
                     repair_source_hint_buffer_drops = repair_source_hint_buffer_drops,
@@ -1560,6 +2034,18 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
                     repair_peer_total = repair_peer_total,
                     repair_peer_active = repair_peer_active,
                     latest_shred_slot = latest_shred_slot.unwrap_or_default(),
+                    fork_window_slots = fork_window_slots,
+                    fork_slots_tracked = u64::try_from(fork_snapshot.tracked_slots).unwrap_or(u64::MAX),
+                    fork_tip_slot = fork_snapshot.tip_slot.unwrap_or_default(),
+                    fork_confirmed_slot = fork_snapshot.confirmed_slot.unwrap_or_default(),
+                    fork_finalized_slot = fork_snapshot.finalized_slot.unwrap_or_default(),
+                    fork_status_transitions = fork_status_transitions_total,
+                    fork_reorgs = fork_reorg_count,
+                    fork_orphaned_slots = fork_orphaned_slots_total,
+                    tx_confirmed_slot =
+                        tx_commitment_tracker.snapshot().confirmed_slot.unwrap_or_default(),
+                    tx_finalized_slot =
+                        tx_commitment_tracker.snapshot().finalized_slot.unwrap_or_default(),
                     latest_shred_age_ms = duration_to_ms_u64(
                         Instant::now().saturating_duration_since(latest_shred_updated_at)
                     ),
@@ -1600,14 +2086,136 @@ pub(in crate::app::runtime) async fn run_async_with_plugin_host(
                         slot = event.slot,
                         signature = %event.signature,
                         kind = ?event.kind,
+                        commitment_status = ?event.commitment_status,
                         "tx observed"
                     );
                 }
             }
         }
     }
-
     dataset_worker_pool.shutdown().await;
     drop(runtime);
     Ok(())
+}
+
+const fn derive_parent_slot(slot: u64, parent_offset: u16) -> Option<u64> {
+    if parent_offset == 0 {
+        return None;
+    }
+    slot.checked_sub(parent_offset as u64)
+}
+
+fn apply_fork_update(
+    update: &ForkTrackerUpdate,
+    tx_commitment_tracker: &CommitmentSlotTracker,
+    plugin_host: &PluginHost,
+    plugin_hooks_enabled: bool,
+    fork_status_transitions_total: &mut u64,
+    fork_reorg_count: &mut u64,
+    fork_orphaned_slots_total: &mut u64,
+) {
+    tx_commitment_tracker.update(
+        update.snapshot.confirmed_slot,
+        update.snapshot.finalized_slot,
+    );
+    *fork_status_transitions_total = fork_status_transitions_total
+        .saturating_add(u64::try_from(update.status_transitions.len()).unwrap_or(u64::MAX));
+    for transition in &update.status_transitions {
+        if transition.status == crate::event::ForkSlotStatus::Orphaned {
+            *fork_orphaned_slots_total = fork_orphaned_slots_total.saturating_add(1);
+        }
+        if plugin_hooks_enabled {
+            plugin_host.on_slot_status(SlotStatusEvent {
+                slot: transition.slot,
+                parent_slot: transition.parent_slot,
+                previous_status: transition.previous_status,
+                status: transition.status,
+                tip_slot: update.snapshot.tip_slot,
+                confirmed_slot: update.snapshot.confirmed_slot,
+                finalized_slot: update.snapshot.finalized_slot,
+            });
+        }
+    }
+    if let Some(reorg) = update.reorg.as_ref() {
+        *fork_reorg_count = fork_reorg_count.saturating_add(1);
+        if plugin_hooks_enabled {
+            plugin_host.on_reorg(ReorgEvent {
+                old_tip: reorg.old_tip,
+                new_tip: reorg.new_tip,
+                common_ancestor: reorg.common_ancestor,
+                detached_slots: reorg.detached_slots.clone(),
+                attached_slots: reorg.attached_slots.clone(),
+                confirmed_slot: update.snapshot.confirmed_slot,
+                finalized_slot: update.snapshot.finalized_slot,
+            });
+        }
+    }
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+#[derive(Default)]
+struct UdpRelayPeers {
+    total_candidates: usize,
+    selected_peers: Vec<SocketAddr>,
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+fn collect_udp_relay_peers(
+    cluster_info: &ClusterInfo,
+    local_pubkey: Pubkey,
+    peer_candidates: usize,
+    fanout: usize,
+    max_peers_per_ip: usize,
+) -> UdpRelayPeers {
+    if peer_candidates == 0 || fanout == 0 || max_peers_per_ip == 0 {
+        return UdpRelayPeers::default();
+    }
+
+    let local_shred_version = cluster_info.my_shred_version();
+    let mut peers = cluster_info.all_peers();
+    peers.sort_unstable_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| right.0.wallclock().cmp(&left.0.wallclock()))
+            .then_with(|| right.0.pubkey().to_bytes().cmp(&left.0.pubkey().to_bytes()))
+    });
+    let mut selected_peers = Vec::with_capacity(fanout.min(peer_candidates));
+    let mut seen = HashSet::new();
+    let mut selected_per_ip: HashMap<IpAddr, usize> = HashMap::new();
+    let mut total_candidates = 0_usize;
+    for (contact_info, _) in peers {
+        if contact_info.pubkey() == &local_pubkey {
+            continue;
+        }
+        if local_shred_version != 0 && contact_info.shred_version() != local_shred_version {
+            continue;
+        }
+        let Some(candidate) = contact_info.tvu(solana_gossip::contact_info::Protocol::UDP) else {
+            continue;
+        };
+        let ip = candidate.ip();
+        if ip.is_unspecified() || ip.is_multicast() || candidate.port() == 0 {
+            continue;
+        }
+        if !seen.insert(candidate) {
+            continue;
+        }
+        total_candidates = total_candidates.saturating_add(1);
+        if selected_peers.len() < fanout {
+            let selected_on_ip = selected_per_ip.entry(ip).or_default();
+            if *selected_on_ip >= max_peers_per_ip {
+                continue;
+            }
+            selected_peers.push(candidate);
+            *selected_on_ip = selected_on_ip.saturating_add(1);
+        }
+        if total_candidates >= peer_candidates && selected_peers.len() >= fanout {
+            break;
+        }
+    }
+    UdpRelayPeers {
+        total_candidates,
+        selected_peers,
+    }
 }

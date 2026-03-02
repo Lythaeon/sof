@@ -14,7 +14,8 @@ use tokio::sync::{Semaphore, mpsc};
 use crate::framework::{
     events::{
         ClusterTopologyEvent, DatasetEvent, LeaderScheduleEntry, LeaderScheduleEvent,
-        ObservedRecentBlockhashEvent, RawPacketEvent, ShredEvent, TransactionEvent,
+        ObservedRecentBlockhashEvent, RawPacketEvent, ReorgEvent, ShredEvent, SlotStatusEvent,
+        TransactionEvent,
     },
     plugin::ObserverPlugin,
 };

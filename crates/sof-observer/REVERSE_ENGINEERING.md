@@ -3,12 +3,14 @@
 This document describes how `sof-observer` currently works in code (not a progress log).
 Primary implementation lives in:
 
-- `crates/sof-observer/src/app/runtime.rs`
+- `crates/sof-observer/src/runtime.rs`
+- `crates/sof-observer/src/app/runtime/*`
 - `crates/sof-observer/src/ingest/core.rs`
 - `crates/sof-observer/src/shred/wire/*`
 - `crates/sof-observer/src/reassembly/*`
 - `crates/sof-observer/src/verify/core/*`
-- `crates/sof-observer/src/repair/core.rs`
+- `crates/sof-observer/src/relay/*`
+- `crates/sof-observer/src/repair/core/*`
 - `crates/sof-observer/src/framework/*`
 
 ## Runtime entrypoints and composition
@@ -17,9 +19,8 @@ Primary implementation lives in:
 - `sof_observer::runtime::run_async()` orchestrates all ingest, parse, verify, reassembly, repair, telemetry, and tx classification.
 - Ingest sources can run concurrently:
   - direct UDP listener (`SOF_BIND`, default `0.0.0.0:8001`)
-  - TCP relay clients (`SOF_RELAY_CONNECT`, comma-separated)
   - gossip bootstrap sockets (`SOF_GOSSIP_ENTRYPOINT`, requires `gossip-bootstrap` feature)
-  - optional TCP relay server (`SOF_RELAY_LISTEN`) that rebroadcasts raw packets
+    including TVU sockets and repair ingress sockets
 
 All sources feed a shared `mpsc::Sender<RawPacketBatch>`.
 
@@ -28,16 +29,17 @@ All sources feed a shared `mpsc::Sender<RawPacketBatch>`.
 For each packet in the runtime loop:
 
 1. Emit `on_raw_packet` plugin hook.
-2. Optionally mirror raw bytes to relay clients (`SOF_RELAY_LISTEN` bus).
-3. If gossip repair is enabled, detect and route repair ping packets to repair handler.
-4. Parse shred header (`parse_shred_header`).
-5. Emit `on_shred` plugin hook.
-6. Optional recent duplicate suppression (signature+slot+index+fec+version+variant key).
-7. Optional cryptographic verification (`ShredVerifier`).
-8. Feed packet into FEC recovery (`FecRecoverer`) to attempt recovered data shreds.
-9. Update missing-shred tracker (repair), slot coverage metrics, and counters.
-10. Feed data shreds into dataset reassembler; enqueue completed datasets to worker queues.
-11. Process recovered data shreds through the same dataset path (with separate counters).
+2. If gossip repair is enabled, detect and route signed repair requests/pings to repair handler.
+3. Parse shred header (`parse_shred_header`).
+4. Emit `on_shred` plugin hook.
+5. Apply duplicate suppression (signature+slot+index+fec+version+variant key).
+6. Optionally run cryptographic verification (`ShredVerifier`).
+7. Insert valid shreds into the bounded relay cache.
+8. In gossip mode, optionally forward bounded UDP relay traffic to selected TVU peers.
+9. Feed packet into FEC recovery (`FecRecoverer`) to attempt recovered data shreds.
+10. Update missing-shred tracker (repair), fork/slot state, coverage metrics, and counters.
+11. Feed data shreds into dataset reassembler; enqueue completed datasets to worker queues.
+12. Process recovered data shreds through the same dataset path (with separate counters).
 
 Dataset workers then:
 
@@ -114,7 +116,7 @@ Statuses:
 
 Slot-leader bootstrap:
 
-- Optional RPC pre-load (`SOF_VERIFY_RPC_SLOT_LEADERS=true` by default) via `getSlot` + `getSlotLeaders`.
+- No RPC pre-load path is used.
 - In gossip mode, known pubkeys are continuously refreshed from repair peer snapshot.
 
 ## FEC recovery model
@@ -167,7 +169,7 @@ Planner behavior:
 - enforces cooldown (`SOF_REPAIR_COOLDOWN_MS`, default `150`)
 - respects slot-lag policy (`SOF_REPAIR_MIN_SLOT_LAG`, default `4`)
 - applies per-slot cap (`SOF_REPAIR_PER_SLOT_CAP`, default `16`)
-- supports forward probing and startup seeding (`SOF_REPAIR_SEED_SLOTS`)
+- supports forward probing
 
 Wire send path:
 
@@ -204,6 +206,11 @@ Hook API:
 - `on_shred`
 - `on_dataset`
 - `on_transaction`
+- `on_slot_status`
+- `on_reorg`
+- `on_recent_blockhash`
+- `on_cluster_topology` (gossip-bootstrap)
+- `on_leader_schedule` (gossip-bootstrap)
 
 Current packaged runtime constructs `PluginHostBuilder::new().build()` (empty host).
 So hooks exist and are called, but no plugins are registered unless you wire a non-empty `PluginHost` in your embedding runtime.

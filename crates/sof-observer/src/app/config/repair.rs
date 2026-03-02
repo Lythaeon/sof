@@ -2,6 +2,17 @@
 use super::read_bool_env;
 use super::read_env_var;
 
+const DEFAULT_REPAIR_MAX_REQUESTS_PER_TICK: usize = 4;
+const REPAIR_MAX_REQUESTS_PER_TICK_CAP: usize = 24;
+#[cfg(feature = "gossip-bootstrap")]
+const REPAIR_PEER_SAMPLE_SIZE_CAP: usize = 10;
+#[cfg(feature = "gossip-bootstrap")]
+const REPAIR_SERVE_MAX_BYTES_PER_SEC_CAP: usize = 12_000_000;
+#[cfg(feature = "gossip-bootstrap")]
+const REPAIR_SERVE_UNSTAKED_MAX_BYTES_PER_SEC_CAP: usize = 2_000_000;
+#[cfg(feature = "gossip-bootstrap")]
+const REPAIR_SERVE_MAX_REQUESTS_PER_PEER_PER_SEC_CAP: usize = 256;
+
 #[cfg(feature = "gossip-bootstrap")]
 pub fn read_repair_enabled() -> bool {
     read_bool_env("SOF_REPAIR_ENABLED", true)
@@ -65,7 +76,8 @@ pub fn read_repair_max_requests_per_tick() -> usize {
     read_env_var("SOF_REPAIR_MAX_REQUESTS_PER_TICK")
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(64)
+        .map(|value| value.min(REPAIR_MAX_REQUESTS_PER_TICK_CAP))
+        .unwrap_or(DEFAULT_REPAIR_MAX_REQUESTS_PER_TICK)
 }
 
 pub fn read_repair_outstanding_timeout_ms() -> u64 {
@@ -88,7 +100,7 @@ pub fn read_repair_per_slot_cap_stalled() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .map(|value| value.min(4096))
-        .unwrap_or_else(|| read_repair_per_slot_cap().saturating_mul(4).clamp(32, 4096))
+        .unwrap_or_else(|| read_repair_per_slot_cap().saturating_mul(2).clamp(16, 4096))
 }
 
 pub fn read_repair_dataset_stall_ms() -> u64 {
@@ -96,6 +108,13 @@ pub fn read_repair_dataset_stall_ms() -> u64 {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(2_000)
+}
+
+pub fn read_repair_stall_sustain_ms() -> u64 {
+    read_env_var("SOF_REPAIR_STALL_SUSTAIN_MS")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1_500)
 }
 
 pub fn read_repair_min_slot_lag() -> u64 {
@@ -107,14 +126,14 @@ pub fn read_repair_min_slot_lag() -> u64 {
 pub fn read_repair_min_slot_lag_stalled() -> u64 {
     read_env_var("SOF_REPAIR_MIN_SLOT_LAG_STALLED")
         .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0)
+        .unwrap_or(2)
 }
 
 pub fn read_repair_tip_stall_ms() -> u64 {
     read_env_var("SOF_REPAIR_TIP_STALL_MS")
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(800)
+        .unwrap_or(1_500)
 }
 
 pub fn read_repair_tip_probe_ahead_slots() -> usize {
@@ -125,15 +144,51 @@ pub fn read_repair_tip_probe_ahead_slots() -> usize {
         .unwrap_or(16)
 }
 
+#[cfg(feature = "gossip-bootstrap")]
+pub fn read_repair_peer_sample_size() -> usize {
+    read_env_var("SOF_REPAIR_PEER_SAMPLE_SIZE")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(REPAIR_PEER_SAMPLE_SIZE_CAP))
+        .unwrap_or(REPAIR_PEER_SAMPLE_SIZE_CAP)
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+pub fn read_repair_serve_max_bytes_per_sec() -> usize {
+    read_env_var("SOF_REPAIR_SERVE_MAX_BYTES_PER_SEC")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(REPAIR_SERVE_MAX_BYTES_PER_SEC_CAP))
+        .unwrap_or(4_000_000)
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+pub fn read_repair_serve_unstaked_max_bytes_per_sec() -> usize {
+    read_env_var("SOF_REPAIR_SERVE_UNSTAKED_MAX_BYTES_PER_SEC")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(REPAIR_SERVE_UNSTAKED_MAX_BYTES_PER_SEC_CAP))
+        .unwrap_or(1_000_000)
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+pub fn read_repair_serve_max_requests_per_peer_per_sec() -> usize {
+    read_env_var("SOF_REPAIR_SERVE_MAX_REQUESTS_PER_PEER_PER_SEC")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(REPAIR_SERVE_MAX_REQUESTS_PER_PEER_PER_SEC_CAP))
+        .unwrap_or(REPAIR_SERVE_MAX_REQUESTS_PER_PEER_PER_SEC_CAP)
+}
+
 pub fn read_repair_max_requests_per_tick_stalled() -> usize {
     read_env_var("SOF_REPAIR_MAX_REQUESTS_PER_TICK_STALLED")
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .map(|value| value.min(4096))
+        .map(|value| value.min(REPAIR_MAX_REQUESTS_PER_TICK_CAP))
         .unwrap_or_else(|| {
             read_repair_max_requests_per_tick()
-                .saturating_mul(4)
-                .clamp(1, 4096)
+                .saturating_mul(2)
+                .clamp(1, REPAIR_MAX_REQUESTS_PER_TICK_CAP)
         })
 }
 
@@ -141,7 +196,7 @@ pub fn read_repair_max_highest_per_tick() -> usize {
     read_env_var("SOF_REPAIR_MAX_HIGHEST_PER_TICK")
         .and_then(|value| value.parse::<usize>().ok())
         .map(|value| value.min(4_096))
-        .unwrap_or(32)
+        .unwrap_or(4)
 }
 
 pub fn read_repair_max_highest_per_tick_stalled() -> usize {
@@ -150,8 +205,8 @@ pub fn read_repair_max_highest_per_tick_stalled() -> usize {
         .map(|value| value.min(4_096))
         .unwrap_or_else(|| {
             read_repair_max_highest_per_tick()
-                .saturating_mul(4)
-                .clamp(128, 4_096)
+                .saturating_mul(2)
+                .clamp(16, 4_096)
         })
 }
 
@@ -159,7 +214,7 @@ pub fn read_repair_max_forward_probe_per_tick() -> usize {
     read_env_var("SOF_REPAIR_MAX_FORWARD_PROBE_PER_TICK")
         .and_then(|value| value.parse::<usize>().ok())
         .map(|value| value.min(4_096))
-        .unwrap_or(16)
+        .unwrap_or(2)
 }
 
 pub fn read_repair_max_forward_probe_per_tick_stalled() -> usize {
@@ -168,15 +223,9 @@ pub fn read_repair_max_forward_probe_per_tick_stalled() -> usize {
         .map(|value| value.min(4_096))
         .unwrap_or_else(|| {
             read_repair_max_forward_probe_per_tick()
-                .saturating_mul(8)
-                .clamp(128, 4_096)
+                .saturating_mul(2)
+                .clamp(8, 4_096)
         })
-}
-
-pub fn read_repair_seed_slots() -> u64 {
-    read_env_var("SOF_REPAIR_SEED_SLOTS")
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(16)
 }
 
 pub fn read_repair_backfill_sets() -> usize {

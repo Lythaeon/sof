@@ -6,6 +6,7 @@
 - optional shred verification
 - dataset reconstruction and transaction extraction
 - plugin-driven event hooks for custom logic
+- local transaction commitment status tagging (`processed` / `confirmed` / `finalized`) without RPC dependency
 
 ## Install
 
@@ -16,7 +17,7 @@ cargo add sof
 Optional gossip bootstrap support at compile time:
 
 ```toml
-sof = { version = "0.2", features = ["gossip-bootstrap"] }
+sof = { version = "0.3", features = ["gossip-bootstrap"] }
 ```
 
 ## Quick Start
@@ -95,14 +96,32 @@ Current hook set:
 - `on_shred`
 - `on_dataset`
 - `on_transaction`
+- `on_slot_status`
+- `on_reorg`
 - `on_recent_blockhash`
 - `on_cluster_topology` (gossip-bootstrap mode)
 - `on_leader_schedule` (gossip-bootstrap mode)
+
+`on_transaction` events include:
+
+- `commitment_status`
+- `confirmed_slot`
+- `finalized_slot`
+
+These commitment fields are derived from local shred-stream slot progress (depth-based), not RPC polling.
+
+`on_slot_status` events include local canonical transitions:
+
+- `processed`
+- `confirmed`
+- `finalized`
+- `orphaned`
 
 ## Operational Notes
 
 - Hooks are dispatched off the ingest hot path through a bounded queue.
 - Queue pressure drops hook events instead of stalling ingest.
+- In gossip mode, SOF runs as an active bounded relay client by default (UDP relay + repair serve), not as an observer-only passive consumer.
 - `SOF_LIVE_SHREDS_ENABLED=false` enables control-plane-only mode.
 
 ## Examples

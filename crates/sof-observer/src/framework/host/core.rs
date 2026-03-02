@@ -114,6 +114,20 @@ impl PluginHost {
         }
     }
 
+    /// Enqueues slot-status transition hook to registered plugins.
+    pub fn on_slot_status(&self, event: SlotStatusEvent) {
+        if let Some(dispatcher) = &self.dispatcher {
+            dispatcher.dispatch("on_slot_status", PluginDispatchEvent::SlotStatus(event));
+        }
+    }
+
+    /// Enqueues canonical reorg hook to registered plugins.
+    pub fn on_reorg(&self, event: ReorgEvent) {
+        if let Some(dispatcher) = &self.dispatcher {
+            dispatcher.dispatch("on_reorg", PluginDispatchEvent::Reorg(event));
+        }
+    }
+
     /// Updates latest observed recent blockhash and enqueues hook when hash changed.
     pub fn on_recent_blockhash(&self, event: ObservedRecentBlockhashEvent) {
         let should_emit = self

@@ -80,6 +80,13 @@ pub fn read_coverage_window_slots() -> u64 {
         .unwrap_or(256)
 }
 
+pub fn read_fork_window_slots() -> u64 {
+    read_env_var("SOF_FORK_WINDOW_SLOTS")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(2_048)
+}
+
 pub fn read_log_all_txs() -> bool {
     read_env_var("SOF_LOG_ALL_TXS")
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
@@ -113,29 +120,6 @@ pub fn read_log_repair_peer_traffic_every() -> u64 {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(256)
-}
-
-pub fn read_rpc_url() -> String {
-    read_env_var("SOF_RPC_URL")
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "https://api.mainnet-beta.solana.com".to_owned())
-}
-
-pub fn read_verify_rpc_slot_leaders() -> bool {
-    read_bool_env("SOF_VERIFY_RPC_SLOT_LEADERS", true)
-}
-
-pub fn read_verify_rpc_slot_leader_history_slots() -> u64 {
-    read_env_var("SOF_VERIFY_RPC_SLOT_LEADER_HISTORY")
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(512)
-}
-
-pub fn read_verify_rpc_slot_leader_fetch_slots() -> usize {
-    read_env_var("SOF_VERIFY_RPC_SLOT_LEADER_FETCH")
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(4_096)
 }
 
 pub fn read_verify_shreds() -> bool {
@@ -182,4 +166,16 @@ pub fn read_shred_dedupe_ttl_ms() -> u64 {
     read_env_var("SOF_SHRED_DEDUP_TTL_MS")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(250)
+}
+
+pub fn read_tx_confirmed_depth_slots() -> u64 {
+    read_env_var("SOF_TX_CONFIRMED_DEPTH_SLOTS")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(32)
+}
+
+pub fn read_tx_finalized_depth_slots() -> u64 {
+    read_env_var("SOF_TX_FINALIZED_DEPTH_SLOTS")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(150)
 }

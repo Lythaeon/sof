@@ -11,6 +11,7 @@ pub(super) struct DatasetProcessInput {
 pub(super) struct DatasetProcessContext<'context> {
     pub(super) plugin_host: &'context PluginHost,
     pub(super) tx_event_tx: &'context mpsc::Sender<TxObservedEvent>,
+    pub(super) tx_commitment_tracker: &'context CommitmentSlotTracker,
     pub(super) tx_event_drop_count: &'context AtomicU64,
     pub(super) dataset_decode_fail_count: &'context AtomicU64,
     pub(super) dataset_tail_skip_count: &'context AtomicU64,
@@ -50,6 +51,12 @@ pub(super) fn process_completed_dataset(
             .fetch_add(u64::from(skipped_prefix_shreds), Ordering::Relaxed);
     }
     let plugin_hooks_enabled = !context.plugin_host.is_empty();
+    let commitment_snapshot = context.tx_commitment_tracker.snapshot();
+    let commitment_status = TxCommitmentStatus::from_slot(
+        slot,
+        commitment_snapshot.confirmed_slot,
+        commitment_snapshot.finalized_slot,
+    );
 
     let mut tx_count: u64 = 0;
     let mut observed_recent_blockhash: Option<[u8; 32]> = None;
@@ -64,6 +71,9 @@ pub(super) fn process_completed_dataset(
             if plugin_hooks_enabled {
                 context.plugin_host.on_transaction(TransactionEvent {
                     slot,
+                    commitment_status,
+                    confirmed_slot: commitment_snapshot.confirmed_slot,
+                    finalized_slot: commitment_snapshot.finalized_slot,
                     signature,
                     tx: Arc::new(tx),
                     kind,
@@ -73,6 +83,7 @@ pub(super) fn process_completed_dataset(
                 slot,
                 signature: signature.unwrap_or_default(),
                 kind,
+                commitment_status,
             };
             if context.tx_event_tx.try_send(event).is_err() {
                 let _ = context.tx_event_drop_count.fetch_add(1, Ordering::Relaxed);

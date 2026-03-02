@@ -6,15 +6,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+// Linux-only ancillary control messages are used for RX queue overflow telemetry.
+// Runtime ingest remains cross-platform; non-Linux builds use the standard recv_from path.
 #[cfg(target_os = "linux")]
 use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg};
 use socket2::SockRef;
 use thiserror::Error;
 use tokio::{
-    io::AsyncReadExt,
     sync::mpsc,
     task::{self, JoinHandle},
-    time::sleep,
 };
 
 use crate::ingest::config::{
@@ -22,9 +22,15 @@ use crate::ingest::config::{
     read_udp_idle_wait_ms, read_udp_rcvbuf_bytes, read_udp_receiver_core,
 };
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum RawPacketIngress {
+    Udp,
+}
+
 #[derive(Debug)]
 pub struct RawPacket {
     pub source: SocketAddr,
+    pub ingress: RawPacketIngress,
     pub bytes: Vec<u8>,
 }
 
@@ -132,18 +138,6 @@ pub fn spawn_udp_receiver(
 }
 
 #[must_use]
-pub fn spawn_tcp_relay_receiver(
-    remote_addr: SocketAddr,
-    tx: mpsc::Sender<RawPacketBatch>,
-) -> JoinHandle<()> {
-    task::spawn(async move {
-        if let Err(err) = run_tcp_relay_receiver(remote_addr, tx).await {
-            tracing::error!(remote = %remote_addr, error = %err, "tcp relay receiver terminated");
-        }
-    })
-}
-
-#[must_use]
 pub fn spawn_udp_receiver_from_std(
     std_socket: std::net::UdpSocket,
     tx: mpsc::Sender<RawPacketBatch>,
@@ -233,6 +227,7 @@ fn run_udp_receiver_with_socket(
                 }
                 batch.push(RawPacket {
                     source: packet.source,
+                    ingress: RawPacketIngress::Udp,
                     bytes: bytes.to_vec(),
                 });
                 let batch_elapsed = batch_started_at
@@ -271,6 +266,5 @@ fn run_udp_receiver_with_socket(
 #[path = "io.rs"]
 mod io;
 use io::{
-    current_unix_ms, flush_batch, maybe_pin_receiver_thread, recv_udp_packet,
-    run_tcp_relay_receiver, tune_udp_socket,
+    current_unix_ms, flush_batch, maybe_pin_receiver_thread, recv_udp_packet, tune_udp_socket,
 };

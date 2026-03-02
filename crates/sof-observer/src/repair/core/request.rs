@@ -1,7 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bincode::Options;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signature::{SIGNATURE_BYTES, Signature};
@@ -10,6 +10,9 @@ use thiserror::Error;
 
 use super::MissingShredRequestKind;
 
+const SIGNATURE_OFFSET: usize = 4;
+const SIGNED_REPAIR_REQUEST_TIME_WINDOW_MS: u64 = 10 * 60 * 1_000;
+const MIN_SIGNED_REPAIR_REQUEST_BYTES: usize = 4 + SIGNATURE_BYTES + 32 + 32 + 8 + 4 + 8 + 8;
 const REPAIR_PROTOCOL_WINDOW_INDEX_VARIANT: u32 = 8;
 const REPAIR_PROTOCOL_HIGHEST_WINDOW_INDEX_VARIANT: u32 = 9;
 
@@ -36,7 +39,7 @@ pub enum RepairRequestError {
     },
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepairRequestHeader {
     signature: Signature,
     sender: Pubkey,
@@ -57,6 +60,73 @@ struct HighestWindowIndexRequest {
     header: RepairRequestHeader,
     slot: u64,
     shred_index: u64,
+}
+
+#[derive(Debug, Deserialize)]
+enum TaggedRepairRequest {
+    LegacyWindowIndex,
+    LegacyHighestWindowIndex,
+    LegacyOrphan,
+    LegacyWindowIndexWithNonce,
+    LegacyHighestWindowIndexWithNonce,
+    LegacyOrphanWithNonce,
+    LegacyAncestorHashes,
+    Pong,
+    WindowIndex {
+        header: RepairRequestHeader,
+        slot: u64,
+        shred_index: u64,
+    },
+    HighestWindowIndex {
+        header: RepairRequestHeader,
+        slot: u64,
+        shred_index: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ParsedRepairRequestKind {
+    WindowIndex,
+    HighestWindowIndex,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ParsedRepairRequest {
+    pub kind: ParsedRepairRequestKind,
+    pub sender: Pubkey,
+    pub slot: u64,
+    pub shred_index: u64,
+    pub nonce: u32,
+}
+
+#[derive(Debug, Error)]
+pub enum ParseRepairRequestError {
+    #[error("failed to deserialize repair request payload: {source}")]
+    Deserialize { source: bincode::Error },
+    #[error(
+        "repair request payload too short to verify signature: payload_len={payload_len}, required_len={required_len}"
+    )]
+    PayloadTooShort {
+        payload_len: usize,
+        required_len: usize,
+    },
+    #[error(
+        "repair request recipient mismatch; expected={expected_recipient} actual={actual_recipient}"
+    )]
+    RecipientMismatch {
+        expected_recipient: Pubkey,
+        actual_recipient: Pubkey,
+    },
+    #[error("repair request signature verification failed for sender={sender}")]
+    SignatureVerificationFailed { sender: Pubkey },
+    #[error(
+        "repair request timestamp outside max age; request_timestamp_ms={request_timestamp_ms} now_ms={now_ms} max_age_ms={max_age_ms}"
+    )]
+    TimestampOutsideMaxAge {
+        request_timestamp_ms: u64,
+        now_ms: u64,
+        max_age_ms: u64,
+    },
 }
 
 fn serialize_tagged_repair_request<T: Serialize>(
@@ -83,7 +153,6 @@ pub fn build_repair_request(
     nonce: u32,
     kind: MissingShredRequestKind,
 ) -> Result<Vec<u8>, RepairRequestError> {
-    const SIGNATURE_OFFSET: usize = 4;
     let header = RepairRequestHeader {
         signature: Signature::default(),
         sender: keypair.pubkey(),
@@ -133,6 +202,122 @@ pub fn build_repair_request(
     Ok(payload)
 }
 
+#[must_use]
+pub fn is_supported_repair_request_packet(packet: &[u8]) -> bool {
+    if packet.len() < MIN_SIGNED_REPAIR_REQUEST_BYTES {
+        return false;
+    }
+    let Some(variant_prefix) = packet.get(..4) else {
+        return false;
+    };
+    let Ok(variant_bytes): Result<[u8; 4], _> = variant_prefix.try_into() else {
+        return false;
+    };
+    let variant = u32::from_le_bytes(variant_bytes);
+    matches!(
+        variant,
+        REPAIR_PROTOCOL_WINDOW_INDEX_VARIANT | REPAIR_PROTOCOL_HIGHEST_WINDOW_INDEX_VARIANT
+    )
+}
+
+#[must_use]
+pub const fn signed_repair_request_time_window_ms() -> u64 {
+    SIGNED_REPAIR_REQUEST_TIME_WINDOW_MS
+}
+
+pub fn parse_signed_repair_request(
+    packet: &[u8],
+    expected_recipient: Pubkey,
+    now_ms: u64,
+    max_age_ms: u64,
+) -> Result<Option<ParsedRepairRequest>, ParseRepairRequestError> {
+    if !is_supported_repair_request_packet(packet) {
+        return Ok(None);
+    }
+    let request = bincode::options()
+        .with_fixint_encoding()
+        .deserialize::<TaggedRepairRequest>(packet)
+        .map_err(|source| ParseRepairRequestError::Deserialize { source })?;
+    let (kind, header, slot, shred_index) = match request {
+        TaggedRepairRequest::WindowIndex {
+            header,
+            slot,
+            shred_index,
+        } => (
+            ParsedRepairRequestKind::WindowIndex,
+            header,
+            slot,
+            shred_index,
+        ),
+        TaggedRepairRequest::HighestWindowIndex {
+            header,
+            slot,
+            shred_index,
+        } => (
+            ParsedRepairRequestKind::HighestWindowIndex,
+            header,
+            slot,
+            shred_index,
+        ),
+        TaggedRepairRequest::LegacyWindowIndex
+        | TaggedRepairRequest::LegacyHighestWindowIndex
+        | TaggedRepairRequest::LegacyOrphan
+        | TaggedRepairRequest::LegacyWindowIndexWithNonce
+        | TaggedRepairRequest::LegacyHighestWindowIndexWithNonce
+        | TaggedRepairRequest::LegacyOrphanWithNonce
+        | TaggedRepairRequest::LegacyAncestorHashes
+        | TaggedRepairRequest::Pong => return Ok(None),
+    };
+    if header.recipient != expected_recipient {
+        return Err(ParseRepairRequestError::RecipientMismatch {
+            expected_recipient,
+            actual_recipient: header.recipient,
+        });
+    }
+    if now_ms.abs_diff(header.timestamp) > max_age_ms {
+        return Err(ParseRepairRequestError::TimestampOutsideMaxAge {
+            request_timestamp_ms: header.timestamp,
+            now_ms,
+            max_age_ms,
+        });
+    }
+    let signature_end = SIGNATURE_OFFSET.saturating_add(SIGNATURE_BYTES);
+    if packet.len() < signature_end {
+        return Err(ParseRepairRequestError::PayloadTooShort {
+            payload_len: packet.len(),
+            required_len: signature_end,
+        });
+    }
+    let Some(leading_data) = packet.get(..SIGNATURE_OFFSET) else {
+        return Err(ParseRepairRequestError::PayloadTooShort {
+            payload_len: packet.len(),
+            required_len: SIGNATURE_OFFSET,
+        });
+    };
+    let Some(trailing_data) = packet.get(signature_end..) else {
+        return Err(ParseRepairRequestError::PayloadTooShort {
+            payload_len: packet.len(),
+            required_len: signature_end,
+        });
+    };
+    let signed_data = [leading_data, trailing_data].concat();
+    if !header
+        .signature
+        .verify(header.sender.as_ref(), &signed_data)
+    {
+        return Err(ParseRepairRequestError::SignatureVerificationFailed {
+            sender: header.sender,
+        });
+    }
+    Ok(Some(ParsedRepairRequest {
+        kind,
+        sender: header.sender,
+        slot,
+        shred_index,
+        nonce: header.nonce,
+    }))
+}
+
 pub fn build_window_index_request(
     keypair: &Keypair,
     recipient: Pubkey,
@@ -166,6 +351,7 @@ pub(super) fn unix_timestamp_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solana_signer::Signer;
 
     #[derive(Debug, Clone, Serialize)]
     struct LegacyRepairRequestHeader {
@@ -318,5 +504,67 @@ mod tests {
             }
         };
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn parse_signed_window_index_request_roundtrips() {
+        let requester = Keypair::new();
+        let recipient = Keypair::new().pubkey();
+        let payload = build_window_index_request(&requester, recipient, 123, 456, 9)
+            .expect("request payload");
+        let parsed = parse_signed_repair_request(
+            &payload,
+            recipient,
+            unix_timestamp_ms(),
+            signed_repair_request_time_window_ms(),
+        )
+        .expect("parse succeeds")
+        .expect("request recognized");
+        assert_eq!(parsed.kind, ParsedRepairRequestKind::WindowIndex);
+        assert_eq!(parsed.sender, requester.pubkey());
+        assert_eq!(parsed.slot, 123);
+        assert_eq!(parsed.shred_index, 456);
+        assert_eq!(parsed.nonce, 9);
+    }
+
+    #[test]
+    fn parse_signed_request_rejects_wrong_recipient() {
+        let requester = Keypair::new();
+        let recipient = Keypair::new().pubkey();
+        let wrong_recipient = Keypair::new().pubkey();
+        let payload =
+            build_window_index_request(&requester, recipient, 12, 3, 4).expect("request payload");
+        let error = parse_signed_repair_request(
+            &payload,
+            wrong_recipient,
+            unix_timestamp_ms(),
+            signed_repair_request_time_window_ms(),
+        )
+        .expect_err("recipient mismatch must fail");
+        assert!(matches!(
+            error,
+            ParseRepairRequestError::RecipientMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn parse_signed_request_rejects_timestamp_outside_window() {
+        let requester = Keypair::new();
+        let recipient = Keypair::new().pubkey();
+        let payload =
+            build_window_index_request(&requester, recipient, 12, 3, 4).expect("request payload");
+        let too_late = unix_timestamp_ms()
+            .saturating_add(signed_repair_request_time_window_ms().saturating_mul(2));
+        let error = parse_signed_repair_request(
+            &payload,
+            recipient,
+            too_late,
+            signed_repair_request_time_window_ms(),
+        )
+        .expect_err("stale request must fail");
+        assert!(matches!(
+            error,
+            ParseRepairRequestError::TimestampOutsideMaxAge { .. }
+        ));
     }
 }

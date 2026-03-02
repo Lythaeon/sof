@@ -65,26 +65,6 @@ impl RuntimeSetup {
         self.with_env("SOF_BIND", bind_addr.to_string())
     }
 
-    /// Sets `SOF_RELAY_LISTEN`.
-    #[must_use]
-    pub fn with_relay_listen_addr(self, relay_listen_addr: SocketAddr) -> Self {
-        self.with_env("SOF_RELAY_LISTEN", relay_listen_addr.to_string())
-    }
-
-    /// Sets `SOF_RELAY_CONNECT` from a list of upstream relay addresses.
-    #[must_use]
-    pub fn with_relay_connect_addrs<I>(self, relay_connect_addrs: I) -> Self
-    where
-        I: IntoIterator<Item = SocketAddr>,
-    {
-        let serialized = relay_connect_addrs
-            .into_iter()
-            .map(|addr| addr.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        self.with_env("SOF_RELAY_CONNECT", serialized)
-    }
-
     /// Sets `SOF_GOSSIP_ENTRYPOINT` from a list of entrypoints.
     #[must_use]
     pub fn with_gossip_entrypoints<I, S>(self, gossip_entrypoints: I) -> Self
@@ -98,6 +78,21 @@ impl RuntimeSetup {
             .collect::<Vec<_>>()
             .join(",");
         self.with_env("SOF_GOSSIP_ENTRYPOINT", serialized)
+    }
+
+    /// Sets `SOF_GOSSIP_VALIDATORS` from a list of validator identity pubkeys.
+    #[must_use]
+    pub fn with_gossip_validators<I, S>(self, gossip_validators: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let serialized = gossip_validators
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<_>>()
+            .join(",");
+        self.with_env("SOF_GOSSIP_VALIDATORS", serialized)
     }
 
     /// Sets `SOF_PORT_RANGE`.
@@ -166,12 +161,6 @@ impl RuntimeSetup {
         self.with_env("SOF_FEC_MAX_TRACKED_SETS", max_tracked_sets.to_string())
     }
 
-    /// Sets `SOF_RPC_URL`.
-    #[must_use]
-    pub fn with_rpc_url(self, rpc_url: impl Into<String>) -> Self {
-        self.with_env("SOF_RPC_URL", rpc_url)
-    }
-
     /// Sets `SOF_LOG_ALL_TXS`.
     #[must_use]
     pub fn with_log_all_txs(self, enabled: bool) -> Self {
@@ -215,12 +204,6 @@ impl RuntimeSetup {
     #[must_use]
     pub fn with_verify_recovered_shreds(self, enabled: bool) -> Self {
         self.with_env("SOF_VERIFY_RECOVERED_SHREDS", enabled.to_string())
-    }
-
-    /// Sets `SOF_VERIFY_RPC_SLOT_LEADERS`.
-    #[must_use]
-    pub fn with_verify_rpc_slot_leaders(self, enabled: bool) -> Self {
-        self.with_env("SOF_VERIFY_RPC_SLOT_LEADERS", enabled.to_string())
     }
 
     /// Sets `SOF_VERIFY_SLOT_WINDOW`.
@@ -295,6 +278,39 @@ impl RuntimeSetup {
         self.with_env("SOF_REPAIR_SLOT_WINDOW", repair_slot_window.to_string())
     }
 
+    /// Sets `SOF_REPAIR_PEER_SAMPLE_SIZE`.
+    #[must_use]
+    pub fn with_repair_peer_sample_size(self, peer_sample_size: usize) -> Self {
+        self.with_env("SOF_REPAIR_PEER_SAMPLE_SIZE", peer_sample_size.to_string())
+    }
+
+    /// Sets `SOF_REPAIR_SERVE_MAX_BYTES_PER_SEC`.
+    #[must_use]
+    pub fn with_repair_serve_max_bytes_per_sec(self, bytes_per_sec: usize) -> Self {
+        self.with_env(
+            "SOF_REPAIR_SERVE_MAX_BYTES_PER_SEC",
+            bytes_per_sec.to_string(),
+        )
+    }
+
+    /// Sets `SOF_REPAIR_SERVE_UNSTAKED_MAX_BYTES_PER_SEC`.
+    #[must_use]
+    pub fn with_repair_serve_unstaked_max_bytes_per_sec(self, bytes_per_sec: usize) -> Self {
+        self.with_env(
+            "SOF_REPAIR_SERVE_UNSTAKED_MAX_BYTES_PER_SEC",
+            bytes_per_sec.to_string(),
+        )
+    }
+
+    /// Sets `SOF_REPAIR_SERVE_MAX_REQUESTS_PER_PEER_PER_SEC`.
+    #[must_use]
+    pub fn with_repair_serve_max_requests_per_peer_per_sec(self, requests_per_sec: usize) -> Self {
+        self.with_env(
+            "SOF_REPAIR_SERVE_MAX_REQUESTS_PER_PEER_PER_SEC",
+            requests_per_sec.to_string(),
+        )
+    }
+
     /// Sets `SOF_REPAIR_MAX_REQUESTS_PER_TICK`.
     #[must_use]
     pub fn with_repair_max_requests_per_tick(self, max_requests_per_tick: usize) -> Self {
@@ -316,10 +332,10 @@ impl RuntimeSetup {
         self.with_env("SOF_REPAIR_DATASET_STALL_MS", dataset_stall_ms.to_string())
     }
 
-    /// Sets `SOF_REPAIR_SEED_SLOTS`.
+    /// Sets `SOF_REPAIR_STALL_SUSTAIN_MS`.
     #[must_use]
-    pub fn with_repair_seed_slots(self, seed_slots: u64) -> Self {
-        self.with_env("SOF_REPAIR_SEED_SLOTS", seed_slots.to_string())
+    pub fn with_repair_stall_sustain_ms(self, stall_sustain_ms: u64) -> Self {
+        self.with_env("SOF_REPAIR_STALL_SUSTAIN_MS", stall_sustain_ms.to_string())
     }
 
     /// Sets `SOF_GOSSIP_RUNTIME_SWITCH_ENABLED`.
