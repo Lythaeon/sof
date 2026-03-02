@@ -72,21 +72,18 @@ fuzz_target!(|bytes: &[u8]| {
                 }
             }
             3 => {
-                if let Some(addr) = take_socket_addr(&mut input) {
-                    setup.with_relay_listen_addr(addr)
-                } else {
-                    setup
+                let count = usize::from(take_u8(&mut input).unwrap_or(0) % 4);
+                let mut validators = Vec::with_capacity(count);
+                for _ in 0..count {
+                    validators.push(
+                        take_string(&mut input, 64)
+                            .unwrap_or_else(|| "11111111111111111111111111111111".to_owned()),
+                    );
                 }
+                setup.with_gossip_validators(validators)
             }
             4 => {
-                let count = usize::from(take_u8(&mut input).unwrap_or(0) % 4);
-                let mut addrs = Vec::with_capacity(count);
-                for _ in 0..count {
-                    if let Some(addr) = take_socket_addr(&mut input) {
-                        addrs.push(addr);
-                    }
-                }
-                setup.with_relay_connect_addrs(addrs)
+                setup.with_udp_receiver_core(usize::from(take_u8(&mut input).unwrap_or(0)))
             }
             5 => {
                 let count = usize::from(take_u8(&mut input).unwrap_or(0) % 4);
