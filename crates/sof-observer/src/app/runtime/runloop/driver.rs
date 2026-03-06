@@ -171,14 +171,42 @@ async fn run_async_with_hosts_inner(
     }
     let derived_state_hooks_enabled = !derived_state_host.is_empty();
     let derived_state_replay_max_envelopes = read_derived_state_replay_max_envelopes();
+    let derived_state_replay_backend = read_derived_state_replay_backend();
+    let derived_state_replay_dir = read_derived_state_replay_dir();
     if derived_state_hooks_enabled {
         if derived_state_replay_max_envelopes > 0 {
-            let installed = derived_state_host.install_runtime_replay_source(Arc::new(
-                InMemoryDerivedStateReplaySource::with_max_envelopes_per_session(
-                    derived_state_replay_max_envelopes,
-                ),
-            ));
+            let configured_backend = derived_state_replay_backend.to_ascii_lowercase();
+            let runtime_replay_source: Arc<dyn crate::framework::DerivedStateReplaySource> =
+                match configured_backend.as_str() {
+                    "disk" => match DiskDerivedStateReplaySource::new(
+                        derived_state_replay_dir.clone(),
+                        derived_state_replay_max_envelopes,
+                    ) {
+                        Ok(replay_source) => Arc::new(replay_source),
+                        Err(error) => {
+                            tracing::warn!(
+                                backend = "disk",
+                                path = %derived_state_replay_dir.display(),
+                                error = %error,
+                                "failed to initialize disk-backed derived-state replay tail; falling back to memory"
+                            );
+                            Arc::new(
+                                InMemoryDerivedStateReplaySource::with_max_envelopes_per_session(
+                                    derived_state_replay_max_envelopes,
+                                ),
+                            )
+                        }
+                    },
+                    _ => Arc::new(
+                        InMemoryDerivedStateReplaySource::with_max_envelopes_per_session(
+                            derived_state_replay_max_envelopes,
+                        ),
+                    ),
+                };
+            let installed = derived_state_host.install_runtime_replay_source(runtime_replay_source);
             tracing::info!(
+                derived_state_replay_backend = configured_backend,
+                derived_state_replay_dir = %derived_state_replay_dir.display(),
                 derived_state_replay_max_envelopes,
                 installed_runtime_replay_source = installed,
                 "derived-state runtime replay tail configured"
@@ -745,6 +773,8 @@ async fn run_async_with_hosts_inner(
         udp_relay_require_turbine_source_ports,
         udp_relay_send_error_backoff_ms,
         udp_relay_send_error_backoff_threshold,
+        derived_state_replay_backend,
+        derived_state_replay_dir = %derived_state_replay_dir.display(),
         derived_state_replay_max_envelopes,
         tx_confirmed_depth_slots,
         tx_finalized_depth_slots,

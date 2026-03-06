@@ -7,6 +7,9 @@
 
 use std::{
     collections::HashMap,
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Write},
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -14,6 +17,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use serde::{Deserialize, Serialize};
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
@@ -28,11 +32,11 @@ use crate::{
 ///
 /// A new session id is expected whenever feed continuity cannot be assumed across process
 /// lifetimes or replay sources.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct FeedSessionId(pub u128);
 
 /// Monotonic sequence number for the derived-state feed within one session.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct FeedSequence(pub u64);
 
 impl FeedSequence {
@@ -47,7 +51,7 @@ impl FeedSequence {
 }
 
 /// Runtime truth watermarks visible to derived-state consumers.
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FeedWatermarks {
     /// Current canonical tip slot.
     pub canonical_tip_slot: Option<u64>,
@@ -95,7 +99,7 @@ impl FeedWatermarks {
 }
 
 /// One envelope delivered to a derived-state consumer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DerivedStateFeedEnvelope {
     /// Feed session identity.
     pub session_id: FeedSessionId,
@@ -110,7 +114,7 @@ pub struct DerivedStateFeedEnvelope {
 }
 
 /// Event families intended for authoritative stateful consumers.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DerivedStateFeedEvent {
     /// Decoded transaction apply record.
     TransactionApplied(TransactionAppliedEvent),
@@ -125,7 +129,7 @@ pub enum DerivedStateFeedEvent {
 }
 
 /// Decoded transaction apply record for the derived-state feed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionAppliedEvent {
     /// Slot containing the transaction.
     pub slot: u64,
@@ -155,7 +159,7 @@ impl From<(u32, TransactionEvent)> for TransactionAppliedEvent {
 }
 
 /// Slot lifecycle transition record for the derived-state feed.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SlotStatusChangedEvent {
     /// Slot whose state changed.
     pub slot: u64,
@@ -179,7 +183,7 @@ impl From<SlotStatusEvent> for SlotStatusChangedEvent {
 }
 
 /// Canonical branch switch record for the derived-state feed.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BranchReorgedEvent {
     /// Previous canonical tip.
     pub old_tip: u64,
@@ -206,7 +210,7 @@ impl From<ReorgEvent> for BranchReorgedEvent {
 }
 
 /// Transaction-derived account-touch metadata for stateful consumers.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AccountTouchObservedEvent {
     /// Slot containing the transaction.
     pub slot: u64,
@@ -239,7 +243,7 @@ impl From<(u32, AccountTouchEvent)> for AccountTouchObservedEvent {
 }
 
 /// Checkpoint barrier emitted by the derived-state feed.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CheckpointBarrierEvent {
     /// Highest contiguous sequence fully covered by the barrier.
     pub barrier_sequence: FeedSequence,
@@ -248,7 +252,7 @@ pub struct CheckpointBarrierEvent {
 }
 
 /// Reasons for emitting a checkpoint barrier.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub enum CheckpointBarrierReason {
     /// Periodic background checkpoint opportunity.
     Periodic,
@@ -378,6 +382,14 @@ pub enum DerivedStateReplayError {
         /// Oldest sequence still retained for the session.
         oldest_retained_sequence: FeedSequence,
     },
+    /// The replay backend could not load or decode the retained feed.
+    #[error("replay backend failure for {session_id:?}: {message}")]
+    BackendFailure {
+        /// Session whose retained log could not be loaded.
+        session_id: FeedSessionId,
+        /// Free-form backend diagnostic.
+        message: String,
+    },
 }
 
 /// Ordered replay source for retained derived-state feed envelopes.
@@ -473,49 +485,266 @@ impl DerivedStateReplaySource for InMemoryDerivedStateReplaySource {
         let Some(envelopes) = sessions.get(&session_id) else {
             return Err(DerivedStateReplayError::SessionUnavailable(session_id));
         };
-        if let Some(oldest_retained_sequence) = envelopes.first().map(|envelope| envelope.sequence)
-            && next_sequence < oldest_retained_sequence
-        {
-            return Err(DerivedStateReplayError::Truncated {
-                session_id,
-                sequence: next_sequence,
-                oldest_retained_sequence,
-            });
-        }
-        let Some(start_index) = envelopes
-            .iter()
-            .position(|envelope| envelope.sequence == next_sequence)
-        else {
-            if envelopes.is_empty() && next_sequence == FeedSequence(0) {
-                return Ok(Vec::new());
-            }
-            return Err(DerivedStateReplayError::SequenceGap {
-                session_id,
-                sequence: next_sequence,
-            });
-        };
-        let Some(replayed) = envelopes.get(start_index..) else {
-            return Err(DerivedStateReplayError::SequenceGap {
-                session_id,
-                sequence: next_sequence,
-            });
-        };
-        let replayed = replayed.to_vec();
-        let mut expected_sequence = next_sequence;
-        for envelope in &replayed {
-            if envelope.sequence != expected_sequence {
-                return Err(DerivedStateReplayError::SequenceGap {
-                    session_id,
-                    sequence: expected_sequence,
-                });
-            }
-            let Some(next) = expected_sequence.next() else {
-                break;
-            };
-            expected_sequence = next;
-        }
-        Ok(replayed)
+        validate_replayed_envelopes(session_id, envelopes, next_sequence)
     }
+}
+
+/// Disk-backed replay source for retained derived-state feed envelopes.
+pub struct DiskDerivedStateReplaySource {
+    /// Root directory that stores one retained log per session.
+    root_dir: PathBuf,
+    /// Bounded retention policy applied per session.
+    max_envelopes_per_session: usize,
+    /// Retained feed envelopes loaded in-process by session id.
+    sessions: Mutex<HashMap<FeedSessionId, Vec<DerivedStateFeedEnvelope>>>,
+    /// Total number of envelopes truncated by the retention policy.
+    truncated_envelopes: AtomicU64,
+}
+
+impl DiskDerivedStateReplaySource {
+    /// Creates a disk-backed replay source rooted at one directory.
+    ///
+    /// # Errors
+    /// Returns an IO error when the replay directory cannot be created.
+    pub fn new(root_dir: impl Into<PathBuf>, max_envelopes_per_session: usize) -> io::Result<Self> {
+        let root_dir = root_dir.into();
+        fs::create_dir_all(&root_dir)?;
+        Ok(Self {
+            root_dir,
+            max_envelopes_per_session,
+            sessions: Mutex::new(HashMap::new()),
+            truncated_envelopes: AtomicU64::new(0),
+        })
+    }
+
+    /// Returns the replay directory root.
+    #[must_use]
+    pub fn root_dir(&self) -> &Path {
+        &self.root_dir
+    }
+
+    /// Returns the total number of envelopes truncated across all sessions.
+    #[must_use]
+    pub fn truncated_envelopes(&self) -> u64 {
+        self.truncated_envelopes.load(Ordering::Relaxed)
+    }
+
+    /// Returns the number of envelopes currently retained for one session.
+    #[must_use]
+    pub fn retained_envelopes(&self, session_id: FeedSessionId) -> usize {
+        self.sessions
+            .lock()
+            .ok()
+            .and_then(|sessions| sessions.get(&session_id).map(Vec::len))
+            .unwrap_or_else(|| {
+                self.load_session_from_disk(session_id)
+                    .map_or(0, |envelopes| envelopes.len())
+            })
+    }
+
+    /// Returns the file path for one retained session log.
+    fn session_path(&self, session_id: FeedSessionId) -> PathBuf {
+        self.root_dir.join(format!("{:032x}.replay", session_id.0))
+    }
+
+    /// Serializes one feed envelope into an on-disk record payload.
+    fn encode_envelope(envelope: &DerivedStateFeedEnvelope) -> io::Result<Vec<u8>> {
+        bincode::serialize(envelope)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+    }
+
+    /// Deserializes one feed envelope from an on-disk record payload.
+    fn decode_envelope(bytes: &[u8]) -> io::Result<DerivedStateFeedEnvelope> {
+        bincode::deserialize(bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+    }
+
+    /// Appends one length-prefixed record to an existing session log.
+    fn append_record(path: &Path, envelope: &DerivedStateFeedEnvelope) -> io::Result<()> {
+        let encoded = Self::encode_envelope(envelope)?;
+        let encoded_len = u32::try_from(encoded.len()).map_err(|_error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "derived-state replay envelope exceeded u32 record length",
+            )
+        })?;
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        file.write_all(&encoded_len.to_le_bytes())?;
+        file.write_all(&encoded)?;
+        file.flush()
+    }
+
+    /// Rewrites one retained session log from the currently in-memory tail.
+    fn rewrite_records(path: &Path, envelopes: &[DerivedStateFeedEnvelope]) -> io::Result<()> {
+        let temp_path = path.with_extension("replay.tmp");
+        {
+            let mut file = File::create(&temp_path)?;
+            for envelope in envelopes {
+                let encoded = Self::encode_envelope(envelope)?;
+                let encoded_len = u32::try_from(encoded.len()).map_err(|_error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "derived-state replay envelope exceeded u32 record length",
+                    )
+                })?;
+                file.write_all(&encoded_len.to_le_bytes())?;
+                file.write_all(&encoded)?;
+            }
+            file.flush()?;
+        }
+        fs::rename(temp_path, path)
+    }
+
+    /// Loads one retained session log from disk into memory.
+    fn load_session_from_disk(
+        &self,
+        session_id: FeedSessionId,
+    ) -> io::Result<Vec<DerivedStateFeedEnvelope>> {
+        let path = self.session_path(session_id);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let mut file = File::open(path)?;
+        let mut envelopes = Vec::new();
+        loop {
+            let mut length_bytes = [0_u8; 4];
+            match file.read_exact(&mut length_bytes) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(error) => return Err(error),
+            }
+            let encoded_len = u32::from_le_bytes(length_bytes);
+            let mut encoded = vec![0_u8; encoded_len as usize];
+            file.read_exact(&mut encoded)?;
+            envelopes.push(Self::decode_envelope(&encoded)?);
+        }
+        Ok(envelopes)
+    }
+
+    /// Ensures one session tail is resident in the in-process cache.
+    fn load_session(
+        &self,
+        sessions: &mut HashMap<FeedSessionId, Vec<DerivedStateFeedEnvelope>>,
+        session_id: FeedSessionId,
+    ) -> io::Result<()> {
+        if sessions.contains_key(&session_id) {
+            return Ok(());
+        }
+        let loaded = self.load_session_from_disk(session_id)?;
+        sessions.insert(session_id, loaded);
+        Ok(())
+    }
+}
+
+impl DerivedStateReplaySource for DiskDerivedStateReplaySource {
+    fn append(&self, envelope: DerivedStateFeedEnvelope) {
+        let session_id = envelope.session_id;
+        let path = self.session_path(session_id);
+        let append_result = (|| -> io::Result<()> {
+            let Ok(mut sessions) = self.sessions.lock() else {
+                return Err(io::Error::other(
+                    "derived-state replay session mutex poisoned during append",
+                ));
+            };
+            self.load_session(&mut sessions, session_id)?;
+            let retained = sessions.entry(session_id).or_default();
+            retained.push(envelope.clone());
+            let truncated = retained
+                .len()
+                .saturating_sub(self.max_envelopes_per_session.max(1));
+            if truncated > 0 {
+                retained.drain(..truncated);
+                let _ = self
+                    .truncated_envelopes
+                    .fetch_add(truncated as u64, Ordering::Relaxed);
+                return Self::rewrite_records(&path, retained);
+            }
+            Self::append_record(&path, &envelope)
+        })();
+        if let Err(error) = append_result {
+            tracing::warn!(
+                session_id = ?session_id,
+                path = %path.display(),
+                error = %error,
+                "failed to append derived-state replay envelope to disk"
+            );
+        }
+    }
+
+    fn replay_from(
+        &self,
+        session_id: FeedSessionId,
+        next_sequence: FeedSequence,
+    ) -> Result<Vec<DerivedStateFeedEnvelope>, DerivedStateReplayError> {
+        let Ok(mut sessions) = self.sessions.lock() else {
+            return Err(DerivedStateReplayError::BackendFailure {
+                session_id,
+                message: "derived-state replay session mutex poisoned during replay".to_owned(),
+            });
+        };
+        self.load_session(&mut sessions, session_id)
+            .map_err(|error| DerivedStateReplayError::BackendFailure {
+                session_id,
+                message: error.to_string(),
+            })?;
+        let Some(envelopes) = sessions.get(&session_id) else {
+            return Err(DerivedStateReplayError::SessionUnavailable(session_id));
+        };
+        if envelopes.is_empty() {
+            return Err(DerivedStateReplayError::SessionUnavailable(session_id));
+        }
+        validate_replayed_envelopes(session_id, envelopes, next_sequence)
+    }
+}
+
+/// Validates that one retained session tail can satisfy replay continuity.
+fn validate_replayed_envelopes(
+    session_id: FeedSessionId,
+    envelopes: &[DerivedStateFeedEnvelope],
+    next_sequence: FeedSequence,
+) -> Result<Vec<DerivedStateFeedEnvelope>, DerivedStateReplayError> {
+    if let Some(oldest_retained_sequence) = envelopes.first().map(|envelope| envelope.sequence)
+        && next_sequence < oldest_retained_sequence
+    {
+        return Err(DerivedStateReplayError::Truncated {
+            session_id,
+            sequence: next_sequence,
+            oldest_retained_sequence,
+        });
+    }
+    let Some(start_index) = envelopes
+        .iter()
+        .position(|envelope| envelope.sequence == next_sequence)
+    else {
+        if envelopes.is_empty() && next_sequence == FeedSequence(0) {
+            return Ok(Vec::new());
+        }
+        return Err(DerivedStateReplayError::SequenceGap {
+            session_id,
+            sequence: next_sequence,
+        });
+    };
+    let Some(replayed) = envelopes.get(start_index..) else {
+        return Err(DerivedStateReplayError::SequenceGap {
+            session_id,
+            sequence: next_sequence,
+        });
+    };
+    let replayed = replayed.to_vec();
+    let mut expected_sequence = next_sequence;
+    for envelope in &replayed {
+        if envelope.sequence != expected_sequence {
+            return Err(DerivedStateReplayError::SequenceGap {
+                session_id,
+                sequence: expected_sequence,
+            });
+        }
+        let Some(next) = expected_sequence.next() else {
+            break;
+        };
+        expected_sequence = next;
+    }
+    Ok(replayed)
 }
 
 /// Stateful consumer interface for the dedicated derived-state feed scaffold.
@@ -698,6 +927,19 @@ impl DerivedStateHost {
                 format!(
                     "derived-state replay truncated in session {:?} before sequence {:?}; oldest retained {:?}",
                     session_id, sequence, oldest_retained_sequence
+                ),
+            ),
+            DerivedStateReplayError::BackendFailure {
+                session_id,
+                message,
+            } => DerivedStateConsumerFault::new(
+                DerivedStateConsumerFaultKind::ReplayGap,
+                checkpoint
+                    .next_sequence()
+                    .or(Some(checkpoint.last_applied_sequence)),
+                format!(
+                    "derived-state replay backend failure in session {:?}: {}",
+                    session_id, message
                 ),
             ),
         }
@@ -1246,12 +1488,24 @@ fn generate_session_id() -> FeedSessionId {
 mod tests {
     use super::*;
     use std::{
+        env, fs,
+        path::PathBuf,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering as AtomicOrdering},
         },
         thread,
     };
+
+    fn unique_test_replay_dir(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0_u128, |duration| duration.as_nanos());
+        env::temp_dir().join(format!(
+            "sof-derived-state-{name}-{}-{unique}",
+            std::process::id()
+        ))
+    }
 
     #[test]
     fn feed_sequence_next_advances_by_one() {
@@ -2017,6 +2271,105 @@ mod tests {
             runtime_replay_source.retained_envelopes(host.session_id()),
             0
         );
+    }
+
+    #[test]
+    fn disk_replay_source_replays_after_reopen() {
+        let replay_dir = unique_test_replay_dir("reopen");
+        let session_id = FeedSessionId(1337);
+        let replay_source = DiskDerivedStateReplaySource::new(&replay_dir, 4)
+            .expect("disk replay source should create its root directory");
+        replay_source.append(DerivedStateFeedEnvelope {
+            session_id,
+            sequence: FeedSequence(0),
+            emitted_at: SystemTime::UNIX_EPOCH,
+            watermarks: FeedWatermarks {
+                canonical_tip_slot: Some(60),
+                processed_slot: Some(60),
+                confirmed_slot: Some(59),
+                finalized_slot: Some(58),
+            },
+            event: DerivedStateFeedEvent::SlotStatusChanged(SlotStatusChangedEvent {
+                slot: 60,
+                parent_slot: Some(59),
+                previous_status: None,
+                status: ForkSlotStatus::Processed,
+            }),
+        });
+        replay_source.append(DerivedStateFeedEnvelope {
+            session_id,
+            sequence: FeedSequence(1),
+            emitted_at: SystemTime::UNIX_EPOCH,
+            watermarks: FeedWatermarks {
+                canonical_tip_slot: Some(61),
+                processed_slot: Some(61),
+                confirmed_slot: Some(60),
+                finalized_slot: Some(59),
+            },
+            event: DerivedStateFeedEvent::CheckpointBarrier(CheckpointBarrierEvent {
+                barrier_sequence: FeedSequence(1),
+                reason: CheckpointBarrierReason::Periodic,
+            }),
+        });
+        drop(replay_source);
+
+        let reopened = DiskDerivedStateReplaySource::new(&replay_dir, 4)
+            .expect("disk replay source should reopen persisted logs");
+        let replayed = reopened
+            .replay_from(session_id, FeedSequence(0))
+            .expect("reopened disk replay source should replay the retained session");
+        assert_eq!(replayed.len(), 2);
+        assert_eq!(replayed[0].sequence, FeedSequence(0));
+        assert_eq!(replayed[1].sequence, FeedSequence(1));
+
+        drop(fs::remove_dir_all(replay_dir));
+    }
+
+    #[test]
+    fn disk_replay_source_persists_truncation_window() {
+        let replay_dir = unique_test_replay_dir("truncate");
+        let session_id = FeedSessionId(1440);
+        let replay_source = DiskDerivedStateReplaySource::new(&replay_dir, 2)
+            .expect("disk replay source should create its root directory");
+        for (sequence, slot) in [
+            (FeedSequence(0), 70),
+            (FeedSequence(1), 71),
+            (FeedSequence(2), 72),
+        ] {
+            replay_source.append(DerivedStateFeedEnvelope {
+                session_id,
+                sequence,
+                emitted_at: SystemTime::UNIX_EPOCH,
+                watermarks: FeedWatermarks {
+                    canonical_tip_slot: Some(slot),
+                    processed_slot: Some(slot),
+                    confirmed_slot: Some(slot.saturating_sub(1)),
+                    finalized_slot: Some(slot.saturating_sub(2)),
+                },
+                event: DerivedStateFeedEvent::SlotStatusChanged(SlotStatusChangedEvent {
+                    slot,
+                    parent_slot: slot.checked_sub(1),
+                    previous_status: None,
+                    status: ForkSlotStatus::Processed,
+                }),
+            });
+        }
+        drop(replay_source);
+
+        let reopened = DiskDerivedStateReplaySource::new(&replay_dir, 2)
+            .expect("disk replay source should reopen persisted logs");
+        assert_eq!(reopened.retained_envelopes(session_id), 2);
+        let replay_result = reopened.replay_from(session_id, FeedSequence(0));
+        assert!(matches!(
+            replay_result,
+            Err(DerivedStateReplayError::Truncated {
+                session_id: _,
+                sequence: FeedSequence(0),
+                oldest_retained_sequence: FeedSequence(1),
+            })
+        ));
+
+        drop(fs::remove_dir_all(replay_dir));
     }
 
     #[test]

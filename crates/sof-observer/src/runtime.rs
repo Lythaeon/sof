@@ -201,6 +201,24 @@ impl RuntimeSetup {
         )
     }
 
+    /// Sets `SOF_DERIVED_STATE_REPLAY_BACKEND`.
+    ///
+    /// Accepted values:
+    /// - `memory` (default): in-process retained tail
+    /// - `disk`: retained tail persisted under `SOF_DERIVED_STATE_REPLAY_DIR`
+    #[must_use]
+    pub fn with_derived_state_replay_backend(self, backend: impl Into<String>) -> Self {
+        self.with_env("SOF_DERIVED_STATE_REPLAY_BACKEND", backend)
+    }
+
+    /// Sets `SOF_DERIVED_STATE_REPLAY_DIR`.
+    ///
+    /// Used when `SOF_DERIVED_STATE_REPLAY_BACKEND=disk`.
+    #[must_use]
+    pub fn with_derived_state_replay_dir(self, replay_dir: impl Into<String>) -> Self {
+        self.with_env("SOF_DERIVED_STATE_REPLAY_DIR", replay_dir)
+    }
+
     /// Sets `SOF_LIVE_SHREDS_ENABLED`.
     ///
     /// When false, runtime keeps control-plane hooks active but skips live
