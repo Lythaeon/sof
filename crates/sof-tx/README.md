@@ -12,6 +12,13 @@ It provides:
   - `Hybrid` (direct first, RPC fallback)
 - routing policy and signature-level dedupe
 
+## At a Glance
+
+- Build `V0` or legacy Solana transactions
+- Submit through RPC, direct leader routing, or hybrid fallback
+- Attach live `sof` runtime adapters when you want local leader/blockhash signals
+- Use optional kernel-bypass direct transports for custom low-latency networking
+
 ## Install
 
 ```bash
@@ -21,13 +28,54 @@ cargo add sof-tx
 Enable SOF runtime adapters when you want provider values from live `sof` plugin events:
 
 ```toml
-sof-tx = { version = "0.5.0", features = ["sof-adapters"] }
+sof-tx = { version = "0.6.0", features = ["sof-adapters"] }
 ```
 
 Enable `kernel-bypass` transport hooks for kernel-bypass direct submit integrations:
 
 ```toml
-sof-tx = { version = "0.5.0", features = ["kernel-bypass"] }
+sof-tx = { version = "0.6.0", features = ["kernel-bypass"] }
+```
+
+## Quick Start
+
+Basic client setup:
+
+```rust
+use std::sync::Arc;
+
+use sof_tx::{
+    SubmitMode, SubmitReliability, TxBuilder, TxSubmitClient,
+    providers::{StaticLeaderProvider, StaticRecentBlockhashProvider},
+    submit::{JsonRpcTransport, UdpDirectTransport},
+};
+use solana_keypair::Keypair;
+use solana_signer::Signer;
+use solana_system_interface::instruction as system_instruction;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let payer = Keypair::new();
+    let recipient = Keypair::new();
+
+    let blockhash_provider = Arc::new(StaticRecentBlockhashProvider::new(Some([7_u8; 32])));
+    let leader_provider = Arc::new(StaticLeaderProvider::new(None, Vec::new()));
+
+    let client = TxSubmitClient::new(blockhash_provider, leader_provider)
+        .with_reliability(SubmitReliability::Balanced)
+        .with_rpc_transport(Arc::new(JsonRpcTransport::new("https://api.mainnet-beta.solana.com")?))
+        .with_direct_transport(Arc::new(UdpDirectTransport));
+
+    let builder = TxBuilder::new(payer.pubkey()).add_instruction(
+        system_instruction::transfer(&payer.pubkey(), &recipient.pubkey(), 1),
+    );
+
+    let _ = client
+        .submit_builder(builder, &[&payer], SubmitMode::Hybrid)
+        .await?;
+
+    Ok(())
+}
 ```
 
 ## Core Types
@@ -112,7 +160,7 @@ Direct submit needs TPU endpoints for scheduled leaders. The adapter gets these 
 - `set_leader_tpu_addr(pubkey, tpu_addr)`
 - `remove_leader_tpu_addr(pubkey)`
 
-## Quickstart
+## Expanded Quickstart
 
 ```rust
 use std::sync::Arc;
@@ -302,4 +350,5 @@ Compile-time capability flags from ADR-0006 can be introduced incrementally as t
 
 - ADR for SDK scope: `../../docs/architecture/adr/0006-transaction-sdk-and-dual-submit-routing.md`
 - Workspace docs index: `../../docs/README.md`
+- Architecture docs: `../../docs/architecture/README.md`
 - Contribution guide: `../../CONTRIBUTING.md`
