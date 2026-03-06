@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -263,7 +263,7 @@ pub enum CheckpointBarrierReason {
 }
 
 /// Durable checkpoint shape for one derived-state consumer.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DerivedStateCheckpoint {
     /// Feed session against which this checkpoint was created.
     pub session_id: FeedSessionId,
@@ -309,6 +309,30 @@ impl DerivedStateConsumerFaultKind {
             Self::LagExceeded | Self::QueueOverflow | Self::ReplayGap | Self::ConsumerApplyFailed
         )
     }
+
+    /// Returns the compact storage representation used in atomics.
+    #[must_use]
+    const fn into_u8(self) -> u8 {
+        match self {
+            Self::LagExceeded => 0,
+            Self::QueueOverflow => 1,
+            Self::CheckpointWriteFailed => 2,
+            Self::ReplayGap => 3,
+            Self::ConsumerApplyFailed => 4,
+        }
+    }
+
+    /// Decodes a compact storage representation used in atomics.
+    #[must_use]
+    const fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::QueueOverflow,
+            2 => Self::CheckpointWriteFailed,
+            3 => Self::ReplayGap,
+            4 => Self::ConsumerApplyFailed,
+            _ => Self::LagExceeded,
+        }
+    }
 }
 
 /// Structured consumer fault returned by the feed scaffold.
@@ -346,6 +370,8 @@ pub struct DerivedStateConsumerTelemetry {
     pub name: &'static str,
     /// Whether live continuity has been lost for this consumer.
     pub unhealthy: bool,
+    /// Recovery state for the consumer.
+    pub recovery_state: DerivedStateConsumerRecoveryState,
     /// Total number of successfully applied envelopes.
     pub applied_events: u64,
     /// Total number of successfully flushed checkpoints.
@@ -356,6 +382,73 @@ pub struct DerivedStateConsumerTelemetry {
     pub last_applied_sequence: Option<FeedSequence>,
     /// Highest fault-associated sequence when known.
     pub last_fault_sequence: Option<FeedSequence>,
+    /// Last structured fault kind when known.
+    pub last_fault_kind: Option<DerivedStateConsumerFaultKind>,
+}
+
+/// Recovery state for one derived-state consumer.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum DerivedStateConsumerRecoveryState {
+    /// Consumer is live and receiving feed events.
+    Live,
+    /// Consumer should attempt replay-based recovery from its durable checkpoint.
+    ReplayRecoveryPending,
+    /// Consumer cannot be recovered from the retained replay tail and needs a rebuild.
+    RebuildRequired,
+}
+
+impl DerivedStateConsumerRecoveryState {
+    /// Returns the compact storage representation used in atomics.
+    #[must_use]
+    const fn into_u8(self) -> u8 {
+        match self {
+            Self::Live => 0,
+            Self::ReplayRecoveryPending => 1,
+            Self::RebuildRequired => 2,
+        }
+    }
+
+    /// Decodes a compact storage representation used in atomics.
+    #[must_use]
+    const fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::ReplayRecoveryPending,
+            2 => Self::RebuildRequired,
+            _ => Self::Live,
+        }
+    }
+}
+
+/// Replay backend telemetry snapshot exposed to runtime logs and tests.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct DerivedStateReplayTelemetry {
+    /// Stable backend name.
+    pub backend: &'static str,
+    /// Number of retained sessions visible to the backend.
+    pub retained_sessions: usize,
+    /// Number of retained envelopes visible to the backend.
+    pub retained_envelopes: usize,
+    /// Number of envelopes truncated by retention policy.
+    pub truncated_envelopes: u64,
+    /// Number of backend append failures.
+    pub append_failures: u64,
+    /// Number of backend load/decode failures.
+    pub load_failures: u64,
+    /// Number of compaction runs performed by the backend.
+    pub compactions: u64,
+}
+
+/// Recovery attempt summary returned by the derived-state host.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct DerivedStateRecoveryReport {
+    /// Number of unhealthy consumers considered for recovery.
+    pub attempted: u64,
+    /// Number of consumers returned to live state.
+    pub recovered: u64,
+    /// Number of consumers still waiting for replay-based recovery.
+    pub still_pending: u64,
+    /// Number of consumers that require a full rebuild.
+    pub rebuild_required: u64,
 }
 
 /// Replay errors returned by derived-state feed sources.
@@ -406,6 +499,12 @@ pub trait DerivedStateReplaySource: Send + Sync + 'static {
         session_id: FeedSessionId,
         next_sequence: FeedSequence,
     ) -> Result<Vec<DerivedStateFeedEnvelope>, DerivedStateReplayError>;
+
+    /// Returns operator-facing telemetry for this replay backend.
+    #[must_use]
+    fn telemetry(&self) -> DerivedStateReplayTelemetry {
+        DerivedStateReplayTelemetry::default()
+    }
 }
 
 /// In-memory replay source used by the scaffold and tests.
@@ -487,6 +586,27 @@ impl DerivedStateReplaySource for InMemoryDerivedStateReplaySource {
         };
         validate_replayed_envelopes(session_id, envelopes, next_sequence)
     }
+
+    fn telemetry(&self) -> DerivedStateReplayTelemetry {
+        let (retained_sessions, retained_envelopes) = self
+            .sessions
+            .lock()
+            .map(|sessions| {
+                let retained_sessions = sessions.len();
+                let retained_envelopes = sessions.values().map(Vec::len).sum();
+                (retained_sessions, retained_envelopes)
+            })
+            .unwrap_or((0, 0));
+        DerivedStateReplayTelemetry {
+            backend: "memory",
+            retained_sessions,
+            retained_envelopes,
+            truncated_envelopes: self.truncated_envelopes(),
+            append_failures: 0,
+            load_failures: 0,
+            compactions: 0,
+        }
+    }
 }
 
 /// Disk-backed replay source for retained derived-state feed envelopes.
@@ -495,10 +615,29 @@ pub struct DiskDerivedStateReplaySource {
     root_dir: PathBuf,
     /// Bounded retention policy applied per session.
     max_envelopes_per_session: usize,
+    /// Maximum number of retained session logs on disk.
+    max_retained_sessions: usize,
+    /// Durability policy used for disk writes.
+    durability: DerivedStateReplayDurability,
     /// Retained feed envelopes loaded in-process by session id.
     sessions: Mutex<HashMap<FeedSessionId, Vec<DerivedStateFeedEnvelope>>>,
     /// Total number of envelopes truncated by the retention policy.
     truncated_envelopes: AtomicU64,
+    /// Total number of backend append failures.
+    append_failures: AtomicU64,
+    /// Total number of backend load failures.
+    load_failures: AtomicU64,
+    /// Total number of disk compaction runs.
+    compactions: AtomicU64,
+}
+
+/// Durability policy for the disk-backed replay source.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum DerivedStateReplayDurability {
+    /// Flush buffered writes to the OS before returning.
+    Flush,
+    /// Flush buffered writes and issue `fsync`/`sync_all`.
+    Fsync,
 }
 
 impl DiskDerivedStateReplaySource {
@@ -507,13 +646,36 @@ impl DiskDerivedStateReplaySource {
     /// # Errors
     /// Returns an IO error when the replay directory cannot be created.
     pub fn new(root_dir: impl Into<PathBuf>, max_envelopes_per_session: usize) -> io::Result<Self> {
+        Self::with_policy(
+            root_dir,
+            max_envelopes_per_session,
+            4,
+            DerivedStateReplayDurability::Flush,
+        )
+    }
+
+    /// Creates a disk-backed replay source with explicit retention and durability policy.
+    ///
+    /// # Errors
+    /// Returns an IO error when the replay directory cannot be created.
+    pub fn with_policy(
+        root_dir: impl Into<PathBuf>,
+        max_envelopes_per_session: usize,
+        max_retained_sessions: usize,
+        durability: DerivedStateReplayDurability,
+    ) -> io::Result<Self> {
         let root_dir = root_dir.into();
         fs::create_dir_all(&root_dir)?;
         Ok(Self {
             root_dir,
             max_envelopes_per_session,
+            max_retained_sessions: max_retained_sessions.max(1),
+            durability,
             sessions: Mutex::new(HashMap::new()),
             truncated_envelopes: AtomicU64::new(0),
+            append_failures: AtomicU64::new(0),
+            load_failures: AtomicU64::new(0),
+            compactions: AtomicU64::new(0),
         })
     }
 
@@ -527,6 +689,24 @@ impl DiskDerivedStateReplaySource {
     #[must_use]
     pub fn truncated_envelopes(&self) -> u64 {
         self.truncated_envelopes.load(Ordering::Relaxed)
+    }
+
+    /// Returns the total number of append failures observed by the backend.
+    #[must_use]
+    pub fn append_failures(&self) -> u64 {
+        self.append_failures.load(Ordering::Relaxed)
+    }
+
+    /// Returns the total number of load/decode failures observed by the backend.
+    #[must_use]
+    pub fn load_failures(&self) -> u64 {
+        self.load_failures.load(Ordering::Relaxed)
+    }
+
+    /// Returns the total number of compaction runs observed by the backend.
+    #[must_use]
+    pub fn compactions(&self) -> u64 {
+        self.compactions.load(Ordering::Relaxed)
     }
 
     /// Returns the number of envelopes currently retained for one session.
@@ -560,7 +740,7 @@ impl DiskDerivedStateReplaySource {
     }
 
     /// Appends one length-prefixed record to an existing session log.
-    fn append_record(path: &Path, envelope: &DerivedStateFeedEnvelope) -> io::Result<()> {
+    fn append_record(&self, path: &Path, envelope: &DerivedStateFeedEnvelope) -> io::Result<()> {
         let encoded = Self::encode_envelope(envelope)?;
         let encoded_len = u32::try_from(encoded.len()).map_err(|_error| {
             io::Error::new(
@@ -571,11 +751,17 @@ impl DiskDerivedStateReplaySource {
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
         file.write_all(&encoded_len.to_le_bytes())?;
         file.write_all(&encoded)?;
-        file.flush()
+        file.flush()?;
+        self.sync_file(&file)?;
+        Ok(())
     }
 
     /// Rewrites one retained session log from the currently in-memory tail.
-    fn rewrite_records(path: &Path, envelopes: &[DerivedStateFeedEnvelope]) -> io::Result<()> {
+    fn rewrite_records(
+        &self,
+        path: &Path,
+        envelopes: &[DerivedStateFeedEnvelope],
+    ) -> io::Result<()> {
         let temp_path = path.with_extension("replay.tmp");
         {
             let mut file = File::create(&temp_path)?;
@@ -591,8 +777,14 @@ impl DiskDerivedStateReplaySource {
                 file.write_all(&encoded)?;
             }
             file.flush()?;
+            self.sync_file(&file)?;
         }
-        fs::rename(temp_path, path)
+        fs::rename(temp_path, path)?;
+        if let DerivedStateReplayDurability::Fsync = self.durability {
+            let directory = File::open(&self.root_dir)?;
+            directory.sync_all()?;
+        }
+        Ok(())
     }
 
     /// Loads one retained session log from disk into memory.
@@ -621,6 +813,25 @@ impl DiskDerivedStateReplaySource {
         Ok(envelopes)
     }
 
+    /// Returns the number of retained session files currently visible on disk.
+    fn retained_session_files(&self) -> usize {
+        fs::read_dir(&self.root_dir)
+            .ok()
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "replay"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Returns one parsed session id from a retained replay filename when possible.
+    fn parse_session_id(path: &Path) -> Option<FeedSessionId> {
+        let stem = path.file_stem()?.to_str()?;
+        u128::from_str_radix(stem, 16).ok().map(FeedSessionId)
+    }
+
     /// Ensures one session tail is resident in the in-process cache.
     fn load_session(
         &self,
@@ -632,6 +843,49 @@ impl DiskDerivedStateReplaySource {
         }
         let loaded = self.load_session_from_disk(session_id)?;
         sessions.insert(session_id, loaded);
+        Ok(())
+    }
+
+    /// Applies the configured durability policy to one open file handle.
+    fn sync_file(&self, file: &File) -> io::Result<()> {
+        match self.durability {
+            DerivedStateReplayDurability::Flush => Ok(()),
+            DerivedStateReplayDurability::Fsync => file.sync_all(),
+        }
+    }
+
+    /// Compacts old session logs when the backend exceeds its retention budget.
+    fn compact_sessions(
+        &self,
+        sessions: &mut HashMap<FeedSessionId, Vec<DerivedStateFeedEnvelope>>,
+        current_session_id: FeedSessionId,
+    ) -> io::Result<()> {
+        let mut retained_sessions = fs::read_dir(&self.root_dir)?
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                (path.extension().is_some_and(|ext| ext == "replay"))
+                    .then(|| Self::parse_session_id(&path).map(|session_id| (session_id, path)))
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        retained_sessions.sort_by_key(|(session_id, _path)| *session_id);
+        let mut removed_any = false;
+        while retained_sessions.len() > self.max_retained_sessions {
+            let Some((session_id, path)) = retained_sessions.first().cloned() else {
+                break;
+            };
+            if session_id == current_session_id {
+                break;
+            }
+            fs::remove_file(&path)?;
+            let _ = sessions.remove(&session_id);
+            retained_sessions.remove(0);
+            removed_any = true;
+        }
+        if removed_any {
+            let _ = self.compactions.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(())
     }
 }
@@ -657,11 +911,14 @@ impl DerivedStateReplaySource for DiskDerivedStateReplaySource {
                 let _ = self
                     .truncated_envelopes
                     .fetch_add(truncated as u64, Ordering::Relaxed);
-                return Self::rewrite_records(&path, retained);
+                self.rewrite_records(&path, retained)?;
+            } else {
+                self.append_record(&path, &envelope)?;
             }
-            Self::append_record(&path, &envelope)
+            self.compact_sessions(&mut sessions, session_id)
         })();
         if let Err(error) = append_result {
+            let _ = self.append_failures.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 session_id = ?session_id,
                 path = %path.display(),
@@ -683,9 +940,12 @@ impl DerivedStateReplaySource for DiskDerivedStateReplaySource {
             });
         };
         self.load_session(&mut sessions, session_id)
-            .map_err(|error| DerivedStateReplayError::BackendFailure {
-                session_id,
-                message: error.to_string(),
+            .map_err(|error| {
+                let _ = self.load_failures.fetch_add(1, Ordering::Relaxed);
+                DerivedStateReplayError::BackendFailure {
+                    session_id,
+                    message: error.to_string(),
+                }
             })?;
         let Some(envelopes) = sessions.get(&session_id) else {
             return Err(DerivedStateReplayError::SessionUnavailable(session_id));
@@ -695,6 +955,29 @@ impl DerivedStateReplaySource for DiskDerivedStateReplaySource {
         }
         validate_replayed_envelopes(session_id, envelopes, next_sequence)
     }
+
+    fn telemetry(&self) -> DerivedStateReplayTelemetry {
+        let (retained_sessions, retained_envelopes) = self
+            .sessions
+            .lock()
+            .map(|sessions| {
+                let retained_envelopes = sessions.values().map(Vec::len).sum();
+                (
+                    self.retained_session_files().max(sessions.len()),
+                    retained_envelopes,
+                )
+            })
+            .unwrap_or_else(|_poison| (self.retained_session_files(), 0));
+        DerivedStateReplayTelemetry {
+            backend: "disk",
+            retained_sessions,
+            retained_envelopes,
+            truncated_envelopes: self.truncated_envelopes(),
+            append_failures: self.append_failures(),
+            load_failures: self.load_failures(),
+            compactions: self.compactions(),
+        }
+    }
 }
 
 /// Validates that one retained session tail can satisfy replay continuity.
@@ -703,6 +986,13 @@ fn validate_replayed_envelopes(
     envelopes: &[DerivedStateFeedEnvelope],
     next_sequence: FeedSequence,
 ) -> Result<Vec<DerivedStateFeedEnvelope>, DerivedStateReplayError> {
+    if let Some(last_retained_sequence) = envelopes.last().map(|envelope| envelope.sequence)
+        && last_retained_sequence
+            .next()
+            .is_some_and(|expected_next| next_sequence == expected_next)
+    {
+        return Ok(Vec::new());
+    }
     if let Some(oldest_retained_sequence) = envelopes.first().map(|envelope| envelope.sequence)
         && next_sequence < oldest_retained_sequence
     {
@@ -821,6 +1111,7 @@ impl DerivedStateHostBuilder {
             name,
             consumer: Arc::new(Mutex::new(Box::new(consumer))),
             unhealthy: AtomicBool::new(false),
+            recovery_state: AtomicU8::new(DerivedStateConsumerRecoveryState::Live.into_u8()),
             applied_events: AtomicU64::new(0),
             checkpoint_flushes: AtomicU64::new(0),
             fault_count: AtomicU64::new(0),
@@ -828,6 +1119,8 @@ impl DerivedStateHostBuilder {
             has_last_applied_sequence: AtomicBool::new(false),
             last_fault_sequence: AtomicU64::new(0),
             has_last_fault_sequence: AtomicBool::new(false),
+            last_fault_kind: AtomicU8::new(0),
+            has_last_fault_kind: AtomicBool::new(false),
         });
         self
     }
@@ -1041,6 +1334,33 @@ impl DerivedStateHost {
         self.unhealthy_consumer_names()
     }
 
+    /// Returns the names of consumers that can still attempt replay-based recovery.
+    #[must_use]
+    pub fn consumers_pending_recovery(&self) -> Vec<&'static str> {
+        self.inner
+            .consumers
+            .iter()
+            .filter(|consumer| {
+                consumer.recovery_state()
+                    == DerivedStateConsumerRecoveryState::ReplayRecoveryPending
+            })
+            .map(|consumer| consumer.name)
+            .collect()
+    }
+
+    /// Returns the names of consumers that now require a full rebuild.
+    #[must_use]
+    pub fn consumers_requiring_rebuild(&self) -> Vec<&'static str> {
+        self.inner
+            .consumers
+            .iter()
+            .filter(|consumer| {
+                consumer.recovery_state() == DerivedStateConsumerRecoveryState::RebuildRequired
+            })
+            .map(|consumer| consumer.name)
+            .collect()
+    }
+
     /// Returns per-consumer live-feed telemetry snapshots in registration order.
     #[must_use]
     pub fn consumer_telemetry(&self) -> Vec<DerivedStateConsumerTelemetry> {
@@ -1049,6 +1369,13 @@ impl DerivedStateHost {
             .iter()
             .map(RegisteredDerivedStateConsumer::telemetry)
             .collect()
+    }
+
+    /// Returns operator-facing telemetry for the configured replay backend when present.
+    #[must_use]
+    pub fn replay_telemetry(&self) -> Option<DerivedStateReplayTelemetry> {
+        self.replay_source()
+            .map(|replay_source| replay_source.telemetry())
     }
 
     /// Returns the highest sequence emitted by this host when one exists.
@@ -1137,6 +1464,103 @@ impl DerivedStateHost {
                 }
             }
         }
+    }
+
+    /// Attempts replay-based recovery for unhealthy consumers.
+    #[must_use]
+    pub fn recover_consumers(&self) -> DerivedStateRecoveryReport {
+        let mut report = DerivedStateRecoveryReport::default();
+        for registered in self.inner.consumers.iter() {
+            if !registered.is_unhealthy() {
+                continue;
+            }
+            report.attempted = report.attempted.saturating_add(1);
+
+            let Ok(mut consumer) = registered.consumer.lock() else {
+                self.record_consumer_fault(
+                    registered,
+                    &DerivedStateConsumerFault::new(
+                        DerivedStateConsumerFaultKind::ConsumerApplyFailed,
+                        None,
+                        "derived-state consumer mutex poisoned during recovery",
+                    ),
+                );
+                report.still_pending = report.still_pending.saturating_add(1);
+                continue;
+            };
+            let checkpoint = match consumer.load_checkpoint() {
+                Ok(Some(checkpoint)) => checkpoint,
+                Ok(None) => {
+                    registered
+                        .set_recovery_state(DerivedStateConsumerRecoveryState::RebuildRequired);
+                    report.rebuild_required = report.rebuild_required.saturating_add(1);
+                    continue;
+                }
+                Err(fault) => {
+                    self.record_consumer_fault(registered, &fault);
+                    report.still_pending = report.still_pending.saturating_add(1);
+                    continue;
+                }
+            };
+            let Some(next_sequence) = checkpoint.next_sequence() else {
+                registered.note_recovered_checkpoint(checkpoint.last_applied_sequence);
+                report.recovered = report.recovered.saturating_add(1);
+                continue;
+            };
+            let Some(replay_source) = self.replay_source() else {
+                registered.set_recovery_state(DerivedStateConsumerRecoveryState::RebuildRequired);
+                report.rebuild_required = report.rebuild_required.saturating_add(1);
+                continue;
+            };
+            match replay_source.replay_from(checkpoint.session_id, next_sequence) {
+                Ok(replayed) => {
+                    let mut recovered = true;
+                    if replayed.is_empty() {
+                        registered.note_recovered_checkpoint(checkpoint.last_applied_sequence);
+                    } else {
+                        for envelope in replayed {
+                            let sequence = envelope.sequence;
+                            if let Err(fault) = consumer.apply(envelope) {
+                                self.record_consumer_fault(registered, &fault);
+                                recovered = false;
+                                break;
+                            }
+                            registered.note_applied(sequence);
+                        }
+                        if recovered {
+                            registered.mark_live();
+                        }
+                    }
+                    if recovered {
+                        report.recovered = report.recovered.saturating_add(1);
+                    } else {
+                        match registered.recovery_state() {
+                            DerivedStateConsumerRecoveryState::RebuildRequired => {
+                                report.rebuild_required = report.rebuild_required.saturating_add(1);
+                            }
+                            DerivedStateConsumerRecoveryState::Live
+                            | DerivedStateConsumerRecoveryState::ReplayRecoveryPending => {
+                                report.still_pending = report.still_pending.saturating_add(1);
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    let fault = Self::replay_fault(&checkpoint, &error);
+                    self.record_consumer_fault(registered, &fault);
+                    match registered.recovery_state() {
+                        DerivedStateConsumerRecoveryState::RebuildRequired => {
+                            report.rebuild_required = report.rebuild_required.saturating_add(1);
+                        }
+                        DerivedStateConsumerRecoveryState::Live
+                        | DerivedStateConsumerRecoveryState::ReplayRecoveryPending => {
+                            report.still_pending = report.still_pending.saturating_add(1);
+                        }
+                    }
+                }
+            }
+        }
+        report
     }
 
     /// Allocates the next per-slot transaction index for feed events.
@@ -1338,11 +1762,28 @@ impl DerivedStateHost {
     ) {
         let _ = self.inner.fault_count.fetch_add(1, Ordering::Relaxed);
         registered.note_fault(fault.sequence);
+        registered.note_fault_kind(fault.kind);
+        if fault.kind.breaks_live_continuity() {
+            registered.set_recovery_state(match fault.kind {
+                DerivedStateConsumerFaultKind::ReplayGap => {
+                    DerivedStateConsumerRecoveryState::RebuildRequired
+                }
+                DerivedStateConsumerFaultKind::LagExceeded
+                | DerivedStateConsumerFaultKind::QueueOverflow
+                | DerivedStateConsumerFaultKind::ConsumerApplyFailed => {
+                    DerivedStateConsumerRecoveryState::ReplayRecoveryPending
+                }
+                DerivedStateConsumerFaultKind::CheckpointWriteFailed => {
+                    DerivedStateConsumerRecoveryState::Live
+                }
+            });
+        }
         if fault.kind.breaks_live_continuity() && registered.mark_unhealthy() {
             tracing::warn!(
                 consumer = registered.name,
                 ?fault.kind,
                 sequence = ?fault.sequence,
+                recovery_state = ?registered.recovery_state(),
                 "derived-state consumer marked unhealthy"
             );
         }
@@ -1401,6 +1842,8 @@ struct RegisteredDerivedStateConsumer {
     consumer: Arc<Mutex<Box<dyn DerivedStateConsumer>>>,
     /// Whether the consumer has lost live continuity and should stop receiving events.
     unhealthy: AtomicBool,
+    /// Current recovery state for this consumer.
+    recovery_state: AtomicU8,
     /// Total number of successfully applied envelopes.
     applied_events: AtomicU64,
     /// Total number of successfully flushed checkpoints.
@@ -1415,6 +1858,10 @@ struct RegisteredDerivedStateConsumer {
     last_fault_sequence: AtomicU64,
     /// Whether `last_fault_sequence` is initialized.
     has_last_fault_sequence: AtomicBool,
+    /// Last structured fault kind when one exists.
+    last_fault_kind: AtomicU8,
+    /// Whether `last_fault_kind` is initialized.
+    has_last_fault_kind: AtomicBool,
 }
 
 impl RegisteredDerivedStateConsumer {
@@ -1424,10 +1871,31 @@ impl RegisteredDerivedStateConsumer {
         self.unhealthy.load(Ordering::Acquire)
     }
 
+    /// Returns the current recovery state for this consumer.
+    #[must_use]
+    fn recovery_state(&self) -> DerivedStateConsumerRecoveryState {
+        DerivedStateConsumerRecoveryState::from_u8(self.recovery_state.load(Ordering::Acquire))
+    }
+
     /// Marks the consumer unhealthy and returns whether the state changed.
     #[must_use]
     fn mark_unhealthy(&self) -> bool {
         !self.unhealthy.swap(true, Ordering::AcqRel)
+    }
+
+    /// Marks the consumer healthy after successful recovery.
+    fn mark_live(&self) {
+        self.unhealthy.store(false, Ordering::Release);
+        self.recovery_state.store(
+            DerivedStateConsumerRecoveryState::Live.into_u8(),
+            Ordering::Release,
+        );
+    }
+
+    /// Records one recovery state transition.
+    fn set_recovery_state(&self, state: DerivedStateConsumerRecoveryState) {
+        self.recovery_state
+            .store(state.into_u8(), Ordering::Release);
     }
 
     /// Records one successful envelope application.
@@ -1437,6 +1905,18 @@ impl RegisteredDerivedStateConsumer {
             .store(sequence.0, Ordering::Release);
         self.has_last_applied_sequence
             .store(true, Ordering::Release);
+        if !self.is_unhealthy() {
+            self.set_recovery_state(DerivedStateConsumerRecoveryState::Live);
+        }
+    }
+
+    /// Records one successful recovery to an already-applied checkpoint boundary.
+    fn note_recovered_checkpoint(&self, sequence: FeedSequence) {
+        self.last_applied_sequence
+            .store(sequence.0, Ordering::Release);
+        self.has_last_applied_sequence
+            .store(true, Ordering::Release);
+        self.mark_live();
     }
 
     /// Records one successful checkpoint flush.
@@ -1454,12 +1934,20 @@ impl RegisteredDerivedStateConsumer {
         }
     }
 
+    /// Records the last fault kind for telemetry.
+    fn note_fault_kind(&self, kind: DerivedStateConsumerFaultKind) {
+        self.last_fault_kind
+            .store(kind.into_u8(), Ordering::Release);
+        self.has_last_fault_kind.store(true, Ordering::Release);
+    }
+
     /// Builds a point-in-time telemetry snapshot for this consumer.
     #[must_use]
     fn telemetry(&self) -> DerivedStateConsumerTelemetry {
         DerivedStateConsumerTelemetry {
             name: self.name,
             unhealthy: self.is_unhealthy(),
+            recovery_state: self.recovery_state(),
             applied_events: self.applied_events.load(Ordering::Relaxed),
             checkpoint_flushes: self.checkpoint_flushes.load(Ordering::Relaxed),
             fault_count: self.fault_count.load(Ordering::Relaxed),
@@ -1471,6 +1959,9 @@ impl RegisteredDerivedStateConsumer {
                 .has_last_fault_sequence
                 .load(Ordering::Acquire)
                 .then(|| FeedSequence(self.last_fault_sequence.load(Ordering::Acquire))),
+            last_fault_kind: self.has_last_fault_kind.load(Ordering::Acquire).then(|| {
+                DerivedStateConsumerFaultKind::from_u8(self.last_fault_kind.load(Ordering::Acquire))
+            }),
         }
     }
 }
@@ -1779,11 +2270,13 @@ mod tests {
             vec![DerivedStateConsumerTelemetry {
                 name: "recording-consumer",
                 unhealthy: false,
+                recovery_state: DerivedStateConsumerRecoveryState::Live,
                 applied_events: 2,
                 checkpoint_flushes: 1,
                 fault_count: 0,
                 last_applied_sequence: Some(FeedSequence(1)),
                 last_fault_sequence: None,
+                last_fault_kind: None,
             }]
         );
     }
@@ -1865,17 +2358,21 @@ mod tests {
         assert_eq!(host.unhealthy_consumer_names(), vec!["failing-apply"]);
         assert!(host.has_consumers_requiring_resync());
         assert_eq!(host.consumers_requiring_resync(), vec!["failing-apply"]);
+        assert_eq!(host.consumers_pending_recovery(), vec!["failing-apply"]);
+        assert!(host.consumers_requiring_rebuild().is_empty());
         assert_eq!(host.fault_count(), 1);
         assert_eq!(
             host.consumer_telemetry(),
             vec![DerivedStateConsumerTelemetry {
                 name: "failing-apply",
                 unhealthy: true,
+                recovery_state: DerivedStateConsumerRecoveryState::ReplayRecoveryPending,
                 applied_events: 0,
                 checkpoint_flushes: 0,
                 fault_count: 1,
                 last_applied_sequence: None,
                 last_fault_sequence: Some(FeedSequence(0)),
+                last_fault_kind: Some(DerivedStateConsumerFaultKind::ConsumerApplyFailed),
             }]
         );
     }
@@ -1977,11 +2474,13 @@ mod tests {
             vec![DerivedStateConsumerTelemetry {
                 name: "failing-checkpoint",
                 unhealthy: false,
+                recovery_state: DerivedStateConsumerRecoveryState::Live,
                 applied_events: 3,
                 checkpoint_flushes: 0,
                 fault_count: 1,
                 last_applied_sequence: Some(FeedSequence(2)),
                 last_fault_sequence: Some(FeedSequence(1)),
+                last_fault_kind: Some(DerivedStateConsumerFaultKind::CheckpointWriteFailed),
             }]
         );
     }
@@ -2043,6 +2542,84 @@ mod tests {
                 })?
                 .checkpoints
                 .push(checkpoint);
+            Ok(())
+        }
+    }
+
+    struct RecoverableConsumerState {
+        checkpoint: Option<DerivedStateCheckpoint>,
+        fail_sequence_once: Option<FeedSequence>,
+        applied_sequences: Vec<FeedSequence>,
+    }
+
+    struct RecoverableConsumer {
+        state: Arc<Mutex<RecoverableConsumerState>>,
+    }
+
+    impl DerivedStateConsumer for RecoverableConsumer {
+        fn name(&self) -> &'static str {
+            "recoverable-consumer"
+        }
+
+        fn state_version(&self) -> u32 {
+            5
+        }
+
+        fn extension_version(&self) -> &'static str {
+            "recoverable-consumer-test"
+        }
+
+        fn load_checkpoint(
+            &mut self,
+        ) -> Result<Option<DerivedStateCheckpoint>, DerivedStateConsumerFault> {
+            let state = self.state.lock().map_err(|_poison| {
+                DerivedStateConsumerFault::new(
+                    DerivedStateConsumerFaultKind::CheckpointWriteFailed,
+                    None,
+                    "recoverable consumer state mutex poisoned while loading checkpoint",
+                )
+            })?;
+            Ok(state.checkpoint.clone())
+        }
+
+        fn apply(
+            &mut self,
+            envelope: DerivedStateFeedEnvelope,
+        ) -> Result<(), DerivedStateConsumerFault> {
+            let mut state = self.state.lock().map_err(|_poison| {
+                DerivedStateConsumerFault::new(
+                    DerivedStateConsumerFaultKind::ConsumerApplyFailed,
+                    Some(envelope.sequence),
+                    "recoverable consumer state mutex poisoned while applying envelope",
+                )
+            })?;
+            if state.fail_sequence_once == Some(envelope.sequence) {
+                state.fail_sequence_once = None;
+                return Err(DerivedStateConsumerFault::new(
+                    DerivedStateConsumerFaultKind::ConsumerApplyFailed,
+                    Some(envelope.sequence),
+                    "recoverable consumer injected one-shot apply failure",
+                ));
+            }
+            state.applied_sequences.push(envelope.sequence);
+            Ok(())
+        }
+
+        fn flush_checkpoint(
+            &mut self,
+            checkpoint: DerivedStateCheckpoint,
+        ) -> Result<(), DerivedStateConsumerFault> {
+            let sequence = checkpoint.last_applied_sequence;
+            self.state
+                .lock()
+                .map_err(|_poison| {
+                    DerivedStateConsumerFault::new(
+                        DerivedStateConsumerFaultKind::CheckpointWriteFailed,
+                        Some(sequence),
+                        "recoverable consumer state mutex poisoned while flushing checkpoint",
+                    )
+                })?
+                .checkpoint = Some(checkpoint);
             Ok(())
         }
     }
@@ -2123,13 +2700,68 @@ mod tests {
             vec![DerivedStateConsumerTelemetry {
                 name: "replay-checkpoint",
                 unhealthy: false,
+                recovery_state: DerivedStateConsumerRecoveryState::Live,
                 applied_events: 1,
                 checkpoint_flushes: 0,
                 fault_count: 0,
                 last_applied_sequence: Some(FeedSequence(1)),
                 last_fault_sequence: None,
+                last_fault_kind: None,
             }]
         );
+    }
+
+    #[test]
+    fn initialize_accepts_checkpoint_already_at_retained_tail() {
+        let replay_source = Arc::new(InMemoryDerivedStateReplaySource::new());
+        let session_id = FeedSessionId(41);
+        replay_source.append(DerivedStateFeedEnvelope {
+            session_id,
+            sequence: FeedSequence(0),
+            emitted_at: SystemTime::UNIX_EPOCH,
+            watermarks: FeedWatermarks::default(),
+            event: DerivedStateFeedEvent::SlotStatusChanged(SlotStatusChangedEvent {
+                slot: 5,
+                parent_slot: Some(4),
+                previous_status: None,
+                status: ForkSlotStatus::Processed,
+            }),
+        });
+        replay_source.append(DerivedStateFeedEnvelope {
+            session_id,
+            sequence: FeedSequence(1),
+            emitted_at: SystemTime::UNIX_EPOCH,
+            watermarks: FeedWatermarks::default(),
+            event: DerivedStateFeedEvent::CheckpointBarrier(CheckpointBarrierEvent {
+                barrier_sequence: FeedSequence(1),
+                reason: CheckpointBarrierReason::Periodic,
+            }),
+        });
+
+        let state = Arc::new(Mutex::new(RecordingState::default()));
+        let host = DerivedStateHost::builder()
+            .with_session_id(FeedSessionId(999))
+            .with_replay_source(replay_source)
+            .add_consumer(ReplayCheckpointConsumer {
+                state: Arc::clone(&state),
+                checkpoint: Some(DerivedStateCheckpoint {
+                    session_id,
+                    last_applied_sequence: FeedSequence(1),
+                    watermarks: FeedWatermarks::default(),
+                    state_version: 3,
+                    extension_version: "replay-checkpoint-test".to_owned(),
+                }),
+            })
+            .build();
+
+        host.initialize();
+
+        let state = state
+            .lock()
+            .expect("replay recording state mutex should not be poisoned");
+        assert!(state.envelopes.is_empty());
+        assert_eq!(host.healthy_consumer_count(), 1);
+        assert!(!host.has_unhealthy_consumers());
     }
 
     #[test]
@@ -2224,17 +2856,24 @@ mod tests {
         assert_eq!(host.unhealthy_consumer_names(), vec!["replay-checkpoint"]);
         assert!(host.has_consumers_requiring_resync());
         assert_eq!(host.consumers_requiring_resync(), vec!["replay-checkpoint"]);
+        assert!(host.consumers_pending_recovery().is_empty());
+        assert_eq!(
+            host.consumers_requiring_rebuild(),
+            vec!["replay-checkpoint"]
+        );
         assert_eq!(host.fault_count(), 1);
         assert_eq!(
             host.consumer_telemetry(),
             vec![DerivedStateConsumerTelemetry {
                 name: "replay-checkpoint",
                 unhealthy: true,
+                recovery_state: DerivedStateConsumerRecoveryState::RebuildRequired,
                 applied_events: 0,
                 checkpoint_flushes: 0,
                 fault_count: 1,
                 last_applied_sequence: None,
                 last_fault_sequence: Some(FeedSequence(1)),
+                last_fault_kind: Some(DerivedStateConsumerFaultKind::ReplayGap),
             }]
         );
     }
@@ -2270,6 +2909,99 @@ mod tests {
         assert_eq!(
             runtime_replay_source.retained_envelopes(host.session_id()),
             0
+        );
+    }
+
+    #[test]
+    fn recover_consumers_replays_from_checkpoint_after_live_failure() {
+        let replay_source = Arc::new(InMemoryDerivedStateReplaySource::new());
+        let state = Arc::new(Mutex::new(RecoverableConsumerState {
+            checkpoint: None,
+            fail_sequence_once: Some(FeedSequence(2)),
+            applied_sequences: Vec::new(),
+        }));
+        let host = DerivedStateHost::builder()
+            .with_replay_source(replay_source)
+            .add_consumer(RecoverableConsumer {
+                state: Arc::clone(&state),
+            })
+            .build();
+
+        host.on_slot_status(SlotStatusEvent {
+            slot: 10,
+            tip_slot: Some(10),
+            confirmed_slot: Some(9),
+            finalized_slot: Some(8),
+            parent_slot: Some(9),
+            status: ForkSlotStatus::Processed,
+            previous_status: None,
+        });
+        host.emit_checkpoint_barrier(
+            CheckpointBarrierReason::Periodic,
+            FeedWatermarks {
+                canonical_tip_slot: Some(10),
+                processed_slot: Some(10),
+                confirmed_slot: Some(9),
+                finalized_slot: Some(8),
+            },
+        );
+        host.on_slot_status(SlotStatusEvent {
+            slot: 11,
+            tip_slot: Some(11),
+            confirmed_slot: Some(10),
+            finalized_slot: Some(9),
+            parent_slot: Some(10),
+            status: ForkSlotStatus::Processed,
+            previous_status: None,
+        });
+
+        assert_eq!(
+            host.consumers_pending_recovery(),
+            vec!["recoverable-consumer"]
+        );
+        assert!(host.consumers_requiring_rebuild().is_empty());
+
+        let recovery_report = host.recover_consumers();
+        assert_eq!(
+            recovery_report,
+            DerivedStateRecoveryReport {
+                attempted: 1,
+                recovered: 1,
+                still_pending: 0,
+                rebuild_required: 0,
+            }
+        );
+        assert_eq!(host.healthy_consumer_count(), 1);
+        assert!(!host.has_unhealthy_consumers());
+        assert!(host.consumers_pending_recovery().is_empty());
+
+        let state = state
+            .lock()
+            .expect("recoverable consumer state mutex should not be poisoned");
+        assert_eq!(
+            state.applied_sequences,
+            vec![FeedSequence(0), FeedSequence(1), FeedSequence(2)]
+        );
+        assert_eq!(
+            state
+                .checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.last_applied_sequence),
+            Some(FeedSequence(1))
+        );
+        assert_eq!(
+            host.consumer_telemetry(),
+            vec![DerivedStateConsumerTelemetry {
+                name: "recoverable-consumer",
+                unhealthy: false,
+                recovery_state: DerivedStateConsumerRecoveryState::Live,
+                applied_events: 3,
+                checkpoint_flushes: 1,
+                fault_count: 1,
+                last_applied_sequence: Some(FeedSequence(2)),
+                last_fault_sequence: Some(FeedSequence(2)),
+                last_fault_kind: Some(DerivedStateConsumerFaultKind::ConsumerApplyFailed),
+            }]
         );
     }
 
@@ -2437,17 +3169,24 @@ mod tests {
         assert_eq!(host.unhealthy_consumer_names(), vec!["replay-checkpoint"]);
         assert!(host.has_consumers_requiring_resync());
         assert_eq!(host.consumers_requiring_resync(), vec!["replay-checkpoint"]);
+        assert!(host.consumers_pending_recovery().is_empty());
+        assert_eq!(
+            host.consumers_requiring_rebuild(),
+            vec!["replay-checkpoint"]
+        );
         assert_eq!(host.fault_count(), 1);
         assert_eq!(
             host.consumer_telemetry(),
             vec![DerivedStateConsumerTelemetry {
                 name: "replay-checkpoint",
                 unhealthy: true,
+                recovery_state: DerivedStateConsumerRecoveryState::RebuildRequired,
                 applied_events: 0,
                 checkpoint_flushes: 0,
                 fault_count: 1,
                 last_applied_sequence: None,
                 last_fault_sequence: Some(FeedSequence(1)),
+                last_fault_kind: Some(DerivedStateConsumerFaultKind::ReplayGap),
             }]
         );
     }
