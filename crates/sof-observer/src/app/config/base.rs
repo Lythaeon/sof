@@ -197,3 +197,15 @@ pub fn read_runtime_extension_drop_warn_delta() -> u64 {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(100)
 }
+
+pub fn read_derived_state_checkpoint_interval_ms() -> u64 {
+    read_env_var("SOF_DERIVED_STATE_CHECKPOINT_INTERVAL_MS")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(30_000)
+}
+
+pub fn read_derived_state_replay_max_envelopes() -> usize {
+    read_env_var("SOF_DERIVED_STATE_REPLAY_MAX_ENVELOPES")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(8_192)
+}

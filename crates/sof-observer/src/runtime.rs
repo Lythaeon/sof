@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use crate::framework::{PluginHost, RuntimeExtensionHost};
+use crate::framework::{DerivedStateHost, PluginHost, RuntimeExtensionHost};
 use thiserror::Error;
 
 /// Public runtime error surface for packaged SOF entrypoints.
@@ -177,6 +177,28 @@ impl RuntimeSetup {
     #[must_use]
     pub fn with_log_dataset_reconstruction(self, enabled: bool) -> Self {
         self.with_env("SOF_LOG_DATASET_RECONSTRUCTION", enabled.to_string())
+    }
+
+    /// Sets `SOF_DERIVED_STATE_CHECKPOINT_INTERVAL_MS`.
+    ///
+    /// Use `0` to disable periodic checkpoint barriers.
+    #[must_use]
+    pub fn with_derived_state_checkpoint_interval_ms(self, interval_ms: u64) -> Self {
+        self.with_env(
+            "SOF_DERIVED_STATE_CHECKPOINT_INTERVAL_MS",
+            interval_ms.to_string(),
+        )
+    }
+
+    /// Sets `SOF_DERIVED_STATE_REPLAY_MAX_ENVELOPES`.
+    ///
+    /// Use `0` to disable the runtime-owned retained replay tail.
+    #[must_use]
+    pub fn with_derived_state_replay_max_envelopes(self, max_envelopes: usize) -> Self {
+        self.with_env(
+            "SOF_DERIVED_STATE_REPLAY_MAX_ENVELOPES",
+            max_envelopes.to_string(),
+        )
     }
 
     /// Sets `SOF_LIVE_SHREDS_ENABLED`.
@@ -434,6 +456,19 @@ pub fn run_with_extension_host(extension_host: RuntimeExtensionHost) -> Result<(
     )?)
 }
 
+/// Runs the packaged observer runtime with an explicit derived-state host.
+///
+/// # Errors
+/// Returns any runtime initialization or shutdown error from the underlying observer runtime.
+pub fn run_with_derived_state_host(
+    derived_state_host: DerivedStateHost,
+) -> Result<(), RuntimeError> {
+    crate::runtime_env::clear_runtime_env_overrides();
+    Ok(crate::app::runtime::run_with_derived_state_host(
+        derived_state_host,
+    )?)
+}
+
 /// Runs the packaged observer runtime with explicit plugin and runtime extension hosts.
 ///
 /// # Errors
@@ -446,6 +481,24 @@ pub fn run_with_hosts(
     Ok(crate::app::runtime::run_with_hosts(
         plugin_host,
         extension_host,
+        DerivedStateHost::builder().build(),
+    )?)
+}
+
+/// Runs the packaged observer runtime with explicit hosts, including derived-state consumers.
+///
+/// # Errors
+/// Returns any runtime initialization or shutdown error from the underlying observer runtime.
+pub fn run_with_hosts_and_derived_state_host(
+    plugin_host: PluginHost,
+    extension_host: RuntimeExtensionHost,
+    derived_state_host: DerivedStateHost,
+) -> Result<(), RuntimeError> {
+    crate::runtime_env::clear_runtime_env_overrides();
+    Ok(crate::app::runtime::run_with_hosts(
+        plugin_host,
+        extension_host,
+        derived_state_host,
     )?)
 }
 
@@ -497,6 +550,7 @@ pub fn run_with_hosts_and_setup(
     Ok(crate::app::runtime::run_with_hosts(
         plugin_host,
         extension_host,
+        DerivedStateHost::builder().build(),
     )?)
 }
 
@@ -529,6 +583,17 @@ pub async fn run_async_with_extension_host(
     Ok(crate::app::runtime::run_async_with_extension_host(extension_host).await?)
 }
 
+/// Async variant of [`run_with_derived_state_host`].
+///
+/// # Errors
+/// Returns any runtime initialization or shutdown error from the underlying observer runtime.
+pub async fn run_async_with_derived_state_host(
+    derived_state_host: DerivedStateHost,
+) -> Result<(), RuntimeError> {
+    crate::runtime_env::clear_runtime_env_overrides();
+    Ok(crate::app::runtime::run_async_with_derived_state_host(derived_state_host).await?)
+}
+
 /// Async variant of [`run_with_hosts`].
 ///
 /// # Errors
@@ -538,7 +603,28 @@ pub async fn run_async_with_hosts(
     extension_host: RuntimeExtensionHost,
 ) -> Result<(), RuntimeError> {
     crate::runtime_env::clear_runtime_env_overrides();
-    Ok(crate::app::runtime::run_async_with_hosts(plugin_host, extension_host).await?)
+    Ok(crate::app::runtime::run_async_with_hosts(
+        plugin_host,
+        extension_host,
+        DerivedStateHost::builder().build(),
+    )
+    .await?)
+}
+
+/// Async variant of [`run_with_hosts_and_derived_state_host`].
+///
+/// # Errors
+/// Returns any runtime initialization or shutdown error from the underlying observer runtime.
+pub async fn run_async_with_hosts_and_derived_state_host(
+    plugin_host: PluginHost,
+    extension_host: RuntimeExtensionHost,
+    derived_state_host: DerivedStateHost,
+) -> Result<(), RuntimeError> {
+    crate::runtime_env::clear_runtime_env_overrides();
+    Ok(
+        crate::app::runtime::run_async_with_hosts(plugin_host, extension_host, derived_state_host)
+            .await?,
+    )
 }
 
 #[cfg(feature = "kernel-bypass")]
@@ -627,6 +713,49 @@ pub async fn run_async_with_hosts_and_kernel_bypass_ingress(
         crate::app::runtime::run_async_with_hosts_and_kernel_bypass_ingress(
             plugin_host,
             extension_host,
+            DerivedStateHost::builder().build(),
+            packet_ingest_rx.into(),
+        )
+        .await?,
+    )
+}
+
+#[cfg(feature = "kernel-bypass")]
+/// Async runtime entrypoint using external ingress and an explicit derived-state host.
+///
+/// # Errors
+/// Returns any runtime initialization or shutdown error from the underlying observer runtime.
+pub async fn run_async_with_derived_state_host_and_kernel_bypass_ingress(
+    derived_state_host: DerivedStateHost,
+    packet_ingest_rx: impl Into<KernelBypassIngressReceiver>,
+) -> Result<(), RuntimeError> {
+    crate::runtime_env::clear_runtime_env_overrides();
+    Ok(
+        crate::app::runtime::run_async_with_derived_state_host_and_kernel_bypass_ingress(
+            derived_state_host,
+            packet_ingest_rx.into(),
+        )
+        .await?,
+    )
+}
+
+#[cfg(feature = "kernel-bypass")]
+/// Async runtime entrypoint using explicit hosts and external ingress, including a derived-state host.
+///
+/// # Errors
+/// Returns any runtime initialization or shutdown error from the underlying observer runtime.
+pub async fn run_async_with_hosts_and_derived_state_host_and_kernel_bypass_ingress(
+    plugin_host: PluginHost,
+    extension_host: RuntimeExtensionHost,
+    derived_state_host: DerivedStateHost,
+    packet_ingest_rx: impl Into<KernelBypassIngressReceiver>,
+) -> Result<(), RuntimeError> {
+    crate::runtime_env::clear_runtime_env_overrides();
+    Ok(
+        crate::app::runtime::run_async_with_hosts_and_kernel_bypass_ingress(
+            plugin_host,
+            extension_host,
+            derived_state_host,
             packet_ingest_rx.into(),
         )
         .await?,
@@ -676,5 +805,10 @@ pub async fn run_async_with_hosts_and_setup(
     setup: &RuntimeSetup,
 ) -> Result<(), RuntimeError> {
     setup.apply();
-    Ok(crate::app::runtime::run_async_with_hosts(plugin_host, extension_host).await?)
+    Ok(crate::app::runtime::run_async_with_hosts(
+        plugin_host,
+        extension_host,
+        DerivedStateHost::builder().build(),
+    )
+    .await?)
 }

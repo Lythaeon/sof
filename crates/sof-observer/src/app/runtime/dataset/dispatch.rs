@@ -93,6 +93,7 @@ pub(in crate::app::runtime) struct DatasetWorkerConfig {
 
 #[derive(Clone)]
 pub(in crate::app::runtime) struct DatasetWorkerShared {
+    pub(in crate::app::runtime) derived_state_host: DerivedStateHost,
     pub(in crate::app::runtime) plugin_host: PluginHost,
     pub(in crate::app::runtime) tx_event_tx: mpsc::Sender<TxObservedEvent>,
     pub(in crate::app::runtime) tx_commitment_tracker: Arc<CommitmentSlotTracker>,
@@ -125,6 +126,7 @@ pub(in crate::app::runtime) fn spawn_dataset_workers(
         let dataset_duplicate_drop_count = shared.dataset_duplicate_drop_count.clone();
         let dataset_jobs_started_count = shared.dataset_jobs_started_count.clone();
         let dataset_jobs_completed_count = shared.dataset_jobs_completed_count.clone();
+        let derived_state_host = shared.derived_state_host.clone();
         let plugin_host = shared.plugin_host.clone();
         let attempt_cache_capacity = config.attempt_cache_capacity;
         let attempt_success_ttl = config.attempt_success_ttl;
@@ -160,6 +162,7 @@ pub(in crate::app::runtime) fn spawn_dataset_workers(
                             serialized_shreds: job.serialized_shreds,
                         },
                         &process::DatasetProcessContext {
+                            derived_state_host: &derived_state_host,
                             plugin_host: &plugin_host,
                             tx_event_tx: &tx_event_tx,
                             tx_commitment_tracker: tx_commitment_tracker.as_ref(),

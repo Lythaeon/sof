@@ -8,11 +8,13 @@ mod runloop;
 mod tests;
 
 pub(crate) use entrypoints::{
-    RuntimeEntrypointError, run, run_async, run_async_with_extension_host, run_async_with_hosts,
-    run_async_with_plugin_host, run_with_extension_host, run_with_hosts, run_with_plugin_host,
+    RuntimeEntrypointError, run, run_async, run_async_with_derived_state_host,
+    run_async_with_extension_host, run_async_with_hosts, run_async_with_plugin_host,
+    run_with_derived_state_host, run_with_extension_host, run_with_hosts, run_with_plugin_host,
 };
 #[cfg(feature = "kernel-bypass")]
 pub(crate) use entrypoints::{
+    run_async_with_derived_state_host_and_kernel_bypass_ingress,
     run_async_with_extension_host_and_kernel_bypass_ingress,
     run_async_with_hosts_and_kernel_bypass_ingress, run_async_with_kernel_bypass_ingress,
     run_async_with_plugin_host_and_kernel_bypass_ingress,

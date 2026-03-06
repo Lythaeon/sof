@@ -17,8 +17,10 @@ pub use crate::event::{ForkSlotStatus, TxCommitmentStatus};
 pub use derived_state::{
     AccountTouchObservedEvent, BranchReorgedEvent, CheckpointBarrierEvent, CheckpointBarrierReason,
     DerivedStateCheckpoint, DerivedStateConsumer, DerivedStateConsumerFault,
-    DerivedStateConsumerFaultKind, DerivedStateFeedEnvelope, DerivedStateFeedEvent, FeedSequence,
-    FeedSessionId, FeedWatermarks, SlotStatusChangedEvent, TransactionAppliedEvent,
+    DerivedStateConsumerFaultKind, DerivedStateConsumerTelemetry, DerivedStateFeedEnvelope,
+    DerivedStateFeedEvent, DerivedStateHost, DerivedStateHostBuilder, DerivedStateReplayError,
+    DerivedStateReplaySource, FeedSequence, FeedSessionId, FeedWatermarks,
+    InMemoryDerivedStateReplaySource, SlotStatusChangedEvent, TransactionAppliedEvent,
 };
 pub use events::{
     AccountTouchEvent, ClusterNodeInfo, ClusterTopologyEvent, ControlPlaneSource, DatasetEvent,
