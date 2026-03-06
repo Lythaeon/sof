@@ -217,6 +217,10 @@ fn cluster_node_info_from_contact(contact_info: &ContactInfo) -> ClusterNodeInfo
         shred_version: contact_info.shred_version(),
         gossip: contact_info.gossip(),
         tpu: contact_info.tpu(solana_gossip::contact_info::Protocol::UDP),
+        tpu_quic: contact_info.tpu(solana_gossip::contact_info::Protocol::QUIC),
+        tpu_forwards: contact_info.tpu_forwards(solana_gossip::contact_info::Protocol::UDP),
+        tpu_forwards_quic: contact_info.tpu_forwards(solana_gossip::contact_info::Protocol::QUIC),
+        tpu_vote: contact_info.tpu_vote(solana_gossip::contact_info::Protocol::UDP),
         tvu: contact_info.tvu(solana_gossip::contact_info::Protocol::UDP),
         rpc: contact_info.rpc(),
     }

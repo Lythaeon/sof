@@ -21,6 +21,10 @@ impl Plugin for NonVoteTxPlugin {
         "coexistence-non-vote-plugin"
     }
 
+    fn wants_transaction(&self) -> bool {
+        true
+    }
+
     async fn on_transaction(&self, event: TransactionEvent) {
         if event.kind == TxKind::VoteOnly {
             return;

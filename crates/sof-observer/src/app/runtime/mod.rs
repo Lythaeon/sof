@@ -11,11 +11,19 @@ pub(crate) use entrypoints::{
     RuntimeEntrypointError, run, run_async, run_async_with_extension_host, run_async_with_hosts,
     run_async_with_plugin_host, run_with_extension_host, run_with_hosts, run_with_plugin_host,
 };
+#[cfg(feature = "kernel-bypass")]
+pub(crate) use entrypoints::{
+    run_async_with_extension_host_and_kernel_bypass_ingress,
+    run_async_with_hosts_and_kernel_bypass_ingress, run_async_with_kernel_bypass_ingress,
+    run_async_with_plugin_host_and_kernel_bypass_ingress,
+};
 use logging::init_tracing;
 use prelude::*;
 
 #[cfg(feature = "gossip-bootstrap")]
 use bootstrap::gossip::maybe_switch_gossip_runtime;
+#[cfg(feature = "kernel-bypass")]
+use bootstrap::gossip::start_external_receiver;
 use bootstrap::gossip::start_receiver;
 #[cfg(feature = "gossip-bootstrap")]
 use bootstrap::repair::{RepairCommand, RepairOutcome};

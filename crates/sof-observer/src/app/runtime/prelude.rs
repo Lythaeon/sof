@@ -38,7 +38,7 @@ pub(super) use crate::{
         ReorgEvent, RuntimeExtensionDispatchMetrics, RuntimeExtensionHost,
         RuntimeExtensionHostBuilder, ShredEvent, SlotStatusEvent, TransactionEvent,
     },
-    ingest::{self, RawPacketBatch},
+    ingest,
     reassembly::dataset::DataSetReassembler,
     relay::{RecentShredRingBuffer, SharedRelayCache},
     repair::MissingShredTracker,

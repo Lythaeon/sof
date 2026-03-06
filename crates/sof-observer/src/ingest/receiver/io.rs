@@ -76,7 +76,7 @@ fn sockaddr_storage_to_socket_addr(storage: &SockaddrStorage) -> Option<SocketAd
 }
 
 pub(super) fn flush_batch(
-    tx: &mpsc::Sender<RawPacketBatch>,
+    tx: &crate::ingest::RawPacketBatchSender,
     batch: &mut RawPacketBatch,
     telemetry: Option<&ReceiverTelemetry>,
 ) {
@@ -85,17 +85,13 @@ pub(super) fn flush_batch(
     }
     let packet_count = batch.len();
     let outbound = std::mem::take(batch);
-    match tx.try_send(outbound) {
-        Ok(()) => {
-            if let Some(telemetry) = telemetry {
-                telemetry.record_sent_batch(packet_count);
-            }
+    let drop_on_full = crate::ingest::config::read_udp_drop_on_channel_full();
+    if tx.send_batch(outbound, drop_on_full) {
+        if let Some(telemetry) = telemetry {
+            telemetry.record_sent_batch(packet_count);
         }
-        Err(mpsc::error::TrySendError::Full(_)) | Err(mpsc::error::TrySendError::Closed(_)) => {
-            if let Some(telemetry) = telemetry {
-                telemetry.record_dropped_batch(packet_count);
-            }
-        }
+    } else if let Some(telemetry) = telemetry {
+        telemetry.record_dropped_batch(packet_count);
     }
 }
 

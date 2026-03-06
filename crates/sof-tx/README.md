@@ -24,6 +24,12 @@ Enable SOF runtime adapters when you want provider values from live `sof` plugin
 sof-tx = { version = "0.5.0", features = ["sof-adapters"] }
 ```
 
+Enable `kernel-bypass` transport hooks for kernel-bypass direct submit integrations:
+
+```toml
+sof-tx = { version = "0.5.0", features = ["kernel-bypass"] }
+```
+
 ## Core Types
 
 - `TxBuilder`: compose transaction instructions and signing inputs.
@@ -32,6 +38,20 @@ sof-tx = { version = "0.5.0", features = ["sof-adapters"] }
 - `SignedTx`: submit externally signed transaction bytes.
 - `RoutingPolicy`: leader/backup fanout controls.
 - `LeaderProvider` and `RecentBlockhashProvider`: provider boundaries.
+- `TxMessageVersion`: select `V0` (default) or `Legacy` message output.
+- `MAX_TRANSACTION_WIRE_BYTES`: current max over-the-wire transaction bytes.
+- `MAX_TRANSACTION_ACCOUNT_LOCKS`: current max account locks per transaction.
+
+## Message Version and Limits
+
+`TxBuilder` emits `V0` messages by default without requiring address lookup tables.
+
+Legacy output remains available through `with_legacy_message()`.
+
+Current protocol-aligned limits exposed by `sof-tx`:
+
+- `MAX_TRANSACTION_WIRE_BYTES = 1232`
+- `MAX_TRANSACTION_ACCOUNT_LOCKS = 128`
 
 ## SOF Adapter Layer
 
@@ -222,6 +242,56 @@ Direct and hybrid modes include built-in reliability defaults through `SubmitRel
 - `HighReliability`: most direct retrying (`direct_target_rounds=3`, `hybrid_direct_attempts=3`)
 
 Use `TxSubmitClient::with_reliability(...)` for presets, or `with_direct_config(...)` for full control.
+
+## KernelBypass Direct Transport
+
+With `kernel-bypass` enabled, implement `KernelBypassDatagramSocket` for your socket type and wrap it with
+`KernelBypassDirectTransport`.
+
+```rust
+use std::{net::SocketAddr, sync::Arc};
+use async_trait::async_trait;
+use sof_tx::{KernelBypassDatagramSocket, KernelBypassDirectTransport, TxSubmitClient};
+
+struct MyKernelBypassSocket;
+
+#[async_trait]
+impl KernelBypassDatagramSocket for MyKernelBypassSocket {
+    async fn send_to(&self, payload: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+        let _ = (payload, target);
+        Ok(payload.len())
+    }
+}
+
+fn build_client(
+    blockhash_provider: Arc<dyn sof_tx::RecentBlockhashProvider>,
+    leader_provider: Arc<dyn sof_tx::LeaderProvider>,
+) -> TxSubmitClient {
+    let socket = Arc::new(MyKernelBypassSocket);
+    TxSubmitClient::new(blockhash_provider, leader_provider)
+        .with_direct_transport(Arc::new(KernelBypassDirectTransport::new(socket)))
+}
+```
+
+## AF_XDP Demo and E2E
+
+Linux-only AF_XDP demo (runs in an isolated user+network namespace via `unshare -Urn`):
+
+```bash
+cargo run -p sof-tx --example kernel_bypass_af_xdp --features kernel-bypass
+```
+
+Ignored integration test for AF_XDP kernel-bypass direct submit:
+
+```bash
+cargo test -p sof-tx --features kernel-bypass --test kernel_bypass_af_xdp_e2e -- --ignored --nocapture
+```
+
+Requirements:
+
+- `unshare` from util-linux
+- `ip` from iproute2
+- Linux kernel with AF_XDP support
 
 ## Feature Model
 

@@ -17,6 +17,10 @@ impl Plugin for NonVoteTxLoggerPlugin {
         "non-vote-tx-logger"
     }
 
+    fn wants_transaction(&self) -> bool {
+        true
+    }
+
     async fn on_transaction(&self, event: TransactionEvent) {
         if event.kind == TxKind::VoteOnly {
             return;
@@ -43,6 +47,10 @@ struct DatasetLoggerPlugin;
 impl Plugin for DatasetLoggerPlugin {
     fn name(&self) -> &'static str {
         "dataset-logger"
+    }
+
+    fn wants_dataset(&self) -> bool {
+        true
     }
 
     async fn on_dataset(&self, event: DatasetEvent) {

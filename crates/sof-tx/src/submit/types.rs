@@ -67,8 +67,28 @@ pub struct DirectSubmitConfig {
     pub global_timeout: Duration,
     /// Number of rounds to iterate across selected direct targets.
     pub direct_target_rounds: usize,
+    /// Number of direct-only submit attempts (target selection can refresh per attempt).
+    pub direct_submit_attempts: usize,
     /// Number of direct submit attempts in `Hybrid` mode before RPC fallback.
     pub hybrid_direct_attempts: usize,
+    /// Delay between direct rebroadcast attempts/rounds (Agave-like pacing).
+    pub rebroadcast_interval: Duration,
+    /// Enables Agave-style post-ack rebroadcast persistence for direct submits.
+    pub agave_rebroadcast_enabled: bool,
+    /// Maximum time budget for background rebroadcast persistence.
+    pub agave_rebroadcast_window: Duration,
+    /// Delay between background rebroadcast cycles.
+    pub agave_rebroadcast_interval: Duration,
+    /// When true, `Hybrid` mode broadcasts to RPC even after direct send succeeds.
+    pub hybrid_rpc_broadcast: bool,
+    /// Enables latency-aware ordering of direct targets before submit.
+    pub latency_aware_targeting: bool,
+    /// Timeout used for per-target TCP latency probes.
+    pub latency_probe_timeout: Duration,
+    /// Optional extra TCP port to probe (in addition to target TPU port).
+    pub latency_probe_port: Option<u16>,
+    /// Max number of targets to probe per submission.
+    pub latency_probe_max_targets: usize,
 }
 
 impl DirectSubmitConfig {
@@ -78,21 +98,51 @@ impl DirectSubmitConfig {
         match reliability {
             SubmitReliability::LowLatency => Self {
                 per_target_timeout: Duration::from_millis(200),
-                global_timeout: Duration::from_millis(700),
-                direct_target_rounds: 1,
-                hybrid_direct_attempts: 1,
+                global_timeout: Duration::from_millis(1_200),
+                direct_target_rounds: 3,
+                direct_submit_attempts: 3,
+                hybrid_direct_attempts: 2,
+                rebroadcast_interval: Duration::from_millis(90),
+                agave_rebroadcast_enabled: true,
+                agave_rebroadcast_window: Duration::from_secs(30),
+                agave_rebroadcast_interval: Duration::from_millis(700),
+                hybrid_rpc_broadcast: false,
+                latency_aware_targeting: true,
+                latency_probe_timeout: Duration::from_millis(80),
+                latency_probe_port: Some(8899),
+                latency_probe_max_targets: 128,
             },
             SubmitReliability::Balanced => Self {
                 per_target_timeout: Duration::from_millis(300),
-                global_timeout: Duration::from_millis(1_200),
-                direct_target_rounds: 2,
-                hybrid_direct_attempts: 2,
+                global_timeout: Duration::from_millis(1_800),
+                direct_target_rounds: 4,
+                direct_submit_attempts: 4,
+                hybrid_direct_attempts: 3,
+                rebroadcast_interval: Duration::from_millis(110),
+                agave_rebroadcast_enabled: true,
+                agave_rebroadcast_window: Duration::from_secs(45),
+                agave_rebroadcast_interval: Duration::from_millis(800),
+                hybrid_rpc_broadcast: true,
+                latency_aware_targeting: true,
+                latency_probe_timeout: Duration::from_millis(120),
+                latency_probe_port: Some(8899),
+                latency_probe_max_targets: 128,
             },
             SubmitReliability::HighReliability => Self {
                 per_target_timeout: Duration::from_millis(450),
-                global_timeout: Duration::from_millis(2_200),
-                direct_target_rounds: 3,
-                hybrid_direct_attempts: 3,
+                global_timeout: Duration::from_millis(3_200),
+                direct_target_rounds: 6,
+                direct_submit_attempts: 5,
+                hybrid_direct_attempts: 4,
+                rebroadcast_interval: Duration::from_millis(140),
+                agave_rebroadcast_enabled: true,
+                agave_rebroadcast_window: Duration::from_secs(70),
+                agave_rebroadcast_interval: Duration::from_millis(900),
+                hybrid_rpc_broadcast: true,
+                latency_aware_targeting: true,
+                latency_probe_timeout: Duration::from_millis(160),
+                latency_probe_port: Some(8899),
+                latency_probe_max_targets: 128,
             },
         }
     }
@@ -105,16 +155,46 @@ impl DirectSubmitConfig {
         } else {
             self.direct_target_rounds
         };
+        let direct_submit_attempts = if self.direct_submit_attempts == 0 {
+            1
+        } else {
+            self.direct_submit_attempts
+        };
         let hybrid_direct_attempts = if self.hybrid_direct_attempts == 0 {
             1
         } else {
             self.hybrid_direct_attempts
         };
+        let latency_probe_max_targets = if self.latency_probe_max_targets == 0 {
+            1
+        } else {
+            self.latency_probe_max_targets
+        };
+        let rebroadcast_interval = if self.rebroadcast_interval.is_zero() {
+            Duration::from_millis(1)
+        } else {
+            self.rebroadcast_interval
+        };
+        let agave_rebroadcast_interval = if self.agave_rebroadcast_interval.is_zero() {
+            Duration::from_millis(1)
+        } else {
+            self.agave_rebroadcast_interval
+        };
         Self {
             per_target_timeout: self.per_target_timeout,
             global_timeout: self.global_timeout,
             direct_target_rounds,
+            direct_submit_attempts,
             hybrid_direct_attempts,
+            rebroadcast_interval,
+            agave_rebroadcast_enabled: self.agave_rebroadcast_enabled,
+            agave_rebroadcast_window: self.agave_rebroadcast_window,
+            agave_rebroadcast_interval,
+            hybrid_rpc_broadcast: self.hybrid_rpc_broadcast,
+            latency_aware_targeting: self.latency_aware_targeting,
+            latency_probe_timeout: self.latency_probe_timeout,
+            latency_probe_port: self.latency_probe_port,
+            latency_probe_max_targets,
         }
     }
 }
@@ -205,6 +285,10 @@ pub struct SubmitResult {
     pub rpc_signature: Option<String>,
     /// True when RPC fallback was used from hybrid mode.
     pub used_rpc_fallback: bool,
+    /// Number of direct targets selected for submit attempt that succeeded.
+    pub selected_target_count: usize,
+    /// Number of unique validator identities in selected direct targets.
+    pub selected_identity_count: usize,
 }
 
 /// RPC transport interface.

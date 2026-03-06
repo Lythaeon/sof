@@ -1,10 +1,12 @@
 //! High-level transaction builder APIs.
 
 use solana_compute_budget_interface::ComputeBudgetInstruction;
-use solana_message::{Hash, Instruction, Message, VersionedMessage};
+use solana_message::{Hash, Instruction, Message, VersionedMessage, v0};
+use solana_packet::PACKET_DATA_SIZE;
 use solana_pubkey::Pubkey;
 use solana_signer::{SignerError, signers::Signers};
 use solana_system_interface::instruction as system_instruction;
+use solana_transaction::sanitized::MAX_TX_ACCOUNT_LOCKS as SOLANA_MAX_TX_ACCOUNT_LOCKS;
 use solana_transaction::versioned::VersionedTransaction;
 use thiserror::Error;
 
@@ -14,6 +16,22 @@ pub const DEFAULT_DEVELOPER_TIP_LAMPORTS: u64 = 5_000;
 /// Default developer tip recipient used by [`TxBuilder::tip_developer`].
 pub const DEFAULT_DEVELOPER_TIP_RECIPIENT: Pubkey =
     Pubkey::from_str_const("G3WHMVjx7Cb3MFhBAHe52zw8yhbHodWnas5gYLceaqze");
+
+/// Current maximum serialized transaction payload size accepted by Solana networking.
+pub const MAX_TRANSACTION_WIRE_BYTES: usize = PACKET_DATA_SIZE;
+
+/// Current maximum number of account locks allowed per transaction.
+pub const MAX_TRANSACTION_ACCOUNT_LOCKS: usize = SOLANA_MAX_TX_ACCOUNT_LOCKS;
+
+/// Transaction message version emitted by [`TxBuilder`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TxMessageVersion {
+    /// Legacy message encoding.
+    Legacy,
+    /// Version 0 message encoding.
+    #[default]
+    V0,
+}
 
 /// Builder-layer errors.
 #[derive(Debug, Error)]
@@ -54,7 +72,7 @@ impl UnsignedTx {
     }
 }
 
-/// High-level builder for legacy-versioned transaction messages.
+/// High-level builder for Solana versioned transaction messages.
 #[derive(Debug, Clone)]
 pub struct TxBuilder {
     /// Fee payer and signer.
@@ -69,6 +87,8 @@ pub struct TxBuilder {
     developer_tip_lamports: Option<u64>,
     /// Tip recipient used when tip is enabled.
     developer_tip_recipient: Pubkey,
+    /// Message version emitted by the builder.
+    message_version: TxMessageVersion,
 }
 
 impl TxBuilder {
@@ -82,6 +102,7 @@ impl TxBuilder {
             priority_fee_micro_lamports: None,
             developer_tip_lamports: None,
             developer_tip_recipient: DEFAULT_DEVELOPER_TIP_RECIPIENT,
+            message_version: TxMessageVersion::V0,
         }
     }
 
@@ -138,6 +159,25 @@ impl TxBuilder {
         self
     }
 
+    /// Sets the message version emitted by the builder.
+    #[must_use]
+    pub const fn with_message_version(mut self, version: TxMessageVersion) -> Self {
+        self.message_version = version;
+        self
+    }
+
+    /// Forces legacy message output.
+    #[must_use]
+    pub const fn with_legacy_message(self) -> Self {
+        self.with_message_version(TxMessageVersion::Legacy)
+    }
+
+    /// Forces version 0 message output.
+    #[must_use]
+    pub const fn with_v0_message(self) -> Self {
+        self.with_message_version(TxMessageVersion::V0)
+    }
+
     /// Builds an unsigned transaction wrapper.
     #[must_use]
     pub fn build_unsigned(self, recent_blockhash: [u8; 32]) -> UnsignedTx {
@@ -162,7 +202,7 @@ impl TxBuilder {
         self.build_unsigned(recent_blockhash).sign(signers)
     }
 
-    /// Builds a legacy message wrapped as a versioned message.
+    /// Builds a message wrapped as a versioned message.
     #[must_use]
     pub fn build_message(self, recent_blockhash: [u8; 32]) -> VersionedMessage {
         let mut instructions = Vec::new();
@@ -183,8 +223,18 @@ impl TxBuilder {
             ));
         }
         let blockhash = Hash::new_from_array(recent_blockhash);
-        let message = Message::new_with_blockhash(&instructions, Some(&self.payer), &blockhash);
-        VersionedMessage::Legacy(message)
+        let legacy_message =
+            Message::new_with_blockhash(&instructions, Some(&self.payer), &blockhash);
+        match self.message_version {
+            TxMessageVersion::Legacy => VersionedMessage::Legacy(legacy_message),
+            TxMessageVersion::V0 => VersionedMessage::V0(v0::Message {
+                header: legacy_message.header,
+                account_keys: legacy_message.account_keys,
+                recent_blockhash: legacy_message.recent_blockhash,
+                instructions: legacy_message.instructions,
+                address_table_lookups: Vec::new(),
+            }),
+        }
     }
 }
 
@@ -205,6 +255,7 @@ mod tests {
         let keys = message.static_account_keys();
         let instructions = message.instructions();
         assert_eq!(instructions.len(), 1);
+        assert!(matches!(message, VersionedMessage::V0(_)));
 
         let first = instructions.first();
         assert!(first.is_some());
@@ -230,6 +281,7 @@ mod tests {
 
         let instructions = message.instructions();
         assert_eq!(instructions.len(), 3);
+        assert!(matches!(message, VersionedMessage::V0(_)));
         let first = instructions.first();
         assert!(first.is_some());
         if let Some(first) = first {
@@ -259,5 +311,23 @@ mod tests {
                 assert_ne!(*first, solana_signature::Signature::default());
             }
         }
+    }
+
+    #[test]
+    fn legacy_message_override_builds_legacy_message() {
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let message = TxBuilder::new(payer.pubkey())
+            .with_legacy_message()
+            .add_instruction(system_instruction::transfer(&payer.pubkey(), &recipient, 1))
+            .build_message([4_u8; 32]);
+
+        assert!(matches!(message, VersionedMessage::Legacy(_)));
+    }
+
+    #[test]
+    fn exported_limit_constants_match_runtime_constants() {
+        assert_eq!(MAX_TRANSACTION_WIRE_BYTES, PACKET_DATA_SIZE);
+        assert_eq!(MAX_TRANSACTION_ACCOUNT_LOCKS, SOLANA_MAX_TX_ACCOUNT_LOCKS);
     }
 }

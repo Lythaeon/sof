@@ -32,7 +32,7 @@ custom logic without forking the runtime.
 
 ## Hook Semantics
 
-Current hook count: `9` (must stay in sync with `sof::framework::ObserverPlugin`).
+Current hook count: `10` (must stay in sync with `sof::framework::ObserverPlugin`).
 
 Callbacks are invoked in this order as data flows through runtime:
 
@@ -40,11 +40,12 @@ Callbacks are invoked in this order as data flows through runtime:
 2. `on_shred`
 3. `on_dataset`
 4. `on_transaction`
-5. `on_slot_status`
-6. `on_reorg`
-7. `on_recent_blockhash`
-8. `on_cluster_topology` (near-real-time, gossip-bootstrap only)
-9. `on_leader_schedule` (event-driven, gossip-bootstrap only)
+5. `on_account_touch`
+6. `on_slot_status`
+7. `on_reorg`
+8. `on_recent_blockhash`
+9. `on_cluster_topology` (near-real-time, gossip-bootstrap only)
+10. `on_leader_schedule` (event-driven, gossip-bootstrap only)
 
 Detailed behavior:
 
@@ -62,6 +63,11 @@ Detailed behavior:
   - Includes slot, optional signature, tx payload, SOF `TxKind`, plus commitment tagging:
     `commitment_status`, `confirmed_slot`, and `finalized_slot`.
   - Commitment tagging is derived from local shred-stream slot depth progression (no RPC dependency).
+- `on_account_touch`:
+  - Fires for each decoded transaction alongside `on_transaction`.
+  - Includes slot/signature/commitment tagging plus static account-key sets:
+    all static account keys, writable static keys, readonly static keys, and lookup-table account pubkeys.
+  - This is a transaction-derived discovery hook, not a validator-grade post-write `update_account` stream.
 - `on_slot_status`:
   - Fires when local slot classification changes (`processed` / `confirmed` / `finalized` / `orphaned`).
   - Includes per-slot parent linkage when known and current canonical tip/commitment watermarks.

@@ -20,6 +20,12 @@ Optional gossip bootstrap support at compile time:
 sof = { version = "0.5.0", features = ["gossip-bootstrap"] }
 ```
 
+Optional external `kernel-bypass` ingress support:
+
+```toml
+sof = { version = "0.5.0", features = ["kernel-bypass"] }
+```
+
 ## Quick Start
 
 Run the bundled runtime example:
@@ -59,6 +65,54 @@ async fn main() -> Result<(), sof::runtime::RuntimeError> {
 }
 ```
 
+With external `kernel-bypass` ingress, feed `RawPacketBatch` values through SOF's ingress queue:
+
+```rust
+#[tokio::main]
+async fn main() -> Result<(), sof::runtime::RuntimeError> {
+    let (tx, rx) = sof::runtime::create_kernel_bypass_ingress_queue();
+    // Publish batches from your bypass receiver thread:
+    // let _ok = tx.send_batch(batch, false);
+    // Spawn your kernel-bypass receiver and forward batches into `tx`.
+    sof::runtime::run_async_with_kernel_bypass_ingress(rx).await
+}
+```
+
+Run the kernel-bypass ingress metrics example for 180 seconds:
+
+```bash
+SOF_KERNEL_BYPASS_EXAMPLE_DURATION_SECS=180 \
+  cargo run --release -p sof --example kernel_bypass_ingress_metrics --features kernel-bypass
+```
+
+Run the same example against live Solana gossip traffic (real chain data):
+
+```bash
+SOF_KERNEL_BYPASS_EXAMPLE_SOURCE=gossip \
+SOF_KERNEL_BYPASS_EXAMPLE_DURATION_SECS=180 \
+RUST_LOG=info \
+  cargo run --release -p sof --example kernel_bypass_ingress_metrics --features "kernel-bypass gossip-bootstrap"
+```
+
+Run AF_XDP external-ingress example (requires Linux, AF_XDP-capable NIC setup, and privileges to create XDP sockets/programs):
+
+```bash
+SOF_AF_XDP_IFACE=enp17s0 \
+SOF_AF_XDP_EXAMPLE_DURATION_SECS=180 \
+  cargo run --release -p sof --example af_xdp_kernel_bypass_ingress_metrics --features "kernel-bypass gossip-bootstrap"
+```
+
+Notes for high-ingest runs:
+
+- The example configures `SOF_PORT_RANGE=12000-12100` and `SOF_GOSSIP_PORT=8001`.
+- It defaults live gossip mode to `SOF_INGEST_QUEUE_MODE=lockfree` with `SOF_INGEST_QUEUE_CAPACITY=262144`.
+- `SOF_UDP_DROP_ON_CHANNEL_FULL` only applies to SOF's built-in UDP receiver path (non-external ingress).
+- Queue mode is configurable with `SOF_INGEST_QUEUE_MODE`:
+  - `bounded` (default): Tokio bounded channel.
+  - `unbounded`: Tokio unbounded channel (no backpressure drops; memory grows with load).
+  - `lockfree`: lock-free `ArrayQueue` ring + async wakeups.
+- Ring/bounded capacity is configurable with `SOF_INGEST_QUEUE_CAPACITY` (default `16384`).
+
 ## Plugin Quickstart
 
 ```rust
@@ -73,6 +127,10 @@ struct NonVoteLogger;
 
 #[async_trait]
 impl Plugin for NonVoteLogger {
+    fn wants_transaction(&self) -> bool {
+        true
+    }
+
     async fn on_transaction(&self, event: TransactionEvent) {
         if event.kind == TxKind::VoteOnly {
             return;
@@ -134,6 +192,7 @@ Current hook set:
 - `on_shred`
 - `on_dataset`
 - `on_transaction`
+- `on_account_touch`
 - `on_slot_status`
 - `on_reorg`
 - `on_recent_blockhash`
@@ -147,6 +206,15 @@ Current hook set:
 - `finalized_slot`
 
 These commitment fields are derived from local shred-stream slot progress (depth-based), not RPC polling.
+
+`on_account_touch` events include transaction-derived static account-key sets:
+
+- `account_keys`
+- `writable_account_keys`
+- `readonly_account_keys`
+- `lookup_table_account_keys`
+
+This hook is for account discovery/invalidation. It is not a validator post-write account-update feed.
 
 `on_slot_status` events include local canonical transitions:
 
@@ -178,6 +246,13 @@ These commitment fields are derived from local shred-stream slot progress (depth
 - `runtime_extension_shared_stream`
 - `runtime_extension_with_plugins`
 - `runtime_extension_websocket_connector`
+- `kernel_bypass_ingress_metrics` (`--features kernel-bypass`)
+
+Run kernel-bypass ingress E2E test:
+
+```bash
+cargo test -p sof --features kernel-bypass --test kernel_bypass_ingress_e2e -- --nocapture
+```
 
 Run any example:
 

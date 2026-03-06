@@ -1,4 +1,5 @@
 use super::*;
+use crate::framework::AccountTouchEvent;
 
 pub(super) struct DatasetProcessInput {
     pub(super) slot: u64,
@@ -67,8 +68,47 @@ pub(super) fn process_completed_dataset(
             }
             let kind = classify_tx_kind(&tx);
             let signature = tx.signatures.first().cloned();
+            let account_touch_event = plugin_hooks_enabled.then(|| AccountTouchEvent {
+                slot,
+                commitment_status,
+                confirmed_slot: commitment_snapshot.confirmed_slot,
+                finalized_slot: commitment_snapshot.finalized_slot,
+                signature,
+                account_keys: Arc::new(tx.message.static_account_keys().to_vec()),
+                writable_account_keys: Arc::new(
+                    tx.message
+                        .static_account_keys()
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, key)| {
+                            tx.message.is_maybe_writable(index, None).then_some(*key)
+                        })
+                        .collect(),
+                ),
+                readonly_account_keys: Arc::new(
+                    tx.message
+                        .static_account_keys()
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, key)| {
+                            (!tx.message.is_maybe_writable(index, None)).then_some(*key)
+                        })
+                        .collect(),
+                ),
+                lookup_table_account_keys: Arc::new(
+                    tx.message
+                        .address_table_lookups()
+                        .unwrap_or(&[])
+                        .iter()
+                        .map(|lookup| lookup.account_key)
+                        .collect(),
+                ),
+            });
             tx_count = tx_count.saturating_add(1);
             if plugin_hooks_enabled {
+                if let Some(event) = account_touch_event {
+                    context.plugin_host.on_account_touch(event);
+                }
                 context.plugin_host.on_transaction(TransactionEvent {
                     slot,
                     commitment_status,

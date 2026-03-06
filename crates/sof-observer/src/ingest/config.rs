@@ -70,6 +70,10 @@ pub(super) fn read_udp_idle_wait_ms() -> u64 {
         .unwrap_or(100)
 }
 
+pub(super) fn read_udp_drop_on_channel_full() -> bool {
+    read_bool_env("SOF_UDP_DROP_ON_CHANNEL_FULL", true)
+}
+
 fn read_udp_track_rxq_ovfl() -> bool {
     read_bool_env("SOF_UDP_TRACK_RXQ_OVFL", false)
 }

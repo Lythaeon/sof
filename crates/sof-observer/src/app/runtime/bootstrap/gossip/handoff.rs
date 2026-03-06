@@ -305,7 +305,7 @@ pub(super) enum GossipBootstrapGuardError {
 #[cfg(feature = "gossip-bootstrap")]
 async fn start_gossip_bootstrapped_receiver(
     entrypoint: &str,
-    tx: mpsc::Sender<RawPacketBatch>,
+    tx: ingest::RawPacketBatchSender,
     gossip_identity: Arc<Keypair>,
     port_range_override: Option<PortRange>,
 ) -> Result<GossipBootstrapRuntime, GossipBootstrapStartError> {
@@ -498,7 +498,7 @@ async fn start_gossip_bootstrapped_receiver(
 #[cfg(feature = "gossip-bootstrap")]
 pub(super) async fn start_gossip_bootstrapped_receiver_guarded(
     entrypoint: &str,
-    tx: mpsc::Sender<RawPacketBatch>,
+    tx: ingest::RawPacketBatchSender,
     gossip_identity: Arc<Keypair>,
     port_range_override: Option<PortRange>,
 ) -> Result<GossipBootstrapRuntime, GossipBootstrapGuardError> {

@@ -13,9 +13,9 @@ pub mod plugin;
 
 pub use crate::event::{ForkSlotStatus, TxCommitmentStatus};
 pub use events::{
-    ClusterNodeInfo, ClusterTopologyEvent, ControlPlaneSource, DatasetEvent, LeaderScheduleEntry,
-    LeaderScheduleEvent, ObservedRecentBlockhashEvent, RawPacketEvent, ReorgEvent, ShredEvent,
-    SlotStatusEvent, TransactionEvent,
+    AccountTouchEvent, ClusterNodeInfo, ClusterTopologyEvent, ControlPlaneSource, DatasetEvent,
+    LeaderScheduleEntry, LeaderScheduleEvent, ObservedRecentBlockhashEvent, RawPacketEvent,
+    ReorgEvent, ShredEvent, SlotStatusEvent, TransactionEvent,
 };
 pub use extension::{
     ExtensionCapability, ExtensionManifest, ExtensionResourceSpec, ExtensionShutdownContext,

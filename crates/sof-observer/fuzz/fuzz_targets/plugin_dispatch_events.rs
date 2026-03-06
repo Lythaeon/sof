@@ -116,6 +116,26 @@ fn read_nodes(input: &mut &[u8], max: usize) -> Vec<ClusterNodeInfo> {
         } else {
             None
         };
+        let tpu_quic = if take_u8(input).unwrap_or(0) & 1 == 1 {
+            take_socket_addr(input)
+        } else {
+            None
+        };
+        let tpu_forwards = if take_u8(input).unwrap_or(0) & 1 == 1 {
+            take_socket_addr(input)
+        } else {
+            None
+        };
+        let tpu_forwards_quic = if take_u8(input).unwrap_or(0) & 1 == 1 {
+            take_socket_addr(input)
+        } else {
+            None
+        };
+        let tpu_vote = if take_u8(input).unwrap_or(0) & 1 == 1 {
+            take_socket_addr(input)
+        } else {
+            None
+        };
         let tvu = if take_u8(input).unwrap_or(0) & 1 == 1 {
             take_socket_addr(input)
         } else {
@@ -132,6 +152,10 @@ fn read_nodes(input: &mut &[u8], max: usize) -> Vec<ClusterNodeInfo> {
             shred_version,
             gossip,
             tpu,
+            tpu_quic,
+            tpu_forwards,
+            tpu_forwards_quic,
+            tpu_vote,
             tvu,
             rpc,
         });

@@ -19,8 +19,9 @@ pub(crate) enum ReceiverBootstrapError {
 }
 
 pub(crate) async fn start_receiver(
-    tx: mpsc::Sender<RawPacketBatch>,
+    tx: ingest::RawPacketBatchSender,
     tx_event_rx: mpsc::Receiver<TxObservedEvent>,
+    #[cfg(feature = "kernel-bypass")] _control_plane_only_bootstrap: bool,
 ) -> Result<ReceiverRuntime, ReceiverBootstrapError> {
     let log_startup_steps = read_log_startup_steps();
     let mut static_receiver_handles = Vec::new();
@@ -88,7 +89,21 @@ pub(crate) async fn start_receiver(
                 Duration::from_millis(read_gossip_runtime_switch_stabilize_ms());
             let bootstrap_stabilize_max_wait =
                 Duration::from_millis(read_gossip_bootstrap_stabilize_max_wait_ms());
-            let bootstrap_stabilize_min_peers = read_gossip_bootstrap_stabilize_min_peers();
+            let bootstrap_stabilize_min_peers = {
+                let configured = read_gossip_bootstrap_stabilize_min_peers();
+                #[cfg(feature = "kernel-bypass")]
+                {
+                    if _control_plane_only_bootstrap {
+                        1
+                    } else {
+                        configured
+                    }
+                }
+                #[cfg(not(feature = "kernel-bypass"))]
+                {
+                    configured
+                }
+            };
             for (attempt, entrypoint) in prioritized_entrypoints.iter().enumerate() {
                 if log_startup_steps {
                     tracing::info!(
@@ -142,6 +157,25 @@ pub(crate) async fn start_receiver(
                             continue;
                         }
                         if !stabilization.stabilized && stabilized_by_peers {
+                            #[cfg(feature = "kernel-bypass")]
+                            if _control_plane_only_bootstrap {
+                                tracing::info!(
+                                    entrypoint = %entrypoint,
+                                    packets_seen = stabilization.packets_seen,
+                                    peers_discovered = discovered_peers,
+                                    min_peers = bootstrap_stabilize_min_peers,
+                                    "accepting gossip bootstrap runtime via peer discovery for external kernel-bypass ingress"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    entrypoint = %entrypoint,
+                                    packets_seen = stabilization.packets_seen,
+                                    peers_discovered = discovered_peers,
+                                    min_peers = bootstrap_stabilize_min_peers,
+                                    "accepting gossip bootstrap runtime via peer discovery despite low packet flow"
+                                );
+                            }
+                            #[cfg(not(feature = "kernel-bypass"))]
                             tracing::warn!(
                                 entrypoint = %entrypoint,
                                 packets_seen = stabilization.packets_seen,
@@ -226,4 +260,13 @@ pub(crate) async fn start_receiver(
         repair_client,
         tx_event_rx,
     })
+}
+
+#[cfg(feature = "kernel-bypass")]
+#[must_use]
+#[allow(clippy::missing_const_for_fn)]
+pub(crate) fn start_external_receiver(
+    tx_event_rx: mpsc::Receiver<TxObservedEvent>,
+) -> ReceiverRuntime {
+    ReceiverRuntime::external(tx_event_rx)
 }

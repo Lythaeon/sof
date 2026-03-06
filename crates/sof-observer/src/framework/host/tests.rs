@@ -52,6 +52,10 @@ impl ObserverPlugin for PanicPlugin {
         "panic-plugin"
     }
 
+    fn wants_dataset(&self) -> bool {
+        true
+    }
+
     async fn on_dataset(&self, _event: DatasetEvent) {
         panic!("panic-plugin failed");
     }
@@ -66,6 +70,10 @@ struct CounterPlugin {
 impl ObserverPlugin for CounterPlugin {
     fn name(&self) -> &'static str {
         "counter-plugin"
+    }
+
+    fn wants_dataset(&self) -> bool {
+        true
     }
 
     async fn on_dataset(&self, _event: DatasetEvent) {
@@ -84,6 +92,10 @@ impl ObserverPlugin for RecentBlockhashCounterPlugin {
         "recent-blockhash-counter-plugin"
     }
 
+    fn wants_recent_blockhash(&self) -> bool {
+        true
+    }
+
     async fn on_recent_blockhash(&self, _event: ObservedRecentBlockhashEvent) {
         self.counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -99,6 +111,14 @@ struct ForkHookCounterPlugin {
 impl ObserverPlugin for ForkHookCounterPlugin {
     fn name(&self) -> &'static str {
         "fork-hook-counter-plugin"
+    }
+
+    fn wants_slot_status(&self) -> bool {
+        true
+    }
+
+    fn wants_reorg(&self) -> bool {
+        true
     }
 
     async fn on_slot_status(&self, _event: SlotStatusEvent) {

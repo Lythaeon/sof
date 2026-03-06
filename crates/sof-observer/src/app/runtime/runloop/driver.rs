@@ -14,7 +14,6 @@ pub(in crate::app::runtime) enum RuntimeRunloopError {
 }
 
 // Runtime coordination defaults kept local to the runloop for operational clarity.
-const RAW_PACKET_CHANNEL_CAPACITY: usize = 16_384;
 const TX_EVENT_CHANNEL_CAPACITY: usize = 65_536;
 const TELEMETRY_INTERVAL_SECS: u64 = 5;
 const TURBINE_PRIMARY_SOURCE_PORT: u16 = 8_899;
@@ -31,13 +30,61 @@ pub(in crate::app::runtime) async fn run_async_with_hosts(
     plugin_host: PluginHost,
     extension_host: RuntimeExtensionHost,
 ) -> Result<(), RuntimeRunloopError> {
+    run_async_with_hosts_inner(
+        plugin_host,
+        extension_host,
+        #[cfg(feature = "kernel-bypass")]
+        None,
+    )
+    .await
+}
+
+#[cfg(feature = "kernel-bypass")]
+pub(in crate::app::runtime) async fn run_async_with_hosts_and_kernel_bypass_ingress(
+    plugin_host: PluginHost,
+    extension_host: RuntimeExtensionHost,
+    packet_ingest_rx: ingest::RawPacketBatchReceiver,
+) -> Result<(), RuntimeRunloopError> {
+    run_async_with_hosts_inner(plugin_host, extension_host, Some(packet_ingest_rx)).await
+}
+
+async fn run_async_with_hosts_inner(
+    plugin_host: PluginHost,
+    extension_host: RuntimeExtensionHost,
+    #[cfg(feature = "kernel-bypass")] mut kernel_bypass_packet_ingest_rx: Option<
+        ingest::RawPacketBatchReceiver,
+    >,
+) -> Result<(), RuntimeRunloopError> {
     init_tracing();
     let log_startup_steps = read_log_startup_steps();
     if log_startup_steps {
         tracing::info!(step = "runtime_init", "SOF runtime starting");
     }
 
-    let (tx, mut rx) = mpsc::channel::<RawPacketBatch>(RAW_PACKET_CHANNEL_CAPACITY);
+    let (tx, default_rx) = ingest::create_raw_packet_batch_queue();
+    #[cfg(feature = "kernel-bypass")]
+    let kernel_bypass_ingress_enabled = kernel_bypass_packet_ingest_rx.is_some();
+    #[cfg(all(feature = "kernel-bypass", feature = "gossip-bootstrap"))]
+    let kernel_bypass_gossip_control_plane_enabled = kernel_bypass_ingress_enabled
+        && crate::runtime_env::read_env_var("SOF_GOSSIP_ENTRYPOINT").is_some();
+    #[cfg(all(feature = "kernel-bypass", not(feature = "gossip-bootstrap")))]
+    let kernel_bypass_gossip_control_plane_enabled = false;
+    #[cfg(feature = "kernel-bypass")]
+    let mut kernel_bypass_internal_ingest_drain_task: Option<JoinHandle<()>> = None;
+    #[cfg(feature = "kernel-bypass")]
+    let mut rx = if let Some(packet_ingest_rx) = kernel_bypass_packet_ingest_rx.take() {
+        if kernel_bypass_gossip_control_plane_enabled {
+            let mut ignored_internal_rx = default_rx;
+            kernel_bypass_internal_ingest_drain_task = Some(tokio::spawn(async move {
+                while ignored_internal_rx.recv().await.is_some() {}
+            }));
+        }
+        packet_ingest_rx
+    } else {
+        default_rx
+    };
+    #[cfg(not(feature = "kernel-bypass"))]
+    let mut rx = default_rx;
     #[cfg(feature = "gossip-bootstrap")]
     let packet_ingest_tx = tx.clone();
     let (tx_event_tx, tx_event_rx) = mpsc::channel::<TxObservedEvent>(TX_EVENT_CHANNEL_CAPACITY);
@@ -115,7 +162,14 @@ pub(in crate::app::runtime) async fn run_async_with_hosts(
             Duration::from_millis(relay_cache_window_ms),
         ))
     });
-    #[cfg(feature = "gossip-bootstrap")]
+    #[cfg(all(feature = "gossip-bootstrap", feature = "kernel-bypass"))]
+    let udp_relay_enabled =
+        if kernel_bypass_ingress_enabled && !kernel_bypass_gossip_control_plane_enabled {
+            false
+        } else {
+            read_udp_relay_enabled()
+        };
+    #[cfg(all(feature = "gossip-bootstrap", not(feature = "kernel-bypass")))]
     let udp_relay_enabled = read_udp_relay_enabled();
     #[cfg(not(feature = "gossip-bootstrap"))]
     let udp_relay_enabled = false;
@@ -157,6 +211,30 @@ pub(in crate::app::runtime) async fn run_async_with_hosts(
             "starting receiver bootstrap"
         );
     }
+    #[cfg(feature = "kernel-bypass")]
+    if kernel_bypass_ingress_enabled {
+        if kernel_bypass_gossip_control_plane_enabled {
+            tracing::info!(
+                "kernel-bypass ingress enabled; keeping gossip control-plane bootstrap active"
+            );
+        } else {
+            tracing::info!("kernel-bypass ingress enabled; SOF UDP receiver bootstrap is bypassed");
+        }
+    }
+    #[cfg(feature = "kernel-bypass")]
+    let mut runtime =
+        if kernel_bypass_ingress_enabled && !kernel_bypass_gossip_control_plane_enabled {
+            start_external_receiver(tx_event_rx)
+        } else {
+            start_receiver(
+                tx,
+                tx_event_rx,
+                kernel_bypass_ingress_enabled && kernel_bypass_gossip_control_plane_enabled,
+            )
+            .await
+            .map_err(|source| RuntimeRunloopError::ReceiverBootstrap { source })?
+        };
+    #[cfg(not(feature = "kernel-bypass"))]
     let mut runtime = start_receiver(tx, tx_event_rx)
         .await
         .map_err(|source| RuntimeRunloopError::ReceiverBootstrap { source })?;
@@ -204,7 +282,14 @@ pub(in crate::app::runtime) async fn run_async_with_hosts(
         "shred verification configuration"
     );
 
-    #[cfg(feature = "gossip-bootstrap")]
+    #[cfg(all(feature = "gossip-bootstrap", feature = "kernel-bypass"))]
+    let repair_enabled_configured =
+        if kernel_bypass_ingress_enabled && !kernel_bypass_gossip_control_plane_enabled {
+            false
+        } else {
+            read_repair_enabled()
+        };
+    #[cfg(all(feature = "gossip-bootstrap", not(feature = "kernel-bypass")))]
     let repair_enabled_configured = read_repair_enabled();
     #[cfg(feature = "gossip-bootstrap")]
     if !live_shreds_enabled && repair_enabled_configured {
@@ -2173,6 +2258,12 @@ pub(in crate::app::runtime) async fn run_async_with_hosts(
         extension_host.shutdown().await;
     }
     drop(runtime);
+    #[cfg(feature = "kernel-bypass")]
+    if let Some(drain_task) = kernel_bypass_internal_ingest_drain_task.take()
+        && drain_task.await.is_err()
+    {
+        // Internal drain task was already cancelled by runtime teardown.
+    }
     Ok(())
 }
 

@@ -126,6 +126,18 @@ impl PluginHostBuilder {
     #[must_use]
     pub fn build(self) -> PluginHost {
         let plugins: Arc<[Arc<dyn ObserverPlugin>]> = Arc::from(self.plugins);
+        let subscriptions = PluginHookSubscriptions {
+            raw_packet: plugins.iter().any(|plugin| plugin.wants_raw_packet()),
+            shred: plugins.iter().any(|plugin| plugin.wants_shred()),
+            dataset: plugins.iter().any(|plugin| plugin.wants_dataset()),
+            transaction: plugins.iter().any(|plugin| plugin.wants_transaction()),
+            account_touch: plugins.iter().any(|plugin| plugin.wants_account_touch()),
+            slot_status: plugins.iter().any(|plugin| plugin.wants_slot_status()),
+            reorg: plugins.iter().any(|plugin| plugin.wants_reorg()),
+            recent_blockhash: plugins.iter().any(|plugin| plugin.wants_recent_blockhash()),
+            cluster_topology: plugins.iter().any(|plugin| plugin.wants_cluster_topology()),
+            leader_schedule: plugins.iter().any(|plugin| plugin.wants_leader_schedule()),
+        };
         let dispatcher = PluginDispatcher::new(
             plugins.clone(),
             self.event_queue_capacity,
@@ -134,6 +146,7 @@ impl PluginHostBuilder {
         PluginHost {
             plugins,
             dispatcher,
+            subscriptions,
             latest_observed_recent_blockhash: Arc::new(RwLock::new(None)),
             latest_observed_tpu_leader: Arc::new(RwLock::new(None)),
         }

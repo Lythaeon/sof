@@ -29,6 +29,18 @@ impl Plugin for NonVoteTxLoggerPlugin {
         "non-vote-tx-logger"
     }
 
+    fn wants_dataset(&self) -> bool {
+        true
+    }
+
+    fn wants_shred(&self) -> bool {
+        true
+    }
+
+    fn wants_transaction(&self) -> bool {
+        true
+    }
+
     async fn on_dataset(&self, event: DatasetEvent) {
         let seen = DATASET_COUNT
             .fetch_add(1, Ordering::Relaxed)
