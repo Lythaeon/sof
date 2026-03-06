@@ -30,6 +30,18 @@ custom logic without forking the runtime.
   - `PluginHost::latest_observed_recent_blockhash`
   - `PluginHost::latest_observed_tpu_leader`
 
+## Subscription Model
+
+Hooks are opt-in.
+
+Implementing `on_*` is not enough by itself. Plugins must also return `true` from the
+matching `wants_*` method or the host will skip queueing that hook entirely.
+
+`on_transaction` has an additional synchronous prefilter:
+
+- `wants_transaction()` enables transaction hook delivery at all
+- `accepts_transaction(&event)` allows cheap hot-path rejection before queueing
+
 ## Hook Semantics
 
 Current hook count: `10` (must stay in sync with `sof::framework::ObserverPlugin`).
@@ -86,6 +98,37 @@ Detailed behavior:
   - No polling loop is used for leader emission.
   - Requires live shred processing (`SOF_LIVE_SHREDS_ENABLED=true`) and shred verification (`SOF_VERIFY_SHREDS=true`).
   - `snapshot_leaders` remains in the event schema for compatibility and is typically empty.
+
+## Statefulness Guidance
+
+`ObserverPlugin` is still primarily an observational hook system, not a full derived-state
+replication contract.
+
+Current guidance for official/stateful consumers:
+
+- Primarily observational:
+  - `on_raw_packet`
+  - `on_shred`
+  - `on_dataset`
+  - `on_recent_blockhash`
+  - `on_cluster_topology`
+  - `on_leader_schedule`
+- Candidate inputs for replayable derived state, but not yet sufficient alone:
+  - `on_transaction`
+  - `on_account_touch`
+  - `on_slot_status`
+  - `on_reorg`
+
+Important caveat:
+
+- `on_account_touch` is transaction-derived discovery metadata, not a validator-grade
+  post-write account update feed.
+- Stateful systems such as a local bank or geyser-like stream should not treat the current
+  hook surface as an authoritative replay contract without an additional ordering/rollback
+  specification.
+
+See ADR-0009 for the proposed direction on official derived-state extensions and replay
+contracts.
 
 ## Host Construction
 

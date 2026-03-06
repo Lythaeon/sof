@@ -32,7 +32,9 @@ User-facing crate docs:
 - ADR-0006: `adr/0006-transaction-sdk-and-dual-submit-routing.md` (Implemented)
 - ADR-0007: `adr/0007-always-on-relay-and-shred-cache-mesh.md` (Implemented)
 - ADR-0008: `adr/0008-runtime-extension-capability-and-filtered-ingress.md` (Implemented)
+- ADR-0009: `adr/0009-derived-state-extensions-and-replay-contracts.md` (Proposed)
 - Framework Hooks: `framework-plugin-hooks.md`
+- Derived-State Extension Contract: `derived-state-extension-contract.md`
 - Runtime Extension Hooks: `runtime-extension-hooks.md`
 - Runtime Bootstrap Modes: `runtime-bootstrap-modes.md`
 - ARD-0001: `ard/0001-project-structure-and-code-goals.md`
