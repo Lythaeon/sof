@@ -26,13 +26,34 @@ const CONTROL_PLANE_EVENT_TICK_MS: u64 = 250;
 #[cfg(feature = "gossip-bootstrap")]
 const CONTROL_PLANE_EVENT_SNAPSHOT_SECS: u64 = 30;
 
+const fn feed_watermarks_from_fork_snapshot(
+    snapshot: crate::app::state::ForkTrackerSnapshot,
+) -> FeedWatermarks {
+    FeedWatermarks {
+        canonical_tip_slot: snapshot.tip_slot,
+        processed_slot: snapshot.tip_slot,
+        confirmed_slot: snapshot.confirmed_slot,
+        finalized_slot: snapshot.finalized_slot,
+    }
+}
+
+fn emit_shutdown_checkpoint_barrier(
+    derived_state_host: &DerivedStateHost,
+    fork_snapshot: crate::app::state::ForkTrackerSnapshot,
+) {
+    derived_state_host
+        .emit_shutdown_checkpoint_barrier(feed_watermarks_from_fork_snapshot(fork_snapshot));
+}
+
 pub(in crate::app::runtime) async fn run_async_with_hosts(
     plugin_host: PluginHost,
     extension_host: RuntimeExtensionHost,
+    derived_state_host: DerivedStateHost,
 ) -> Result<(), RuntimeRunloopError> {
     run_async_with_hosts_inner(
         plugin_host,
         extension_host,
+        derived_state_host,
         #[cfg(feature = "kernel-bypass")]
         None,
     )
@@ -43,14 +64,22 @@ pub(in crate::app::runtime) async fn run_async_with_hosts(
 pub(in crate::app::runtime) async fn run_async_with_hosts_and_kernel_bypass_ingress(
     plugin_host: PluginHost,
     extension_host: RuntimeExtensionHost,
+    derived_state_host: DerivedStateHost,
     packet_ingest_rx: ingest::RawPacketBatchReceiver,
 ) -> Result<(), RuntimeRunloopError> {
-    run_async_with_hosts_inner(plugin_host, extension_host, Some(packet_ingest_rx)).await
+    run_async_with_hosts_inner(
+        plugin_host,
+        extension_host,
+        derived_state_host,
+        Some(packet_ingest_rx),
+    )
+    .await
 }
 
 async fn run_async_with_hosts_inner(
     plugin_host: PluginHost,
     extension_host: RuntimeExtensionHost,
+    derived_state_host: DerivedStateHost,
     #[cfg(feature = "kernel-bypass")] mut kernel_bypass_packet_ingest_rx: Option<
         ingest::RawPacketBatchReceiver,
     >,
@@ -114,6 +143,7 @@ async fn run_async_with_hosts_inner(
         tx_finalized_depth_slots,
     );
     let dataset_worker_shared = DatasetWorkerShared {
+        derived_state_host: derived_state_host.clone(),
         plugin_host: plugin_host.clone(),
         tx_event_tx: tx_event_tx.clone(),
         tx_commitment_tracker: tx_commitment_tracker.clone(),
@@ -138,6 +168,69 @@ async fn run_async_with_hosts_inner(
     let plugin_hooks_enabled = !plugin_host.is_empty();
     if plugin_hooks_enabled {
         tracing::info!(plugins = ?plugin_host.plugin_names(), "observer plugins enabled");
+    }
+    let derived_state_hooks_enabled = !derived_state_host.is_empty();
+    let derived_state_recovery_interval_ms = read_derived_state_recovery_interval_ms();
+    let derived_state_replay_max_envelopes = read_derived_state_replay_max_envelopes();
+    let derived_state_replay_max_sessions = read_derived_state_replay_max_sessions();
+    let derived_state_replay_backend = read_derived_state_replay_backend();
+    let derived_state_replay_dir = read_derived_state_replay_dir();
+    let derived_state_replay_durability = read_derived_state_replay_durability();
+    if derived_state_hooks_enabled {
+        if derived_state_replay_max_envelopes > 0 {
+            let configured_backend = derived_state_replay_backend.to_ascii_lowercase();
+            let configured_durability = match derived_state_replay_durability
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "fsync" => DerivedStateReplayDurability::Fsync,
+                _ => DerivedStateReplayDurability::Flush,
+            };
+            let runtime_replay_source: Arc<dyn crate::framework::DerivedStateReplaySource> =
+                match configured_backend.as_str() {
+                    "disk" => match DiskDerivedStateReplaySource::with_policy(
+                        derived_state_replay_dir.clone(),
+                        derived_state_replay_max_envelopes,
+                        derived_state_replay_max_sessions,
+                        configured_durability,
+                    ) {
+                        Ok(replay_source) => Arc::new(replay_source),
+                        Err(error) => {
+                            tracing::warn!(
+                                backend = "disk",
+                                path = %derived_state_replay_dir.display(),
+                                error = %error,
+                                "failed to initialize disk-backed derived-state replay tail; falling back to memory"
+                            );
+                            Arc::new(
+                                InMemoryDerivedStateReplaySource::with_max_envelopes_per_session(
+                                    derived_state_replay_max_envelopes,
+                                ),
+                            )
+                        }
+                    },
+                    _ => Arc::new(
+                        InMemoryDerivedStateReplaySource::with_max_envelopes_per_session(
+                            derived_state_replay_max_envelopes,
+                        ),
+                    ),
+                };
+            let installed = derived_state_host.install_runtime_replay_source(runtime_replay_source);
+            tracing::info!(
+                derived_state_replay_backend = configured_backend,
+                derived_state_replay_durability,
+                derived_state_replay_dir = %derived_state_replay_dir.display(),
+                derived_state_replay_max_envelopes,
+                derived_state_replay_max_sessions,
+                installed_runtime_replay_source = installed,
+                "derived-state runtime replay tail configured"
+            );
+        }
+        derived_state_host.initialize();
+        tracing::info!(
+            consumers = ?derived_state_host.consumer_names(),
+            "derived-state consumers enabled"
+        );
     }
     let extension_hooks_enabled = !extension_host.is_empty();
     if extension_hooks_enabled {
@@ -664,6 +757,17 @@ async fn run_async_with_hosts_inner(
     let mut telemetry_tick = interval(Duration::from_secs(TELEMETRY_INTERVAL_SECS));
     let mut repair_tick = interval(Duration::from_millis(read_repair_tick_ms()));
     let mut control_plane_tick = interval(Duration::from_millis(CONTROL_PLANE_EVENT_TICK_MS));
+    let derived_state_checkpoint_interval_ms = read_derived_state_checkpoint_interval_ms();
+    let derived_state_checkpoint_enabled =
+        derived_state_hooks_enabled && derived_state_checkpoint_interval_ms > 0;
+    let derived_state_recovery_enabled =
+        derived_state_hooks_enabled && derived_state_recovery_interval_ms > 0;
+    let mut derived_state_checkpoint_tick = interval(Duration::from_millis(
+        derived_state_checkpoint_interval_ms.max(250),
+    ));
+    let mut derived_state_recovery_tick = interval(Duration::from_millis(
+        derived_state_recovery_interval_ms.max(250),
+    ));
     let mut logged_waiting_for_packets = false;
     tracing::info!(
         live_shreds_enabled,
@@ -688,6 +792,12 @@ async fn run_async_with_hosts_inner(
         udp_relay_require_turbine_source_ports,
         udp_relay_send_error_backoff_ms,
         udp_relay_send_error_backoff_threshold,
+        derived_state_recovery_interval_ms,
+        derived_state_replay_backend,
+        derived_state_replay_durability,
+        derived_state_replay_dir = %derived_state_replay_dir.display(),
+        derived_state_replay_max_envelopes,
+        derived_state_replay_max_sessions,
         tx_confirmed_depth_slots,
         tx_finalized_depth_slots,
         fork_window_slots,
@@ -702,6 +812,12 @@ async fn run_async_with_hosts_inner(
     telemetry_tick.tick().await;
     repair_tick.tick().await;
     control_plane_tick.tick().await;
+    if derived_state_checkpoint_enabled {
+        derived_state_checkpoint_tick.tick().await;
+    }
+    if derived_state_recovery_enabled {
+        derived_state_recovery_tick.tick().await;
+    }
     #[cfg(feature = "gossip-bootstrap")]
     let mut topology_tracker = ClusterTopologyTracker::new(
         Duration::from_millis(CONTROL_PLANE_EVENT_TICK_MS),
@@ -1107,12 +1223,16 @@ async fn run_async_with_hosts_inner(
                         );
                         apply_fork_update(
                             &fork_update,
-                            tx_commitment_tracker.as_ref(),
-                            &plugin_host,
-                            plugin_hooks_enabled,
-                            &mut fork_status_transitions_total,
-                            &mut fork_reorg_count,
-                            &mut fork_orphaned_slots_total,
+                            &mut ForkUpdateDispatchContext {
+                                tx_commitment_tracker: tx_commitment_tracker.as_ref(),
+                                plugin_host: &plugin_host,
+                                derived_state_host: &derived_state_host,
+                                plugin_hooks_enabled,
+                                derived_state_hooks_enabled,
+                                fork_status_transitions_total: &mut fork_status_transitions_total,
+                                fork_reorg_count: &mut fork_reorg_count,
+                                fork_orphaned_slots_total: &mut fork_orphaned_slots_total,
+                            },
                         );
                         coverage_window.on_data_shred(data.common.slot);
                         if let Some(outstanding_repairs) = outstanding_repairs.as_mut()
@@ -1190,12 +1310,16 @@ async fn run_async_with_hosts_inner(
                         let fork_update = fork_tracker.observe_code_shred(code.common.slot);
                         apply_fork_update(
                             &fork_update,
-                            tx_commitment_tracker.as_ref(),
-                            &plugin_host,
-                            plugin_hooks_enabled,
-                            &mut fork_status_transitions_total,
-                            &mut fork_reorg_count,
-                            &mut fork_orphaned_slots_total,
+                            &mut ForkUpdateDispatchContext {
+                                tx_commitment_tracker: tx_commitment_tracker.as_ref(),
+                                plugin_host: &plugin_host,
+                                derived_state_host: &derived_state_host,
+                                plugin_hooks_enabled,
+                                derived_state_hooks_enabled,
+                                fork_status_transitions_total: &mut fork_status_transitions_total,
+                                fork_reorg_count: &mut fork_reorg_count,
+                                fork_orphaned_slots_total: &mut fork_orphaned_slots_total,
+                            },
                         );
                         coverage_window.on_code_shred(code.common.slot);
                         if let Some(outstanding_repairs) = outstanding_repairs.as_mut() {
@@ -1280,12 +1404,16 @@ async fn run_async_with_hosts_inner(
                             );
                             apply_fork_update(
                                 &fork_update,
-                                tx_commitment_tracker.as_ref(),
-                                &plugin_host,
-                                plugin_hooks_enabled,
-                                &mut fork_status_transitions_total,
-                                &mut fork_reorg_count,
-                                &mut fork_orphaned_slots_total,
+                                &mut ForkUpdateDispatchContext {
+                                    tx_commitment_tracker: tx_commitment_tracker.as_ref(),
+                                    plugin_host: &plugin_host,
+                                    derived_state_host: &derived_state_host,
+                                    plugin_hooks_enabled,
+                                    derived_state_hooks_enabled,
+                                    fork_status_transitions_total: &mut fork_status_transitions_total,
+                                    fork_reorg_count: &mut fork_reorg_count,
+                                    fork_orphaned_slots_total: &mut fork_orphaned_slots_total,
+                                },
                             );
                             coverage_window.on_recovered_data_shred(data.common.slot);
                             if let Some(outstanding_repairs) = outstanding_repairs.as_mut()
@@ -1812,6 +1940,27 @@ async fn run_async_with_hosts_inner(
                     }
                 }
             }
+            _ = derived_state_checkpoint_tick.tick(), if derived_state_checkpoint_enabled => {
+                let fork_snapshot = fork_tracker.snapshot();
+                derived_state_host.emit_checkpoint_barrier(
+                    CheckpointBarrierReason::Periodic,
+                    feed_watermarks_from_fork_snapshot(fork_snapshot),
+                );
+            }
+            _ = derived_state_recovery_tick.tick(), if derived_state_recovery_enabled => {
+                if derived_state_host.has_unhealthy_consumers() {
+                    let recovery_report = derived_state_host.recover_consumers();
+                    tracing::info!(
+                        attempted = recovery_report.attempted,
+                        recovered = recovery_report.recovered,
+                        still_pending = recovery_report.still_pending,
+                        rebuild_required = recovery_report.rebuild_required,
+                        pending_recovery = ?derived_state_host.consumers_pending_recovery(),
+                        rebuild_consumers = ?derived_state_host.consumers_requiring_rebuild(),
+                        "derived-state recovery attempt completed"
+                    );
+                }
+            }
             _ = telemetry_tick.tick() => {
                 if packet_count == 0 && !logged_waiting_for_packets {
                     tracing::info!(
@@ -1990,6 +2139,26 @@ async fn run_async_with_hosts_inner(
                 } else {
                     ExtensionDispatchTelemetrySnapshot::default()
                 };
+                let derived_state_last_sequence = derived_state_host
+                    .last_emitted_sequence()
+                    .map_or(0_u64, |sequence| sequence.0);
+                let derived_state_healthy_consumers =
+                    u64::try_from(derived_state_host.healthy_consumer_count()).unwrap_or(u64::MAX);
+                let derived_state_unhealthy_names = derived_state_host.unhealthy_consumer_names();
+                let derived_state_unhealthy_consumers =
+                    u64::try_from(derived_state_unhealthy_names.len()).unwrap_or(u64::MAX);
+                let derived_state_pending_recovery_names =
+                    derived_state_host.consumers_pending_recovery();
+                let derived_state_pending_recovery =
+                    u64::try_from(derived_state_pending_recovery_names.len()).unwrap_or(u64::MAX);
+                let derived_state_rebuild_names =
+                    derived_state_host.consumers_requiring_rebuild();
+                let derived_state_rebuild_required =
+                    u64::try_from(derived_state_rebuild_names.len()).unwrap_or(u64::MAX);
+                let derived_state_fault_total = derived_state_host.fault_count();
+                let derived_state_consumer_telemetry = derived_state_host.consumer_telemetry();
+                let derived_state_replay_telemetry =
+                    derived_state_host.replay_telemetry().unwrap_or_default();
                 tracing::info!(
                     packets = packet_count,
                     source_8899_packets = source_port_8899_packets,
@@ -2067,6 +2236,32 @@ async fn run_async_with_hosts_inner(
                         extension_dispatch.max_avg_dispatch_lag_us,
                     runtime_extension_max_dispatch_lag_us =
                         extension_dispatch.max_dispatch_lag_us,
+                    derived_state_enabled = derived_state_hooks_enabled,
+                    derived_state_checkpoint_interval_ms = derived_state_checkpoint_interval_ms,
+                    derived_state_recovery_interval_ms = derived_state_recovery_interval_ms,
+                    derived_state_healthy_consumers = derived_state_healthy_consumers,
+                    derived_state_unhealthy_consumers = derived_state_unhealthy_consumers,
+                    derived_state_pending_recovery = derived_state_pending_recovery,
+                    derived_state_rebuild_required = derived_state_rebuild_required,
+                    derived_state_fault_total = derived_state_fault_total,
+                    derived_state_last_sequence = derived_state_last_sequence,
+                    derived_state_replay_backend = derived_state_replay_telemetry.backend,
+                    derived_state_replay_retained_sessions =
+                        derived_state_replay_telemetry.retained_sessions,
+                    derived_state_replay_retained_envelopes =
+                        derived_state_replay_telemetry.retained_envelopes,
+                    derived_state_replay_truncated_envelopes =
+                        derived_state_replay_telemetry.truncated_envelopes,
+                    derived_state_replay_append_failures =
+                        derived_state_replay_telemetry.append_failures,
+                    derived_state_replay_load_failures =
+                        derived_state_replay_telemetry.load_failures,
+                    derived_state_replay_compactions =
+                        derived_state_replay_telemetry.compactions,
+                    derived_state_pending_recovery_consumers =
+                        ?derived_state_pending_recovery_names,
+                    derived_state_rebuild_consumers = ?derived_state_rebuild_names,
+                    derived_state_consumers = ?derived_state_consumer_telemetry,
                     dataset_decode_failures = dataset_decode_fail_count.load(Ordering::Relaxed),
                     dataset_tail_skips = dataset_tail_skip_count.load(Ordering::Relaxed),
                     dataset_duplicate_drops = dataset_duplicate_drop_count.load(Ordering::Relaxed),
@@ -2192,6 +2387,15 @@ async fn run_async_with_hosts_inner(
                     window_recovered_data = coverage.recovered_data_shreds,
                     "ingest telemetry"
                 );
+                if derived_state_hooks_enabled && !derived_state_unhealthy_names.is_empty() {
+                    tracing::warn!(
+                        unhealthy_consumers = ?derived_state_unhealthy_names,
+                        consumer_telemetry = ?derived_state_consumer_telemetry,
+                        derived_state_fault_total = derived_state_fault_total,
+                        derived_state_last_sequence = derived_state_last_sequence,
+                        "derived-state consumers lost live continuity"
+                    );
+                }
                 if extension_hooks_enabled {
                     let dropped_delta = extension_dispatch
                         .dropped_events
@@ -2254,6 +2458,9 @@ async fn run_async_with_hosts_inner(
         }
     }
     dataset_worker_pool.shutdown().await;
+    if derived_state_hooks_enabled {
+        emit_shutdown_checkpoint_barrier(&derived_state_host, fork_tracker.snapshot());
+    }
     if extension_hooks_enabled {
         extension_host.shutdown().await;
     }
@@ -2310,49 +2517,71 @@ const fn derive_parent_slot(slot: u64, parent_offset: u16) -> Option<u64> {
     slot.checked_sub(parent_offset as u64)
 }
 
-fn apply_fork_update(
-    update: &ForkTrackerUpdate,
-    tx_commitment_tracker: &CommitmentSlotTracker,
-    plugin_host: &PluginHost,
+/// Shared inputs and counters used while dispatching one fork-tracker update.
+struct ForkUpdateDispatchContext<'context> {
+    /// Commitment tracker updated from the latest fork snapshot.
+    tx_commitment_tracker: &'context CommitmentSlotTracker,
+    /// Plugin host that receives observational fork events.
+    plugin_host: &'context PluginHost,
+    /// Derived-state host that receives authoritative fork events.
+    derived_state_host: &'context DerivedStateHost,
+    /// Whether plugin fork hooks are enabled for this runtime.
     plugin_hooks_enabled: bool,
-    fork_status_transitions_total: &mut u64,
-    fork_reorg_count: &mut u64,
-    fork_orphaned_slots_total: &mut u64,
-) {
-    tx_commitment_tracker.update(
+    /// Whether derived-state fork hooks are enabled for this runtime.
+    derived_state_hooks_enabled: bool,
+    /// Aggregate count of slot status transitions seen so far.
+    fork_status_transitions_total: &'context mut u64,
+    /// Aggregate count of reorgs seen so far.
+    fork_reorg_count: &'context mut u64,
+    /// Aggregate count of orphaned slots seen so far.
+    fork_orphaned_slots_total: &'context mut u64,
+}
+
+fn apply_fork_update(update: &ForkTrackerUpdate, context: &mut ForkUpdateDispatchContext<'_>) {
+    context.tx_commitment_tracker.update(
         update.snapshot.confirmed_slot,
         update.snapshot.finalized_slot,
     );
-    *fork_status_transitions_total = fork_status_transitions_total
+    *context.fork_status_transitions_total = context
+        .fork_status_transitions_total
         .saturating_add(u64::try_from(update.status_transitions.len()).unwrap_or(u64::MAX));
     for transition in &update.status_transitions {
         if transition.status == crate::event::ForkSlotStatus::Orphaned {
-            *fork_orphaned_slots_total = fork_orphaned_slots_total.saturating_add(1);
+            *context.fork_orphaned_slots_total =
+                context.fork_orphaned_slots_total.saturating_add(1);
         }
-        if plugin_hooks_enabled {
-            plugin_host.on_slot_status(SlotStatusEvent {
-                slot: transition.slot,
-                parent_slot: transition.parent_slot,
-                previous_status: transition.previous_status,
-                status: transition.status,
-                tip_slot: update.snapshot.tip_slot,
-                confirmed_slot: update.snapshot.confirmed_slot,
-                finalized_slot: update.snapshot.finalized_slot,
-            });
+        let event = SlotStatusEvent {
+            slot: transition.slot,
+            parent_slot: transition.parent_slot,
+            previous_status: transition.previous_status,
+            status: transition.status,
+            tip_slot: update.snapshot.tip_slot,
+            confirmed_slot: update.snapshot.confirmed_slot,
+            finalized_slot: update.snapshot.finalized_slot,
+        };
+        if context.derived_state_hooks_enabled {
+            context.derived_state_host.on_slot_status(event);
+        }
+        if context.plugin_hooks_enabled {
+            context.plugin_host.on_slot_status(event);
         }
     }
     if let Some(reorg) = update.reorg.as_ref() {
-        *fork_reorg_count = fork_reorg_count.saturating_add(1);
-        if plugin_hooks_enabled {
-            plugin_host.on_reorg(ReorgEvent {
-                old_tip: reorg.old_tip,
-                new_tip: reorg.new_tip,
-                common_ancestor: reorg.common_ancestor,
-                detached_slots: reorg.detached_slots.clone(),
-                attached_slots: reorg.attached_slots.clone(),
-                confirmed_slot: update.snapshot.confirmed_slot,
-                finalized_slot: update.snapshot.finalized_slot,
-            });
+        *context.fork_reorg_count = context.fork_reorg_count.saturating_add(1);
+        let event = ReorgEvent {
+            old_tip: reorg.old_tip,
+            new_tip: reorg.new_tip,
+            common_ancestor: reorg.common_ancestor,
+            detached_slots: reorg.detached_slots.clone(),
+            attached_slots: reorg.attached_slots.clone(),
+            confirmed_slot: update.snapshot.confirmed_slot,
+            finalized_slot: update.snapshot.finalized_slot,
+        };
+        if context.derived_state_hooks_enabled {
+            context.derived_state_host.on_reorg(event.clone());
+        }
+        if context.plugin_hooks_enabled {
+            context.plugin_host.on_reorg(event);
         }
     }
 }
@@ -2428,6 +2657,12 @@ fn collect_udp_relay_peers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::framework::{
+        CheckpointBarrierEvent, DerivedStateCheckpoint, DerivedStateConsumer,
+        DerivedStateConsumerFault, DerivedStateConsumerFaultKind, DerivedStateFeedEnvelope,
+        DerivedStateFeedEvent, FeedSequence,
+    };
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn extension_dispatch_telemetry_aggregates_totals_and_maxima() {
@@ -2467,5 +2702,94 @@ mod tests {
     fn extension_dispatch_telemetry_handles_empty_metrics() {
         let snapshot = collect_extension_dispatch_telemetry(Vec::new());
         assert_eq!(snapshot, ExtensionDispatchTelemetrySnapshot::default());
+    }
+
+    #[test]
+    fn shutdown_barrier_uses_fork_snapshot_watermarks() {
+        let state = Arc::new(Mutex::new(Vec::<DerivedStateFeedEnvelope>::new()));
+        let host = DerivedStateHost::builder()
+            .add_consumer(DriverRecordingConsumer {
+                state: Arc::clone(&state),
+            })
+            .build();
+
+        emit_shutdown_checkpoint_barrier(
+            &host,
+            crate::app::state::ForkTrackerSnapshot {
+                tracked_slots: 4,
+                tip_slot: Some(88),
+                confirmed_slot: Some(80),
+                finalized_slot: Some(70),
+            },
+        );
+
+        let state = state
+            .lock()
+            .expect("driver recording state mutex should not be poisoned");
+        assert_eq!(state.len(), 1);
+        assert!(matches!(
+            state[0].event,
+            DerivedStateFeedEvent::CheckpointBarrier(CheckpointBarrierEvent {
+                barrier_sequence: FeedSequence(0),
+                reason: CheckpointBarrierReason::ShutdownRequested,
+            })
+        ));
+        assert_eq!(
+            state[0].watermarks,
+            FeedWatermarks {
+                canonical_tip_slot: Some(88),
+                processed_slot: Some(88),
+                confirmed_slot: Some(80),
+                finalized_slot: Some(70),
+            }
+        );
+    }
+
+    struct DriverRecordingConsumer {
+        state: Arc<Mutex<Vec<DerivedStateFeedEnvelope>>>,
+    }
+
+    impl DerivedStateConsumer for DriverRecordingConsumer {
+        fn name(&self) -> &'static str {
+            "driver-recording-consumer"
+        }
+
+        fn state_version(&self) -> u32 {
+            1
+        }
+
+        fn extension_version(&self) -> &'static str {
+            "driver-test"
+        }
+
+        fn load_checkpoint(
+            &mut self,
+        ) -> Result<Option<DerivedStateCheckpoint>, DerivedStateConsumerFault> {
+            Ok(None)
+        }
+
+        fn apply(
+            &mut self,
+            envelope: DerivedStateFeedEnvelope,
+        ) -> Result<(), DerivedStateConsumerFault> {
+            self.state
+                .lock()
+                .map_err(|_poison| {
+                    DerivedStateConsumerFault::new(
+                        DerivedStateConsumerFaultKind::ConsumerApplyFailed,
+                        Some(envelope.sequence),
+                        "driver recording state mutex poisoned during apply",
+                    )
+                })?
+                .push(envelope);
+            Ok(())
+        }
+
+        fn flush_checkpoint(
+            &mut self,
+            _checkpoint: DerivedStateCheckpoint,
+        ) -> Result<(), DerivedStateConsumerFault> {
+            Ok(())
+        }
     }
 }

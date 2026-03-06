@@ -1802,8 +1802,10 @@ mod tests {
     #[tokio::test]
     async fn shutdown_deadline_then_cancel() {
         let shutdown_called = Arc::new(AtomicBool::new(false));
+        let shutdown_timeout = Duration::from_millis(25);
+        let shutdown_wait = Duration::from_secs(5);
         let host = RuntimeExtensionHost::builder()
-            .with_shutdown_timeout(Duration::from_millis(25))
+            .with_shutdown_timeout(shutdown_timeout)
             .add_extension(CounterExtension {
                 name: "slow-shutdown",
                 startup_manifest: ExtensionManifest {
@@ -1815,7 +1817,7 @@ mod tests {
                     }],
                 },
                 packet_count: Arc::new(AtomicUsize::new(0)),
-                shutdown_wait: Duration::from_millis(250),
+                shutdown_wait,
                 shutdown_called: Arc::clone(&shutdown_called),
             })
             .build();
@@ -1825,7 +1827,9 @@ mod tests {
         let started = tokio::time::Instant::now();
         host.shutdown().await;
         let elapsed = started.elapsed();
-        assert!(elapsed < Duration::from_millis(150));
+        assert!(elapsed >= shutdown_timeout);
+        assert!(elapsed < Duration::from_secs(1));
+        assert!(elapsed < shutdown_wait);
         assert!(shutdown_called.load(Ordering::Relaxed));
     }
 

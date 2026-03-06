@@ -8,7 +8,7 @@ mod repair;
 pub use commitment::CommitmentSlotTracker;
 pub use coverage::SlotCoverageWindow;
 pub use dedupe::RecentShredCache;
-pub use fork::{ForkTracker, ForkTrackerUpdate};
+pub use fork::{ForkTracker, ForkTrackerSnapshot, ForkTrackerUpdate};
 pub use latest::note_latest_shred_slot;
 pub use repair::OutstandingRepairRequests;
 

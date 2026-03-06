@@ -1,6 +1,7 @@
+use serde::{Deserialize, Serialize};
 use solana_signature::Signature;
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 /// Transaction classification used by runtime and plugins.
 pub enum TxKind {
     /// Contains only vote program instructions.
@@ -11,7 +12,7 @@ pub enum TxKind {
     NonVote,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 /// Runtime slot status classification for local fork/canonical tracking.
 pub enum ForkSlotStatus {
     /// Slot has been observed but is not yet locally confirmed/finalized.
@@ -24,7 +25,7 @@ pub enum ForkSlotStatus {
     Orphaned,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 /// Runtime commitment state for an observed transaction slot.
 pub enum TxCommitmentStatus {
     /// Transaction was observed from live shred stream, but slot is not yet confirmed.

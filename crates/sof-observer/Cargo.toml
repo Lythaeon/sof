@@ -27,12 +27,12 @@ solana-gossip = { version = "3.1.8", optional = true, features = ["agave-unstabl
 solana-entry = { version = "3.1.8", features = ["agave-unstable-api"] }
 solana-keypair = "3.0.1"
 solana-net-utils = "3.1.8"
-solana-pubkey = "3.0.0"
+solana-pubkey = { version = "3.0.0", features = ["serde"] }
 solana-sdk-ids = "3.1.0"
 solana-signature = { version = "3.1.0", features = ["serde"] }
 solana-signer = "3.0.0"
 solana-streamer = "3.1.8"
-solana-transaction = "3.0.2"
+solana-transaction = { version = "3.0.2", features = ["serde"] }
 reed-solomon-erasure = { version = "6.0.0", features = ["simd-accel"] }
 thiserror = "2.0"
 tokio = { version = "1.48", features = ["io-util", "macros", "rt-multi-thread", "net", "sync", "time"] }
@@ -41,7 +41,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 wincode = "=0.1.2"
 socket2 = "0.5"
 bincode = "1.3.3"
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 sha2 = "0.10"

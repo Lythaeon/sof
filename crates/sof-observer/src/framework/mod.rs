@@ -1,5 +1,7 @@
 //! Public plugin framework surface for embedding custom observers into SOF runtime.
 
+/// Experimental derived-state feed scaffold for official stateful extensions.
+pub mod derived_state;
 /// Framework event payload types delivered to plugins.
 pub mod events;
 /// Runtime extension trait and manifest/filter/resource types.
@@ -12,6 +14,17 @@ pub mod host;
 pub mod plugin;
 
 pub use crate::event::{ForkSlotStatus, TxCommitmentStatus};
+pub use derived_state::{
+    AccountTouchObservedEvent, BranchReorgedEvent, CheckpointBarrierEvent, CheckpointBarrierReason,
+    DerivedStateCheckpoint, DerivedStateConsumer, DerivedStateConsumerFault,
+    DerivedStateConsumerFaultKind, DerivedStateConsumerRecoveryState,
+    DerivedStateConsumerTelemetry, DerivedStateFeedEnvelope, DerivedStateFeedEvent,
+    DerivedStateHost, DerivedStateHostBuilder, DerivedStateRecoveryReport,
+    DerivedStateReplayDurability, DerivedStateReplayError, DerivedStateReplaySource,
+    DerivedStateReplayTelemetry, DiskDerivedStateReplaySource, FeedSequence, FeedSessionId,
+    FeedWatermarks, InMemoryDerivedStateReplaySource, SlotStatusChangedEvent,
+    TransactionAppliedEvent,
+};
 pub use events::{
     AccountTouchEvent, ClusterNodeInfo, ClusterTopologyEvent, ControlPlaneSource, DatasetEvent,
     LeaderScheduleEntry, LeaderScheduleEvent, ObservedRecentBlockhashEvent, RawPacketEvent,

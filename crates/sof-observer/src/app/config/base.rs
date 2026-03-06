@@ -1,4 +1,4 @@
-use std::num::NonZeroUsize;
+use std::{num::NonZeroUsize, path::PathBuf};
 
 use super::{read_bool_env, read_env_var};
 
@@ -196,4 +196,47 @@ pub fn read_runtime_extension_drop_warn_delta() -> u64 {
     read_env_var("SOF_RUNTIME_EXTENSION_DROP_WARN_DELTA")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(100)
+}
+
+pub fn read_derived_state_checkpoint_interval_ms() -> u64 {
+    read_env_var("SOF_DERIVED_STATE_CHECKPOINT_INTERVAL_MS")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(30_000)
+}
+
+pub fn read_derived_state_recovery_interval_ms() -> u64 {
+    read_env_var("SOF_DERIVED_STATE_RECOVERY_INTERVAL_MS")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(5_000)
+}
+
+pub fn read_derived_state_replay_max_envelopes() -> usize {
+    read_env_var("SOF_DERIVED_STATE_REPLAY_MAX_ENVELOPES")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(8_192)
+}
+
+pub fn read_derived_state_replay_max_sessions() -> usize {
+    read_env_var("SOF_DERIVED_STATE_REPLAY_MAX_SESSIONS")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(4)
+}
+
+pub fn read_derived_state_replay_backend() -> String {
+    read_env_var("SOF_DERIVED_STATE_REPLAY_BACKEND")
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "memory".to_owned())
+}
+
+pub fn read_derived_state_replay_dir() -> PathBuf {
+    read_env_var("SOF_DERIVED_STATE_REPLAY_DIR")
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".sof-derived-state-replay"))
+}
+
+pub fn read_derived_state_replay_durability() -> String {
+    read_env_var("SOF_DERIVED_STATE_REPLAY_DURABILITY")
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "flush".to_owned())
 }

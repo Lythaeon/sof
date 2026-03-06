@@ -34,9 +34,11 @@ pub(super) use crate::repair::MissingShredRequestKind;
 pub(super) use crate::{
     event::{TxCommitmentStatus, TxKind, TxObservedEvent},
     framework::{
-        DatasetEvent, ObservedRecentBlockhashEvent, PluginHost, PluginHostBuilder, RawPacketEvent,
-        ReorgEvent, RuntimeExtensionDispatchMetrics, RuntimeExtensionHost,
-        RuntimeExtensionHostBuilder, ShredEvent, SlotStatusEvent, TransactionEvent,
+        CheckpointBarrierReason, DatasetEvent, DerivedStateHost, DerivedStateReplayDurability,
+        DiskDerivedStateReplaySource, FeedWatermarks, InMemoryDerivedStateReplaySource,
+        ObservedRecentBlockhashEvent, PluginHost, PluginHostBuilder, RawPacketEvent, ReorgEvent,
+        RuntimeExtensionDispatchMetrics, RuntimeExtensionHost, RuntimeExtensionHostBuilder,
+        ShredEvent, SlotStatusEvent, TransactionEvent,
     },
     ingest,
     reassembly::dataset::DataSetReassembler,

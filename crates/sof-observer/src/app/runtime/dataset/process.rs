@@ -10,6 +10,7 @@ pub(super) struct DatasetProcessInput {
 }
 
 pub(super) struct DatasetProcessContext<'context> {
+    pub(super) derived_state_host: &'context DerivedStateHost,
     pub(super) plugin_host: &'context PluginHost,
     pub(super) tx_event_tx: &'context mpsc::Sender<TxObservedEvent>,
     pub(super) tx_commitment_tracker: &'context CommitmentSlotTracker,
@@ -52,6 +53,7 @@ pub(super) fn process_completed_dataset(
             .fetch_add(u64::from(skipped_prefix_shreds), Ordering::Relaxed);
     }
     let plugin_hooks_enabled = !context.plugin_host.is_empty();
+    let derived_state_hooks_enabled = !context.derived_state_host.is_empty();
     let commitment_snapshot = context.tx_commitment_tracker.snapshot();
     let commitment_status = TxCommitmentStatus::from_slot(
         slot,
@@ -67,57 +69,77 @@ pub(super) fn process_completed_dataset(
                 observed_recent_blockhash = Some(tx.message.recent_blockhash().to_bytes());
             }
             let kind = classify_tx_kind(&tx);
-            let signature = tx.signatures.first().cloned();
-            let account_touch_event = plugin_hooks_enabled.then(|| AccountTouchEvent {
-                slot,
-                commitment_status,
-                confirmed_slot: commitment_snapshot.confirmed_slot,
-                finalized_slot: commitment_snapshot.finalized_slot,
-                signature,
-                account_keys: Arc::new(tx.message.static_account_keys().to_vec()),
-                writable_account_keys: Arc::new(
-                    tx.message
-                        .static_account_keys()
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, key)| {
-                            tx.message.is_maybe_writable(index, None).then_some(*key)
-                        })
-                        .collect(),
-                ),
-                readonly_account_keys: Arc::new(
-                    tx.message
-                        .static_account_keys()
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, key)| {
-                            (!tx.message.is_maybe_writable(index, None)).then_some(*key)
-                        })
-                        .collect(),
-                ),
-                lookup_table_account_keys: Arc::new(
-                    tx.message
-                        .address_table_lookups()
-                        .unwrap_or(&[])
-                        .iter()
-                        .map(|lookup| lookup.account_key)
-                        .collect(),
-                ),
-            });
-            tx_count = tx_count.saturating_add(1);
-            if plugin_hooks_enabled {
-                if let Some(event) = account_touch_event {
-                    context.plugin_host.on_account_touch(event);
-                }
-                context.plugin_host.on_transaction(TransactionEvent {
+            let signature = tx.signatures.first().copied();
+            let account_touch_signature = signature;
+            let transaction_signature = signature;
+            let account_touch_event =
+                (plugin_hooks_enabled || derived_state_hooks_enabled).then(|| AccountTouchEvent {
                     slot,
                     commitment_status,
                     confirmed_slot: commitment_snapshot.confirmed_slot,
                     finalized_slot: commitment_snapshot.finalized_slot,
-                    signature,
+                    signature: account_touch_signature,
+                    account_keys: Arc::new(tx.message.static_account_keys().to_vec()),
+                    writable_account_keys: Arc::new(
+                        tx.message
+                            .static_account_keys()
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, key)| {
+                                tx.message.is_maybe_writable(index, None).then_some(*key)
+                            })
+                            .collect(),
+                    ),
+                    readonly_account_keys: Arc::new(
+                        tx.message
+                            .static_account_keys()
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, key)| {
+                                (!tx.message.is_maybe_writable(index, None)).then_some(*key)
+                            })
+                            .collect(),
+                    ),
+                    lookup_table_account_keys: Arc::new(
+                        tx.message
+                            .address_table_lookups()
+                            .unwrap_or(&[])
+                            .iter()
+                            .map(|lookup| lookup.account_key)
+                            .collect(),
+                    ),
+                });
+            let tx_index = if derived_state_hooks_enabled {
+                context.derived_state_host.next_slot_tx_index(slot)
+            } else {
+                0
+            };
+            let transaction_event =
+                (plugin_hooks_enabled || derived_state_hooks_enabled).then(|| TransactionEvent {
+                    slot,
+                    commitment_status,
+                    confirmed_slot: commitment_snapshot.confirmed_slot,
+                    finalized_slot: commitment_snapshot.finalized_slot,
+                    signature: transaction_signature,
                     tx: Arc::new(tx),
                     kind,
                 });
+            tx_count = tx_count.saturating_add(1);
+            if derived_state_hooks_enabled {
+                if let Some(event) = account_touch_event.clone() {
+                    context.derived_state_host.on_account_touch(tx_index, event);
+                }
+                if let Some(event) = transaction_event.clone() {
+                    context.derived_state_host.on_transaction(tx_index, event);
+                }
+            }
+            if plugin_hooks_enabled {
+                if let Some(event) = account_touch_event {
+                    context.plugin_host.on_account_touch(event);
+                }
+                if let Some(event) = transaction_event {
+                    context.plugin_host.on_transaction(event);
+                }
             }
             let event = TxObservedEvent {
                 slot,
