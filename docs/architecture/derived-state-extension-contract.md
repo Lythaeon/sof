@@ -5,6 +5,7 @@ This document is a working contract sketch for official stateful extensions buil
 
 It complements ADR-0009 by classifying the current runtime/plugin surfaces and identifying
 which parts are usable for deterministic derived state versus best-effort observation.
+The target dedicated feed shape is specified in `derived-state-feed-contract.md`.
 
 ## Purpose
 

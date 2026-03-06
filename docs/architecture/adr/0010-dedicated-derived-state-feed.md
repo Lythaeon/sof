@@ -3,7 +3,7 @@
 - Status: Proposed
 - Date: 2026-03-06
 - Decision makers: `sof-observer` maintainers
-- Related: `docs/architecture/adr/0009-derived-state-extensions-and-replay-contracts.md`, `docs/architecture/derived-state-extension-contract.md`, `docs/architecture/framework-plugin-hooks.md`, `docs/architecture/runtime-extension-hooks.md`
+- Related: `docs/architecture/adr/0009-derived-state-extensions-and-replay-contracts.md`, `docs/architecture/derived-state-extension-contract.md`, `docs/architecture/derived-state-feed-contract.md`, `docs/architecture/framework-plugin-hooks.md`, `docs/architecture/runtime-extension-hooks.md`
 
 ## Context
 
@@ -201,3 +201,5 @@ Before adopting a first implementation of the feed:
 3. replay source/checkpoint model is documented,
 4. lag/drop semantics are documented,
 5. at least one official stateful consumer validates the abstraction end-to-end.
+
+The current concrete target contract is captured in `docs/architecture/derived-state-feed-contract.md`.
