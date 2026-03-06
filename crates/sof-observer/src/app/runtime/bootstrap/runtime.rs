@@ -51,6 +51,34 @@ impl Drop for ReceiverRuntime {
     }
 }
 
+impl ReceiverRuntime {
+    /// Builds a receiver runtime that relies on external ingress feed(s).
+    #[cfg(feature = "kernel-bypass")]
+    #[allow(clippy::missing_const_for_fn)]
+    #[must_use]
+    pub(in crate::app::runtime) fn external(tx_event_rx: mpsc::Receiver<TxObservedEvent>) -> Self {
+        Self {
+            static_receiver_handles: Vec::new(),
+            gossip_receiver_handles: Vec::new(),
+            #[cfg(feature = "gossip-bootstrap")]
+            gossip_runtime: None,
+            #[cfg(feature = "gossip-bootstrap")]
+            gossip_identity: Arc::new(Keypair::new()),
+            #[cfg(feature = "gossip-bootstrap")]
+            active_gossip_entrypoint: None,
+            #[cfg(feature = "gossip-bootstrap")]
+            gossip_runtime_primary_port_range: None,
+            #[cfg(feature = "gossip-bootstrap")]
+            gossip_runtime_secondary_port_range: None,
+            #[cfg(feature = "gossip-bootstrap")]
+            gossip_runtime_active_port_range: None,
+            #[cfg(feature = "gossip-bootstrap")]
+            repair_client: None,
+            tx_event_rx,
+        }
+    }
+}
+
 #[cfg(feature = "gossip-bootstrap")]
 impl ReceiverRuntime {
     pub(in crate::app::runtime) fn replace_gossip_runtime(

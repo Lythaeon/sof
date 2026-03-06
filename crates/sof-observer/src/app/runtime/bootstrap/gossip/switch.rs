@@ -13,7 +13,7 @@ pub(crate) enum GossipRuntimeSwitchError {
 #[cfg(feature = "gossip-bootstrap")]
 pub(crate) async fn maybe_switch_gossip_runtime(
     runtime: &mut ReceiverRuntime,
-    packet_ingest_tx: &mpsc::Sender<RawPacketBatch>,
+    packet_ingest_tx: &ingest::RawPacketBatchSender,
     entrypoints: &[String],
 ) -> Result<Option<String>, GossipRuntimeSwitchError> {
     let candidate_pool = collect_runtime_switch_entrypoints(

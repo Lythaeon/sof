@@ -254,7 +254,7 @@ async fn hybrid_falls_back_to_rpc_when_direct_fails() {
     let rpc_calls = rpc.calls.load(Ordering::Relaxed);
     let direct_calls = direct.calls.load(Ordering::Relaxed);
     assert_eq!(rpc_calls, 1);
-    assert_eq!(direct_calls, 2);
+    assert_eq!(direct_calls, 3);
 }
 
 #[tokio::test]
@@ -294,14 +294,17 @@ async fn hybrid_uses_second_direct_attempt_before_rpc() {
     assert!(result.is_ok());
     if let Ok(result) = result {
         assert_eq!(result.direct_target, Some(direct_target));
-        assert_eq!(result.rpc_signature, None);
+        assert_eq!(
+            result.rpc_signature,
+            Some("rpc-fallback-signature".to_owned())
+        );
         assert!(!result.used_rpc_fallback);
     }
 
     let rpc_calls = rpc.calls.load(Ordering::Relaxed);
     let direct_calls = direct.calls.load(Ordering::Relaxed);
     assert_eq!(direct_calls, 2);
-    assert_eq!(rpc_calls, 0);
+    assert_eq!(rpc_calls, 1);
 }
 
 #[tokio::test]
@@ -344,8 +347,51 @@ async fn low_latency_reliability_uses_single_hybrid_attempt() {
 
     let rpc_calls = rpc.calls.load(Ordering::Relaxed);
     let direct_calls = direct.calls.load(Ordering::Relaxed);
-    assert_eq!(direct_calls, 1);
+    assert_eq!(direct_calls, 2);
     assert_eq!(rpc_calls, 1);
+}
+
+#[tokio::test]
+async fn low_latency_hybrid_direct_success_skips_rpc_broadcast() {
+    let rpc = Arc::new(MockRpcTransport {
+        result: Ok("rpc-signature".to_owned()),
+        calls: AtomicU64::new(0),
+    });
+    let direct_target = target(9042);
+    let direct = Arc::new(MockDirectTransport {
+        result: Ok(direct_target.clone()),
+        calls: AtomicU64::new(0),
+    });
+    let mut client = TxSubmitClient::new(
+        Arc::new(StaticRecentBlockhashProvider::new(Some([15_u8; 32]))),
+        Arc::new(StaticLeaderProvider::new(
+            Some(direct_target.clone()),
+            Vec::new(),
+        )),
+    )
+    .with_reliability(SubmitReliability::LowLatency)
+    .with_rpc_transport(rpc.clone())
+    .with_direct_transport(direct.clone());
+
+    let (bytes, _signature) = signed_transfer_bytes();
+    let result = client
+        .submit_signed(
+            SignedTx::VersionedTransactionBytes(bytes),
+            SubmitMode::Hybrid,
+        )
+        .await;
+
+    assert!(result.is_ok());
+    if let Ok(result) = result {
+        assert_eq!(result.direct_target, Some(direct_target));
+        assert_eq!(result.rpc_signature, None);
+        assert!(!result.used_rpc_fallback);
+    }
+
+    let rpc_calls = rpc.calls.load(Ordering::Relaxed);
+    let direct_calls = direct.calls.load(Ordering::Relaxed);
+    assert_eq!(direct_calls, 1);
+    assert_eq!(rpc_calls, 0);
 }
 
 #[tokio::test]

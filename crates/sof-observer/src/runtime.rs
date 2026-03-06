@@ -260,6 +260,25 @@ impl RuntimeSetup {
         self.with_env("SOF_UDP_IDLE_WAIT_MS", idle_wait_ms.to_string())
     }
 
+    /// Sets `SOF_INGEST_QUEUE_MODE`.
+    ///
+    /// Accepted values:
+    /// - `bounded` (default): Tokio bounded channel.
+    /// - `unbounded`: Tokio unbounded channel.
+    /// - `lockfree`: lock-free `ArrayQueue` ring with async wakeups.
+    #[must_use]
+    pub fn with_ingest_queue_mode(self, mode: impl Into<String>) -> Self {
+        self.with_env("SOF_INGEST_QUEUE_MODE", mode)
+    }
+
+    /// Sets `SOF_INGEST_QUEUE_CAPACITY`.
+    ///
+    /// Used by `bounded` and `lockfree` modes.
+    #[must_use]
+    pub fn with_ingest_queue_capacity(self, queue_capacity: usize) -> Self {
+        self.with_env("SOF_INGEST_QUEUE_CAPACITY", queue_capacity.to_string())
+    }
+
     /// Sets `SOF_REPAIR_ENABLED`.
     #[must_use]
     pub fn with_repair_enabled(self, enabled: bool) -> Self {
@@ -520,6 +539,98 @@ pub async fn run_async_with_hosts(
 ) -> Result<(), RuntimeError> {
     crate::runtime_env::clear_runtime_env_overrides();
     Ok(crate::app::runtime::run_async_with_hosts(plugin_host, extension_host).await?)
+}
+
+#[cfg(feature = "kernel-bypass")]
+/// External ingress sender type used by `kernel-bypass` integrations.
+///
+/// Producers publish [`crate::ingest::RawPacketBatch`] values through this queue.
+pub type KernelBypassIngressSender = crate::ingest::RawPacketBatchSender;
+
+#[cfg(feature = "kernel-bypass")]
+/// External ingress receiver type used by `kernel-bypass` integrations.
+pub type KernelBypassIngressReceiver = crate::ingest::RawPacketBatchReceiver;
+
+#[cfg(feature = "kernel-bypass")]
+/// Creates a kernel-bypass ingress queue pair.
+///
+/// Queue behavior is controlled by `SOF_INGEST_QUEUE_MODE` and
+/// `SOF_INGEST_QUEUE_CAPACITY`, allowing bounded/unbounded/lock-free modes.
+#[must_use]
+pub fn create_kernel_bypass_ingress_queue()
+-> (KernelBypassIngressSender, KernelBypassIngressReceiver) {
+    crate::ingest::create_raw_packet_batch_queue()
+}
+
+#[cfg(feature = "kernel-bypass")]
+/// Async runtime entrypoint that consumes packets from external `kernel-bypass` ingress.
+///
+/// # Errors
+/// Returns any runtime initialization or shutdown error from the underlying observer runtime.
+pub async fn run_async_with_kernel_bypass_ingress(
+    packet_ingest_rx: impl Into<KernelBypassIngressReceiver>,
+) -> Result<(), RuntimeError> {
+    crate::runtime_env::clear_runtime_env_overrides();
+    Ok(crate::app::runtime::run_async_with_kernel_bypass_ingress(packet_ingest_rx.into()).await?)
+}
+
+#[cfg(feature = "kernel-bypass")]
+/// Async variant of [`run_async_with_plugin_host`] using external `kernel-bypass` ingress.
+///
+/// # Errors
+/// Returns any runtime initialization or shutdown error from the underlying observer runtime.
+pub async fn run_async_with_plugin_host_and_kernel_bypass_ingress(
+    plugin_host: PluginHost,
+    packet_ingest_rx: impl Into<KernelBypassIngressReceiver>,
+) -> Result<(), RuntimeError> {
+    crate::runtime_env::clear_runtime_env_overrides();
+    Ok(
+        crate::app::runtime::run_async_with_plugin_host_and_kernel_bypass_ingress(
+            plugin_host,
+            packet_ingest_rx.into(),
+        )
+        .await?,
+    )
+}
+
+#[cfg(feature = "kernel-bypass")]
+/// Async variant of [`run_async_with_extension_host`] using external `kernel-bypass` ingress.
+///
+/// # Errors
+/// Returns any runtime initialization or shutdown error from the underlying observer runtime.
+pub async fn run_async_with_extension_host_and_kernel_bypass_ingress(
+    extension_host: RuntimeExtensionHost,
+    packet_ingest_rx: impl Into<KernelBypassIngressReceiver>,
+) -> Result<(), RuntimeError> {
+    crate::runtime_env::clear_runtime_env_overrides();
+    Ok(
+        crate::app::runtime::run_async_with_extension_host_and_kernel_bypass_ingress(
+            extension_host,
+            packet_ingest_rx.into(),
+        )
+        .await?,
+    )
+}
+
+#[cfg(feature = "kernel-bypass")]
+/// Async variant of [`run_async_with_hosts`] using external `kernel-bypass` ingress.
+///
+/// # Errors
+/// Returns any runtime initialization or shutdown error from the underlying observer runtime.
+pub async fn run_async_with_hosts_and_kernel_bypass_ingress(
+    plugin_host: PluginHost,
+    extension_host: RuntimeExtensionHost,
+    packet_ingest_rx: impl Into<KernelBypassIngressReceiver>,
+) -> Result<(), RuntimeError> {
+    crate::runtime_env::clear_runtime_env_overrides();
+    Ok(
+        crate::app::runtime::run_async_with_hosts_and_kernel_bypass_ingress(
+            plugin_host,
+            extension_host,
+            packet_ingest_rx.into(),
+        )
+        .await?,
+    )
 }
 
 /// Async variant of [`run_with_setup`], for callers that already own a Tokio runtime.

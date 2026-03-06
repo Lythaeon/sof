@@ -76,3 +76,28 @@ fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
         |message| (*message).to_owned(),
     )
 }
+
+/// Hook-interest bitmap used to skip enqueueing callbacks no plugin requested.
+#[derive(Debug, Clone, Copy, Default)]
+struct PluginHookSubscriptions {
+    /// At least one plugin wants raw-packet callbacks.
+    raw_packet: bool,
+    /// At least one plugin wants parsed-shred callbacks.
+    shred: bool,
+    /// At least one plugin wants dataset callbacks.
+    dataset: bool,
+    /// At least one plugin wants transaction callbacks.
+    transaction: bool,
+    /// At least one plugin wants account-touch callbacks.
+    account_touch: bool,
+    /// At least one plugin wants slot-status callbacks.
+    slot_status: bool,
+    /// At least one plugin wants reorg callbacks.
+    reorg: bool,
+    /// At least one plugin wants recent-blockhash callbacks.
+    recent_blockhash: bool,
+    /// At least one plugin wants cluster-topology callbacks.
+    cluster_topology: bool,
+    /// At least one plugin wants leader-schedule callbacks.
+    leader_schedule: bool,
+}

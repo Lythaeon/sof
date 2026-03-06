@@ -12,11 +12,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg};
 use socket2::SockRef;
 use thiserror::Error;
-use tokio::{
-    sync::mpsc,
-    task::{self, JoinHandle},
-};
+use tokio::task::{self, JoinHandle};
 
+use crate::ingest::RawPacketBatchSender;
 use crate::ingest::config::{
     enable_rxq_ovfl_tracking, read_udp_batch_max_wait_ms, read_udp_batch_size,
     read_udp_idle_wait_ms, read_udp_rcvbuf_bytes, read_udp_receiver_core,
@@ -126,10 +124,7 @@ impl ReceiverTelemetry {
 }
 
 #[must_use]
-pub fn spawn_udp_receiver(
-    bind_addr: SocketAddr,
-    tx: mpsc::Sender<RawPacketBatch>,
-) -> JoinHandle<()> {
+pub fn spawn_udp_receiver(bind_addr: SocketAddr, tx: RawPacketBatchSender) -> JoinHandle<()> {
     task::spawn_blocking(move || {
         if let Err(err) = run_udp_receiver(bind_addr, &tx, None) {
             tracing::error!(%bind_addr, error = %err, "udp receiver terminated");
@@ -140,7 +135,7 @@ pub fn spawn_udp_receiver(
 #[must_use]
 pub fn spawn_udp_receiver_from_std(
     std_socket: std::net::UdpSocket,
-    tx: mpsc::Sender<RawPacketBatch>,
+    tx: RawPacketBatchSender,
 ) -> JoinHandle<()> {
     spawn_udp_receiver_from_std_with_telemetry(std_socket, tx, None)
 }
@@ -148,7 +143,7 @@ pub fn spawn_udp_receiver_from_std(
 #[must_use]
 pub fn spawn_udp_receiver_from_std_with_telemetry(
     std_socket: std::net::UdpSocket,
-    tx: mpsc::Sender<RawPacketBatch>,
+    tx: RawPacketBatchSender,
     telemetry: Option<ReceiverTelemetry>,
 ) -> JoinHandle<()> {
     task::spawn_blocking(move || {
@@ -160,7 +155,7 @@ pub fn spawn_udp_receiver_from_std_with_telemetry(
 
 fn run_udp_receiver(
     bind_addr: SocketAddr,
-    tx: &mpsc::Sender<RawPacketBatch>,
+    tx: &RawPacketBatchSender,
     telemetry: Option<&ReceiverTelemetry>,
 ) -> Result<(), UdpReceiverError> {
     let std_socket = std::net::UdpSocket::bind(bind_addr)
@@ -171,7 +166,7 @@ fn run_udp_receiver(
 
 fn run_udp_receiver_with_socket(
     std_socket: &std::net::UdpSocket,
-    tx: &mpsc::Sender<RawPacketBatch>,
+    tx: &RawPacketBatchSender,
     telemetry: Option<&ReceiverTelemetry>,
 ) -> Result<(), UdpReceiverError> {
     std_socket

@@ -1,6 +1,8 @@
 //! Submission client implementation and mode orchestration.
 
 use std::{
+    collections::HashSet,
+    net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -8,6 +10,11 @@ use std::{
 use solana_signature::Signature;
 use solana_signer::signers::Signers;
 use solana_transaction::versioned::VersionedTransaction;
+use tokio::{
+    net::TcpStream,
+    task::JoinSet,
+    time::{sleep, timeout},
+};
 
 use super::{
     DirectSubmitConfig, DirectSubmitTransport, RpcSubmitConfig, RpcSubmitTransport, SignedTx,
@@ -225,6 +232,8 @@ impl TxSubmitClient {
             direct_target: None,
             rpc_signature: Some(rpc_signature),
             used_rpc_fallback: false,
+            selected_target_count: 0,
+            selected_identity_count: 0,
         })
     }
 
@@ -239,21 +248,54 @@ impl TxSubmitClient {
             .direct_transport
             .as_ref()
             .ok_or(SubmitError::MissingDirectTransport)?;
-        let targets = select_targets(self.leader_provider.as_ref(), &self.backups, self.policy);
-        if targets.is_empty() {
-            return Err(SubmitError::NoDirectTargets);
-        }
         let direct_config = self.direct_config.clone().normalized();
-        let target = direct
-            .submit_direct(&tx_bytes, &targets, self.policy, &direct_config)
+        let mut last_error = None;
+        let attempt_timeout = direct_attempt_timeout(&direct_config);
+
+        for attempt_idx in 0..direct_config.direct_submit_attempts {
+            let mut targets = self.select_direct_targets(&direct_config).await;
+            rotate_targets_for_attempt(&mut targets, attempt_idx, self.policy);
+            let (selected_target_count, selected_identity_count) = summarize_targets(&targets);
+            if targets.is_empty() {
+                return Err(SubmitError::NoDirectTargets);
+            }
+            match timeout(
+                attempt_timeout,
+                direct.submit_direct(&tx_bytes, &targets, self.policy, &direct_config),
+            )
             .await
-            .map_err(|source| SubmitError::Direct { source })?;
-        Ok(SubmitResult {
-            signature,
-            mode,
-            direct_target: Some(target),
-            rpc_signature: None,
-            used_rpc_fallback: false,
+            {
+                Ok(Ok(target)) => {
+                    self.spawn_agave_rebroadcast(tx_bytes.clone(), &direct_config);
+                    return Ok(SubmitResult {
+                        signature,
+                        mode,
+                        direct_target: Some(target),
+                        rpc_signature: None,
+                        used_rpc_fallback: false,
+                        selected_target_count,
+                        selected_identity_count,
+                    });
+                }
+                Ok(Err(source)) => last_error = Some(source),
+                Err(_elapsed) => {
+                    last_error = Some(super::SubmitTransportError::Failure {
+                        message: format!(
+                            "direct submit attempt timed out after {}ms",
+                            attempt_timeout.as_millis()
+                        ),
+                    });
+                }
+            }
+            if attempt_idx < direct_config.direct_submit_attempts.saturating_sub(1) {
+                sleep(direct_config.rebroadcast_interval).await;
+            }
+        }
+
+        Err(SubmitError::Direct {
+            source: last_error.unwrap_or_else(|| super::SubmitTransportError::Failure {
+                message: "direct submit attempts exhausted".to_owned(),
+            }),
         })
     }
 
@@ -274,21 +316,46 @@ impl TxSubmitClient {
             .ok_or(SubmitError::MissingRpcTransport)?;
 
         let direct_config = self.direct_config.clone().normalized();
-        let targets = select_targets(self.leader_provider.as_ref(), &self.backups, self.policy);
-        if !targets.is_empty() {
-            for _ in 0..direct_config.hybrid_direct_attempts {
-                if let Ok(target) = direct
-                    .submit_direct(&tx_bytes, &targets, self.policy, &direct_config)
-                    .await
+        let attempt_timeout = direct_attempt_timeout(&direct_config);
+        for attempt_idx in 0..direct_config.hybrid_direct_attempts {
+            let mut targets = self.select_direct_targets(&direct_config).await;
+            rotate_targets_for_attempt(&mut targets, attempt_idx, self.policy);
+            let (selected_target_count, selected_identity_count) = summarize_targets(&targets);
+            if targets.is_empty() {
+                break;
+            }
+            if let Ok(Ok(target)) = timeout(
+                attempt_timeout,
+                direct.submit_direct(&tx_bytes, &targets, self.policy, &direct_config),
+            )
+            .await
+            {
+                self.spawn_agave_rebroadcast(tx_bytes.clone(), &direct_config);
+                if direct_config.hybrid_rpc_broadcast
+                    && let Ok(rpc_signature) = rpc.submit_rpc(&tx_bytes, &self.rpc_config).await
                 {
                     return Ok(SubmitResult {
                         signature,
                         mode,
                         direct_target: Some(target),
-                        rpc_signature: None,
+                        rpc_signature: Some(rpc_signature),
                         used_rpc_fallback: false,
+                        selected_target_count,
+                        selected_identity_count,
                     });
                 }
+                return Ok(SubmitResult {
+                    signature,
+                    mode,
+                    direct_target: Some(target),
+                    rpc_signature: None,
+                    used_rpc_fallback: false,
+                    selected_target_count,
+                    selected_identity_count,
+                });
+            }
+            if attempt_idx < direct_config.hybrid_direct_attempts.saturating_sub(1) {
+                sleep(direct_config.rebroadcast_interval).await;
             }
         }
 
@@ -302,6 +369,244 @@ impl TxSubmitClient {
             direct_target: None,
             rpc_signature: Some(rpc_signature),
             used_rpc_fallback: true,
+            selected_target_count: 0,
+            selected_identity_count: 0,
         })
     }
+
+    /// Resolves and ranks the direct targets for the next submission attempt.
+    async fn select_direct_targets(&self, direct_config: &DirectSubmitConfig) -> Vec<LeaderTarget> {
+        select_and_rank_targets(
+            self.leader_provider.as_ref(),
+            &self.backups,
+            self.policy,
+            direct_config,
+        )
+        .await
+    }
+
+    /// Starts the post-ack rebroadcast worker when that reliability mode is enabled.
+    fn spawn_agave_rebroadcast(&self, tx_bytes: Vec<u8>, direct_config: &DirectSubmitConfig) {
+        if !direct_config.agave_rebroadcast_enabled
+            || direct_config.agave_rebroadcast_window.is_zero()
+        {
+            return;
+        }
+        let Some(direct_transport) = self.direct_transport.clone() else {
+            return;
+        };
+        spawn_agave_rebroadcast_task(
+            tx_bytes,
+            direct_transport,
+            self.leader_provider.clone(),
+            self.backups.clone(),
+            self.policy,
+            direct_config.clone(),
+        );
+    }
+}
+
+#[cfg(not(test))]
+/// Replays successful direct submissions for a bounded Agave-like persistence window.
+fn spawn_agave_rebroadcast_task(
+    tx_bytes: Vec<u8>,
+    direct_transport: Arc<dyn DirectSubmitTransport>,
+    leader_provider: Arc<dyn LeaderProvider>,
+    backups: Vec<LeaderTarget>,
+    policy: RoutingPolicy,
+    direct_config: DirectSubmitConfig,
+) {
+    tokio::spawn(async move {
+        let deadline = Instant::now()
+            .checked_add(direct_config.agave_rebroadcast_window)
+            .unwrap_or_else(Instant::now);
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+
+            let sleep_for = deadline
+                .saturating_duration_since(now)
+                .min(direct_config.agave_rebroadcast_interval);
+            if !sleep_for.is_zero() {
+                sleep(sleep_for).await;
+            }
+
+            if Instant::now() >= deadline {
+                break;
+            }
+
+            let targets = select_and_rank_targets(
+                leader_provider.as_ref(),
+                backups.as_slice(),
+                policy,
+                &direct_config,
+            )
+            .await;
+            if targets.is_empty() {
+                continue;
+            }
+
+            drop(
+                timeout(
+                    direct_attempt_timeout(&direct_config),
+                    direct_transport.submit_direct(&tx_bytes, &targets, policy, &direct_config),
+                )
+                .await,
+            );
+        }
+    });
+}
+
+#[cfg(test)]
+/// Test-only stub that disables background rebroadcasting for deterministic assertions.
+fn spawn_agave_rebroadcast_task(
+    _tx_bytes: Vec<u8>,
+    _direct_transport: Arc<dyn DirectSubmitTransport>,
+    _leader_provider: Arc<dyn LeaderProvider>,
+    _backups: Vec<LeaderTarget>,
+    _policy: RoutingPolicy,
+    _direct_config: DirectSubmitConfig,
+) {
+}
+
+/// Selects routing targets and applies optional latency-aware ranking.
+async fn select_and_rank_targets(
+    leader_provider: &dyn LeaderProvider,
+    backups: &[LeaderTarget],
+    policy: RoutingPolicy,
+    direct_config: &DirectSubmitConfig,
+) -> Vec<LeaderTarget> {
+    let targets = select_targets(leader_provider, backups, policy);
+    rank_targets_by_latency(targets, direct_config).await
+}
+
+/// Reorders the probe set by observed TCP connect latency while preserving the tail order.
+async fn rank_targets_by_latency(
+    targets: Vec<LeaderTarget>,
+    direct_config: &DirectSubmitConfig,
+) -> Vec<LeaderTarget> {
+    if targets.len() <= 1 || !direct_config.latency_aware_targeting {
+        return targets;
+    }
+
+    let probe_count = targets
+        .len()
+        .min(direct_config.latency_probe_max_targets.max(1));
+    let mut latencies = vec![None; probe_count];
+    let mut probes = JoinSet::new();
+    for (idx, target) in targets.iter().take(probe_count).cloned().enumerate() {
+        let cfg = direct_config.clone();
+        probes.spawn(async move { (idx, probe_target_latency(&target, &cfg).await) });
+    }
+    while let Some(result) = probes.join_next().await {
+        if let Ok((idx, latency)) = result
+            && idx < latencies.len()
+            && let Some(slot) = latencies.get_mut(idx)
+        {
+            *slot = latency;
+        }
+    }
+
+    let mut ranked = targets
+        .iter()
+        .take(probe_count)
+        .cloned()
+        .enumerate()
+        .collect::<Vec<_>>();
+    ranked.sort_by_key(|(idx, _target)| {
+        (
+            latencies.get(*idx).copied().flatten().unwrap_or(u128::MAX),
+            *idx,
+        )
+    });
+
+    let mut output = ranked
+        .into_iter()
+        .map(|(_idx, target)| target)
+        .collect::<Vec<_>>();
+    output.extend(targets.iter().skip(probe_count).cloned());
+    output
+}
+
+/// Probes a target's candidate ports and keeps the best observed connect latency.
+async fn probe_target_latency(
+    target: &LeaderTarget,
+    direct_config: &DirectSubmitConfig,
+) -> Option<u128> {
+    let mut ports = vec![target.tpu_addr.port()];
+    if let Some(port) = direct_config.latency_probe_port
+        && port != target.tpu_addr.port()
+    {
+        ports.push(port);
+    }
+
+    let ip = target.tpu_addr.ip();
+    let mut best = None::<u128>;
+    for port in ports {
+        if let Some(latency) =
+            probe_tcp_latency(ip, port, direct_config.latency_probe_timeout).await
+        {
+            best = Some(best.map_or(latency, |current| current.min(latency)));
+        }
+    }
+    best
+}
+
+/// Measures one TCP connect attempt and returns elapsed milliseconds on success.
+async fn probe_tcp_latency(
+    ip: std::net::IpAddr,
+    port: u16,
+    timeout_duration: Duration,
+) -> Option<u128> {
+    let start = Instant::now();
+    let addr = SocketAddr::new(ip, port);
+    let stream = timeout(timeout_duration, TcpStream::connect(addr))
+        .await
+        .ok()?
+        .ok()?;
+    drop(stream);
+    Some(start.elapsed().as_millis())
+}
+
+/// Summarizes the selected target list for observability.
+fn summarize_targets(targets: &[LeaderTarget]) -> (usize, usize) {
+    let selected_target_count = targets.len();
+    let selected_identity_count = targets
+        .iter()
+        .filter_map(|target| target.identity)
+        .collect::<HashSet<_>>()
+        .len();
+    (selected_target_count, selected_identity_count)
+}
+
+/// Rotates the target ordering between attempts to spread retries across candidates.
+fn rotate_targets_for_attempt(
+    targets: &mut [LeaderTarget],
+    attempt_idx: usize,
+    policy: RoutingPolicy,
+) {
+    if attempt_idx == 0 || targets.len() <= 1 {
+        return;
+    }
+
+    let normalized = policy.normalized();
+    let stride = normalized.max_parallel_sends.max(1);
+    let rotation = attempt_idx
+        .saturating_mul(stride)
+        .checked_rem(targets.len())
+        .unwrap_or(0);
+    if rotation > 0 {
+        targets.rotate_left(rotation);
+    }
+}
+
+/// Bounds one submit attempt so retry loops cannot hang indefinitely.
+fn direct_attempt_timeout(direct_config: &DirectSubmitConfig) -> Duration {
+    direct_config
+        .global_timeout
+        .saturating_add(direct_config.per_target_timeout)
+        .saturating_add(direct_config.rebroadcast_interval)
+        .max(Duration::from_secs(8))
 }

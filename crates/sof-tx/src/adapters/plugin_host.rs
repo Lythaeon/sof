@@ -15,6 +15,8 @@ use sof::framework::{
 use solana_pubkey::Pubkey;
 
 use crate::providers::{LeaderProvider, LeaderTarget, RecentBlockhashProvider};
+/// Agave's TPU QUIC port is derived by adding this offset to the TPU UDP port.
+const AGAVE_QUIC_PORT_OFFSET: u16 = 6;
 
 /// Configuration for [`PluginHostTxProviderAdapter`].
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -44,7 +46,7 @@ impl Default for PluginHostTxProviderAdapterConfig {
     fn default() -> Self {
         Self {
             max_leader_slots: 2_048,
-            max_next_leaders: 8,
+            max_next_leaders: 128,
         }
     }
 }
@@ -114,14 +116,16 @@ impl PluginHostTxProviderAdapter {
     /// Inserts or updates one TPU address mapping for a leader identity.
     pub fn set_leader_tpu_addr(&self, identity: Pubkey, tpu_addr: SocketAddr) {
         self.with_state_write(move |state| {
-            let _ = state.tpu_by_identity.insert(identity, tpu_addr);
+            let ingress = state.ingress_by_identity.entry(identity).or_default();
+            ingress.tpu = Some(tpu_addr);
+            ingress.tpu_quic = with_agave_quic_fallback(Some(tpu_addr), ingress.tpu_quic);
         });
     }
 
     /// Removes one TPU address mapping for a leader identity.
     pub fn remove_leader_tpu_addr(&self, identity: Pubkey) {
         self.with_state_write(move |state| {
-            let _ = state.tpu_by_identity.remove(&identity);
+            let _ = state.ingress_by_identity.remove(&identity);
         });
     }
 
@@ -129,11 +133,12 @@ impl PluginHostTxProviderAdapter {
     #[must_use]
     fn leader_window(&self, next_leaders: usize) -> Vec<LeaderTarget> {
         let capped_next = next_leaders.min(self.config.max_next_leaders);
-        let requested = capped_next.saturating_add(1);
-        if requested == 0 {
+        let requested_identities = capped_next.saturating_add(1);
+        if requested_identities == 0 {
             return Vec::new();
         }
-        collect_leader_targets_from_state(&self.state.shared_get(), requested)
+        let requested_targets = requested_identities.saturating_mul(4);
+        collect_leader_targets_from_state(&self.state.shared_get(), requested_targets)
     }
 
     /// Updates adapter state behind write lock when available.
@@ -179,8 +184,41 @@ impl LeaderProvider for PluginHostTxProviderAdapter {
         if n == 0 {
             return Vec::new();
         }
-        self.leader_window(n).into_iter().skip(1).take(n).collect()
+        take_next_leader_identity_targets(self.leader_window(n), n)
     }
+}
+
+/// Returns targets for the next distinct leader identities after the current leader.
+fn take_next_leader_identity_targets(
+    window: Vec<LeaderTarget>,
+    requested_identities: usize,
+) -> Vec<LeaderTarget> {
+    if requested_identities == 0 || window.is_empty() {
+        return Vec::new();
+    }
+
+    let current_identity = window.first().and_then(|target| target.identity);
+    let mut seen_identities = HashSet::new();
+    let mut out = Vec::new();
+
+    for target in window {
+        let Some(identity) = target.identity else {
+            continue;
+        };
+        if current_identity.is_some() && Some(identity) == current_identity {
+            continue;
+        }
+
+        let is_new_identity = seen_identities.insert(identity);
+        if is_new_identity && seen_identities.len() > requested_identities {
+            break;
+        }
+        if seen_identities.len() <= requested_identities {
+            out.push(target);
+        }
+    }
+
+    out
 }
 
 #[async_trait]
@@ -224,8 +262,8 @@ struct AdapterState {
     leader_by_slot: BTreeMap<u64, Pubkey>,
     /// Most recent slot cursor from leader-schedule events.
     leader_slot_cursor: Option<u64>,
-    /// TPU endpoints keyed by validator identity.
-    tpu_by_identity: HashMap<Pubkey, SocketAddr>,
+    /// Ingress endpoints keyed by validator identity.
+    ingress_by_identity: HashMap<Pubkey, NodeIngress>,
 }
 
 impl AdapterState {
@@ -245,29 +283,58 @@ impl AdapterState {
     }
 }
 
-/// Applies one topology event to TPU endpoint state.
-fn apply_cluster_topology(state: &mut AdapterState, event: &ClusterTopologyEvent) {
-    if !event.snapshot_nodes.is_empty() {
-        state.tpu_by_identity.clear();
-        insert_node_tpus(&event.snapshot_nodes, &mut state.tpu_by_identity);
-    }
-    insert_node_tpus(&event.added_nodes, &mut state.tpu_by_identity);
-    insert_node_tpus(&event.updated_nodes, &mut state.tpu_by_identity);
-    for pubkey in &event.removed_pubkeys {
-        let _ = state.tpu_by_identity.remove(pubkey);
+/// Cached ingress endpoints for one validator identity.
+#[derive(Debug, Clone, Default)]
+struct NodeIngress {
+    /// TPU UDP ingress endpoint.
+    tpu: Option<SocketAddr>,
+    /// TPU QUIC ingress endpoint.
+    tpu_quic: Option<SocketAddr>,
+    /// TPU forwards UDP ingress endpoint.
+    tpu_forwards: Option<SocketAddr>,
+    /// TPU forwards QUIC ingress endpoint.
+    tpu_forwards_quic: Option<SocketAddr>,
+}
+
+impl NodeIngress {
+    /// Returns `true` when the node currently exposes no usable ingress address.
+    const fn is_empty(&self) -> bool {
+        self.tpu.is_none()
+            && self.tpu_quic.is_none()
+            && self.tpu_forwards.is_none()
+            && self.tpu_forwards_quic.is_none()
     }
 }
 
-/// Inserts node TPU mappings into lookup map.
-fn insert_node_tpus(nodes: &[ClusterNodeInfo], tpu_by_identity: &mut HashMap<Pubkey, SocketAddr>) {
+/// Applies one topology event to TPU endpoint state.
+fn apply_cluster_topology(state: &mut AdapterState, event: &ClusterTopologyEvent) {
+    if !event.snapshot_nodes.is_empty() {
+        state.ingress_by_identity.clear();
+        insert_node_ingresses(&event.snapshot_nodes, &mut state.ingress_by_identity);
+    }
+    insert_node_ingresses(&event.added_nodes, &mut state.ingress_by_identity);
+    insert_node_ingresses(&event.updated_nodes, &mut state.ingress_by_identity);
+    for pubkey in &event.removed_pubkeys {
+        let _ = state.ingress_by_identity.remove(pubkey);
+    }
+}
+
+/// Inserts node ingress mappings into lookup map.
+fn insert_node_ingresses(
+    nodes: &[ClusterNodeInfo],
+    ingress_by_identity: &mut HashMap<Pubkey, NodeIngress>,
+) {
     for node in nodes {
-        match node.tpu {
-            Some(tpu_addr) => {
-                let _ = tpu_by_identity.insert(node.pubkey, tpu_addr);
-            }
-            None => {
-                let _ = tpu_by_identity.remove(&node.pubkey);
-            }
+        let ingress = NodeIngress {
+            tpu: node.tpu,
+            tpu_quic: with_agave_quic_fallback(node.tpu, node.tpu_quic),
+            tpu_forwards: node.tpu_forwards,
+            tpu_forwards_quic: with_agave_quic_fallback(node.tpu_forwards, node.tpu_forwards_quic),
+        };
+        if ingress.is_empty() {
+            let _ = ingress_by_identity.remove(&node.pubkey);
+        } else {
+            let _ = ingress_by_identity.insert(node.pubkey, ingress);
         }
     }
 }
@@ -330,6 +397,9 @@ fn cap_leader_slots(state: &mut AdapterState, max_leader_slots: usize) {
 fn collect_leader_targets_from_state(state: &AdapterState, requested: usize) -> Vec<LeaderTarget> {
     let mut selected = Vec::new();
     let mut seen_addrs = HashSet::new();
+    if requested == 0 {
+        return selected;
+    }
 
     if let Some(cursor) = state.leader_slot_cursor {
         append_targets(
@@ -364,6 +434,37 @@ fn collect_leader_targets_from_state(state: &AdapterState, requested: usize) -> 
         );
     }
 
+    if selected.len() < requested && !state.ingress_by_identity.is_empty() {
+        let mut topology_targets = state
+            .ingress_by_identity
+            .iter()
+            .map(|(identity, ingress)| (*identity, ingress.clone()))
+            .collect::<Vec<_>>();
+        topology_targets.sort_unstable_by_key(|(identity, _ingress)| identity.to_bytes());
+        for (identity, ingress) in topology_targets {
+            if selected.len() >= requested {
+                break;
+            }
+            for candidate in [
+                ingress.tpu_quic,
+                ingress.tpu_forwards_quic,
+                ingress.tpu,
+                ingress.tpu_forwards,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if selected.len() >= requested {
+                    break;
+                }
+                if !seen_addrs.insert(candidate) {
+                    continue;
+                }
+                selected.push(LeaderTarget::new(Some(identity), candidate));
+            }
+        }
+    }
+
     selected
 }
 
@@ -381,13 +482,38 @@ fn append_targets<'leader, I>(
         if selected.len() >= requested {
             break;
         }
-        let tpu_addr = state.tpu_by_identity.get(leader).copied();
-        if let Some(tpu_addr) = tpu_addr
-            && seen_addrs.insert(tpu_addr)
-        {
-            selected.push(LeaderTarget::new(Some(*leader), tpu_addr));
+        let Some(ingress) = state.ingress_by_identity.get(leader) else {
+            continue;
+        };
+        let candidate_addrs = [
+            ingress.tpu_quic,
+            ingress.tpu_forwards_quic,
+            ingress.tpu,
+            ingress.tpu_forwards,
+        ];
+        for candidate in candidate_addrs.into_iter().flatten() {
+            if selected.len() >= requested {
+                break;
+            }
+            if !seen_addrs.insert(candidate) {
+                continue;
+            }
+            selected.push(LeaderTarget::new(Some(*leader), candidate));
         }
     }
+}
+
+/// Uses an explicit QUIC address when present, otherwise derives Agave's default.
+fn with_agave_quic_fallback(
+    udp_addr: Option<SocketAddr>,
+    quic_addr: Option<SocketAddr>,
+) -> Option<SocketAddr> {
+    quic_addr.or_else(|| {
+        let mut addr = udp_addr?;
+        let port = addr.port().checked_add(AGAVE_QUIC_PORT_OFFSET)?;
+        addr.set_port(port);
+        Some(addr)
+    })
 }
 
 #[cfg(test)]
@@ -406,6 +532,30 @@ mod tests {
             shred_version: 0,
             gossip: None,
             tpu: Some(addr(tpu_port)),
+            tpu_quic: None,
+            tpu_forwards: None,
+            tpu_forwards_quic: None,
+            tpu_vote: None,
+            tvu: None,
+            rpc: None,
+        }
+    }
+
+    fn node_with_forwards(
+        pubkey: Pubkey,
+        tpu_port: u16,
+        tpu_forwards_port: u16,
+    ) -> ClusterNodeInfo {
+        ClusterNodeInfo {
+            pubkey,
+            wallclock: 0,
+            shred_version: 0,
+            gossip: None,
+            tpu: Some(addr(tpu_port)),
+            tpu_quic: None,
+            tpu_forwards: Some(addr(tpu_forwards_port)),
+            tpu_forwards_quic: None,
+            tpu_vote: None,
             tvu: None,
             rpc: None,
         }
@@ -491,13 +641,87 @@ mod tests {
             .await;
 
         let current = adapter.current_leader();
-        assert_eq!(current, Some(LeaderTarget::new(Some(leader_a), addr(9001))));
+        assert_eq!(current, Some(LeaderTarget::new(Some(leader_a), addr(9007))));
 
         let next = adapter.next_leaders(2);
-        let expected_b = LeaderTarget::new(Some(leader_b), addr(9002));
-        let expected_c = LeaderTarget::new(Some(leader_c), addr(9003));
+        let expected_b = LeaderTarget::new(Some(leader_b), addr(9008));
+        let expected_c = LeaderTarget::new(Some(leader_c), addr(9009));
         assert_eq!(next.first(), Some(&expected_b));
-        assert_eq!(next.get(1), Some(&expected_c));
+        assert!(next.contains(&expected_c));
+    }
+
+    #[tokio::test]
+    async fn adapter_falls_back_to_topology_when_schedule_is_unmapped() {
+        let adapter = PluginHostTxProviderAdapter::default();
+        let unmapped_leader = Pubkey::new_unique();
+        let topo_a = Pubkey::new_unique();
+        let topo_b = Pubkey::new_unique();
+
+        adapter
+            .on_cluster_topology(topology_snapshot(vec![
+                node(topo_b, 9122),
+                node(topo_a, 9121),
+            ]))
+            .await;
+        adapter
+            .on_leader_schedule(leader_snapshot(
+                100,
+                vec![LeaderScheduleEntry {
+                    slot: 100,
+                    leader: unmapped_leader,
+                }],
+            ))
+            .await;
+
+        let current = adapter.current_leader();
+        assert_eq!(current, Some(LeaderTarget::new(Some(topo_a), addr(9127))));
+
+        let next = adapter.next_leaders(1);
+        assert_eq!(
+            next,
+            vec![
+                LeaderTarget::new(Some(topo_b), addr(9128)),
+                LeaderTarget::new(Some(topo_b), addr(9122)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn adapter_next_leaders_skip_current_identity_and_return_next_identity() {
+        let adapter = PluginHostTxProviderAdapter::default();
+        let leader_a = Pubkey::new_unique();
+        let leader_b = Pubkey::new_unique();
+
+        adapter
+            .on_cluster_topology(topology_snapshot(vec![
+                node_with_forwards(leader_a, 9041, 9042),
+                node(leader_b, 9043),
+            ]))
+            .await;
+        adapter
+            .on_leader_schedule(leader_snapshot(
+                100,
+                vec![
+                    LeaderScheduleEntry {
+                        slot: 100,
+                        leader: leader_a,
+                    },
+                    LeaderScheduleEntry {
+                        slot: 101,
+                        leader: leader_b,
+                    },
+                ],
+            ))
+            .await;
+
+        let current = adapter.current_leader();
+        assert_eq!(current, Some(LeaderTarget::new(Some(leader_a), addr(9047))));
+
+        let next = adapter.next_leaders(1);
+        assert_eq!(
+            next.first(),
+            Some(&LeaderTarget::new(Some(leader_b), addr(9049)))
+        );
     }
 
     #[tokio::test]
@@ -536,12 +760,12 @@ mod tests {
             .await;
 
         let current = adapter.current_leader();
-        assert_eq!(current, Some(LeaderTarget::new(Some(leader_c), addr(9013))));
+        assert_eq!(current, Some(LeaderTarget::new(Some(leader_c), addr(9019))));
 
         let next = adapter.next_leaders(1);
         assert_eq!(
             next.first(),
-            Some(&LeaderTarget::new(Some(leader_b), addr(9012)))
+            Some(&LeaderTarget::new(Some(leader_b), addr(9018)))
         );
     }
 
@@ -574,7 +798,7 @@ mod tests {
         adapter.flush().await;
         assert_eq!(
             adapter.current_leader(),
-            Some(LeaderTarget::new(Some(leader), addr(9021)))
+            Some(LeaderTarget::new(Some(leader), addr(9027)))
         );
     }
 }

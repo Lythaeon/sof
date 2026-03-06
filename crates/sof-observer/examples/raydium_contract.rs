@@ -67,6 +67,10 @@ impl Plugin for RaydiumTxFilterLoggerPlugin {
         "raydium-tx-filter-logger"
     }
 
+    fn wants_transaction(&self) -> bool {
+        true
+    }
+
     async fn on_transaction(&self, event: TransactionEvent) {
         let Some(touched) = classify_raydium_transaction(&event) else {
             return;

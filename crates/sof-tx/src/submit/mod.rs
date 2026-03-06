@@ -4,6 +4,9 @@
 mod client;
 /// UDP direct transport implementation.
 mod direct;
+#[cfg(feature = "kernel-bypass")]
+/// Kernel-bypass direct transport hooks for `kernel-bypass` integrations.
+mod kernel_bypass;
 /// JSON-RPC transport implementation.
 mod rpc;
 #[cfg(test)]
@@ -14,6 +17,8 @@ mod types;
 
 pub use client::TxSubmitClient;
 pub use direct::UdpDirectTransport;
+#[cfg(feature = "kernel-bypass")]
+pub use kernel_bypass::{KernelBypassDatagramSocket, KernelBypassDirectTransport};
 pub use rpc::JsonRpcTransport;
 pub use types::{
     DirectSubmitConfig, DirectSubmitTransport, RpcSubmitConfig, RpcSubmitTransport, SignedTx,

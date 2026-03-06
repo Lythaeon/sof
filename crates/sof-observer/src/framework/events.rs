@@ -67,6 +67,29 @@ pub struct TransactionEvent {
     pub kind: TxKind,
 }
 
+#[derive(Debug, Clone)]
+/// Runtime event emitted for each decoded transaction's touched account set.
+pub struct AccountTouchEvent {
+    /// Slot containing this transaction.
+    pub slot: u64,
+    /// Commitment status for this transaction slot when event was emitted.
+    pub commitment_status: TxCommitmentStatus,
+    /// Latest observed confirmed slot watermark when event was emitted.
+    pub confirmed_slot: Option<u64>,
+    /// Latest observed finalized slot watermark when event was emitted.
+    pub finalized_slot: Option<u64>,
+    /// Transaction signature if present.
+    pub signature: Option<Signature>,
+    /// All static message account keys present on the transaction.
+    pub account_keys: Arc<Vec<Pubkey>>,
+    /// Writable static message account keys inferred from the versioned message header.
+    pub writable_account_keys: Arc<Vec<Pubkey>>,
+    /// Read-only static message account keys inferred from the versioned message header.
+    pub readonly_account_keys: Arc<Vec<Pubkey>>,
+    /// Lookup table account pubkeys referenced by the message itself.
+    pub lookup_table_account_keys: Arc<Vec<Pubkey>>,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 /// Runtime event emitted when local canonical classification for one slot changes.
 pub struct SlotStatusEvent {
@@ -138,6 +161,14 @@ pub struct ClusterNodeInfo {
     pub gossip: Option<SocketAddr>,
     /// TPU endpoint when present.
     pub tpu: Option<SocketAddr>,
+    /// TPU QUIC endpoint when present.
+    pub tpu_quic: Option<SocketAddr>,
+    /// TPU-forwards endpoint when present.
+    pub tpu_forwards: Option<SocketAddr>,
+    /// TPU-forwards QUIC endpoint when present.
+    pub tpu_forwards_quic: Option<SocketAddr>,
+    /// TPU-vote endpoint when present.
+    pub tpu_vote: Option<SocketAddr>,
     /// TVU endpoint when present.
     pub tvu: Option<SocketAddr>,
     /// RPC endpoint when present.

@@ -1,4 +1,5 @@
 use super::*;
+use crate::framework::AccountTouchEvent;
 
 #[derive(Clone)]
 /// Shared sender/counters for asynchronous plugin event delivery.
@@ -70,6 +71,8 @@ pub(super) enum PluginDispatchEvent {
     Dataset(DatasetEvent),
     /// Decoded transaction callback payload.
     Transaction(TransactionEvent),
+    /// Static account-touch callback payload.
+    AccountTouch(AccountTouchEvent),
     /// Slot-status callback payload.
     SlotStatus(SlotStatusEvent),
     /// Canonical reorg callback payload.
@@ -153,13 +156,16 @@ async fn dispatch_event(
             .await
         }
         PluginDispatchEvent::Transaction(event) => {
+            dispatch_transaction_hook_event(plugins, event, dispatch_mode).await
+        }
+        PluginDispatchEvent::AccountTouch(event) => {
             dispatch_hook_event(
                 plugins,
-                "on_transaction",
+                "on_account_touch",
                 event,
                 dispatch_mode,
                 |plugin, hook_event| async move {
-                    plugin.on_transaction(hook_event).await;
+                    plugin.on_account_touch(hook_event).await;
                 },
             )
             .await
@@ -225,6 +231,33 @@ async fn dispatch_event(
             .await
         }
     }
+}
+
+/// Dispatches transaction callbacks only to plugins that accept the event.
+async fn dispatch_transaction_hook_event(
+    plugins: &[Arc<dyn ObserverPlugin>],
+    event: TransactionEvent,
+    dispatch_mode: PluginDispatchMode,
+) {
+    let interested_plugins = plugins
+        .iter()
+        .filter(|plugin| plugin.wants_transaction() && plugin.accepts_transaction(&event))
+        .cloned()
+        .collect::<Vec<_>>();
+    if interested_plugins.is_empty() {
+        return;
+    }
+
+    dispatch_hook_event(
+        interested_plugins.as_slice(),
+        "on_transaction",
+        event,
+        dispatch_mode,
+        |plugin, hook_event| async move {
+            plugin.on_transaction(hook_event).await;
+        },
+    )
+    .await;
 }
 
 /// Dispatches one hook payload to all plugins using the selected dispatch strategy.

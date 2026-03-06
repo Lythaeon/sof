@@ -11,12 +11,16 @@ homepage = "https://github.com/Lythaeon/sof"
 keywords = ["solana", "observer", "shreds", "plugins", "ingestion"]
 categories = ["network-programming", "cryptography::cryptocurrencies"]
 
+[package.metadata.docs.rs]
+rustdoc-args = ["--html-no-source"]
+
 [lints]
 workspace = true
 
 [features]
 default = []
 gossip-bootstrap = ["dep:solana-gossip"]
+kernel-bypass = ["dep:xdp"]
 
 [dependencies]
 solana-gossip = { version = "3.1.8", optional = true, features = ["agave-unstable-api"] }
@@ -50,6 +54,7 @@ crossbeam-skiplist = "0.1"
 async-trait = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+xdp = { version = "0.7.3", optional = true }
 
 [[example]]
 name = "non_vote_tx_logger"
@@ -94,3 +99,11 @@ path = "examples/runtime_extension_with_plugins.rs"
 [[example]]
 name = "runtime_extension_websocket_connector"
 path = "examples/runtime_extension_websocket_connector.rs"
+
+[[example]]
+name = "kernel_bypass_ingress_metrics"
+path = "examples/kernel_bypass_ingress_metrics.rs"
+
+[[example]]
+name = "af_xdp_kernel_bypass_ingress_metrics"
+path = "examples/af_xdp_kernel_bypass_ingress_metrics.rs"

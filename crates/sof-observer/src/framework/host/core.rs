@@ -1,6 +1,7 @@
 use super::dispatch::{PluginDispatchEvent, PluginDispatcher};
 use super::state::{ObservedRecentBlockhashState, ObservedTpuLeaderState};
 use super::*;
+use crate::framework::AccountTouchEvent;
 
 /// Immutable plugin registry and async event dispatcher.
 #[derive(Clone)]
@@ -9,6 +10,8 @@ pub struct PluginHost {
     pub(super) plugins: Arc<[Arc<dyn ObserverPlugin>]>,
     /// Optional async dispatcher state (absent when no plugins are registered).
     pub(super) dispatcher: Option<PluginDispatcher>,
+    /// Hook-interest bitmap so unused hooks never enter the async queue.
+    pub(super) subscriptions: PluginHookSubscriptions,
     /// Latest observed recent blockhash snapshot.
     pub(super) latest_observed_recent_blockhash: Arc<RwLock<Option<ObservedRecentBlockhashState>>>,
     /// Latest observed TPU leader snapshot.
@@ -20,6 +23,7 @@ impl Default for PluginHost {
         Self {
             plugins: Arc::from(Vec::<Arc<dyn ObserverPlugin>>::new()),
             dispatcher: None,
+            subscriptions: PluginHookSubscriptions::default(),
             latest_observed_recent_blockhash: Arc::new(RwLock::new(None)),
             latest_observed_tpu_leader: Arc::new(RwLock::new(None)),
         }
@@ -88,42 +92,66 @@ impl PluginHost {
 
     /// Enqueues raw packet hook to registered plugins.
     pub fn on_raw_packet(&self, event: RawPacketEvent) {
-        if let Some(dispatcher) = &self.dispatcher {
+        if self.subscriptions.raw_packet
+            && let Some(dispatcher) = &self.dispatcher
+        {
             dispatcher.dispatch("on_raw_packet", PluginDispatchEvent::RawPacket(event));
         }
     }
 
     /// Enqueues parsed shred hook to registered plugins.
     pub fn on_shred(&self, event: ShredEvent) {
-        if let Some(dispatcher) = &self.dispatcher {
+        if self.subscriptions.shred
+            && let Some(dispatcher) = &self.dispatcher
+        {
             dispatcher.dispatch("on_shred", PluginDispatchEvent::Shred(event));
         }
     }
 
     /// Enqueues reconstructed dataset hook to registered plugins.
     pub fn on_dataset(&self, event: DatasetEvent) {
-        if let Some(dispatcher) = &self.dispatcher {
+        if self.subscriptions.dataset
+            && let Some(dispatcher) = &self.dispatcher
+        {
             dispatcher.dispatch("on_dataset", PluginDispatchEvent::Dataset(event));
         }
     }
 
     /// Enqueues reconstructed transaction hook to registered plugins.
     pub fn on_transaction(&self, event: TransactionEvent) {
-        if let Some(dispatcher) = &self.dispatcher {
+        let any_interested = self.subscriptions.transaction
+            && self
+                .plugins
+                .iter()
+                .any(|plugin| plugin.wants_transaction() && plugin.accepts_transaction(&event));
+        if any_interested && let Some(dispatcher) = &self.dispatcher {
             dispatcher.dispatch("on_transaction", PluginDispatchEvent::Transaction(event));
+        }
+    }
+
+    /// Enqueues account-touch hook to registered plugins.
+    pub fn on_account_touch(&self, event: AccountTouchEvent) {
+        if self.subscriptions.account_touch
+            && let Some(dispatcher) = &self.dispatcher
+        {
+            dispatcher.dispatch("on_account_touch", PluginDispatchEvent::AccountTouch(event));
         }
     }
 
     /// Enqueues slot-status transition hook to registered plugins.
     pub fn on_slot_status(&self, event: SlotStatusEvent) {
-        if let Some(dispatcher) = &self.dispatcher {
+        if self.subscriptions.slot_status
+            && let Some(dispatcher) = &self.dispatcher
+        {
             dispatcher.dispatch("on_slot_status", PluginDispatchEvent::SlotStatus(event));
         }
     }
 
     /// Enqueues canonical reorg hook to registered plugins.
     pub fn on_reorg(&self, event: ReorgEvent) {
-        if let Some(dispatcher) = &self.dispatcher {
+        if self.subscriptions.reorg
+            && let Some(dispatcher) = &self.dispatcher
+        {
             dispatcher.dispatch("on_reorg", PluginDispatchEvent::Reorg(event));
         }
     }
@@ -162,7 +190,10 @@ impl PluginHost {
                     true
                 }
             });
-        if should_emit && let Some(dispatcher) = &self.dispatcher {
+        if should_emit
+            && self.subscriptions.recent_blockhash
+            && let Some(dispatcher) = &self.dispatcher
+        {
             dispatcher.dispatch(
                 "on_recent_blockhash",
                 PluginDispatchEvent::ObservedRecentBlockhash(event),
@@ -172,7 +203,9 @@ impl PluginHost {
 
     /// Enqueues cluster topology diff/snapshot hook to registered plugins.
     pub fn on_cluster_topology(&self, event: ClusterTopologyEvent) {
-        if let Some(dispatcher) = &self.dispatcher {
+        if self.subscriptions.cluster_topology
+            && let Some(dispatcher) = &self.dispatcher
+        {
             dispatcher.dispatch(
                 "on_cluster_topology",
                 PluginDispatchEvent::ClusterTopology(event),
@@ -209,7 +242,9 @@ impl PluginHost {
                 Some(_) => {}
             }
         }
-        if let Some(dispatcher) = &self.dispatcher {
+        if self.subscriptions.leader_schedule
+            && let Some(dispatcher) = &self.dispatcher
+        {
             dispatcher.dispatch(
                 "on_leader_schedule",
                 PluginDispatchEvent::LeaderSchedule(event),

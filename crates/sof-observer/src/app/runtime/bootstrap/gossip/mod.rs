@@ -4,6 +4,8 @@ mod receiver;
 #[cfg(feature = "gossip-bootstrap")]
 mod switch;
 
+#[cfg(feature = "kernel-bypass")]
+pub(crate) use receiver::start_external_receiver;
 pub(crate) use receiver::{ReceiverBootstrapError, start_receiver};
 #[cfg(feature = "gossip-bootstrap")]
 pub(crate) use switch::maybe_switch_gossip_runtime;

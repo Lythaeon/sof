@@ -16,7 +16,10 @@ pub mod signing;
 /// Submission client and mode orchestration.
 pub mod submit;
 
-pub use builder::{BuilderError, DEFAULT_DEVELOPER_TIP_LAMPORTS, TxBuilder, UnsignedTx};
+pub use builder::{
+    BuilderError, DEFAULT_DEVELOPER_TIP_LAMPORTS, MAX_TRANSACTION_ACCOUNT_LOCKS,
+    MAX_TRANSACTION_WIRE_BYTES, TxBuilder, TxMessageVersion, UnsignedTx,
+};
 pub use providers::{LeaderProvider, LeaderTarget, RecentBlockhashProvider};
 pub use routing::{RoutingPolicy, SignatureDeduper};
 pub use signing::SignerRef;
@@ -24,3 +27,5 @@ pub use submit::{
     DirectSubmitConfig, RpcSubmitConfig, SignedTx, SubmitError, SubmitMode, SubmitReliability,
     SubmitResult, SubmitTransportError, TxSubmitClient,
 };
+#[cfg(feature = "kernel-bypass")]
+pub use submit::{KernelBypassDatagramSocket, KernelBypassDirectTransport};

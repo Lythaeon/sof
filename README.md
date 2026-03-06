@@ -5,6 +5,11 @@ SOF is a Solana-focused Rust workspace with two user-facing crates:
 1. `sof` (`crates/sof-observer`): low-latency observer runtime and active relay client for shred ingest, bounded cache/serve, shred propagation to peers, dataset reconstruction, plugin-driven events, local fork/reorg tracking, and tx commitment tagging (`processed`/`confirmed`/`finalized`) without RPC dependency.
 2. `sof-tx` (`crates/sof-tx`): transaction SDK for building, signing, and submitting transactions with RPC/direct/hybrid routing.
 
+Kernel-bypass integrations:
+
+- `sof` supports external packet ingress via `--features kernel-bypass` runtime APIs.
+- `sof-tx` supports custom kernel-bypass direct transport adapters via `--features kernel-bypass`.
+
 ## Pick Your Starting Point
 
 - Building a runtime observer: see `crates/sof-observer/README.md`.

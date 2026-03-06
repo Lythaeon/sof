@@ -52,6 +52,11 @@ pub fn select_targets(
     let policy = policy.normalized();
     let mut seen = HashSet::new();
     let mut selected = Vec::new();
+    let dynamic_backup_count = if backups.is_empty() {
+        policy.backup_validators
+    } else {
+        0
+    };
 
     if let Some(current) = leader_provider.current_leader()
         && seen.insert(current.tpu_addr)
@@ -59,7 +64,8 @@ pub fn select_targets(
         selected.push(current);
     }
 
-    for target in leader_provider.next_leaders(policy.next_leaders) {
+    let requested_next = policy.next_leaders.saturating_add(dynamic_backup_count);
+    for target in leader_provider.next_leaders(requested_next) {
         if seen.insert(target.tpu_addr) {
             selected.push(target);
         }
@@ -149,6 +155,33 @@ mod tests {
         assert_eq!(
             selected,
             vec![target(9001), target(9002), target(9003), target(9004)]
+        );
+    }
+
+    #[test]
+    fn select_targets_uses_dynamic_backups_when_static_backups_are_absent() {
+        let provider = StaticLeaderProvider::new(
+            Some(target(9010)),
+            vec![target(9011), target(9012), target(9013), target(9014)],
+        );
+        let selected = select_targets(
+            &provider,
+            &[],
+            RoutingPolicy {
+                next_leaders: 2,
+                backup_validators: 2,
+                max_parallel_sends: 8,
+            },
+        );
+        assert_eq!(
+            selected,
+            vec![
+                target(9010),
+                target(9011),
+                target(9012),
+                target(9013),
+                target(9014)
+            ]
         );
     }
 

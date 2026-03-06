@@ -31,6 +31,14 @@ impl Plugin for TpuLeaderLoggerPlugin {
         "tpu-leader-logger"
     }
 
+    fn wants_cluster_topology(&self) -> bool {
+        true
+    }
+
+    fn wants_leader_schedule(&self) -> bool {
+        true
+    }
+
     async fn on_cluster_topology(&self, event: ClusterTopologyEvent) {
         let mut state = self.state.lock().await;
 
