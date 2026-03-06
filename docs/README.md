@@ -1,28 +1,42 @@
 # SOF Docs
 
-This folder contains architecture and operations documentation for the SOF workspace.
+This folder is the documentation index for the SOF workspace.
 
-## Where To Read First
+Use it as the entry point for architecture references, operations guides, and crate-level setup docs.
 
-1. Runtime observer users:
-   - `../crates/sof-observer/README.md`
-   - `operations/README.md`
-2. Transaction SDK users:
-   - `../crates/sof-tx/README.md`
-   - `architecture/adr/0006-transaction-sdk-and-dual-submit-routing.md`
-3. Contributors:
-   - `../CONTRIBUTING.md`
-   - `architecture/README.md`
+## Start Here
 
-## Architecture
+Observer/runtime users:
 
-- `architecture/README.md`: ADR/ARD index and scope.
-- `architecture/framework-plugin-hooks.md`: plugin hook contracts and semantics.
-- `architecture/runtime-extension-hooks.md`: runtime extension capabilities, resources, and filter semantics.
-- `architecture/runtime-bootstrap-modes.md`: runtime capability profiles and source selection.
+- `../crates/sof-observer/README.md`
+- `operations/README.md`
 
-## Operations
+Transaction SDK users:
 
-- `operations/README.md`: operational runbook index.
-- `operations/advanced-env.md`: expert tuning knobs and guardrails.
-- `operations/shred-ingestion-home-router-and-proxy.md`: home-router/proxy deployment guide.
+- `../crates/sof-tx/README.md`
+- `architecture/adr/0006-transaction-sdk-and-dual-submit-routing.md`
+
+Contributors:
+
+- `../CONTRIBUTING.md`
+- `architecture/README.md`
+
+## Architecture Docs
+
+- `architecture/README.md`: architecture index and ADR/ARD scope
+- `architecture/framework-plugin-hooks.md`: observer plugin hooks and event contracts
+- `architecture/runtime-extension-hooks.md`: runtime extension capabilities and filtered ingress model
+- `architecture/runtime-bootstrap-modes.md`: runtime bootstrap and ingress modes
+- `architecture/derived-state-extension-contract.md`: stateful extension contract
+- `architecture/derived-state-feed-contract.md`: replayable derived-state feed contract
+
+## Operations Docs
+
+- `operations/README.md`: runbook index
+- `operations/advanced-env.md`: advanced environment variables and tuning knobs
+- `operations/shred-ingestion-home-router-and-proxy.md`: deployment guide for public ingress hosts
+
+## Crate Docs
+
+- `../crates/sof-observer/README.md`: runtime/observer setup, examples, and features
+- `../crates/sof-tx/README.md`: transaction SDK setup, routing, and transport usage

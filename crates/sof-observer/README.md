@@ -1,12 +1,24 @@
 # sof
 
-`sof` is a low-latency Solana observer runtime focused on:
+`sof` is the SOF observer/runtime crate.
+
+It is built for low-latency Solana data ingest and local runtime-derived signals.
+
+Core responsibilities:
 
 - shred ingestion (direct UDP, relay, optional gossip bootstrap)
 - optional shred verification
 - dataset reconstruction and transaction extraction
 - plugin-driven event hooks for custom logic
 - local transaction commitment status tagging (`processed` / `confirmed` / `finalized`) without RPC dependency
+
+## At a Glance
+
+- Embed SOF directly inside a Tokio application
+- Attach `Plugin` or `RuntimeExtension` consumers
+- Run with built-in UDP ingress or external kernel-bypass ingress
+- Consume local slot/reorg/transaction/account-touch signals
+- Use derived-state feed support for restart-safe stateful consumers
 
 ## Install
 
@@ -17,13 +29,13 @@ cargo add sof
 Optional gossip bootstrap support at compile time:
 
 ```toml
-sof = { version = "0.5.0", features = ["gossip-bootstrap"] }
+sof = { version = "0.6.0", features = ["gossip-bootstrap"] }
 ```
 
 Optional external `kernel-bypass` ingress support:
 
 ```toml
-sof = { version = "0.5.0", features = ["kernel-bypass"] }
+sof = { version = "0.6.0", features = ["kernel-bypass"] }
 ```
 
 ## Quick Start
@@ -38,6 +50,17 @@ With gossip bootstrap:
 
 ```bash
 cargo run --release -p sof --example observer_runtime --features gossip-bootstrap
+```
+
+Basic programmatic setup:
+
+```rust
+#[tokio::main]
+async fn main() -> Result<(), sof::runtime::RuntimeError> {
+    let setup = sof::runtime::RuntimeSetup::new()
+        .with_startup_step_logs(true);
+    sof::runtime::run_async_with_setup(&setup).await
+}
 ```
 
 ## Runtime API
@@ -216,6 +239,24 @@ These commitment fields are derived from local shred-stream slot progress (depth
 
 This hook is for account discovery/invalidation. It is not a validator post-write account-update feed.
 
+## Derived-State Consumers
+
+SOF also exposes a replayable derived-state feed intended for stateful official extensions and local consumers that need:
+
+- retained feed continuity
+- checkpoint persistence
+- replay-based recovery after restart or transient failure
+- explicit resync/rebuild signaling
+
+Example implementation:
+
+- `examples/derived_state_slot_mirror.rs`
+
+Design references:
+
+- `../../docs/architecture/derived-state-extension-contract.md`
+- `../../docs/architecture/derived-state-feed-contract.md`
+
 `on_slot_status` events include local canonical transitions:
 
 - `processed`
@@ -246,6 +287,7 @@ This hook is for account discovery/invalidation. It is not a validator post-writ
 - `runtime_extension_shared_stream`
 - `runtime_extension_with_plugins`
 - `runtime_extension_websocket_connector`
+- `derived_state_slot_mirror`
 - `kernel_bypass_ingress_metrics` (`--features kernel-bypass`)
 
 Run kernel-bypass ingress E2E test:
@@ -265,4 +307,5 @@ cargo run --release -p sof --example observer_with_multiple_plugins
 - Workspace docs index: `../../docs/README.md`
 - Architecture docs: `../../docs/architecture/README.md`
 - Operations docs: `../../docs/operations/README.md`
+- Reverse-engineering notes: `REVERSE_ENGINEERING.md`
 - Contribution guide: `../../CONTRIBUTING.md`
