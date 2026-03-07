@@ -5277,7 +5277,7 @@ dependencies = [
 
 [[package]]
 name = "sof-gossip-tuning"
-version = "0.1.0"
+version = "0.6.3"
 
 [[package]]
 name = "sof-tx"
