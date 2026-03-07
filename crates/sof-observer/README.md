@@ -30,13 +30,13 @@ cargo add sof
 Optional gossip bootstrap support at compile time:
 
 ```toml
-sof = { version = "0.6.3", features = ["gossip-bootstrap"] }
+sof = { version = "0.7.0", features = ["gossip-bootstrap"] }
 ```
 
 Optional external `kernel-bypass` ingress support:
 
 ```toml
-sof = { version = "0.6.3", features = ["kernel-bypass"] }
+sof = { version = "0.7.0", features = ["kernel-bypass"] }
 ```
 
 ## Quick Start
@@ -270,6 +270,11 @@ This is the right substrate for local service layers that want to build a bank, 
 Example implementation:
 
 - `examples/derived_state_slot_mirror.rs`
+
+Replay retention modes:
+
+- `DerivedStateReplayConfig::checkpoint_only()` disables the runtime-owned replay tail and keeps recovery checkpoint-driven.
+- `DerivedStateReplayBackend::Disk` retains envelopes on disk without keeping a full in-process mirror of the retained tail.
 
 Design references:
 

@@ -221,6 +221,14 @@ async fn run_async_with_hosts_inner(
                 installed_runtime_replay_source = installed,
                 "derived-state runtime replay tail configured"
             );
+        } else {
+            tracing::info!(
+                derived_state_replay_backend = %derived_state_replay_backend,
+                derived_state_replay_dir = %derived_state_replay_dir.display(),
+                derived_state_replay_max_envelopes,
+                derived_state_replay_max_sessions,
+                "derived-state runtime replay tail disabled; consumers will recover from checkpoints only"
+            );
         }
         derived_state_host.initialize();
         tracing::info!(
@@ -2245,6 +2253,7 @@ async fn run_async_with_hosts_inner(
                     derived_state_rebuild_required = derived_state_rebuild_required,
                     derived_state_fault_total = derived_state_fault_total,
                     derived_state_last_sequence = derived_state_last_sequence,
+                    derived_state_replay_enabled = derived_state_replay_telemetry.enabled,
                     derived_state_replay_backend = %derived_state_replay_telemetry.backend,
                     derived_state_replay_retained_sessions =
                         derived_state_replay_telemetry.retained_sessions,
