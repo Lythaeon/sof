@@ -9,7 +9,7 @@ use std::{
     collections::HashMap,
     fmt,
     fs::{self, File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
@@ -1030,7 +1030,7 @@ impl DerivedStateReplaySource for InMemoryDerivedStateReplaySource {
 
 /// Disk-backed replay source for retained derived-state feed envelopes.
 pub struct DiskDerivedStateReplaySource {
-    /// Root directory that stores one retained log per session.
+    /// Root directory that stores one retained log directory per session.
     root_dir: PathBuf,
     /// Bounded retention policy applied per session.
     max_envelopes_per_session: usize,
@@ -1051,11 +1051,29 @@ pub struct DiskDerivedStateReplaySource {
 }
 
 /// Lightweight retained-session metadata for the disk replay backend.
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
 struct DiskDerivedStateSessionMetadata {
+    /// Ordered retained segment metadata for the session.
+    segments: Vec<DiskDerivedStateSegmentMetadata>,
     /// Number of retained envelopes for the session.
     retained_envelopes: usize,
 }
+
+/// Lightweight metadata for one retained session segment on disk.
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct DiskDerivedStateSegmentMetadata {
+    /// Filesystem path of the segment file.
+    path: PathBuf,
+    /// First sequence stored in the segment.
+    first_sequence: FeedSequence,
+    /// Last sequence stored in the segment.
+    last_sequence: FeedSequence,
+    /// Number of retained envelopes stored in the segment.
+    retained_envelopes: usize,
+}
+
+/// Target number of envelopes kept in one disk replay segment before rolling to a new file.
+const DISK_REPLAY_TARGET_SEGMENT_ENVELOPES: usize = 256;
 
 /// Durability policy for the disk-backed replay source.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -1173,9 +1191,15 @@ impl DiskDerivedStateReplaySource {
             .unwrap_or(0)
     }
 
-    /// Returns the file path for one retained session log.
+    /// Returns the directory path for one retained replay session.
     fn session_path(&self, session_id: FeedSessionId) -> PathBuf {
-        self.root_dir.join(format!("{:032x}.replay", session_id.0))
+        self.root_dir.join(format!("{:032x}", session_id.0))
+    }
+
+    /// Returns the file path for one retained session segment.
+    fn segment_path(&self, session_id: FeedSessionId, first_sequence: FeedSequence) -> PathBuf {
+        self.session_path(session_id)
+            .join(format!("{:020}.segment", first_sequence.0))
     }
 
     /// Serializes one feed envelope into an on-disk record payload.
@@ -1207,13 +1231,14 @@ impl DiskDerivedStateReplaySource {
         Ok(())
     }
 
-    /// Rewrites one retained session log from the currently in-memory tail.
+    /// Rewrites one retained segment from the currently in-memory tail.
     fn rewrite_records(
         &self,
-        path: &Path,
+        old_path: &Path,
+        new_path: &Path,
         envelopes: &[DerivedStateFeedEnvelope],
     ) -> io::Result<()> {
-        let temp_path = path.with_extension("replay.tmp");
+        let temp_path = new_path.with_extension("segment.tmp");
         {
             let mut file = File::create(&temp_path)?;
             for envelope in envelopes {
@@ -1230,20 +1255,23 @@ impl DiskDerivedStateReplaySource {
             file.flush()?;
             self.sync_file(&file)?;
         }
-        fs::rename(temp_path, path)?;
+        fs::rename(&temp_path, new_path)?;
+        if old_path != new_path && old_path.exists() {
+            fs::remove_file(old_path)?;
+        }
         if let DerivedStateReplayDurability::Fsync = self.durability {
-            let directory = File::open(&self.root_dir)?;
+            let directory = File::open(
+                new_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new(&self.root_dir)),
+            )?;
             directory.sync_all()?;
         }
         Ok(())
     }
 
-    /// Loads one retained session log from disk into memory.
-    fn load_session_from_disk(
-        &self,
-        session_id: FeedSessionId,
-    ) -> io::Result<Vec<DerivedStateFeedEnvelope>> {
-        let path = self.session_path(session_id);
+    /// Loads one retained replay segment from disk into memory.
+    fn load_segment_from_disk(&self, path: &Path) -> io::Result<Vec<DerivedStateFeedEnvelope>> {
         if !path.exists() {
             return Ok(Vec::new());
         }
@@ -1264,14 +1292,18 @@ impl DiskDerivedStateReplaySource {
         Ok(envelopes)
     }
 
-    /// Counts retained records for one session without deserializing the full envelope payloads.
-    fn count_session_records(&self, session_id: FeedSessionId) -> io::Result<usize> {
-        let path = self.session_path(session_id);
+    /// Scans one retained replay segment to reconstruct lightweight metadata.
+    fn scan_segment_metadata(
+        &self,
+        path: &Path,
+    ) -> io::Result<Option<DiskDerivedStateSegmentMetadata>> {
         if !path.exists() {
-            return Ok(0);
+            return Ok(None);
         }
         let mut file = File::open(path)?;
         let mut count = 0_usize;
+        let mut first_sequence = None;
+        let mut last_sequence = None;
         loop {
             let mut length_bytes = [0_u8; 4];
             match file.read_exact(&mut length_bytes) {
@@ -1280,29 +1312,94 @@ impl DiskDerivedStateReplaySource {
                 Err(error) => return Err(error),
             }
             let encoded_len = u32::from_le_bytes(length_bytes);
-            file.seek(SeekFrom::Current(i64::from(encoded_len)))?;
+            let mut encoded = vec![0_u8; encoded_len as usize];
+            file.read_exact(&mut encoded)?;
+            let envelope = Self::decode_envelope(&encoded)?;
+            first_sequence.get_or_insert(envelope.sequence);
+            last_sequence = Some(envelope.sequence);
             count = count.saturating_add(1);
         }
-        Ok(count)
+        let Some(first_sequence) = first_sequence else {
+            return Ok(None);
+        };
+        let Some(last_sequence) = last_sequence else {
+            return Ok(None);
+        };
+        Ok(Some(DiskDerivedStateSegmentMetadata {
+            path: path.to_path_buf(),
+            first_sequence,
+            last_sequence,
+            retained_envelopes: count,
+        }))
     }
 
-    /// Returns the number of retained session files currently visible on disk.
-    fn retained_session_files(&self) -> usize {
+    /// Returns the number of retained session directories currently visible on disk.
+    fn retained_session_dirs(&self) -> usize {
         fs::read_dir(&self.root_dir)
             .ok()
             .map(|entries| {
                 entries
                     .flatten()
-                    .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "replay"))
+                    .filter(|entry| entry.path().is_dir())
                     .count()
             })
             .unwrap_or(0)
     }
 
-    /// Returns one parsed session id from a retained replay filename when possible.
+    /// Returns one parsed session id from a retained replay session directory when possible.
     fn parse_session_id(path: &Path) -> Option<FeedSessionId> {
+        let name = path.file_name()?.to_str()?;
+        u128::from_str_radix(name, 16).ok().map(FeedSessionId)
+    }
+
+    /// Returns one parsed first-sequence boundary from a retained segment filename when possible.
+    fn parse_segment_first_sequence(path: &Path) -> Option<FeedSequence> {
         let stem = path.file_stem()?.to_str()?;
-        u128::from_str_radix(stem, 16).ok().map(FeedSessionId)
+        stem.parse::<u64>().ok().map(FeedSequence)
+    }
+
+    /// Returns the target envelope count per disk segment.
+    #[must_use]
+    fn segment_envelope_capacity(&self) -> usize {
+        if self.max_envelopes_per_session < DISK_REPLAY_TARGET_SEGMENT_ENVELOPES {
+            self.max_envelopes_per_session.max(1)
+        } else {
+            DISK_REPLAY_TARGET_SEGMENT_ENVELOPES
+        }
+    }
+
+    /// Reconstructs lightweight retained-session metadata by scanning the session directory.
+    fn scan_session_metadata(
+        &self,
+        session_id: FeedSessionId,
+    ) -> io::Result<DiskDerivedStateSessionMetadata> {
+        let session_dir = self.session_path(session_id);
+        if !session_dir.exists() {
+            return Ok(DiskDerivedStateSessionMetadata::default());
+        }
+        let mut segments = fs::read_dir(&session_dir)?
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                (path.extension().is_some_and(|ext| ext == "segment")).then_some(path)
+            })
+            .collect::<Vec<_>>();
+        segments.sort_by_key(|path| {
+            Self::parse_segment_first_sequence(path).unwrap_or(FeedSequence(0))
+        });
+
+        let mut retained_envelopes = 0_usize;
+        let mut segment_metadata = Vec::new();
+        for path in segments {
+            if let Some(metadata) = self.scan_segment_metadata(&path)? {
+                retained_envelopes = retained_envelopes.saturating_add(metadata.retained_envelopes);
+                segment_metadata.push(metadata);
+            }
+        }
+        Ok(DiskDerivedStateSessionMetadata {
+            segments: segment_metadata,
+            retained_envelopes,
+        })
     }
 
     /// Returns lightweight retained-session metadata, populating the cache on demand.
@@ -1311,35 +1408,87 @@ impl DiskDerivedStateReplaySource {
         session_id: FeedSessionId,
     ) -> io::Result<DiskDerivedStateSessionMetadata> {
         if let Ok(metadata) = self.session_metadata.lock()
-            && let Some(metadata) = metadata.get(&session_id).copied()
+            && let Some(metadata) = metadata.get(&session_id).cloned()
         {
             return Ok(metadata);
         }
-        let metadata = DiskDerivedStateSessionMetadata {
-            retained_envelopes: self.count_session_records(session_id)?,
-        };
+        let metadata = self.scan_session_metadata(session_id)?;
         if let Ok(mut cached) = self.session_metadata.lock() {
-            if metadata.retained_envelopes == 0 {
+            if metadata.segments.is_empty() {
                 let _ = cached.remove(&session_id);
             } else {
-                cached.insert(session_id, metadata);
+                cached.insert(session_id, metadata.clone());
             }
         }
         Ok(metadata)
     }
 
     /// Stores updated retained-session metadata after one append or truncation event.
-    fn update_session_metadata(&self, session_id: FeedSessionId, retained_envelopes: usize) {
-        if let Ok(mut metadata) = self.session_metadata.lock() {
-            if retained_envelopes == 0 {
-                let _ = metadata.remove(&session_id);
+    fn update_session_metadata(
+        &self,
+        session_id: FeedSessionId,
+        session_metadata: DiskDerivedStateSessionMetadata,
+    ) {
+        if let Ok(mut cached) = self.session_metadata.lock() {
+            if session_metadata.segments.is_empty() {
+                let _ = cached.remove(&session_id);
             } else {
-                metadata.insert(
-                    session_id,
-                    DiskDerivedStateSessionMetadata { retained_envelopes },
-                );
+                cached.insert(session_id, session_metadata);
             }
         }
+    }
+
+    /// Truncates the oldest retained envelopes from one session without rewriting the full tail.
+    fn truncate_oldest_envelopes(
+        &self,
+        session_id: FeedSessionId,
+        metadata: &mut DiskDerivedStateSessionMetadata,
+        mut envelopes_to_remove: usize,
+    ) -> io::Result<usize> {
+        let mut removed = 0_usize;
+        while envelopes_to_remove > 0 {
+            let Some(oldest_segment) = metadata.segments.first().cloned() else {
+                break;
+            };
+            if oldest_segment.retained_envelopes <= envelopes_to_remove {
+                fs::remove_file(&oldest_segment.path)?;
+                metadata.segments.remove(0);
+                metadata.retained_envelopes = metadata
+                    .retained_envelopes
+                    .saturating_sub(oldest_segment.retained_envelopes);
+                envelopes_to_remove =
+                    envelopes_to_remove.saturating_sub(oldest_segment.retained_envelopes);
+                removed = removed.saturating_add(oldest_segment.retained_envelopes);
+                continue;
+            }
+
+            let mut retained = self.load_segment_from_disk(&oldest_segment.path)?;
+            retained.drain(..envelopes_to_remove);
+            let Some(new_first_sequence) = retained.first().map(|envelope| envelope.sequence)
+            else {
+                break;
+            };
+            let Some(new_last_sequence) = retained.last().map(|envelope| envelope.sequence) else {
+                break;
+            };
+            let new_path = self.segment_path(session_id, new_first_sequence);
+            self.rewrite_records(&oldest_segment.path, &new_path, &retained)?;
+            let Some(oldest_segment_metadata) = metadata.segments.first_mut() else {
+                break;
+            };
+            *oldest_segment_metadata = DiskDerivedStateSegmentMetadata {
+                path: new_path,
+                first_sequence: new_first_sequence,
+                last_sequence: new_last_sequence,
+                retained_envelopes: retained.len(),
+            };
+            metadata.retained_envelopes = metadata
+                .retained_envelopes
+                .saturating_sub(envelopes_to_remove);
+            removed = removed.saturating_add(envelopes_to_remove);
+            envelopes_to_remove = 0;
+        }
+        Ok(removed)
     }
 
     /// Applies the configured durability policy to one open file handle.
@@ -1356,7 +1505,7 @@ impl DiskDerivedStateReplaySource {
             .flatten()
             .filter_map(|entry| {
                 let path = entry.path();
-                (path.extension().is_some_and(|ext| ext == "replay"))
+                path.is_dir()
                     .then(|| Self::parse_session_id(&path).map(|session_id| (session_id, path)))
                     .flatten()
             })
@@ -1370,8 +1519,8 @@ impl DiskDerivedStateReplaySource {
             if session_id == current_session_id {
                 break;
             }
-            fs::remove_file(&path)?;
-            self.update_session_metadata(session_id, 0);
+            fs::remove_dir_all(&path)?;
+            self.update_session_metadata(session_id, DiskDerivedStateSessionMetadata::default());
             retained_sessions.remove(0);
             removed_any = true;
         }
@@ -1385,33 +1534,44 @@ impl DiskDerivedStateReplaySource {
 impl DerivedStateReplaySource for DiskDerivedStateReplaySource {
     fn append(&self, envelope: DerivedStateFeedEnvelope) {
         let session_id = envelope.session_id;
-        let path = self.session_path(session_id);
         let append_result = (|| -> io::Result<()> {
-            let max_envelopes = self.max_envelopes_per_session.max(1);
-            let retained_count = self.session_metadata(session_id)?.retained_envelopes;
-            if retained_count < max_envelopes {
-                self.append_record(&path, &envelope)?;
-                self.update_session_metadata(session_id, retained_count.saturating_add(1));
+            let mut metadata = self.session_metadata(session_id)?;
+            fs::create_dir_all(self.session_path(session_id))?;
+            let segment_capacity = self.segment_envelope_capacity();
+            if let Some(segment) = metadata.segments.last_mut()
+                && segment.retained_envelopes < segment_capacity
+            {
+                self.append_record(&segment.path, &envelope)?;
+                segment.last_sequence = envelope.sequence;
+                segment.retained_envelopes = segment.retained_envelopes.saturating_add(1);
             } else {
-                let mut retained = self.load_session_from_disk(session_id)?;
-                retained.push(envelope);
-                let truncated = retained.len().saturating_sub(max_envelopes);
-                if truncated > 0 {
-                    retained.drain(..truncated);
-                    let _ = self
-                        .truncated_envelopes
-                        .fetch_add(truncated as u64, Ordering::Relaxed);
-                }
-                self.rewrite_records(&path, &retained)?;
-                self.update_session_metadata(session_id, retained.len());
+                let path = self.segment_path(session_id, envelope.sequence);
+                self.append_record(&path, &envelope)?;
+                metadata.segments.push(DiskDerivedStateSegmentMetadata {
+                    path,
+                    first_sequence: envelope.sequence,
+                    last_sequence: envelope.sequence,
+                    retained_envelopes: 1,
+                });
             }
+            metadata.retained_envelopes = metadata.retained_envelopes.saturating_add(1);
+            let overflow = metadata
+                .retained_envelopes
+                .saturating_sub(self.max_envelopes_per_session.max(1));
+            if overflow > 0 {
+                let truncated =
+                    self.truncate_oldest_envelopes(session_id, &mut metadata, overflow)?;
+                let _ = self
+                    .truncated_envelopes
+                    .fetch_add(truncated as u64, Ordering::Relaxed);
+            }
+            self.update_session_metadata(session_id, metadata);
             self.compact_sessions(session_id)
         })();
         if let Err(error) = append_result {
             let _ = self.append_failures.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 session_id = ?session_id,
-                path = %path.display(),
                 error = %error,
                 "failed to append derived-state replay envelope to disk"
             );
@@ -1423,28 +1583,78 @@ impl DerivedStateReplaySource for DiskDerivedStateReplaySource {
         session_id: FeedSessionId,
         next_sequence: FeedSequence,
     ) -> Result<Vec<DerivedStateFeedEnvelope>, DerivedStateReplayError> {
-        let envelopes = self.load_session_from_disk(session_id).map_err(|error| {
+        let metadata = self.session_metadata(session_id).map_err(|error| {
             let _ = self.load_failures.fetch_add(1, Ordering::Relaxed);
             DerivedStateReplayError::BackendFailure {
                 session_id,
                 message: error.to_string(),
             }
         })?;
-        if envelopes.is_empty() {
+        if metadata.segments.is_empty() {
             return Err(DerivedStateReplayError::SessionUnavailable(session_id));
+        }
+        if metadata
+            .segments
+            .last()
+            .and_then(|segment| segment.last_sequence.next())
+            .is_some_and(|expected_next| next_sequence == expected_next)
+        {
+            return Ok(Vec::new());
+        }
+        if metadata
+            .segments
+            .first()
+            .is_some_and(|segment| next_sequence < segment.first_sequence)
+        {
+            let Some(oldest_segment) = metadata.segments.first() else {
+                return Err(DerivedStateReplayError::SessionUnavailable(session_id));
+            };
+            return Err(DerivedStateReplayError::Truncated {
+                session_id,
+                sequence: next_sequence,
+                oldest_retained_sequence: oldest_segment.first_sequence,
+            });
+        }
+
+        let mut envelopes = Vec::new();
+        let mut started = false;
+        for segment in &metadata.segments {
+            if !started && segment.last_sequence < next_sequence {
+                continue;
+            }
+            started = true;
+            let mut loaded = self
+                .load_segment_from_disk(&segment.path)
+                .map_err(|error| {
+                    let _ = self.load_failures.fetch_add(1, Ordering::Relaxed);
+                    DerivedStateReplayError::BackendFailure {
+                        session_id,
+                        message: error.to_string(),
+                    }
+                })?;
+            envelopes.append(&mut loaded);
         }
         validate_replayed_envelopes(session_id, &envelopes, next_sequence)
     }
 
     fn telemetry(&self) -> DerivedStateReplayTelemetry {
-        let retained_sessions = self.retained_session_files();
+        let retained_sessions = self.retained_session_dirs();
         let retained_envelopes = fs::read_dir(&self.root_dir)
             .ok()
             .map(|entries| {
                 entries
                     .flatten()
-                    .filter_map(|entry| Self::parse_session_id(&entry.path()))
-                    .map(|session_id| self.retained_envelopes(session_id))
+                    .filter_map(|entry| {
+                        let path = entry.path();
+                        path.is_dir()
+                            .then(|| Self::parse_session_id(&path))
+                            .flatten()
+                    })
+                    .map(|session_id| {
+                        self.session_metadata(session_id)
+                            .map(|metadata| metadata.retained_envelopes)
+                            .unwrap_or(0)
+                    })
                     .sum()
             })
             .unwrap_or(0);
