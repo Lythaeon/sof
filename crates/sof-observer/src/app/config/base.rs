@@ -1,6 +1,10 @@
 use std::{num::NonZeroUsize, path::PathBuf};
 
 use super::{read_bool_env, read_env_var};
+use crate::{
+    framework::{DerivedStateReplayBackend, DerivedStateReplayDurability},
+    runtime::{DerivedStateReplayConfig, DerivedStateRuntimeConfig},
+};
 
 pub fn read_worker_threads() -> usize {
     read_env_var("SOF_WORKER_THREADS")
@@ -222,10 +226,12 @@ pub fn read_derived_state_replay_max_sessions() -> usize {
         .unwrap_or(4)
 }
 
-pub fn read_derived_state_replay_backend() -> String {
+pub fn read_derived_state_replay_backend() -> DerivedStateReplayBackend {
     read_env_var("SOF_DERIVED_STATE_REPLAY_BACKEND")
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "memory".to_owned())
+        .as_deref()
+        .and_then(DerivedStateReplayBackend::from_config_value)
+        .unwrap_or_default()
 }
 
 pub fn read_derived_state_replay_dir() -> PathBuf {
@@ -235,8 +241,24 @@ pub fn read_derived_state_replay_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".sof-derived-state-replay"))
 }
 
-pub fn read_derived_state_replay_durability() -> String {
+pub fn read_derived_state_replay_durability() -> DerivedStateReplayDurability {
     read_env_var("SOF_DERIVED_STATE_REPLAY_DURABILITY")
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "flush".to_owned())
+        .as_deref()
+        .and_then(DerivedStateReplayDurability::from_config_value)
+        .unwrap_or_default()
+}
+
+pub fn read_derived_state_runtime_config() -> DerivedStateRuntimeConfig {
+    DerivedStateRuntimeConfig {
+        checkpoint_interval_ms: read_derived_state_checkpoint_interval_ms(),
+        recovery_interval_ms: read_derived_state_recovery_interval_ms(),
+        replay: DerivedStateReplayConfig {
+            backend: read_derived_state_replay_backend(),
+            replay_dir: read_derived_state_replay_dir(),
+            durability: read_derived_state_replay_durability(),
+            max_envelopes: read_derived_state_replay_max_envelopes(),
+            max_sessions: read_derived_state_replay_max_sessions(),
+        },
+    }
 }

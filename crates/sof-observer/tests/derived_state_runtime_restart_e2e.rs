@@ -13,11 +13,12 @@ use sof::{
     framework::{
         DerivedStateCheckpoint, DerivedStateConsumer, DerivedStateConsumerFault,
         DerivedStateConsumerFaultKind, DerivedStateFeedEnvelope, DerivedStateFeedEvent,
-        DerivedStateHost, FeedSequence, FeedSessionId,
+        DerivedStateHost, DerivedStateReplayBackend, DerivedStateReplayDurability, FeedSequence,
+        FeedSessionId,
     },
     ingest::{RawPacket, RawPacketBatch},
     protocol::shred_wire::{SIZE_OF_DATA_SHRED_PAYLOAD, VARIANT_MERKLE_DATA},
-    runtime::{self, RuntimeSetup},
+    runtime::{self, DerivedStateReplayConfig, DerivedStateRuntimeConfig, RuntimeSetup},
     shred::wire::SIZE_OF_DATA_SHRED_HEADERS,
 };
 use tokio::sync::mpsc;
@@ -194,14 +195,17 @@ async fn derived_state_runtime_restart_replays_retained_tail_from_disk()
     let checkpoint_path = test_dir.join("checkpoint.json");
     std::fs::create_dir_all(&test_dir)?;
 
-    let setup = RuntimeSetup::new()
-        .with_derived_state_checkpoint_interval_ms(0)
-        .with_derived_state_recovery_interval_ms(50)
-        .with_derived_state_replay_backend("disk")
-        .with_derived_state_replay_dir(replay_dir.to_string_lossy().into_owned())
-        .with_derived_state_replay_max_envelopes(64)
-        .with_derived_state_replay_max_sessions(4)
-        .with_derived_state_replay_durability("flush");
+    let setup = RuntimeSetup::new().with_derived_state_config(DerivedStateRuntimeConfig {
+        checkpoint_interval_ms: 0,
+        recovery_interval_ms: 50,
+        replay: DerivedStateReplayConfig {
+            backend: DerivedStateReplayBackend::Disk,
+            replay_dir: replay_dir.clone(),
+            durability: DerivedStateReplayDurability::Flush,
+            max_envelopes: 64,
+            max_sessions: 4,
+        },
+    });
 
     let first_run_state = Arc::new(Mutex::new(AppliedEnvelopeState::default()));
     let first_run_host = DerivedStateHost::builder()

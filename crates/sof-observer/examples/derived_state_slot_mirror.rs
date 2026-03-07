@@ -11,9 +11,9 @@ use sof::{
     framework::{
         DerivedStateCheckpoint, DerivedStateConsumer, DerivedStateConsumerFault,
         DerivedStateConsumerFaultKind, DerivedStateFeedEnvelope, DerivedStateFeedEvent,
-        DerivedStateHost,
+        DerivedStateHost, DerivedStateReplayBackend, DerivedStateReplayDurability,
     },
-    runtime::{self, RuntimeSetup},
+    runtime::{self, DerivedStateReplayConfig, DerivedStateRuntimeConfig, RuntimeSetup},
 };
 
 #[derive(Default)]
@@ -128,14 +128,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .build();
 
-    let setup = RuntimeSetup::new()
-        .with_derived_state_checkpoint_interval_ms(5_000)
-        .with_derived_state_recovery_interval_ms(2_000)
-        .with_derived_state_replay_backend("disk")
-        .with_derived_state_replay_dir("./.sof-example/replay")
-        .with_derived_state_replay_max_envelopes(32_768)
-        .with_derived_state_replay_max_sessions(4)
-        .with_derived_state_replay_durability("flush");
+    let setup = RuntimeSetup::new().with_derived_state_config(DerivedStateRuntimeConfig {
+        checkpoint_interval_ms: 5_000,
+        recovery_interval_ms: 2_000,
+        replay: DerivedStateReplayConfig {
+            backend: DerivedStateReplayBackend::Disk,
+            replay_dir: PathBuf::from("./.sof-example/replay"),
+            durability: DerivedStateReplayDurability::Flush,
+            max_envelopes: 32_768,
+            max_sessions: 4,
+        },
+    });
 
     runtime::run_async_with_derived_state_host_and_setup(derived_state_host, &setup).await?;
     Ok(())

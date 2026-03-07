@@ -1,6 +1,9 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, path::PathBuf};
 
-use crate::framework::{DerivedStateHost, PluginHost, RuntimeExtensionHost};
+use crate::framework::{
+    DerivedStateHost, DerivedStateReplayBackend, DerivedStateReplayDurability, PluginHost,
+    RuntimeExtensionHost,
+};
 use thiserror::Error;
 
 /// Public runtime error surface for packaged SOF entrypoints.
@@ -35,6 +38,62 @@ impl From<crate::app::runtime::RuntimeEntrypointError> for RuntimeError {
 pub struct RuntimeSetup {
     /// Env-like key/value overrides applied before runtime bootstrap.
     env_overrides: Vec<(String, String)>,
+}
+
+/// Typed replay retention configuration for derived-state consumers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DerivedStateReplayConfig {
+    /// Replay backend used to retain envelopes.
+    pub backend: DerivedStateReplayBackend,
+    /// Filesystem directory used by the disk backend.
+    pub replay_dir: PathBuf,
+    /// Durability policy used by the disk backend.
+    pub durability: DerivedStateReplayDurability,
+    /// Maximum number of retained envelopes per session.
+    pub max_envelopes: usize,
+    /// Maximum number of retained sessions visible to the disk backend.
+    pub max_sessions: usize,
+}
+
+impl Default for DerivedStateReplayConfig {
+    fn default() -> Self {
+        Self {
+            backend: DerivedStateReplayBackend::Memory,
+            replay_dir: PathBuf::from(".sof-derived-state-replay"),
+            durability: DerivedStateReplayDurability::Flush,
+            max_envelopes: 8_192,
+            max_sessions: 4,
+        }
+    }
+}
+
+/// Typed derived-state runtime configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DerivedStateRuntimeConfig {
+    /// Periodic checkpoint-barrier cadence in milliseconds.
+    pub checkpoint_interval_ms: u64,
+    /// Periodic recovery-attempt cadence in milliseconds.
+    pub recovery_interval_ms: u64,
+    /// Replay retention settings.
+    pub replay: DerivedStateReplayConfig,
+}
+
+impl Default for DerivedStateRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            checkpoint_interval_ms: 30_000,
+            recovery_interval_ms: 5_000,
+            replay: DerivedStateReplayConfig::default(),
+        }
+    }
+}
+
+impl DerivedStateRuntimeConfig {
+    /// Returns the default runtime configuration used when no env overrides are present.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 impl RuntimeSetup {
@@ -223,32 +282,41 @@ impl RuntimeSetup {
         )
     }
 
-    /// Sets `SOF_DERIVED_STATE_REPLAY_BACKEND`.
-    ///
-    /// Accepted values:
-    /// - `memory` (default): in-process retained tail
-    /// - `disk`: retained tail persisted under `SOF_DERIVED_STATE_REPLAY_DIR`
+    /// Applies one typed derived-state configuration bundle.
     #[must_use]
-    pub fn with_derived_state_replay_backend(self, backend: impl Into<String>) -> Self {
-        self.with_env("SOF_DERIVED_STATE_REPLAY_BACKEND", backend)
+    pub fn with_derived_state_config(self, config: DerivedStateRuntimeConfig) -> Self {
+        self.with_derived_state_checkpoint_interval_ms(config.checkpoint_interval_ms)
+            .with_derived_state_recovery_interval_ms(config.recovery_interval_ms)
+            .with_derived_state_replay_max_envelopes(config.replay.max_envelopes)
+            .with_derived_state_replay_max_sessions(config.replay.max_sessions)
+            .with_derived_state_replay_backend(config.replay.backend)
+            .with_derived_state_replay_dir(config.replay.replay_dir)
+            .with_derived_state_replay_durability(config.replay.durability)
+    }
+
+    /// Sets `SOF_DERIVED_STATE_REPLAY_BACKEND`.
+    #[must_use]
+    pub fn with_derived_state_replay_backend(self, backend: DerivedStateReplayBackend) -> Self {
+        self.with_env("SOF_DERIVED_STATE_REPLAY_BACKEND", backend.as_str())
     }
 
     /// Sets `SOF_DERIVED_STATE_REPLAY_DIR`.
-    ///
-    /// Used when `SOF_DERIVED_STATE_REPLAY_BACKEND=disk`.
     #[must_use]
-    pub fn with_derived_state_replay_dir(self, replay_dir: impl Into<String>) -> Self {
-        self.with_env("SOF_DERIVED_STATE_REPLAY_DIR", replay_dir)
+    pub fn with_derived_state_replay_dir(self, replay_dir: impl Into<PathBuf>) -> Self {
+        let replay_dir = replay_dir.into();
+        self.with_env(
+            "SOF_DERIVED_STATE_REPLAY_DIR",
+            replay_dir.to_string_lossy().into_owned(),
+        )
     }
 
     /// Sets `SOF_DERIVED_STATE_REPLAY_DURABILITY`.
-    ///
-    /// Accepted values:
-    /// - `flush` (default): flush buffered writes
-    /// - `fsync`: flush and sync replay files to disk
     #[must_use]
-    pub fn with_derived_state_replay_durability(self, durability: impl Into<String>) -> Self {
-        self.with_env("SOF_DERIVED_STATE_REPLAY_DURABILITY", durability)
+    pub fn with_derived_state_replay_durability(
+        self,
+        durability: DerivedStateReplayDurability,
+    ) -> Self {
+        self.with_env("SOF_DERIVED_STATE_REPLAY_DURABILITY", durability.as_str())
     }
 
     /// Sets `SOF_LIVE_SHREDS_ENABLED`.
@@ -966,4 +1034,56 @@ pub async fn run_async_with_hosts_and_setup(
         DerivedStateHost::builder().build(),
     )
     .await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    #[test]
+    fn typed_derived_state_config_serializes_into_env_overrides() {
+        let setup = RuntimeSetup::new().with_derived_state_config(DerivedStateRuntimeConfig {
+            checkpoint_interval_ms: 111,
+            recovery_interval_ms: 222,
+            replay: DerivedStateReplayConfig {
+                backend: DerivedStateReplayBackend::Disk,
+                replay_dir: PathBuf::from("/tmp/sof-derived-state"),
+                durability: DerivedStateReplayDurability::Fsync,
+                max_envelopes: 333,
+                max_sessions: 4,
+            },
+        });
+        let overrides = setup.env_overrides.into_iter().collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            overrides.get("SOF_DERIVED_STATE_CHECKPOINT_INTERVAL_MS"),
+            Some(&"111".to_owned())
+        );
+        assert_eq!(
+            overrides.get("SOF_DERIVED_STATE_RECOVERY_INTERVAL_MS"),
+            Some(&"222".to_owned())
+        );
+        assert_eq!(
+            overrides.get("SOF_DERIVED_STATE_REPLAY_BACKEND"),
+            Some(&"disk".to_owned())
+        );
+        assert_eq!(
+            overrides.get("SOF_DERIVED_STATE_REPLAY_DURABILITY"),
+            Some(&"fsync".to_owned())
+        );
+        assert_eq!(
+            overrides.get("SOF_DERIVED_STATE_REPLAY_MAX_ENVELOPES"),
+            Some(&"333".to_owned())
+        );
+        assert_eq!(
+            overrides.get("SOF_DERIVED_STATE_REPLAY_MAX_SESSIONS"),
+            Some(&"4".to_owned())
+        );
+        assert_eq!(
+            overrides.get("SOF_DERIVED_STATE_REPLAY_DIR"),
+            Some(&"/tmp/sof-derived-state".to_owned())
+        );
+    }
 }
