@@ -2,10 +2,10 @@
     not(all(target_os = "linux", feature = "kernel-bypass")),
     allow(unused)
 )]
-#![allow(clippy::missing_docs_in_private_items)]
 //! AF_XDP kernel-bypass example for direct submission.
 
 #[cfg(not(all(target_os = "linux", feature = "kernel-bypass")))]
+/// Example helper used by this binary.
 fn main() {
     eprintln!("This example requires Linux and --features kernel-bypass");
 }
@@ -39,38 +39,56 @@ use xdp::{
 };
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
+/// Example configuration constant.
 const INNER_ENV: &str = "SOF_AF_XDP_EXAMPLE_INNER";
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
+/// Example configuration constant.
 const VETH_SENDER: &str = "veth_kb_tx";
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
+/// Example configuration constant.
 const VETH_RECEIVER: &str = "veth_kb_rx";
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
+/// Example configuration constant.
 const SENDER_IP: Ipv4Addr = Ipv4Addr::new(10, 77, 0, 1);
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
+/// Example configuration constant.
 const RECEIVER_IP: Ipv4Addr = Ipv4Addr::new(10, 77, 0, 2);
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
+/// Example configuration constant.
 const SRC_PORT: u16 = 42_424;
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
+/// Example configuration constant.
 const DST_PORT: u16 = 19_001;
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
+/// Example-local state or configuration type.
 struct AfXdpSocketState {
+    /// Example-local field.
     socket: XdpSocket,
+    /// Example-local field.
     rings: WakableRings,
+    /// Example-local field.
     umem: Umem,
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
+/// Example-local state or configuration type.
 struct AfXdpKernelBypassSocket {
+    /// Example-local field.
     state: Mutex<AfXdpSocketState>,
+    /// Example-local field.
     src_mac: [u8; 6],
+    /// Example-local field.
     dst_mac: [u8; 6],
+    /// Example-local field.
     src_ip: Ipv4Addr,
+    /// Example-local field.
     src_port: u16,
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
 impl AfXdpKernelBypassSocket {
+    /// Example helper used by this binary.
     fn bind_to_interface(
         interface_name: &str,
         src_mac: [u8; 6],
@@ -118,6 +136,7 @@ impl AfXdpKernelBypassSocket {
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
 #[async_trait]
 impl KernelBypassDatagramSocket for AfXdpKernelBypassSocket {
+    /// Example helper used by this binary.
     async fn send_to(&self, payload: &[u8], target: SocketAddr) -> io::Result<usize> {
         let dst = match target.ip() {
             std::net::IpAddr::V4(ip) => ip,
@@ -202,11 +221,13 @@ impl KernelBypassDatagramSocket for AfXdpKernelBypassSocket {
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
+/// Example helper used by this binary.
 fn packet_error_to_io(error: &PacketError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
+/// Example helper used by this binary.
 fn build_ipv4_udp_ethernet_frame(
     src_mac: [u8; 6],
     dst_mac: [u8; 6],
@@ -253,6 +274,7 @@ fn build_ipv4_udp_ethernet_frame(
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
+/// Example helper used by this binary.
 fn ipv4_header_checksum(header: &[u8; 20]) -> u16 {
     let mut sum: u32 = 0;
     for chunk in header.chunks_exact(2) {
@@ -267,6 +289,7 @@ fn ipv4_header_checksum(header: &[u8; 20]) -> u16 {
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
+/// Example helper used by this binary.
 fn parse_mac(mac: &str) -> Result<[u8; 6], Box<dyn std::error::Error>> {
     let mut out = [0_u8; 6];
     let mut split = mac.split(':');
@@ -294,6 +317,7 @@ fn parse_mac(mac: &str) -> Result<[u8; 6], Box<dyn std::error::Error>> {
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
+/// Example helper used by this binary.
 fn run_ip(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
     for candidate in ["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "ip"] {
         match Command::new(candidate).args(args).status() {
@@ -317,6 +341,7 @@ fn run_ip(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
+/// Example helper used by this binary.
 fn run_ip_output(args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
     for candidate in ["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "ip"] {
         match Command::new(candidate).args(args).output() {
@@ -343,6 +368,7 @@ fn run_ip_output(args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
+/// Example helper used by this binary.
 fn read_mac(interface_name: &str) -> Result<[u8; 6], Box<dyn std::error::Error>> {
     let output = run_ip_output(&["-o", "link", "show", "dev", interface_name])?;
     let mut words = output.split_whitespace();
@@ -364,6 +390,7 @@ fn read_mac(interface_name: &str) -> Result<[u8; 6], Box<dyn std::error::Error>>
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
+/// Example helper used by this binary.
 fn read_link_packets(interface_name: &str) -> Result<(u64, u64), Box<dyn std::error::Error>> {
     let output = run_ip_output(&["-j", "-s", "link", "show", "dev", interface_name])?;
     let value: Value = serde_json::from_str(&output)?;
@@ -408,6 +435,7 @@ fn read_link_packets(interface_name: &str) -> Result<(u64, u64), Box<dyn std::er
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
+/// Example helper used by this binary.
 fn setup_veth_pair() -> Result<(), Box<dyn std::error::Error>> {
     run_ip(&["link", "set", "lo", "up"])?;
     run_ip(&[
@@ -428,6 +456,7 @@ fn setup_veth_pair() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
+/// Example helper used by this binary.
 fn run_unshare(current_exe: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     for candidate in [
         "/usr/bin/unshare",
@@ -460,6 +489,7 @@ fn run_unshare(current_exe: &std::path::Path) -> Result<(), Box<dyn std::error::
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
+/// Example helper used by this binary.
 fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     setup_veth_pair()?;
 
@@ -544,6 +574,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
+/// Example helper used by this binary.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var_os(INNER_ENV).is_none() {
         let current_exe = std::env::current_exe()?;

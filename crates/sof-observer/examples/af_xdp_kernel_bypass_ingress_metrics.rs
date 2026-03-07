@@ -2,7 +2,6 @@
     not(all(target_os = "linux", feature = "kernel-bypass")),
     allow(unused)
 )]
-#![allow(clippy::missing_docs_in_private_items)]
 //! AF_XDP external-ingress metrics example for SOF kernel-bypass runtime mode.
 
 #[cfg(not(all(target_os = "linux", feature = "kernel-bypass")))]
@@ -40,60 +39,95 @@ use xdp::{
 };
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
-type ExampleError = Box<dyn std::error::Error + Send + Sync>;
+/// Example-local type alias.
+pub(crate) type ExampleError = Box<dyn std::error::Error + Send + Sync>;
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
-const DEFAULT_DURATION_SECS: u64 = 180;
+/// Example configuration constant.
+pub(crate) const DEFAULT_DURATION_SECS: u64 = 180;
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
-const DEFAULT_INTERFACE: &str = "enp17s0";
+/// Example configuration constant.
+pub(crate) const DEFAULT_INTERFACE: &str = "enp17s0";
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
-const DEFAULT_QUEUE_ID: u32 = 0;
+/// Example configuration constant.
+pub(crate) const DEFAULT_QUEUE_ID: u32 = 0;
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
-const DEFAULT_BATCH_SIZE: usize = 64;
+/// Example configuration constant.
+pub(crate) const DEFAULT_BATCH_SIZE: usize = 64;
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
-const DEFAULT_UMEM_FRAME_COUNT: u32 = 4_096;
+/// Example configuration constant.
+pub(crate) const DEFAULT_UMEM_FRAME_COUNT: u32 = 4_096;
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
-const DEFAULT_RING_DEPTH: u32 = 2_048;
+/// Example configuration constant.
+pub(crate) const DEFAULT_RING_DEPTH: u32 = 2_048;
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
-const DEFAULT_POLL_TIMEOUT_MS: u64 = 100;
+/// Example configuration constant.
+pub(crate) const DEFAULT_POLL_TIMEOUT_MS: u64 = 100;
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
-struct RawIngressSnapshot {
-    packets: u64,
-    bytes: u64,
-    shreds: u64,
-    data_shreds: u64,
-    code_shreds: u64,
-    tx_total: u64,
-    tx_vote_only: u64,
-    tx_mixed: u64,
-    tx_non_vote: u64,
-    source_8899_packets: u64,
-    source_8900_packets: u64,
-    source_other_packets: u64,
+/// Example-local state or configuration type.
+pub(crate) struct RawIngressSnapshot {
+    /// Example-local field.
+    pub(crate) packets: u64,
+    /// Example-local field.
+    pub(crate) bytes: u64,
+    /// Example-local field.
+    pub(crate) shreds: u64,
+    /// Example-local field.
+    pub(crate) data_shreds: u64,
+    /// Example-local field.
+    pub(crate) code_shreds: u64,
+    /// Example-local field.
+    pub(crate) tx_total: u64,
+    /// Example-local field.
+    pub(crate) tx_vote_only: u64,
+    /// Example-local field.
+    pub(crate) tx_mixed: u64,
+    /// Example-local field.
+    pub(crate) tx_non_vote: u64,
+    /// Example-local field.
+    pub(crate) source_8899_packets: u64,
+    /// Example-local field.
+    pub(crate) source_8900_packets: u64,
+    /// Example-local field.
+    pub(crate) source_other_packets: u64,
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
 #[derive(Default)]
-struct RawIngressMetricsPlugin {
-    packets: AtomicU64,
-    bytes: AtomicU64,
-    shreds: AtomicU64,
-    data_shreds: AtomicU64,
-    code_shreds: AtomicU64,
-    tx_total: AtomicU64,
-    tx_vote_only: AtomicU64,
-    tx_mixed: AtomicU64,
-    tx_non_vote: AtomicU64,
-    source_8899_packets: AtomicU64,
-    source_8900_packets: AtomicU64,
-    source_other_packets: AtomicU64,
+/// Example-local state or configuration type.
+pub(crate) struct RawIngressMetricsPlugin {
+    /// Example-local field.
+    pub(crate) packets: AtomicU64,
+    /// Example-local field.
+    pub(crate) bytes: AtomicU64,
+    /// Example-local field.
+    pub(crate) shreds: AtomicU64,
+    /// Example-local field.
+    pub(crate) data_shreds: AtomicU64,
+    /// Example-local field.
+    pub(crate) code_shreds: AtomicU64,
+    /// Example-local field.
+    pub(crate) tx_total: AtomicU64,
+    /// Example-local field.
+    pub(crate) tx_vote_only: AtomicU64,
+    /// Example-local field.
+    pub(crate) tx_mixed: AtomicU64,
+    /// Example-local field.
+    pub(crate) tx_non_vote: AtomicU64,
+    /// Example-local field.
+    pub(crate) source_8899_packets: AtomicU64,
+    /// Example-local field.
+    pub(crate) source_8900_packets: AtomicU64,
+    /// Example-local field.
+    pub(crate) source_other_packets: AtomicU64,
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
 impl RawIngressMetricsPlugin {
-    fn snapshot(&self) -> RawIngressSnapshot {
+    /// Example helper used by this binary.
+    pub(crate) fn snapshot(&self) -> RawIngressSnapshot {
         RawIngressSnapshot {
             packets: self.packets.load(Ordering::Relaxed),
             bytes: self.bytes.load(Ordering::Relaxed),
@@ -179,26 +213,38 @@ impl ObserverPlugin for RawIngressMetricsPlugin {
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
-struct AfXdpProducerStats {
-    frames_seen: u64,
-    udp_frames_forwarded: u64,
-    filtered_frames: u64,
-    parse_error_frames: u64,
-    batches_sent: u64,
-    bytes_forwarded: u64,
+/// Example-local state or configuration type.
+pub(crate) struct AfXdpProducerStats {
+    /// Example-local field.
+    pub(crate) frames_seen: u64,
+    /// Example-local field.
+    pub(crate) udp_frames_forwarded: u64,
+    /// Example-local field.
+    pub(crate) filtered_frames: u64,
+    /// Example-local field.
+    pub(crate) parse_error_frames: u64,
+    /// Example-local field.
+    pub(crate) batches_sent: u64,
+    /// Example-local field.
+    pub(crate) bytes_forwarded: u64,
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-struct PortFilter {
-    range_start: u16,
-    range_end: u16,
-    extra_port: u16,
+/// Example-local state or configuration type.
+pub(crate) struct PortFilter {
+    /// Example-local field.
+    pub(crate) range_start: u16,
+    /// Example-local field.
+    pub(crate) range_end: u16,
+    /// Example-local field.
+    pub(crate) extra_port: u16,
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
 impl PortFilter {
-    const fn default_sol() -> Self {
+    /// Example configuration constant.
+    pub(crate) const fn default_sol() -> Self {
         Self {
             range_start: 12_000,
             range_end: 12_100,
@@ -206,38 +252,54 @@ impl PortFilter {
         }
     }
 
-    const fn allows(self, port: u16) -> bool {
+    /// Example configuration constant.
+    pub(crate) const fn allows(self, port: u16) -> bool {
         (port >= self.range_start && port <= self.range_end) || port == self.extra_port
     }
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum FrameParseOutcome {
+/// Example-local enum used by this example binary.
+pub(crate) enum FrameParseOutcome {
+    /// Example-local variant.
     ParseError,
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
 #[derive(Debug, Clone, Eq, PartialEq)]
-struct AfXdpConfig {
-    interface: String,
-    queue_id: u32,
-    batch_size: usize,
-    umem_frame_count: u32,
-    ring_depth: u32,
-    poll_timeout: Duration,
-    filter: PortFilter,
+/// Example-local state or configuration type.
+pub(crate) struct AfXdpConfig {
+    /// Example-local field.
+    pub(crate) interface: String,
+    /// Example-local field.
+    pub(crate) queue_id: u32,
+    /// Example-local field.
+    pub(crate) batch_size: usize,
+    /// Example-local field.
+    pub(crate) umem_frame_count: u32,
+    /// Example-local field.
+    pub(crate) ring_depth: u32,
+    /// Example-local field.
+    pub(crate) poll_timeout: Duration,
+    /// Example-local field.
+    pub(crate) filter: PortFilter,
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
-struct AfXdpSocketState {
-    socket: XdpSocket,
-    rings: xdp::WakableRings,
-    umem: Umem,
+/// Example-local state or configuration type.
+pub(crate) struct AfXdpSocketState {
+    /// Example-local field.
+    pub(crate) socket: XdpSocket,
+    /// Example-local field.
+    pub(crate) rings: xdp::WakableRings,
+    /// Example-local field.
+    pub(crate) umem: Umem,
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
-fn read_env_u64(name: &str, default: u64) -> u64 {
+/// Example helper used by this binary.
+pub(crate) fn read_env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -246,7 +308,8 @@ fn read_env_u64(name: &str, default: u64) -> u64 {
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
-fn read_env_u32(name: &str, default: u32) -> u32 {
+/// Example helper used by this binary.
+pub(crate) fn read_env_u32(name: &str, default: u32) -> u32 {
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
@@ -255,7 +318,8 @@ fn read_env_u32(name: &str, default: u32) -> u32 {
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
-fn read_env_usize(name: &str, default: usize) -> usize {
+/// Example helper used by this binary.
+pub(crate) fn read_env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -264,7 +328,8 @@ fn read_env_usize(name: &str, default: usize) -> usize {
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
-fn read_af_xdp_config() -> AfXdpConfig {
+/// Example helper used by this binary.
+pub(crate) fn read_af_xdp_config() -> AfXdpConfig {
     AfXdpConfig {
         interface: std::env::var("SOF_AF_XDP_IFACE")
             .unwrap_or_else(|_| DEFAULT_INTERFACE.to_owned()),
@@ -281,7 +346,8 @@ fn read_af_xdp_config() -> AfXdpConfig {
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
-fn build_af_xdp_socket(config: &AfXdpConfig) -> Result<AfXdpSocketState, ExampleError> {
+/// Example helper used by this binary.
+pub(crate) fn build_af_xdp_socket(config: &AfXdpConfig) -> Result<AfXdpSocketState, ExampleError> {
     let ifname = CString::new(config.interface.clone())?;
     let nic = xdp::nic::NicIndex::lookup_by_name(&ifname)?.ok_or_else(|| {
         io::Error::other(format!(
@@ -333,7 +399,8 @@ fn build_af_xdp_socket(config: &AfXdpConfig) -> Result<AfXdpSocketState, Example
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
-fn parse_udp_payload_to_raw_packet(
+/// Example helper used by this binary.
+pub(crate) fn parse_udp_payload_to_raw_packet(
     frame: &[u8],
     filter: PortFilter,
 ) -> Result<Option<RawPacket>, FrameParseOutcome> {
@@ -398,12 +465,14 @@ fn parse_udp_payload_to_raw_packet(
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
-fn checked_add(lhs: usize, rhs: usize) -> Result<usize, FrameParseOutcome> {
+/// Example helper used by this binary.
+pub(crate) fn checked_add(lhs: usize, rhs: usize) -> Result<usize, FrameParseOutcome> {
     lhs.checked_add(rhs).ok_or(FrameParseOutcome::ParseError)
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
-fn read_u8(frame: &[u8], offset: usize) -> Result<u8, FrameParseOutcome> {
+/// Example helper used by this binary.
+pub(crate) fn read_u8(frame: &[u8], offset: usize) -> Result<u8, FrameParseOutcome> {
     frame
         .get(offset)
         .copied()
@@ -411,7 +480,8 @@ fn read_u8(frame: &[u8], offset: usize) -> Result<u8, FrameParseOutcome> {
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
-fn read_u16_be(frame: &[u8], offset: usize) -> Result<u16, FrameParseOutcome> {
+/// Example helper used by this binary.
+pub(crate) fn read_u16_be(frame: &[u8], offset: usize) -> Result<u16, FrameParseOutcome> {
     let end = checked_add(offset, 2)?;
     let bytes: [u8; 2] = frame
         .get(offset..end)
@@ -422,7 +492,8 @@ fn read_u16_be(frame: &[u8], offset: usize) -> Result<u16, FrameParseOutcome> {
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
-fn read_ipv4_addr(frame: &[u8], offset: usize) -> Result<Ipv4Addr, FrameParseOutcome> {
+/// Example helper used by this binary.
+pub(crate) fn read_ipv4_addr(frame: &[u8], offset: usize) -> Result<Ipv4Addr, FrameParseOutcome> {
     let end = checked_add(offset, 4)?;
     let octets: [u8; 4] = frame
         .get(offset..end)
@@ -433,7 +504,8 @@ fn read_ipv4_addr(frame: &[u8], offset: usize) -> Result<Ipv4Addr, FrameParseOut
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
-fn run_af_xdp_producer(
+/// Example helper used by this binary.
+pub(crate) fn run_af_xdp_producer(
     tx: &KernelBypassIngressSender,
     config: &AfXdpConfig,
     run_for: Duration,
@@ -509,7 +581,8 @@ fn run_af_xdp_producer(
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
-fn print_summary(
+/// Example helper used by this binary.
+pub(crate) fn print_summary(
     duration: Duration,
     config: &AfXdpConfig,
     producer_stats: AfXdpProducerStats,
@@ -553,7 +626,8 @@ fn print_summary(
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
-fn format_mib_per_sec(bytes: u64, elapsed_ms: u64) -> String {
+/// Example helper used by this binary.
+pub(crate) fn format_mib_per_sec(bytes: u64, elapsed_ms: u64) -> String {
     if elapsed_ms == 0 {
         return "0.000".to_owned();
     }

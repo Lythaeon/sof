@@ -3,10 +3,10 @@
 use std::{
     net::SocketAddr,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use async_trait::async_trait;
@@ -72,6 +72,35 @@ struct SequencedDirectTransport {
     results: Vec<Result<LeaderTarget, SubmitTransportError>>,
     /// Number of submit calls.
     calls: AtomicU64,
+}
+
+/// Mock toxic-flow source with a fixed snapshot.
+#[derive(Debug)]
+struct MockFlowSafetySource {
+    /// Snapshot returned to the submit client.
+    snapshot: TxFlowSafetySnapshot,
+}
+
+impl TxFlowSafetySource for MockFlowSafetySource {
+    fn toxic_flow_snapshot(&self) -> TxFlowSafetySnapshot {
+        self.snapshot.clone()
+    }
+}
+
+/// Recording outcome reporter used by guard-path tests.
+#[derive(Debug, Default)]
+struct RecordingOutcomeReporter {
+    /// Recorded outcomes in call order.
+    outcomes: Mutex<Vec<TxSubmitOutcome>>,
+}
+
+impl TxSubmitOutcomeReporter for RecordingOutcomeReporter {
+    fn record_outcome(&self, outcome: &TxSubmitOutcome) {
+        self.outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(outcome.clone());
+    }
 }
 
 #[async_trait]
@@ -424,4 +453,158 @@ async fn duplicate_signature_is_suppressed() {
         .await;
     assert!(second.is_err());
     assert!(matches!(second, Err(SubmitError::DuplicateSignature)));
+}
+
+#[tokio::test]
+async fn toxic_flow_guard_rejects_reorg_risk_before_submit() {
+    let rpc = Arc::new(MockRpcTransport {
+        result: Ok("rpc-signature".to_owned()),
+        calls: AtomicU64::new(0),
+    });
+    let reporter = Arc::new(RecordingOutcomeReporter::default());
+    let mut client = TxSubmitClient::new(
+        Arc::new(StaticRecentBlockhashProvider::new(Some([21_u8; 32]))),
+        Arc::new(StaticLeaderProvider::new(Some(target(9051)), Vec::new())),
+    )
+    .with_rpc_transport(rpc.clone())
+    .with_flow_safety_source(Arc::new(MockFlowSafetySource {
+        snapshot: TxFlowSafetySnapshot {
+            quality: TxFlowSafetyQuality::ReorgRisk,
+            issues: vec![TxFlowSafetyIssue::ReorgRisk],
+            current_state_version: Some(99),
+            replay_recovery_pending: false,
+        },
+    }))
+    .with_outcome_reporter(reporter.clone());
+
+    let (bytes, _signature) = signed_transfer_bytes();
+    let result = client
+        .submit_signed(
+            SignedTx::VersionedTransactionBytes(bytes),
+            SubmitMode::RpcOnly,
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(SubmitError::ToxicFlow {
+            reason: TxToxicFlowRejectionReason::UnsafeControlPlane {
+                quality: TxFlowSafetyQuality::ReorgRisk
+            }
+        })
+    ));
+    assert_eq!(rpc.calls.load(Ordering::Relaxed), 0);
+    assert_eq!(client.toxic_flow_telemetry().rejected_due_to_reorg_risk, 1);
+    let outcomes = reporter
+        .outcomes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    assert_eq!(outcomes.len(), 1);
+    let first = outcomes.first();
+    assert!(first.is_some());
+    if let Some(first) = first {
+        assert_eq!(first.kind, TxSubmitOutcomeKind::RejectedDueToReorgRisk);
+    }
+}
+
+#[tokio::test]
+async fn toxic_flow_guard_rejects_state_drift_before_submit() {
+    let rpc = Arc::new(MockRpcTransport {
+        result: Ok("rpc-signature".to_owned()),
+        calls: AtomicU64::new(0),
+    });
+    let mut client = TxSubmitClient::new(
+        Arc::new(StaticRecentBlockhashProvider::new(Some([22_u8; 32]))),
+        Arc::new(StaticLeaderProvider::new(Some(target(9052)), Vec::new())),
+    )
+    .with_rpc_transport(rpc.clone())
+    .with_flow_safety_source(Arc::new(MockFlowSafetySource {
+        snapshot: TxFlowSafetySnapshot {
+            quality: TxFlowSafetyQuality::Stable,
+            issues: Vec::new(),
+            current_state_version: Some(200),
+            replay_recovery_pending: false,
+        },
+    }));
+
+    let (bytes, _signature) = signed_transfer_bytes();
+    let result = client
+        .submit_signed_with_context(
+            SignedTx::VersionedTransactionBytes(bytes),
+            SubmitMode::RpcOnly,
+            TxSubmitContext {
+                suppression_keys: Vec::new(),
+                decision_state_version: Some(150),
+                opportunity_created_at: None,
+            },
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(SubmitError::ToxicFlow {
+            reason: TxToxicFlowRejectionReason::StateDrift {
+                drift: 50,
+                max_allowed: 4
+            }
+        })
+    ));
+    assert_eq!(rpc.calls.load(Ordering::Relaxed), 0);
+    assert_eq!(client.toxic_flow_telemetry().rejected_due_to_state_drift, 1);
+}
+
+#[tokio::test]
+async fn toxic_flow_suppression_keys_block_repeated_opportunities() {
+    let rpc = Arc::new(MockRpcTransport {
+        result: Ok("rpc-signature".to_owned()),
+        calls: AtomicU64::new(0),
+    });
+    let mut client = TxSubmitClient::new(
+        Arc::new(StaticRecentBlockhashProvider::new(Some([23_u8; 32]))),
+        Arc::new(StaticLeaderProvider::new(None, Vec::new())),
+    )
+    .with_rpc_transport(rpc.clone())
+    .with_flow_safety_source(Arc::new(MockFlowSafetySource {
+        snapshot: TxFlowSafetySnapshot {
+            quality: TxFlowSafetyQuality::Stable,
+            issues: Vec::new(),
+            current_state_version: Some(300),
+            replay_recovery_pending: false,
+        },
+    }));
+
+    let key = TxSubmitSuppressionKey::Opportunity([7_u8; 32]);
+    let context = TxSubmitContext {
+        suppression_keys: vec![key.clone()],
+        decision_state_version: Some(300),
+        opportunity_created_at: Some(SystemTime::now()),
+    };
+
+    let (first_bytes, _) = signed_transfer_bytes();
+    let first = client
+        .submit_signed_with_context(
+            SignedTx::VersionedTransactionBytes(first_bytes),
+            SubmitMode::RpcOnly,
+            context.clone(),
+        )
+        .await;
+    assert!(first.is_ok());
+
+    let (second_bytes, _) = signed_transfer_bytes();
+    let second = client
+        .submit_signed_with_context(
+            SignedTx::VersionedTransactionBytes(second_bytes),
+            SubmitMode::RpcOnly,
+            context,
+        )
+        .await;
+
+    assert!(matches!(
+        second,
+        Err(SubmitError::ToxicFlow {
+            reason: TxToxicFlowRejectionReason::Suppressed
+        })
+    ));
+    assert_eq!(client.toxic_flow_telemetry().suppressed_submissions, 1);
 }

@@ -18,7 +18,8 @@ Core responsibilities:
 - Attach `Plugin` or `RuntimeExtension` consumers
 - Run with built-in UDP ingress or external kernel-bypass ingress
 - Consume local slot/reorg/transaction/account-touch signals
-- Use derived-state feed support for restart-safe stateful consumers
+- Use the replayable derived-state feed for restart-safe stateful consumers
+- Apply typed gossip and ingest tuning profiles instead of env-string bundles
 
 ## Install
 
@@ -84,6 +85,19 @@ async fn main() -> Result<(), sof::runtime::RuntimeError> {
     let setup = sof::runtime::RuntimeSetup::new()
         .with_bind_addr(SocketAddr::from(([0, 0, 0, 0], 8001)))
         .with_startup_step_logs(true);
+    sof::runtime::run_async_with_setup(&setup).await
+}
+```
+
+Or apply one typed gossip/ingest profile instead of stringly env overrides:
+
+```rust
+use sof_gossip_tuning::{GossipTuningProfile, HostProfilePreset};
+
+#[tokio::main]
+async fn main() -> Result<(), sof::runtime::RuntimeError> {
+    let setup = sof::runtime::RuntimeSetup::new()
+        .with_gossip_tuning_profile(GossipTuningProfile::preset(HostProfilePreset::Vps));
     sof::runtime::run_async_with_setup(&setup).await
 }
 ```
@@ -247,6 +261,11 @@ SOF also exposes a replayable derived-state feed intended for stateful official 
 - checkpoint persistence
 - replay-based recovery after restart or transient failure
 - explicit resync/rebuild signaling
+- typed control-plane replay for recent blockhash, cluster topology, and leader schedule inputs
+- canonical control-plane quality snapshots through `ControlPlaneStateUpdated`
+- invalidation and tx-feedback events through `StateInvalidated` and `TxOutcomeObserved`
+
+This is the right substrate for local service layers that want to build a bank, query index, or gRPC stream on top of SOF without depending on validator-native Geyser.
 
 Example implementation:
 
@@ -268,6 +287,7 @@ Design references:
 
 - Hooks are dispatched off the ingest hot path through a bounded queue.
 - Queue pressure drops hook events instead of stalling ingest.
+- Typed host tuning is available through `sof-gossip-tuning` and `RuntimeSetup::with_gossip_tuning_profile(...)`.
 - `RuntimeExtension` WebSocket connectors support full `ws://` / `wss://` handshake + frame decoding.
 - WebSocket close frames emit `RuntimePacketEventClass::ConnectionClosed` in `on_packet_received`.
 - WebSocket packet events expose `websocket_frame_type` (`Text`/`Binary`/`Ping`/`Pong`) for startup-time filtering and runtime routing.
@@ -307,5 +327,6 @@ cargo run --release -p sof --example observer_with_multiple_plugins
 - Workspace docs index: `../../docs/README.md`
 - Architecture docs: `../../docs/architecture/README.md`
 - Operations docs: `../../docs/operations/README.md`
+- Derived-state feed contract: `../../docs/architecture/derived-state-feed-contract.md`
 - Reverse-engineering notes: `REVERSE_ENGINEERING.md`
 - Contribution guide: `../../CONTRIBUTING.md`

@@ -1,5 +1,4 @@
 //! `sof` derived-state adapter that bridges replayable control-plane state into `sof-tx` providers.
-#![allow(clippy::missing_docs_in_private_items)]
 
 use std::{
     path::PathBuf,
@@ -8,20 +7,25 @@ use std::{
 
 use sof::framework::{
     DerivedStateCheckpoint, DerivedStateCheckpointStore, DerivedStateConsumer,
-    DerivedStateConsumerFault, DerivedStateFeedEnvelope, DerivedStateFeedEvent,
-    DerivedStatePersistedCheckpoint,
+    DerivedStateConsumerFault, DerivedStateControlPlaneQuality, DerivedStateControlPlaneStateEvent,
+    DerivedStateFeedEnvelope, DerivedStateFeedEvent, DerivedStatePersistedCheckpoint,
 };
 
 use crate::{
     adapters::common::{
         TxProviderAdapterConfig, TxProviderAdapterCore, TxProviderAdapterSnapshot,
+        TxProviderControlPlaneSnapshot, TxProviderFlowSafetyPolicy, TxProviderFlowSafetyReport,
         take_next_leader_identity_targets,
     },
     providers::{LeaderProvider, LeaderTarget, RecentBlockhashProvider},
+    submit::{TxFlowSafetyIssue, TxFlowSafetyQuality, TxFlowSafetySnapshot, TxFlowSafetySource},
 };
 
+/// Stable derived-state consumer name exposed to the SOF host.
 const DERIVED_STATE_ADAPTER_NAME: &str = "sof-tx-derived-state-provider-adapter";
+/// Extension contract version for persisted compatibility checks.
 const DERIVED_STATE_ADAPTER_EXTENSION_VERSION: &str = "sof-tx-derived-state-provider-adapter-v1";
+/// State-schema version for persisted compatibility checks.
 const DERIVED_STATE_ADAPTER_STATE_VERSION: u32 = 1;
 
 /// Configuration for [`DerivedStateTxProviderAdapter`].
@@ -59,6 +63,8 @@ pub struct DerivedStateTxProviderAdapter {
     persistence: Option<DerivedStateTxProviderAdapterPersistence>,
     /// Latest checkpoint visible to recovery logic.
     checkpoint: Arc<Mutex<Option<DerivedStateCheckpoint>>>,
+    /// Latest canonical observer-side control-plane state when present in the feed.
+    latest_control_plane_state: Arc<Mutex<Option<DerivedStateControlPlaneStateEvent>>>,
 }
 
 impl DerivedStateTxProviderAdapter {
@@ -69,6 +75,7 @@ impl DerivedStateTxProviderAdapter {
             core: TxProviderAdapterCore::new(config),
             persistence: None,
             checkpoint: Arc::new(Mutex::new(None)),
+            latest_control_plane_state: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -82,6 +89,7 @@ impl DerivedStateTxProviderAdapter {
             core: TxProviderAdapterCore::new(config),
             persistence: Some(persistence),
             checkpoint: Arc::new(Mutex::new(None)),
+            latest_control_plane_state: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -108,12 +116,28 @@ impl DerivedStateTxProviderAdapter {
         self.core.restore_snapshot(snapshot);
     }
 
+    /// Returns the current control-plane freshness snapshot.
+    #[must_use]
+    pub fn control_plane_snapshot(&self) -> TxProviderControlPlaneSnapshot {
+        self.core.control_plane_snapshot()
+    }
+
+    /// Evaluates the current control-plane state against one flow-safety policy.
+    #[must_use]
+    pub fn evaluate_flow_safety(
+        &self,
+        policy: TxProviderFlowSafetyPolicy,
+    ) -> TxProviderFlowSafetyReport {
+        self.core.evaluate_flow_safety(policy)
+    }
+
     /// Returns configured persistence when file-backed checkpoints are enabled.
     #[must_use]
     pub const fn persistence(&self) -> Option<&DerivedStateTxProviderAdapterPersistence> {
         self.persistence.as_ref()
     }
 
+    /// Returns the latest in-memory checkpoint observed by the adapter.
     fn current_checkpoint(&self) -> Option<DerivedStateCheckpoint> {
         self.checkpoint
             .lock()
@@ -121,6 +145,7 @@ impl DerivedStateTxProviderAdapter {
             .clone()
     }
 
+    /// Replaces the latest in-memory checkpoint visible to recovery logic.
     fn set_checkpoint(&self, checkpoint: Option<DerivedStateCheckpoint>) {
         *self
             .checkpoint
@@ -128,6 +153,7 @@ impl DerivedStateTxProviderAdapter {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = checkpoint;
     }
 
+    /// Loads one compatible persisted checkpoint and state snapshot, when configured.
     fn load_persisted_state(
         &self,
     ) -> Result<
@@ -143,6 +169,7 @@ impl DerivedStateTxProviderAdapter {
         )
     }
 
+    /// Persists the current adapter snapshot alongside one checkpoint, when configured.
     fn persist_state(
         &self,
         checkpoint: &DerivedStateCheckpoint,
@@ -152,6 +179,14 @@ impl DerivedStateTxProviderAdapter {
         };
         DerivedStateCheckpointStore::new(persistence.checkpoint_path())
             .store(checkpoint, &self.snapshot_state())
+    }
+
+    /// Returns the latest observer-side control-plane snapshot when the feed has emitted one.
+    fn latest_control_plane_state(&self) -> Option<DerivedStateControlPlaneStateEvent> {
+        *self
+            .latest_control_plane_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -177,6 +212,78 @@ impl LeaderProvider for DerivedStateTxProviderAdapter {
             return Vec::new();
         }
         take_next_leader_identity_targets(self.core.leader_window(n), n)
+    }
+}
+
+impl TxFlowSafetySource for DerivedStateTxProviderAdapter {
+    fn toxic_flow_snapshot(&self) -> TxFlowSafetySnapshot {
+        self.latest_control_plane_state().map_or_else(
+            || {
+                let report = self.evaluate_flow_safety(TxProviderFlowSafetyPolicy::default());
+                TxFlowSafetySnapshot {
+                    quality: match report.quality {
+                        crate::adapters::TxProviderControlPlaneQuality::Stable => {
+                            TxFlowSafetyQuality::Stable
+                        }
+                        crate::adapters::TxProviderControlPlaneQuality::Degraded => {
+                            TxFlowSafetyQuality::Degraded
+                        }
+                        crate::adapters::TxProviderControlPlaneQuality::Stale => {
+                            TxFlowSafetyQuality::Stale
+                        }
+                        crate::adapters::TxProviderControlPlaneQuality::IncompleteControlPlane => {
+                            TxFlowSafetyQuality::IncompleteControlPlane
+                        }
+                    },
+                    issues: if report.is_safe() {
+                        Vec::new()
+                    } else {
+                        vec![TxFlowSafetyIssue::MissingControlPlane]
+                    },
+                    current_state_version: report.snapshot.tip_slot,
+                    replay_recovery_pending: false,
+                }
+            },
+            |control_plane_state| {
+                let quality = match control_plane_state.quality {
+                    DerivedStateControlPlaneQuality::Stable => TxFlowSafetyQuality::Stable,
+                    DerivedStateControlPlaneQuality::Provisional => {
+                        TxFlowSafetyQuality::Provisional
+                    }
+                    DerivedStateControlPlaneQuality::ReorgRisk => TxFlowSafetyQuality::ReorgRisk,
+                    DerivedStateControlPlaneQuality::Stale => TxFlowSafetyQuality::Stale,
+                    DerivedStateControlPlaneQuality::Degraded => TxFlowSafetyQuality::Degraded,
+                    DerivedStateControlPlaneQuality::IncompleteControlPlane => {
+                        TxFlowSafetyQuality::IncompleteControlPlane
+                    }
+                };
+                let mut issues = Vec::new();
+                if !control_plane_state.strategy_safe {
+                    match quality {
+                        TxFlowSafetyQuality::Stable => {}
+                        TxFlowSafetyQuality::Provisional => {
+                            issues.push(TxFlowSafetyIssue::Provisional)
+                        }
+                        TxFlowSafetyQuality::ReorgRisk => issues.push(TxFlowSafetyIssue::ReorgRisk),
+                        TxFlowSafetyQuality::Stale => {
+                            issues.push(TxFlowSafetyIssue::StaleControlPlane)
+                        }
+                        TxFlowSafetyQuality::Degraded => {
+                            issues.push(TxFlowSafetyIssue::DegradedControlPlane)
+                        }
+                        TxFlowSafetyQuality::IncompleteControlPlane => {
+                            issues.push(TxFlowSafetyIssue::MissingControlPlane)
+                        }
+                    }
+                }
+                TxFlowSafetySnapshot {
+                    quality,
+                    issues,
+                    current_state_version: control_plane_state.tip_slot,
+                    replay_recovery_pending: false,
+                }
+            },
+        )
     }
 }
 
@@ -229,7 +336,15 @@ impl DerivedStateConsumer for DerivedStateTxProviderAdapter {
             DerivedStateFeedEvent::BranchReorged(event) => {
                 self.core.apply_reorg(&event);
             }
-            DerivedStateFeedEvent::TransactionApplied(_)
+            DerivedStateFeedEvent::ControlPlaneStateUpdated(event) => {
+                *self
+                    .latest_control_plane_state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(event);
+            }
+            DerivedStateFeedEvent::StateInvalidated(_)
+            | DerivedStateFeedEvent::TxOutcomeObserved(_)
+            | DerivedStateFeedEvent::TransactionApplied(_)
             | DerivedStateFeedEvent::AccountTouchObserved(_)
             | DerivedStateFeedEvent::CheckpointBarrier(_) => {}
         }
@@ -317,6 +432,29 @@ mod tests {
             Ok(value) => value,
             Err(error) => panic!("unexpected error: {error:?}"),
         }
+    }
+
+    #[test]
+    fn flow_safety_reports_missing_inputs_before_feed_replay() {
+        let adapter = DerivedStateTxProviderAdapter::default();
+        let report = adapter.evaluate_flow_safety(TxProviderFlowSafetyPolicy::default());
+
+        assert!(!report.is_safe());
+        assert!(
+            report
+                .issues
+                .contains(&crate::adapters::TxProviderFlowSafetyIssue::MissingRecentBlockhash)
+        );
+        assert!(
+            report
+                .issues
+                .contains(&crate::adapters::TxProviderFlowSafetyIssue::MissingClusterTopology)
+        );
+        assert!(
+            report
+                .issues
+                .contains(&crate::adapters::TxProviderFlowSafetyIssue::MissingLeaderSchedule)
+        );
     }
 
     #[test]

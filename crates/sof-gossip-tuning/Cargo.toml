@@ -1,0 +1,19 @@
+[package]
+name = "sof-gossip-tuning"
+version = "0.6.3"
+edition.workspace = true
+description = "Typed gossip and ingest tuning presets for SOF hosts"
+license = "Apache-2.0 OR MIT"
+readme = "README.md"
+repository = "https://github.com/Lythaeon/sof"
+homepage = "https://github.com/Lythaeon/sof"
+keywords = ["solana", "observer", "gossip", "tuning", "ingestion"]
+categories = ["network-programming", "cryptography::cryptocurrencies"]
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]

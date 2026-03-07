@@ -26,6 +26,15 @@ To run a bounded live profile sweep and rank candidate settings on your host:
 
 - `cargo make tune-relay-defaults`
 
+If you configure SOF programmatically, prefer the typed control surface from
+`sof-gossip-tuning` instead of open-coding env strings and numeric literals:
+
+- `sof_gossip_tuning::GossipTuningProfile`
+- `sof::runtime::RuntimeSetup::with_gossip_tuning_profile(...)`
+
+That path only applies knobs SOF can honor directly today. Internal Agave gossip queue capacities
+remain advisory until they are wired through the bootstrap path.
+
 ## Runtime and dataset tuning
 
 | Variable | Default | Why this is advanced |
@@ -164,6 +173,17 @@ Additional implemented behavior (not env-tunable in current release):
 | `SOF_UDP_RECEIVER_CORE` | unset | Wrong pinning can hurt NUMA/locality and starve other work. |
 | `SOF_UDP_RECEIVER_PIN_BY_PORT` | `false` | Deterministic pinning may conflict with scheduler strategy. |
 | `SOF_UDP_TRACK_RXQ_OVFL` | `false` | Linux-only telemetry path adds socket option behavior. |
+
+Programmatic equivalent for the currently supported subset:
+
+- `RuntimeSetup::with_tvu_receive_sockets(...)`
+- `RuntimeSetup::with_udp_batch_size(...)`
+- `RuntimeSetup::with_udp_batch_max_wait_ms(...)`
+- `RuntimeSetup::with_udp_receiver_core(...)`
+- `RuntimeSetup::with_udp_receiver_pin_by_port(...)`
+- `RuntimeSetup::with_ingest_queue_mode_typed(...)`
+- `RuntimeSetup::with_sof_gossip_runtime_tuning(...)`
+- `RuntimeSetup::with_gossip_tuning_profile(...)`
 
 ## Non-advanced operational selectors
 

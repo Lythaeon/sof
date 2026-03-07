@@ -2,24 +2,29 @@
 
 SOF is a Solana-focused Rust workspace for low-latency data ingest and transaction execution.
 
-It is split into two user-facing crates:
+It is split into three user-facing crates:
 
 - `sof`: observer/runtime crate for shred ingest, relay/cache, dataset reconstruction, plugin and runtime-extension events, fork/reorg tracking, and local commitment tagging without RPC dependency
 - `sof-tx`: transaction SDK for building, signing, and submitting Solana transactions through RPC, direct leader routing, hybrid fallback, and optional kernel-bypass transports
+- `sof-gossip-tuning`: typed gossip and ingest tuning presets for hosts embedding `sof`
 
 ## Highlights
 
 - Low-latency shred ingest and dataset reconstruction
 - Local `processed` / `confirmed` / `finalized` transaction tagging
 - Plugin hooks and runtime extensions for downstream logic
+- Replayable derived-state feed for restart-safe stateful services
+- First-class `sof-tx` adapters for live plugin and replayable derived-state control-plane inputs
+- Flow-safety policy evaluation for stale or degraded tx-control-plane state
 - Optional gossip bootstrap and external kernel-bypass ingress
 - Transaction submission with RPC, direct, hybrid, and kernel-bypass paths
-- Derived-state replay and recovery support for stateful extensions
+- Typed gossip and ingest tuning presets for embedded SOF hosts
 
 ## Repository Layout
 
 - `crates/sof-observer`: published as `sof`
 - `crates/sof-tx`: published as `sof-tx`
+- `crates/sof-gossip-tuning`: typed host tuning presets for gossip bootstrap and ingest
 - `docs/architecture`: ADRs, ARDs, and framework/runtime contracts
 - `docs/operations`: deployment and tuning docs
 - `scripts`: local tooling and helper scripts
@@ -47,6 +52,12 @@ Transaction SDK:
 
 ```bash
 cargo add sof-tx
+```
+
+Typed host tuning presets:
+
+```bash
+cargo add sof-gossip-tuning
 ```
 
 Feature examples:
@@ -81,6 +92,12 @@ Run the transaction SDK tests:
 cargo test -p sof-tx
 ```
 
+Run the derived-state service example:
+
+```bash
+cargo run --release -p sof --example derived_state_slot_mirror
+```
+
 Run the full contributor gate:
 
 ```bash
@@ -91,6 +108,7 @@ cargo make ci
 
 - Observer/runtime setup: `crates/sof-observer/README.md`
 - Transaction SDK setup: `crates/sof-tx/README.md`
+- Typed gossip tuning setup: `crates/sof-gossip-tuning/README.md`
 - Docs entry point: `docs/README.md`
 - Contribution guide: `CONTRIBUTING.md`
 

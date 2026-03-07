@@ -40,6 +40,9 @@ jobs:
       - name: Run full CI matrix before publish
         run: cargo make ci
 
+      - name: Verify publishable crate archives
+        run: bash scripts/verify-publishable-archives.sh
+
       - name: Verify and Publish crates
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         env:
@@ -55,7 +58,7 @@ jobs:
           failed_count=0
 
           # Define crates in dependency order
-          crates=("sof" "sof-tx")
+          crates=("sof-gossip-tuning" "sof" "sof-tx")
 
           for pkg in "${crates[@]}"; do
             crate_version="$(cargo pkgid -p "$pkg" | awk -F'[#@]' '{print $NF}')"
@@ -98,7 +101,7 @@ jobs:
 
             # If we just processed the core crate and there are more to go,
             # sleep to allow crates.io indexing before downstream publish.
-            if [[ "$pkg" == "sof" ]]; then
+            if [[ "$pkg" == "sof-gossip-tuning" || "$pkg" == "sof" ]]; then
               echo "Waiting for crates.io indexing..."
               sleep 30
             fi

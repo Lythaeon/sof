@@ -1,4 +1,4 @@
-#![allow(clippy::missing_docs_in_private_items, clippy::too_many_arguments)]
+//! Runtime host for packet-oriented extensions and their resource adapters.
 
 #[cfg(test)]
 use std::str::FromStr;
@@ -66,6 +66,7 @@ pub struct RuntimeExtensionStartupReport {
 }
 
 impl RuntimeExtensionStartupReport {
+    /// Returns an empty startup report sized to the current extension set.
     const fn empty(discovered_extensions: usize) -> Self {
         Self {
             discovered_extensions,
@@ -98,6 +99,7 @@ pub struct RuntimeExtensionDispatchMetrics {
 /// Capability allowlist used by runtime extension startup validation.
 #[derive(Debug, Clone)]
 pub struct RuntimeExtensionCapabilityPolicy {
+    /// Capabilities currently allowed for extension startup.
     allowed: HashSet<ExtensionCapability>,
 }
 
@@ -160,11 +162,17 @@ impl RuntimeExtensionCapabilityPolicy {
 
 /// Builder for constructing an immutable [`RuntimeExtensionHost`].
 pub struct RuntimeExtensionHostBuilder {
+    /// Extensions that will be registered on the host.
     extensions: Vec<Arc<dyn RuntimeExtension>>,
+    /// Bounded queue depth used by each extension dispatcher.
     event_queue_capacity: usize,
+    /// Deadline applied to extension startup hooks.
     startup_timeout: Duration,
+    /// Deadline applied to extension shutdown hooks.
     shutdown_timeout: Duration,
+    /// Capability policy enforced during startup validation.
     capability_policy: RuntimeExtensionCapabilityPolicy,
+    /// Whether extensions must override the default type-name identifier.
     require_explicit_extension_names: bool,
 }
 
@@ -270,44 +278,65 @@ impl RuntimeExtensionHostBuilder {
     }
 }
 
+/// Immutable host configuration plus the currently active runtime state.
 struct RuntimeExtensionHostInner {
+    /// Extensions registered on the host in registration order.
     extensions: Arc<[Arc<dyn RuntimeExtension>]>,
+    /// Bounded queue depth used by each extension dispatcher.
     event_queue_capacity: usize,
+    /// Deadline applied to extension startup hooks.
     startup_timeout: Duration,
+    /// Deadline applied to extension shutdown hooks.
     shutdown_timeout: Duration,
+    /// Capability policy enforced during startup validation.
     capability_policy: RuntimeExtensionCapabilityPolicy,
+    /// Whether extensions must override the default type-name identifier.
     require_explicit_extension_names: bool,
+    /// Active runtime state populated after successful startup.
     runtime_state: RwLock<Option<RuntimeExtensionRuntimeState>>,
 }
 
+/// Active extension set installed after startup succeeds.
 struct RuntimeExtensionRuntimeState {
+    /// Extensions that passed validation and completed startup.
     active_extensions: Arc<[Arc<ActiveRuntimeExtension>]>,
 }
 
+/// Runtime metadata and worker handles for one active extension.
 struct ActiveRuntimeExtension {
+    /// Shared extension implementation.
     extension: Arc<dyn RuntimeExtension>,
+    /// Stable extension identifier.
     name: &'static str,
+    /// Manifest capabilities granted to the extension.
     capabilities: HashSet<ExtensionCapability>,
+    /// Packet subscriptions accepted by the extension.
     subscriptions: Arc<[PacketSubscription]>,
+    /// Async dispatcher responsible for packet delivery.
     dispatcher: ExtensionDispatcher,
+    /// Background resource tasks owned by this extension.
     resource_handles: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl ActiveRuntimeExtension {
+    /// Returns the number of packet events dropped for this extension.
     fn dropped_event_count(&self) -> u64 {
         self.dispatcher.dropped_count()
     }
 
+    /// Builds a dispatch telemetry snapshot for this extension.
     fn dispatch_metrics_snapshot(&self) -> RuntimeExtensionDispatchMetrics {
         self.dispatcher.metrics_snapshot(self.name)
     }
 
+    /// Tracks one background resource task so it can be aborted on shutdown.
     fn push_resource_handle(&self, handle: JoinHandle<()>) {
         if let Ok(mut guard) = self.resource_handles.lock() {
             guard.push(handle);
         }
     }
 
+    /// Aborts all background resource tasks owned by this extension.
     fn abort_resource_handles(&self) {
         if let Ok(mut guard) = self.resource_handles.lock() {
             for handle in guard.drain(..) {
@@ -317,24 +346,37 @@ impl ActiveRuntimeExtension {
     }
 }
 
+/// Bounded asynchronous dispatcher for one active runtime extension.
 #[derive(Clone)]
 struct ExtensionDispatcher {
+    /// Bounded queue used for packet delivery.
     tx: mpsc::Sender<QueuedRuntimePacketEvent>,
+    /// Total number of dropped packet events.
     dropped_events: Arc<AtomicU64>,
+    /// Current queue depth.
     queue_depth: Arc<AtomicU64>,
+    /// Maximum queue depth observed since startup.
     max_queue_depth: Arc<AtomicU64>,
+    /// Number of packet callbacks completed.
     dispatched_events: Arc<AtomicU64>,
+    /// Cumulative queue wait time across dispatched events.
     total_dispatch_lag_us: Arc<AtomicU64>,
+    /// Maximum queue wait time observed since startup.
     max_dispatch_lag_us: Arc<AtomicU64>,
+    /// Join handle for the background dispatch worker.
     worker: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
+/// Packet event buffered for asynchronous extension dispatch.
 struct QueuedRuntimePacketEvent {
+    /// Event to deliver to the extension callback.
     event: RuntimePacketEvent,
+    /// Instant when the event entered the queue.
     queued_at: Instant,
 }
 
 impl ExtensionDispatcher {
+    /// Spawns one bounded dispatcher worker for an active extension.
     fn spawn(
         extension: &Arc<dyn RuntimeExtension>,
         extension_name: &'static str,
@@ -398,6 +440,7 @@ impl ExtensionDispatcher {
         }
     }
 
+    /// Enqueues one runtime packet event for asynchronous delivery.
     fn dispatch(&self, extension_name: &'static str, event: RuntimePacketEvent) {
         let queued_event = QueuedRuntimePacketEvent {
             event,
@@ -421,10 +464,12 @@ impl ExtensionDispatcher {
         }
     }
 
+    /// Returns the number of packet events dropped by this dispatcher.
     fn dropped_count(&self) -> u64 {
         self.dropped_events.load(Ordering::Relaxed)
     }
 
+    /// Builds a dispatch telemetry snapshot for this dispatcher.
     fn metrics_snapshot(&self, extension_name: &'static str) -> RuntimeExtensionDispatchMetrics {
         let dispatched_events = self.dispatched_events.load(Ordering::Relaxed);
         let total_dispatch_lag_us = self.total_dispatch_lag_us.load(Ordering::Relaxed);
@@ -446,6 +491,7 @@ impl ExtensionDispatcher {
         }
     }
 
+    /// Aborts the background dispatch worker if it is still running.
     fn abort_worker(&self) {
         if let Ok(mut guard) = self.worker.lock()
             && let Some(handle) = guard.take()
@@ -454,6 +500,7 @@ impl ExtensionDispatcher {
         }
     }
 
+    /// Records one dropped packet event and emits sampled warnings.
     fn record_drop(&self, extension_name: &'static str, reason: &'static str) {
         let dropped = self
             .dropped_events
@@ -474,6 +521,7 @@ impl ExtensionDispatcher {
 /// Separate runtime extension host from observer plugin host.
 #[derive(Clone)]
 pub struct RuntimeExtensionHost {
+    /// Shared host configuration and runtime state.
     inner: Arc<RuntimeExtensionHostInner>,
 }
 
@@ -805,6 +853,7 @@ impl RuntimeExtensionHost {
         }
     }
 
+    /// Dispatches one packet event to all eligible active extensions.
     fn dispatch_runtime_packet(&self, event: &RuntimePacketEvent) {
         let Some(active_extensions) = self.inner.runtime_state.read().ok().and_then(|guard| {
             guard
@@ -828,6 +877,7 @@ impl RuntimeExtensionHost {
         }
     }
 
+    /// Starts external resources declared by one extension manifest.
     async fn provision_resources(
         &self,
         extension: &Arc<ActiveRuntimeExtension>,
@@ -854,6 +904,7 @@ impl RuntimeExtensionHost {
     }
 }
 
+/// Returns whether an extension is allowed to observe the provided packet event.
 fn extension_can_observe_event(
     extension: &ActiveRuntimeExtension,
     event: &RuntimePacketEvent,
@@ -875,6 +926,105 @@ fn extension_can_observe_event(
     }
 }
 
+/// Immutable metadata for events emitted from one extension-owned resource.
+#[derive(Clone)]
+struct ExtensionResourceEmitter {
+    /// Host receiving translated resource events.
+    host: RuntimeExtensionHost,
+    /// Owning extension identifier.
+    owner_extension: String,
+    /// Stable resource identifier from the extension manifest.
+    resource_id: String,
+    /// Shared visibility tag, if the stream is shared.
+    shared_tag: Option<String>,
+    /// Transport used by the resource.
+    transport: RuntimePacketTransport,
+    /// Resource local socket address, if available.
+    local_addr: Option<SocketAddr>,
+    /// Resource remote socket address, if available.
+    remote_addr: Option<SocketAddr>,
+}
+
+impl ExtensionResourceEmitter {
+    /// Builds a new emitter for one extension-owned resource stream.
+    fn new(
+        host: RuntimeExtensionHost,
+        extension_name: &str,
+        resource_id: &str,
+        shared_tag: Option<String>,
+        transport: RuntimePacketTransport,
+        local_addr: Option<SocketAddr>,
+        remote_addr: Option<SocketAddr>,
+    ) -> Self {
+        Self {
+            host,
+            owner_extension: extension_name.to_owned(),
+            resource_id: resource_id.to_owned(),
+            shared_tag,
+            transport,
+            local_addr,
+            remote_addr,
+        }
+    }
+
+    /// Emits one packet payload, chunking it to the configured max size.
+    fn emit_payload(
+        &self,
+        payload: &[u8],
+        websocket_frame_type: Option<RuntimeWebSocketFrameType>,
+        max_payload_chunk_bytes: usize,
+    ) {
+        let chunk_size = max_payload_chunk_bytes.max(1);
+        for chunk in payload.chunks(chunk_size) {
+            self.emit_event(
+                RuntimePacketEventClass::Packet,
+                websocket_frame_type,
+                Arc::from(chunk),
+            );
+        }
+    }
+
+    /// Emits one runtime packet event from this resource.
+    fn emit_event(
+        &self,
+        event_class: RuntimePacketEventClass,
+        websocket_frame_type: Option<RuntimeWebSocketFrameType>,
+        bytes: Arc<[u8]>,
+    ) {
+        let source = RuntimePacketSource {
+            kind: RuntimePacketSourceKind::ExtensionResource,
+            transport: self.transport,
+            event_class,
+            owner_extension: Some(self.owner_extension.clone()),
+            resource_id: Some(self.resource_id.clone()),
+            shared_tag: self.shared_tag.clone(),
+            websocket_frame_type,
+            local_addr: self.local_addr,
+            remote_addr: self.remote_addr,
+        };
+        self.host.emit_extension_packet(source, bytes);
+    }
+}
+
+/// Runtime parameters for one streaming resource reader.
+struct ExtensionResourceReadContext {
+    /// Emitter translating raw I/O into runtime packet events.
+    emitter: ExtensionResourceEmitter,
+    /// Maximum chunk size used for emitted payload slices.
+    max_payload_chunk_bytes: usize,
+}
+
+impl ExtensionResourceReadContext {
+    /// Creates a new resource read context for payload-oriented streams.
+    const fn new(emitter: ExtensionResourceEmitter, max_payload_chunk_bytes: usize) -> Self {
+        Self {
+            emitter,
+            max_payload_chunk_bytes,
+        }
+    }
+}
+
+/// Spawns one UDP listener declared by an extension resource manifest.
 async fn spawn_udp_listener(
     host: RuntimeExtensionHost,
     extension: &Arc<ActiveRuntimeExtension>,
@@ -890,6 +1040,15 @@ async fn spawn_udp_listener(
     let read_buffer_bytes = spec
         .read_buffer_bytes
         .max(DEFAULT_RESOURCE_READ_BUFFER_BYTES);
+    let emitter = ExtensionResourceEmitter::new(
+        host,
+        &owner_extension,
+        &resource_id,
+        shared_tag,
+        RuntimePacketTransport::Udp,
+        local_addr,
+        None,
+    );
     let handle = tokio::spawn(async move {
         let mut buffer = vec![0_u8; read_buffer_bytes];
         loop {
@@ -898,19 +1057,16 @@ async fn spawn_udp_listener(
                     if len == 0 {
                         continue;
                     }
-                    let source = RuntimePacketSource {
-                        kind: RuntimePacketSourceKind::ExtensionResource,
-                        transport: RuntimePacketTransport::Udp,
-                        event_class: RuntimePacketEventClass::Packet,
-                        owner_extension: Some(owner_extension.clone()),
-                        resource_id: Some(resource_id.clone()),
-                        shared_tag: shared_tag.clone(),
-                        websocket_frame_type: None,
-                        local_addr,
-                        remote_addr: Some(remote_addr),
-                    };
                     if let Some(payload) = buffer.get(..len) {
-                        host.emit_extension_packet(source, Arc::from(payload));
+                        ExtensionResourceEmitter {
+                            remote_addr: Some(remote_addr),
+                            ..emitter.clone()
+                        }
+                        .emit_event(
+                            RuntimePacketEventClass::Packet,
+                            None,
+                            Arc::from(payload),
+                        );
                     }
                 }
                 Err(error) => {
@@ -930,6 +1086,7 @@ async fn spawn_udp_listener(
     Ok(handle)
 }
 
+/// Spawns one TCP listener declared by an extension resource manifest.
 async fn spawn_tcp_listener(
     host: RuntimeExtensionHost,
     extension: &Arc<ActiveRuntimeExtension>,
@@ -949,16 +1106,18 @@ async fn spawn_tcp_listener(
             match listener.accept().await {
                 Ok((stream, remote_addr)) => {
                     let local_addr = stream.local_addr().ok();
-                    read_tcp_stream_packets(
-                        &host,
+                    let emitter = ExtensionResourceEmitter::new(
+                        host.clone(),
                         &owner_extension,
                         &resource_id,
-                        shared_tag.as_deref(),
+                        shared_tag.clone(),
                         RuntimePacketTransport::Tcp,
-                        stream,
                         local_addr,
                         Some(remote_addr),
-                        read_buffer_bytes,
+                    );
+                    read_tcp_stream_packets(
+                        ExtensionResourceReadContext::new(emitter, read_buffer_bytes),
+                        stream,
                     )
                     .await;
                 }
@@ -977,6 +1136,7 @@ async fn spawn_tcp_listener(
     Ok(handle)
 }
 
+/// Spawns one TCP connector declared by an extension resource manifest.
 async fn spawn_tcp_connector(
     host: RuntimeExtensionHost,
     extension: &Arc<ActiveRuntimeExtension>,
@@ -994,22 +1154,25 @@ async fn spawn_tcp_connector(
         .read_buffer_bytes
         .max(DEFAULT_RESOURCE_READ_BUFFER_BYTES);
     let handle = tokio::spawn(async move {
-        read_tcp_stream_packets(
-            &host,
+        let emitter = ExtensionResourceEmitter::new(
+            host,
             &owner_extension,
             &resource_id,
-            shared_tag.as_deref(),
+            shared_tag,
             RuntimePacketTransport::Tcp,
-            stream,
             local_addr,
             remote_addr,
-            read_buffer_bytes,
+        );
+        read_tcp_stream_packets(
+            ExtensionResourceReadContext::new(emitter, read_buffer_bytes),
+            stream,
         )
         .await;
     });
     Ok(handle)
 }
 
+/// Spawns one WebSocket connector declared by an extension resource manifest.
 async fn spawn_ws_connector(
     host: RuntimeExtensionHost,
     extension: &Arc<ActiveRuntimeExtension>,
@@ -1028,57 +1191,44 @@ async fn spawn_ws_connector(
         .read_buffer_bytes
         .max(DEFAULT_RESOURCE_READ_BUFFER_BYTES);
     let handle = tokio::spawn(async move {
-        read_websocket_messages(
-            &host,
+        let emitter = ExtensionResourceEmitter::new(
+            host,
             &owner_extension,
             &resource_id,
-            shared_tag.as_deref(),
-            stream,
+            shared_tag,
+            RuntimePacketTransport::WebSocket,
             local_addr,
             peer_addr,
-            max_payload_chunk_bytes,
+        );
+        read_websocket_messages(
+            ExtensionResourceReadContext::new(emitter, max_payload_chunk_bytes),
+            stream,
         )
         .await;
     });
     Ok(handle)
 }
 
-async fn read_tcp_stream_packets(
-    host: &RuntimeExtensionHost,
-    owner_extension: &str,
-    resource_id: &str,
-    shared_tag: Option<&str>,
-    transport: RuntimePacketTransport,
-    mut stream: TcpStream,
-    local_addr: Option<SocketAddr>,
-    remote_addr: Option<SocketAddr>,
-    read_buffer_bytes: usize,
-) {
-    let mut buffer = vec![0_u8; read_buffer_bytes.max(1)];
+/// Reads packet chunks from one TCP stream and forwards them into the runtime.
+async fn read_tcp_stream_packets(context: ExtensionResourceReadContext, mut stream: TcpStream) {
+    let mut buffer = vec![0_u8; context.max_payload_chunk_bytes.max(1)];
     loop {
         match stream.read(&mut buffer).await {
             Ok(0) => break,
             Ok(len) => {
-                let source = RuntimePacketSource {
-                    kind: RuntimePacketSourceKind::ExtensionResource,
-                    transport,
-                    event_class: RuntimePacketEventClass::Packet,
-                    owner_extension: Some(owner_extension.to_owned()),
-                    resource_id: Some(resource_id.to_owned()),
-                    shared_tag: shared_tag.map(str::to_owned),
-                    websocket_frame_type: None,
-                    local_addr,
-                    remote_addr,
-                };
                 if let Some(payload) = buffer.get(..len) {
-                    host.emit_extension_packet(source, Arc::from(payload));
+                    context.emitter.emit_event(
+                        RuntimePacketEventClass::Packet,
+                        None,
+                        Arc::from(payload),
+                    );
                 }
             }
             Err(error) => {
                 if error.kind() != ErrorKind::Interrupted {
                     tracing::warn!(
-                        extension = owner_extension,
-                        resource_id,
+                        extension = context.emitter.owner_extension.as_str(),
+                        resource_id = context.emitter.resource_id.as_str(),
                         error = %error,
                         "extension tcp stream read loop terminated"
                     );
@@ -1089,63 +1239,37 @@ async fn read_tcp_stream_packets(
     }
 }
 
+/// Reads decoded WebSocket messages and forwards them into the runtime.
 async fn read_websocket_messages(
-    host: &RuntimeExtensionHost,
-    owner_extension: &str,
-    resource_id: &str,
-    shared_tag: Option<&str>,
+    context: ExtensionResourceReadContext,
     mut stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
-    local_addr: Option<SocketAddr>,
-    remote_addr: Option<SocketAddr>,
-    max_payload_chunk_bytes: usize,
 ) {
     loop {
         match stream.next().await {
             Some(Ok(Message::Text(text))) => {
-                emit_extension_resource_payload(
-                    host,
-                    owner_extension,
-                    resource_id,
-                    shared_tag,
-                    RuntimePacketTransport::WebSocket,
-                    Some(RuntimeWebSocketFrameType::Text),
-                    local_addr,
-                    remote_addr,
+                context.emitter.emit_payload(
                     text.as_str().as_bytes(),
-                    max_payload_chunk_bytes,
+                    Some(RuntimeWebSocketFrameType::Text),
+                    context.max_payload_chunk_bytes,
                 );
             }
             Some(Ok(Message::Binary(bytes))) => {
-                emit_extension_resource_payload(
-                    host,
-                    owner_extension,
-                    resource_id,
-                    shared_tag,
-                    RuntimePacketTransport::WebSocket,
-                    Some(RuntimeWebSocketFrameType::Binary),
-                    local_addr,
-                    remote_addr,
+                context.emitter.emit_payload(
                     bytes.as_ref(),
-                    max_payload_chunk_bytes,
+                    Some(RuntimeWebSocketFrameType::Binary),
+                    context.max_payload_chunk_bytes,
                 );
             }
             Some(Ok(Message::Ping(payload))) => {
-                emit_extension_resource_payload(
-                    host,
-                    owner_extension,
-                    resource_id,
-                    shared_tag,
-                    RuntimePacketTransport::WebSocket,
-                    Some(RuntimeWebSocketFrameType::Ping),
-                    local_addr,
-                    remote_addr,
+                context.emitter.emit_payload(
                     payload.as_ref(),
-                    max_payload_chunk_bytes,
+                    Some(RuntimeWebSocketFrameType::Ping),
+                    context.max_payload_chunk_bytes,
                 );
                 if let Err(error) = stream.send(Message::Pong(payload)).await {
                     tracing::warn!(
-                        extension = owner_extension,
-                        resource_id,
+                        extension = context.emitter.owner_extension.as_str(),
+                        resource_id = context.emitter.resource_id.as_str(),
                         error = %error,
                         "failed to send websocket pong frame; stopping connector"
                     );
@@ -1153,17 +1277,10 @@ async fn read_websocket_messages(
                 }
             }
             Some(Ok(Message::Pong(payload))) => {
-                emit_extension_resource_payload(
-                    host,
-                    owner_extension,
-                    resource_id,
-                    shared_tag,
-                    RuntimePacketTransport::WebSocket,
-                    Some(RuntimeWebSocketFrameType::Pong),
-                    local_addr,
-                    remote_addr,
+                context.emitter.emit_payload(
                     payload.as_ref(),
-                    max_payload_chunk_bytes,
+                    Some(RuntimeWebSocketFrameType::Pong),
+                    context.max_payload_chunk_bytes,
                 );
             }
             Some(Ok(Message::Close(frame))) => {
@@ -1171,21 +1288,14 @@ async fn read_websocket_messages(
                     .as_ref()
                     .map(|frame| frame.reason.as_bytes())
                     .unwrap_or_default();
-                emit_extension_resource_event(
-                    host,
-                    owner_extension,
-                    resource_id,
-                    shared_tag,
-                    RuntimePacketTransport::WebSocket,
+                context.emitter.emit_event(
                     RuntimePacketEventClass::ConnectionClosed,
                     None,
-                    local_addr,
-                    remote_addr,
                     Arc::from(close_payload),
                 );
                 tracing::info!(
-                    extension = owner_extension,
-                    resource_id,
+                    extension = context.emitter.owner_extension.as_str(),
+                    resource_id = context.emitter.resource_id.as_str(),
                     close_code = frame.as_ref().map(|frame| u16::from(frame.code)),
                     close_reason = frame
                         .as_ref()
@@ -1200,8 +1310,8 @@ async fn read_websocket_messages(
             }
             Some(Err(error)) => {
                 tracing::warn!(
-                    extension = owner_extension,
-                    resource_id,
+                    extension = context.emitter.owner_extension.as_str(),
+                    resource_id = context.emitter.resource_id.as_str(),
                     error = %error,
                     "websocket connector read loop terminated"
                 );
@@ -1212,61 +1322,7 @@ async fn read_websocket_messages(
     }
 }
 
-fn emit_extension_resource_payload(
-    host: &RuntimeExtensionHost,
-    owner_extension: &str,
-    resource_id: &str,
-    shared_tag: Option<&str>,
-    transport: RuntimePacketTransport,
-    websocket_frame_type: Option<RuntimeWebSocketFrameType>,
-    local_addr: Option<SocketAddr>,
-    remote_addr: Option<SocketAddr>,
-    payload: &[u8],
-    max_payload_chunk_bytes: usize,
-) {
-    let chunk_size = max_payload_chunk_bytes.max(1);
-    for chunk in payload.chunks(chunk_size) {
-        emit_extension_resource_event(
-            host,
-            owner_extension,
-            resource_id,
-            shared_tag,
-            transport,
-            RuntimePacketEventClass::Packet,
-            websocket_frame_type,
-            local_addr,
-            remote_addr,
-            Arc::from(chunk),
-        );
-    }
-}
-
-fn emit_extension_resource_event(
-    host: &RuntimeExtensionHost,
-    owner_extension: &str,
-    resource_id: &str,
-    shared_tag: Option<&str>,
-    transport: RuntimePacketTransport,
-    event_class: RuntimePacketEventClass,
-    websocket_frame_type: Option<RuntimeWebSocketFrameType>,
-    local_addr: Option<SocketAddr>,
-    remote_addr: Option<SocketAddr>,
-    bytes: Arc<[u8]>,
-) {
-    let source = RuntimePacketSource {
-        kind: RuntimePacketSourceKind::ExtensionResource,
-        transport,
-        event_class,
-        owner_extension: Some(owner_extension.to_owned()),
-        resource_id: Some(resource_id.to_owned()),
-        shared_tag: shared_tag.map(str::to_owned),
-        websocket_frame_type,
-        local_addr,
-        remote_addr,
-    };
-    host.emit_extension_packet(source, bytes);
-}
-
+/// Converts extension stream visibility into the optional shared stream tag.
 fn visibility_tag(
     visibility: crate::framework::extension::ExtensionStreamVisibility,
 ) -> Option<String> {
@@ -1276,11 +1332,15 @@ fn visibility_tag(
     }
 }
 
+/// Manifest data retained after policy validation.
 struct ValidatedManifest {
+    /// Capabilities granted to the extension.
     capabilities: HashSet<ExtensionCapability>,
+    /// Packet subscriptions accepted by the extension.
     subscriptions: Vec<PacketSubscription>,
 }
 
+/// Validates one extension manifest against the active runtime policy.
 fn validate_manifest(
     extension_name: &'static str,
     manifest: &ExtensionManifest,
@@ -1330,6 +1390,7 @@ fn validate_manifest(
     })
 }
 
+/// Atomically records a new maximum value when it exceeds the observed maximum.
 fn record_max_atomic(target: &AtomicU64, value: u64) {
     let mut observed = target.load(Ordering::Relaxed);
     while value > observed {
@@ -1340,6 +1401,7 @@ fn record_max_atomic(target: &AtomicU64, value: u64) {
     }
 }
 
+/// Returns the current Unix timestamp in milliseconds.
 fn current_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1347,6 +1409,7 @@ fn current_unix_ms() -> u64 {
         .unwrap_or_default()
 }
 
+/// Converts a panic payload into a loggable message string.
 fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
     payload.downcast_ref::<&str>().map_or_else(
         || {

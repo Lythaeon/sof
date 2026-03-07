@@ -24,8 +24,8 @@ jobs:
       - name: Run contributor CI matrix
         run: cargo make ci
 
-      - name: Build and verify publishable crate archive
-        run: cargo package -p sof --locked
+      - name: Build and verify publishable crate archives
+        run: bash scripts/verify-publishable-archives.sh
 
   fuzz-smoke:
     runs-on: ubuntu-latest

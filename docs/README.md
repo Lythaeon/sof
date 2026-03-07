@@ -40,3 +40,4 @@ Contributors:
 
 - `../crates/sof-observer/README.md`: runtime/observer setup, examples, and features
 - `../crates/sof-tx/README.md`: transaction SDK setup, routing, and transport usage
+- `../crates/sof-gossip-tuning/README.md`: typed gossip/ingest tuning presets for SOF hosts

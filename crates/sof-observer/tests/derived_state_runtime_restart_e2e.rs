@@ -80,6 +80,9 @@ impl DerivedStateConsumer for PersistedCheckpointConsumer {
             | DerivedStateFeedEvent::RecentBlockhashObserved(_)
             | DerivedStateFeedEvent::ClusterTopologyChanged(_)
             | DerivedStateFeedEvent::LeaderScheduleUpdated(_)
+            | DerivedStateFeedEvent::ControlPlaneStateUpdated(_)
+            | DerivedStateFeedEvent::StateInvalidated(_)
+            | DerivedStateFeedEvent::TxOutcomeObserved(_)
             | DerivedStateFeedEvent::BranchReorged(_)
             | DerivedStateFeedEvent::AccountTouchObserved(_) => return Ok(()),
         };
@@ -254,10 +257,10 @@ async fn derived_state_runtime_restart_replays_retained_tail_from_disk()
         ))
         .into());
     }
-    if persisted_checkpoint.last_applied_sequence != FeedSequence(0) {
+    if persisted_checkpoint.last_applied_sequence != FeedSequence(2) {
         return Err(std::io::Error::other(format!(
             "unexpected checkpoint sequence: expected {:?}, got {:?}",
-            FeedSequence(0),
+            FeedSequence(2),
             persisted_checkpoint.last_applied_sequence
         ))
         .into());
@@ -302,7 +305,7 @@ async fn derived_state_runtime_restart_replays_retained_tail_from_disk()
         .clone();
     if !second_run_envelopes.contains(&(
         first_run_session,
-        FeedSequence(1),
+        FeedSequence(3),
         AppliedEventKind::CheckpointBarrier,
     )) {
         return Err(std::io::Error::other(

@@ -4,6 +4,10 @@ use crate::framework::{
     DerivedStateHost, DerivedStateReplayBackend, DerivedStateReplayDurability, PluginHost,
     RuntimeExtensionHost,
 };
+use sof_gossip_tuning::{
+    CpuCoreIndex, GossipTuningProfile, GossipTuningService, IngestQueueMode, QueueCapacity,
+    ReceiverCoalesceWindow, RuntimeTuningPort, SofRuntimeTuning, TvuReceiveSocketCount,
+};
 use thiserror::Error;
 
 /// Public runtime error surface for packaged SOF entrypoints.
@@ -370,6 +374,12 @@ impl RuntimeSetup {
         self.with_env("SOF_SHRED_DEDUP_TTL_MS", dedupe_ttl_ms.to_string())
     }
 
+    /// Sets `SOF_TVU_SOCKETS`.
+    #[must_use]
+    pub fn with_tvu_receive_sockets(self, tvu_receive_sockets: usize) -> Self {
+        self.with_env("SOF_TVU_SOCKETS", tvu_receive_sockets.to_string())
+    }
+
     /// Sets `SOF_UDP_RECEIVER_CORE`.
     #[must_use]
     pub fn with_udp_receiver_core(self, core_index: usize) -> Self {
@@ -392,6 +402,12 @@ impl RuntimeSetup {
     #[must_use]
     pub fn with_udp_batch_max_wait_ms(self, batch_max_wait_ms: u64) -> Self {
         self.with_env("SOF_UDP_BATCH_MAX_WAIT_MS", batch_max_wait_ms.to_string())
+    }
+
+    /// Sets `SOF_UDP_RECEIVER_PIN_BY_PORT`.
+    #[must_use]
+    pub fn with_udp_receiver_pin_by_port(self, enabled: bool) -> Self {
+        self.with_env("SOF_UDP_RECEIVER_PIN_BY_PORT", enabled.to_string())
     }
 
     /// Sets `SOF_UDP_IDLE_WAIT_MS`.
@@ -417,6 +433,30 @@ impl RuntimeSetup {
     #[must_use]
     pub fn with_ingest_queue_capacity(self, queue_capacity: usize) -> Self {
         self.with_env("SOF_INGEST_QUEUE_CAPACITY", queue_capacity.to_string())
+    }
+
+    /// Sets `SOF_INGEST_QUEUE_MODE` from a typed queue mode.
+    #[must_use]
+    pub fn with_ingest_queue_mode_typed(self, mode: IngestQueueMode) -> Self {
+        self.with_ingest_queue_mode(mode.as_str())
+    }
+
+    /// Applies one typed SOF-supported gossip/runtime tuning bundle.
+    #[must_use]
+    pub fn with_sof_gossip_runtime_tuning(self, tuning: SofRuntimeTuning) -> Self {
+        let mut adapter = RuntimeSetupTuningAdapter::new(self);
+        GossipTuningService::apply_runtime_tuning(tuning, &mut adapter);
+        adapter.into_setup()
+    }
+
+    /// Applies one typed gossip host profile.
+    ///
+    /// Only the subset that SOF can honor directly is applied here. Upstream/internal gossip queue
+    /// capacities remain advisory and can be inspected through
+    /// [`sof_gossip_tuning::GossipTuningProfile::pending_gossip_queue_plan`].
+    #[must_use]
+    pub fn with_gossip_tuning_profile(self, profile: GossipTuningProfile) -> Self {
+        self.with_sof_gossip_runtime_tuning(profile.supported_runtime_tuning())
     }
 
     /// Sets `SOF_REPAIR_ENABLED`.
@@ -542,6 +582,63 @@ impl RuntimeSetup {
     /// Applies setup overrides to the runtime config layer.
     fn apply(&self) {
         crate::runtime_env::set_runtime_env_overrides(self.env_overrides.clone());
+    }
+}
+
+/// Runtime adapter that applies typed gossip tuning through `RuntimeSetup` env overrides.
+#[derive(Debug)]
+struct RuntimeSetupTuningAdapter {
+    /// Accumulated runtime setup under construction.
+    setup: RuntimeSetup,
+}
+
+impl RuntimeSetupTuningAdapter {
+    /// Creates a new runtime tuning adapter from an existing setup value.
+    const fn new(setup: RuntimeSetup) -> Self {
+        Self { setup }
+    }
+
+    /// Returns the fully projected runtime setup after port application.
+    fn into_setup(self) -> RuntimeSetup {
+        self.setup
+    }
+}
+
+impl RuntimeTuningPort for RuntimeSetupTuningAdapter {
+    fn set_ingest_queue_mode(&mut self, mode: IngestQueueMode) {
+        self.setup = self.setup.clone().with_ingest_queue_mode_typed(mode);
+    }
+
+    fn set_ingest_queue_capacity(&mut self, capacity: QueueCapacity) {
+        self.setup = self
+            .setup
+            .clone()
+            .with_ingest_queue_capacity(capacity.get() as usize);
+    }
+
+    fn set_udp_batch_size(&mut self, batch_size: u16) {
+        self.setup = self.setup.clone().with_udp_batch_size(batch_size as usize);
+    }
+
+    fn set_receiver_coalesce_window(&mut self, window: ReceiverCoalesceWindow) {
+        self.setup = self
+            .setup
+            .clone()
+            .with_udp_batch_max_wait_ms(window.as_millis_u64());
+    }
+
+    fn set_udp_receiver_core(&mut self, core: Option<CpuCoreIndex>) {
+        if let Some(core_index) = core {
+            self.setup = self.setup.clone().with_udp_receiver_core(core_index.get());
+        }
+    }
+
+    fn set_udp_receiver_pin_by_port(&mut self, enabled: bool) {
+        self.setup = self.setup.clone().with_udp_receiver_pin_by_port(enabled);
+    }
+
+    fn set_tvu_receive_sockets(&mut self, sockets: TvuReceiveSocketCount) {
+        self.setup = self.setup.clone().with_tvu_receive_sockets(sockets.get());
     }
 }
 
@@ -1041,6 +1138,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use sof_gossip_tuning::{GossipTuningProfile, HostProfilePreset, IngestQueueMode};
 
     #[test]
     fn typed_derived_state_config_serializes_into_env_overrides() {
@@ -1084,6 +1182,38 @@ mod tests {
         assert_eq!(
             overrides.get("SOF_DERIVED_STATE_REPLAY_DIR"),
             Some(&"/tmp/sof-derived-state".to_owned())
+        );
+    }
+
+    #[test]
+    fn typed_gossip_runtime_tuning_sets_expected_env_overrides() {
+        let profile = GossipTuningProfile::preset(HostProfilePreset::Vps);
+        let setup = RuntimeSetup::new().with_gossip_tuning_profile(profile);
+
+        assert!(setup.env_overrides.contains(&(
+            String::from("SOF_INGEST_QUEUE_MODE"),
+            String::from("lockfree")
+        )));
+        assert!(
+            setup
+                .env_overrides
+                .contains(&(String::from("SOF_TVU_SOCKETS"), String::from("2")))
+        );
+        assert!(setup.env_overrides.contains(&(
+            String::from("SOF_UDP_RECEIVER_PIN_BY_PORT"),
+            String::from("true")
+        )));
+    }
+
+    #[test]
+    fn typed_ingest_queue_mode_uses_expected_strings() {
+        let setup = RuntimeSetup::new().with_ingest_queue_mode_typed(IngestQueueMode::Bounded);
+        assert_eq!(
+            setup.env_overrides.last(),
+            Some(&(
+                String::from("SOF_INGEST_QUEUE_MODE"),
+                String::from("bounded")
+            ))
         );
     }
 }

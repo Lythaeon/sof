@@ -25,7 +25,10 @@ pub use routing::{RoutingPolicy, SignatureDeduper};
 pub use signing::SignerRef;
 pub use submit::{
     DirectSubmitConfig, RpcSubmitConfig, SignedTx, SubmitError, SubmitMode, SubmitReliability,
-    SubmitResult, SubmitTransportError, TxSubmitClient,
+    SubmitResult, SubmitTransportError, TxFlowSafetyIssue, TxFlowSafetyQuality,
+    TxFlowSafetySnapshot, TxFlowSafetySource, TxSubmitClient, TxSubmitContext, TxSubmitGuardPolicy,
+    TxSubmitOutcome, TxSubmitOutcomeKind, TxSubmitOutcomeReporter, TxSubmitSuppressionKey,
+    TxToxicFlowRejectionReason, TxToxicFlowTelemetry, TxToxicFlowTelemetrySnapshot,
 };
 #[cfg(feature = "kernel-bypass")]
 pub use submit::{KernelBypassDatagramSocket, KernelBypassDirectTransport};

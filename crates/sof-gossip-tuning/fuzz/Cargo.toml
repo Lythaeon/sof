@@ -1,0 +1,22 @@
+[package]
+name = "sof-gossip-tuning-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+sof-gossip-tuning = { path = ".." }
+
+[[bin]]
+name = "profile_runtime_port"
+path = "fuzz_targets/profile_runtime_port.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
