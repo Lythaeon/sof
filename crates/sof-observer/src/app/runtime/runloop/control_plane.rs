@@ -106,6 +106,7 @@ impl ClusterTopologyTracker {
 #[cfg(feature = "gossip-bootstrap")]
 pub(super) fn emit_leader_schedule_diff_event(
     plugin_host: &PluginHost,
+    derived_state_host: &DerivedStateHost,
     verifier: &mut ShredVerifier,
     latest_slot: Option<u64>,
     emitted_slot_leaders: &mut HashMap<u64, [u8; 32]>,
@@ -153,7 +154,7 @@ pub(super) fn emit_leader_schedule_diff_event(
         .or_else(|| removed_slots.last().copied())
         .or(latest_slot);
 
-    plugin_host.on_leader_schedule(LeaderScheduleEvent {
+    let event = LeaderScheduleEvent {
         source: ControlPlaneSource::GossipBootstrap,
         slot: event_slot,
         epoch: None,
@@ -161,12 +162,17 @@ pub(super) fn emit_leader_schedule_diff_event(
         removed_slots,
         updated_leaders,
         snapshot_leaders: Vec::new(),
-    });
+    };
+    if !derived_state_host.is_empty() {
+        derived_state_host.on_leader_schedule(event.clone());
+    }
+    plugin_host.on_leader_schedule(event);
 }
 
 #[cfg(feature = "gossip-bootstrap")]
 pub(super) fn emit_observed_slot_leader_event(
     plugin_host: &PluginHost,
+    derived_state_host: &DerivedStateHost,
     verifier: &ShredVerifier,
     observed_slot: u64,
     emitted_slot_leaders: &mut HashMap<u64, [u8; 32]>,
@@ -198,7 +204,7 @@ pub(super) fn emit_observed_slot_leader_event(
     let floor = observed_slot.saturating_sub(slot_leader_window);
     emitted_slot_leaders.retain(|slot, _| *slot >= floor);
 
-    plugin_host.on_leader_schedule(LeaderScheduleEvent {
+    let event = LeaderScheduleEvent {
         source: ControlPlaneSource::GossipBootstrap,
         slot: Some(observed_slot),
         epoch: None,
@@ -206,7 +212,11 @@ pub(super) fn emit_observed_slot_leader_event(
         removed_slots: Vec::new(),
         updated_leaders,
         snapshot_leaders: Vec::new(),
-    });
+    };
+    if !derived_state_host.is_empty() {
+        derived_state_host.on_leader_schedule(event.clone());
+    }
+    plugin_host.on_leader_schedule(event);
 }
 
 #[cfg(feature = "gossip-bootstrap")]

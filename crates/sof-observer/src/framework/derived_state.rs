@@ -26,7 +26,10 @@ use thiserror::Error;
 
 use crate::{
     event::{ForkSlotStatus, TxCommitmentStatus, TxKind},
-    framework::{AccountTouchEvent, ReorgEvent, SlotStatusEvent, TransactionEvent},
+    framework::{
+        AccountTouchEvent, ClusterTopologyEvent, LeaderScheduleEvent, ObservedRecentBlockhashEvent,
+        ReorgEvent, SlotStatusEvent, TransactionEvent,
+    },
 };
 
 /// One runtime feed session identity.
@@ -119,6 +122,12 @@ pub struct DerivedStateFeedEnvelope {
 pub enum DerivedStateFeedEvent {
     /// Decoded transaction apply record.
     TransactionApplied(TransactionAppliedEvent),
+    /// Recent blockhash observation suitable for direct-submit consumers.
+    RecentBlockhashObserved(ObservedRecentBlockhashEvent),
+    /// Cluster topology diff/snapshot suitable for direct-submit consumers.
+    ClusterTopologyChanged(ClusterTopologyEvent),
+    /// Leader schedule diff/snapshot suitable for direct-submit consumers.
+    LeaderScheduleUpdated(LeaderScheduleEvent),
     /// Slot lifecycle transition.
     SlotStatusChanged(SlotStatusChangedEvent),
     /// Canonical branch switch requiring consumer rollback/reconciliation.
@@ -1677,6 +1686,54 @@ impl DerivedStateHost {
         );
     }
 
+    /// Emits one observed recent blockhash record into the derived-state feed.
+    pub fn on_recent_blockhash(&self, event: ObservedRecentBlockhashEvent) {
+        if self.is_empty() {
+            return;
+        }
+        self.dispatch(
+            FeedWatermarks {
+                canonical_tip_slot: Some(event.slot),
+                processed_slot: Some(event.slot),
+                confirmed_slot: None,
+                finalized_slot: None,
+            },
+            DerivedStateFeedEvent::RecentBlockhashObserved(event),
+        );
+    }
+
+    /// Emits one cluster topology record into the derived-state feed.
+    pub fn on_cluster_topology(&self, event: ClusterTopologyEvent) {
+        if self.is_empty() {
+            return;
+        }
+        self.dispatch(
+            FeedWatermarks {
+                canonical_tip_slot: event.slot,
+                processed_slot: event.slot,
+                confirmed_slot: None,
+                finalized_slot: None,
+            },
+            DerivedStateFeedEvent::ClusterTopologyChanged(event),
+        );
+    }
+
+    /// Emits one leader schedule record into the derived-state feed.
+    pub fn on_leader_schedule(&self, event: LeaderScheduleEvent) {
+        if self.is_empty() {
+            return;
+        }
+        self.dispatch(
+            FeedWatermarks {
+                canonical_tip_slot: event.slot,
+                processed_slot: event.slot,
+                confirmed_slot: None,
+                finalized_slot: None,
+            },
+            DerivedStateFeedEvent::LeaderScheduleUpdated(event),
+        );
+    }
+
     /// Emits one slot-status change record into the derived-state feed.
     pub fn on_slot_status(&self, event: SlotStatusEvent) {
         if self.is_empty() {
@@ -2048,8 +2105,10 @@ fn generate_session_id() -> FeedSessionId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::framework::{ClusterNodeInfo, ControlPlaneSource, LeaderScheduleEntry};
     use std::{
         env, fs,
+        net::SocketAddr,
         path::PathBuf,
         sync::{
             Arc,
@@ -2272,6 +2331,76 @@ mod tests {
             }
         );
         assert_eq!(host.fault_count(), 0);
+    }
+
+    #[test]
+    fn host_dispatches_control_plane_events_into_feed() {
+        let state = Arc::new(Mutex::new(RecordingState::default()));
+        let host = DerivedStateHost::builder()
+            .add_consumer(RecordingConsumer::new(Arc::clone(&state)))
+            .build();
+
+        host.on_recent_blockhash(ObservedRecentBlockhashEvent {
+            slot: 70,
+            recent_blockhash: [7_u8; 32],
+            dataset_tx_count: 3,
+        });
+        host.on_cluster_topology(ClusterTopologyEvent {
+            source: ControlPlaneSource::GossipBootstrap,
+            slot: Some(71),
+            epoch: None,
+            active_entrypoint: None,
+            total_nodes: 1,
+            added_nodes: Vec::new(),
+            removed_pubkeys: Vec::new(),
+            updated_nodes: vec![ClusterNodeInfo {
+                pubkey: [1_u8; 32].into(),
+                wallclock: 1,
+                shred_version: 1,
+                gossip: None,
+                tpu: Some(SocketAddr::from(([127, 0, 0, 1], 9000))),
+                tpu_quic: Some(SocketAddr::from(([127, 0, 0, 1], 9006))),
+                tpu_forwards: None,
+                tpu_forwards_quic: None,
+                tpu_vote: None,
+                tvu: None,
+                rpc: None,
+            }],
+            snapshot_nodes: Vec::new(),
+        });
+        host.on_leader_schedule(LeaderScheduleEvent {
+            source: ControlPlaneSource::GossipBootstrap,
+            slot: Some(72),
+            epoch: None,
+            added_leaders: Vec::new(),
+            removed_slots: Vec::new(),
+            updated_leaders: vec![LeaderScheduleEntry {
+                slot: 72,
+                leader: [2_u8; 32].into(),
+            }],
+            snapshot_leaders: Vec::new(),
+        });
+
+        let state = state
+            .lock()
+            .expect("recording state mutex should not be poisoned");
+        assert_eq!(state.envelopes.len(), 3);
+        assert!(matches!(
+            state.envelopes[0].event,
+            DerivedStateFeedEvent::RecentBlockhashObserved(_)
+        ));
+        assert_eq!(state.envelopes[0].watermarks.processed_slot, Some(70));
+        assert!(matches!(
+            state.envelopes[1].event,
+            DerivedStateFeedEvent::ClusterTopologyChanged(_)
+        ));
+        assert_eq!(state.envelopes[1].watermarks.processed_slot, Some(71));
+        assert!(matches!(
+            state.envelopes[2].event,
+            DerivedStateFeedEvent::LeaderScheduleUpdated(_)
+        ));
+        assert_eq!(state.envelopes[2].watermarks.processed_slot, Some(72));
+        assert_eq!(host.last_emitted_sequence(), Some(FeedSequence(2)));
     }
 
     #[test]

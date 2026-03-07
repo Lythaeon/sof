@@ -153,14 +153,20 @@ pub(super) fn process_completed_dataset(
         }
     }
 
-    if plugin_hooks_enabled && let Some(recent_blockhash) = observed_recent_blockhash {
-        context
-            .plugin_host
-            .on_recent_blockhash(ObservedRecentBlockhashEvent {
-                slot,
-                recent_blockhash,
-                dataset_tx_count: tx_count,
-            });
+    if let Some(recent_blockhash) = observed_recent_blockhash {
+        let event = ObservedRecentBlockhashEvent {
+            slot,
+            recent_blockhash,
+            dataset_tx_count: tx_count,
+        };
+        if derived_state_hooks_enabled {
+            context
+                .derived_state_host
+                .on_recent_blockhash(event.clone());
+        }
+        if plugin_hooks_enabled {
+            context.plugin_host.on_recent_blockhash(event);
+        }
     }
 
     if plugin_hooks_enabled {
