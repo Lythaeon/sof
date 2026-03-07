@@ -4,7 +4,7 @@ use std::{
     collections::HashSet,
     net::SocketAddr,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use solana_signature::Signature;
@@ -18,12 +18,16 @@ use tokio::{
 
 use super::{
     DirectSubmitConfig, DirectSubmitTransport, RpcSubmitConfig, RpcSubmitTransport, SignedTx,
-    SubmitError, SubmitMode, SubmitReliability, SubmitResult,
+    SubmitError, SubmitMode, SubmitReliability, SubmitResult, TxFlowSafetyQuality,
+    TxFlowSafetySource, TxSubmitContext, TxSubmitGuardPolicy, TxSubmitOutcome, TxSubmitOutcomeKind,
+    TxSubmitOutcomeReporter, TxToxicFlowRejectionReason, TxToxicFlowTelemetry,
+    TxToxicFlowTelemetrySnapshot,
 };
 use crate::{
     builder::TxBuilder,
     providers::{LeaderProvider, LeaderTarget, RecentBlockhashProvider},
     routing::{RoutingPolicy, SignatureDeduper, select_targets},
+    submit::types::TxSuppressionCache,
 };
 
 /// Transaction submission client that orchestrates RPC and direct submit modes.
@@ -46,6 +50,16 @@ pub struct TxSubmitClient {
     rpc_config: RpcSubmitConfig,
     /// Direct tuning.
     direct_config: DirectSubmitConfig,
+    /// Optional toxic-flow guard source.
+    flow_safety_source: Option<Arc<dyn TxFlowSafetySource>>,
+    /// Guard policy applied before submit.
+    guard_policy: TxSubmitGuardPolicy,
+    /// Built-in suppression keys.
+    suppression: TxSuppressionCache,
+    /// Built-in toxic-flow telemetry sink.
+    telemetry: Arc<TxToxicFlowTelemetry>,
+    /// Optional external outcome reporter.
+    outcome_reporter: Option<Arc<dyn TxSubmitOutcomeReporter>>,
 }
 
 impl TxSubmitClient {
@@ -65,6 +79,11 @@ impl TxSubmitClient {
             direct_transport: None,
             rpc_config: RpcSubmitConfig::default(),
             direct_config: DirectSubmitConfig::default(),
+            flow_safety_source: None,
+            guard_policy: TxSubmitGuardPolicy::default(),
+            suppression: TxSuppressionCache::default(),
+            telemetry: TxToxicFlowTelemetry::shared(),
+            outcome_reporter: None,
         }
     }
 
@@ -124,6 +143,41 @@ impl TxSubmitClient {
         self
     }
 
+    /// Sets the toxic-flow guard source used before submission.
+    #[must_use]
+    pub fn with_flow_safety_source(mut self, source: Arc<dyn TxFlowSafetySource>) -> Self {
+        self.flow_safety_source = Some(source);
+        self
+    }
+
+    /// Sets the toxic-flow guard policy.
+    #[must_use]
+    pub const fn with_guard_policy(mut self, policy: TxSubmitGuardPolicy) -> Self {
+        self.guard_policy = policy;
+        self
+    }
+
+    /// Sets an optional external outcome reporter.
+    #[must_use]
+    pub fn with_outcome_reporter(mut self, reporter: Arc<dyn TxSubmitOutcomeReporter>) -> Self {
+        self.outcome_reporter = Some(reporter);
+        self
+    }
+
+    /// Returns the current built-in toxic-flow telemetry snapshot.
+    #[must_use]
+    pub fn toxic_flow_telemetry(&self) -> TxToxicFlowTelemetrySnapshot {
+        self.telemetry.snapshot()
+    }
+
+    /// Records one external terminal outcome against the built-in telemetry and optional reporter.
+    pub fn record_external_outcome(&self, outcome: &TxSubmitOutcome) {
+        self.telemetry.record(outcome);
+        if let Some(reporter) = &self.outcome_reporter {
+            reporter.record_outcome(outcome);
+        }
+    }
+
     /// Builds, signs, and submits a transaction in one API call.
     ///
     /// # Errors
@@ -146,7 +200,35 @@ impl TxSubmitClient {
         let tx = builder
             .build_and_sign(blockhash, signers)
             .map_err(|source| SubmitError::Build { source })?;
-        self.submit_transaction(tx, mode).await
+        self.submit_transaction_with_context(tx, mode, TxSubmitContext::default())
+            .await
+    }
+
+    /// Builds, signs, and submits a transaction with explicit toxic-flow context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubmitError`] when blockhash lookup, signing, dedupe, toxic-flow guards,
+    /// routing, or submission fails.
+    pub async fn submit_builder_with_context<T>(
+        &mut self,
+        builder: TxBuilder,
+        signers: &T,
+        mode: SubmitMode,
+        context: TxSubmitContext,
+    ) -> Result<SubmitResult, SubmitError>
+    where
+        T: Signers + ?Sized,
+    {
+        let blockhash = self
+            .blockhash_provider
+            .latest_blockhash()
+            .ok_or(SubmitError::MissingRecentBlockhash)?;
+        let tx = builder
+            .build_and_sign(blockhash, signers)
+            .map_err(|source| SubmitError::Build { source })?;
+        self.submit_transaction_with_context(tx, mode, context)
+            .await
     }
 
     /// Submits one signed `VersionedTransaction`.
@@ -159,10 +241,26 @@ impl TxSubmitClient {
         tx: VersionedTransaction,
         mode: SubmitMode,
     ) -> Result<SubmitResult, SubmitError> {
+        self.submit_transaction_with_context(tx, mode, TxSubmitContext::default())
+            .await
+    }
+
+    /// Submits one signed `VersionedTransaction` with explicit toxic-flow context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubmitError`] when encoding, dedupe, toxic-flow guards, routing, or submission
+    /// fails.
+    pub async fn submit_transaction_with_context(
+        &mut self,
+        tx: VersionedTransaction,
+        mode: SubmitMode,
+        context: TxSubmitContext,
+    ) -> Result<SubmitResult, SubmitError> {
         let signature = tx.signatures.first().copied();
         let tx_bytes =
             bincode::serialize(&tx).map_err(|source| SubmitError::DecodeSignedBytes { source })?;
-        self.submit_bytes(tx_bytes, signature, mode).await
+        self.submit_bytes(tx_bytes, signature, mode, context).await
     }
 
     /// Submits externally signed transaction bytes.
@@ -175,6 +273,22 @@ impl TxSubmitClient {
         signed_tx: SignedTx,
         mode: SubmitMode,
     ) -> Result<SubmitResult, SubmitError> {
+        self.submit_signed_with_context(signed_tx, mode, TxSubmitContext::default())
+            .await
+    }
+
+    /// Submits externally signed transaction bytes with explicit toxic-flow context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubmitError`] when decoding, dedupe, toxic-flow guards, routing, or submission
+    /// fails.
+    pub async fn submit_signed_with_context(
+        &mut self,
+        signed_tx: SignedTx,
+        mode: SubmitMode,
+        context: TxSubmitContext,
+    ) -> Result<SubmitResult, SubmitError> {
         let tx_bytes = match signed_tx {
             SignedTx::VersionedTransactionBytes(bytes) => bytes,
             SignedTx::WireTransactionBytes(bytes) => bytes,
@@ -182,7 +296,7 @@ impl TxSubmitClient {
         let tx: VersionedTransaction = bincode::deserialize(&tx_bytes)
             .map_err(|source| SubmitError::DecodeSignedBytes { source })?;
         let signature = tx.signatures.first().copied();
-        self.submit_bytes(tx_bytes, signature, mode).await
+        self.submit_bytes(tx_bytes, signature, mode, context).await
     }
 
     /// Submits raw tx bytes after dedupe check.
@@ -191,7 +305,9 @@ impl TxSubmitClient {
         tx_bytes: Vec<u8>,
         signature: Option<Signature>,
         mode: SubmitMode,
+        context: TxSubmitContext,
     ) -> Result<SubmitResult, SubmitError> {
+        self.enforce_toxic_flow_guards(signature, mode, &context)?;
         self.enforce_dedupe(signature)?;
         match mode {
             SubmitMode::RpcOnly => self.submit_rpc_only(tx_bytes, signature, mode).await,
@@ -211,6 +327,133 @@ impl TxSubmitClient {
         Ok(())
     }
 
+    /// Applies toxic-flow guard policy before transport.
+    fn enforce_toxic_flow_guards(
+        &mut self,
+        signature: Option<Signature>,
+        mode: SubmitMode,
+        context: &TxSubmitContext,
+    ) -> Result<(), SubmitError> {
+        let now = SystemTime::now();
+        let opportunity_age_ms = context
+            .opportunity_created_at
+            .and_then(|created_at| now.duration_since(created_at).ok())
+            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64);
+        if let Some(age_ms) = opportunity_age_ms
+            && let Some(max_age) = self.guard_policy.max_opportunity_age
+        {
+            let max_allowed_ms = max_age.as_millis().min(u128::from(u64::MAX)) as u64;
+            if age_ms > max_allowed_ms {
+                return Err(self.reject_with_outcome(
+                    TxToxicFlowRejectionReason::OpportunityStale {
+                        age_ms,
+                        max_allowed_ms,
+                    },
+                    TxSubmitOutcomeKind::RejectedDueToStaleness,
+                    signature,
+                    mode,
+                    None,
+                    opportunity_age_ms,
+                ));
+            }
+        }
+
+        if self.suppression.is_suppressed(
+            &context.suppression_keys,
+            now,
+            self.guard_policy.suppression_ttl,
+        ) {
+            return Err(self.reject_with_outcome(
+                TxToxicFlowRejectionReason::Suppressed,
+                TxSubmitOutcomeKind::Suppressed,
+                signature,
+                mode,
+                None,
+                opportunity_age_ms,
+            ));
+        }
+
+        if let Some(source) = &self.flow_safety_source {
+            let snapshot = source.toxic_flow_snapshot();
+            if self.guard_policy.reject_on_replay_recovery_pending
+                && snapshot.replay_recovery_pending
+            {
+                return Err(self.reject_with_outcome(
+                    TxToxicFlowRejectionReason::ReplayRecoveryPending,
+                    TxSubmitOutcomeKind::RejectedDueToReplayRecovery,
+                    signature,
+                    mode,
+                    snapshot.current_state_version,
+                    opportunity_age_ms,
+                ));
+            }
+            if self.guard_policy.require_stable_control_plane
+                && !matches!(snapshot.quality, TxFlowSafetyQuality::Stable)
+            {
+                let outcome_kind = match snapshot.quality {
+                    TxFlowSafetyQuality::ReorgRisk | TxFlowSafetyQuality::Provisional => {
+                        TxSubmitOutcomeKind::RejectedDueToReorgRisk
+                    }
+                    TxFlowSafetyQuality::Stale => TxSubmitOutcomeKind::RejectedDueToStaleness,
+                    TxFlowSafetyQuality::Degraded
+                    | TxFlowSafetyQuality::IncompleteControlPlane
+                    | TxFlowSafetyQuality::Stable => TxSubmitOutcomeKind::Suppressed,
+                };
+                return Err(self.reject_with_outcome(
+                    TxToxicFlowRejectionReason::UnsafeControlPlane {
+                        quality: snapshot.quality,
+                    },
+                    outcome_kind,
+                    signature,
+                    mode,
+                    snapshot.current_state_version,
+                    opportunity_age_ms,
+                ));
+            }
+            if let (Some(decision_version), Some(current_version), Some(max_allowed)) = (
+                context.decision_state_version,
+                snapshot.current_state_version,
+                self.guard_policy.max_state_version_drift,
+            ) {
+                let drift = current_version.saturating_sub(decision_version);
+                if drift > max_allowed {
+                    return Err(self.reject_with_outcome(
+                        TxToxicFlowRejectionReason::StateDrift { drift, max_allowed },
+                        TxSubmitOutcomeKind::RejectedDueToStateDrift,
+                        signature,
+                        mode,
+                        Some(current_version),
+                        opportunity_age_ms,
+                    ));
+                }
+            }
+        }
+
+        self.suppression.insert_all(&context.suppression_keys, now);
+        Ok(())
+    }
+
+    /// Builds one rejection error while recording telemetry and reporting.
+    fn reject_with_outcome(
+        &self,
+        reason: TxToxicFlowRejectionReason,
+        outcome_kind: TxSubmitOutcomeKind,
+        signature: Option<Signature>,
+        mode: SubmitMode,
+        state_version: Option<u64>,
+        opportunity_age_ms: Option<u64>,
+    ) -> SubmitError {
+        let outcome = TxSubmitOutcome {
+            kind: outcome_kind,
+            signature,
+            mode,
+            state_version,
+            opportunity_age_ms,
+        };
+        self.record_external_outcome(&outcome);
+        SubmitError::ToxicFlow { reason }
+    }
+
     /// Submits through RPC path only.
     async fn submit_rpc_only(
         &self,
@@ -226,6 +469,16 @@ impl TxSubmitClient {
             .submit_rpc(&tx_bytes, &self.rpc_config)
             .await
             .map_err(|source| SubmitError::Rpc { source })?;
+        self.record_external_outcome(&TxSubmitOutcome {
+            kind: TxSubmitOutcomeKind::RpcAccepted,
+            signature,
+            mode,
+            state_version: self
+                .flow_safety_source
+                .as_ref()
+                .and_then(|source| source.toxic_flow_snapshot().current_state_version),
+            opportunity_age_ms: None,
+        });
         Ok(SubmitResult {
             signature,
             mode,
@@ -266,6 +519,16 @@ impl TxSubmitClient {
             .await
             {
                 Ok(Ok(target)) => {
+                    self.record_external_outcome(&TxSubmitOutcome {
+                        kind: TxSubmitOutcomeKind::DirectAccepted,
+                        signature,
+                        mode,
+                        state_version: self
+                            .flow_safety_source
+                            .as_ref()
+                            .and_then(|source| source.toxic_flow_snapshot().current_state_version),
+                        opportunity_age_ms: None,
+                    });
                     self.spawn_agave_rebroadcast(tx_bytes.clone(), &direct_config);
                     return Ok(SubmitResult {
                         signature,
@@ -334,6 +597,16 @@ impl TxSubmitClient {
                 if direct_config.hybrid_rpc_broadcast
                     && let Ok(rpc_signature) = rpc.submit_rpc(&tx_bytes, &self.rpc_config).await
                 {
+                    self.record_external_outcome(&TxSubmitOutcome {
+                        kind: TxSubmitOutcomeKind::DirectAccepted,
+                        signature,
+                        mode,
+                        state_version: self
+                            .flow_safety_source
+                            .as_ref()
+                            .and_then(|source| source.toxic_flow_snapshot().current_state_version),
+                        opportunity_age_ms: None,
+                    });
                     return Ok(SubmitResult {
                         signature,
                         mode,
@@ -344,6 +617,16 @@ impl TxSubmitClient {
                         selected_identity_count,
                     });
                 }
+                self.record_external_outcome(&TxSubmitOutcome {
+                    kind: TxSubmitOutcomeKind::DirectAccepted,
+                    signature,
+                    mode,
+                    state_version: self
+                        .flow_safety_source
+                        .as_ref()
+                        .and_then(|source| source.toxic_flow_snapshot().current_state_version),
+                    opportunity_age_ms: None,
+                });
                 return Ok(SubmitResult {
                     signature,
                     mode,
@@ -363,6 +646,16 @@ impl TxSubmitClient {
             .submit_rpc(&tx_bytes, &self.rpc_config)
             .await
             .map_err(|source| SubmitError::Rpc { source })?;
+        self.record_external_outcome(&TxSubmitOutcome {
+            kind: TxSubmitOutcomeKind::RpcAccepted,
+            signature,
+            mode,
+            state_version: self
+                .flow_safety_source
+                .as_ref()
+                .and_then(|source| source.toxic_flow_snapshot().current_state_version),
+            opportunity_age_ms: None,
+        });
         Ok(SubmitResult {
             signature,
             mode,

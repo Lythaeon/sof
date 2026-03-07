@@ -21,11 +21,12 @@ pub use derived_state::{
     DerivedStateConsumerTelemetry, DerivedStateControlPlaneQuality,
     DerivedStateControlPlaneStateEvent, DerivedStateFeedEnvelope, DerivedStateFeedEvent,
     DerivedStateFreshnessState, DerivedStateHost, DerivedStateHostBuilder,
-    DerivedStateInputFreshness, DerivedStatePersistedCheckpoint, DerivedStateRecoveryReport,
-    DerivedStateReplayBackend, DerivedStateReplayDurability, DerivedStateReplayError,
-    DerivedStateReplaySource, DerivedStateReplayTelemetry, DiskDerivedStateReplaySource,
-    FeedSequence, FeedSessionId, FeedWatermarks, InMemoryDerivedStateReplaySource,
-    SlotStatusChangedEvent, TransactionAppliedEvent,
+    DerivedStateInputFreshness, DerivedStateInvalidationEvent, DerivedStateInvalidationReason,
+    DerivedStatePersistedCheckpoint, DerivedStateRecoveryReport, DerivedStateReplayBackend,
+    DerivedStateReplayDurability, DerivedStateReplayError, DerivedStateReplaySource,
+    DerivedStateReplayTelemetry, DerivedStateTxOutcomeEvent, DerivedStateTxOutcomeKind,
+    DiskDerivedStateReplaySource, FeedSequence, FeedSessionId, FeedWatermarks,
+    InMemoryDerivedStateReplaySource, SlotStatusChangedEvent, TransactionAppliedEvent,
 };
 pub use events::{
     AccountTouchEvent, ClusterNodeInfo, ClusterTopologyEvent, ControlPlaneSource, DatasetEvent,

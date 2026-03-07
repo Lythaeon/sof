@@ -1,15 +1,24 @@
 //! Shared submission types, errors, and transport traits.
 
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    hash::{Hash, Hasher},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime},
+};
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use solana_signature::Signature;
 use thiserror::Error;
 
 use crate::{builder::BuilderError, providers::LeaderTarget, routing::RoutingPolicy};
 
 /// Runtime submit mode.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SubmitMode {
     /// Submit only through JSON-RPC.
     RpcOnly,
@@ -20,7 +29,7 @@ pub enum SubmitMode {
 }
 
 /// Reliability profile for direct and hybrid submission behavior.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default, Serialize, Deserialize)]
 pub enum SubmitReliability {
     /// Fastest path with minimal retrying.
     LowLatency,
@@ -270,6 +279,12 @@ pub enum SubmitError {
         /// Synchronization error details.
         message: String,
     },
+    /// Submit attempt was rejected by the toxic-flow guard.
+    #[error("submission rejected by toxic-flow guard: {reason}")]
+    ToxicFlow {
+        /// Structured reason for the rejection.
+        reason: TxToxicFlowRejectionReason,
+    },
 }
 
 /// Summary of a successful submission.
@@ -289,6 +304,390 @@ pub struct SubmitResult {
     pub selected_target_count: usize,
     /// Number of unique validator identities in selected direct targets.
     pub selected_identity_count: usize,
+}
+
+/// Coarse toxic-flow quality used by submit guards.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub enum TxFlowSafetyQuality {
+    /// Required inputs are present, coherent, and safe to use.
+    Stable,
+    /// Inputs exist but have not reached a stable confirmation boundary yet.
+    Provisional,
+    /// Inputs exist but the current branch still carries material reorg risk.
+    ReorgRisk,
+    /// Inputs are present but stale.
+    Stale,
+    /// Inputs are present but mutually inconsistent.
+    Degraded,
+    /// Required inputs are still missing.
+    IncompleteControlPlane,
+}
+
+/// One concrete toxic-flow issue reported by a submit guard source.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub enum TxFlowSafetyIssue {
+    /// Submit source is still recovering from replay/checkpoint continuity.
+    ReplayRecoveryPending,
+    /// Control-plane inputs are still missing.
+    MissingControlPlane,
+    /// Control-plane inputs are stale.
+    StaleControlPlane,
+    /// Control-plane inputs are inconsistent.
+    DegradedControlPlane,
+    /// Current branch carries reorg risk.
+    ReorgRisk,
+    /// Current branch is still provisional.
+    Provisional,
+}
+
+/// Current toxic-flow safety snapshot exposed by one submit guard source.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TxFlowSafetySnapshot {
+    /// Coarse quality classification for the current control-plane view.
+    pub quality: TxFlowSafetyQuality,
+    /// Concrete issues behind `quality`.
+    pub issues: Vec<TxFlowSafetyIssue>,
+    /// Current upstream state version when known.
+    pub current_state_version: Option<u64>,
+    /// True when replay recovery is still pending.
+    pub replay_recovery_pending: bool,
+}
+
+impl TxFlowSafetySnapshot {
+    /// Returns true when the current snapshot is strategy-safe.
+    #[must_use]
+    pub const fn is_safe(&self) -> bool {
+        matches!(self.quality, TxFlowSafetyQuality::Stable) && !self.replay_recovery_pending
+    }
+}
+
+/// Dynamic source of toxic-flow safety state for submit guards.
+pub trait TxFlowSafetySource: Send + Sync {
+    /// Returns the latest toxic-flow safety snapshot.
+    fn toxic_flow_snapshot(&self) -> TxFlowSafetySnapshot;
+}
+
+/// One key used to suppress repeated submission attempts for the same opportunity.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub enum TxSubmitSuppressionKey {
+    /// Suppress by signature.
+    Signature(Signature),
+    /// Suppress by opaque opportunity identifier.
+    Opportunity([u8; 32]),
+    /// Suppress by hashed account set identifier.
+    AccountSet([u8; 32]),
+    /// Suppress by slot-window key.
+    SlotWindow {
+        /// Slot associated with the opportunity.
+        slot: u64,
+        /// Window width used to group nearby opportunities.
+        window: u64,
+    },
+}
+
+impl Hash for TxSubmitSuppressionKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Self::Signature(signature) => {
+                0_u8.hash(state);
+                signature.as_array().hash(state);
+            }
+            Self::Opportunity(key) => {
+                1_u8.hash(state);
+                key.hash(state);
+            }
+            Self::AccountSet(key) => {
+                2_u8.hash(state);
+                key.hash(state);
+            }
+            Self::SlotWindow { slot, window } => {
+                3_u8.hash(state);
+                slot.hash(state);
+                window.hash(state);
+            }
+        }
+    }
+}
+
+/// Call-site context used by toxic-flow guards.
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TxSubmitContext {
+    /// Additional suppression keys to apply before submit.
+    pub suppression_keys: Vec<TxSubmitSuppressionKey>,
+    /// State version used when the submit decision was made.
+    pub decision_state_version: Option<u64>,
+    /// Timestamp when the opportunity or decision was created.
+    pub opportunity_created_at: Option<SystemTime>,
+}
+
+/// Policy controlling toxic-flow submit rejection.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TxSubmitGuardPolicy {
+    /// Reject when the flow-safety source is not `Stable`.
+    pub require_stable_control_plane: bool,
+    /// Reject when the flow-safety source reports replay recovery pending.
+    pub reject_on_replay_recovery_pending: bool,
+    /// Maximum allowed drift between decision and current state versions.
+    pub max_state_version_drift: Option<u64>,
+    /// Maximum allowed age for one opportunity before submit.
+    pub max_opportunity_age: Option<Duration>,
+    /// TTL applied to built-in suppression keys.
+    pub suppression_ttl: Duration,
+}
+
+impl Default for TxSubmitGuardPolicy {
+    fn default() -> Self {
+        Self {
+            require_stable_control_plane: true,
+            reject_on_replay_recovery_pending: true,
+            max_state_version_drift: Some(4),
+            max_opportunity_age: Some(Duration::from_millis(750)),
+            suppression_ttl: Duration::from_millis(750),
+        }
+    }
+}
+
+/// Concrete reason one submit attempt was rejected before transport.
+#[derive(Debug, Error, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub enum TxToxicFlowRejectionReason {
+    /// Control-plane quality is not safe enough.
+    #[error("control-plane quality {quality:?} is not safe for submit")]
+    UnsafeControlPlane {
+        /// Current quality observed from the guard source.
+        quality: TxFlowSafetyQuality,
+    },
+    /// Replay recovery is still pending.
+    #[error("submit source is still recovering replay continuity")]
+    ReplayRecoveryPending,
+    /// One suppression key is still active.
+    #[error("submit suppressed by active key")]
+    Suppressed,
+    /// State version drift exceeded policy.
+    #[error("state version drift {drift} exceeded maximum {max_allowed}")]
+    StateDrift {
+        /// Observed drift between decision and current state versions.
+        drift: u64,
+        /// Maximum drift allowed by policy.
+        max_allowed: u64,
+    },
+    /// Opportunity age exceeded policy.
+    #[error("opportunity age {age_ms}ms exceeded maximum {max_allowed_ms}ms")]
+    OpportunityStale {
+        /// Observed age in milliseconds.
+        age_ms: u64,
+        /// Maximum age allowed in milliseconds.
+        max_allowed_ms: u64,
+    },
+}
+
+/// Final or immediate outcome classification for one submit attempt.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub enum TxSubmitOutcomeKind {
+    /// Direct path accepted the transaction.
+    DirectAccepted,
+    /// RPC path accepted the transaction.
+    RpcAccepted,
+    /// Transaction landed on chain.
+    Landed,
+    /// Transaction expired before landing.
+    Expired,
+    /// Transaction was dropped before landing.
+    Dropped,
+    /// Route missed the intended leader window.
+    LeaderMissed,
+    /// Submit used a stale blockhash.
+    BlockhashStale,
+    /// Selected route was unhealthy.
+    UnhealthyRoute,
+    /// Submit was rejected due to stale inputs.
+    RejectedDueToStaleness,
+    /// Submit was rejected due to reorg risk.
+    RejectedDueToReorgRisk,
+    /// Submit was rejected due to state drift.
+    RejectedDueToStateDrift,
+    /// Submit was rejected by replay recovery pending.
+    RejectedDueToReplayRecovery,
+    /// Submit was suppressed by a built-in key.
+    Suppressed,
+}
+
+/// Structured outcome record for toxic-flow telemetry/reporting.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TxSubmitOutcome {
+    /// Outcome classification.
+    pub kind: TxSubmitOutcomeKind,
+    /// Transaction signature when available.
+    pub signature: Option<Signature>,
+    /// Mode selected for the submit attempt.
+    pub mode: SubmitMode,
+    /// Current state version at outcome time when known.
+    pub state_version: Option<u64>,
+    /// Opportunity age in milliseconds when known.
+    pub opportunity_age_ms: Option<u64>,
+}
+
+/// Callback surface for external outcome sinks.
+pub trait TxSubmitOutcomeReporter: Send + Sync {
+    /// Records one structured outcome.
+    fn record_outcome(&self, outcome: &TxSubmitOutcome);
+}
+
+/// Snapshot of built-in toxic-flow counters collected by [`TxSubmitClient`](crate::submit::TxSubmitClient).
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TxToxicFlowTelemetrySnapshot {
+    /// Number of submit attempts rejected due to stale inputs.
+    pub rejected_due_to_staleness: u64,
+    /// Number of submit attempts rejected due to reorg risk.
+    pub rejected_due_to_reorg_risk: u64,
+    /// Number of submit attempts rejected due to state drift.
+    pub rejected_due_to_state_drift: u64,
+    /// Number of accepted submits emitted while the source was stale.
+    pub submit_on_stale_blockhash: u64,
+    /// Number of route misses classified as leader misses.
+    pub leader_route_miss_rate: u64,
+    /// Most recent opportunity age seen at submit time.
+    pub opportunity_age_at_send_ms: Option<u64>,
+    /// Number of submits rejected while replay recovery was pending.
+    pub rejected_due_to_replay_recovery: u64,
+    /// Number of submits suppressed by a built-in key.
+    pub suppressed_submissions: u64,
+}
+
+/// In-memory telemetry counters for toxic-flow outcomes.
+#[derive(Debug, Default)]
+pub struct TxToxicFlowTelemetry {
+    /// Number of stale-input rejections.
+    rejected_due_to_staleness: AtomicU64,
+    /// Number of reorg-risk rejections.
+    rejected_due_to_reorg_risk: AtomicU64,
+    /// Number of state-drift rejections.
+    rejected_due_to_state_drift: AtomicU64,
+    /// Number of accepted submits observed with stale blockhash state.
+    submit_on_stale_blockhash: AtomicU64,
+    /// Number of leader-route misses.
+    leader_route_miss_rate: AtomicU64,
+    /// Last opportunity age seen by the client.
+    opportunity_age_at_send_ms: AtomicU64,
+    /// Number of replay-recovery rejections.
+    rejected_due_to_replay_recovery: AtomicU64,
+    /// Number of suppressed submissions.
+    suppressed_submissions: AtomicU64,
+}
+
+impl TxToxicFlowTelemetry {
+    /// Returns a shareable telemetry sink.
+    #[must_use]
+    pub fn shared() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Records one structured outcome.
+    pub fn record(&self, outcome: &TxSubmitOutcome) {
+        if let Some(age_ms) = outcome.opportunity_age_ms {
+            let _ = self
+                .opportunity_age_at_send_ms
+                .swap(age_ms, Ordering::Relaxed);
+        }
+        match outcome.kind {
+            TxSubmitOutcomeKind::RejectedDueToStaleness => {
+                let _ = self
+                    .rejected_due_to_staleness
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            TxSubmitOutcomeKind::RejectedDueToReorgRisk => {
+                let _ = self
+                    .rejected_due_to_reorg_risk
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            TxSubmitOutcomeKind::RejectedDueToStateDrift => {
+                let _ = self
+                    .rejected_due_to_state_drift
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            TxSubmitOutcomeKind::RejectedDueToReplayRecovery => {
+                let _ = self
+                    .rejected_due_to_replay_recovery
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            TxSubmitOutcomeKind::Suppressed => {
+                let _ = self.suppressed_submissions.fetch_add(1, Ordering::Relaxed);
+            }
+            TxSubmitOutcomeKind::LeaderMissed => {
+                let _ = self.leader_route_miss_rate.fetch_add(1, Ordering::Relaxed);
+            }
+            TxSubmitOutcomeKind::DirectAccepted
+            | TxSubmitOutcomeKind::RpcAccepted
+            | TxSubmitOutcomeKind::Landed
+            | TxSubmitOutcomeKind::Expired
+            | TxSubmitOutcomeKind::Dropped
+            | TxSubmitOutcomeKind::UnhealthyRoute => {}
+            TxSubmitOutcomeKind::BlockhashStale => {
+                let _ = self
+                    .submit_on_stale_blockhash
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Returns the current telemetry snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> TxToxicFlowTelemetrySnapshot {
+        let age_ms = self.opportunity_age_at_send_ms.load(Ordering::Relaxed);
+        TxToxicFlowTelemetrySnapshot {
+            rejected_due_to_staleness: self.rejected_due_to_staleness.load(Ordering::Relaxed),
+            rejected_due_to_reorg_risk: self.rejected_due_to_reorg_risk.load(Ordering::Relaxed),
+            rejected_due_to_state_drift: self.rejected_due_to_state_drift.load(Ordering::Relaxed),
+            submit_on_stale_blockhash: self.submit_on_stale_blockhash.load(Ordering::Relaxed),
+            leader_route_miss_rate: self.leader_route_miss_rate.load(Ordering::Relaxed),
+            opportunity_age_at_send_ms: if age_ms == 0 { None } else { Some(age_ms) },
+            rejected_due_to_replay_recovery: self
+                .rejected_due_to_replay_recovery
+                .load(Ordering::Relaxed),
+            suppressed_submissions: self.suppressed_submissions.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl TxSubmitOutcomeReporter for TxToxicFlowTelemetry {
+    fn record_outcome(&self, outcome: &TxSubmitOutcome) {
+        self.record(outcome);
+    }
+}
+
+/// Internal suppression map used by the submit client.
+#[derive(Debug, Default)]
+pub(crate) struct TxSuppressionCache {
+    /// Active suppression entries keyed by opportunity identity.
+    entries: HashMap<TxSubmitSuppressionKey, SystemTime>,
+}
+
+impl TxSuppressionCache {
+    /// Returns true when at least one key is still active inside `ttl`.
+    pub(crate) fn is_suppressed(
+        &mut self,
+        keys: &[TxSubmitSuppressionKey],
+        now: SystemTime,
+        ttl: Duration,
+    ) -> bool {
+        self.evict_expired(now, ttl);
+        keys.iter().any(|key| self.entries.contains_key(key))
+    }
+
+    /// Inserts all provided suppression keys with the current timestamp.
+    pub(crate) fn insert_all(&mut self, keys: &[TxSubmitSuppressionKey], now: SystemTime) {
+        for key in keys {
+            let _ = self.entries.insert(key.clone(), now);
+        }
+    }
+
+    /// Removes entries older than the current TTL window.
+    fn evict_expired(&mut self, now: SystemTime, ttl: Duration) {
+        self.entries.retain(|_, inserted_at| {
+            now.duration_since(*inserted_at)
+                .map(|elapsed| elapsed <= ttl)
+                .unwrap_or(false)
+        });
+    }
 }
 
 /// RPC transport interface.

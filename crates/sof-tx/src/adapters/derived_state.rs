@@ -7,8 +7,8 @@ use std::{
 
 use sof::framework::{
     DerivedStateCheckpoint, DerivedStateCheckpointStore, DerivedStateConsumer,
-    DerivedStateConsumerFault, DerivedStateFeedEnvelope, DerivedStateFeedEvent,
-    DerivedStatePersistedCheckpoint,
+    DerivedStateConsumerFault, DerivedStateControlPlaneQuality, DerivedStateControlPlaneStateEvent,
+    DerivedStateFeedEnvelope, DerivedStateFeedEvent, DerivedStatePersistedCheckpoint,
 };
 
 use crate::{
@@ -18,6 +18,7 @@ use crate::{
         take_next_leader_identity_targets,
     },
     providers::{LeaderProvider, LeaderTarget, RecentBlockhashProvider},
+    submit::{TxFlowSafetyIssue, TxFlowSafetyQuality, TxFlowSafetySnapshot, TxFlowSafetySource},
 };
 
 /// Stable derived-state consumer name exposed to the SOF host.
@@ -62,6 +63,8 @@ pub struct DerivedStateTxProviderAdapter {
     persistence: Option<DerivedStateTxProviderAdapterPersistence>,
     /// Latest checkpoint visible to recovery logic.
     checkpoint: Arc<Mutex<Option<DerivedStateCheckpoint>>>,
+    /// Latest canonical observer-side control-plane state when present in the feed.
+    latest_control_plane_state: Arc<Mutex<Option<DerivedStateControlPlaneStateEvent>>>,
 }
 
 impl DerivedStateTxProviderAdapter {
@@ -72,6 +75,7 @@ impl DerivedStateTxProviderAdapter {
             core: TxProviderAdapterCore::new(config),
             persistence: None,
             checkpoint: Arc::new(Mutex::new(None)),
+            latest_control_plane_state: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -85,6 +89,7 @@ impl DerivedStateTxProviderAdapter {
             core: TxProviderAdapterCore::new(config),
             persistence: Some(persistence),
             checkpoint: Arc::new(Mutex::new(None)),
+            latest_control_plane_state: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -175,6 +180,14 @@ impl DerivedStateTxProviderAdapter {
         DerivedStateCheckpointStore::new(persistence.checkpoint_path())
             .store(checkpoint, &self.snapshot_state())
     }
+
+    /// Returns the latest observer-side control-plane snapshot when the feed has emitted one.
+    fn latest_control_plane_state(&self) -> Option<DerivedStateControlPlaneStateEvent> {
+        *self
+            .latest_control_plane_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 impl Default for DerivedStateTxProviderAdapter {
@@ -199,6 +212,78 @@ impl LeaderProvider for DerivedStateTxProviderAdapter {
             return Vec::new();
         }
         take_next_leader_identity_targets(self.core.leader_window(n), n)
+    }
+}
+
+impl TxFlowSafetySource for DerivedStateTxProviderAdapter {
+    fn toxic_flow_snapshot(&self) -> TxFlowSafetySnapshot {
+        self.latest_control_plane_state().map_or_else(
+            || {
+                let report = self.evaluate_flow_safety(TxProviderFlowSafetyPolicy::default());
+                TxFlowSafetySnapshot {
+                    quality: match report.quality {
+                        crate::adapters::TxProviderControlPlaneQuality::Stable => {
+                            TxFlowSafetyQuality::Stable
+                        }
+                        crate::adapters::TxProviderControlPlaneQuality::Degraded => {
+                            TxFlowSafetyQuality::Degraded
+                        }
+                        crate::adapters::TxProviderControlPlaneQuality::Stale => {
+                            TxFlowSafetyQuality::Stale
+                        }
+                        crate::adapters::TxProviderControlPlaneQuality::IncompleteControlPlane => {
+                            TxFlowSafetyQuality::IncompleteControlPlane
+                        }
+                    },
+                    issues: if report.is_safe() {
+                        Vec::new()
+                    } else {
+                        vec![TxFlowSafetyIssue::MissingControlPlane]
+                    },
+                    current_state_version: report.snapshot.tip_slot,
+                    replay_recovery_pending: false,
+                }
+            },
+            |control_plane_state| {
+                let quality = match control_plane_state.quality {
+                    DerivedStateControlPlaneQuality::Stable => TxFlowSafetyQuality::Stable,
+                    DerivedStateControlPlaneQuality::Provisional => {
+                        TxFlowSafetyQuality::Provisional
+                    }
+                    DerivedStateControlPlaneQuality::ReorgRisk => TxFlowSafetyQuality::ReorgRisk,
+                    DerivedStateControlPlaneQuality::Stale => TxFlowSafetyQuality::Stale,
+                    DerivedStateControlPlaneQuality::Degraded => TxFlowSafetyQuality::Degraded,
+                    DerivedStateControlPlaneQuality::IncompleteControlPlane => {
+                        TxFlowSafetyQuality::IncompleteControlPlane
+                    }
+                };
+                let mut issues = Vec::new();
+                if !control_plane_state.strategy_safe {
+                    match quality {
+                        TxFlowSafetyQuality::Stable => {}
+                        TxFlowSafetyQuality::Provisional => {
+                            issues.push(TxFlowSafetyIssue::Provisional)
+                        }
+                        TxFlowSafetyQuality::ReorgRisk => issues.push(TxFlowSafetyIssue::ReorgRisk),
+                        TxFlowSafetyQuality::Stale => {
+                            issues.push(TxFlowSafetyIssue::StaleControlPlane)
+                        }
+                        TxFlowSafetyQuality::Degraded => {
+                            issues.push(TxFlowSafetyIssue::DegradedControlPlane)
+                        }
+                        TxFlowSafetyQuality::IncompleteControlPlane => {
+                            issues.push(TxFlowSafetyIssue::MissingControlPlane)
+                        }
+                    }
+                }
+                TxFlowSafetySnapshot {
+                    quality,
+                    issues,
+                    current_state_version: control_plane_state.tip_slot,
+                    replay_recovery_pending: false,
+                }
+            },
+        )
     }
 }
 
@@ -251,7 +336,14 @@ impl DerivedStateConsumer for DerivedStateTxProviderAdapter {
             DerivedStateFeedEvent::BranchReorged(event) => {
                 self.core.apply_reorg(&event);
             }
-            DerivedStateFeedEvent::ControlPlaneStateUpdated(_)
+            DerivedStateFeedEvent::ControlPlaneStateUpdated(event) => {
+                *self
+                    .latest_control_plane_state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(event);
+            }
+            DerivedStateFeedEvent::StateInvalidated(_)
+            | DerivedStateFeedEvent::TxOutcomeObserved(_)
             | DerivedStateFeedEvent::TransactionApplied(_)
             | DerivedStateFeedEvent::AccountTouchObserved(_)
             | DerivedStateFeedEvent::CheckpointBarrier(_) => {}

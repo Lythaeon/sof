@@ -15,6 +15,7 @@ use crate::{
         TxProviderFlowSafetyPolicy, TxProviderFlowSafetyReport, take_next_leader_identity_targets,
     },
     providers::{LeaderProvider, LeaderTarget, RecentBlockhashProvider},
+    submit::{TxFlowSafetyIssue, TxFlowSafetyQuality, TxFlowSafetySnapshot, TxFlowSafetySource},
 };
 
 /// Configuration for [`PluginHostTxProviderAdapter`].
@@ -106,6 +107,42 @@ impl LeaderProvider for PluginHostTxProviderAdapter {
             return Vec::new();
         }
         take_next_leader_identity_targets(self.leader_window(n), n)
+    }
+}
+
+impl TxFlowSafetySource for PluginHostTxProviderAdapter {
+    fn toxic_flow_snapshot(&self) -> TxFlowSafetySnapshot {
+        let report = self.evaluate_flow_safety(TxProviderFlowSafetyPolicy::default());
+        let quality = match report.quality {
+            crate::adapters::TxProviderControlPlaneQuality::Stable => TxFlowSafetyQuality::Stable,
+            crate::adapters::TxProviderControlPlaneQuality::Degraded => {
+                TxFlowSafetyQuality::Degraded
+            }
+            crate::adapters::TxProviderControlPlaneQuality::Stale => TxFlowSafetyQuality::Stale,
+            crate::adapters::TxProviderControlPlaneQuality::IncompleteControlPlane => {
+                TxFlowSafetyQuality::IncompleteControlPlane
+            }
+        };
+        let issues = if report.is_safe() {
+            Vec::new()
+        } else {
+            vec![match quality {
+                TxFlowSafetyQuality::Stable => TxFlowSafetyIssue::MissingControlPlane,
+                TxFlowSafetyQuality::Provisional => TxFlowSafetyIssue::Provisional,
+                TxFlowSafetyQuality::ReorgRisk => TxFlowSafetyIssue::ReorgRisk,
+                TxFlowSafetyQuality::Stale => TxFlowSafetyIssue::StaleControlPlane,
+                TxFlowSafetyQuality::Degraded => TxFlowSafetyIssue::DegradedControlPlane,
+                TxFlowSafetyQuality::IncompleteControlPlane => {
+                    TxFlowSafetyIssue::MissingControlPlane
+                }
+            }]
+        };
+        TxFlowSafetySnapshot {
+            quality,
+            issues,
+            current_state_version: report.snapshot.tip_slot,
+            replay_recovery_pending: false,
+        }
     }
 }
 

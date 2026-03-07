@@ -27,8 +27,8 @@ use thiserror::Error;
 use crate::{
     event::{ForkSlotStatus, TxCommitmentStatus, TxKind},
     framework::{
-        AccountTouchEvent, ClusterTopologyEvent, LeaderScheduleEvent, ObservedRecentBlockhashEvent,
-        ReorgEvent, SlotStatusEvent, TransactionEvent,
+        AccountTouchEvent, ClusterTopologyEvent, ControlPlaneSource, LeaderScheduleEvent,
+        ObservedRecentBlockhashEvent, ReorgEvent, SlotStatusEvent, TransactionEvent,
     },
 };
 
@@ -139,6 +139,10 @@ pub enum DerivedStateFeedEvent {
     LeaderScheduleUpdated(LeaderScheduleEvent),
     /// Canonical control-plane freshness and quality state derived from feed inputs.
     ControlPlaneStateUpdated(DerivedStateControlPlaneStateEvent),
+    /// Explicit invalidation boundary for replay, reorg, or degraded control-plane state.
+    StateInvalidated(DerivedStateInvalidationEvent),
+    /// Tx outcome feedback emitted by services layered on top of SOF.
+    TxOutcomeObserved(DerivedStateTxOutcomeEvent),
     /// Slot lifecycle transition.
     SlotStatusChanged(SlotStatusChangedEvent),
     /// Canonical branch switch requiring consumer rollback/reconciliation.
@@ -182,6 +186,10 @@ pub struct DerivedStateInputFreshness {
 pub enum DerivedStateControlPlaneQuality {
     /// Required inputs are present and within policy.
     Stable,
+    /// Inputs are coherent but not yet beyond a provisional confirmation boundary.
+    Provisional,
+    /// Inputs are coherent but still carry elevated reorg risk.
+    ReorgRisk,
     /// Inputs exist, but they are not coherent enough to trust as one control-plane view.
     Degraded,
     /// Required inputs exist but at least one is stale.
@@ -205,6 +213,12 @@ pub struct DerivedStateControlPlaneStateEvent {
     pub known_cluster_nodes: usize,
     /// Number of leader-slot assignments visible in the latest schedule snapshot.
     pub known_leader_slots: usize,
+    /// Latest topology source when known.
+    pub cluster_topology_source: Option<ControlPlaneSource>,
+    /// Latest leader-schedule source when known.
+    pub leader_schedule_source: Option<ControlPlaneSource>,
+    /// Wallclock skew budget observed across topology nodes when known.
+    pub cluster_topology_max_wallclock_skew_ms: Option<u64>,
     /// Freshness metadata for the recent blockhash input.
     pub recent_blockhash_freshness: DerivedStateInputFreshness,
     /// Freshness metadata for the cluster topology input.
@@ -215,8 +229,78 @@ pub struct DerivedStateControlPlaneStateEvent {
     pub control_plane_slot_spread: Option<u64>,
     /// Whether control-plane inputs are aligned under the built-in classifier.
     pub inputs_aligned: bool,
+    /// True when the current control-plane snapshot is safe to use for strategy decisions.
+    pub strategy_safe: bool,
+    /// True when conflicting source or slot regressions have been observed.
+    pub conflicts_detected: bool,
+    /// Total number of detected control-plane conflicts in this host session.
+    pub conflict_count: u64,
     /// Coarse quality classification for the control-plane snapshot.
     pub quality: DerivedStateControlPlaneQuality,
+}
+
+/// Explicit invalidation reason for derived-state consumers.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub enum DerivedStateInvalidationReason {
+    /// Canonical branch switched and prior state must be reconsidered.
+    Reorg,
+    /// Control-plane quality is no longer strategy-safe.
+    ControlPlaneUnsafe,
+    /// Replay continuity was lost and consumer state must be rebuilt.
+    ReplayGap,
+}
+
+/// Explicit invalidation envelope for replay/reorg-aware consumers.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DerivedStateInvalidationEvent {
+    /// Root cause for the invalidation.
+    pub reason: DerivedStateInvalidationReason,
+    /// Detached slots affected by the invalidation.
+    pub detached_slots: Vec<u64>,
+    /// Current control-plane quality when invalidation is control-plane driven.
+    pub control_plane_quality: Option<DerivedStateControlPlaneQuality>,
+}
+
+/// Outcome classification reported by services layered on top of SOF.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub enum DerivedStateTxOutcomeKind {
+    /// Transaction landed on chain.
+    Landed,
+    /// Transaction expired before landing.
+    Expired,
+    /// Transaction was dropped before landing.
+    Dropped,
+    /// Intended leader window was missed.
+    LeaderMissed,
+    /// Submit path used a stale blockhash.
+    BlockhashStale,
+    /// Selected route was unhealthy.
+    UnhealthyRoute,
+    /// Submit was rejected due to stale inputs.
+    RejectedDueToStaleness,
+    /// Submit was rejected due to reorg risk.
+    RejectedDueToReorgRisk,
+    /// Submit was rejected due to state drift.
+    RejectedDueToStateDrift,
+    /// Submit was rejected while replay recovery was pending.
+    RejectedDueToReplayRecovery,
+    /// Submit was suppressed by a built-in key.
+    Suppressed,
+}
+
+/// Derived-state tx outcome feedback emitted by higher-level services.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DerivedStateTxOutcomeEvent {
+    /// Transaction signature when known.
+    pub signature: Option<Signature>,
+    /// Outcome classification.
+    pub kind: DerivedStateTxOutcomeKind,
+    /// Decision-state version used by the service when known.
+    pub decision_state_version: Option<u64>,
+    /// Current service/runtime state version when known.
+    pub current_state_version: Option<u64>,
+    /// Opportunity age at outcome time in milliseconds when known.
+    pub opportunity_age_ms: Option<u64>,
 }
 
 /// Decoded transaction apply record for the derived-state feed.
@@ -1994,6 +2078,7 @@ impl DerivedStateHost {
             return;
         }
         let slot = event.slot;
+        let source = event.source;
         let known_cluster_nodes = if !event.snapshot_nodes.is_empty() {
             event.snapshot_nodes.len()
         } else {
@@ -2005,13 +2090,17 @@ impl DerivedStateHost {
             confirmed_slot: None,
             finalized_slot: None,
         };
+        let wallclock_skew_ms = topology_max_wallclock_skew_ms(&event);
         self.dispatch_with_control_plane_update(
             watermarks,
             DerivedStateFeedEvent::ClusterTopologyChanged(event),
             |state| {
-                state
-                    .control_plane_state
-                    .apply_cluster_topology(slot, known_cluster_nodes)
+                state.control_plane_state.apply_cluster_topology(
+                    slot,
+                    known_cluster_nodes,
+                    source,
+                    wallclock_skew_ms,
+                )
             },
         );
     }
@@ -2022,6 +2111,7 @@ impl DerivedStateHost {
             return;
         }
         let slot = event.slot;
+        let source = event.source;
         let snapshot_leader_count = event.snapshot_leaders.len();
         let added_leader_count = event.added_leaders.len();
         let removed_slot_count = event.removed_slots.len();
@@ -2040,6 +2130,7 @@ impl DerivedStateHost {
                     snapshot_leader_count,
                     added_leader_count,
                     removed_slot_count,
+                    source,
                 )
             },
         );
@@ -2071,11 +2162,39 @@ impl DerivedStateHost {
             return;
         }
         let watermarks = FeedWatermarks::from_reorg(&event);
-        self.dispatch_with_control_plane_update(
+        let detached_slots = event.detached_slots.clone();
+        let branch_event = BranchReorgedEvent::from(event);
+        self.dispatch_many(
             watermarks,
-            DerivedStateFeedEvent::BranchReorged(event.into()),
-            |_| {},
+            [
+                DerivedStateFeedEvent::BranchReorged(branch_event),
+                DerivedStateFeedEvent::StateInvalidated(DerivedStateInvalidationEvent {
+                    reason: DerivedStateInvalidationReason::Reorg,
+                    detached_slots,
+                    control_plane_quality: None,
+                }),
+            ],
         );
+    }
+
+    /// Emits one externally computed invalidation event.
+    pub fn on_state_invalidation(
+        &self,
+        watermarks: FeedWatermarks,
+        event: DerivedStateInvalidationEvent,
+    ) {
+        if self.is_empty() {
+            return;
+        }
+        self.dispatch(watermarks, DerivedStateFeedEvent::StateInvalidated(event));
+    }
+
+    /// Emits one tx outcome event supplied by a higher-level service.
+    pub fn on_tx_outcome(&self, watermarks: FeedWatermarks, event: DerivedStateTxOutcomeEvent) {
+        if self.is_empty() {
+            return;
+        }
+        self.dispatch(watermarks, DerivedStateFeedEvent::TxOutcomeObserved(event));
     }
 
     /// Emits a checkpoint barrier and flushes durable checkpoints for all consumers.
@@ -2171,14 +2290,23 @@ impl DerivedStateHost {
         };
         update_state(&mut dispatch_state);
         let control_plane_event = dispatch_state.control_plane_state.snapshot(watermarks);
-        self.dispatch_many_locked(
-            &mut dispatch_state,
-            watermarks,
-            [
+        let invalidation_event = invalidation_from_control_plane_state(
+            &mut dispatch_state.control_plane_state,
+            control_plane_event,
+        );
+        let events = if let Some(invalidation_event) = invalidation_event {
+            vec![
                 primary_event,
                 DerivedStateFeedEvent::ControlPlaneStateUpdated(control_plane_event),
-            ],
-        );
+                DerivedStateFeedEvent::StateInvalidated(invalidation_event),
+            ]
+        } else {
+            vec![
+                primary_event,
+                DerivedStateFeedEvent::ControlPlaneStateUpdated(control_plane_event),
+            ]
+        };
+        self.dispatch_vec_locked(&mut dispatch_state, watermarks, events);
     }
 
     /// Emits a fixed batch of feed events under one dispatch lock.
@@ -2194,6 +2322,18 @@ impl DerivedStateHost {
         self.dispatch_many_locked(&mut dispatch_state, watermarks, events);
     }
 
+    /// Emits an owned event list using an already-held dispatch lock.
+    fn dispatch_vec_locked(
+        &self,
+        dispatch_state: &mut DerivedStateDispatchState,
+        watermarks: FeedWatermarks,
+        events: Vec<DerivedStateFeedEvent>,
+    ) {
+        for event in events {
+            self.dispatch_one_locked(dispatch_state, watermarks, event);
+        }
+    }
+
     /// Emits a fixed batch of feed events using an already-held dispatch lock.
     fn dispatch_many_locked<const N: usize>(
         &self,
@@ -2202,44 +2342,54 @@ impl DerivedStateHost {
         events: [DerivedStateFeedEvent; N],
     ) {
         for event in events {
-            let sequence = FeedSequence(dispatch_state.next_sequence);
-            dispatch_state.next_sequence = dispatch_state.next_sequence.saturating_add(1);
-            let envelope = DerivedStateFeedEnvelope {
-                session_id: self.inner.session_id,
-                sequence,
-                emitted_at: SystemTime::now(),
-                watermarks,
-                event,
-            };
-            if let Some(replay_source) = self.replay_source() {
-                replay_source.append(envelope.clone());
-            }
-
-            for registered in self.inner.consumers.iter() {
-                if registered.is_unhealthy() {
-                    continue;
-                }
-                let Ok(mut consumer) = registered.consumer.lock() else {
-                    self.record_consumer_fault(
-                        registered,
-                        &DerivedStateConsumerFault::new(
-                            DerivedStateConsumerFaultKind::ConsumerApplyFailed,
-                            Some(sequence),
-                            "derived-state consumer mutex poisoned during apply",
-                        ),
-                    );
-                    continue;
-                };
-                if let Err(fault) = consumer.apply(envelope.clone()) {
-                    self.record_consumer_fault(registered, &fault);
-                } else {
-                    registered.note_applied(sequence);
-                }
-            }
-
-            dispatch_state.last_sequence = Some(sequence);
-            dispatch_state.last_watermarks = watermarks;
+            self.dispatch_one_locked(dispatch_state, watermarks, event);
         }
+    }
+
+    /// Emits one event using an already-held dispatch lock.
+    fn dispatch_one_locked(
+        &self,
+        dispatch_state: &mut DerivedStateDispatchState,
+        watermarks: FeedWatermarks,
+        event: DerivedStateFeedEvent,
+    ) {
+        let sequence = FeedSequence(dispatch_state.next_sequence);
+        dispatch_state.next_sequence = dispatch_state.next_sequence.saturating_add(1);
+        let envelope = DerivedStateFeedEnvelope {
+            session_id: self.inner.session_id,
+            sequence,
+            emitted_at: SystemTime::now(),
+            watermarks,
+            event,
+        };
+        if let Some(replay_source) = self.replay_source() {
+            replay_source.append(envelope.clone());
+        }
+
+        for registered in self.inner.consumers.iter() {
+            if registered.is_unhealthy() {
+                continue;
+            }
+            let Ok(mut consumer) = registered.consumer.lock() else {
+                self.record_consumer_fault(
+                    registered,
+                    &DerivedStateConsumerFault::new(
+                        DerivedStateConsumerFaultKind::ConsumerApplyFailed,
+                        Some(sequence),
+                        "derived-state consumer mutex poisoned during apply",
+                    ),
+                );
+                continue;
+            };
+            if let Err(fault) = consumer.apply(envelope.clone()) {
+                self.record_consumer_fault(registered, &fault);
+            } else {
+                registered.note_applied(sequence);
+            }
+        }
+
+        dispatch_state.last_sequence = Some(sequence);
+        dispatch_state.last_watermarks = watermarks;
     }
 
     /// Records one consumer fault for telemetry and structured logs.
@@ -2336,6 +2486,16 @@ struct DerivedStateControlPlaneTracker {
     known_cluster_nodes: usize,
     /// Number of leader slots visible in the latest leader-schedule snapshot.
     known_leader_slots: usize,
+    /// Source of the latest cluster-topology update.
+    cluster_topology_source: Option<ControlPlaneSource>,
+    /// Source of the latest leader-schedule update.
+    leader_schedule_source: Option<ControlPlaneSource>,
+    /// Maximum wallclock skew observed across the latest topology payload.
+    cluster_topology_max_wallclock_skew_ms: Option<u64>,
+    /// Number of source or slot conflicts seen in this host session.
+    conflict_count: u64,
+    /// Last emitted quality used for invalidation transitions.
+    last_quality: Option<DerivedStateControlPlaneQuality>,
 }
 
 impl DerivedStateControlPlaneTracker {
@@ -2345,23 +2505,56 @@ impl DerivedStateControlPlaneTracker {
     }
 
     /// Updates the tracker from one cluster-topology observation.
-    const fn apply_cluster_topology(&mut self, slot: Option<u64>, known_cluster_nodes: usize) {
+    fn apply_cluster_topology(
+        &mut self,
+        slot: Option<u64>,
+        known_cluster_nodes: usize,
+        source: ControlPlaneSource,
+        wallclock_skew_ms: Option<u64>,
+    ) {
         if let Some(slot) = slot {
+            if self
+                .cluster_topology_slot
+                .is_some_and(|previous| slot < previous)
+            {
+                self.conflict_count = self.conflict_count.saturating_add(1);
+            }
             self.cluster_topology_slot = Some(slot);
         }
+        if self
+            .cluster_topology_source
+            .is_some_and(|previous| previous != source)
+        {
+            self.conflict_count = self.conflict_count.saturating_add(1);
+        }
         self.known_cluster_nodes = known_cluster_nodes;
+        self.cluster_topology_source = Some(source);
+        self.cluster_topology_max_wallclock_skew_ms = wallclock_skew_ms;
     }
 
     /// Updates the tracker from one leader-schedule observation.
-    const fn apply_leader_schedule(
+    fn apply_leader_schedule(
         &mut self,
         slot: Option<u64>,
         snapshot_leader_count: usize,
         added_leader_count: usize,
         removed_slot_count: usize,
+        source: ControlPlaneSource,
     ) {
         if let Some(slot) = slot {
+            if self
+                .leader_schedule_slot
+                .is_some_and(|previous| slot < previous)
+            {
+                self.conflict_count = self.conflict_count.saturating_add(1);
+            }
             self.leader_schedule_slot = Some(slot);
+        }
+        if self
+            .leader_schedule_source
+            .is_some_and(|previous| previous != source)
+        {
+            self.conflict_count = self.conflict_count.saturating_add(1);
         }
         self.known_leader_slots = if snapshot_leader_count > 0 {
             snapshot_leader_count
@@ -2370,6 +2563,7 @@ impl DerivedStateControlPlaneTracker {
                 .saturating_add(added_leader_count)
                 .saturating_sub(removed_slot_count)
         };
+        self.leader_schedule_source = Some(source);
     }
 
     /// Builds the canonical control-plane state snapshot for one watermark boundary.
@@ -2404,7 +2598,9 @@ impl DerivedStateControlPlaneTracker {
             leader_schedule_freshness,
             inputs_aligned,
             tip_slot,
+            watermarks,
         );
+        let strategy_safe = matches!(quality, DerivedStateControlPlaneQuality::Stable);
 
         DerivedStateControlPlaneStateEvent {
             recent_blockhash_slot: self.recent_blockhash_slot,
@@ -2413,11 +2609,17 @@ impl DerivedStateControlPlaneTracker {
             tip_slot,
             known_cluster_nodes: self.known_cluster_nodes,
             known_leader_slots: self.known_leader_slots,
+            cluster_topology_source: self.cluster_topology_source,
+            leader_schedule_source: self.leader_schedule_source,
+            cluster_topology_max_wallclock_skew_ms: self.cluster_topology_max_wallclock_skew_ms,
             recent_blockhash_freshness,
             cluster_topology_freshness,
             leader_schedule_freshness,
             control_plane_slot_spread,
             inputs_aligned,
+            strategy_safe,
+            conflicts_detected: self.conflict_count > 0,
+            conflict_count: self.conflict_count,
             quality,
         }
     }
@@ -2472,12 +2674,13 @@ fn control_plane_slot_spread(
 }
 
 /// Classifies the observer-side control plane from per-input freshness and alignment state.
-const fn classify_control_plane_quality(
+fn classify_control_plane_quality(
     recent_blockhash_freshness: DerivedStateInputFreshness,
     cluster_topology_freshness: DerivedStateInputFreshness,
     leader_schedule_freshness: DerivedStateInputFreshness,
     inputs_aligned: bool,
     tip_slot: Option<u64>,
+    watermarks: FeedWatermarks,
 ) -> DerivedStateControlPlaneQuality {
     if tip_slot.is_none()
         || matches!(
@@ -2513,7 +2716,46 @@ const fn classify_control_plane_quality(
         return DerivedStateControlPlaneQuality::Degraded;
     }
 
+    if watermarks.finalized_slot != tip_slot {
+        if watermarks.confirmed_slot == tip_slot {
+            return DerivedStateControlPlaneQuality::Provisional;
+        }
+        return DerivedStateControlPlaneQuality::ReorgRisk;
+    }
+
     DerivedStateControlPlaneQuality::Stable
+}
+
+/// Emits an invalidation when control-plane quality transitions into an unsafe state.
+fn invalidation_from_control_plane_state(
+    tracker: &mut DerivedStateControlPlaneTracker,
+    state: DerivedStateControlPlaneStateEvent,
+) -> Option<DerivedStateInvalidationEvent> {
+    let previous_quality = tracker.last_quality.replace(state.quality);
+    let became_unsafe = !state.strategy_safe
+        && previous_quality
+            .is_none_or(|previous| previous == DerivedStateControlPlaneQuality::Stable);
+    if became_unsafe {
+        Some(DerivedStateInvalidationEvent {
+            reason: DerivedStateInvalidationReason::ControlPlaneUnsafe,
+            detached_slots: Vec::new(),
+            control_plane_quality: Some(state.quality),
+        })
+    } else {
+        None
+    }
+}
+
+/// Returns the maximum wallclock skew across topology nodes when present.
+fn topology_max_wallclock_skew_ms(event: &ClusterTopologyEvent) -> Option<u64> {
+    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    event
+        .snapshot_nodes
+        .iter()
+        .chain(event.added_nodes.iter())
+        .chain(event.updated_nodes.iter())
+        .map(|node| now_secs.abs_diff(node.wallclock).saturating_mul(1_000))
+        .max()
 }
 
 /// Consumer registration entry stored by the host.
@@ -2968,10 +3210,11 @@ mod tests {
                 FeedSequence(0),
                 FeedSequence(1),
                 FeedSequence(2),
-                FeedSequence(3)
+                FeedSequence(3),
+                FeedSequence(4)
             ]
         );
-        assert_eq!(host.last_emitted_sequence(), Some(FeedSequence(3)));
+        assert_eq!(host.last_emitted_sequence(), Some(FeedSequence(4)));
         assert_eq!(
             host.current_watermarks(),
             FeedWatermarks {
@@ -3035,7 +3278,7 @@ mod tests {
         let state = state
             .lock()
             .expect("recording state mutex should not be poisoned");
-        assert_eq!(state.envelopes.len(), 6);
+        assert_eq!(state.envelopes.len(), 7);
         assert!(matches!(
             state.envelopes[0].event,
             DerivedStateFeedEvent::RecentBlockhashObserved(_)
@@ -3047,34 +3290,40 @@ mod tests {
         ));
         assert!(matches!(
             state.envelopes[2].event,
-            DerivedStateFeedEvent::ClusterTopologyChanged(_)
+            DerivedStateFeedEvent::StateInvalidated(_)
         ));
-        assert_eq!(state.envelopes[2].watermarks.processed_slot, Some(71));
+        assert_eq!(state.envelopes[2].watermarks.processed_slot, Some(70));
         assert!(matches!(
             state.envelopes[3].event,
-            DerivedStateFeedEvent::ControlPlaneStateUpdated(_)
+            DerivedStateFeedEvent::ClusterTopologyChanged(_)
         ));
+        assert_eq!(state.envelopes[3].watermarks.processed_slot, Some(71));
         assert!(matches!(
             state.envelopes[4].event,
-            DerivedStateFeedEvent::LeaderScheduleUpdated(_)
-        ));
-        assert_eq!(state.envelopes[4].watermarks.processed_slot, Some(72));
-        assert!(matches!(
-            state.envelopes[5].event,
             DerivedStateFeedEvent::ControlPlaneStateUpdated(_)
         ));
+        assert!(matches!(
+            state.envelopes[5].event,
+            DerivedStateFeedEvent::LeaderScheduleUpdated(_)
+        ));
         assert_eq!(state.envelopes[5].watermarks.processed_slot, Some(72));
+        assert!(matches!(
+            state.envelopes[6].event,
+            DerivedStateFeedEvent::ControlPlaneStateUpdated(_)
+        ));
+        assert_eq!(state.envelopes[6].watermarks.processed_slot, Some(72));
         let DerivedStateFeedEvent::ControlPlaneStateUpdated(control_plane) =
-            state.envelopes[5].event.clone()
+            state.envelopes[6].event.clone()
         else {
             panic!("expected control-plane state update");
         };
         assert_eq!(
             control_plane.quality,
-            DerivedStateControlPlaneQuality::Stable
+            DerivedStateControlPlaneQuality::ReorgRisk
         );
         assert!(control_plane.inputs_aligned);
-        assert_eq!(host.last_emitted_sequence(), Some(FeedSequence(5)));
+        assert!(!control_plane.strategy_safe);
+        assert_eq!(host.last_emitted_sequence(), Some(FeedSequence(6)));
     }
 
     #[test]
@@ -3109,9 +3358,9 @@ mod tests {
             .iter()
             .map(|envelope| envelope.sequence.0)
             .collect::<Vec<_>>();
-        assert_eq!(sequences.len(), 32);
-        assert_eq!(sequences, (0_u64..32).collect::<Vec<_>>());
-        assert_eq!(host.last_emitted_sequence(), Some(FeedSequence(31)));
+        assert_eq!(sequences.len(), 33);
+        assert_eq!(sequences, (0_u64..33).collect::<Vec<_>>());
+        assert_eq!(host.last_emitted_sequence(), Some(FeedSequence(32)));
         assert_eq!(host.fault_count(), 0);
     }
 
@@ -3142,15 +3391,15 @@ mod tests {
         let state = state
             .lock()
             .expect("recording state mutex should not be poisoned");
-        assert_eq!(state.envelopes.len(), 3);
+        assert_eq!(state.envelopes.len(), 4);
         assert_eq!(state.checkpoints.len(), 1);
-        let barrier_envelope = &state.envelopes[2];
-        assert_eq!(barrier_envelope.sequence, FeedSequence(2));
+        let barrier_envelope = &state.envelopes[3];
+        assert_eq!(barrier_envelope.sequence, FeedSequence(3));
         assert_eq!(barrier_envelope.watermarks, watermarks);
         assert!(matches!(
             barrier_envelope.event,
             DerivedStateFeedEvent::CheckpointBarrier(CheckpointBarrierEvent {
-                barrier_sequence: FeedSequence(2),
+                barrier_sequence: FeedSequence(3),
                 reason: CheckpointBarrierReason::Periodic,
             })
         ));
@@ -3158,13 +3407,13 @@ mod tests {
             state.checkpoints[0],
             DerivedStateCheckpoint {
                 session_id: host.session_id(),
-                last_applied_sequence: FeedSequence(2),
+                last_applied_sequence: FeedSequence(3),
                 watermarks,
                 state_version: 7,
                 extension_version: "test-consumer".to_owned(),
             }
         );
-        assert_eq!(host.last_emitted_sequence(), Some(FeedSequence(2)));
+        assert_eq!(host.last_emitted_sequence(), Some(FeedSequence(3)));
         assert_eq!(host.current_watermarks(), watermarks);
         assert_eq!(host.fault_count(), 0);
         assert_eq!(
@@ -3173,10 +3422,10 @@ mod tests {
                 name: "recording-consumer",
                 unhealthy: false,
                 recovery_state: DerivedStateConsumerRecoveryState::Live,
-                applied_events: 3,
+                applied_events: 4,
                 checkpoint_flushes: 1,
                 fault_count: 0,
-                last_applied_sequence: Some(FeedSequence(2)),
+                last_applied_sequence: Some(FeedSequence(3)),
                 last_fault_sequence: None,
                 last_fault_kind: None,
             }]
@@ -3363,7 +3612,7 @@ mod tests {
             finalized_slot: Some(8),
         });
 
-        assert_eq!(apply_calls.load(AtomicOrdering::Relaxed), 5);
+        assert_eq!(apply_calls.load(AtomicOrdering::Relaxed), 6);
         assert_eq!(flush_calls.load(AtomicOrdering::Relaxed), 1);
         assert_eq!(host.healthy_consumer_count(), 1);
         assert!(!host.has_unhealthy_consumers());
@@ -3377,11 +3626,11 @@ mod tests {
                 name: "failing-checkpoint",
                 unhealthy: false,
                 recovery_state: DerivedStateConsumerRecoveryState::Live,
-                applied_events: 5,
+                applied_events: 6,
                 checkpoint_flushes: 0,
                 fault_count: 1,
-                last_applied_sequence: Some(FeedSequence(4)),
-                last_fault_sequence: Some(FeedSequence(2)),
+                last_applied_sequence: Some(FeedSequence(5)),
+                last_fault_sequence: Some(FeedSequence(3)),
                 last_fault_kind: Some(DerivedStateConsumerFaultKind::CheckpointWriteFailed),
             }]
         );
@@ -3806,7 +4055,7 @@ mod tests {
 
         assert_eq!(
             configured_replay_source.retained_envelopes(host.session_id()),
-            2
+            3
         );
         assert_eq!(
             runtime_replay_source.retained_envelopes(host.session_id()),
@@ -3819,7 +4068,7 @@ mod tests {
         let replay_source = Arc::new(InMemoryDerivedStateReplaySource::new());
         let state = Arc::new(Mutex::new(RecoverableConsumerState {
             checkpoint: None,
-            fail_sequence_once: Some(FeedSequence(3)),
+            fail_sequence_once: Some(FeedSequence(4)),
             applied_sequences: Vec::new(),
         }));
         let host = DerivedStateHost::builder()
@@ -3887,7 +4136,8 @@ mod tests {
                 FeedSequence(1),
                 FeedSequence(2),
                 FeedSequence(3),
-                FeedSequence(4)
+                FeedSequence(4),
+                FeedSequence(5)
             ]
         );
         assert_eq!(
@@ -3895,7 +4145,7 @@ mod tests {
                 .checkpoint
                 .as_ref()
                 .map(|checkpoint| checkpoint.last_applied_sequence),
-            Some(FeedSequence(2))
+            Some(FeedSequence(3))
         );
         assert_eq!(
             host.consumer_telemetry(),
@@ -3903,11 +4153,11 @@ mod tests {
                 name: "recoverable-consumer",
                 unhealthy: false,
                 recovery_state: DerivedStateConsumerRecoveryState::Live,
-                applied_events: 5,
+                applied_events: 6,
                 checkpoint_flushes: 1,
                 fault_count: 1,
-                last_applied_sequence: Some(FeedSequence(4)),
-                last_fault_sequence: Some(FeedSequence(3)),
+                last_applied_sequence: Some(FeedSequence(5)),
+                last_fault_sequence: Some(FeedSequence(4)),
                 last_fault_kind: Some(DerivedStateConsumerFaultKind::ConsumerApplyFailed),
             }]
         );
