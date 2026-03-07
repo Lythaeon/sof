@@ -2474,6 +2474,7 @@ struct DerivedStateDispatchState {
     control_plane_state: DerivedStateControlPlaneTracker,
 }
 
+/// Observer-side control-plane tracker used to classify feed freshness and quality.
 #[derive(Debug, Clone, Default)]
 struct DerivedStateControlPlaneTracker {
     /// Slot of the most recent recent-blockhash observation.
