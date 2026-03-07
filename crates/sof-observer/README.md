@@ -271,6 +271,11 @@ Example implementation:
 
 - `examples/derived_state_slot_mirror.rs`
 
+Replay retention modes:
+
+- `DerivedStateReplayConfig::checkpoint_only()` disables the runtime-owned replay tail and keeps recovery checkpoint-driven.
+- `DerivedStateReplayBackend::Disk` retains envelopes on disk without keeping a full in-process mirror of the retained tail.
+
 Design references:
 
 - `../../docs/architecture/derived-state-extension-contract.md`

@@ -71,6 +71,27 @@ impl Default for DerivedStateReplayConfig {
     }
 }
 
+impl DerivedStateReplayConfig {
+    /// Returns a checkpoint-only replay configuration with no retained runtime tail.
+    ///
+    /// This is the lowest-memory derived-state mode. Consumers rely on their own
+    /// durable checkpoints and accept that retained envelope replay is unavailable.
+    #[must_use]
+    pub fn checkpoint_only() -> Self {
+        Self {
+            max_envelopes: 0,
+            max_sessions: 0,
+            ..Self::default()
+        }
+    }
+
+    /// Returns whether the runtime-owned replay tail is enabled.
+    #[must_use]
+    pub const fn is_enabled(&self) -> bool {
+        self.max_envelopes > 0
+    }
+}
+
 /// Typed derived-state runtime configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DerivedStateRuntimeConfig {
@@ -284,6 +305,13 @@ impl RuntimeSetup {
             "SOF_DERIVED_STATE_REPLAY_MAX_SESSIONS",
             max_sessions.to_string(),
         )
+    }
+
+    /// Disables the runtime-owned replay tail and keeps derived-state recovery checkpoint-only.
+    #[must_use]
+    pub fn with_derived_state_checkpoint_only(self) -> Self {
+        self.with_derived_state_replay_max_envelopes(0)
+            .with_derived_state_replay_max_sessions(0)
     }
 
     /// Applies one typed derived-state configuration bundle.
@@ -1182,6 +1210,29 @@ mod tests {
         assert_eq!(
             overrides.get("SOF_DERIVED_STATE_REPLAY_DIR"),
             Some(&"/tmp/sof-derived-state".to_owned())
+        );
+    }
+
+    #[test]
+    fn checkpoint_only_replay_config_disables_runtime_tail() {
+        let replay = DerivedStateReplayConfig::checkpoint_only();
+        assert!(!replay.is_enabled());
+        assert_eq!(replay.max_envelopes, 0);
+        assert_eq!(replay.max_sessions, 0);
+    }
+
+    #[test]
+    fn checkpoint_only_runtime_setup_serializes_zero_retention() {
+        let setup = RuntimeSetup::new().with_derived_state_checkpoint_only();
+        let overrides = setup.env_overrides.into_iter().collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            overrides.get("SOF_DERIVED_STATE_REPLAY_MAX_ENVELOPES"),
+            Some(&"0".to_owned())
+        );
+        assert_eq!(
+            overrides.get("SOF_DERIVED_STATE_REPLAY_MAX_SESSIONS"),
+            Some(&"0".to_owned())
         );
     }
 

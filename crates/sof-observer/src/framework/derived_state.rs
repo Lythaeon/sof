@@ -9,7 +9,7 @@ use std::{
     collections::HashMap,
     fmt,
     fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
@@ -799,6 +799,8 @@ impl DerivedStateConsumerRecoveryState {
 /// Replay backend telemetry snapshot exposed to runtime logs and tests.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct DerivedStateReplayTelemetry {
+    /// Whether the runtime installed a replay backend.
+    pub enabled: bool,
     /// Stable backend identifier.
     pub backend: DerivedStateReplayBackend,
     /// Number of retained sessions visible to the backend.
@@ -1014,6 +1016,7 @@ impl DerivedStateReplaySource for InMemoryDerivedStateReplaySource {
             })
             .unwrap_or((0, 0));
         DerivedStateReplayTelemetry {
+            enabled: true,
             backend: DerivedStateReplayBackend::Memory,
             retained_sessions,
             retained_envelopes,
@@ -1035,8 +1038,8 @@ pub struct DiskDerivedStateReplaySource {
     max_retained_sessions: usize,
     /// Durability policy used for disk writes.
     durability: DerivedStateReplayDurability,
-    /// Retained feed envelopes loaded in-process by session id.
-    sessions: Mutex<HashMap<FeedSessionId, Vec<DerivedStateFeedEnvelope>>>,
+    /// Lightweight per-session metadata cached in-process.
+    session_metadata: Mutex<HashMap<FeedSessionId, DiskDerivedStateSessionMetadata>>,
     /// Total number of envelopes truncated by the retention policy.
     truncated_envelopes: AtomicU64,
     /// Total number of backend append failures.
@@ -1045,6 +1048,13 @@ pub struct DiskDerivedStateReplaySource {
     load_failures: AtomicU64,
     /// Total number of disk compaction runs.
     compactions: AtomicU64,
+}
+
+/// Lightweight retained-session metadata for the disk replay backend.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+struct DiskDerivedStateSessionMetadata {
+    /// Number of retained envelopes for the session.
+    retained_envelopes: usize,
 }
 
 /// Durability policy for the disk-backed replay source.
@@ -1117,7 +1127,7 @@ impl DiskDerivedStateReplaySource {
             max_envelopes_per_session,
             max_retained_sessions: max_retained_sessions.max(1),
             durability,
-            sessions: Mutex::new(HashMap::new()),
+            session_metadata: Mutex::new(HashMap::new()),
             truncated_envelopes: AtomicU64::new(0),
             append_failures: AtomicU64::new(0),
             load_failures: AtomicU64::new(0),
@@ -1158,14 +1168,9 @@ impl DiskDerivedStateReplaySource {
     /// Returns the number of envelopes currently retained for one session.
     #[must_use]
     pub fn retained_envelopes(&self, session_id: FeedSessionId) -> usize {
-        self.sessions
-            .lock()
-            .ok()
-            .and_then(|sessions| sessions.get(&session_id).map(Vec::len))
-            .unwrap_or_else(|| {
-                self.load_session_from_disk(session_id)
-                    .map_or(0, |envelopes| envelopes.len())
-            })
+        self.session_metadata(session_id)
+            .map(|metadata| metadata.retained_envelopes)
+            .unwrap_or(0)
     }
 
     /// Returns the file path for one retained session log.
@@ -1259,6 +1264,28 @@ impl DiskDerivedStateReplaySource {
         Ok(envelopes)
     }
 
+    /// Counts retained records for one session without deserializing the full envelope payloads.
+    fn count_session_records(&self, session_id: FeedSessionId) -> io::Result<usize> {
+        let path = self.session_path(session_id);
+        if !path.exists() {
+            return Ok(0);
+        }
+        let mut file = File::open(path)?;
+        let mut count = 0_usize;
+        loop {
+            let mut length_bytes = [0_u8; 4];
+            match file.read_exact(&mut length_bytes) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(error) => return Err(error),
+            }
+            let encoded_len = u32::from_le_bytes(length_bytes);
+            file.seek(SeekFrom::Current(i64::from(encoded_len)))?;
+            count = count.saturating_add(1);
+        }
+        Ok(count)
+    }
+
     /// Returns the number of retained session files currently visible on disk.
     fn retained_session_files(&self) -> usize {
         fs::read_dir(&self.root_dir)
@@ -1278,18 +1305,41 @@ impl DiskDerivedStateReplaySource {
         u128::from_str_radix(stem, 16).ok().map(FeedSessionId)
     }
 
-    /// Ensures one session tail is resident in the in-process cache.
-    fn load_session(
+    /// Returns lightweight retained-session metadata, populating the cache on demand.
+    fn session_metadata(
         &self,
-        sessions: &mut HashMap<FeedSessionId, Vec<DerivedStateFeedEnvelope>>,
         session_id: FeedSessionId,
-    ) -> io::Result<()> {
-        if sessions.contains_key(&session_id) {
-            return Ok(());
+    ) -> io::Result<DiskDerivedStateSessionMetadata> {
+        if let Ok(metadata) = self.session_metadata.lock()
+            && let Some(metadata) = metadata.get(&session_id).copied()
+        {
+            return Ok(metadata);
         }
-        let loaded = self.load_session_from_disk(session_id)?;
-        sessions.insert(session_id, loaded);
-        Ok(())
+        let metadata = DiskDerivedStateSessionMetadata {
+            retained_envelopes: self.count_session_records(session_id)?,
+        };
+        if let Ok(mut cached) = self.session_metadata.lock() {
+            if metadata.retained_envelopes == 0 {
+                let _ = cached.remove(&session_id);
+            } else {
+                cached.insert(session_id, metadata);
+            }
+        }
+        Ok(metadata)
+    }
+
+    /// Stores updated retained-session metadata after one append or truncation event.
+    fn update_session_metadata(&self, session_id: FeedSessionId, retained_envelopes: usize) {
+        if let Ok(mut metadata) = self.session_metadata.lock() {
+            if retained_envelopes == 0 {
+                let _ = metadata.remove(&session_id);
+            } else {
+                metadata.insert(
+                    session_id,
+                    DiskDerivedStateSessionMetadata { retained_envelopes },
+                );
+            }
+        }
     }
 
     /// Applies the configured durability policy to one open file handle.
@@ -1301,11 +1351,7 @@ impl DiskDerivedStateReplaySource {
     }
 
     /// Compacts old session logs when the backend exceeds its retention budget.
-    fn compact_sessions(
-        &self,
-        sessions: &mut HashMap<FeedSessionId, Vec<DerivedStateFeedEnvelope>>,
-        current_session_id: FeedSessionId,
-    ) -> io::Result<()> {
+    fn compact_sessions(&self, current_session_id: FeedSessionId) -> io::Result<()> {
         let mut retained_sessions = fs::read_dir(&self.root_dir)?
             .flatten()
             .filter_map(|entry| {
@@ -1325,7 +1371,7 @@ impl DiskDerivedStateReplaySource {
                 break;
             }
             fs::remove_file(&path)?;
-            let _ = sessions.remove(&session_id);
+            self.update_session_metadata(session_id, 0);
             retained_sessions.remove(0);
             removed_any = true;
         }
@@ -1341,27 +1387,25 @@ impl DerivedStateReplaySource for DiskDerivedStateReplaySource {
         let session_id = envelope.session_id;
         let path = self.session_path(session_id);
         let append_result = (|| -> io::Result<()> {
-            let Ok(mut sessions) = self.sessions.lock() else {
-                return Err(io::Error::other(
-                    "derived-state replay session mutex poisoned during append",
-                ));
-            };
-            self.load_session(&mut sessions, session_id)?;
-            let retained = sessions.entry(session_id).or_default();
-            retained.push(envelope.clone());
-            let truncated = retained
-                .len()
-                .saturating_sub(self.max_envelopes_per_session.max(1));
-            if truncated > 0 {
-                retained.drain(..truncated);
-                let _ = self
-                    .truncated_envelopes
-                    .fetch_add(truncated as u64, Ordering::Relaxed);
-                self.rewrite_records(&path, retained)?;
-            } else {
+            let max_envelopes = self.max_envelopes_per_session.max(1);
+            let retained_count = self.session_metadata(session_id)?.retained_envelopes;
+            if retained_count < max_envelopes {
                 self.append_record(&path, &envelope)?;
+                self.update_session_metadata(session_id, retained_count.saturating_add(1));
+            } else {
+                let mut retained = self.load_session_from_disk(session_id)?;
+                retained.push(envelope);
+                let truncated = retained.len().saturating_sub(max_envelopes);
+                if truncated > 0 {
+                    retained.drain(..truncated);
+                    let _ = self
+                        .truncated_envelopes
+                        .fetch_add(truncated as u64, Ordering::Relaxed);
+                }
+                self.rewrite_records(&path, &retained)?;
+                self.update_session_metadata(session_id, retained.len());
             }
-            self.compact_sessions(&mut sessions, session_id)
+            self.compact_sessions(session_id)
         })();
         if let Err(error) = append_result {
             let _ = self.append_failures.fetch_add(1, Ordering::Relaxed);
@@ -1379,42 +1423,33 @@ impl DerivedStateReplaySource for DiskDerivedStateReplaySource {
         session_id: FeedSessionId,
         next_sequence: FeedSequence,
     ) -> Result<Vec<DerivedStateFeedEnvelope>, DerivedStateReplayError> {
-        let Ok(mut sessions) = self.sessions.lock() else {
-            return Err(DerivedStateReplayError::BackendFailure {
+        let envelopes = self.load_session_from_disk(session_id).map_err(|error| {
+            let _ = self.load_failures.fetch_add(1, Ordering::Relaxed);
+            DerivedStateReplayError::BackendFailure {
                 session_id,
-                message: "derived-state replay session mutex poisoned during replay".to_owned(),
-            });
-        };
-        self.load_session(&mut sessions, session_id)
-            .map_err(|error| {
-                let _ = self.load_failures.fetch_add(1, Ordering::Relaxed);
-                DerivedStateReplayError::BackendFailure {
-                    session_id,
-                    message: error.to_string(),
-                }
-            })?;
-        let Some(envelopes) = sessions.get(&session_id) else {
-            return Err(DerivedStateReplayError::SessionUnavailable(session_id));
-        };
+                message: error.to_string(),
+            }
+        })?;
         if envelopes.is_empty() {
             return Err(DerivedStateReplayError::SessionUnavailable(session_id));
         }
-        validate_replayed_envelopes(session_id, envelopes, next_sequence)
+        validate_replayed_envelopes(session_id, &envelopes, next_sequence)
     }
 
     fn telemetry(&self) -> DerivedStateReplayTelemetry {
-        let (retained_sessions, retained_envelopes) = self
-            .sessions
-            .lock()
-            .map(|sessions| {
-                let retained_envelopes = sessions.values().map(Vec::len).sum();
-                (
-                    self.retained_session_files().max(sessions.len()),
-                    retained_envelopes,
-                )
+        let retained_sessions = self.retained_session_files();
+        let retained_envelopes = fs::read_dir(&self.root_dir)
+            .ok()
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|entry| Self::parse_session_id(&entry.path()))
+                    .map(|session_id| self.retained_envelopes(session_id))
+                    .sum()
             })
-            .unwrap_or_else(|_poison| (self.retained_session_files(), 0));
+            .unwrap_or(0);
         DerivedStateReplayTelemetry {
+            enabled: true,
             backend: DerivedStateReplayBackend::Disk,
             retained_sessions,
             retained_envelopes,
