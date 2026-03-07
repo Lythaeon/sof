@@ -1,6 +1,6 @@
 [package]
 name = "sof-gossip-tuning"
-version = "0.6.3"
+version = "0.7.0"
 edition.workspace = true
 description = "Typed gossip and ingest tuning presets for SOF hosts"
 license = "Apache-2.0 OR MIT"
