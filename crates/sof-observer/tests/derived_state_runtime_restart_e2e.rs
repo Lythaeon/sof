@@ -77,6 +77,9 @@ impl DerivedStateConsumer for PersistedCheckpointConsumer {
             DerivedStateFeedEvent::SlotStatusChanged(_) => AppliedEventKind::SlotStatus,
             DerivedStateFeedEvent::CheckpointBarrier(_) => AppliedEventKind::CheckpointBarrier,
             DerivedStateFeedEvent::TransactionApplied(_)
+            | DerivedStateFeedEvent::RecentBlockhashObserved(_)
+            | DerivedStateFeedEvent::ClusterTopologyChanged(_)
+            | DerivedStateFeedEvent::LeaderScheduleUpdated(_)
             | DerivedStateFeedEvent::BranchReorged(_)
             | DerivedStateFeedEvent::AccountTouchObserved(_) => return Ok(()),
         };

@@ -1152,12 +1152,14 @@ async fn run_async_with_hosts_inner(
                 {
                     emit_leader_schedule_diff_event(
                         &plugin_host,
+                        &derived_state_host,
                         verifier,
                         latest_shred_slot,
                         &mut emitted_slot_leaders,
                     );
                     emit_observed_slot_leader_event(
                         &plugin_host,
+                        &derived_state_host,
                         verifier,
                         parsed_slot,
                         &mut emitted_slot_leaders,
@@ -1931,6 +1933,9 @@ async fn run_async_with_hosts_inner(
                         runtime.active_gossip_entrypoint.clone(),
                         now,
                     ) {
+                        if derived_state_hooks_enabled {
+                            derived_state_host.on_cluster_topology(topology_event.clone());
+                        }
                         plugin_host.on_cluster_topology(topology_event);
                     }
                 }
