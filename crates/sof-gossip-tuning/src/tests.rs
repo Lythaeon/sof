@@ -1,8 +1,13 @@
 use crate::{
-    constants::{LEGACY_GOSSIP_CHANNEL_CAPACITY, VPS_GOSSIP_CHANNEL_CAPACITY},
-    error::TuningValueError,
-    newtypes::{QueueCapacity, TvuReceiveSocketCount},
-    types::{GossipTuningProfile, HostProfilePreset, IngestQueueMode},
+    application::{ports::RuntimeTuningPort, service::GossipTuningService},
+    domain::{
+        constants::{LEGACY_GOSSIP_CHANNEL_CAPACITY, VPS_GOSSIP_CHANNEL_CAPACITY},
+        error::TuningValueError,
+        model::{GossipTuningProfile, HostProfilePreset, IngestQueueMode},
+        value_objects::{
+            CpuCoreIndex, QueueCapacity, ReceiverCoalesceWindow, TvuReceiveSocketCount,
+        },
+    },
 };
 
 #[test]
@@ -39,4 +44,59 @@ fn runtime_tuning_matches_supported_sof_surface() {
     assert_eq!(tuning.ingest_queue_mode, IngestQueueMode::Lockfree);
     assert!(tuning.udp_receiver_pin_by_port);
     assert_eq!(tuning.tvu_receive_sockets.get(), 2);
+}
+
+#[derive(Default)]
+struct RecordingRuntimePort {
+    mode: Option<IngestQueueMode>,
+    capacity: Option<QueueCapacity>,
+    batch_size: Option<u16>,
+    coalesce_window: Option<ReceiverCoalesceWindow>,
+    core: Option<Option<CpuCoreIndex>>,
+    pin_by_port: Option<bool>,
+    sockets: Option<TvuReceiveSocketCount>,
+}
+
+impl RuntimeTuningPort for RecordingRuntimePort {
+    fn set_ingest_queue_mode(&mut self, mode: IngestQueueMode) {
+        self.mode = Some(mode);
+    }
+
+    fn set_ingest_queue_capacity(&mut self, capacity: QueueCapacity) {
+        self.capacity = Some(capacity);
+    }
+
+    fn set_udp_batch_size(&mut self, batch_size: u16) {
+        self.batch_size = Some(batch_size);
+    }
+
+    fn set_receiver_coalesce_window(&mut self, window: ReceiverCoalesceWindow) {
+        self.coalesce_window = Some(window);
+    }
+
+    fn set_udp_receiver_core(&mut self, core: Option<CpuCoreIndex>) {
+        self.core = Some(core);
+    }
+
+    fn set_udp_receiver_pin_by_port(&mut self, enabled: bool) {
+        self.pin_by_port = Some(enabled);
+    }
+
+    fn set_tvu_receive_sockets(&mut self, sockets: TvuReceiveSocketCount) {
+        self.sockets = Some(sockets);
+    }
+}
+
+#[test]
+fn application_service_projects_profile_through_port() {
+    let mut port = RecordingRuntimePort::default();
+    GossipTuningService::apply_supported_runtime_tuning(
+        GossipTuningProfile::preset(HostProfilePreset::Vps),
+        &mut port,
+    );
+
+    assert_eq!(port.mode, Some(IngestQueueMode::Lockfree));
+    assert_eq!(port.batch_size, Some(128));
+    assert_eq!(port.pin_by_port, Some(true));
+    assert_eq!(port.sockets.map(TvuReceiveSocketCount::get), Some(2));
 }

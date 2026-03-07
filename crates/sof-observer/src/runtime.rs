@@ -4,7 +4,10 @@ use crate::framework::{
     DerivedStateHost, DerivedStateReplayBackend, DerivedStateReplayDurability, PluginHost,
     RuntimeExtensionHost,
 };
-use sof_gossip_tuning::{GossipTuningProfile, IngestQueueMode, SofRuntimeTuning};
+use sof_gossip_tuning::{
+    CpuCoreIndex, GossipTuningProfile, GossipTuningService, IngestQueueMode, QueueCapacity,
+    ReceiverCoalesceWindow, RuntimeTuningPort, SofRuntimeTuning, TvuReceiveSocketCount,
+};
 use thiserror::Error;
 
 /// Public runtime error surface for packaged SOF entrypoints.
@@ -441,18 +444,9 @@ impl RuntimeSetup {
     /// Applies one typed SOF-supported gossip/runtime tuning bundle.
     #[must_use]
     pub fn with_sof_gossip_runtime_tuning(self, tuning: SofRuntimeTuning) -> Self {
-        let mut setup = self
-            .with_ingest_queue_mode_typed(tuning.ingest_queue_mode)
-            .with_ingest_queue_capacity(tuning.ingest_queue_capacity.get() as usize)
-            .with_udp_batch_size(tuning.udp_batch_size as usize)
-            .with_udp_batch_max_wait_ms(tuning.receiver_coalesce_window.as_millis_u64())
-            .with_udp_receiver_pin_by_port(tuning.udp_receiver_pin_by_port)
-            .with_tvu_receive_sockets(tuning.tvu_receive_sockets.get());
-
-        if let Some(core_index) = tuning.udp_receiver_core {
-            setup = setup.with_udp_receiver_core(core_index.get());
-        }
-        setup
+        let mut adapter = RuntimeSetupTuningAdapter::new(self);
+        GossipTuningService::apply_runtime_tuning(tuning, &mut adapter);
+        adapter.into_setup()
     }
 
     /// Applies one typed gossip host profile.
@@ -588,6 +582,63 @@ impl RuntimeSetup {
     /// Applies setup overrides to the runtime config layer.
     fn apply(&self) {
         crate::runtime_env::set_runtime_env_overrides(self.env_overrides.clone());
+    }
+}
+
+/// Runtime adapter that applies typed gossip tuning through `RuntimeSetup` env overrides.
+#[derive(Debug)]
+struct RuntimeSetupTuningAdapter {
+    /// Accumulated runtime setup under construction.
+    setup: RuntimeSetup,
+}
+
+impl RuntimeSetupTuningAdapter {
+    /// Creates a new runtime tuning adapter from an existing setup value.
+    const fn new(setup: RuntimeSetup) -> Self {
+        Self { setup }
+    }
+
+    /// Returns the fully projected runtime setup after port application.
+    fn into_setup(self) -> RuntimeSetup {
+        self.setup
+    }
+}
+
+impl RuntimeTuningPort for RuntimeSetupTuningAdapter {
+    fn set_ingest_queue_mode(&mut self, mode: IngestQueueMode) {
+        self.setup = self.setup.clone().with_ingest_queue_mode_typed(mode);
+    }
+
+    fn set_ingest_queue_capacity(&mut self, capacity: QueueCapacity) {
+        self.setup = self
+            .setup
+            .clone()
+            .with_ingest_queue_capacity(capacity.get() as usize);
+    }
+
+    fn set_udp_batch_size(&mut self, batch_size: u16) {
+        self.setup = self.setup.clone().with_udp_batch_size(batch_size as usize);
+    }
+
+    fn set_receiver_coalesce_window(&mut self, window: ReceiverCoalesceWindow) {
+        self.setup = self
+            .setup
+            .clone()
+            .with_udp_batch_max_wait_ms(window.as_millis_u64());
+    }
+
+    fn set_udp_receiver_core(&mut self, core: Option<CpuCoreIndex>) {
+        if let Some(core_index) = core {
+            self.setup = self.setup.clone().with_udp_receiver_core(core_index.get());
+        }
+    }
+
+    fn set_udp_receiver_pin_by_port(&mut self, enabled: bool) {
+        self.setup = self.setup.clone().with_udp_receiver_pin_by_port(enabled);
+    }
+
+    fn set_tvu_receive_sockets(&mut self, sockets: TvuReceiveSocketCount) {
+        self.setup = self.setup.clone().with_tvu_receive_sockets(sockets.get());
     }
 }
 

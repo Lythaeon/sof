@@ -16,22 +16,22 @@
 //! - it keeps upstream gossip queue ambitions explicit without pretending they are live,
 //! - it gives service builders one typed place to define host-specific tuning presets.
 
-mod constants;
-mod error;
-mod newtypes;
-mod profiles;
-mod types;
+pub mod application;
+pub mod domain;
 
 #[cfg(test)]
 mod tests;
 
-pub use constants::{
-    DEFAULT_INGEST_QUEUE_CAPACITY, DEFAULT_RECEIVER_COALESCE_WAIT_MS, DEFAULT_UDP_BATCH_SIZE,
-    LEGACY_GOSSIP_CHANNEL_CAPACITY, VPS_GOSSIP_CHANNEL_CAPACITY,
-};
-pub use error::TuningValueError;
-pub use newtypes::{CpuCoreIndex, QueueCapacity, ReceiverCoalesceWindow, TvuReceiveSocketCount};
-pub use types::{
-    GossipChannelTuning, GossipTuningProfile, HostProfilePreset, IngestQueueMode,
-    PendingGossipQueuePlan, ReceiverFanoutProfile, ReceiverPinningPolicy, SofRuntimeTuning,
+pub use application::{ports::RuntimeTuningPort, service::GossipTuningService};
+pub use domain::{
+    constants::{
+        DEFAULT_INGEST_QUEUE_CAPACITY, DEFAULT_RECEIVER_COALESCE_WAIT_MS, DEFAULT_UDP_BATCH_SIZE,
+        LEGACY_GOSSIP_CHANNEL_CAPACITY, VPS_GOSSIP_CHANNEL_CAPACITY,
+    },
+    error::TuningValueError,
+    model::{
+        GossipChannelTuning, GossipTuningProfile, HostProfilePreset, IngestQueueMode,
+        PendingGossipQueuePlan, ReceiverFanoutProfile, ReceiverPinningPolicy, SofRuntimeTuning,
+    },
+    value_objects::{CpuCoreIndex, QueueCapacity, ReceiverCoalesceWindow, TvuReceiveSocketCount},
 };
