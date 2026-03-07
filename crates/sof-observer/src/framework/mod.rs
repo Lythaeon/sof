@@ -16,14 +16,14 @@ pub mod plugin;
 pub use crate::event::{ForkSlotStatus, TxCommitmentStatus};
 pub use derived_state::{
     AccountTouchObservedEvent, BranchReorgedEvent, CheckpointBarrierEvent, CheckpointBarrierReason,
-    DerivedStateCheckpoint, DerivedStateConsumer, DerivedStateConsumerFault,
-    DerivedStateConsumerFaultKind, DerivedStateConsumerRecoveryState,
+    DerivedStateCheckpoint, DerivedStateCheckpointStore, DerivedStateConsumer,
+    DerivedStateConsumerFault, DerivedStateConsumerFaultKind, DerivedStateConsumerRecoveryState,
     DerivedStateConsumerTelemetry, DerivedStateFeedEnvelope, DerivedStateFeedEvent,
-    DerivedStateHost, DerivedStateHostBuilder, DerivedStateRecoveryReport,
-    DerivedStateReplayBackend, DerivedStateReplayDurability, DerivedStateReplayError,
-    DerivedStateReplaySource, DerivedStateReplayTelemetry, DiskDerivedStateReplaySource,
-    FeedSequence, FeedSessionId, FeedWatermarks, InMemoryDerivedStateReplaySource,
-    SlotStatusChangedEvent, TransactionAppliedEvent,
+    DerivedStateHost, DerivedStateHostBuilder, DerivedStatePersistedCheckpoint,
+    DerivedStateRecoveryReport, DerivedStateReplayBackend, DerivedStateReplayDurability,
+    DerivedStateReplayError, DerivedStateReplaySource, DerivedStateReplayTelemetry,
+    DiskDerivedStateReplaySource, FeedSequence, FeedSessionId, FeedWatermarks,
+    InMemoryDerivedStateReplaySource, SlotStatusChangedEvent, TransactionAppliedEvent,
 };
 pub use events::{
     AccountTouchEvent, ClusterNodeInfo, ClusterTopologyEvent, ControlPlaneSource, DatasetEvent,

@@ -52,8 +52,8 @@ cargo add sof-tx
 Feature examples:
 
 ```toml
-sof = { version = "0.6.2", features = ["gossip-bootstrap"] }
-sof-tx = { version = "0.6.2", features = ["sof-adapters"] }
+sof = { version = "0.6.3", features = ["gossip-bootstrap"] }
+sof-tx = { version = "0.6.3", features = ["sof-adapters"] }
 ```
 
 Kernel-bypass integrations:
