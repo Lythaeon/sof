@@ -17,6 +17,8 @@ It provides:
 - Build `V0` or legacy Solana transactions
 - Submit through RPC, direct leader routing, or hybrid fallback
 - Attach live `sof` runtime adapters when you want local leader/blockhash signals
+- Use replayable derived-state adapters when your service must survive restart or replay
+- Evaluate typed flow-safety policies before acting on local control-plane state
 - Use optional kernel-bypass direct transports for custom low-latency networking
 
 ## Install
@@ -159,11 +161,23 @@ For restart-safe services built on SOF derived-state, use `DerivedStateTxProvide
 It consumes the replayable derived-state feed, supports checkpoint persistence, and exposes the
 same `evaluate_flow_safety(...)` helper for control-plane freshness checks.
 
+For services that do not want to maintain a parallel checkpoint file format, use the adapter
+persistence helper backed by SOF's generic `DerivedStateCheckpointStore`.
+
 Direct submit needs TPU endpoints for scheduled leaders. The adapter gets these from
 `on_cluster_topology` events, or you can inject them manually with:
 
 - `set_leader_tpu_addr(pubkey, tpu_addr)`
 - `remove_leader_tpu_addr(pubkey)`
+
+The flow-safety report is intended to keep stale or degraded control-plane state from silently
+driving direct or hybrid sends. Typical checks include:
+
+- missing recent blockhash
+- stale tip slot
+- missing leader schedule
+- missing TPU addresses for targeted leaders
+- degraded topology freshness
 
 ## Expanded Quickstart
 
@@ -296,6 +310,9 @@ Direct and hybrid modes include built-in reliability defaults through `SubmitRel
 
 Use `TxSubmitClient::with_reliability(...)` for presets, or `with_direct_config(...)` for full control.
 
+Reliability profiles are transport-side only. If you are sourcing blockhash, leader, and topology
+state from SOF, pair them with `evaluate_flow_safety(...)` before sending.
+
 ## KernelBypass Direct Transport
 
 With `kernel-bypass` enabled, implement `KernelBypassDatagramSocket` for your socket type and wrap it with
@@ -356,4 +373,5 @@ Compile-time capability flags from ADR-0006 can be introduced incrementally as t
 - ADR for SDK scope: `../../docs/architecture/adr/0006-transaction-sdk-and-dual-submit-routing.md`
 - Workspace docs index: `../../docs/README.md`
 - Architecture docs: `../../docs/architecture/README.md`
+- Toxic-flow roadmap: `../../docs/architecture/toxic-flow-todo.md`
 - Contribution guide: `../../CONTRIBUTING.md`

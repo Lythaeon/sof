@@ -1,7 +1,10 @@
 use crate::{
     application::{ports::RuntimeTuningPort, service::GossipTuningService},
     domain::{
-        constants::{LEGACY_GOSSIP_CHANNEL_CAPACITY, VPS_GOSSIP_CHANNEL_CAPACITY},
+        constants::{
+            DEFAULT_UDP_BATCH_SIZE, LEGACY_GOSSIP_CHANNEL_CAPACITY, VPS_GOSSIP_CHANNEL_CAPACITY,
+            VPS_TVU_RECEIVE_SOCKETS,
+        },
         error::TuningValueError,
         model::{GossipTuningProfile, HostProfilePreset, IngestQueueMode},
         value_objects::{
@@ -43,7 +46,7 @@ fn runtime_tuning_matches_supported_sof_surface() {
     let tuning = GossipTuningProfile::preset(HostProfilePreset::Vps).supported_runtime_tuning();
     assert_eq!(tuning.ingest_queue_mode, IngestQueueMode::Lockfree);
     assert!(tuning.udp_receiver_pin_by_port);
-    assert_eq!(tuning.tvu_receive_sockets.get(), 2);
+    assert_eq!(tuning.tvu_receive_sockets.get(), VPS_TVU_RECEIVE_SOCKETS);
 }
 
 #[derive(Default)]
@@ -96,7 +99,10 @@ fn application_service_projects_profile_through_port() {
     );
 
     assert_eq!(port.mode, Some(IngestQueueMode::Lockfree));
-    assert_eq!(port.batch_size, Some(128));
+    assert_eq!(port.batch_size, Some(DEFAULT_UDP_BATCH_SIZE));
     assert_eq!(port.pin_by_port, Some(true));
-    assert_eq!(port.sockets.map(TvuReceiveSocketCount::get), Some(2));
+    assert_eq!(
+        port.sockets.map(TvuReceiveSocketCount::get),
+        Some(VPS_TVU_RECEIVE_SOCKETS)
+    );
 }

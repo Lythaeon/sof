@@ -4,8 +4,11 @@ use crate::{
     application::ports::RuntimeTuningPort,
     domain::{
         constants::{
-            DEFAULT_INGEST_QUEUE_CAPACITY, DEFAULT_RECEIVER_COALESCE_WAIT_MS,
-            DEFAULT_UDP_BATCH_SIZE, VPS_GOSSIP_CHANNEL_CAPACITY,
+            DEDICATED_GOSSIP_CHANNEL_CAPACITY, DEDICATED_SOCKET_CONSUME_CHANNEL_CAPACITY,
+            DEDICATED_TVU_RECEIVE_SOCKETS, DEFAULT_INGEST_QUEUE_CAPACITY,
+            DEFAULT_RECEIVER_COALESCE_WAIT_MS, DEFAULT_UDP_BATCH_SIZE,
+            HOME_GOSSIP_CHANNEL_CAPACITY, HOME_INGEST_QUEUE_CAPACITY, HOME_TVU_RECEIVE_SOCKETS,
+            HOME_UDP_BATCH_SIZE, VPS_GOSSIP_CHANNEL_CAPACITY, VPS_TVU_RECEIVE_SOCKETS,
         },
         model::{
             GossipChannelTuning, GossipTuningProfile, HostProfilePreset, IngestQueueMode,
@@ -28,19 +31,25 @@ impl GossipTuningService {
                 preset,
                 runtime: SofRuntimeTuning {
                     ingest_queue_mode: IngestQueueMode::Bounded,
-                    ingest_queue_capacity: QueueCapacity::fixed(65_536),
-                    udp_batch_size: 64,
+                    ingest_queue_capacity: QueueCapacity::fixed(HOME_INGEST_QUEUE_CAPACITY),
+                    udp_batch_size: HOME_UDP_BATCH_SIZE,
                     receiver_coalesce_window: ReceiverCoalesceWindow::fixed(
                         DEFAULT_RECEIVER_COALESCE_WAIT_MS,
                     ),
                     udp_receiver_core: None,
                     udp_receiver_pin_by_port: false,
-                    tvu_receive_sockets: TvuReceiveSocketCount::fixed(1),
+                    tvu_receive_sockets: TvuReceiveSocketCount::fixed(HOME_TVU_RECEIVE_SOCKETS),
                 },
                 channels: GossipChannelTuning {
-                    gossip_receiver_channel_capacity: QueueCapacity::fixed(8_192),
-                    socket_consume_channel_capacity: QueueCapacity::fixed(8_192),
-                    gossip_response_channel_capacity: QueueCapacity::fixed(8_192),
+                    gossip_receiver_channel_capacity: QueueCapacity::fixed(
+                        HOME_GOSSIP_CHANNEL_CAPACITY,
+                    ),
+                    socket_consume_channel_capacity: QueueCapacity::fixed(
+                        HOME_GOSSIP_CHANNEL_CAPACITY,
+                    ),
+                    gossip_response_channel_capacity: QueueCapacity::fixed(
+                        HOME_GOSSIP_CHANNEL_CAPACITY,
+                    ),
                 },
                 fanout: ReceiverFanoutProfile::Conservative,
             },
@@ -55,14 +64,18 @@ impl GossipTuningService {
                     ),
                     udp_receiver_core: None,
                     udp_receiver_pin_by_port: true,
-                    tvu_receive_sockets: TvuReceiveSocketCount::fixed(2),
+                    tvu_receive_sockets: TvuReceiveSocketCount::fixed(VPS_TVU_RECEIVE_SOCKETS),
                 },
                 channels: GossipChannelTuning {
                     gossip_receiver_channel_capacity: QueueCapacity::fixed(
                         VPS_GOSSIP_CHANNEL_CAPACITY,
                     ),
-                    socket_consume_channel_capacity: QueueCapacity::fixed(8_192),
-                    gossip_response_channel_capacity: QueueCapacity::fixed(8_192),
+                    socket_consume_channel_capacity: QueueCapacity::fixed(
+                        HOME_GOSSIP_CHANNEL_CAPACITY,
+                    ),
+                    gossip_response_channel_capacity: QueueCapacity::fixed(
+                        HOME_GOSSIP_CHANNEL_CAPACITY,
+                    ),
                 },
                 fanout: ReceiverFanoutProfile::Balanced,
             },
@@ -71,16 +84,26 @@ impl GossipTuningService {
                 runtime: SofRuntimeTuning {
                     ingest_queue_mode: IngestQueueMode::Lockfree,
                     ingest_queue_capacity: QueueCapacity::fixed(DEFAULT_INGEST_QUEUE_CAPACITY),
-                    udp_batch_size: 128,
-                    receiver_coalesce_window: ReceiverCoalesceWindow::fixed(1),
+                    udp_batch_size: DEFAULT_UDP_BATCH_SIZE,
+                    receiver_coalesce_window: ReceiverCoalesceWindow::fixed(
+                        DEFAULT_RECEIVER_COALESCE_WAIT_MS,
+                    ),
                     udp_receiver_core: None,
                     udp_receiver_pin_by_port: true,
-                    tvu_receive_sockets: TvuReceiveSocketCount::fixed(4),
+                    tvu_receive_sockets: TvuReceiveSocketCount::fixed(
+                        DEDICATED_TVU_RECEIVE_SOCKETS,
+                    ),
                 },
                 channels: GossipChannelTuning {
-                    gossip_receiver_channel_capacity: QueueCapacity::fixed(65_536),
-                    socket_consume_channel_capacity: QueueCapacity::fixed(32_768),
-                    gossip_response_channel_capacity: QueueCapacity::fixed(32_768),
+                    gossip_receiver_channel_capacity: QueueCapacity::fixed(
+                        DEDICATED_GOSSIP_CHANNEL_CAPACITY,
+                    ),
+                    socket_consume_channel_capacity: QueueCapacity::fixed(
+                        DEDICATED_SOCKET_CONSUME_CHANNEL_CAPACITY,
+                    ),
+                    gossip_response_channel_capacity: QueueCapacity::fixed(
+                        DEDICATED_SOCKET_CONSUME_CHANNEL_CAPACITY,
+                    ),
                 },
                 fanout: ReceiverFanoutProfile::Aggressive,
             },

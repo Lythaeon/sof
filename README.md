@@ -13,9 +13,12 @@ It is split into three user-facing crates:
 - Low-latency shred ingest and dataset reconstruction
 - Local `processed` / `confirmed` / `finalized` transaction tagging
 - Plugin hooks and runtime extensions for downstream logic
+- Replayable derived-state feed for restart-safe stateful services
+- First-class `sof-tx` adapters for live plugin and replayable derived-state control-plane inputs
+- Flow-safety policy evaluation for stale or degraded tx-control-plane state
 - Optional gossip bootstrap and external kernel-bypass ingress
 - Transaction submission with RPC, direct, hybrid, and kernel-bypass paths
-- Derived-state replay and recovery support for stateful extensions
+- Typed gossip and ingest tuning presets for embedded SOF hosts
 
 ## Repository Layout
 
@@ -89,6 +92,12 @@ Run the transaction SDK tests:
 cargo test -p sof-tx
 ```
 
+Run the derived-state service example:
+
+```bash
+cargo run --release -p sof --example derived_state_slot_mirror
+```
+
 Run the full contributor gate:
 
 ```bash
@@ -121,6 +130,7 @@ To keep ingest/processing but reduce outward network activity:
 - Plugin hook model: `docs/architecture/framework-plugin-hooks.md`
 - Runtime extension model: `docs/architecture/runtime-extension-hooks.md`
 - Derived-state feed contract: `docs/architecture/derived-state-feed-contract.md`
+- Toxic-flow roadmap: `docs/architecture/toxic-flow-todo.md`
 - Transaction SDK ADR: `docs/architecture/adr/0006-transaction-sdk-and-dual-submit-routing.md`
 
 ## CI and Release

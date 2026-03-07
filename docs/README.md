@@ -15,6 +15,7 @@ Transaction SDK users:
 
 - `../crates/sof-tx/README.md`
 - `architecture/adr/0006-transaction-sdk-and-dual-submit-routing.md`
+- `architecture/toxic-flow-todo.md`
 
 Contributors:
 
