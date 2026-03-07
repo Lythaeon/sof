@@ -170,46 +170,42 @@ async fn run_async_with_hosts_inner(
         tracing::info!(plugins = ?plugin_host.plugin_names(), "observer plugins enabled");
     }
     let derived_state_hooks_enabled = !derived_state_host.is_empty();
-    let derived_state_recovery_interval_ms = read_derived_state_recovery_interval_ms();
-    let derived_state_replay_max_envelopes = read_derived_state_replay_max_envelopes();
-    let derived_state_replay_max_sessions = read_derived_state_replay_max_sessions();
-    let derived_state_replay_backend = read_derived_state_replay_backend();
-    let derived_state_replay_dir = read_derived_state_replay_dir();
-    let derived_state_replay_durability = read_derived_state_replay_durability();
+    let derived_state_config = read_derived_state_runtime_config();
+    let derived_state_checkpoint_interval_ms = derived_state_config.checkpoint_interval_ms;
+    let derived_state_recovery_interval_ms = derived_state_config.recovery_interval_ms;
+    let derived_state_replay_backend = derived_state_config.replay.backend;
+    let derived_state_replay_dir = derived_state_config.replay.replay_dir.clone();
+    let derived_state_replay_durability = derived_state_config.replay.durability;
+    let derived_state_replay_max_envelopes = derived_state_config.replay.max_envelopes;
+    let derived_state_replay_max_sessions = derived_state_config.replay.max_sessions;
     if derived_state_hooks_enabled {
         if derived_state_replay_max_envelopes > 0 {
-            let configured_backend = derived_state_replay_backend.to_ascii_lowercase();
-            let configured_durability = match derived_state_replay_durability
-                .to_ascii_lowercase()
-                .as_str()
-            {
-                "fsync" => DerivedStateReplayDurability::Fsync,
-                _ => DerivedStateReplayDurability::Flush,
-            };
             let runtime_replay_source: Arc<dyn crate::framework::DerivedStateReplaySource> =
-                match configured_backend.as_str() {
-                    "disk" => match DiskDerivedStateReplaySource::with_policy(
-                        derived_state_replay_dir.clone(),
-                        derived_state_replay_max_envelopes,
-                        derived_state_replay_max_sessions,
-                        configured_durability,
-                    ) {
-                        Ok(replay_source) => Arc::new(replay_source),
-                        Err(error) => {
-                            tracing::warn!(
-                                backend = "disk",
-                                path = %derived_state_replay_dir.display(),
-                                error = %error,
-                                "failed to initialize disk-backed derived-state replay tail; falling back to memory"
-                            );
-                            Arc::new(
+                match derived_state_replay_backend {
+                    crate::framework::DerivedStateReplayBackend::Disk => {
+                        match DiskDerivedStateReplaySource::with_policy(
+                            derived_state_replay_dir.clone(),
+                            derived_state_replay_max_envelopes,
+                            derived_state_replay_max_sessions,
+                            derived_state_replay_durability,
+                        ) {
+                            Ok(replay_source) => Arc::new(replay_source),
+                            Err(error) => {
+                                tracing::warn!(
+                                    backend = %crate::framework::DerivedStateReplayBackend::Disk,
+                                    path = %derived_state_replay_dir.display(),
+                                    error = %error,
+                                    "failed to initialize disk-backed derived-state replay tail; falling back to memory"
+                                );
+                                Arc::new(
                                 InMemoryDerivedStateReplaySource::with_max_envelopes_per_session(
                                     derived_state_replay_max_envelopes,
                                 ),
                             )
+                            }
                         }
-                    },
-                    _ => Arc::new(
+                    }
+                    crate::framework::DerivedStateReplayBackend::Memory => Arc::new(
                         InMemoryDerivedStateReplaySource::with_max_envelopes_per_session(
                             derived_state_replay_max_envelopes,
                         ),
@@ -217,8 +213,8 @@ async fn run_async_with_hosts_inner(
                 };
             let installed = derived_state_host.install_runtime_replay_source(runtime_replay_source);
             tracing::info!(
-                derived_state_replay_backend = configured_backend,
-                derived_state_replay_durability,
+                derived_state_replay_backend = %derived_state_replay_backend,
+                derived_state_replay_durability = %derived_state_replay_durability,
                 derived_state_replay_dir = %derived_state_replay_dir.display(),
                 derived_state_replay_max_envelopes,
                 derived_state_replay_max_sessions,
@@ -757,7 +753,6 @@ async fn run_async_with_hosts_inner(
     let mut telemetry_tick = interval(Duration::from_secs(TELEMETRY_INTERVAL_SECS));
     let mut repair_tick = interval(Duration::from_millis(read_repair_tick_ms()));
     let mut control_plane_tick = interval(Duration::from_millis(CONTROL_PLANE_EVENT_TICK_MS));
-    let derived_state_checkpoint_interval_ms = read_derived_state_checkpoint_interval_ms();
     let derived_state_checkpoint_enabled =
         derived_state_hooks_enabled && derived_state_checkpoint_interval_ms > 0;
     let derived_state_recovery_enabled =
@@ -793,8 +788,8 @@ async fn run_async_with_hosts_inner(
         udp_relay_send_error_backoff_ms,
         udp_relay_send_error_backoff_threshold,
         derived_state_recovery_interval_ms,
-        derived_state_replay_backend,
-        derived_state_replay_durability,
+        derived_state_replay_backend = %derived_state_replay_backend,
+        derived_state_replay_durability = %derived_state_replay_durability,
         derived_state_replay_dir = %derived_state_replay_dir.display(),
         derived_state_replay_max_envelopes,
         derived_state_replay_max_sessions,
@@ -2245,7 +2240,7 @@ async fn run_async_with_hosts_inner(
                     derived_state_rebuild_required = derived_state_rebuild_required,
                     derived_state_fault_total = derived_state_fault_total,
                     derived_state_last_sequence = derived_state_last_sequence,
-                    derived_state_replay_backend = derived_state_replay_telemetry.backend,
+                    derived_state_replay_backend = %derived_state_replay_telemetry.backend,
                     derived_state_replay_retained_sessions =
                         derived_state_replay_telemetry.retained_sessions,
                     derived_state_replay_retained_envelopes =

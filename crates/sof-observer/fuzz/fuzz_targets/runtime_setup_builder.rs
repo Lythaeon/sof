@@ -1,9 +1,12 @@
 #![no_main]
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, path::PathBuf};
 
 use libfuzzer_sys::fuzz_target;
-use sof::runtime::RuntimeSetup;
+use sof::{
+    framework::{DerivedStateReplayBackend, DerivedStateReplayDurability},
+    runtime::{DerivedStateReplayConfig, DerivedStateRuntimeConfig, RuntimeSetup},
+};
 
 fn take_bytes<'a>(input: &mut &'a [u8], len: usize) -> Option<&'a [u8]> {
     if input.len() < len {
@@ -56,7 +59,7 @@ fuzz_target!(|bytes: &[u8]| {
             break;
         };
 
-        setup = match op % 26 {
+        setup = match op % 32 {
             0 => setup.with_env(
                 take_string(&mut input, 32).unwrap_or_else(|| "KEY".to_owned()),
                 take_string(&mut input, 64).unwrap_or_else(|| "VALUE".to_owned()),
@@ -123,6 +126,48 @@ fuzz_target!(|bytes: &[u8]| {
             22 => setup.with_verify_strict_unknown(take_bool(&mut input)),
             23 => setup.with_verify_recovered_shreds(take_bool(&mut input)),
             24 => setup.with_verify_slot_window(take_u64(&mut input).unwrap_or(1)),
+            25 => setup.with_derived_state_checkpoint_interval_ms(take_u64(&mut input).unwrap_or(0)),
+            26 => setup.with_derived_state_recovery_interval_ms(take_u64(&mut input).unwrap_or(0)),
+            27 => setup.with_derived_state_replay_max_envelopes(
+                usize::from(take_u16(&mut input).unwrap_or(0)),
+            ),
+            28 => setup.with_derived_state_replay_max_sessions(
+                usize::from(take_u8(&mut input).unwrap_or(0)).max(1),
+            ),
+            29 => {
+                let backend = if take_bool(&mut input) {
+                    DerivedStateReplayBackend::Disk
+                } else {
+                    DerivedStateReplayBackend::Memory
+                };
+                setup.with_derived_state_replay_backend(backend)
+            }
+            30 => {
+                let replay_dir = take_string(&mut input, 48)
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(".sof-derived-state-fuzz"));
+                let backend = if take_bool(&mut input) {
+                    DerivedStateReplayBackend::Disk
+                } else {
+                    DerivedStateReplayBackend::Memory
+                };
+                let durability = if take_bool(&mut input) {
+                    DerivedStateReplayDurability::Fsync
+                } else {
+                    DerivedStateReplayDurability::Flush
+                };
+                setup.with_derived_state_config(DerivedStateRuntimeConfig {
+                    checkpoint_interval_ms: take_u64(&mut input).unwrap_or(30_000),
+                    recovery_interval_ms: take_u64(&mut input).unwrap_or(5_000),
+                    replay: DerivedStateReplayConfig {
+                        backend,
+                        replay_dir,
+                        durability,
+                        max_envelopes: usize::from(take_u16(&mut input).unwrap_or(0)),
+                        max_sessions: usize::from(take_u8(&mut input).unwrap_or(1)).max(1),
+                    },
+                })
+            }
             _ => setup
                 .with_verify_slot_window(take_u64(&mut input).unwrap_or(1))
                 .with_verify_signature_cache_entries(

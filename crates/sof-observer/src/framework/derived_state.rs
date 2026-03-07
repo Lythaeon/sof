@@ -7,6 +7,7 @@
 
 use std::{
     collections::HashMap,
+    fmt,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -422,8 +423,8 @@ impl DerivedStateConsumerRecoveryState {
 /// Replay backend telemetry snapshot exposed to runtime logs and tests.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct DerivedStateReplayTelemetry {
-    /// Stable backend name.
-    pub backend: &'static str,
+    /// Stable backend identifier.
+    pub backend: DerivedStateReplayBackend,
     /// Number of retained sessions visible to the backend.
     pub retained_sessions: usize,
     /// Number of retained envelopes visible to the backend.
@@ -436,6 +437,45 @@ pub struct DerivedStateReplayTelemetry {
     pub load_failures: u64,
     /// Number of compaction runs performed by the backend.
     pub compactions: u64,
+}
+
+/// Backend used for retained derived-state replay.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum DerivedStateReplayBackend {
+    /// In-process retained feed tail.
+    #[default]
+    Memory,
+    /// Disk-backed retained feed tail.
+    Disk,
+}
+
+impl DerivedStateReplayBackend {
+    /// Returns the stable env/config representation for the backend.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Disk => "disk",
+        }
+    }
+
+    /// Parses one env/config value into a backend.
+    #[must_use]
+    pub const fn from_config_value(value: &str) -> Option<Self> {
+        if value.eq_ignore_ascii_case("memory") {
+            Some(Self::Memory)
+        } else if value.eq_ignore_ascii_case("disk") {
+            Some(Self::Disk)
+        } else {
+            None
+        }
+    }
+}
+
+impl fmt::Display for DerivedStateReplayBackend {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 /// Recovery attempt summary returned by the derived-state host.
@@ -598,7 +638,7 @@ impl DerivedStateReplaySource for InMemoryDerivedStateReplaySource {
             })
             .unwrap_or((0, 0));
         DerivedStateReplayTelemetry {
-            backend: "memory",
+            backend: DerivedStateReplayBackend::Memory,
             retained_sessions,
             retained_envelopes,
             truncated_envelopes: self.truncated_envelopes(),
@@ -632,12 +672,42 @@ pub struct DiskDerivedStateReplaySource {
 }
 
 /// Durability policy for the disk-backed replay source.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum DerivedStateReplayDurability {
     /// Flush buffered writes to the OS before returning.
+    #[default]
     Flush,
     /// Flush buffered writes and issue `fsync`/`sync_all`.
     Fsync,
+}
+
+impl DerivedStateReplayDurability {
+    /// Returns the stable env/config representation for the durability mode.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Flush => "flush",
+            Self::Fsync => "fsync",
+        }
+    }
+
+    /// Parses one env/config value into a durability mode.
+    #[must_use]
+    pub const fn from_config_value(value: &str) -> Option<Self> {
+        if value.eq_ignore_ascii_case("flush") {
+            Some(Self::Flush)
+        } else if value.eq_ignore_ascii_case("fsync") {
+            Some(Self::Fsync)
+        } else {
+            None
+        }
+    }
+}
+
+impl fmt::Display for DerivedStateReplayDurability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 impl DiskDerivedStateReplaySource {
@@ -969,7 +1039,7 @@ impl DerivedStateReplaySource for DiskDerivedStateReplaySource {
             })
             .unwrap_or_else(|_poison| (self.retained_session_files(), 0));
         DerivedStateReplayTelemetry {
-            backend: "disk",
+            backend: DerivedStateReplayBackend::Disk,
             retained_sessions,
             retained_envelopes,
             truncated_envelopes: self.truncated_envelopes(),
@@ -2035,6 +2105,35 @@ mod tests {
             extension_version: "test".to_owned(),
         };
         assert_eq!(checkpoint.next_sequence(), Some(FeedSequence(100)));
+    }
+
+    #[test]
+    fn replay_backend_parses_case_insensitively() {
+        assert_eq!(
+            DerivedStateReplayBackend::from_config_value("memory"),
+            Some(DerivedStateReplayBackend::Memory)
+        );
+        assert_eq!(
+            DerivedStateReplayBackend::from_config_value("DISK"),
+            Some(DerivedStateReplayBackend::Disk)
+        );
+        assert_eq!(DerivedStateReplayBackend::from_config_value("other"), None);
+    }
+
+    #[test]
+    fn replay_durability_parses_case_insensitively() {
+        assert_eq!(
+            DerivedStateReplayDurability::from_config_value("flush"),
+            Some(DerivedStateReplayDurability::Flush)
+        );
+        assert_eq!(
+            DerivedStateReplayDurability::from_config_value("FSYNC"),
+            Some(DerivedStateReplayDurability::Fsync)
+        );
+        assert_eq!(
+            DerivedStateReplayDurability::from_config_value("other"),
+            None
+        );
     }
 
     #[test]

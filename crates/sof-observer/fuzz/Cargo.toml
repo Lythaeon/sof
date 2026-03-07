@@ -68,5 +68,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "derived_state_replay_host"
+path = "fuzz_targets/derived_state_replay_host.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]
