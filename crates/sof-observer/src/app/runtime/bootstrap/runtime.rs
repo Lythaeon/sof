@@ -54,7 +54,6 @@ impl Drop for ReceiverRuntime {
 impl ReceiverRuntime {
     /// Builds a receiver runtime that relies on external ingress feed(s).
     #[cfg(feature = "kernel-bypass")]
-    #[allow(clippy::missing_const_for_fn)]
     #[must_use]
     pub(in crate::app::runtime) fn external(tx_event_rx: mpsc::Receiver<TxObservedEvent>) -> Self {
         Self {

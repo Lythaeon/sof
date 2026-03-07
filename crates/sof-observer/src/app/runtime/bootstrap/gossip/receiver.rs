@@ -264,7 +264,6 @@ pub(crate) async fn start_receiver(
 
 #[cfg(feature = "kernel-bypass")]
 #[must_use]
-#[allow(clippy::missing_const_for_fn)]
 pub(crate) fn start_external_receiver(
     tx_event_rx: mpsc::Receiver<TxObservedEvent>,
 ) -> ReceiverRuntime {

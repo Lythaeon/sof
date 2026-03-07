@@ -1,104 +1,85 @@
-# Toxic-Flow Reduction Todo
+# Toxic-Flow Substrate Status
 
-This file tracks the next substrate improvements needed so services built on top of SOF do not
-have to hand-roll stale-input guards, invalidation handling, and low-confidence routing policy.
+This document tracks the toxic-flow reduction substrate shipped in SOF so services built on top of
+the derived-state feed and `sof-tx` do not have to reimplement stale-input guards, invalidation,
+and low-confidence routing policy.
 
-## Best Improvements
+## Implemented
 
-1. Add first-class freshness metadata everywhere.
-   - event age
-   - slot age
-   - source timestamp skew
-   - blockhash age
-   - topology age
-   - leader-schedule age
+1. First-class freshness metadata.
+   - observer-side control-plane state tracks recent-blockhash, topology, and leader-schedule age
+   - control-plane snapshots also carry source wallclock skew and slot spread
+   - tx-provider adapters expose freshness through `TxProviderFlowSafetyReport`
 
-2. Add confidence and quality classification to the derived-state feed.
-   - `provisional`
-   - `stable`
-   - `reorg-risk`
-   - `stale`
-   - `degraded`
-   - `incomplete-control-plane`
+2. Confidence and quality classification in the derived-state feed.
+   - `ControlPlaneStateUpdated` carries canonical quality state
+   - quality now distinguishes `Provisional`, `Stable`, `ReorgRisk`, `Stale`, `Degraded`, and
+     `IncompleteControlPlane`
 
-3. Add feed-level consistency guards.
-   - do not emit strategy-safe signals until required inputs are aligned
-   - recent blockhash, topology, leader schedule, and tip watermark should be policy-checkable as
-     one coherent control-plane snapshot
+3. Feed-level consistency guards.
+   - observer-side control-plane tracking computes `strategy_safe`
+   - tx-side guard policy can reject degraded or misaligned control-plane state before submit
 
-4. Add replay and reorg-aware invalidation primitives.
-   - explicit revocation events
-   - invalidation of derived opportunities or state views after reorg
+4. Replay and reorg-aware invalidation primitives.
+   - derived-state feed emits `StateInvalidated`
+   - branch reorgs emit invalidation automatically
+   - control-plane regressions can emit invalidation when the state becomes unsafe
 
-5. Add source attribution and conflict tracking.
-   - source-of-truth metadata
-   - winner/loser source selection
-   - conflict visibility when two control-plane sources disagree
+5. Source attribution and conflict tracking.
+   - control-plane snapshots include selected topology and leader-schedule sources
+   - conflict and disagreement counters are emitted on the canonical control-plane event
 
-6. Add tx-outcome feedback into the same substrate.
-   - landed
-   - expired
-   - dropped
-   - leader missed
-   - blockhash stale
-   - unhealthy route
+6. Tx-outcome feedback in the same substrate.
+   - derived-state feed emits `TxOutcomeObserved`
+   - tx-side submit code can report landed, expired, dropped, stale-blockhash, and route-health
+     outcomes
 
-7. Add built-in suppression keys.
-   - signature-level
-   - opportunity-level
-   - account-set-level
-   - slot-window-level
+7. Built-in suppression keys.
+   - `sof-tx` exposes typed suppression keys for repeated submit attempts
+   - suppression can be keyed by signature, opportunity, account set, or slot window
 
-8. Add state-drift guards for services using local banks.
-   - decision state version
-   - send-time state version
-   - policy for rejecting or downgrading drifted decisions
+8. State-drift guards for services using local banks.
+   - `TxSubmitGuardPolicy` can reject submits when decision state version and send-time state
+     version drift beyond policy
 
-9. Add typed safety and guard policy objects in `sof-tx`.
-   - minimum freshness
-   - maximum slot lag
-   - require stable topology
-   - require leader confidence
-   - suppress on replay recovery pending
+9. Typed safety and guard policy objects in `sof-tx`.
+   - `TxSubmitGuardPolicy`
+   - `TxFlowSafetySnapshot`
+   - `TxFlowSafetyQuality`
+   - `TxToxicFlowRejectionReason`
 
-10. Add toxic-flow telemetry.
-    - `rejected_due_to_staleness`
-    - `rejected_due_to_reorg_risk`
-    - `rejected_due_to_state_drift`
-    - `submit_on_stale_blockhash`
-    - `leader_route_miss_rate`
-    - `opportunity_age_at_send`
+10. Toxic-flow telemetry.
+    - `TxToxicFlowTelemetry`
+    - `TxToxicFlowTelemetrySnapshot`
+    - rejection counters for stale, degraded, replay-pending, and drifted sends
+    - outcome counters for external feedback paths
 
-## Current Implementation Slice
+## Main Surfaces
 
-This branch now covers three concrete pieces:
+Observer/runtime side:
 
-1. Observer-side control-plane freshness and quality classification in the derived-state feed
-2. Typed tx-provider control-plane safety policy and freshness metadata in `sof-tx`
-3. Typed gossip/runtime tuning integration in `sof`
+- `DerivedStateFeedEvent::ControlPlaneStateUpdated`
+- `DerivedStateFeedEvent::StateInvalidated`
+- `DerivedStateFeedEvent::TxOutcomeObserved`
 
-That still does not finish the full toxic-flow roadmap, but it removes several immediate sources of
-downstream boilerplate:
+Transaction side:
 
-- ad hoc observer-side freshness and quality classification for recent blockhash, topology, and leader schedule inputs
-- ad hoc tx-provider freshness guards around control-plane state
-- ad hoc numeric/string tuning overlays for gossip bootstrap and ingest
+- `TxSubmitGuardPolicy`
+- `TxSubmitContext`
+- `TxSubmitOutcome`
+- `TxSubmitOutcomeReporter`
+- `TxToxicFlowTelemetry`
+- `TxFlowSafetySource`
 
-Implemented now:
+## Usage Direction
 
-- item 1: partial
-  - per-input freshness metadata for recent blockhash, topology, and leader schedule
-- item 2: partial
-  - coarse `stable` / `degraded` / `stale` / `incomplete-control-plane` classification
-- item 3: partial
-  - coherent control-plane spread checks
-- item 9: expanded
-  - typed tx-provider guard policy, freshness snapshots, and safety reports
+For services built on top of SOF:
 
-Still open:
+1. source control-plane state from the derived-state feed or the official `sof-tx` derived-state
+   adapter
+2. evaluate it through the built-in flow-safety surfaces before direct or hybrid submit
+3. feed submit outcomes back into the same substrate when the service has authoritative delivery
+   signals
 
-- explicit invalidation and replay/reorg-aware revocation
-- tx outcome feedback
-- suppression keys
-- state-drift guards
-- toxic-flow counters/telemetry
+This is now an implemented substrate, not a speculative roadmap. Future work should extend the same
+typed surfaces instead of introducing parallel downstream policy code.

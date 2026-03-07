@@ -315,7 +315,7 @@ Direct and hybrid modes include built-in reliability defaults through `SubmitRel
 Use `TxSubmitClient::with_reliability(...)` for presets, or `with_direct_config(...)` for full control.
 
 Reliability profiles are transport-side only. If you are sourcing blockhash, leader, and topology
-state from SOF, pair them with `evaluate_flow_safety(...)` before sending.
+state from SOF, pair them with `evaluate_flow_safety(...)` or `TxSubmitGuardPolicy` before sending.
 
 ## KernelBypass Direct Transport
 
@@ -377,5 +377,5 @@ Compile-time capability flags from ADR-0006 can be introduced incrementally as t
 - ADR for SDK scope: `../../docs/architecture/adr/0006-transaction-sdk-and-dual-submit-routing.md`
 - Workspace docs index: `../../docs/README.md`
 - Architecture docs: `../../docs/architecture/README.md`
-- Toxic-flow roadmap: `../../docs/architecture/toxic-flow-todo.md`
+- Toxic-flow substrate status: `../../docs/architecture/toxic-flow-todo.md`
 - Contribution guide: `../../CONTRIBUTING.md`

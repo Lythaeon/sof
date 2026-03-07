@@ -1,5 +1,4 @@
 //! SOF kernel-bypass ingress example with runtime telemetry and plugin-side metrics.
-#![allow(clippy::missing_docs_in_private_items)]
 #![cfg_attr(
     not(any(feature = "kernel-bypass", feature = "gossip-bootstrap")),
     allow(unused)
@@ -30,51 +29,86 @@ use sof::{
     runtime::{KernelBypassIngressSender, create_kernel_bypass_ingress_queue},
     shred::wire::SIZE_OF_DATA_SHRED_HEADERS,
 };
-const DEFAULT_DURATION_SECS: u64 = 180;
-const DEFAULT_BATCH_SIZE: usize = 8;
-const DEFAULT_BATCH_INTERVAL_MS: u64 = 20;
+/// Example configuration constant.
+pub(crate) const DEFAULT_DURATION_SECS: u64 = 180;
+/// Example configuration constant.
+pub(crate) const DEFAULT_BATCH_SIZE: usize = 8;
+/// Example configuration constant.
+pub(crate) const DEFAULT_BATCH_INTERVAL_MS: u64 = 20;
 #[cfg(feature = "kernel-bypass")]
-const SHRED_PAYLOAD_BYTES: usize = 128;
-const DEFAULT_RUNTIME_SHUTDOWN_TIMEOUT_SECS: u64 = 120;
-const DEFAULT_PLUGIN_DRAIN_TIMEOUT_SECS: u64 = 10;
+/// Example configuration constant.
+pub(crate) const SHRED_PAYLOAD_BYTES: usize = 128;
+/// Example configuration constant.
+pub(crate) const DEFAULT_RUNTIME_SHUTDOWN_TIMEOUT_SECS: u64 = 120;
+/// Example configuration constant.
+pub(crate) const DEFAULT_PLUGIN_DRAIN_TIMEOUT_SECS: u64 = 10;
 #[cfg(feature = "kernel-bypass")]
-const SHRED_VERSION: u16 = 1;
-const SOURCE_ENV: &str = "SOF_KERNEL_BYPASS_EXAMPLE_SOURCE";
+/// Example configuration constant.
+pub(crate) const SHRED_VERSION: u16 = 1;
+/// Example configuration constant.
+pub(crate) const SOURCE_ENV: &str = "SOF_KERNEL_BYPASS_EXAMPLE_SOURCE";
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
-struct RawIngressSnapshot {
-    packets: u64,
-    bytes: u64,
-    shreds: u64,
-    data_shreds: u64,
-    code_shreds: u64,
-    tx_total: u64,
-    tx_vote_only: u64,
-    tx_mixed: u64,
-    tx_non_vote: u64,
-    source_8899_packets: u64,
-    source_8900_packets: u64,
-    source_other_packets: u64,
+/// Example-local state or configuration type.
+pub(crate) struct RawIngressSnapshot {
+    /// Example-local field.
+    pub(crate) packets: u64,
+    /// Example-local field.
+    pub(crate) bytes: u64,
+    /// Example-local field.
+    pub(crate) shreds: u64,
+    /// Example-local field.
+    pub(crate) data_shreds: u64,
+    /// Example-local field.
+    pub(crate) code_shreds: u64,
+    /// Example-local field.
+    pub(crate) tx_total: u64,
+    /// Example-local field.
+    pub(crate) tx_vote_only: u64,
+    /// Example-local field.
+    pub(crate) tx_mixed: u64,
+    /// Example-local field.
+    pub(crate) tx_non_vote: u64,
+    /// Example-local field.
+    pub(crate) source_8899_packets: u64,
+    /// Example-local field.
+    pub(crate) source_8900_packets: u64,
+    /// Example-local field.
+    pub(crate) source_other_packets: u64,
 }
 
 #[derive(Default)]
-struct RawIngressMetricsPlugin {
-    packets: AtomicU64,
-    bytes: AtomicU64,
-    shreds: AtomicU64,
-    data_shreds: AtomicU64,
-    code_shreds: AtomicU64,
-    tx_total: AtomicU64,
-    tx_vote_only: AtomicU64,
-    tx_mixed: AtomicU64,
-    tx_non_vote: AtomicU64,
-    source_8899_packets: AtomicU64,
-    source_8900_packets: AtomicU64,
-    source_other_packets: AtomicU64,
+/// Example-local state or configuration type.
+pub(crate) struct RawIngressMetricsPlugin {
+    /// Example-local field.
+    pub(crate) packets: AtomicU64,
+    /// Example-local field.
+    pub(crate) bytes: AtomicU64,
+    /// Example-local field.
+    pub(crate) shreds: AtomicU64,
+    /// Example-local field.
+    pub(crate) data_shreds: AtomicU64,
+    /// Example-local field.
+    pub(crate) code_shreds: AtomicU64,
+    /// Example-local field.
+    pub(crate) tx_total: AtomicU64,
+    /// Example-local field.
+    pub(crate) tx_vote_only: AtomicU64,
+    /// Example-local field.
+    pub(crate) tx_mixed: AtomicU64,
+    /// Example-local field.
+    pub(crate) tx_non_vote: AtomicU64,
+    /// Example-local field.
+    pub(crate) source_8899_packets: AtomicU64,
+    /// Example-local field.
+    pub(crate) source_8900_packets: AtomicU64,
+    /// Example-local field.
+    pub(crate) source_other_packets: AtomicU64,
 }
 
 impl RawIngressMetricsPlugin {
-    fn snapshot(&self) -> RawIngressSnapshot {
+    /// Example helper used by this binary.
+    pub(crate) fn snapshot(&self) -> RawIngressSnapshot {
         RawIngressSnapshot {
             packets: self.packets.load(Ordering::Relaxed),
             bytes: self.bytes.load(Ordering::Relaxed),
@@ -158,22 +192,31 @@ impl ObserverPlugin for RawIngressMetricsPlugin {
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
-struct ProducerStats {
-    packets: u64,
-    batches: u64,
-    bytes: u64,
-    elapsed_ms: u64,
+/// Example-local state or configuration type.
+pub(crate) struct ProducerStats {
+    /// Example-local field.
+    pub(crate) packets: u64,
+    /// Example-local field.
+    pub(crate) batches: u64,
+    /// Example-local field.
+    pub(crate) bytes: u64,
+    /// Example-local field.
+    pub(crate) elapsed_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum IngressSource {
+/// Example-local enum used by this example binary.
+pub(crate) enum IngressSource {
     #[cfg(feature = "kernel-bypass")]
+    /// Example-local variant.
     SyntheticKernelBypass,
+    /// Example-local variant.
     LiveGossip,
 }
 
 #[cfg(feature = "kernel-bypass")]
-fn build_raw_packet(sequence: u64, source_port: u16) -> RawPacket {
+/// Example helper used by this binary.
+pub(crate) fn build_raw_packet(sequence: u64, source_port: u16) -> RawPacket {
     let slot = (sequence / 128).saturating_add(1);
     let index = u32::try_from(sequence % 128).unwrap_or(0);
     let fec_set_index = index;
@@ -208,7 +251,8 @@ fn build_raw_packet(sequence: u64, source_port: u16) -> RawPacket {
 }
 
 #[cfg(feature = "kernel-bypass")]
-fn produce_kernel_bypass_ingress(
+/// Example helper used by this binary.
+pub(crate) fn produce_kernel_bypass_ingress(
     tx: &KernelBypassIngressSender,
     run_for: Duration,
     batch_size: usize,
@@ -244,7 +288,8 @@ fn produce_kernel_bypass_ingress(
 }
 
 #[cfg(feature = "kernel-bypass")]
-fn write_bytes(buf: &mut [u8], offset: usize, src: &[u8]) {
+/// Example helper used by this binary.
+pub(crate) fn write_bytes(buf: &mut [u8], offset: usize, src: &[u8]) {
     let end = offset.saturating_add(src.len());
     if let Some(dst) = buf.get_mut(offset..end) {
         dst.copy_from_slice(src);
@@ -252,13 +297,15 @@ fn write_bytes(buf: &mut [u8], offset: usize, src: &[u8]) {
 }
 
 #[cfg(feature = "kernel-bypass")]
-fn write_byte(buf: &mut [u8], offset: usize, value: u8) {
+/// Example helper used by this binary.
+pub(crate) fn write_byte(buf: &mut [u8], offset: usize, value: u8) {
     if let Some(slot) = buf.get_mut(offset) {
         *slot = value;
     }
 }
 
-async fn wait_for_plugin_packets(
+/// Example helper used by this binary.
+pub(crate) async fn wait_for_plugin_packets(
     plugin: &RawIngressMetricsPlugin,
     expected_packets: u64,
     timeout: Duration,
@@ -276,7 +323,8 @@ async fn wait_for_plugin_packets(
     }
 }
 
-fn read_env_u64(name: &str, default: u64) -> u64 {
+/// Example helper used by this binary.
+pub(crate) fn read_env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -284,7 +332,8 @@ fn read_env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-fn read_env_usize(name: &str, default: usize) -> usize {
+/// Example helper used by this binary.
+pub(crate) fn read_env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -292,7 +341,8 @@ fn read_env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn read_ingress_source() -> Result<IngressSource, Box<dyn std::error::Error>> {
+/// Example helper used by this binary.
+pub(crate) fn read_ingress_source() -> Result<IngressSource, Box<dyn std::error::Error>> {
     let default_source = if cfg!(feature = "kernel-bypass") {
         "synthetic"
     } else {
@@ -325,7 +375,8 @@ fn read_ingress_source() -> Result<IngressSource, Box<dyn std::error::Error>> {
     }
 }
 
-fn print_summary(
+/// Example helper used by this binary.
+pub(crate) fn print_summary(
     source: IngressSource,
     producer_stats: ProducerStats,
     plugin_snapshot: RawIngressSnapshot,
@@ -364,7 +415,8 @@ fn print_summary(
     println!("plugin_dispatch_dropped_events={dropped_events}");
 }
 
-fn format_mib_per_sec(bytes: u64, elapsed_ms: u64) -> String {
+/// Example helper used by this binary.
+pub(crate) fn format_mib_per_sec(bytes: u64, elapsed_ms: u64) -> String {
     if elapsed_ms == 0 {
         return "0.000".to_owned();
     }
@@ -379,7 +431,8 @@ fn format_mib_per_sec(bytes: u64, elapsed_ms: u64) -> String {
 }
 
 #[cfg(feature = "kernel-bypass")]
-async fn run_synthetic_mode(
+/// Example helper used by this binary.
+pub(crate) async fn run_synthetic_mode(
     plugin: Arc<RawIngressMetricsPlugin>,
     plugin_host: PluginHost,
     run_for: Duration,
@@ -426,7 +479,8 @@ async fn run_synthetic_mode(
 }
 
 #[cfg(feature = "gossip-bootstrap")]
-async fn run_gossip_mode(
+/// Example helper used by this binary.
+pub(crate) async fn run_gossip_mode(
     plugin: Arc<RawIngressMetricsPlugin>,
     plugin_host: PluginHost,
     run_for: Duration,

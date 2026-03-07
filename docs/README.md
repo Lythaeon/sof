@@ -30,7 +30,7 @@ Contributors:
 - `architecture/runtime-bootstrap-modes.md`: runtime bootstrap and ingress modes
 - `architecture/derived-state-extension-contract.md`: stateful extension contract
 - `architecture/derived-state-feed-contract.md`: replayable derived-state feed contract
-- `architecture/toxic-flow-todo.md`: planned freshness, invalidation, and safety-policy work
+- `architecture/toxic-flow-todo.md`: implemented toxic-flow freshness, invalidation, and tx guard substrate
 
 ## Operations Docs
 
