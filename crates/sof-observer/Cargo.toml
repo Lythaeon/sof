@@ -23,6 +23,7 @@ gossip-bootstrap = ["dep:solana-gossip"]
 kernel-bypass = ["dep:xdp"]
 
 [dependencies]
+sof-gossip-tuning = { version = "0.1.0", path = "../sof-gossip-tuning" }
 solana-gossip = { version = "3.1.8", optional = true, features = ["agave-unstable-api"] }
 solana-entry = { version = "3.1.8", features = ["agave-unstable-api"] }
 solana-keypair = "3.0.1"

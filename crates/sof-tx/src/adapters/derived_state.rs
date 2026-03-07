@@ -15,6 +15,7 @@ use sof::framework::{
 use crate::{
     adapters::common::{
         TxProviderAdapterConfig, TxProviderAdapterCore, TxProviderAdapterSnapshot,
+        TxProviderControlPlaneSnapshot, TxProviderFlowSafetyPolicy, TxProviderFlowSafetyReport,
         take_next_leader_identity_targets,
     },
     providers::{LeaderProvider, LeaderTarget, RecentBlockhashProvider},
@@ -106,6 +107,21 @@ impl DerivedStateTxProviderAdapter {
     /// Restores provider state from a snapshot.
     pub fn restore_snapshot(&self, snapshot: TxProviderAdapterSnapshot) {
         self.core.restore_snapshot(snapshot);
+    }
+
+    /// Returns the current control-plane freshness snapshot.
+    #[must_use]
+    pub fn control_plane_snapshot(&self) -> TxProviderControlPlaneSnapshot {
+        self.core.control_plane_snapshot()
+    }
+
+    /// Evaluates the current control-plane state against one flow-safety policy.
+    #[must_use]
+    pub fn evaluate_flow_safety(
+        &self,
+        policy: TxProviderFlowSafetyPolicy,
+    ) -> TxProviderFlowSafetyReport {
+        self.core.evaluate_flow_safety(policy)
     }
 
     /// Returns configured persistence when file-backed checkpoints are enabled.
@@ -317,6 +333,29 @@ mod tests {
             Ok(value) => value,
             Err(error) => panic!("unexpected error: {error:?}"),
         }
+    }
+
+    #[test]
+    fn flow_safety_reports_missing_inputs_before_feed_replay() {
+        let adapter = DerivedStateTxProviderAdapter::default();
+        let report = adapter.evaluate_flow_safety(TxProviderFlowSafetyPolicy::default());
+
+        assert!(!report.is_safe());
+        assert!(
+            report
+                .issues
+                .contains(&crate::adapters::TxProviderFlowSafetyIssue::MissingRecentBlockhash)
+        );
+        assert!(
+            report
+                .issues
+                .contains(&crate::adapters::TxProviderFlowSafetyIssue::MissingClusterTopology)
+        );
+        assert!(
+            report
+                .issues
+                .contains(&crate::adapters::TxProviderFlowSafetyIssue::MissingLeaderSchedule)
+        );
     }
 
     #[test]

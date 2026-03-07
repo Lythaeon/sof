@@ -107,6 +107,7 @@ With `sof-adapters` enabled, `PluginHostTxProviderAdapter` can be:
 
 - registered as a SOF plugin to ingest blockhash/leader/topology events, and
 - passed directly into `TxSubmitClient` as both providers.
+- evaluated with `evaluate_flow_safety(...)` before using its control-plane state for direct send decisions.
 
 ```rust
 use std::sync::Arc;
@@ -153,6 +154,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+For restart-safe services built on SOF derived-state, use `DerivedStateTxProviderAdapter` instead.
+It consumes the replayable derived-state feed, supports checkpoint persistence, and exposes the
+same `evaluate_flow_safety(...)` helper for control-plane freshness checks.
 
 Direct submit needs TPU endpoints for scheduled leaders. The adapter gets these from
 `on_cluster_topology` events, or you can inject them manually with:

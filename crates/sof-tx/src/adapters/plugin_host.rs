@@ -11,7 +11,8 @@ use solana_pubkey::Pubkey;
 
 use crate::{
     adapters::common::{
-        TxProviderAdapterConfig, TxProviderAdapterCore, take_next_leader_identity_targets,
+        TxProviderAdapterConfig, TxProviderAdapterCore, TxProviderControlPlaneSnapshot,
+        TxProviderFlowSafetyPolicy, TxProviderFlowSafetyReport, take_next_leader_identity_targets,
     },
     providers::{LeaderProvider, LeaderTarget, RecentBlockhashProvider},
 };
@@ -61,6 +62,21 @@ impl PluginHostTxProviderAdapter {
     #[must_use]
     fn leader_window(&self, next_leaders: usize) -> Vec<LeaderTarget> {
         self.core.leader_window(next_leaders)
+    }
+
+    /// Returns the current control-plane freshness snapshot.
+    #[must_use]
+    pub fn control_plane_snapshot(&self) -> TxProviderControlPlaneSnapshot {
+        self.core.control_plane_snapshot()
+    }
+
+    /// Evaluates the current control-plane state against one flow-safety policy.
+    #[must_use]
+    pub fn evaluate_flow_safety(
+        &self,
+        policy: TxProviderFlowSafetyPolicy,
+    ) -> TxProviderFlowSafetyReport {
+        self.core.evaluate_flow_safety(policy)
     }
 
     /// Flushes all currently queued updates.
@@ -418,5 +434,49 @@ mod tests {
             adapter.current_leader(),
             Some(LeaderTarget::new(Some(leader), addr(9027)))
         );
+    }
+
+    #[tokio::test]
+    async fn adapter_reports_stale_control_plane_state() {
+        let adapter = PluginHostTxProviderAdapter::default();
+        let leader = Pubkey::new_unique();
+
+        adapter
+            .on_recent_blockhash(ObservedRecentBlockhashEvent {
+                slot: 10,
+                recent_blockhash: [9_u8; 32],
+                dataset_tx_count: 1,
+            })
+            .await;
+        adapter
+            .on_cluster_topology(topology_snapshot(vec![node(leader, 9331)]))
+            .await;
+        adapter
+            .on_leader_schedule(leader_snapshot(
+                200,
+                vec![LeaderScheduleEntry { slot: 200, leader }],
+            ))
+            .await;
+        adapter
+            .core
+            .apply_slot_status(sof::framework::SlotStatusChangedEvent {
+                slot: 200,
+                parent_slot: Some(199),
+                previous_status: Some(sof::event::ForkSlotStatus::Processed),
+                status: sof::event::ForkSlotStatus::Confirmed,
+            });
+
+        let report = adapter.evaluate_flow_safety(TxProviderFlowSafetyPolicy {
+            max_recent_blockhash_slot_lag: Some(16),
+            ..TxProviderFlowSafetyPolicy::default()
+        });
+
+        assert!(!report.is_safe());
+        assert!(report.issues.contains(
+            &crate::adapters::TxProviderFlowSafetyIssue::StaleRecentBlockhash {
+                slot_lag: 190,
+                max_allowed: 16,
+            }
+        ));
     }
 }

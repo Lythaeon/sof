@@ -4,7 +4,11 @@ mod common;
 mod derived_state;
 mod plugin_host;
 
-pub use common::{TxProviderAdapterConfig, TxProviderAdapterSnapshot, TxProviderIngressSnapshot};
+pub use common::{
+    TxProviderAdapterConfig, TxProviderAdapterSnapshot, TxProviderControlPlaneSnapshot,
+    TxProviderFlowSafetyIssue, TxProviderFlowSafetyPolicy, TxProviderFlowSafetyReport,
+    TxProviderIngressSnapshot,
+};
 pub use derived_state::{
     DerivedStateTxProviderAdapter, DerivedStateTxProviderAdapterConfig,
     DerivedStateTxProviderAdapterPersistence,

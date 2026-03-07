@@ -88,6 +88,19 @@ async fn main() -> Result<(), sof::runtime::RuntimeError> {
 }
 ```
 
+Or apply one typed gossip/ingest profile instead of stringly env overrides:
+
+```rust
+use sof_gossip_tuning::{GossipTuningProfile, HostProfilePreset};
+
+#[tokio::main]
+async fn main() -> Result<(), sof::runtime::RuntimeError> {
+    let setup = sof::runtime::RuntimeSetup::new()
+        .with_gossip_tuning_profile(GossipTuningProfile::preset(HostProfilePreset::Vps));
+    sof::runtime::run_async_with_setup(&setup).await
+}
+```
+
 With external `kernel-bypass` ingress, feed `RawPacketBatch` values through SOF's ingress queue:
 
 ```rust

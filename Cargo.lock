@@ -5255,6 +5255,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "socket2 0.5.10",
+ "sof-gossip-tuning",
  "solana-entry",
  "solana-gossip",
  "solana-keypair",
@@ -5273,6 +5274,10 @@ dependencies = [
  "wincode 0.1.2",
  "xdp",
 ]
+
+[[package]]
+name = "sof-gossip-tuning"
+version = "0.1.0"
 
 [[package]]
 name = "sof-tx"

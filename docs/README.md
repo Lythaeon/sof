@@ -29,6 +29,7 @@ Contributors:
 - `architecture/runtime-bootstrap-modes.md`: runtime bootstrap and ingress modes
 - `architecture/derived-state-extension-contract.md`: stateful extension contract
 - `architecture/derived-state-feed-contract.md`: replayable derived-state feed contract
+- `architecture/toxic-flow-todo.md`: planned freshness, invalidation, and safety-policy work
 
 ## Operations Docs
 
@@ -40,3 +41,4 @@ Contributors:
 
 - `../crates/sof-observer/README.md`: runtime/observer setup, examples, and features
 - `../crates/sof-tx/README.md`: transaction SDK setup, routing, and transport usage
+- `../crates/sof-gossip-tuning/README.md`: typed gossip/ingest tuning presets for SOF hosts

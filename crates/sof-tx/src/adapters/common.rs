@@ -52,17 +52,127 @@ impl Default for TxProviderAdapterConfig {
     }
 }
 
+/// Snapshot of tx-provider control-plane freshness inputs.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TxProviderControlPlaneSnapshot {
+    /// Slot of the most recently observed recent blockhash.
+    pub latest_recent_blockhash_slot: Option<u64>,
+    /// Slot of the most recently applied cluster topology update.
+    pub cluster_topology_slot: Option<u64>,
+    /// Slot of the most recently applied leader schedule update.
+    pub leader_schedule_slot: Option<u64>,
+    /// Current canonical tip slot known to the adapter.
+    pub tip_slot: Option<u64>,
+    /// Number of retained ingress identities.
+    pub known_ingress_nodes: usize,
+    /// Number of retained leader-slot assignments.
+    pub known_leader_slots: usize,
+}
+
+/// Slot-lag policy used to classify tx-provider control-plane state.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct TxProviderFlowSafetyPolicy {
+    /// Require a recent blockhash observation before treating the adapter as safe.
+    pub require_recent_blockhash: bool,
+    /// Require a cluster topology observation before treating the adapter as safe.
+    pub require_cluster_topology: bool,
+    /// Require a leader schedule observation before treating the adapter as safe.
+    pub require_leader_schedule: bool,
+    /// Require a known tip slot before evaluating lag-based freshness.
+    pub require_tip_slot: bool,
+    /// Maximum allowed lag between current tip and recent blockhash slot.
+    pub max_recent_blockhash_slot_lag: Option<u64>,
+    /// Maximum allowed lag between current tip and topology slot.
+    pub max_cluster_topology_slot_lag: Option<u64>,
+    /// Maximum allowed lag between current tip and leader schedule slot.
+    pub max_leader_schedule_slot_lag: Option<u64>,
+}
+
+impl Default for TxProviderFlowSafetyPolicy {
+    fn default() -> Self {
+        Self {
+            require_recent_blockhash: true,
+            require_cluster_topology: true,
+            require_leader_schedule: true,
+            require_tip_slot: true,
+            max_recent_blockhash_slot_lag: Some(32),
+            max_cluster_topology_slot_lag: Some(64),
+            max_leader_schedule_slot_lag: Some(128),
+        }
+    }
+}
+
+/// One reason a tx-provider adapter is not currently safe to drive submit decisions.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum TxProviderFlowSafetyIssue {
+    /// No recent blockhash has been observed yet.
+    MissingRecentBlockhash,
+    /// No topology event has been observed yet.
+    MissingClusterTopology,
+    /// No leader schedule event has been observed yet.
+    MissingLeaderSchedule,
+    /// No canonical tip slot is available, so lag cannot be evaluated safely.
+    MissingTipSlot,
+    /// Recent blockhash data is older than the configured lag policy.
+    StaleRecentBlockhash {
+        /// Observed lag between the tip slot and the most recent blockhash slot.
+        slot_lag: u64,
+        /// Maximum allowed lag from the policy.
+        max_allowed: u64,
+    },
+    /// Cluster topology data is older than the configured lag policy.
+    StaleClusterTopology {
+        /// Observed lag between the tip slot and the most recent topology slot.
+        slot_lag: u64,
+        /// Maximum allowed lag from the policy.
+        max_allowed: u64,
+    },
+    /// Leader schedule data is older than the configured lag policy.
+    StaleLeaderSchedule {
+        /// Observed lag between the tip slot and the most recent leader schedule slot.
+        slot_lag: u64,
+        /// Maximum allowed lag from the policy.
+        max_allowed: u64,
+    },
+}
+
+/// Evaluation result for one tx-provider control-plane snapshot.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TxProviderFlowSafetyReport {
+    /// Snapshot used for the evaluation.
+    pub snapshot: TxProviderControlPlaneSnapshot,
+    /// All detected issues under the requested policy.
+    pub issues: Vec<TxProviderFlowSafetyIssue>,
+}
+
+impl TxProviderFlowSafetyReport {
+    /// Returns true when the control-plane state satisfies the policy.
+    #[must_use]
+    pub const fn is_safe(&self) -> bool {
+        self.issues.is_empty()
+    }
+}
+
 /// Serializable snapshot of tx-provider adapter state.
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TxProviderAdapterSnapshot {
     /// Most recent observed recent blockhash.
     pub latest_recent_blockhash: Option<[u8; 32]>,
+    /// Slot of the most recent recent-blockhash observation.
+    #[serde(default)]
+    pub latest_recent_blockhash_slot: Option<u64>,
     /// Slot-to-leader assignments.
     pub leader_by_slot: Vec<(u64, [u8; 32])>,
     /// Latest observed canonical tip slot.
     pub tip_slot: Option<u64>,
     /// Most recent leader schedule cursor.
     pub leader_slot_cursor: Option<u64>,
+    /// Slot of the most recent topology update.
+    #[serde(default)]
+    pub cluster_topology_slot: Option<u64>,
+    /// Slot of the most recent leader schedule update.
+    #[serde(default)]
+    pub leader_schedule_slot: Option<u64>,
     /// Cached ingress endpoints keyed by validator identity.
     pub ingress_by_identity: Vec<TxProviderIngressSnapshot>,
 }
@@ -137,8 +247,10 @@ impl TxProviderAdapterCore {
     pub(crate) fn apply_recent_blockhash(&self, event: &ObservedRecentBlockhashEvent) {
         self.update({
             let recent_blockhash = event.recent_blockhash;
+            let slot = event.slot;
             move |state| {
                 state.latest_recent_blockhash = Some(recent_blockhash);
+                state.latest_recent_blockhash_slot = Some(slot);
             }
         });
     }
@@ -148,6 +260,9 @@ impl TxProviderAdapterCore {
         self.update({
             let event = event.clone();
             move |state| {
+                if let Some(slot) = event.slot {
+                    state.cluster_topology_slot = Some(slot);
+                }
                 apply_cluster_topology(state, &event);
             }
         });
@@ -159,6 +274,9 @@ impl TxProviderAdapterCore {
         self.update({
             let event = event.clone();
             move |state| {
+                if let Some(slot) = event.slot {
+                    state.leader_schedule_slot = Some(slot);
+                }
                 apply_leader_schedule(state, &event, max_leader_slots);
             }
         });
@@ -185,6 +303,7 @@ impl TxProviderAdapterCore {
     pub(crate) fn restore_snapshot(&self, snapshot: TxProviderAdapterSnapshot) {
         self.update(move |state| {
             state.latest_recent_blockhash = snapshot.latest_recent_blockhash;
+            state.latest_recent_blockhash_slot = snapshot.latest_recent_blockhash_slot;
             state.leader_by_slot = snapshot
                 .leader_by_slot
                 .into_iter()
@@ -192,6 +311,8 @@ impl TxProviderAdapterCore {
                 .collect();
             state.tip_slot = snapshot.tip_slot;
             state.leader_slot_cursor = snapshot.leader_slot_cursor;
+            state.cluster_topology_slot = snapshot.cluster_topology_slot;
+            state.leader_schedule_slot = snapshot.leader_schedule_slot;
             state.ingress_by_identity = snapshot
                 .ingress_by_identity
                 .into_iter()
@@ -220,6 +341,7 @@ impl TxProviderAdapterCore {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         TxProviderAdapterSnapshot {
             latest_recent_blockhash: state.latest_recent_blockhash,
+            latest_recent_blockhash_slot: state.latest_recent_blockhash_slot,
             leader_by_slot: state
                 .leader_by_slot
                 .iter()
@@ -227,6 +349,8 @@ impl TxProviderAdapterCore {
                 .collect(),
             tip_slot: state.tip_slot,
             leader_slot_cursor: state.leader_slot_cursor,
+            cluster_topology_slot: state.cluster_topology_slot,
+            leader_schedule_slot: state.leader_schedule_slot,
             ingress_by_identity: state
                 .ingress_by_identity
                 .iter()
@@ -248,6 +372,32 @@ impl TxProviderAdapterCore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .latest_recent_blockhash
+    }
+
+    /// Captures control-plane freshness state for downstream submit policy checks.
+    #[must_use]
+    pub(crate) fn control_plane_snapshot(&self) -> TxProviderControlPlaneSnapshot {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        TxProviderControlPlaneSnapshot {
+            latest_recent_blockhash_slot: state.latest_recent_blockhash_slot,
+            cluster_topology_slot: state.cluster_topology_slot,
+            leader_schedule_slot: state.leader_schedule_slot,
+            tip_slot: state.tip_slot,
+            known_ingress_nodes: state.ingress_by_identity.len(),
+            known_leader_slots: state.leader_by_slot.len(),
+        }
+    }
+
+    /// Evaluates the current control-plane snapshot against one typed safety policy.
+    #[must_use]
+    pub(crate) fn evaluate_flow_safety(
+        &self,
+        policy: TxProviderFlowSafetyPolicy,
+    ) -> TxProviderFlowSafetyReport {
+        evaluate_flow_safety(self.control_plane_snapshot(), policy)
     }
 
     /// Returns current leader plus up to `next_leaders` future leaders, in slot order.
@@ -325,9 +475,12 @@ pub(crate) fn take_next_leader_identity_targets(
 #[derive(Debug, Default, Clone)]
 struct AdapterState {
     latest_recent_blockhash: Option<[u8; 32]>,
+    latest_recent_blockhash_slot: Option<u64>,
     leader_by_slot: BTreeMap<u64, Pubkey>,
     tip_slot: Option<u64>,
     leader_slot_cursor: Option<u64>,
+    cluster_topology_slot: Option<u64>,
+    leader_schedule_slot: Option<u64>,
     ingress_by_identity: HashMap<Pubkey, NodeIngress>,
 }
 
@@ -526,6 +679,83 @@ fn append_ingress_targets(
             continue;
         }
         output.push(LeaderTarget::new(Some(identity), candidate));
+    }
+}
+
+fn evaluate_flow_safety(
+    snapshot: TxProviderControlPlaneSnapshot,
+    policy: TxProviderFlowSafetyPolicy,
+) -> TxProviderFlowSafetyReport {
+    let mut issues = Vec::new();
+
+    if policy.require_recent_blockhash && snapshot.latest_recent_blockhash_slot.is_none() {
+        issues.push(TxProviderFlowSafetyIssue::MissingRecentBlockhash);
+    }
+    if policy.require_cluster_topology && snapshot.cluster_topology_slot.is_none() {
+        issues.push(TxProviderFlowSafetyIssue::MissingClusterTopology);
+    }
+    if policy.require_leader_schedule && snapshot.leader_schedule_slot.is_none() {
+        issues.push(TxProviderFlowSafetyIssue::MissingLeaderSchedule);
+    }
+    if policy.require_tip_slot && snapshot.tip_slot.is_none() {
+        issues.push(TxProviderFlowSafetyIssue::MissingTipSlot);
+    }
+
+    if let Some(tip_slot) = snapshot.tip_slot {
+        apply_slot_lag_issue(
+            &mut issues,
+            snapshot.latest_recent_blockhash_slot,
+            policy.max_recent_blockhash_slot_lag,
+            |slot_lag, max_allowed| TxProviderFlowSafetyIssue::StaleRecentBlockhash {
+                slot_lag,
+                max_allowed,
+            },
+            tip_slot,
+        );
+        apply_slot_lag_issue(
+            &mut issues,
+            snapshot.cluster_topology_slot,
+            policy.max_cluster_topology_slot_lag,
+            |slot_lag, max_allowed| TxProviderFlowSafetyIssue::StaleClusterTopology {
+                slot_lag,
+                max_allowed,
+            },
+            tip_slot,
+        );
+        apply_slot_lag_issue(
+            &mut issues,
+            snapshot.leader_schedule_slot,
+            policy.max_leader_schedule_slot_lag,
+            |slot_lag, max_allowed| TxProviderFlowSafetyIssue::StaleLeaderSchedule {
+                slot_lag,
+                max_allowed,
+            },
+            tip_slot,
+        );
+    }
+
+    TxProviderFlowSafetyReport { snapshot, issues }
+}
+
+fn apply_slot_lag_issue<F>(
+    issues: &mut Vec<TxProviderFlowSafetyIssue>,
+    observed_slot: Option<u64>,
+    max_allowed: Option<u64>,
+    build_issue: F,
+    tip_slot: u64,
+) where
+    F: FnOnce(u64, u64) -> TxProviderFlowSafetyIssue,
+{
+    let Some(observed_slot) = observed_slot else {
+        return;
+    };
+    let Some(max_allowed) = max_allowed else {
+        return;
+    };
+
+    let slot_lag = tip_slot.saturating_sub(observed_slot);
+    if slot_lag > max_allowed {
+        issues.push(build_issue(slot_lag, max_allowed));
     }
 }
 

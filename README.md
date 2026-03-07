@@ -2,10 +2,11 @@
 
 SOF is a Solana-focused Rust workspace for low-latency data ingest and transaction execution.
 
-It is split into two user-facing crates:
+It is split into three user-facing crates:
 
 - `sof`: observer/runtime crate for shred ingest, relay/cache, dataset reconstruction, plugin and runtime-extension events, fork/reorg tracking, and local commitment tagging without RPC dependency
 - `sof-tx`: transaction SDK for building, signing, and submitting Solana transactions through RPC, direct leader routing, hybrid fallback, and optional kernel-bypass transports
+- `sof-gossip-tuning`: typed gossip and ingest tuning presets for hosts embedding `sof`
 
 ## Highlights
 
@@ -20,6 +21,7 @@ It is split into two user-facing crates:
 
 - `crates/sof-observer`: published as `sof`
 - `crates/sof-tx`: published as `sof-tx`
+- `crates/sof-gossip-tuning`: typed host tuning presets for gossip bootstrap and ingest
 - `docs/architecture`: ADRs, ARDs, and framework/runtime contracts
 - `docs/operations`: deployment and tuning docs
 - `scripts`: local tooling and helper scripts
@@ -47,6 +49,12 @@ Transaction SDK:
 
 ```bash
 cargo add sof-tx
+```
+
+Typed host tuning presets:
+
+```bash
+cargo add sof-gossip-tuning
 ```
 
 Feature examples:
@@ -91,6 +99,7 @@ cargo make ci
 
 - Observer/runtime setup: `crates/sof-observer/README.md`
 - Transaction SDK setup: `crates/sof-tx/README.md`
+- Typed gossip tuning setup: `crates/sof-gossip-tuning/README.md`
 - Docs entry point: `docs/README.md`
 - Contribution guide: `CONTRIBUTING.md`
 
