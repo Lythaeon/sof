@@ -377,5 +377,4 @@ Compile-time capability flags from ADR-0006 can be introduced incrementally as t
 - ADR for SDK scope: `../../docs/architecture/adr/0006-transaction-sdk-and-dual-submit-routing.md`
 - Workspace docs index: `../../docs/README.md`
 - Architecture docs: `../../docs/architecture/README.md`
-- Toxic-flow substrate status: `../../docs/architecture/toxic-flow-todo.md`
 - Contribution guide: `../../CONTRIBUTING.md`

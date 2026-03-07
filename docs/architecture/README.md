@@ -37,7 +37,6 @@ User-facing crate docs:
 - Framework Hooks: `framework-plugin-hooks.md`
 - Derived-State Extension Contract: `derived-state-extension-contract.md`
 - Derived-State Feed Contract: `derived-state-feed-contract.md`
-- Toxic-Flow Substrate Status: `toxic-flow-todo.md`
 - Runtime Extension Hooks: `runtime-extension-hooks.md`
 - Runtime Bootstrap Modes: `runtime-bootstrap-modes.md`
 - ARD-0001: `ard/0001-project-structure-and-code-goals.md`

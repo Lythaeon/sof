@@ -130,7 +130,6 @@ To keep ingest/processing but reduce outward network activity:
 - Plugin hook model: `docs/architecture/framework-plugin-hooks.md`
 - Runtime extension model: `docs/architecture/runtime-extension-hooks.md`
 - Derived-state feed contract: `docs/architecture/derived-state-feed-contract.md`
-- Toxic-flow substrate status: `docs/architecture/toxic-flow-todo.md`
 - Transaction SDK ADR: `docs/architecture/adr/0006-transaction-sdk-and-dual-submit-routing.md`
 
 ## CI and Release

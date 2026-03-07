@@ -15,7 +15,6 @@ Transaction SDK users:
 
 - `../crates/sof-tx/README.md`
 - `architecture/adr/0006-transaction-sdk-and-dual-submit-routing.md`
-- `architecture/toxic-flow-todo.md`
 
 Contributors:
 
@@ -30,7 +29,6 @@ Contributors:
 - `architecture/runtime-bootstrap-modes.md`: runtime bootstrap and ingress modes
 - `architecture/derived-state-extension-contract.md`: stateful extension contract
 - `architecture/derived-state-feed-contract.md`: replayable derived-state feed contract
-- `architecture/toxic-flow-todo.md`: implemented toxic-flow freshness, invalidation, and tx guard substrate
 
 ## Operations Docs
 
