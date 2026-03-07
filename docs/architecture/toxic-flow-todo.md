@@ -71,13 +71,34 @@ have to hand-roll stale-input guards, invalidation handling, and low-confidence 
 
 ## Current Implementation Slice
 
-This branch starts with two concrete pieces:
+This branch now covers three concrete pieces:
 
-1. Typed tx-provider control-plane safety policy in `sof-tx`
-2. Typed gossip/runtime tuning integration in `sof`
+1. Observer-side control-plane freshness and quality classification in the derived-state feed
+2. Typed tx-provider control-plane safety policy and freshness metadata in `sof-tx`
+3. Typed gossip/runtime tuning integration in `sof`
 
-That does not finish the toxic-flow roadmap, but it removes two immediate sources of downstream
-boilerplate:
+That still does not finish the full toxic-flow roadmap, but it removes several immediate sources of
+downstream boilerplate:
 
-- ad hoc freshness guards around tx-provider control-plane state
+- ad hoc observer-side freshness and quality classification for recent blockhash, topology, and leader schedule inputs
+- ad hoc tx-provider freshness guards around control-plane state
 - ad hoc numeric/string tuning overlays for gossip bootstrap and ingest
+
+Implemented now:
+
+- item 1: partial
+  - per-input freshness metadata for recent blockhash, topology, and leader schedule
+- item 2: partial
+  - coarse `stable` / `degraded` / `stale` / `incomplete-control-plane` classification
+- item 3: partial
+  - coherent control-plane spread checks
+- item 9: expanded
+  - typed tx-provider guard policy, freshness snapshots, and safety reports
+
+Still open:
+
+- explicit invalidation and replay/reorg-aware revocation
+- tx outcome feedback
+- suppression keys
+- state-drift guards
+- toxic-flow counters/telemetry

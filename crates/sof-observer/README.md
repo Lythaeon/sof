@@ -262,6 +262,7 @@ SOF also exposes a replayable derived-state feed intended for stateful official 
 - replay-based recovery after restart or transient failure
 - explicit resync/rebuild signaling
 - typed control-plane replay for recent blockhash, cluster topology, and leader schedule inputs
+- canonical control-plane quality snapshots through `ControlPlaneStateUpdated`
 
 This is the right substrate for local service layers that want to build a bank, query index, or gRPC stream on top of SOF without depending on validator-native Geyser.
 

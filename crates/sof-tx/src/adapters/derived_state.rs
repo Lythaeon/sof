@@ -1,5 +1,4 @@
 //! `sof` derived-state adapter that bridges replayable control-plane state into `sof-tx` providers.
-#![allow(clippy::missing_docs_in_private_items)]
 
 use std::{
     path::PathBuf,
@@ -21,8 +20,11 @@ use crate::{
     providers::{LeaderProvider, LeaderTarget, RecentBlockhashProvider},
 };
 
+/// Stable derived-state consumer name exposed to the SOF host.
 const DERIVED_STATE_ADAPTER_NAME: &str = "sof-tx-derived-state-provider-adapter";
+/// Extension contract version for persisted compatibility checks.
 const DERIVED_STATE_ADAPTER_EXTENSION_VERSION: &str = "sof-tx-derived-state-provider-adapter-v1";
+/// State-schema version for persisted compatibility checks.
 const DERIVED_STATE_ADAPTER_STATE_VERSION: u32 = 1;
 
 /// Configuration for [`DerivedStateTxProviderAdapter`].
@@ -130,6 +132,7 @@ impl DerivedStateTxProviderAdapter {
         self.persistence.as_ref()
     }
 
+    /// Returns the latest in-memory checkpoint observed by the adapter.
     fn current_checkpoint(&self) -> Option<DerivedStateCheckpoint> {
         self.checkpoint
             .lock()
@@ -137,6 +140,7 @@ impl DerivedStateTxProviderAdapter {
             .clone()
     }
 
+    /// Replaces the latest in-memory checkpoint visible to recovery logic.
     fn set_checkpoint(&self, checkpoint: Option<DerivedStateCheckpoint>) {
         *self
             .checkpoint
@@ -144,6 +148,7 @@ impl DerivedStateTxProviderAdapter {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = checkpoint;
     }
 
+    /// Loads one compatible persisted checkpoint and state snapshot, when configured.
     fn load_persisted_state(
         &self,
     ) -> Result<
@@ -159,6 +164,7 @@ impl DerivedStateTxProviderAdapter {
         )
     }
 
+    /// Persists the current adapter snapshot alongside one checkpoint, when configured.
     fn persist_state(
         &self,
         checkpoint: &DerivedStateCheckpoint,
@@ -245,7 +251,8 @@ impl DerivedStateConsumer for DerivedStateTxProviderAdapter {
             DerivedStateFeedEvent::BranchReorged(event) => {
                 self.core.apply_reorg(&event);
             }
-            DerivedStateFeedEvent::TransactionApplied(_)
+            DerivedStateFeedEvent::ControlPlaneStateUpdated(_)
+            | DerivedStateFeedEvent::TransactionApplied(_)
             | DerivedStateFeedEvent::AccountTouchObserved(_)
             | DerivedStateFeedEvent::CheckpointBarrier(_) => {}
         }

@@ -161,6 +161,10 @@ For restart-safe services built on SOF derived-state, use `DerivedStateTxProvide
 It consumes the replayable derived-state feed, supports checkpoint persistence, and exposes the
 same `evaluate_flow_safety(...)` helper for control-plane freshness checks.
 
+The observer-side feed now also emits canonical control-plane quality snapshots, so services can
+source freshness and confidence metadata from `sof` first and keep `sof-tx` focused on send-time
+guard decisions.
+
 For services that do not want to maintain a parallel checkpoint file format, use the adapter
 persistence helper backed by SOF's generic `DerivedStateCheckpointStore`.
 
