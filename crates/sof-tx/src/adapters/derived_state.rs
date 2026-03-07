@@ -2,16 +2,14 @@
 #![allow(clippy::missing_docs_in_private_items)]
 
 use std::{
-    fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde::{Deserialize, Serialize};
 use sof::framework::{
-    DerivedStateCheckpoint, DerivedStateConsumer, DerivedStateConsumerFault,
-    DerivedStateConsumerFaultKind, DerivedStateFeedEnvelope, DerivedStateFeedEvent,
+    DerivedStateCheckpoint, DerivedStateCheckpointStore, DerivedStateConsumer,
+    DerivedStateConsumerFault, DerivedStateFeedEnvelope, DerivedStateFeedEvent,
+    DerivedStatePersistedCheckpoint,
 };
 
 use crate::{
@@ -47,7 +45,7 @@ impl DerivedStateTxProviderAdapterPersistence {
 
     /// Returns the persisted checkpoint path.
     #[must_use]
-    pub fn checkpoint_path(&self) -> &Path {
+    pub fn checkpoint_path(&self) -> &std::path::Path {
         &self.checkpoint_path
     }
 }
@@ -132,35 +130,17 @@ impl DerivedStateTxProviderAdapter {
 
     fn load_persisted_state(
         &self,
-    ) -> Result<Option<PersistedDerivedStateTxProviderAdapter>, DerivedStateConsumerFault> {
+    ) -> Result<
+        Option<DerivedStatePersistedCheckpoint<TxProviderAdapterSnapshot>>,
+        DerivedStateConsumerFault,
+    > {
         let Some(persistence) = self.persistence() else {
             return Ok(None);
         };
-        if !persistence.checkpoint_path().exists() {
-            return Ok(None);
-        }
-        let bytes = fs::read(persistence.checkpoint_path()).map_err(|error| {
-            DerivedStateConsumerFault::new(
-                DerivedStateConsumerFaultKind::CheckpointWriteFailed,
-                None,
-                format!(
-                    "failed to read derived-state tx adapter checkpoint {}: {error}",
-                    persistence.checkpoint_path().display()
-                ),
-            )
-        })?;
-        let persisted = serde_json::from_slice::<PersistedDerivedStateTxProviderAdapter>(&bytes)
-            .map_err(|error| {
-                DerivedStateConsumerFault::new(
-                    DerivedStateConsumerFaultKind::CheckpointWriteFailed,
-                    None,
-                    format!(
-                        "failed to parse derived-state tx adapter checkpoint {}: {error}",
-                        persistence.checkpoint_path().display()
-                    ),
-                )
-            })?;
-        Ok(Some(persisted))
+        DerivedStateCheckpointStore::new(persistence.checkpoint_path()).load_compatible(
+            DERIVED_STATE_ADAPTER_STATE_VERSION,
+            DERIVED_STATE_ADAPTER_EXTENSION_VERSION,
+        )
     }
 
     fn persist_state(
@@ -170,58 +150,8 @@ impl DerivedStateTxProviderAdapter {
         let Some(persistence) = self.persistence() else {
             return Ok(());
         };
-        let persisted = PersistedDerivedStateTxProviderAdapter {
-            checkpoint: Some(checkpoint.clone()),
-            snapshot: self.snapshot_state(),
-        };
-        let bytes = serde_json::to_vec_pretty(&persisted).map_err(|error| {
-            DerivedStateConsumerFault::new(
-                DerivedStateConsumerFaultKind::CheckpointWriteFailed,
-                Some(checkpoint.last_applied_sequence),
-                format!("failed to serialize derived-state tx adapter checkpoint: {error}"),
-            )
-        })?;
-        if let Some(parent) = persistence.checkpoint_path().parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                DerivedStateConsumerFault::new(
-                    DerivedStateConsumerFaultKind::CheckpointWriteFailed,
-                    Some(checkpoint.last_applied_sequence),
-                    format!(
-                        "failed to create derived-state tx adapter checkpoint directory {}: {error}",
-                        parent.display()
-                    ),
-                )
-            })?;
-        }
-
-        let tmp_path = temp_checkpoint_path(persistence.checkpoint_path());
-        fs::write(&tmp_path, bytes).map_err(|error| {
-            DerivedStateConsumerFault::new(
-                DerivedStateConsumerFaultKind::CheckpointWriteFailed,
-                Some(checkpoint.last_applied_sequence),
-                format!(
-                    "failed to write temporary derived-state tx adapter checkpoint {}: {error}",
-                    tmp_path.display()
-                ),
-            )
-        })?;
-        fs::rename(&tmp_path, persistence.checkpoint_path()).map_err(|error| {
-            if let Err(_error) = fs::remove_file(&tmp_path) {}
-            DerivedStateConsumerFault::new(
-                DerivedStateConsumerFaultKind::CheckpointWriteFailed,
-                Some(checkpoint.last_applied_sequence),
-                format!(
-                    "failed to move derived-state tx adapter checkpoint into place {}: {error}",
-                    persistence.checkpoint_path().display()
-                ),
-            )
-        })?;
-        Ok(())
-    }
-
-    fn checkpoint_is_compatible(checkpoint: &DerivedStateCheckpoint) -> bool {
-        checkpoint.state_version == DERIVED_STATE_ADAPTER_STATE_VERSION
-            && checkpoint.extension_version == DERIVED_STATE_ADAPTER_EXTENSION_VERSION
+        DerivedStateCheckpointStore::new(persistence.checkpoint_path())
+            .store(checkpoint, &self.snapshot_state())
     }
 }
 
@@ -273,13 +203,10 @@ impl DerivedStateConsumer for DerivedStateTxProviderAdapter {
         let Some(persisted) = self.load_persisted_state()? else {
             return Ok(None);
         };
-        let checkpoint = persisted.checkpoint.filter(Self::checkpoint_is_compatible);
-        if checkpoint.is_none() {
-            return Ok(None);
-        }
-        self.restore_snapshot(persisted.snapshot);
-        self.set_checkpoint(checkpoint.clone());
-        Ok(checkpoint)
+        let (checkpoint, snapshot) = persisted.into_parts();
+        self.restore_snapshot(snapshot);
+        self.set_checkpoint(Some(checkpoint.clone()));
+        Ok(Some(checkpoint))
     }
 
     fn apply(
@@ -318,26 +245,16 @@ impl DerivedStateConsumer for DerivedStateTxProviderAdapter {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedDerivedStateTxProviderAdapter {
-    checkpoint: Option<DerivedStateCheckpoint>,
-    snapshot: TxProviderAdapterSnapshot,
-}
-
-fn temp_checkpoint_path(path: &Path) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let mut tmp = path.to_path_buf();
-    tmp.set_extension(format!("{}.{}.tmp", std::process::id(), nanos));
-    tmp
-}
-
 #[cfg(test)]
 #[allow(clippy::panic)]
 mod tests {
-    use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
+    use std::{
+        env, fs,
+        net::SocketAddr,
+        path::PathBuf,
+        sync::Arc,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use sof::framework::{
         BranchReorgedEvent, CheckpointBarrierEvent, CheckpointBarrierReason, ClusterNodeInfo,
@@ -595,16 +512,16 @@ mod tests {
     #[test]
     fn derived_state_adapter_ignores_incompatible_persisted_checkpoints() {
         let checkpoint_path = unique_temp_path("derived-state-adapter-incompatible");
-        let persisted = PersistedDerivedStateTxProviderAdapter {
-            checkpoint: Some(DerivedStateCheckpoint {
+        let persisted = DerivedStatePersistedCheckpoint::new(
+            DerivedStateCheckpoint {
                 session_id: FeedSessionId(77),
                 last_applied_sequence: FeedSequence(3),
                 watermarks: FeedWatermarks::default(),
                 state_version: 999,
                 extension_version: "other".to_owned(),
-            }),
-            snapshot: TxProviderAdapterSnapshot::default(),
-        };
+            },
+            TxProviderAdapterSnapshot::default(),
+        );
         must(fs::write(
             &checkpoint_path,
             must(serde_json::to_vec(&persisted)),

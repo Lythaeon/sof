@@ -18,7 +18,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
@@ -292,6 +292,207 @@ impl DerivedStateCheckpoint {
     #[must_use]
     pub const fn next_sequence(&self) -> Option<FeedSequence> {
         self.last_applied_sequence.next()
+    }
+
+    /// Returns whether this checkpoint matches one consumer contract pair.
+    #[must_use]
+    pub fn matches_contract(&self, state_version: u32, extension_version: &str) -> bool {
+        self.state_version == state_version && self.extension_version == extension_version
+    }
+}
+
+/// One persisted derived-state consumer snapshot bundled with its durable checkpoint.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DerivedStatePersistedCheckpoint<T> {
+    /// Durable derived-state checkpoint cursor.
+    pub checkpoint: DerivedStateCheckpoint,
+    /// Consumer-owned persisted state payload.
+    pub state: T,
+}
+
+impl<T> DerivedStatePersistedCheckpoint<T> {
+    /// Creates a new persisted checkpoint/state bundle.
+    #[must_use]
+    pub const fn new(checkpoint: DerivedStateCheckpoint, state: T) -> Self {
+        Self { checkpoint, state }
+    }
+
+    /// Returns whether the bundled checkpoint matches one consumer contract pair.
+    #[must_use]
+    pub fn is_compatible(&self, state_version: u32, extension_version: &str) -> bool {
+        self.checkpoint
+            .matches_contract(state_version, extension_version)
+    }
+
+    /// Splits the bundle into its checkpoint and state payload.
+    #[must_use]
+    pub fn into_parts(self) -> (DerivedStateCheckpoint, T) {
+        (self.checkpoint, self.state)
+    }
+}
+
+/// Small file-backed checkpoint store for derived-state consumers.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DerivedStateCheckpointStore {
+    /// Filesystem path used for persisted checkpoint/state bundles.
+    path: PathBuf,
+}
+
+impl DerivedStateCheckpointStore {
+    /// Creates a checkpoint store rooted at `path`.
+    #[must_use]
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// Returns the underlying checkpoint path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Loads a previously persisted checkpoint/state bundle when present.
+    ///
+    /// # Errors
+    /// Returns [`DerivedStateConsumerFaultKind::CheckpointWriteFailed`] when the bundle
+    /// cannot be read or deserialized.
+    pub fn load<T>(
+        &self,
+    ) -> Result<Option<DerivedStatePersistedCheckpoint<T>>, DerivedStateConsumerFault>
+    where
+        T: DeserializeOwned,
+    {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&self.path).map_err(|error| {
+            DerivedStateConsumerFault::new(
+                DerivedStateConsumerFaultKind::CheckpointWriteFailed,
+                None,
+                format!(
+                    "failed to read derived-state checkpoint {}: {error}",
+                    self.path.display()
+                ),
+            )
+        })?;
+        let persisted = serde_json::from_slice::<DerivedStatePersistedCheckpoint<T>>(&bytes)
+            .map_err(|error| {
+                DerivedStateConsumerFault::new(
+                    DerivedStateConsumerFaultKind::CheckpointWriteFailed,
+                    None,
+                    format!(
+                        "failed to parse derived-state checkpoint {}: {error}",
+                        self.path.display()
+                    ),
+                )
+            })?;
+        Ok(Some(persisted))
+    }
+
+    /// Loads a persisted bundle only when its checkpoint matches one consumer contract pair.
+    ///
+    /// # Errors
+    /// Returns any read or deserialization failure from [`Self::load`].
+    pub fn load_compatible<T>(
+        &self,
+        state_version: u32,
+        extension_version: &str,
+    ) -> Result<Option<DerivedStatePersistedCheckpoint<T>>, DerivedStateConsumerFault>
+    where
+        T: DeserializeOwned,
+    {
+        Ok(self
+            .load::<T>()?
+            .filter(|persisted| persisted.is_compatible(state_version, extension_version)))
+    }
+
+    /// Persists one checkpoint/state bundle atomically.
+    ///
+    /// # Errors
+    /// Returns [`DerivedStateConsumerFaultKind::CheckpointWriteFailed`] when the bundle
+    /// cannot be serialized or written to disk.
+    pub fn store<T>(
+        &self,
+        checkpoint: &DerivedStateCheckpoint,
+        state: &T,
+    ) -> Result<(), DerivedStateConsumerFault>
+    where
+        T: Serialize,
+    {
+        #[allow(clippy::missing_docs_in_private_items)]
+        #[derive(Serialize)]
+        struct PersistedRef<'state, T> {
+            checkpoint: &'state DerivedStateCheckpoint,
+            state: &'state T,
+        }
+
+        let bytes =
+            serde_json::to_vec_pretty(&PersistedRef { checkpoint, state }).map_err(|error| {
+                DerivedStateConsumerFault::new(
+                    DerivedStateConsumerFaultKind::CheckpointWriteFailed,
+                    Some(checkpoint.last_applied_sequence),
+                    format!("failed to serialize derived-state checkpoint: {error}"),
+                )
+            })?;
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                DerivedStateConsumerFault::new(
+                    DerivedStateConsumerFaultKind::CheckpointWriteFailed,
+                    Some(checkpoint.last_applied_sequence),
+                    format!(
+                        "failed to create derived-state checkpoint directory {}: {error}",
+                        parent.display()
+                    ),
+                )
+            })?;
+        }
+
+        let temp_path = self.path.with_extension("checkpoint.tmp");
+        {
+            let mut file = File::create(&temp_path).map_err(|error| {
+                DerivedStateConsumerFault::new(
+                    DerivedStateConsumerFaultKind::CheckpointWriteFailed,
+                    Some(checkpoint.last_applied_sequence),
+                    format!(
+                        "failed to create temporary derived-state checkpoint {}: {error}",
+                        temp_path.display()
+                    ),
+                )
+            })?;
+            file.write_all(&bytes).map_err(|error| {
+                DerivedStateConsumerFault::new(
+                    DerivedStateConsumerFaultKind::CheckpointWriteFailed,
+                    Some(checkpoint.last_applied_sequence),
+                    format!(
+                        "failed to write temporary derived-state checkpoint {}: {error}",
+                        temp_path.display()
+                    ),
+                )
+            })?;
+            file.sync_all().map_err(|error| {
+                DerivedStateConsumerFault::new(
+                    DerivedStateConsumerFaultKind::CheckpointWriteFailed,
+                    Some(checkpoint.last_applied_sequence),
+                    format!(
+                        "failed to fsync temporary derived-state checkpoint {}: {error}",
+                        temp_path.display()
+                    ),
+                )
+            })?;
+        }
+
+        fs::rename(&temp_path, &self.path).map_err(|error| {
+            drop(fs::remove_file(&temp_path));
+            DerivedStateConsumerFault::new(
+                DerivedStateConsumerFaultKind::CheckpointWriteFailed,
+                Some(checkpoint.last_applied_sequence),
+                format!(
+                    "failed to move derived-state checkpoint into place {}: {error}",
+                    self.path.display()
+                ),
+            )
+        })?;
+        Ok(())
     }
 }
 
@@ -2125,6 +2326,94 @@ mod tests {
             "sof-derived-state-{name}-{}-{unique}",
             std::process::id()
         ))
+    }
+
+    fn unique_test_checkpoint_path(name: &str) -> PathBuf {
+        unique_test_replay_dir(name).join("checkpoint.json")
+    }
+
+    #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+    struct TestCheckpointState {
+        latest_slot: Option<u64>,
+        item_count: usize,
+    }
+
+    #[test]
+    fn checkpoint_store_round_trips_persisted_state() {
+        let checkpoint_path = unique_test_checkpoint_path("store-roundtrip");
+        let store = DerivedStateCheckpointStore::new(&checkpoint_path);
+        let checkpoint = DerivedStateCheckpoint {
+            session_id: FeedSessionId(77),
+            last_applied_sequence: FeedSequence(18),
+            watermarks: FeedWatermarks {
+                canonical_tip_slot: Some(55),
+                processed_slot: Some(55),
+                confirmed_slot: Some(55),
+                finalized_slot: Some(54),
+            },
+            state_version: 3,
+            extension_version: "checkpoint-store-test".to_owned(),
+        };
+        let state = TestCheckpointState {
+            latest_slot: Some(55),
+            item_count: 4,
+        };
+
+        let store_result = store.store(&checkpoint, &state);
+        assert!(store_result.is_ok(), "{store_result:?}");
+
+        let persisted_result = store.load::<TestCheckpointState>();
+        assert!(persisted_result.is_ok(), "{persisted_result:?}");
+        let persisted = persisted_result.ok().flatten();
+
+        assert_eq!(
+            persisted,
+            Some(DerivedStatePersistedCheckpoint::new(checkpoint, state))
+        );
+
+        drop(fs::remove_file(&checkpoint_path));
+        if let Some(parent) = checkpoint_path.parent() {
+            drop(fs::remove_dir_all(parent));
+        }
+    }
+
+    #[test]
+    fn checkpoint_store_filters_incompatible_state_contracts() {
+        let checkpoint_path = unique_test_checkpoint_path("store-compatible");
+        let store = DerivedStateCheckpointStore::new(&checkpoint_path);
+        let checkpoint = DerivedStateCheckpoint {
+            session_id: FeedSessionId(91),
+            last_applied_sequence: FeedSequence(7),
+            watermarks: FeedWatermarks::default(),
+            state_version: 2,
+            extension_version: "compatible-test".to_owned(),
+        };
+
+        let store_result = store.store(
+            &checkpoint,
+            &TestCheckpointState {
+                latest_slot: None,
+                item_count: 1,
+            },
+        );
+        assert!(store_result.is_ok(), "{store_result:?}");
+
+        let compatible_result = store.load_compatible::<TestCheckpointState>(2, "compatible-test");
+        assert!(compatible_result.is_ok(), "{compatible_result:?}");
+        let compatible = compatible_result.ok().flatten();
+
+        let incompatible_result =
+            store.load_compatible::<TestCheckpointState>(3, "compatible-test");
+        assert!(incompatible_result.is_ok(), "{incompatible_result:?}");
+        let incompatible = incompatible_result.ok().flatten();
+
+        assert!(compatible.is_some());
+        assert_eq!(incompatible, None);
+
+        drop(fs::remove_file(&checkpoint_path));
+        if let Some(parent) = checkpoint_path.parent() {
+            drop(fs::remove_dir_all(parent));
+        }
     }
 
     #[test]

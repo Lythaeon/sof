@@ -5238,7 +5238,7 @@ dependencies = [
 
 [[package]]
 name = "sof"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "arcshift",
  "async-trait",
@@ -5276,7 +5276,7 @@ dependencies = [
 
 [[package]]
 name = "sof-tx"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "arcshift",
  "async-trait",
