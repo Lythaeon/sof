@@ -75,28 +75,6 @@ jobs:
             fi
           }
 
-          crate_is_published() {
-            local pkg="$1"
-            local version="$2"
-            curl -fsSLo /dev/null "https://crates.io/api/v1/crates/${pkg}/${version}"
-          }
-
-          wait_for_registry() {
-            local pkg="$1"
-            local version="$2"
-            local attempt
-            for attempt in $(seq 1 20); do
-              if crate_is_published "${pkg}" "${version}"; then
-                return 0
-              fi
-              echo "Waiting for ${pkg} v${version} to appear in crates.io index (${attempt}/20)..."
-              sleep 15
-            done
-
-            echo "Error: ${pkg} v${version} did not become visible on crates.io in time"
-            return 1
-          }
-
           # Define crates in dependency order
           crates=("sof-gossip-tuning" "sof-solana-gossip" "sof" "sof-tx")
 
@@ -110,15 +88,6 @@ jobs:
             fi
 
             matched_count=$((matched_count + 1))
-
-            if crate_is_published "$pkg" "${crate_version}"; then
-              echo ">>> Already published $pkg v${crate_version}"
-              already_published_count=$((already_published_count + 1))
-              if [[ "$pkg" == "sof-gossip-tuning" || "$pkg" == "sof-solana-gossip" || "$pkg" == "sof" ]]; then
-                wait_for_registry "$pkg" "${crate_version}"
-              fi
-              continue
-            fi
 
             echo ">>> Target matches: $pkg v${crate_version}. Dry-running..."
             set +e
@@ -149,11 +118,6 @@ jobs:
               failed_count=$((failed_count + 1))
             fi
 
-            # If we just processed the core crate and there are more to go,
-            # sleep to allow crates.io indexing before downstream publish.
-            if [[ "$pkg" == "sof-gossip-tuning" || "$pkg" == "sof-solana-gossip" || "$pkg" == "sof" ]]; then
-              wait_for_registry "$pkg" "${crate_version}"
-            fi
           done
 
           echo "=== Publish summary ==="
