@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/sof-gossip-tuning", "crates/sof-observer", "crates/sof-tx"]
+exclude = ["crates/sof-solana-gossip"]
 
 [patch.crates-io]
 sof-solana-gossip = { path = "crates/sof-solana-gossip" }
