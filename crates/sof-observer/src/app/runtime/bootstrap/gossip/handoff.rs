@@ -183,6 +183,26 @@ pub(super) fn format_port_range(range: PortRange) -> String {
 }
 
 #[cfg(feature = "gossip-bootstrap")]
+fn apply_gossip_runtime_env_overrides() {
+    const GOSSIP_OVERRIDE_KEYS: [&str; 6] = [
+        "SOF_GOSSIP_RECEIVER_CHANNEL_CAPACITY",
+        "SOF_GOSSIP_SOCKET_CONSUME_CHANNEL_CAPACITY",
+        "SOF_GOSSIP_RESPONSE_CHANNEL_CAPACITY",
+        "SOF_GOSSIP_CHANNEL_CONSUME_CAPACITY",
+        "SOF_GOSSIP_CONSUME_THREADS",
+        "SOF_GOSSIP_LISTEN_THREADS",
+    ];
+
+    let overrides = GOSSIP_OVERRIDE_KEYS
+        .iter()
+        .filter_map(|key| {
+            crate::runtime_env::read_env_var(key).map(|value| ((*key).to_owned(), value))
+        })
+        .collect::<Vec<_>>();
+    solana_gossip::set_runtime_env_overrides(overrides);
+}
+
+#[cfg(feature = "gossip-bootstrap")]
 /// Runtime components produced by successful gossip bootstrap.
 pub(super) type GossipBootstrapRuntime = (
     Vec<JoinHandle<()>>,
@@ -411,6 +431,7 @@ async fn start_gossip_bootstrapped_receiver(
     }
     let cluster_info = Arc::new(cluster_info);
     let exit = Arc::new(AtomicBool::new(false));
+    apply_gossip_runtime_env_overrides();
     let gossip_service = GossipService::new(
         &cluster_info,
         None,

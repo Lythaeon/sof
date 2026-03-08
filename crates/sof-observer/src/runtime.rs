@@ -5,8 +5,9 @@ use crate::framework::{
     RuntimeExtensionHost,
 };
 use sof_gossip_tuning::{
-    CpuCoreIndex, GossipTuningProfile, GossipTuningService, IngestQueueMode, QueueCapacity,
-    ReceiverCoalesceWindow, RuntimeTuningPort, SofRuntimeTuning, TvuReceiveSocketCount,
+    CpuCoreIndex, GossipChannelTuning, GossipTuningProfile, GossipTuningService, IngestQueueMode,
+    QueueCapacity, ReceiverCoalesceWindow, RuntimeTuningPort, SofRuntimeTuning,
+    TvuReceiveSocketCount,
 };
 use thiserror::Error;
 
@@ -222,6 +223,69 @@ impl RuntimeSetup {
     #[must_use]
     pub fn with_dataset_workers(self, dataset_workers: usize) -> Self {
         self.with_env("SOF_DATASET_WORKERS", dataset_workers.to_string())
+    }
+
+    /// Sets `SOF_PACKET_WORKERS`.
+    #[must_use]
+    pub fn with_packet_workers(self, packet_workers: usize) -> Self {
+        self.with_env("SOF_PACKET_WORKERS", packet_workers.to_string())
+    }
+
+    /// Sets `SOF_PACKET_WORKER_QUEUE_CAPACITY`.
+    #[must_use]
+    pub fn with_packet_worker_queue_capacity(self, queue_capacity: usize) -> Self {
+        self.with_env(
+            "SOF_PACKET_WORKER_QUEUE_CAPACITY",
+            queue_capacity.to_string(),
+        )
+    }
+
+    /// Sets `SOF_GOSSIP_RECEIVER_CHANNEL_CAPACITY`.
+    #[must_use]
+    pub fn with_gossip_receiver_channel_capacity(self, queue_capacity: usize) -> Self {
+        self.with_env(
+            "SOF_GOSSIP_RECEIVER_CHANNEL_CAPACITY",
+            queue_capacity.to_string(),
+        )
+    }
+
+    /// Sets `SOF_GOSSIP_SOCKET_CONSUME_CHANNEL_CAPACITY`.
+    #[must_use]
+    pub fn with_gossip_socket_consume_channel_capacity(self, queue_capacity: usize) -> Self {
+        self.with_env(
+            "SOF_GOSSIP_SOCKET_CONSUME_CHANNEL_CAPACITY",
+            queue_capacity.to_string(),
+        )
+    }
+
+    /// Sets `SOF_GOSSIP_RESPONSE_CHANNEL_CAPACITY`.
+    #[must_use]
+    pub fn with_gossip_response_channel_capacity(self, queue_capacity: usize) -> Self {
+        self.with_env(
+            "SOF_GOSSIP_RESPONSE_CHANNEL_CAPACITY",
+            queue_capacity.to_string(),
+        )
+    }
+
+    /// Sets `SOF_GOSSIP_CHANNEL_CONSUME_CAPACITY`.
+    #[must_use]
+    pub fn with_gossip_channel_consume_capacity(self, queue_capacity: usize) -> Self {
+        self.with_env(
+            "SOF_GOSSIP_CHANNEL_CONSUME_CAPACITY",
+            queue_capacity.to_string(),
+        )
+    }
+
+    /// Sets `SOF_GOSSIP_CONSUME_THREADS`.
+    #[must_use]
+    pub fn with_gossip_consume_threads(self, thread_count: usize) -> Self {
+        self.with_env("SOF_GOSSIP_CONSUME_THREADS", thread_count.to_string())
+    }
+
+    /// Sets `SOF_GOSSIP_LISTEN_THREADS`.
+    #[must_use]
+    pub fn with_gossip_listen_threads(self, thread_count: usize) -> Self {
+        self.with_env("SOF_GOSSIP_LISTEN_THREADS", thread_count.to_string())
     }
 
     /// Sets `SOF_DATASET_MAX_TRACKED_SLOTS`.
@@ -479,12 +543,12 @@ impl RuntimeSetup {
 
     /// Applies one typed gossip host profile.
     ///
-    /// Only the subset that SOF can honor directly is applied here. Upstream/internal gossip queue
-    /// capacities remain advisory and can be inspected through
-    /// [`sof_gossip_tuning::GossipTuningProfile::pending_gossip_queue_plan`].
+    /// This applies both the SOF runtime subset and the bundled gossip backend queue capacities.
     #[must_use]
     pub fn with_gossip_tuning_profile(self, profile: GossipTuningProfile) -> Self {
-        self.with_sof_gossip_runtime_tuning(profile.supported_runtime_tuning())
+        let mut adapter = RuntimeSetupTuningAdapter::new(self);
+        GossipTuningService::apply_supported_runtime_tuning(profile, &mut adapter);
+        adapter.into_setup()
     }
 
     /// Sets `SOF_REPAIR_ENABLED`.
@@ -667,6 +731,23 @@ impl RuntimeTuningPort for RuntimeSetupTuningAdapter {
 
     fn set_tvu_receive_sockets(&mut self, sockets: TvuReceiveSocketCount) {
         self.setup = self.setup.clone().with_tvu_receive_sockets(sockets.get());
+    }
+
+    fn set_gossip_channel_tuning(&mut self, tuning: GossipChannelTuning) {
+        self.setup = self
+            .setup
+            .clone()
+            .with_gossip_receiver_channel_capacity(
+                usize::try_from(tuning.gossip_receiver_channel_capacity.get())
+                    .unwrap_or(usize::MAX),
+            )
+            .with_gossip_socket_consume_channel_capacity(
+                usize::try_from(tuning.socket_consume_channel_capacity.get()).unwrap_or(usize::MAX),
+            )
+            .with_gossip_response_channel_capacity(
+                usize::try_from(tuning.gossip_response_channel_capacity.get())
+                    .unwrap_or(usize::MAX),
+            );
     }
 }
 
@@ -1250,6 +1331,10 @@ mod tests {
                 .env_overrides
                 .contains(&(String::from("SOF_TVU_SOCKETS"), String::from("2")))
         );
+        assert!(setup.env_overrides.contains(&(
+            String::from("SOF_GOSSIP_RECEIVER_CHANNEL_CAPACITY"),
+            String::from("8192")
+        )));
         assert!(setup.env_overrides.contains(&(
             String::from("SOF_UDP_RECEIVER_PIN_BY_PORT"),
             String::from("true")

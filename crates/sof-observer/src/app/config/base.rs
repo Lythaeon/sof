@@ -24,6 +24,21 @@ pub fn read_dataset_workers() -> usize {
         .unwrap_or_else(read_worker_threads)
 }
 
+pub fn read_packet_workers() -> usize {
+    read_env_var("SOF_PACKET_WORKERS")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(read_worker_threads)
+}
+
+pub fn read_packet_worker_queue_capacity() -> usize {
+    read_env_var("SOF_PACKET_WORKER_QUEUE_CAPACITY")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(65_536))
+        .unwrap_or(256)
+}
+
 pub fn read_dataset_max_tracked_slots() -> usize {
     read_env_var("SOF_DATASET_MAX_TRACKED_SLOTS")
         .and_then(|value| value.parse::<usize>().ok())

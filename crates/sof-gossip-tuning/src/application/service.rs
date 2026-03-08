@@ -116,7 +116,7 @@ impl GossipTuningService {
         profile.runtime
     }
 
-    /// Returns the not-yet-wired upstream gossip queue plan for one profile.
+    /// Returns the gossip queue plan for one profile.
     #[must_use]
     pub const fn pending_gossip_queue_plan(profile: GossipTuningProfile) -> PendingGossipQueuePlan {
         PendingGossipQueuePlan {
@@ -134,6 +134,7 @@ impl GossipTuningService {
     {
         let runtime = Self::supported_runtime_tuning(profile);
         Self::apply_runtime_tuning(runtime, port);
+        port.set_gossip_channel_tuning(profile.channels);
     }
 
     /// Applies one already-projected runtime tuning bundle through an output port.
@@ -164,7 +165,7 @@ impl GossipTuningProfile {
         GossipTuningService::supported_runtime_tuning(self)
     }
 
-    /// Returns the not-yet-wired upstream gossip queue plan.
+    /// Returns the gossip queue plan.
     #[must_use]
     pub const fn pending_gossip_queue_plan(self) -> PendingGossipQueuePlan {
         GossipTuningService::pending_gossip_queue_plan(self)

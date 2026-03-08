@@ -79,7 +79,7 @@ pub struct SofRuntimeTuning {
     pub tvu_receive_sockets: TvuReceiveSocketCount,
 }
 
-/// Agave gossip-side queue knobs that are not yet wired through SOF bootstrap.
+/// Gossip queue budget exposed as a compact planning view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PendingGossipQueuePlan {
     /// Target gossip receiver queue capacity.
@@ -92,7 +92,7 @@ pub struct PendingGossipQueuePlan {
     pub fanout: ReceiverFanoutProfile,
 }
 
-/// Agave gossip-side queue knobs that are currently upstream-internal in practice.
+/// Gossip queue knobs exposed through SOF's bundled gossip backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GossipChannelTuning {
     /// Receiver socket -> gossip request channel capacity.
@@ -112,6 +112,6 @@ pub struct GossipTuningProfile {
     pub runtime: SofRuntimeTuning,
     /// Gossip internal queue tuning.
     pub channels: GossipChannelTuning,
-    /// Desired receiver fanout posture for future integration.
+    /// Desired receiver fanout posture.
     pub fanout: ReceiverFanoutProfile,
 }

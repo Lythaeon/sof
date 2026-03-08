@@ -16,10 +16,10 @@ pub const DEFAULT_UDP_BATCH_SIZE: u16 = 128;
 pub const DEFAULT_INGEST_QUEUE_CAPACITY: u32 = 262_144;
 /// Built-in dual-socket fanout for the VPS preset.
 pub const VPS_TVU_RECEIVE_SOCKETS: usize = 2;
-/// Current Agave gossip channel default observed upstream.
+/// Current upstream gossip channel capacity compiled into `solana-gossip`.
 pub const LEGACY_GOSSIP_CHANNEL_CAPACITY: u32 = 4_096;
-/// Current widened capacity that proved materially better on constrained VPS hosts.
-pub const VPS_GOSSIP_CHANNEL_CAPACITY: u32 = 32_768;
+/// VPS gossip queue target for constrained hosts.
+pub const VPS_GOSSIP_CHANNEL_CAPACITY: u32 = 8_192;
 /// Built-in quad-socket fanout for the Dedicated preset.
 pub const DEDICATED_TVU_RECEIVE_SOCKETS: usize = 4;
 /// Built-in gossip channel capacity for the Dedicated preset.

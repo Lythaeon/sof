@@ -104,14 +104,13 @@ impl ClusterTopologyTracker {
 }
 
 #[cfg(feature = "gossip-bootstrap")]
-pub(super) fn emit_leader_schedule_diff_event(
+pub(super) fn emit_slot_leader_diff_event(
     plugin_host: &PluginHost,
     derived_state_host: &DerivedStateHost,
-    verifier: &mut ShredVerifier,
+    diff: crate::verify::SlotLeaderDiff,
     latest_slot: Option<u64>,
     emitted_slot_leaders: &mut HashMap<u64, [u8; 32]>,
 ) {
-    let diff = verifier.take_slot_leader_diff();
     if diff.added.is_empty() && diff.updated.is_empty() && diff.removed_slots.is_empty() {
         return;
     }
@@ -170,17 +169,14 @@ pub(super) fn emit_leader_schedule_diff_event(
 }
 
 #[cfg(feature = "gossip-bootstrap")]
-pub(super) fn emit_observed_slot_leader_event(
+pub(super) fn emit_observed_slot_leader_bytes_event(
     plugin_host: &PluginHost,
     derived_state_host: &DerivedStateHost,
-    verifier: &ShredVerifier,
     observed_slot: u64,
+    leader_bytes: [u8; 32],
     emitted_slot_leaders: &mut HashMap<u64, [u8; 32]>,
     slot_leader_window: u64,
 ) {
-    let Some(leader_bytes) = verifier.slot_leader_for_slot(observed_slot) else {
-        return;
-    };
     let previous = emitted_slot_leaders.insert(observed_slot, leader_bytes);
     let leader = Pubkey::new_from_array(leader_bytes);
     let (added_leaders, updated_leaders) = match previous {

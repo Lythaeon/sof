@@ -35,10 +35,10 @@ impl DatasetWorkerPool {
     }
 
     /// Gracefully stops workers after draining any already-enqueued jobs.
-    pub(in crate::app::runtime) async fn shutdown(self) {
+    pub(in crate::app::runtime) async fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
         self.shutdown_notify.notify_waiters();
-        for handle in self.worker_handles {
+        for handle in std::mem::take(&mut self.worker_handles) {
             if handle.await.is_err() {
                 // Worker task was already cancelled.
             }
@@ -111,6 +111,7 @@ pub(in crate::app::runtime) fn spawn_dataset_workers(
 ) -> DatasetWorkerPool {
     let worker_count = config.workers.max(1);
     let queue_capacity = config.queue_capacity.max(1);
+    let runtime_handle = tokio::runtime::Handle::current();
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_notify = Arc::new(Notify::new());
     let mut dispatch = Vec::with_capacity(worker_count);
@@ -134,7 +135,8 @@ pub(in crate::app::runtime) fn spawn_dataset_workers(
         let log_dataset_reconstruction = config.log_dataset_reconstruction;
         let worker_shutdown = shutdown.clone();
         let worker_shutdown_notify = shutdown_notify.clone();
-        let worker_handle = tokio::spawn(async move {
+        let worker_runtime_handle = runtime_handle.clone();
+        let worker_handle = tokio::task::spawn_blocking(move || {
             let mut attempt_cache = RecentDatasetAttemptCache::new(
                 attempt_cache_capacity,
                 attempt_success_ttl,
@@ -153,6 +155,7 @@ pub(in crate::app::runtime) fn spawn_dataset_workers(
                         continue;
                     }
                     let _ = dataset_jobs_started_count.fetch_add(1, Ordering::Relaxed);
+                    crate::runtime_metrics::observe_dataset_job_started();
                     let outcome = process::process_completed_dataset(
                         process::DatasetProcessInput {
                             slot: job.slot,
@@ -173,15 +176,18 @@ pub(in crate::app::runtime) fn spawn_dataset_workers(
                         },
                     );
                     let _ = dataset_jobs_completed_count.fetch_add(1, Ordering::Relaxed);
+                    crate::runtime_metrics::observe_dataset_job_completed();
                     attempt_cache.record(cache_key, now, outcome.status());
                 }
                 if worker_shutdown.load(Ordering::Relaxed) {
                     break;
                 }
-                tokio::select! {
-                    () = worker_queue.notify.notified() => {}
-                    () = worker_shutdown_notify.notified() => {}
-                }
+                worker_runtime_handle.block_on(async {
+                    tokio::select! {
+                        () = worker_queue.notify.notified() => {}
+                        () = worker_shutdown_notify.notified() => {}
+                    }
+                });
             }
         });
         worker_handles.push(worker_handle);
@@ -204,8 +210,12 @@ pub(in crate::app::runtime) fn dispatch_completed_dataset(
     let Some(dispatch_len) = NonZeroUsize::new(dataset_dispatch.len()) else {
         return;
     };
-    let slot_index = usize::try_from(dataset.slot).unwrap_or(usize::MAX);
-    let worker_index = slot_index.checked_rem(dispatch_len.get()).unwrap_or(0);
+    let worker_index = dataset_worker_index(
+        dispatch_len,
+        dataset.slot,
+        dataset.start_index,
+        dataset.end_index,
+    );
     let job = CompletedDatasetJob {
         slot: dataset.slot,
         start_index: dataset.start_index,
@@ -218,9 +228,31 @@ pub(in crate::app::runtime) fn dispatch_completed_dataset(
     };
     let overwritten = queue.push_overwrite_oldest(job);
     let _ = dataset_jobs_enqueued_count.fetch_add(1, Ordering::Relaxed);
+    crate::runtime_metrics::observe_dataset_jobs_enqueued(1);
     if overwritten > 0 {
         let _ = dataset_queue_drop_count.fetch_add(overwritten, Ordering::Relaxed);
+        crate::runtime_metrics::observe_dataset_queue_dropped_jobs(overwritten);
     }
+}
+
+fn dataset_worker_index(
+    dispatch_len: NonZeroUsize,
+    slot: u64,
+    start_index: u32,
+    end_index: u32,
+) -> usize {
+    // Slot-only sharding collapses live tip traffic onto too few workers because
+    // most useful datasets arrive from the same small set of hot slots.
+    // Mix the dataset range into the worker key so same-slot datasets can fan out
+    // while duplicate datasets still route deterministically to the same worker.
+    let mut hash = slot;
+    hash ^= u64::from(start_index).wrapping_mul(0x9E37_79B1);
+    hash = hash.rotate_left(17);
+    hash ^= u64::from(end_index).wrapping_mul(0x85EB_CA77);
+    hash = hash.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let dispatch_len_u64 = u64::try_from(dispatch_len.get()).unwrap_or(1);
+    let worker_index = hash.checked_rem(dispatch_len_u64).unwrap_or(0);
+    usize::try_from(worker_index).unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -282,5 +314,20 @@ mod tests {
         assert_eq!(first.slot, 98);
         assert_eq!(second.slot, 99);
         assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn worker_index_fans_out_same_slot_ranges() {
+        let worker_count = NonZeroUsize::new(4).expect("non-zero worker count");
+        let mut seen = std::collections::BTreeSet::new();
+        for start_index in 0_u32..32 {
+            seen.insert(dataset_worker_index(
+                worker_count,
+                404_931_885,
+                start_index,
+                start_index.saturating_add(1),
+            ));
+        }
+        assert!(seen.len() > 1);
     }
 }
