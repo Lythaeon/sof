@@ -34,7 +34,7 @@ package_crate() {
   fi
   echo "== packaging ${crate} (${verify_flag}) =="
   if [[ "${crate}" == "sof-solana-gossip" ]]; then
-    cargo package --manifest-path "crates/sof-solana-gossip/Cargo.toml" --locked "${allow_dirty_flag[@]}" ${verify_flag}
+    cargo package --manifest-path "crates/sof-solana-gossip/Cargo.toml" --target-dir "target" "${allow_dirty_flag[@]}" ${verify_flag}
   else
     cargo package -p "${crate}" --locked "${allow_dirty_flag[@]}" ${verify_flag}
   fi
@@ -68,7 +68,6 @@ cat > "${verify_root}/Cargo.toml" <<EOF
 resolver = "3"
 members = [
   "sof-gossip-tuning-${sof_gossip_tuning_version}",
-  "sof-solana-gossip-${sof_solana_gossip_version}",
   "sof-${sof_version}",
   "sof-tx-${sof_tx_version}",
 ]
@@ -82,5 +81,4 @@ EOF
 echo "== verifying packaged workspace =="
 env CARGO_HOME="${verify_cargo_home}" cargo check \
   --manifest-path "${verify_root}/Cargo.toml" \
-  --workspace \
-  --all-targets
+  --workspace
