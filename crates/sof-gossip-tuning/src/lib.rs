@@ -13,7 +13,7 @@
 //!
 //! This crate is intentionally narrow:
 //! - it models the tuning knobs SOF can already apply directly,
-//! - it keeps upstream gossip queue ambitions explicit without pretending they are live,
+//! - it keeps bundled gossip queue controls explicit and typed,
 //! - it gives service builders one typed place to define host-specific tuning presets.
 
 pub mod application;

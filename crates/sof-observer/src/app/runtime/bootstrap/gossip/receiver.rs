@@ -241,9 +241,16 @@ pub(crate) async fn start_receiver(
         "receiver bootstrap complete; waiting for traffic"
     );
 
-    Ok(ReceiverRuntime {
+    #[cfg(feature = "gossip-bootstrap")]
+    let gossip_ingest_telemetry = gossip_runtime
+        .as_ref()
+        .map(|runtime| runtime.ingest_telemetry.clone());
+
+    let runtime = ReceiverRuntime {
         static_receiver_handles,
         gossip_receiver_handles,
+        #[cfg(feature = "gossip-bootstrap")]
+        gossip_ingest_telemetry,
         #[cfg(feature = "gossip-bootstrap")]
         gossip_runtime,
         #[cfg(feature = "gossip-bootstrap")]
@@ -259,7 +266,21 @@ pub(crate) async fn start_receiver(
         #[cfg(feature = "gossip-bootstrap")]
         repair_client,
         tx_event_rx,
-    })
+    };
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut runtime = runtime;
+    #[cfg(feature = "gossip-bootstrap")]
+    if read_gossip_bootstrap_only() && runtime.gossip_runtime.is_some() {
+        let active_entrypoint = runtime.active_gossip_entrypoint.clone().unwrap_or_default();
+        let gossip_receivers = runtime.gossip_receiver_handles.len();
+        runtime.detach_gossip_control_plane();
+        tracing::info!(
+            entrypoint = %active_entrypoint,
+            gossip_receivers,
+            "gossip bootstrap-only mode enabled; detached gossip control-plane and kept direct receivers"
+        );
+    }
+    Ok(runtime)
 }
 
 #[cfg(feature = "kernel-bypass")]

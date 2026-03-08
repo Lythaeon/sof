@@ -49,6 +49,30 @@ impl PluginHost {
         self.plugins.len()
     }
 
+    /// Returns true when at least one plugin wants dataset callbacks.
+    #[must_use]
+    pub const fn wants_dataset(&self) -> bool {
+        self.subscriptions.dataset
+    }
+
+    /// Returns true when at least one plugin wants transaction callbacks.
+    #[must_use]
+    pub const fn wants_transaction(&self) -> bool {
+        self.subscriptions.transaction
+    }
+
+    /// Returns true when at least one plugin wants account-touch callbacks.
+    #[must_use]
+    pub const fn wants_account_touch(&self) -> bool {
+        self.subscriptions.account_touch
+    }
+
+    /// Returns true when at least one plugin wants recent-blockhash callbacks.
+    #[must_use]
+    pub const fn wants_recent_blockhash(&self) -> bool {
+        self.subscriptions.recent_blockhash
+    }
+
     /// Returns total dropped hook events due to queue backpressure/closure.
     #[must_use]
     pub fn dropped_event_count(&self) -> u64 {

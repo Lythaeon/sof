@@ -4,6 +4,8 @@ pub(in crate::app::runtime) struct ReceiverRuntime {
     pub(in crate::app::runtime) static_receiver_handles: Vec<JoinHandle<()>>,
     pub(in crate::app::runtime) gossip_receiver_handles: Vec<JoinHandle<()>>,
     #[cfg(feature = "gossip-bootstrap")]
+    pub(in crate::app::runtime) gossip_ingest_telemetry: Option<ingest::ReceiverTelemetry>,
+    #[cfg(feature = "gossip-bootstrap")]
     pub(in crate::app::runtime) gossip_runtime: Option<GossipRuntime>,
     #[cfg(feature = "gossip-bootstrap")]
     pub(in crate::app::runtime) gossip_identity: Arc<Keypair>,
@@ -60,6 +62,8 @@ impl ReceiverRuntime {
             static_receiver_handles: Vec::new(),
             gossip_receiver_handles: Vec::new(),
             #[cfg(feature = "gossip-bootstrap")]
+            gossip_ingest_telemetry: None,
+            #[cfg(feature = "gossip-bootstrap")]
             gossip_runtime: None,
             #[cfg(feature = "gossip-bootstrap")]
             gossip_identity: Arc::new(Keypair::new()),
@@ -92,10 +96,15 @@ impl ReceiverRuntime {
             handle.abort();
         }
         self.gossip_receiver_handles = receiver_handles;
+        self.gossip_ingest_telemetry = Some(runtime.ingest_telemetry.clone());
         self.gossip_runtime = Some(runtime);
         self.repair_client = repair_client;
         self.active_gossip_entrypoint = active_entrypoint;
         self.gossip_runtime_active_port_range = active_port_range;
+    }
+
+    pub(in crate::app::runtime) fn detach_gossip_control_plane(&mut self) {
+        self.gossip_runtime = None;
     }
 
     pub(in crate::app::runtime) async fn stop_gossip_runtime(&mut self) {
@@ -107,6 +116,7 @@ impl ReceiverRuntime {
                 // Receiver task was already aborted/cancelled.
             }
         }
+        self.gossip_ingest_telemetry = None;
         self.gossip_runtime = None;
         self.repair_client = None;
         self.active_gossip_entrypoint = None;

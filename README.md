@@ -63,8 +63,8 @@ cargo add sof-gossip-tuning
 Feature examples:
 
 ```toml
-sof = { version = "0.7.0", features = ["gossip-bootstrap"] }
-sof-tx = { version = "0.7.0", features = ["sof-adapters"] }
+sof = { version = "0.7.1", features = ["gossip-bootstrap"] }
+sof-tx = { version = "0.7.1", features = ["sof-adapters"] }
 ```
 
 Kernel-bypass integrations:

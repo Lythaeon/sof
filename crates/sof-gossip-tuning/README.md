@@ -5,7 +5,7 @@ Typed gossip and ingest tuning presets for SOF hosts.
 This crate does two things:
 
 1. models the subset of tuning SOF can already apply directly
-2. keeps desired upstream gossip queue capacities explicit without pretending they are wired
+2. keeps bundled gossip queue capacities explicit and typed
 
 Its structure follows the same split used elsewhere in SOF: domain types and preset values live in
 the domain layer, while the application service projects those profiles into SOF's runtime builder
@@ -19,6 +19,7 @@ through an explicit output port.
 - UDP batch coalesce window
 - receiver pin-by-port / fixed receiver core
 - TVU receive socket count
+- gossip receiver / socket-consume / response channel capacities
 
 Use it with `sof::runtime::RuntimeSetup`:
 
@@ -32,13 +33,12 @@ let setup = sof::runtime::RuntimeSetup::new()
 Built-in presets:
 
 - `Home`: bounded ingest and conservative socket fanout for small self-hosted machines
-- `Vps`: lockfree ingest and wider gossip capacity for constrained but public-facing hosts
+- `Vps`: lockfree ingest, moderate gossip queue targets, and dual-socket fanout for constrained public hosts
 - `Dedicated`: aggressive fanout and larger queue budgets for dedicated ingest machines
 
-## What Remains Advisory
+## Queue Plans
 
-`PendingGossipQueuePlan` is intentionally advisory until SOF can thread those capacities into the
-actual Agave gossip bootstrap path:
+`PendingGossipQueuePlan` remains available as a compact view of the gossip queue budget:
 
 - gossip receiver channel capacity
 - socket consume channel capacity

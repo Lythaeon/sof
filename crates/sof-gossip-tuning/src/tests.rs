@@ -30,7 +30,7 @@ fn rejects_zero_socket_count() {
 }
 
 #[test]
-fn vps_profile_uses_widened_receiver_queue() {
+fn vps_profile_uses_conservative_receiver_queue_plan() {
     let profile = GossipTuningProfile::preset(HostProfilePreset::Vps);
     assert_eq!(
         profile.channels.gossip_receiver_channel_capacity.get(),
@@ -38,6 +38,10 @@ fn vps_profile_uses_widened_receiver_queue() {
     );
     assert!(
         profile.channels.gossip_receiver_channel_capacity.get() > LEGACY_GOSSIP_CHANNEL_CAPACITY
+    );
+    assert!(
+        profile.channels.gossip_receiver_channel_capacity.get() < 16_384,
+        "VPS queue plan should stay conservative on constrained hosts",
     );
 }
 
@@ -58,6 +62,7 @@ struct RecordingRuntimePort {
     core: Option<Option<CpuCoreIndex>>,
     pin_by_port: Option<bool>,
     sockets: Option<TvuReceiveSocketCount>,
+    gossip_channels: Option<crate::domain::model::GossipChannelTuning>,
 }
 
 impl RuntimeTuningPort for RecordingRuntimePort {
@@ -88,6 +93,10 @@ impl RuntimeTuningPort for RecordingRuntimePort {
     fn set_tvu_receive_sockets(&mut self, sockets: TvuReceiveSocketCount) {
         self.sockets = Some(sockets);
     }
+
+    fn set_gossip_channel_tuning(&mut self, tuning: crate::domain::model::GossipChannelTuning) {
+        self.gossip_channels = Some(tuning);
+    }
 }
 
 #[test]
@@ -104,5 +113,10 @@ fn application_service_projects_profile_through_port() {
     assert_eq!(
         port.sockets.map(TvuReceiveSocketCount::get),
         Some(VPS_TVU_RECEIVE_SOCKETS)
+    );
+    assert_eq!(
+        port.gossip_channels
+            .map(|channels| channels.gossip_receiver_channel_capacity.get()),
+        Some(VPS_GOSSIP_CHANNEL_CAPACITY)
     );
 }

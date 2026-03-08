@@ -207,6 +207,11 @@ pub fn read_gossip_runtime_switch_enabled() -> bool {
 }
 
 #[cfg(feature = "gossip-bootstrap")]
+pub fn read_gossip_bootstrap_only() -> bool {
+    read_bool_env("SOF_GOSSIP_BOOTSTRAP_ONLY", false)
+}
+
+#[cfg(feature = "gossip-bootstrap")]
 pub fn read_gossip_runtime_switch_stall_ms() -> u64 {
     read_env_var("SOF_GOSSIP_RUNTIME_SWITCH_STALL_MS")
         .and_then(|value| value.parse::<u64>().ok())

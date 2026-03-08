@@ -1,7 +1,7 @@
 //! Output ports for applying SOF-supported tuning into host-specific adapters.
 
 use crate::domain::{
-    model::IngestQueueMode,
+    model::{GossipChannelTuning, IngestQueueMode},
     value_objects::{CpuCoreIndex, QueueCapacity, ReceiverCoalesceWindow, TvuReceiveSocketCount},
 };
 
@@ -21,4 +21,6 @@ pub trait RuntimeTuningPort {
     fn set_udp_receiver_pin_by_port(&mut self, enabled: bool);
     /// Applies the TVU receive socket count.
     fn set_tvu_receive_sockets(&mut self, sockets: TvuReceiveSocketCount);
+    /// Applies gossip backend queue capacities.
+    fn set_gossip_channel_tuning(&mut self, tuning: GossipChannelTuning);
 }

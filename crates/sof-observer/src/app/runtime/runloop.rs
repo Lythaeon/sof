@@ -1,5 +1,6 @@
 mod control_plane;
 mod driver;
+mod packet_workers;
 
 pub(super) use super::*;
 pub(super) use driver::run_async_with_hosts;

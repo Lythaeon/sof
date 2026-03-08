@@ -40,6 +40,8 @@ pub mod relay;
 pub mod repair;
 /// Packaged runtime entrypoints for embedding SOF.
 pub mod runtime;
+/// Runtime-stage counters for ingress, dataset reconstruction, and tx delivery.
+pub mod runtime_metrics;
 #[doc(hidden)]
 pub mod shred;
 #[doc(hidden)]

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-crates=("sof-gossip-tuning" "sof" "sof-tx")
+crates=("sof-gossip-tuning" "sof-solana-gossip" "sof" "sof-tx")
 package_dir="target/package"
 verify_root="$(mktemp -d)"
 cargo_home_root="$(mktemp -d)"
@@ -11,13 +11,18 @@ trap 'rm -rf "${verify_root}" "${cargo_home_root}" "${verify_cargo_home}"' EXIT
 cat > "${cargo_home_root}/config.toml" <<EOF
 [patch.crates-io]
 sof-gossip-tuning = { path = "$(pwd)/crates/sof-gossip-tuning" }
+sof-solana-gossip = { path = "$(pwd)/crates/sof-solana-gossip" }
 sof = { path = "$(pwd)/crates/sof-observer" }
 EOF
 
 export CARGO_HOME="${cargo_home_root}"
 
 version_for() {
-  cargo pkgid -p "$1" | awk -F'[#@]' '{print $NF}'
+  if [[ "$1" == "sof-solana-gossip" ]]; then
+    cargo pkgid --manifest-path "crates/sof-solana-gossip/Cargo.toml" | awk -F'[#@]' '{print $NF}'
+  else
+    cargo pkgid -p "$1" | awk -F'[#@]' '{print $NF}'
+  fi
 }
 
 package_crate() {
@@ -28,7 +33,11 @@ package_crate() {
     allow_dirty_flag=(--allow-dirty)
   fi
   echo "== packaging ${crate} (${verify_flag}) =="
-  cargo package -p "${crate}" --locked "${allow_dirty_flag[@]}" ${verify_flag}
+  if [[ "${crate}" == "sof-solana-gossip" ]]; then
+    cargo package --manifest-path "crates/sof-solana-gossip/Cargo.toml" --locked "${allow_dirty_flag[@]}" ${verify_flag}
+  else
+    cargo package -p "${crate}" --locked "${allow_dirty_flag[@]}" ${verify_flag}
+  fi
 }
 
 extract_crate() {
@@ -41,6 +50,7 @@ extract_crate() {
 }
 
 package_crate "sof-gossip-tuning" ""
+package_crate "sof-solana-gossip" "--no-verify"
 package_crate "sof" "--no-verify"
 package_crate "sof-tx" "--no-verify"
 
@@ -49,6 +59,7 @@ for crate in "${crates[@]}"; do
 done
 
 sof_gossip_tuning_version="$(version_for "sof-gossip-tuning")"
+sof_solana_gossip_version="$(version_for "sof-solana-gossip")"
 sof_version="$(version_for "sof")"
 sof_tx_version="$(version_for "sof-tx")"
 
@@ -57,12 +68,14 @@ cat > "${verify_root}/Cargo.toml" <<EOF
 resolver = "3"
 members = [
   "sof-gossip-tuning-${sof_gossip_tuning_version}",
+  "sof-solana-gossip-${sof_solana_gossip_version}",
   "sof-${sof_version}",
   "sof-tx-${sof_tx_version}",
 ]
 
 [patch.crates-io]
 sof-gossip-tuning = { path = "sof-gossip-tuning-${sof_gossip_tuning_version}" }
+sof-solana-gossip = { path = "sof-solana-gossip-${sof_solana_gossip_version}" }
 sof = { path = "sof-${sof_version}" }
 EOF
 

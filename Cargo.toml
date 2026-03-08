@@ -2,6 +2,9 @@
 resolver = "3"
 members = ["crates/sof-gossip-tuning", "crates/sof-observer", "crates/sof-tx"]
 
+[patch.crates-io]
+sof-solana-gossip = { path = "crates/sof-solana-gossip" }
+
 [workspace.package]
 edition = "2024"
 

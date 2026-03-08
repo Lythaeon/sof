@@ -1750,6 +1750,21 @@ pub trait DerivedStateConsumer: Send + Sync + 'static {
         &mut self,
     ) -> Result<Option<DerivedStateCheckpoint>, DerivedStateConsumerFault>;
 
+    /// Returns true when this consumer wants transaction-applied feed events.
+    fn wants_transaction_applied(&self) -> bool {
+        true
+    }
+
+    /// Returns true when this consumer wants account-touch feed events.
+    fn wants_account_touch_observed(&self) -> bool {
+        true
+    }
+
+    /// Returns true when account-touch events for this consumer need writable/read-only splits.
+    fn wants_account_touch_key_partitions(&self) -> bool {
+        self.wants_account_touch_observed()
+    }
+
     /// Applies one feed envelope in canonical sequence order.
     ///
     /// # Errors
@@ -1798,9 +1813,15 @@ impl DerivedStateHostBuilder {
         C: DerivedStateConsumer,
     {
         let name = consumer.name();
+        let subscriptions = DerivedStateConsumerSubscriptions {
+            transaction_applied: consumer.wants_transaction_applied(),
+            account_touch_observed: consumer.wants_account_touch_observed(),
+            account_touch_key_partitions: consumer.wants_account_touch_key_partitions(),
+        };
         self.consumers.push(RegisteredDerivedStateConsumer {
             name,
             consumer: Arc::new(Mutex::new(Box::new(consumer))),
+            subscriptions,
             unhealthy: AtomicBool::new(false),
             recovery_state: AtomicU8::new(DerivedStateConsumerRecoveryState::Live.into_u8()),
             applied_events: AtomicU64::new(0),
@@ -1945,6 +1966,33 @@ impl DerivedStateHost {
     #[must_use]
     pub fn len(&self) -> usize {
         self.inner.consumers.len()
+    }
+
+    /// Returns true when at least one consumer wants transaction-applied events.
+    #[must_use]
+    pub fn wants_transaction_applied(&self) -> bool {
+        self.inner
+            .consumers
+            .iter()
+            .any(|consumer| consumer.subscriptions.transaction_applied)
+    }
+
+    /// Returns true when at least one consumer wants account-touch events.
+    #[must_use]
+    pub fn wants_account_touch_observed(&self) -> bool {
+        self.inner
+            .consumers
+            .iter()
+            .any(|consumer| consumer.subscriptions.account_touch_observed)
+    }
+
+    /// Returns true when any account-touch consumer needs writable/read-only key partitions.
+    #[must_use]
+    pub fn wants_account_touch_key_partitions(&self) -> bool {
+        self.inner
+            .consumers
+            .iter()
+            .any(|consumer| consumer.subscriptions.account_touch_key_partitions)
     }
 
     /// Returns registered consumer names in registration order.
@@ -2474,6 +2522,9 @@ impl DerivedStateHost {
 
         for registered in self.inner.consumers.iter() {
             if registered.is_unhealthy() {
+                continue;
+            }
+            if !registered.accepts_event(&envelope.event) {
                 continue;
             }
             let Ok(mut consumer) = registered.consumer.lock() else {
@@ -3010,6 +3061,8 @@ struct RegisteredDerivedStateConsumer {
     name: &'static str,
     /// Boxed consumer behind a mutex so the host can serialize callbacks.
     consumer: Arc<Mutex<Box<dyn DerivedStateConsumer>>>,
+    /// Immutable event-interest bitmap so ignored event classes never lock/apply.
+    subscriptions: DerivedStateConsumerSubscriptions,
     /// Whether the consumer has lost live continuity and should stop receiving events.
     unhealthy: AtomicBool,
     /// Current recovery state for this consumer.
@@ -3034,6 +3087,17 @@ struct RegisteredDerivedStateConsumer {
     has_last_fault_kind: AtomicBool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// Per-consumer subscription bitmap for selectively routing derived-state feed events.
+struct DerivedStateConsumerSubscriptions {
+    /// Whether the consumer wants `TransactionApplied` events.
+    transaction_applied: bool,
+    /// Whether the consumer wants `AccountTouchObserved` events.
+    account_touch_observed: bool,
+    /// Whether the consumer wants partitioned account-touch key sets.
+    account_touch_key_partitions: bool,
+}
+
 impl RegisteredDerivedStateConsumer {
     /// Returns whether this consumer has lost live continuity.
     #[must_use]
@@ -3045,6 +3109,26 @@ impl RegisteredDerivedStateConsumer {
     #[must_use]
     fn recovery_state(&self) -> DerivedStateConsumerRecoveryState {
         DerivedStateConsumerRecoveryState::from_u8(self.recovery_state.load(Ordering::Acquire))
+    }
+
+    /// Returns whether the consumer should receive the provided feed event.
+    #[must_use]
+    const fn accepts_event(&self, event: &DerivedStateFeedEvent) -> bool {
+        match event {
+            DerivedStateFeedEvent::TransactionApplied(_) => self.subscriptions.transaction_applied,
+            DerivedStateFeedEvent::AccountTouchObserved(_) => {
+                self.subscriptions.account_touch_observed
+            }
+            DerivedStateFeedEvent::RecentBlockhashObserved(_)
+            | DerivedStateFeedEvent::ClusterTopologyChanged(_)
+            | DerivedStateFeedEvent::LeaderScheduleUpdated(_)
+            | DerivedStateFeedEvent::ControlPlaneStateUpdated(_)
+            | DerivedStateFeedEvent::StateInvalidated(_)
+            | DerivedStateFeedEvent::TxOutcomeObserved(_)
+            | DerivedStateFeedEvent::SlotStatusChanged(_)
+            | DerivedStateFeedEvent::BranchReorged(_)
+            | DerivedStateFeedEvent::CheckpointBarrier(_) => true,
+        }
     }
 
     /// Marks the consumer unhealthy and returns whether the state changed.

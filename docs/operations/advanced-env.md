@@ -32,15 +32,18 @@ If you configure SOF programmatically, prefer the typed control surface from
 - `sof_gossip_tuning::GossipTuningProfile`
 - `sof::runtime::RuntimeSetup::with_gossip_tuning_profile(...)`
 
-That path only applies knobs SOF can honor directly today. Internal Agave gossip queue capacities
-remain advisory until they are wired through the bootstrap path.
+That path now applies both SOF runtime knobs and the bundled patched gossip queue capacities used by
+SOF's bootstrap path. Downstream users do not need a separate workspace-root
+`[patch.crates-io]` override for those queue controls.
 
 ## Runtime and dataset tuning
 
 | Variable | Default | Why this is advanced |
 |---|---:|---|
 | `SOF_WORKER_THREADS` | host parallelism | Oversizing can add contention and context-switch overhead. |
-| `SOF_DATASET_WORKERS` | `SOF_WORKER_THREADS` | Too high can cause queue churn without higher throughput. |
+| `SOF_DATASET_WORKERS` | `SOF_WORKER_THREADS` | Dataset reconstruction runs on Tokio's blocking pool; too high can still cause queue churn, extra memory pressure, and CPU contention without higher throughput. |
+| `SOF_PACKET_WORKERS` | `SOF_WORKER_THREADS` | Packet verification/FEC/reassembly fanout; too low underuses multi-core hosts, too high adds scheduling and cache overhead. |
+| `SOF_PACKET_WORKER_QUEUE_CAPACITY` | `256` | Queue depth per packet worker. Current full-queue policy is `drop_newest`, so raising this mostly trades packet loss for extra latency/memory unless workers also get faster. |
 | `SOF_DATASET_MAX_TRACKED_SLOTS` | `2048` | Higher values increase memory and stale-state retention. |
 | `SOF_FEC_MAX_TRACKED_SETS` | `8192` | Direct memory/CPU pressure control in recovery paths. |
 | `SOF_DATASET_QUEUE_CAPACITY` | `8192` | Larger queue can hide backpressure and increase latency. |
@@ -94,6 +97,12 @@ remain advisory until they are wired through the bootstrap path.
 | `SOF_PORT_RANGE` | `12000-12100` | Wrong range breaks inbound TVU/gossip reachability. |
 | `SOF_GOSSIP_PORT` | unset | Can collide with existing bindings or NAT mapping. |
 | `SOF_TVU_SOCKETS` | available parallelism, clamped `1..=16` (fallback `1`) | Improper socket fanout can hurt packet locality. |
+| `SOF_GOSSIP_RECEIVER_CHANNEL_CAPACITY` | `8192` | Receiver socket to gossip request queue depth inside SOF's bundled gossip backend. Higher values reduce drops at the cost of more queued control-plane latency and memory. |
+| `SOF_GOSSIP_SOCKET_CONSUME_CHANNEL_CAPACITY` | `8192` | Queue depth between receiver and gossip listen workers. |
+| `SOF_GOSSIP_RESPONSE_CHANNEL_CAPACITY` | `8192` | Queue depth for outbound gossip responses. |
+| `SOF_GOSSIP_CHANNEL_CONSUME_CAPACITY` | `1024` | Max packet batches one gossip worker pass will drain before yielding; larger values favor throughput over fairness/latency. |
+| `SOF_GOSSIP_CONSUME_THREADS` | host parallelism, clamped to `8` | Thread count for gossip socket-consume workers in the bundled backend. |
+| `SOF_GOSSIP_LISTEN_THREADS` | host parallelism, clamped to `8` | Thread count for gossip listen workers in the bundled backend. |
 | `SOF_SHRED_VERSION` | unset | Bad override can reject valid cluster traffic. |
 | `SOF_GOSSIP_VALIDATORS` | unset | Optional comma-separated validator identity pubkeys passed to Agave gossip `gossip_validators`; constrains push/pull targets to this set and can materially lower control-plane traffic/CPU at the cost of narrower gossip mesh. |
 | `SOF_GOSSIP_ENTRYPOINT_PROBE` | `false` | Adds startup probing behavior that can delay launch. |
@@ -181,6 +190,12 @@ Programmatic equivalent for the currently supported subset:
 - `RuntimeSetup::with_udp_batch_max_wait_ms(...)`
 - `RuntimeSetup::with_udp_receiver_core(...)`
 - `RuntimeSetup::with_udp_receiver_pin_by_port(...)`
+- `RuntimeSetup::with_gossip_receiver_channel_capacity(...)`
+- `RuntimeSetup::with_gossip_socket_consume_channel_capacity(...)`
+- `RuntimeSetup::with_gossip_response_channel_capacity(...)`
+- `RuntimeSetup::with_gossip_channel_consume_capacity(...)`
+- `RuntimeSetup::with_gossip_consume_threads(...)`
+- `RuntimeSetup::with_gossip_listen_threads(...)`
 - `RuntimeSetup::with_ingest_queue_mode_typed(...)`
 - `RuntimeSetup::with_sof_gossip_runtime_tuning(...)`
 - `RuntimeSetup::with_gossip_tuning_profile(...)`

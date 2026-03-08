@@ -1,8 +1,14 @@
 #[cfg(feature = "gossip-bootstrap")]
 use super::control_plane::{
-    ClusterTopologyTracker, emit_leader_schedule_diff_event, emit_observed_slot_leader_event,
+    ClusterTopologyTracker, emit_observed_slot_leader_bytes_event, emit_slot_leader_diff_event,
+};
+use super::packet_workers::{
+    PacketWorkerBatchResult, PacketWorkerInput, PacketWorkerPool, PacketWorkerPoolConfig,
+    WorkerAcceptedShred, WorkerAcceptedShredKind,
 };
 use super::*;
+use crate::reassembly::dataset::CompletedDataSet;
+use std::net::{IpAddr, Ipv4Addr};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -25,6 +31,7 @@ const SUBSTANTIAL_DATASET_MIN_SHREDS: usize = 2;
 const CONTROL_PLANE_EVENT_TICK_MS: u64 = 250;
 #[cfg(feature = "gossip-bootstrap")]
 const CONTROL_PLANE_EVENT_SNAPSHOT_SECS: u64 = 30;
+const PACKET_WORKER_QUEUE_OVERFLOW_POLICY: &str = "drop_newest";
 
 const fn feed_watermarks_from_fork_snapshot(
     snapshot: crate::app::state::ForkTrackerSnapshot,
@@ -154,7 +161,7 @@ async fn run_async_with_hosts_inner(
         dataset_jobs_started_count: dataset_jobs_started_count.clone(),
         dataset_jobs_completed_count: dataset_jobs_completed_count.clone(),
     };
-    let dataset_worker_pool = spawn_dataset_workers(
+    let mut dataset_worker_pool = spawn_dataset_workers(
         DatasetWorkerConfig {
             workers: dataset_workers,
             queue_capacity: dataset_queue_capacity,
@@ -165,6 +172,8 @@ async fn run_async_with_hosts_inner(
         },
         &dataset_worker_shared,
     );
+    drop(dataset_worker_shared);
+    drop(tx_event_tx);
     let plugin_hooks_enabled = !plugin_host.is_empty();
     if plugin_hooks_enabled {
         tracing::info!(plugins = ?plugin_host.plugin_names(), "observer plugins enabled");
@@ -360,18 +369,13 @@ async fn run_async_with_hosts_inner(
     let verify_enabled = live_shreds_enabled && verify_enabled;
     let verify_strict_unknown = read_verify_strict_unknown();
     let verify_recovered_shreds = read_verify_recovered_shreds();
+    let verify_signature_cache_entries = read_verify_signature_cache_entries();
+    let verify_unknown_retry = Duration::from_millis(read_verify_unknown_retry_ms());
     let dedupe_capacity = read_shred_dedupe_capacity();
     let dedupe_ttl_ms = read_shred_dedupe_ttl_ms();
     let mut dedupe_cache = (dedupe_capacity > 0 && dedupe_ttl_ms > 0)
         .then(|| RecentShredCache::new(dedupe_capacity, Duration::from_millis(dedupe_ttl_ms)));
     let verify_slot_leader_window = read_verify_slot_leader_window();
-    let mut shred_verifier = verify_enabled.then(|| {
-        ShredVerifier::new(
-            read_verify_signature_cache_entries(),
-            verify_slot_leader_window,
-            Duration::from_millis(read_verify_unknown_retry_ms()),
-        )
-    });
     tracing::info!(
         verify_shreds = verify_enabled,
         verify_recovered_shreds,
@@ -511,7 +515,8 @@ async fn run_async_with_hosts_inner(
     #[cfg(feature = "gossip-bootstrap")]
     let gossip_entrypoints = read_gossip_entrypoints();
     #[cfg(feature = "gossip-bootstrap")]
-    let gossip_runtime_switch_enabled = repair_enabled && read_gossip_runtime_switch_enabled();
+    let gossip_runtime_switch_enabled =
+        repair_enabled && read_gossip_runtime_switch_enabled() && !read_gossip_bootstrap_only();
     #[cfg(feature = "gossip-bootstrap")]
     let gossip_runtime_switch_stall_ms = read_gossip_runtime_switch_stall_ms();
     #[cfg(feature = "gossip-bootstrap")]
@@ -540,9 +545,24 @@ async fn run_async_with_hosts_inner(
 
     let dataset_max_tracked_slots = read_dataset_max_tracked_slots();
     let fec_max_tracked_sets = read_fec_max_tracked_sets();
+    let packet_workers = read_packet_workers();
+    let packet_worker_queue_capacity = read_packet_worker_queue_capacity();
+    let dataset_tail_min_shreds_without_anchor = read_dataset_tail_min_shreds_without_anchor();
+    let mut packet_worker_pool = PacketWorkerPool::new(PacketWorkerPoolConfig {
+        workers: packet_workers,
+        queue_capacity: packet_worker_queue_capacity,
+        verify_enabled,
+        verify_recovered_shreds,
+        verify_strict_unknown,
+        verify_signature_cache_entries,
+        verify_slot_leader_window,
+        verify_unknown_retry,
+        fec_max_tracked_sets,
+    });
+    let mut packet_worker_assignments =
+        PacketWorkerAssignments::new(dataset_max_tracked_slots.max(32));
     let mut dataset_reassembler = DataSetReassembler::new(dataset_max_tracked_slots)
-        .with_tail_min_shreds_without_anchor(read_dataset_tail_min_shreds_without_anchor());
-    let mut fec_recoverer = FecRecoverer::new(fec_max_tracked_sets);
+        .with_tail_min_shreds_without_anchor(dataset_tail_min_shreds_without_anchor);
     let mut packet_count: u64 = 0;
     let mut source_port_8899_packets: u64 = 0;
     let mut source_port_8900_packets: u64 = 0;
@@ -781,6 +801,9 @@ async fn run_async_with_hosts_inner(
         dataset_workers,
         dataset_queue_capacity,
         dataset_attempt_cache_capacity,
+        packet_workers,
+        packet_worker_queue_capacity,
+        packet_worker_queue_overflow_policy = PACKET_WORKER_QUEUE_OVERFLOW_POLICY,
         dedupe_capacity,
         dedupe_ttl_ms,
         relay_cache_enabled = relay_cache.is_some(),
@@ -845,6 +868,10 @@ async fn run_async_with_hosts_inner(
     let mut udp_relay_send_error_streak: u64 = 0;
     #[cfg(feature = "gossip-bootstrap")]
     let mut udp_relay_backoff_until: Option<Instant> = None;
+    let mut ingest_closed = false;
+    let mut packet_workers_closed = false;
+    let mut dataset_workers_shutdown = false;
+    let mut tx_events_closed = false;
     #[cfg(feature = "gossip-bootstrap")]
     let udp_relay_socket: Option<std::net::UdpSocket> = if udp_relay_enabled {
         match std::net::UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)) {
@@ -864,50 +891,151 @@ async fn run_async_with_hosts_inner(
         None
     };
 
-    loop {
+    'event_loop: loop {
         tokio::select! {
-            maybe_packet_batch = rx.recv() => {
-                let Some(packet_batch) = maybe_packet_batch else {
-                    break;
-                };
-                for packet in packet_batch {
-                let observed_at = Instant::now();
-                let source_addr = packet.source;
-                let packet_bytes = packet.bytes;
-                let shared_observer_packet = (plugin_hooks_enabled || extension_hooks_enabled)
-                    .then(|| Arc::<[u8]>::from(packet_bytes.as_slice()));
-                if plugin_hooks_enabled
-                    && let Some(shared_packet) = shared_observer_packet.as_ref()
-                {
-                    plugin_host.on_raw_packet(RawPacketEvent {
-                        source: source_addr,
-                        bytes: Arc::clone(shared_packet),
-                    });
-                }
-                if extension_hooks_enabled
-                    && let Some(shared_packet) = shared_observer_packet.as_ref()
-                {
-                    extension_host.on_observer_packet_shared(
-                        source_addr,
-                        Arc::clone(shared_packet),
-                    );
-                }
-                packet_count = packet_count.saturating_add(1);
-                if logged_waiting_for_packets {
-                    tracing::info!(
-                        packets = packet_count,
-                        source = %source_addr,
-                        "ingress traffic detected"
-                    );
-                    logged_waiting_for_packets = false;
-                }
-                if !live_shreds_enabled {
+            biased;
+            maybe_worker_result = packet_worker_pool.recv(), if !packet_workers_closed => {
+                let Some(worker_result) = maybe_worker_result else {
+                    packet_workers_closed = true;
+                    if !dataset_workers_shutdown {
+                        dataset_worker_pool.shutdown().await;
+                        dataset_workers_shutdown = true;
+                    }
+                    if tx_events_closed {
+                        break 'event_loop;
+                    }
                     continue;
+                };
+                let observed_at = Instant::now();
+                verify_verified_count = verify_verified_count
+                    .saturating_add(worker_result.verify_verified_count);
+                verify_unknown_leader_count = verify_unknown_leader_count
+                    .saturating_add(worker_result.verify_unknown_leader_count);
+                verify_invalid_merkle_count = verify_invalid_merkle_count
+                    .saturating_add(worker_result.verify_invalid_merkle_count);
+                verify_invalid_signature_count = verify_invalid_signature_count
+                    .saturating_add(worker_result.verify_invalid_signature_count);
+                verify_malformed_count = verify_malformed_count
+                    .saturating_add(worker_result.verify_malformed_count);
+                verify_dropped_count = verify_dropped_count
+                    .saturating_add(worker_result.verify_dropped_count);
+                let summary = PacketWorkerResultContext {
+                    tx_commitment_tracker: tx_commitment_tracker.as_ref(),
+                    plugin_host: &plugin_host,
+                    derived_state_host: &derived_state_host,
+                    plugin_hooks_enabled,
+                    derived_state_hooks_enabled,
+                    latest_shred_slot: &mut latest_shred_slot,
+                    latest_shred_updated_at: &mut latest_shred_updated_at,
+                    fork_tracker: &mut fork_tracker,
+                    coverage_window: &mut coverage_window,
+                    missing_tracker: &mut missing_tracker,
+                    outstanding_repairs: &mut outstanding_repairs,
+                    repair_outstanding_cleared_on_receive: &mut repair_outstanding_cleared_on_receive,
+                    dataset_reassembler: &mut dataset_reassembler,
+                    dataset_worker_queues: dataset_worker_pool.queues(),
+                    dataset_jobs_enqueued_count: dataset_jobs_enqueued_count.as_ref(),
+                    dataset_queue_drop_count: dataset_queue_drop_count.as_ref(),
+                    last_dataset_reconstructed_at: &mut last_dataset_reconstructed_at,
+                    data_count: &mut data_count,
+                    code_count: &mut code_count,
+                    recovered_data_count: &mut recovered_data_count,
+                    data_complete_count: &mut data_complete_count,
+                    last_in_slot_count: &mut last_in_slot_count,
+                    source_port_8899_data: &mut source_port_8899_data,
+                    source_port_8900_data: &mut source_port_8900_data,
+                    source_port_other_data: &mut source_port_other_data,
+                    source_port_8899_code: &mut source_port_8899_code,
+                    source_port_8900_code: &mut source_port_8900_code,
+                    source_port_other_code: &mut source_port_other_code,
+                    fork_status_transitions_total: &mut fork_status_transitions_total,
+                    fork_reorg_count: &mut fork_reorg_count,
+                    fork_orphaned_slots_total: &mut fork_orphaned_slots_total,
+                    #[cfg(feature = "gossip-bootstrap")]
+                    emitted_slot_leaders: &mut emitted_slot_leaders,
+                    #[cfg(feature = "gossip-bootstrap")]
+                    verify_slot_leader_window,
+                    #[cfg(feature = "gossip-bootstrap")]
+                    repair_driver_enabled,
+                    #[cfg(feature = "gossip-bootstrap")]
+                    repair_source_hints: &mut repair_source_hints,
+                    #[cfg(feature = "gossip-bootstrap")]
+                    repair_command_tx: repair_command_tx.as_ref(),
+                    #[cfg(feature = "gossip-bootstrap")]
+                    repair_source_hint_batch_size,
+                    #[cfg(feature = "gossip-bootstrap")]
+                    repair_source_hint_flush_interval,
+                    #[cfg(feature = "gossip-bootstrap")]
+                    repair_source_hint_drops: &mut repair_source_hint_drops,
+                    #[cfg(feature = "gossip-bootstrap")]
+                    repair_source_hint_enqueued: &mut repair_source_hint_enqueued,
+                    #[cfg(feature = "gossip-bootstrap")]
+                    repair_source_hint_buffer_drops: &mut repair_source_hint_buffer_drops,
+                    #[cfg(feature = "gossip-bootstrap")]
+                    repair_source_hint_last_flush: &mut repair_source_hint_last_flush,
                 }
-                #[cfg(feature = "gossip-bootstrap")]
-                if repair_driver_enabled
-                    && crate::repair::is_repair_response_ping_packet(&packet_bytes)
-                    && let Some(command_tx) = repair_command_tx.as_ref() {
+                .process(worker_result, observed_at);
+                crate::runtime_metrics::observe_recovered_data_packets(
+                    summary.recovered_data_packets,
+                );
+                dataset_ranges_emitted = dataset_ranges_emitted.saturating_add(
+                    summary.completed_dataset_count,
+                );
+                crate::runtime_metrics::observe_completed_datasets(
+                    summary.completed_dataset_count,
+                );
+                dataset_ranges_emitted_from_recovered = dataset_ranges_emitted_from_recovered
+                    .saturating_add(summary.completed_datasets_from_recovered);
+            }
+            maybe_packet_batch = rx.recv(), if !ingest_closed => {
+                let Some(packet_batch) = maybe_packet_batch else {
+                    ingest_closed = true;
+                    packet_worker_pool.close_inputs();
+                    continue;
+                };
+                let mut worker_loads = packet_worker_pool.worker_queue_depths();
+                let mut worker_batches: Vec<Vec<PacketWorkerInput>> = (0..packet_worker_pool.worker_count())
+                    .map(|_| Vec::new())
+                    .collect();
+                for packet in packet_batch {
+                    let observed_at = Instant::now();
+                    let source_addr = packet.source;
+                    let packet_bytes = packet.bytes;
+                    let shared_observer_packet = (plugin_hooks_enabled || extension_hooks_enabled)
+                        .then(|| Arc::<[u8]>::from(packet_bytes.as_slice()));
+                    if plugin_hooks_enabled
+                        && let Some(shared_packet) = shared_observer_packet.as_ref()
+                    {
+                        plugin_host.on_raw_packet(RawPacketEvent {
+                            source: source_addr,
+                            bytes: Arc::clone(shared_packet),
+                        });
+                    }
+                    if extension_hooks_enabled
+                        && let Some(shared_packet) = shared_observer_packet.as_ref()
+                    {
+                        extension_host.on_observer_packet_shared(
+                            source_addr,
+                            Arc::clone(shared_packet),
+                        );
+                    }
+                    packet_count = packet_count.saturating_add(1);
+                    if logged_waiting_for_packets {
+                        tracing::info!(
+                            packets = packet_count,
+                            source = %source_addr,
+                            "ingress traffic detected"
+                        );
+                        logged_waiting_for_packets = false;
+                    }
+                    if !live_shreds_enabled {
+                        continue;
+                    }
+                    #[cfg(feature = "gossip-bootstrap")]
+                    if repair_driver_enabled
+                        && crate::repair::is_repair_response_ping_packet(&packet_bytes)
+                        && let Some(command_tx) = repair_command_tx.as_ref()
+                    {
                         match command_tx.try_send(RepairCommand::HandleResponsePing {
                             packet: packet_bytes.clone(),
                             from_addr: source_addr,
@@ -924,553 +1052,227 @@ async fn run_async_with_hosts_inner(
                             }
                         }
                     }
-                #[cfg(feature = "gossip-bootstrap")]
-                if repair_driver_enabled
-                    && crate::repair::is_supported_repair_request_packet(&packet_bytes)
-                    && let Some(command_tx) = repair_command_tx.as_ref()
-                {
-                    match command_tx.try_send(RepairCommand::HandleServeRequest {
-                        packet: packet_bytes.clone(),
-                        from_addr: source_addr,
-                    }) {
-                        Ok(()) => {
-                            repair_serve_requests_enqueued =
-                                repair_serve_requests_enqueued.saturating_add(1);
-                        }
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            repair_serve_queue_drops = repair_serve_queue_drops.saturating_add(1);
-                        }
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                            repair_serve_errors = repair_serve_errors.saturating_add(1);
-                        }
-                    }
-                    continue;
-                }
-                match source_addr.port() {
-                    TURBINE_PRIMARY_SOURCE_PORT => {
-                        source_port_8899_packets = source_port_8899_packets.saturating_add(1);
-                    }
-                    TURBINE_SECONDARY_SOURCE_PORT => {
-                        source_port_8900_packets = source_port_8900_packets.saturating_add(1);
-                    }
-                    _ => {
-                        source_port_other_packets = source_port_other_packets.saturating_add(1);
-                    }
-                }
-                let parsed_shred = match parse_shred_header(&packet_bytes) {
-                    Ok(parsed) => parsed,
-                    Err(error) => {
-                        parse_error_count = parse_error_count.saturating_add(1);
-                        match error {
-                            ParseError::PacketTooShort { .. } => {
-                                parse_too_short_count = parse_too_short_count.saturating_add(1);
-                            }
-                            ParseError::InvalidShredVariant(_) => {
-                                parse_invalid_variant_count =
-                                    parse_invalid_variant_count.saturating_add(1);
-                            }
-                            ParseError::InvalidDataSize(_) => {
-                                parse_invalid_data_size_count =
-                                    parse_invalid_data_size_count.saturating_add(1);
-                            }
-                            ParseError::InvalidCodingHeader { .. } => {
-                                parse_invalid_coding_header_count =
-                                    parse_invalid_coding_header_count.saturating_add(1);
-                            }
-                        }
-                        parse_other_count = parse_error_count
-                            .saturating_sub(parse_too_short_count)
-                            .saturating_sub(parse_invalid_variant_count)
-                            .saturating_sub(parse_invalid_data_size_count)
-                            .saturating_sub(parse_invalid_coding_header_count);
-                        if parse_error_count <= INITIAL_DEBUG_SAMPLE_LOG_LIMIT {
-                            tracing::debug!(source = %source_addr, error = %error, "dropping non-shred or malformed packet");
-                        }
-                        continue;
-                    }
-                };
-                #[cfg(feature = "gossip-bootstrap")]
-                let parsed_slot = match &parsed_shred {
-                    ParsedShredHeader::Data(data) => data.common.slot,
-                    ParsedShredHeader::Code(code) => code.common.slot,
-                };
-                if let Some(cache) = dedupe_cache.as_mut()
-                    && cache.is_recent_duplicate(&packet_bytes, &parsed_shred, observed_at)
-                {
-                    dedupe_drop_count = dedupe_drop_count.saturating_add(1);
-                    continue;
-                }
-                if let Some(cache) = relay_cache.as_ref() {
-                    let outcome = cache.insert(&packet_bytes, &parsed_shred, observed_at);
-                    if outcome.inserted {
-                        relay_cache_inserts = relay_cache_inserts.saturating_add(1);
-                    }
-                    if outcome.replaced {
-                        relay_cache_replacements =
-                            relay_cache_replacements.saturating_add(1);
-                    }
-                    relay_cache_evictions = relay_cache_evictions
-                        .saturating_add(u64::try_from(outcome.evicted).unwrap_or(u64::MAX));
-                }
-                if plugin_hooks_enabled {
-                    plugin_host.on_shred(ShredEvent {
-                        source: source_addr,
-                        packet: Arc::from(packet_bytes.as_slice()),
-                        parsed: Arc::new(parsed_shred.clone()),
-                    });
-                }
-                if let Some(verifier) = shred_verifier.as_mut() {
-                    let verify_status = verifier.verify_packet(&packet_bytes, observed_at);
-                    match verify_status {
-                        VerifyStatus::Verified => {
-                            verify_verified_count = verify_verified_count.saturating_add(1);
-                        }
-                        VerifyStatus::UnknownLeader => {
-                            verify_unknown_leader_count =
-                                verify_unknown_leader_count.saturating_add(1);
-                        }
-                        VerifyStatus::InvalidMerkle => {
-                            verify_invalid_merkle_count =
-                                verify_invalid_merkle_count.saturating_add(1);
-                        }
-                        VerifyStatus::InvalidSignature => {
-                            verify_invalid_signature_count =
-                                verify_invalid_signature_count.saturating_add(1);
-                        }
-                        VerifyStatus::Malformed => {
-                            verify_malformed_count = verify_malformed_count.saturating_add(1);
-                        }
-                    }
-                    if !verify_status.is_accepted(verify_strict_unknown) {
-                        verify_dropped_count = verify_dropped_count.saturating_add(1);
-                        continue;
-                    }
-                }
-                #[cfg(feature = "gossip-bootstrap")]
-                if udp_relay_enabled
-                    && udp_relay_socket.is_some()
-                    && !udp_relay_peers.is_empty()
-                {
-                    let source_is_turbine = matches!(
-                        source_addr.port(),
-                        TURBINE_PRIMARY_SOURCE_PORT | TURBINE_SECONDARY_SOURCE_PORT
-                    );
-                    if udp_relay_require_turbine_source_ports && !source_is_turbine {
-                        udp_relay_source_filtered_packets =
-                            udp_relay_source_filtered_packets.saturating_add(1);
-                    } else if udp_relay_backoff_until
-                        .is_some_and(|backoff_until| observed_at < backoff_until)
+                    #[cfg(feature = "gossip-bootstrap")]
+                    if repair_driver_enabled
+                        && crate::repair::is_supported_repair_request_packet(&packet_bytes)
+                        && let Some(command_tx) = repair_command_tx.as_ref()
                     {
-                        udp_relay_backoff_drops = udp_relay_backoff_drops.saturating_add(1);
-                    } else {
-                        udp_relay_backoff_until = None;
-                        if observed_at.saturating_duration_since(udp_relay_window_started)
-                            >= Duration::from_secs(1)
-                        {
-                            udp_relay_window_started = observed_at;
-                            udp_relay_sends_in_window = 0;
-                        }
-                        let sends_remaining = udp_relay_max_sends_per_sec
-                            .saturating_sub(udp_relay_sends_in_window);
-                        if sends_remaining == 0 {
-                            udp_relay_rate_limited_packets =
-                                udp_relay_rate_limited_packets.saturating_add(1);
-                        } else if let Some(socket) = udp_relay_socket.as_ref() {
-                            let fanout = udp_relay_fanout
-                                .min(udp_relay_peers.len())
-                                .min(usize::try_from(sends_remaining).unwrap_or(usize::MAX));
-                            if fanout == 0 {
-                                udp_relay_rate_limited_packets =
-                                    udp_relay_rate_limited_packets.saturating_add(1);
-                            } else {
-                                let mut sent_any = false;
-                                let peers_len = udp_relay_peers.len();
-                                if udp_relay_rr_cursor >= peers_len {
-                                    udp_relay_rr_cursor = 0;
-                                }
-                                let mut cursor = udp_relay_rr_cursor;
-                                for _ in 0..fanout {
-                                    if udp_relay_sends_in_window >= udp_relay_max_sends_per_sec
-                                    {
-                                        udp_relay_rate_limited_packets =
-                                            udp_relay_rate_limited_packets.saturating_add(1);
-                                        break;
-                                    }
-                                    let Some(&peer) = udp_relay_peers.get(cursor) else {
-                                        break;
-                                    };
-                                    cursor = cursor.checked_add(1).unwrap_or(0);
-                                    if cursor >= peers_len {
-                                        cursor = 0;
-                                    }
-                                    if peer == source_addr {
-                                        continue;
-                                    }
-                                    udp_relay_send_attempts =
-                                        udp_relay_send_attempts.saturating_add(1);
-                                    match socket.send_to(packet_bytes.as_slice(), peer) {
-                                        Ok(_) => {
-                                            udp_relay_send_error_streak = 0;
-                                            udp_relay_sends_in_window =
-                                                udp_relay_sends_in_window.saturating_add(1);
-                                            sent_any = true;
-                                        }
-                                        Err(error) => {
-                                            udp_relay_send_errors =
-                                                udp_relay_send_errors.saturating_add(1);
-                                            udp_relay_send_error_streak =
-                                                udp_relay_send_error_streak.saturating_add(1);
-                                            if udp_relay_send_error_streak
-                                                >= udp_relay_send_error_backoff_threshold
-                                            {
-                                                udp_relay_backoff_events =
-                                                    udp_relay_backoff_events.saturating_add(1);
-                                                udp_relay_backoff_until = observed_at.checked_add(
-                                                    Duration::from_millis(
-                                                        udp_relay_send_error_backoff_ms,
-                                                    ),
-                                                );
-                                                udp_relay_send_error_streak = 0;
-                                                break;
-                                            }
-                                            if udp_relay_send_errors
-                                                <= INITIAL_DEBUG_SAMPLE_LOG_LIMIT
-                                            {
-                                                tracing::debug!(
-                                                    peer = %peer,
-                                                    error = %error,
-                                                    "udp relay send failed"
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                                udp_relay_rr_cursor = cursor;
-                                if sent_any {
-                                    udp_relay_forwarded_packets =
-                                        udp_relay_forwarded_packets.saturating_add(1);
-                                }
+                        match command_tx.try_send(RepairCommand::HandleServeRequest {
+                            packet: packet_bytes.clone(),
+                            from_addr: source_addr,
+                        }) {
+                            Ok(()) => {
+                                repair_serve_requests_enqueued =
+                                    repair_serve_requests_enqueued.saturating_add(1);
                             }
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                repair_serve_queue_drops = repair_serve_queue_drops.saturating_add(1);
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                repair_serve_errors = repair_serve_errors.saturating_add(1);
+                            }
+                        }
+                        continue;
+                    }
+                    match source_addr.port() {
+                        TURBINE_PRIMARY_SOURCE_PORT => {
+                            source_port_8899_packets = source_port_8899_packets.saturating_add(1);
+                        }
+                        TURBINE_SECONDARY_SOURCE_PORT => {
+                            source_port_8900_packets = source_port_8900_packets.saturating_add(1);
+                        }
+                        _ => {
+                            source_port_other_packets = source_port_other_packets.saturating_add(1);
                         }
                     }
-                }
-                #[cfg(feature = "gossip-bootstrap")]
-                if plugin_hooks_enabled
-                    && let Some(verifier) = shred_verifier.as_mut()
-                {
-                    emit_leader_schedule_diff_event(
-                        &plugin_host,
-                        &derived_state_host,
-                        verifier,
-                        latest_shred_slot,
-                        &mut emitted_slot_leaders,
-                    );
-                    emit_observed_slot_leader_event(
-                        &plugin_host,
-                        &derived_state_host,
-                        verifier,
-                        parsed_slot,
-                        &mut emitted_slot_leaders,
-                        verify_slot_leader_window,
-                    );
-                }
-                #[cfg(feature = "gossip-bootstrap")]
-                if repair_driver_enabled {
-                    if repair_source_hints.record(source_addr).is_err() {
-                        repair_source_hint_buffer_drops =
-                            repair_source_hint_buffer_drops.saturating_add(1);
-                    }
-                    let should_flush = repair_source_hints.len() >= repair_source_hint_batch_size
-                        || observed_at.saturating_duration_since(repair_source_hint_last_flush)
-                            >= repair_source_hint_flush_interval;
-                    if should_flush {
-                        repair_source_hint_last_flush = observed_at;
-                        flush_repair_source_hints(
-                            &mut repair_source_hints,
-                            repair_command_tx.as_ref(),
-                            repair_source_hint_batch_size,
-                            &mut repair_source_hint_drops,
-                            &mut repair_source_hint_enqueued,
-                        );
-                    }
-                }
-                let recovered_packets = fec_recoverer.ingest_packet(&packet_bytes);
-
-                match parsed_shred {
-                    ParsedShredHeader::Data(data) => {
-                        data_count = data_count.saturating_add(1);
-                        match source_addr.port() {
-                            TURBINE_PRIMARY_SOURCE_PORT => {
-                                source_port_8899_data = source_port_8899_data.saturating_add(1);
-                            }
-                            TURBINE_SECONDARY_SOURCE_PORT => {
-                                source_port_8900_data = source_port_8900_data.saturating_add(1);
-                            }
-                            _ => {
-                                source_port_other_data = source_port_other_data.saturating_add(1);
-                            }
-                        }
-                        if data.data_header.data_complete() {
-                            data_complete_count = data_complete_count.saturating_add(1);
-                        }
-                        if data.data_header.last_in_slot() {
-                            last_in_slot_count = last_in_slot_count.saturating_add(1);
-                        }
-                        note_latest_shred_slot(
-                            &mut latest_shred_slot,
-                            &mut latest_shred_updated_at,
-                            data.common.slot,
-                            observed_at,
-                        );
-                        let fork_update = fork_tracker.observe_data_shred(
-                            data.common.slot,
-                            derive_parent_slot(data.common.slot, data.data_header.parent_offset),
-                        );
-                        apply_fork_update(
-                            &fork_update,
-                            &mut ForkUpdateDispatchContext {
-                                tx_commitment_tracker: tx_commitment_tracker.as_ref(),
-                                plugin_host: &plugin_host,
-                                derived_state_host: &derived_state_host,
-                                plugin_hooks_enabled,
-                                derived_state_hooks_enabled,
-                                fork_status_transitions_total: &mut fork_status_transitions_total,
-                                fork_reorg_count: &mut fork_reorg_count,
-                                fork_orphaned_slots_total: &mut fork_orphaned_slots_total,
-                            },
-                        );
-                        coverage_window.on_data_shred(data.common.slot);
-                        if let Some(outstanding_repairs) = outstanding_repairs.as_mut()
-                        {
-                            let cleared = outstanding_repairs
-                                .on_shred_received(data.common.slot, data.common.index);
-                            repair_outstanding_cleared_on_receive =
-                                repair_outstanding_cleared_on_receive
-                                    .saturating_add(u64::try_from(cleared).unwrap_or(u64::MAX));
-                        }
-                        if let Some(tracker) = missing_tracker.as_mut() {
-                            tracker.on_data_shred(
-                                data.common.slot,
-                                data.common.index,
-                                data.common.fec_set_index,
-                                data.data_header.last_in_slot(),
-                                data.data_header.reference_tick(),
-                                observed_at,
-                            );
-                        }
-                        let datasets = dataset_reassembler.ingest_data_shred_meta(
-                            data.common.slot,
-                            data.common.index,
-                            data.data_header.data_complete(),
-                            data.data_header.last_in_slot(),
-                            packet_bytes,
-                        );
-                        dataset_ranges_emitted = dataset_ranges_emitted
-                            .saturating_add(u64::try_from(datasets.len()).unwrap_or(u64::MAX));
-                        for dataset in datasets {
-                            coverage_window.on_dataset_completed(dataset.slot);
-                            let substantial_dataset =
-                                dataset.serialized_shreds.len() >= SUBSTANTIAL_DATASET_MIN_SHREDS;
-                            dispatch_completed_dataset(
-                                dataset_worker_pool.queues(),
-                                dataset,
-                                dataset_jobs_enqueued_count.as_ref(),
-                                dataset_queue_drop_count.as_ref(),
-                            );
-                            if substantial_dataset {
-                                last_dataset_reconstructed_at = observed_at;
-                            }
-                        }
-                        if data_count <= INITIAL_DEBUG_SAMPLE_LOG_LIMIT {
-                            tracing::info!(
-                                slot = data.common.slot,
-                                index = data.common.index,
-                                fec_set_index = data.common.fec_set_index,
-                                flags = format_args!("0x{:02x}", data.data_header.flags),
-                                declared_size = data.data_header.size,
-                                payload_len = data.payload_len,
-                                "received data shred"
-                            );
-                        }
-                    }
-                    ParsedShredHeader::Code(code) => {
-                        code_count = code_count.saturating_add(1);
-                        match source_addr.port() {
-                            TURBINE_PRIMARY_SOURCE_PORT => {
-                                source_port_8899_code = source_port_8899_code.saturating_add(1);
-                            }
-                            TURBINE_SECONDARY_SOURCE_PORT => {
-                                source_port_8900_code = source_port_8900_code.saturating_add(1);
-                            }
-                            _ => {
-                                source_port_other_code = source_port_other_code.saturating_add(1);
-                            }
-                        }
-                        note_latest_shred_slot(
-                            &mut latest_shred_slot,
-                            &mut latest_shred_updated_at,
-                            code.common.slot,
-                            observed_at,
-                        );
-                        let fork_update = fork_tracker.observe_code_shred(code.common.slot);
-                        apply_fork_update(
-                            &fork_update,
-                            &mut ForkUpdateDispatchContext {
-                                tx_commitment_tracker: tx_commitment_tracker.as_ref(),
-                                plugin_host: &plugin_host,
-                                derived_state_host: &derived_state_host,
-                                plugin_hooks_enabled,
-                                derived_state_hooks_enabled,
-                                fork_status_transitions_total: &mut fork_status_transitions_total,
-                                fork_reorg_count: &mut fork_reorg_count,
-                                fork_orphaned_slots_total: &mut fork_orphaned_slots_total,
-                            },
-                        );
-                        coverage_window.on_code_shred(code.common.slot);
-                        if let Some(outstanding_repairs) = outstanding_repairs.as_mut() {
-                            let cleared = outstanding_repairs
-                                .on_shred_received(code.common.slot, code.common.index);
-                            repair_outstanding_cleared_on_receive = repair_outstanding_cleared_on_receive
-                                .saturating_add(u64::try_from(cleared).unwrap_or(u64::MAX));
-                        }
-                        if let Some(tracker) = missing_tracker.as_mut() {
-                            tracker.on_code_shred(
-                                code.common.slot,
-                                code.common.fec_set_index,
-                                code.coding_header.num_data_shreds,
-                                observed_at,
-                            );
-                        }
-                        if code_count <= INITIAL_DEBUG_SAMPLE_LOG_LIMIT {
-                            tracing::info!(
-                                slot = code.common.slot,
-                                index = code.common.index,
-                                fec_set_index = code.common.fec_set_index,
-                                num_data_shreds = code.coding_header.num_data_shreds,
-                                num_coding_shreds = code.coding_header.num_coding_shreds,
-                                "received coding shred"
-                            );
-                        }
-                    }
-                }
-
-                for recovered in recovered_packets {
-                    let parsed_recovered = match parse_shred(&recovered) {
+                    let parsed_shred = match parse_shred_header(&packet_bytes) {
                         Ok(parsed) => parsed,
-                        Err(_) => continue,
-                    };
-                    if verify_recovered_shreds
-                        && let Some(verifier) = shred_verifier.as_mut()
-                    {
-                        let verify_status = verifier.verify_packet(&recovered, observed_at);
-                        match verify_status {
-                            VerifyStatus::Verified => {
-                                verify_verified_count = verify_verified_count.saturating_add(1);
+                        Err(error) => {
+                            parse_error_count = parse_error_count.saturating_add(1);
+                            match error {
+                                ParseError::PacketTooShort { .. } => {
+                                    parse_too_short_count = parse_too_short_count.saturating_add(1);
+                                }
+                                ParseError::InvalidShredVariant(_) => {
+                                    parse_invalid_variant_count =
+                                        parse_invalid_variant_count.saturating_add(1);
+                                }
+                                ParseError::InvalidDataSize(_) => {
+                                    parse_invalid_data_size_count =
+                                        parse_invalid_data_size_count.saturating_add(1);
+                                }
+                                ParseError::InvalidCodingHeader { .. } => {
+                                    parse_invalid_coding_header_count =
+                                        parse_invalid_coding_header_count.saturating_add(1);
+                                }
                             }
-                            VerifyStatus::UnknownLeader => {
-                                verify_unknown_leader_count =
-                                    verify_unknown_leader_count.saturating_add(1);
+                            parse_other_count = parse_error_count
+                                .saturating_sub(parse_too_short_count)
+                                .saturating_sub(parse_invalid_variant_count)
+                                .saturating_sub(parse_invalid_data_size_count)
+                                .saturating_sub(parse_invalid_coding_header_count);
+                            if parse_error_count <= INITIAL_DEBUG_SAMPLE_LOG_LIMIT {
+                                tracing::debug!(source = %source_addr, error = %error, "dropping non-shred or malformed packet");
                             }
-                            VerifyStatus::InvalidMerkle => {
-                                verify_invalid_merkle_count =
-                                    verify_invalid_merkle_count.saturating_add(1);
-                            }
-                            VerifyStatus::InvalidSignature => {
-                                verify_invalid_signature_count =
-                                    verify_invalid_signature_count.saturating_add(1);
-                            }
-                            VerifyStatus::Malformed => {
-                                verify_malformed_count = verify_malformed_count.saturating_add(1);
-                            }
-                        }
-                        if !verify_status.is_accepted(verify_strict_unknown) {
-                            verify_dropped_count = verify_dropped_count.saturating_add(1);
                             continue;
                         }
+                    };
+                    if let Some(cache) = dedupe_cache.as_mut()
+                        && cache.is_recent_duplicate(&packet_bytes, &parsed_shred, observed_at)
+                    {
+                        dedupe_drop_count = dedupe_drop_count.saturating_add(1);
+                        continue;
                     }
-                    match parsed_recovered {
-                        ParsedShred::Data(data) => {
-                            recovered_data_count = recovered_data_count.saturating_add(1);
-                            if data.data_header.data_complete() {
-                                data_complete_count = data_complete_count.saturating_add(1);
-                            }
-                            if data.data_header.last_in_slot() {
-                                last_in_slot_count = last_in_slot_count.saturating_add(1);
-                            }
-                            note_latest_shred_slot(
-                                &mut latest_shred_slot,
-                                &mut latest_shred_updated_at,
-                                data.common.slot,
-                                observed_at,
-                            );
-                            let fork_update = fork_tracker.observe_recovered_data_shred(
-                                data.common.slot,
-                                derive_parent_slot(data.common.slot, data.data_header.parent_offset),
-                            );
-                            apply_fork_update(
-                                &fork_update,
-                                &mut ForkUpdateDispatchContext {
-                                    tx_commitment_tracker: tx_commitment_tracker.as_ref(),
-                                    plugin_host: &plugin_host,
-                                    derived_state_host: &derived_state_host,
-                                    plugin_hooks_enabled,
-                                    derived_state_hooks_enabled,
-                                    fork_status_transitions_total: &mut fork_status_transitions_total,
-                                    fork_reorg_count: &mut fork_reorg_count,
-                                    fork_orphaned_slots_total: &mut fork_orphaned_slots_total,
-                                },
-                            );
-                            coverage_window.on_recovered_data_shred(data.common.slot);
-                            if let Some(outstanding_repairs) = outstanding_repairs.as_mut()
+                    if let Some(cache) = relay_cache.as_ref() {
+                        let outcome = cache.insert(&packet_bytes, &parsed_shred, observed_at);
+                        if outcome.inserted {
+                            relay_cache_inserts = relay_cache_inserts.saturating_add(1);
+                        }
+                        if outcome.replaced {
+                            relay_cache_replacements =
+                                relay_cache_replacements.saturating_add(1);
+                        }
+                        relay_cache_evictions = relay_cache_evictions
+                            .saturating_add(u64::try_from(outcome.evicted).unwrap_or(u64::MAX));
+                    }
+                    if plugin_hooks_enabled {
+                        plugin_host.on_shred(ShredEvent {
+                            source: source_addr,
+                            packet: Arc::from(packet_bytes.as_slice()),
+                            parsed: Arc::new(parsed_shred.clone()),
+                        });
+                    }
+                    #[cfg(feature = "gossip-bootstrap")]
+                    if udp_relay_enabled
+                        && udp_relay_socket.is_some()
+                        && !udp_relay_peers.is_empty()
+                    {
+                        let source_is_turbine = matches!(
+                            source_addr.port(),
+                            TURBINE_PRIMARY_SOURCE_PORT | TURBINE_SECONDARY_SOURCE_PORT
+                        );
+                        if udp_relay_require_turbine_source_ports && !source_is_turbine {
+                            udp_relay_source_filtered_packets =
+                                udp_relay_source_filtered_packets.saturating_add(1);
+                        } else if udp_relay_backoff_until
+                            .is_some_and(|backoff_until| observed_at < backoff_until)
+                        {
+                            udp_relay_backoff_drops = udp_relay_backoff_drops.saturating_add(1);
+                        } else {
+                            udp_relay_backoff_until = None;
+                            if observed_at.saturating_duration_since(udp_relay_window_started)
+                                >= Duration::from_secs(1)
                             {
-                                let cleared = outstanding_repairs
-                                    .on_shred_received(data.common.slot, data.common.index);
-                                repair_outstanding_cleared_on_receive =
-                                    repair_outstanding_cleared_on_receive
-                                        .saturating_add(u64::try_from(cleared).unwrap_or(u64::MAX));
+                                udp_relay_window_started = observed_at;
+                                udp_relay_sends_in_window = 0;
                             }
-                            if let Some(tracker) = missing_tracker.as_mut() {
-                                tracker.on_recovered_data_shred(
-                                    data.common.slot,
-                                    data.common.index,
-                                    data.common.fec_set_index,
-                                    data.data_header.last_in_slot(),
-                                    data.data_header.reference_tick(),
-                                    observed_at,
-                                );
-                            }
-                            let datasets =
-                                dataset_reassembler.ingest_data_shred_meta(
-                                    data.common.slot,
-                                    data.common.index,
-                                    data.data_header.data_complete(),
-                                    data.data_header.last_in_slot(),
-                                    recovered,
-                                );
-                            let emitted = u64::try_from(datasets.len()).unwrap_or(u64::MAX);
-                            dataset_ranges_emitted =
-                                dataset_ranges_emitted.saturating_add(emitted);
-                            dataset_ranges_emitted_from_recovered =
-                                dataset_ranges_emitted_from_recovered.saturating_add(emitted);
-                            for dataset in datasets {
-                                coverage_window.on_dataset_completed(dataset.slot);
-                                let substantial_dataset =
-                                    dataset.serialized_shreds.len()
-                                        >= SUBSTANTIAL_DATASET_MIN_SHREDS;
-                                dispatch_completed_dataset(
-                                    dataset_worker_pool.queues(),
-                                    dataset,
-                                    dataset_jobs_enqueued_count.as_ref(),
-                                    dataset_queue_drop_count.as_ref(),
-                                );
-                                if substantial_dataset {
-                                    last_dataset_reconstructed_at = observed_at;
+                            let sends_remaining = udp_relay_max_sends_per_sec
+                                .saturating_sub(udp_relay_sends_in_window);
+                            if sends_remaining == 0 {
+                                udp_relay_rate_limited_packets =
+                                    udp_relay_rate_limited_packets.saturating_add(1);
+                            } else if let Some(socket) = udp_relay_socket.as_ref() {
+                                let fanout = udp_relay_fanout
+                                    .min(udp_relay_peers.len())
+                                    .min(usize::try_from(sends_remaining).unwrap_or(usize::MAX));
+                                if fanout == 0 {
+                                    udp_relay_rate_limited_packets =
+                                        udp_relay_rate_limited_packets.saturating_add(1);
+                                } else {
+                                    let mut sent_any = false;
+                                    let peers_len = udp_relay_peers.len();
+                                    if udp_relay_rr_cursor >= peers_len {
+                                        udp_relay_rr_cursor = 0;
+                                    }
+                                    let mut cursor = udp_relay_rr_cursor;
+                                    for _ in 0..fanout {
+                                        if udp_relay_sends_in_window >= udp_relay_max_sends_per_sec
+                                        {
+                                            udp_relay_rate_limited_packets =
+                                                udp_relay_rate_limited_packets.saturating_add(1);
+                                            break;
+                                        }
+                                        let Some(&peer) = udp_relay_peers.get(cursor) else {
+                                            break;
+                                        };
+                                        cursor = cursor.checked_add(1).unwrap_or(0);
+                                        if cursor >= peers_len {
+                                            cursor = 0;
+                                        }
+                                        if peer == source_addr {
+                                            continue;
+                                        }
+                                        udp_relay_send_attempts =
+                                            udp_relay_send_attempts.saturating_add(1);
+                                        match socket.send_to(packet_bytes.as_slice(), peer) {
+                                            Ok(_) => {
+                                                udp_relay_send_error_streak = 0;
+                                                udp_relay_sends_in_window =
+                                                    udp_relay_sends_in_window.saturating_add(1);
+                                                sent_any = true;
+                                            }
+                                            Err(error) => {
+                                                udp_relay_send_errors =
+                                                    udp_relay_send_errors.saturating_add(1);
+                                                udp_relay_send_error_streak =
+                                                    udp_relay_send_error_streak.saturating_add(1);
+                                                if udp_relay_send_error_streak
+                                                    >= udp_relay_send_error_backoff_threshold
+                                                {
+                                                    udp_relay_backoff_events =
+                                                        udp_relay_backoff_events.saturating_add(1);
+                                                    udp_relay_backoff_until = observed_at.checked_add(
+                                                        Duration::from_millis(
+                                                            udp_relay_send_error_backoff_ms,
+                                                        ),
+                                                    );
+                                                    udp_relay_send_error_streak = 0;
+                                                    break;
+                                                }
+                                                if udp_relay_send_errors
+                                                    <= INITIAL_DEBUG_SAMPLE_LOG_LIMIT
+                                                {
+                                                    tracing::debug!(
+                                                        peer = %peer,
+                                                        error = %error,
+                                                        "udp relay send failed"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                    udp_relay_rr_cursor = cursor;
+                                    if sent_any {
+                                        udp_relay_forwarded_packets =
+                                            udp_relay_forwarded_packets.saturating_add(1);
+                                    }
                                 }
                             }
                         }
-                        ParsedShred::Code(_) => {}
+                    }
+
+                    let worker_index = packet_worker_assignments.worker_for(
+                        parsed_shred_slot(&parsed_shred),
+                        parsed_shred_fec_set_index(&parsed_shred),
+                        &worker_loads,
+                    );
+                    if let Some(batch) = worker_batches.get_mut(worker_index) {
+                        batch.push(PacketWorkerInput {
+                            source: source_addr,
+                            packet_bytes,
+                            parsed_header: parsed_shred,
+                        });
+                        if let Some(load) = worker_loads.get_mut(worker_index) {
+                            *load = load.saturating_add(1);
+                        }
                     }
                 }
+                for (worker_index, packets) in worker_batches.into_iter().enumerate() {
+                    if !packet_worker_pool
+                        .dispatch_worker_batch(worker_index, packets)
+                    {
+                        break 'event_loop;
+                    }
                 }
             }
             maybe_repair_result = async {
@@ -1631,7 +1433,7 @@ async fn run_async_with_hosts_inner(
                     let _ = maybe_repair_result;
                 }
             }
-            _ = repair_tick.tick(), if repair_enabled => {
+            _ = repair_tick.tick(), if !ingest_closed && repair_enabled => {
                 #[cfg(feature = "gossip-bootstrap")]
                 {
                     if let (Some(tracker), Some(command_tx), Some(outstanding_repairs)) = (
@@ -1760,9 +1562,9 @@ async fn run_async_with_hosts_inner(
                             now.saturating_duration_since(gossip_runtime_started_at),
                         );
                         let ingest_packets_seen = runtime
-                            .gossip_runtime
+                            .gossip_ingest_telemetry
                             .as_ref()
-                            .map(|runtime| runtime.ingest_telemetry.snapshot().0)
+                            .map(|telemetry| telemetry.snapshot().0)
                             .unwrap_or(0);
                         let no_ingest_seen = ingest_packets_seen == 0;
                         let switch_for_shred_stall =
@@ -1901,7 +1703,7 @@ async fn run_async_with_hosts_inner(
                     }
                 }
             }
-            _ = control_plane_tick.tick() => {
+            _ = control_plane_tick.tick(), if !ingest_closed => {
                 #[cfg(feature = "gossip-bootstrap")]
                 {
                     let now = Instant::now();
@@ -1948,14 +1750,14 @@ async fn run_async_with_hosts_inner(
                     }
                 }
             }
-            _ = derived_state_checkpoint_tick.tick(), if derived_state_checkpoint_enabled => {
+            _ = derived_state_checkpoint_tick.tick(), if !ingest_closed && derived_state_checkpoint_enabled => {
                 let fork_snapshot = fork_tracker.snapshot();
                 derived_state_host.emit_checkpoint_barrier(
                     CheckpointBarrierReason::Periodic,
                     feed_watermarks_from_fork_snapshot(fork_snapshot),
                 );
             }
-            _ = derived_state_recovery_tick.tick(), if derived_state_recovery_enabled => {
+            _ = derived_state_recovery_tick.tick(), if !ingest_closed && derived_state_recovery_enabled => {
                 if derived_state_host.has_unhealthy_consumers() {
                     let recovery_report = derived_state_host.recover_consumers();
                     tracing::info!(
@@ -1969,7 +1771,7 @@ async fn run_async_with_hosts_inner(
                     );
                 }
             }
-            _ = telemetry_tick.tick() => {
+            _ = telemetry_tick.tick(), if !ingest_closed => {
                 if packet_count == 0 && !logged_waiting_for_packets {
                     tracing::info!(
                         "waiting for ingress packets; check SOF_BIND / SOF_GOSSIP_ENTRYPOINT configuration"
@@ -1978,10 +1780,9 @@ async fn run_async_with_hosts_inner(
                 }
                 #[cfg(feature = "gossip-bootstrap")]
                 {
-                    if let (Some(verifier), Some(peer_snapshot)) =
-                        (shred_verifier.as_mut(), repair_peer_snapshot.as_ref())
-                    {
-                        verifier.set_known_pubkeys(peer_snapshot.shared_get().known_pubkeys.clone());
+                    if let Some(peer_snapshot) = repair_peer_snapshot.as_ref() {
+                        packet_worker_pool
+                            .update_known_pubkeys(peer_snapshot.shared_get().known_pubkeys.clone());
                     }
                 }
                 #[cfg(feature = "gossip-bootstrap")]
@@ -2109,19 +1910,18 @@ async fn run_async_with_hosts_inner(
                     ingest_dropped_batches,
                     ingest_rxq_ovfl_drops,
                 ) = runtime
-                    .gossip_runtime
+                    .gossip_ingest_telemetry
                     .as_ref()
-                    .map(|runtime| {
-                        let (packets_seen, last_packet_unix_ms) =
-                            runtime.ingest_telemetry.snapshot();
+                    .map(|telemetry| {
+                        let (packets_seen, last_packet_unix_ms) = telemetry.snapshot();
                         (
                             packets_seen,
                             last_packet_unix_ms,
-                            runtime.ingest_telemetry.sent_packets(),
-                            runtime.ingest_telemetry.sent_batches(),
-                            runtime.ingest_telemetry.dropped_packets(),
-                            runtime.ingest_telemetry.dropped_batches(),
-                            runtime.ingest_telemetry.rxq_ovfl_drops(),
+                            telemetry.sent_packets(),
+                            telemetry.sent_batches(),
+                            telemetry.dropped_packets(),
+                            telemetry.dropped_batches(),
+                            telemetry.rxq_ovfl_drops(),
                         )
                     })
                     .unwrap_or((0, 0, 0, 0, 0, 0, 0));
@@ -2167,6 +1967,7 @@ async fn run_async_with_hosts_inner(
                 let derived_state_consumer_telemetry = derived_state_host.consumer_telemetry();
                 let derived_state_replay_telemetry =
                     derived_state_host.replay_telemetry().unwrap_or_default();
+                let runtime_stage_metrics = crate::runtime_metrics::snapshot();
                 tracing::info!(
                     packets = packet_count,
                     source_8899_packets = source_port_8899_packets,
@@ -2281,9 +2082,22 @@ async fn run_async_with_hosts_inner(
                     dataset_jobs_started,
                     dataset_jobs_completed,
                     dataset_jobs_pending,
+                    packet_worker_queue_depth = runtime_stage_metrics.packet_worker_queue_depth,
+                    packet_worker_max_queue_depth =
+                        runtime_stage_metrics.packet_worker_max_queue_depth,
+                    packet_worker_queue_depth_local = packet_worker_pool.queue_depth(),
+                    packet_worker_max_queue_depth_local = packet_worker_pool.max_queue_depth(),
+                    packet_worker_queue_overflow_policy =
+                        PACKET_WORKER_QUEUE_OVERFLOW_POLICY,
+                    packet_worker_queue_depths = ?packet_worker_pool.worker_queue_depths(),
+                    packet_worker_dropped_batches =
+                        runtime_stage_metrics.packet_worker_dropped_batches_total,
+                    packet_worker_dropped_packets =
+                        runtime_stage_metrics.packet_worker_dropped_packets_total,
                     dataset_slots_tracked = dataset_reassembler.tracked_slots(),
                     dataset_max_tracked_slots = dataset_max_tracked_slots,
-                    fec_sets_tracked = fec_recoverer.tracked_sets(),
+                    fec_sets_tracked = packet_worker_pool.tracked_fec_sets(),
+                    fec_sets_tracked_by_worker = ?packet_worker_pool.tracked_fec_sets_by_worker(),
                     fec_max_tracked_sets = fec_max_tracked_sets,
                     vote_only = vote_only_count,
                     mixed = mixed_count,
@@ -2437,9 +2251,13 @@ async fn run_async_with_hosts_inner(
                     }
                 }
             }
-            maybe_event = runtime.tx_event_rx.recv() => {
+            maybe_event = runtime.tx_event_rx.recv(), if !tx_events_closed => {
                 let Some(event) = maybe_event else {
-                    break;
+                    tx_events_closed = true;
+                    if packet_workers_closed {
+                        break 'event_loop;
+                    }
+                    continue;
                 };
                 match event.kind {
                     TxKind::VoteOnly => {
@@ -2466,6 +2284,7 @@ async fn run_async_with_hosts_inner(
             }
         }
     }
+    packet_worker_pool.shutdown().await;
     dataset_worker_pool.shutdown().await;
     if derived_state_hooks_enabled {
         emit_shutdown_checkpoint_barrier(&derived_state_host, fork_tracker.snapshot());
@@ -2519,11 +2338,490 @@ fn collect_extension_dispatch_telemetry(
     snapshot
 }
 
-const fn derive_parent_slot(slot: u64, parent_offset: u16) -> Option<u64> {
-    if parent_offset == 0 {
-        return None;
+#[derive(Default)]
+struct PacketWorkerResultSummary {
+    recovered_data_packets: u64,
+    completed_dataset_count: u64,
+    completed_datasets_from_recovered: u64,
+}
+
+struct PacketWorkerResultContext<'context> {
+    tx_commitment_tracker: &'context CommitmentSlotTracker,
+    plugin_host: &'context PluginHost,
+    derived_state_host: &'context DerivedStateHost,
+    plugin_hooks_enabled: bool,
+    derived_state_hooks_enabled: bool,
+    latest_shred_slot: &'context mut Option<u64>,
+    latest_shred_updated_at: &'context mut Instant,
+    fork_tracker: &'context mut ForkTracker,
+    coverage_window: &'context mut SlotCoverageWindow,
+    missing_tracker: &'context mut Option<MissingShredTracker>,
+    outstanding_repairs: &'context mut Option<OutstandingRepairRequests>,
+    repair_outstanding_cleared_on_receive: &'context mut u64,
+    dataset_reassembler: &'context mut DataSetReassembler,
+    dataset_worker_queues: &'context [DatasetDispatchQueue],
+    dataset_jobs_enqueued_count: &'context AtomicU64,
+    dataset_queue_drop_count: &'context AtomicU64,
+    last_dataset_reconstructed_at: &'context mut Instant,
+    data_count: &'context mut u64,
+    code_count: &'context mut u64,
+    recovered_data_count: &'context mut u64,
+    data_complete_count: &'context mut u64,
+    last_in_slot_count: &'context mut u64,
+    source_port_8899_data: &'context mut u64,
+    source_port_8900_data: &'context mut u64,
+    source_port_other_data: &'context mut u64,
+    source_port_8899_code: &'context mut u64,
+    source_port_8900_code: &'context mut u64,
+    source_port_other_code: &'context mut u64,
+    fork_status_transitions_total: &'context mut u64,
+    fork_reorg_count: &'context mut u64,
+    fork_orphaned_slots_total: &'context mut u64,
+    #[cfg(feature = "gossip-bootstrap")]
+    emitted_slot_leaders: &'context mut HashMap<u64, [u8; 32]>,
+    #[cfg(feature = "gossip-bootstrap")]
+    verify_slot_leader_window: u64,
+    #[cfg(feature = "gossip-bootstrap")]
+    repair_driver_enabled: bool,
+    #[cfg(feature = "gossip-bootstrap")]
+    repair_source_hints: &'context mut RepairSourceHintBuffer,
+    #[cfg(feature = "gossip-bootstrap")]
+    repair_command_tx: Option<&'context mpsc::Sender<RepairCommand>>,
+    #[cfg(feature = "gossip-bootstrap")]
+    repair_source_hint_batch_size: usize,
+    #[cfg(feature = "gossip-bootstrap")]
+    repair_source_hint_flush_interval: Duration,
+    #[cfg(feature = "gossip-bootstrap")]
+    repair_source_hint_drops: &'context mut u64,
+    #[cfg(feature = "gossip-bootstrap")]
+    repair_source_hint_enqueued: &'context mut u64,
+    #[cfg(feature = "gossip-bootstrap")]
+    repair_source_hint_buffer_drops: &'context mut u64,
+    #[cfg(feature = "gossip-bootstrap")]
+    repair_source_hint_last_flush: &'context mut Instant,
+}
+
+impl PacketWorkerResultContext<'_> {
+    fn process(
+        mut self,
+        worker_result: PacketWorkerBatchResult,
+        observed_at: Instant,
+    ) -> PacketWorkerResultSummary {
+        #[cfg(feature = "gossip-bootstrap")]
+        self.emit_leader_events(
+            worker_result.leader_diff,
+            worker_result.observed_slot_leaders,
+        );
+
+        let mut summary = PacketWorkerResultSummary::default();
+        for shred in worker_result.accepted_shreds {
+            self.process_accepted_shred(shred, observed_at, &mut summary);
+        }
+        summary
     }
-    slot.checked_sub(parent_offset as u64)
+
+    fn process_accepted_shred(
+        &mut self,
+        shred: WorkerAcceptedShred,
+        observed_at: Instant,
+        summary: &mut PacketWorkerResultSummary,
+    ) {
+        match shred.kind {
+            WorkerAcceptedShredKind::Data {
+                parent_slot,
+                data_complete,
+                last_in_slot,
+                reference_tick,
+            } => {
+                let source_addr = source_addr_or_unspecified(shred.source);
+                self.process_data_like_shred(
+                    shred.slot,
+                    shred.index,
+                    shred.fec_set_index,
+                    parent_slot,
+                    data_complete,
+                    last_in_slot,
+                    reference_tick,
+                    shred.serialized_shred,
+                    observed_at,
+                    Some(source_addr),
+                    false,
+                    summary,
+                );
+            }
+            WorkerAcceptedShredKind::Code { num_data_shreds } => {
+                self.process_code_shred(
+                    shred.slot,
+                    shred.index,
+                    shred.fec_set_index,
+                    num_data_shreds,
+                    source_addr_or_unspecified(shred.source),
+                    observed_at,
+                );
+            }
+            WorkerAcceptedShredKind::RecoveredData {
+                parent_slot,
+                data_complete,
+                last_in_slot,
+                reference_tick,
+            } => {
+                self.process_data_like_shred(
+                    shred.slot,
+                    shred.index,
+                    shred.fec_set_index,
+                    parent_slot,
+                    data_complete,
+                    last_in_slot,
+                    reference_tick,
+                    shred.serialized_shred,
+                    observed_at,
+                    None,
+                    true,
+                    summary,
+                );
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_data_like_shred(
+        &mut self,
+        slot: u64,
+        index: u32,
+        fec_set_index: u32,
+        parent_slot: Option<u64>,
+        data_complete: bool,
+        last_in_slot: bool,
+        reference_tick: u8,
+        serialized_shred: Option<Vec<u8>>,
+        observed_at: Instant,
+        source_addr: Option<SocketAddr>,
+        recovered: bool,
+        summary: &mut PacketWorkerResultSummary,
+    ) {
+        if recovered {
+            summary.recovered_data_packets = summary.recovered_data_packets.saturating_add(1);
+            *self.recovered_data_count = self.recovered_data_count.saturating_add(1);
+            self.coverage_window.on_recovered_data_shred(slot);
+        } else if let Some(source_addr) = source_addr {
+            *self.data_count = self.data_count.saturating_add(1);
+            observe_source_port(
+                source_addr,
+                self.source_port_8899_data,
+                self.source_port_8900_data,
+                self.source_port_other_data,
+            );
+            self.coverage_window.on_data_shred(slot);
+            #[cfg(feature = "gossip-bootstrap")]
+            self.record_repair_source_hint(source_addr, observed_at);
+        }
+
+        if data_complete {
+            *self.data_complete_count = self.data_complete_count.saturating_add(1);
+        }
+        if last_in_slot {
+            *self.last_in_slot_count = self.last_in_slot_count.saturating_add(1);
+        }
+
+        self.note_slot(slot, observed_at);
+        let fork_update = if recovered {
+            self.fork_tracker
+                .observe_recovered_data_shred(slot, parent_slot)
+        } else {
+            self.fork_tracker.observe_data_shred(slot, parent_slot)
+        };
+        self.apply_fork_update(&fork_update);
+        self.clear_outstanding_repair(slot, index);
+
+        if let Some(tracker) = self.missing_tracker.as_mut() {
+            if recovered {
+                tracker.on_recovered_data_shred(
+                    slot,
+                    index,
+                    fec_set_index,
+                    last_in_slot,
+                    reference_tick,
+                    observed_at,
+                );
+            } else {
+                tracker.on_data_shred(
+                    slot,
+                    index,
+                    fec_set_index,
+                    last_in_slot,
+                    reference_tick,
+                    observed_at,
+                );
+            }
+        }
+
+        if let Some(serialized_shred) = serialized_shred {
+            let completed_datasets = self.dataset_reassembler.ingest_data_shred_meta(
+                slot,
+                index,
+                data_complete,
+                last_in_slot,
+                serialized_shred,
+            );
+            let completed_count = self.dispatch_completed_datasets(completed_datasets, observed_at);
+            summary.completed_dataset_count = summary
+                .completed_dataset_count
+                .saturating_add(completed_count);
+            if recovered {
+                summary.completed_datasets_from_recovered = summary
+                    .completed_datasets_from_recovered
+                    .saturating_add(completed_count);
+            }
+        }
+    }
+
+    fn process_code_shred(
+        &mut self,
+        slot: u64,
+        index: u32,
+        fec_set_index: u32,
+        num_data_shreds: u16,
+        source_addr: SocketAddr,
+        observed_at: Instant,
+    ) {
+        *self.code_count = self.code_count.saturating_add(1);
+        observe_source_port(
+            source_addr,
+            self.source_port_8899_code,
+            self.source_port_8900_code,
+            self.source_port_other_code,
+        );
+        self.note_slot(slot, observed_at);
+        let fork_update = self.fork_tracker.observe_code_shred(slot);
+        self.apply_fork_update(&fork_update);
+        self.coverage_window.on_code_shred(slot);
+        self.clear_outstanding_repair(slot, index);
+        if let Some(tracker) = self.missing_tracker.as_mut() {
+            tracker.on_code_shred(slot, fec_set_index, num_data_shreds, observed_at);
+        }
+        #[cfg(feature = "gossip-bootstrap")]
+        self.record_repair_source_hint(source_addr, observed_at);
+    }
+
+    fn dispatch_completed_datasets(
+        &mut self,
+        completed_datasets: Vec<CompletedDataSet>,
+        observed_at: Instant,
+    ) -> u64 {
+        let completed_count = u64::try_from(completed_datasets.len()).unwrap_or(u64::MAX);
+        for dataset in completed_datasets {
+            self.coverage_window.on_dataset_completed(dataset.slot);
+            let substantial_dataset =
+                dataset.serialized_shreds.len() >= SUBSTANTIAL_DATASET_MIN_SHREDS;
+            dispatch_completed_dataset(
+                self.dataset_worker_queues,
+                dataset,
+                self.dataset_jobs_enqueued_count,
+                self.dataset_queue_drop_count,
+            );
+            if substantial_dataset {
+                *self.last_dataset_reconstructed_at = observed_at;
+            }
+        }
+        completed_count
+    }
+
+    const fn note_slot(&mut self, slot: u64, observed_at: Instant) {
+        note_latest_shred_slot(
+            self.latest_shred_slot,
+            self.latest_shred_updated_at,
+            slot,
+            observed_at,
+        );
+    }
+
+    fn clear_outstanding_repair(&mut self, slot: u64, index: u32) {
+        if let Some(outstanding_repairs) = self.outstanding_repairs.as_mut() {
+            let cleared = outstanding_repairs.on_shred_received(slot, index);
+            *self.repair_outstanding_cleared_on_receive = self
+                .repair_outstanding_cleared_on_receive
+                .saturating_add(u64::try_from(cleared).unwrap_or(u64::MAX));
+        }
+    }
+
+    fn apply_fork_update(&mut self, update: &ForkTrackerUpdate) {
+        apply_fork_update(
+            update,
+            &mut ForkUpdateDispatchContext {
+                tx_commitment_tracker: self.tx_commitment_tracker,
+                plugin_host: self.plugin_host,
+                derived_state_host: self.derived_state_host,
+                plugin_hooks_enabled: self.plugin_hooks_enabled,
+                derived_state_hooks_enabled: self.derived_state_hooks_enabled,
+                fork_status_transitions_total: self.fork_status_transitions_total,
+                fork_reorg_count: self.fork_reorg_count,
+                fork_orphaned_slots_total: self.fork_orphaned_slots_total,
+            },
+        );
+    }
+
+    #[cfg(feature = "gossip-bootstrap")]
+    fn emit_leader_events(
+        &mut self,
+        leader_diff: crate::verify::SlotLeaderDiff,
+        observed_slot_leaders: Vec<(u64, [u8; 32])>,
+    ) {
+        if !self.plugin_hooks_enabled {
+            return;
+        }
+        emit_slot_leader_diff_event(
+            self.plugin_host,
+            self.derived_state_host,
+            leader_diff,
+            *self.latest_shred_slot,
+            self.emitted_slot_leaders,
+        );
+        for (slot, leader_bytes) in observed_slot_leaders {
+            emit_observed_slot_leader_bytes_event(
+                self.plugin_host,
+                self.derived_state_host,
+                slot,
+                leader_bytes,
+                self.emitted_slot_leaders,
+                self.verify_slot_leader_window,
+            );
+        }
+    }
+
+    #[cfg(feature = "gossip-bootstrap")]
+    fn record_repair_source_hint(&mut self, source_addr: SocketAddr, observed_at: Instant) {
+        if !self.repair_driver_enabled {
+            return;
+        }
+        if self.repair_source_hints.record(source_addr).is_err() {
+            *self.repair_source_hint_buffer_drops =
+                self.repair_source_hint_buffer_drops.saturating_add(1);
+        }
+        let should_flush = self.repair_source_hints.len() >= self.repair_source_hint_batch_size
+            || observed_at.saturating_duration_since(*self.repair_source_hint_last_flush)
+                >= self.repair_source_hint_flush_interval;
+        if should_flush {
+            *self.repair_source_hint_last_flush = observed_at;
+            flush_repair_source_hints(
+                self.repair_source_hints,
+                self.repair_command_tx,
+                self.repair_source_hint_batch_size,
+                self.repair_source_hint_drops,
+                self.repair_source_hint_enqueued,
+            );
+        }
+    }
+}
+
+const fn parsed_shred_slot(parsed_shred: &ParsedShredHeader) -> u64 {
+    match parsed_shred {
+        ParsedShredHeader::Data(data) => data.common.slot,
+        ParsedShredHeader::Code(code) => code.common.slot,
+    }
+}
+
+const fn parsed_shred_fec_set_index(parsed_shred: &ParsedShredHeader) -> u32 {
+    match parsed_shred {
+        ParsedShredHeader::Data(data) => data.common.fec_set_index,
+        ParsedShredHeader::Code(code) => code.common.fec_set_index,
+    }
+}
+
+struct PacketWorkerAssignments {
+    owners: HashMap<(u64, u32), usize>,
+    retained_slot_window: u64,
+    last_pruned_floor: u64,
+}
+
+impl PacketWorkerAssignments {
+    fn new(retained_slot_window: usize) -> Self {
+        Self {
+            owners: HashMap::new(),
+            retained_slot_window: u64::try_from(retained_slot_window).unwrap_or(u64::MAX),
+            last_pruned_floor: 0,
+        }
+    }
+
+    fn worker_for(&mut self, slot: u64, fec_set_index: u32, worker_loads: &[u64]) -> usize {
+        let worker_count = worker_loads.len().max(1);
+        self.prune(slot);
+        if let Some(&worker_index) = self.owners.get(&(slot, fec_set_index)) {
+            return worker_index.min(worker_count.saturating_sub(1));
+        }
+
+        let preferred_worker = shard_fec_set_to_worker(slot, fec_set_index, worker_count)
+            .min(worker_count.saturating_sub(1));
+        let worker_index = select_least_loaded_worker(worker_loads, preferred_worker);
+        self.owners.insert((slot, fec_set_index), worker_index);
+        worker_index
+    }
+
+    fn prune(&mut self, latest_slot: u64) {
+        let floor = latest_slot.saturating_sub(self.retained_slot_window);
+        if floor <= self.last_pruned_floor {
+            return;
+        }
+        self.owners.retain(|(slot, _), _| *slot >= floor);
+        self.last_pruned_floor = floor;
+    }
+}
+
+fn shard_fec_set_to_worker(slot: u64, fec_set_index: u32, worker_count: usize) -> usize {
+    let worker_count = worker_count.max(1);
+    let slot_mix = slot.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let fec_mix = u64::from(fec_set_index).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    usize::try_from(slot_mix ^ fec_mix)
+        .unwrap_or(usize::MAX)
+        .checked_rem(worker_count)
+        .unwrap_or(0)
+}
+
+fn select_least_loaded_worker(worker_loads: &[u64], preferred_worker: usize) -> usize {
+    if worker_loads.is_empty() {
+        return 0;
+    }
+    let preferred_worker = preferred_worker.min(worker_loads.len().saturating_sub(1));
+    let preferred_load = worker_loads
+        .get(preferred_worker)
+        .copied()
+        .unwrap_or(u64::MAX);
+    let mut best_worker = preferred_worker;
+    let mut best_load = preferred_load;
+    for (worker_index, &load) in worker_loads.iter().enumerate() {
+        if load < best_load {
+            best_worker = worker_index;
+            best_load = load;
+        } else if load == best_load
+            && worker_index == preferred_worker
+            && best_worker != preferred_worker
+        {
+            best_worker = worker_index;
+        }
+    }
+    best_worker
+}
+
+fn source_addr_or_unspecified(source_addr: Option<SocketAddr>) -> SocketAddr {
+    source_addr.unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+}
+
+const fn observe_source_port(
+    source_addr: SocketAddr,
+    port_8899_count: &mut u64,
+    port_8900_count: &mut u64,
+    port_other_count: &mut u64,
+) {
+    match source_addr.port() {
+        TURBINE_PRIMARY_SOURCE_PORT => {
+            *port_8899_count = port_8899_count.saturating_add(1);
+        }
+        TURBINE_SECONDARY_SOURCE_PORT => {
+            *port_8900_count = port_8900_count.saturating_add(1);
+        }
+        _ => {
+            *port_other_count = port_other_count.saturating_add(1);
+        }
+    }
 }
 
 /// Shared inputs and counters used while dispatching one fork-tracker update.
