@@ -227,7 +227,10 @@ impl PacketWorkerPool {
                     };
                     let packet_count = u64::try_from(batch.packets.len()).unwrap_or(u64::MAX);
                     let depth_after = saturating_sub_atomic(&worker_queue_depth, packet_count);
-                    worker_telemetry_state.set_queue_depth(depth_after);
+                    let worker_depth_after = worker_telemetry_state
+                        .queue_depth()
+                        .saturating_sub(packet_count);
+                    worker_telemetry_state.set_queue_depth(worker_depth_after);
                     crate::runtime_metrics::set_packet_worker_queue_depth(depth_after);
                     #[cfg(feature = "gossip-bootstrap")]
                     refresh_known_pubkeys(
