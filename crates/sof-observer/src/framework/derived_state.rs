@@ -405,8 +405,8 @@ pub struct AccountTouchObservedEvent {
     pub writable_account_keys: Arc<Vec<Pubkey>>,
     /// Read-only static account keys touched by the transaction.
     pub readonly_account_keys: Arc<Vec<Pubkey>>,
-    /// Lookup-table account keys referenced by the transaction.
-    pub lookup_table_account_keys: Arc<Vec<Pubkey>>,
+    /// Count of lookup-table account keys referenced by the transaction.
+    pub lookup_table_account_key_count: usize,
 }
 
 impl From<(u32, AccountTouchEvent)> for AccountTouchObservedEvent {
@@ -418,7 +418,7 @@ impl From<(u32, AccountTouchEvent)> for AccountTouchObservedEvent {
             account_keys: event.account_keys,
             writable_account_keys: event.writable_account_keys,
             readonly_account_keys: event.readonly_account_keys,
-            lookup_table_account_keys: event.lookup_table_account_keys,
+            lookup_table_account_key_count: event.lookup_table_account_key_count,
         }
     }
 }
