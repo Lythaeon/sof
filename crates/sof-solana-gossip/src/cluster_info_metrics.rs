@@ -14,6 +14,10 @@ use {
     },
 };
 
+fn gossip_sample_logging_enabled() -> bool {
+    crate::read_runtime_env_bool("SOF_GOSSIP_SAMPLE_LOGS_ENABLED").unwrap_or(true)
+}
+
 #[derive(Default)]
 pub(crate) struct Counter(AtomicU64);
 
@@ -719,6 +723,9 @@ pub(crate) fn last_four_chars(s: &str) -> Option<&str> {
 }
 
 pub(crate) fn log_gossip_crds_sample_egress(value: &CrdsValue, peer: &Pubkey) {
+    if !gossip_sample_logging_enabled() {
+        return;
+    }
     datapoint_info!(
         "gossip_crds_sample_egress",
         (

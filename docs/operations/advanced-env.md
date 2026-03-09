@@ -108,8 +108,10 @@ Important scope note:
 | `SOF_GOSSIP_CHANNEL_CONSUME_CAPACITY` | `1024` | Max packet batches one gossip worker pass will drain before yielding; larger values favor throughput over fairness/latency. |
 | `SOF_GOSSIP_CONSUME_THREADS` | host parallelism, clamped to `8` | Thread count for gossip socket-consume workers in the bundled backend. |
 | `SOF_GOSSIP_LISTEN_THREADS` | host parallelism, clamped to `8` | Thread count for gossip listen workers in the bundled backend. |
+| `SOF_GOSSIP_RUN_THREADS` | host parallelism, clamped to `8` | Thread count for the bundled gossip run/push-pull Rayon pool. Useful when the run loop is still underutilizing cores after listen/consume tuning. |
 | `SOF_GOSSIP_SOCKET_CONSUME_PARALLEL_PACKET_THRESHOLD` | `1024` | Below this packet count, socket-consume verification stays serial to avoid paying Rayon overhead on small batches. |
 | `SOF_GOSSIP_STATS_INTERVAL_SECS` | `10` | Controls gossip metrics reporting interval inside the bundled backend. Set to `0` to disable the metrics thread when measuring hot-path overhead. |
+| `SOF_GOSSIP_SAMPLE_LOGS_ENABLED` | `true` | Enables sampled gossip/ping datapoint logging. Set to `false` when measuring pure hot-path behavior and you do not want sampled metrics/log noise. |
 | `SOF_SHRED_VERSION` | unset | Bad override can reject valid cluster traffic. |
 | `SOF_GOSSIP_VALIDATORS` | unset | Optional comma-separated validator identity pubkeys passed to Agave gossip `gossip_validators`; constrains push/pull targets to this set and can materially lower control-plane traffic/CPU at the cost of narrower gossip mesh. |
 | `SOF_GOSSIP_ENTRYPOINT_PROBE` | `false` | Adds startup probing behavior that can delay launch. |
@@ -203,8 +205,10 @@ Programmatic equivalent for the currently supported subset:
 - `RuntimeSetup::with_gossip_channel_consume_capacity(...)`
 - `RuntimeSetup::with_gossip_consume_threads(...)`
 - `RuntimeSetup::with_gossip_listen_threads(...)`
+- `RuntimeSetup::with_gossip_run_threads(...)`
 - `RuntimeSetup::with_gossip_socket_consume_parallel_packet_threshold(...)`
 - `RuntimeSetup::with_gossip_stats_interval_secs(...)`
+- `RuntimeSetup::with_gossip_sample_logs_enabled(...)`
 - `RuntimeSetup::with_ingest_queue_mode_typed(...)`
 - `RuntimeSetup::with_sof_gossip_runtime_tuning(...)`
 - `RuntimeSetup::with_gossip_tuning_profile(...)`

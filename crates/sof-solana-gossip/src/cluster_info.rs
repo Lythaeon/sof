@@ -251,6 +251,11 @@ fn gossip_listen_threads() -> usize {
     read_usize_env("SOF_GOSSIP_LISTEN_THREADS").unwrap_or(default)
 }
 
+fn gossip_run_threads() -> usize {
+    let default = get_thread_count().min(8);
+    read_usize_env("SOF_GOSSIP_RUN_THREADS").unwrap_or(default)
+}
+
 #[derive(Debug, PartialEq, Eq, Error)]
 pub enum ClusterInfoError {
     #[error("NoPeers")]
@@ -1581,7 +1586,7 @@ impl ClusterInfo {
     ) -> JoinHandle<()> {
         let allowed_core_ids = allowed_gossip_core_ids();
         let thread_pool = ThreadPoolBuilder::new()
-            .num_threads(std::cmp::min(get_thread_count(), 8))
+            .num_threads(gossip_run_threads())
             .thread_name(|i| format!("solGossipRun{i:02}"))
             .start_handler({
                 let allowed_core_ids = allowed_core_ids.clone();

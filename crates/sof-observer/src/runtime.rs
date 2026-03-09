@@ -288,6 +288,12 @@ impl RuntimeSetup {
         self.with_env("SOF_GOSSIP_LISTEN_THREADS", thread_count.to_string())
     }
 
+    /// Sets `SOF_GOSSIP_RUN_THREADS`.
+    #[must_use]
+    pub fn with_gossip_run_threads(self, thread_count: usize) -> Self {
+        self.with_env("SOF_GOSSIP_RUN_THREADS", thread_count.to_string())
+    }
+
     /// Sets `SOF_GOSSIP_SOCKET_CONSUME_PARALLEL_PACKET_THRESHOLD`.
     #[must_use]
     pub fn with_gossip_socket_consume_parallel_packet_threshold(
@@ -306,6 +312,12 @@ impl RuntimeSetup {
     #[must_use]
     pub fn with_gossip_stats_interval_secs(self, interval_secs: u64) -> Self {
         self.with_env("SOF_GOSSIP_STATS_INTERVAL_SECS", interval_secs.to_string())
+    }
+
+    /// Sets `SOF_GOSSIP_SAMPLE_LOGS_ENABLED`.
+    #[must_use]
+    pub fn with_gossip_sample_logs_enabled(self, enabled: bool) -> Self {
+        self.with_env("SOF_GOSSIP_SAMPLE_LOGS_ENABLED", enabled.to_string())
     }
 
     /// Sets `SOF_DATASET_MAX_TRACKED_SLOTS`.
@@ -1382,8 +1394,16 @@ mod tests {
     #[test]
     fn direct_gossip_backend_tuning_sets_expected_env_overrides() {
         let setup = RuntimeSetup::new()
+            .with_gossip_run_threads(6)
             .with_gossip_socket_consume_parallel_packet_threshold(2048)
-            .with_gossip_stats_interval_secs(0);
+            .with_gossip_stats_interval_secs(0)
+            .with_gossip_sample_logs_enabled(false);
+
+        assert!(
+            setup
+                .env_overrides
+                .contains(&(String::from("SOF_GOSSIP_RUN_THREADS"), String::from("6")))
+        );
 
         assert!(setup.env_overrides.contains(&(
             String::from("SOF_GOSSIP_SOCKET_CONSUME_PARALLEL_PACKET_THRESHOLD"),
@@ -1392,6 +1412,10 @@ mod tests {
         assert!(setup.env_overrides.contains(&(
             String::from("SOF_GOSSIP_STATS_INTERVAL_SECS"),
             String::from("0")
+        )));
+        assert!(setup.env_overrides.contains(&(
+            String::from("SOF_GOSSIP_SAMPLE_LOGS_ENABLED"),
+            String::from("false")
         )));
     }
 

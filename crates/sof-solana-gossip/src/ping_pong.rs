@@ -23,6 +23,10 @@ const KEY_REFRESH_CADENCE: Duration = Duration::from_secs(60);
 const PING_PONG_HASH_PREFIX: &[u8] = "SOLANA_PING_PONG".as_bytes();
 const PONG_SIGNATURE_SAMPLE_LEADING_ZEROS: u32 = 5;
 
+fn ping_rtt_logging_enabled() -> bool {
+    crate::read_runtime_env_bool("SOF_GOSSIP_SAMPLE_LOGS_ENABLED").unwrap_or(true)
+}
+
 // For backward compatibility we are using a const generic parameter here.
 // N should always be >= 8 and only the first 8 bytes are used. So the new code
 // should only use N == 8.
@@ -186,10 +190,12 @@ impl<const N: usize> PingCache<N> {
         };
         self.pongs.put(remote_node, now);
         if let Some(sent_time) = self.ping_times.pop(&socket.ip()) {
-            if should_report_message_signature(
-                pong.signature(),
-                PONG_SIGNATURE_SAMPLE_LEADING_ZEROS,
-            ) {
+            if ping_rtt_logging_enabled()
+                && should_report_message_signature(
+                    pong.signature(),
+                    PONG_SIGNATURE_SAMPLE_LEADING_ZEROS,
+                )
+            {
                 let rtt = now.saturating_duration_since(sent_time);
                 datapoint_info!(
                     "ping_rtt",
