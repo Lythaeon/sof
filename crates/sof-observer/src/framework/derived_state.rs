@@ -3487,6 +3487,7 @@ struct DerivedStateControlPlaneTracker {
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+/// Outcome flags returned after applying one recent-blockhash observation.
 struct RecentBlockhashUpdate {
     /// Whether the tracked recent blockhash changed.
     hash_changed: bool,
