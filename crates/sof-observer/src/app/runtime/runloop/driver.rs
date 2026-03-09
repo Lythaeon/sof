@@ -21,7 +21,8 @@ pub(in crate::app::runtime) enum RuntimeRunloopError {
 
 // Runtime coordination defaults kept local to the runloop for operational clarity.
 const TX_EVENT_CHANNEL_CAPACITY: usize = 65_536;
-const TELEMETRY_INTERVAL_SECS: u64 = 5;
+const TELEMETRY_INTERVAL_SECS: u64 = 15;
+const TELEMETRY_INFO_EVERY_TICKS: u64 = 4;
 const TURBINE_PRIMARY_SOURCE_PORT: u16 = 8_899;
 const TURBINE_SECONDARY_SOURCE_PORT: u16 = 8_900;
 const INITIAL_DEBUG_SAMPLE_LOG_LIMIT: u64 = 5;
@@ -32,6 +33,7 @@ const CONTROL_PLANE_EVENT_TICK_MS: u64 = 250;
 #[cfg(feature = "gossip-bootstrap")]
 const CONTROL_PLANE_EVENT_SNAPSHOT_SECS: u64 = 30;
 const PACKET_WORKER_QUEUE_OVERFLOW_POLICY: &str = "drop_newest";
+const PACKET_WORKER_FEC_PRESSURE_DIVISOR: u64 = 8;
 
 const fn feed_watermarks_from_fork_snapshot(
     snapshot: crate::app::state::ForkTrackerSnapshot,
@@ -139,6 +141,7 @@ async fn run_async_with_hosts_inner(
     let dataset_attempt_failure_ttl = Duration::from_millis(read_dataset_attempt_failure_ttl_ms());
     let log_all_txs = read_log_all_txs();
     let log_non_vote_txs = read_log_non_vote_txs();
+    let skip_vote_only_tx_detail_path = read_skip_vote_only_tx_detail_path();
     let log_dataset_reconstruction = read_log_dataset_reconstruction();
     let tx_confirmed_depth_slots = read_tx_confirmed_depth_slots();
     let tx_finalized_depth_slots = read_tx_finalized_depth_slots().max(tx_confirmed_depth_slots);
@@ -169,6 +172,9 @@ async fn run_async_with_hosts_inner(
             attempt_success_ttl: dataset_attempt_success_ttl,
             attempt_failure_ttl: dataset_attempt_failure_ttl,
             log_dataset_reconstruction,
+            log_all_txs,
+            log_non_vote_txs,
+            skip_vote_only_tx_detail_path,
         },
         &dataset_worker_shared,
     );
@@ -544,7 +550,9 @@ async fn run_async_with_hosts_inner(
     let mut gossip_runtime_stall_started_at: Option<Instant> = None;
 
     let dataset_max_tracked_slots = read_dataset_max_tracked_slots();
+    let dataset_retained_slot_lag = read_dataset_retained_slot_lag();
     let fec_max_tracked_sets = read_fec_max_tracked_sets();
+    let fec_retained_slot_lag = read_fec_retained_slot_lag();
     let packet_workers = read_packet_workers();
     let packet_worker_queue_capacity = read_packet_worker_queue_capacity();
     let dataset_tail_min_shreds_without_anchor = read_dataset_tail_min_shreds_without_anchor();
@@ -558,10 +566,14 @@ async fn run_async_with_hosts_inner(
         verify_slot_leader_window,
         verify_unknown_retry,
         fec_max_tracked_sets,
+        fec_retained_slot_lag,
     });
+    let packet_worker_assignment_slot_window =
+        usize::try_from(fec_retained_slot_lag.max(32)).unwrap_or(usize::MAX);
     let mut packet_worker_assignments =
-        PacketWorkerAssignments::new(dataset_max_tracked_slots.max(32));
+        PacketWorkerAssignments::new(packet_worker_assignment_slot_window);
     let mut dataset_reassembler = DataSetReassembler::new(dataset_max_tracked_slots)
+        .with_retained_slot_lag(dataset_retained_slot_lag)
         .with_tail_min_shreds_without_anchor(dataset_tail_min_shreds_without_anchor);
     let mut packet_count: u64 = 0;
     let mut source_port_8899_packets: u64 = 0;
@@ -779,6 +791,7 @@ async fn run_async_with_hosts_inner(
     let mut emitted_slot_leaders: HashMap<u64, [u8; 32]> = HashMap::new();
     let mut coverage_window = SlotCoverageWindow::new(read_coverage_window_slots());
     let mut telemetry_tick = interval(Duration::from_secs(TELEMETRY_INTERVAL_SECS));
+    let mut telemetry_tick_count: u64 = 0;
     let mut repair_tick = interval(Duration::from_millis(read_repair_tick_ms()));
     let mut control_plane_tick = interval(Duration::from_millis(CONTROL_PLANE_EVENT_TICK_MS));
     let derived_state_checkpoint_enabled =
@@ -803,6 +816,9 @@ async fn run_async_with_hosts_inner(
         dataset_attempt_cache_capacity,
         packet_workers,
         packet_worker_queue_capacity,
+        dataset_retained_slot_lag,
+        fec_retained_slot_lag,
+        skip_vote_only_tx_detail_path,
         packet_worker_queue_overflow_policy = PACKET_WORKER_QUEUE_OVERFLOW_POLICY,
         dedupe_capacity,
         dedupe_ttl_ms,
@@ -933,6 +949,7 @@ async fn run_async_with_hosts_inner(
                     outstanding_repairs: &mut outstanding_repairs,
                     repair_outstanding_cleared_on_receive: &mut repair_outstanding_cleared_on_receive,
                     dataset_reassembler: &mut dataset_reassembler,
+                    dataset_retained_slot_lag,
                     dataset_worker_queues: dataset_worker_pool.queues(),
                     dataset_jobs_enqueued_count: dataset_jobs_enqueued_count.as_ref(),
                     dataset_queue_drop_count: dataset_queue_drop_count.as_ref(),
@@ -993,7 +1010,10 @@ async fn run_async_with_hosts_inner(
                     packet_worker_pool.close_inputs();
                     continue;
                 };
-                let mut worker_loads = packet_worker_pool.worker_queue_depths();
+                let mut worker_loads = combine_packet_worker_pressure(
+                    &packet_worker_pool.worker_queue_depths(),
+                    &packet_worker_pool.tracked_fec_sets_by_worker(),
+                );
                 let mut worker_batches: Vec<Vec<PacketWorkerInput>> = (0..packet_worker_pool.worker_count())
                     .map(|_| Vec::new())
                     .collect();
@@ -1002,7 +1022,7 @@ async fn run_async_with_hosts_inner(
                     let source_addr = packet.source;
                     let packet_bytes = packet.bytes;
                     let shared_observer_packet = (plugin_hooks_enabled || extension_hooks_enabled)
-                        .then(|| Arc::<[u8]>::from(packet_bytes.as_slice()));
+                        .then(|| Arc::clone(&packet_bytes));
                     if plugin_hooks_enabled
                         && let Some(shared_packet) = shared_observer_packet.as_ref()
                     {
@@ -1033,11 +1053,11 @@ async fn run_async_with_hosts_inner(
                     }
                     #[cfg(feature = "gossip-bootstrap")]
                     if repair_driver_enabled
-                        && crate::repair::is_repair_response_ping_packet(&packet_bytes)
+                        && crate::repair::is_repair_response_ping_packet(packet_bytes.as_ref())
                         && let Some(command_tx) = repair_command_tx.as_ref()
                     {
                         match command_tx.try_send(RepairCommand::HandleResponsePing {
-                            packet: packet_bytes.clone(),
+                            packet: packet_bytes.as_ref().to_vec(),
                             from_addr: source_addr,
                         }) {
                             Ok(()) => {
@@ -1054,11 +1074,11 @@ async fn run_async_with_hosts_inner(
                     }
                     #[cfg(feature = "gossip-bootstrap")]
                     if repair_driver_enabled
-                        && crate::repair::is_supported_repair_request_packet(&packet_bytes)
+                        && crate::repair::is_supported_repair_request_packet(packet_bytes.as_ref())
                         && let Some(command_tx) = repair_command_tx.as_ref()
                     {
                         match command_tx.try_send(RepairCommand::HandleServeRequest {
-                            packet: packet_bytes.clone(),
+                            packet: packet_bytes.as_ref().to_vec(),
                             from_addr: source_addr,
                         }) {
                             Ok(()) => {
@@ -1085,7 +1105,7 @@ async fn run_async_with_hosts_inner(
                             source_port_other_packets = source_port_other_packets.saturating_add(1);
                         }
                     }
-                    let parsed_shred = match parse_shred_header(&packet_bytes) {
+                    let parsed_shred = match parse_shred_header(packet_bytes.as_ref()) {
                         Ok(parsed) => parsed,
                         Err(error) => {
                             parse_error_count = parse_error_count.saturating_add(1);
@@ -1118,7 +1138,7 @@ async fn run_async_with_hosts_inner(
                         }
                     };
                     if let Some(cache) = dedupe_cache.as_mut()
-                        && cache.is_recent_duplicate(&packet_bytes, &parsed_shred, observed_at)
+                        && cache.is_recent_duplicate(packet_bytes.as_ref(), &parsed_shred, observed_at)
                     {
                         dedupe_drop_count = dedupe_drop_count.saturating_add(1);
                         continue;
@@ -1138,7 +1158,7 @@ async fn run_async_with_hosts_inner(
                     if plugin_hooks_enabled {
                         plugin_host.on_shred(ShredEvent {
                             source: source_addr,
-                            packet: Arc::from(packet_bytes.as_slice()),
+                            packet: Arc::clone(&packet_bytes),
                             parsed: Arc::new(parsed_shred.clone()),
                         });
                     }
@@ -1204,7 +1224,7 @@ async fn run_async_with_hosts_inner(
                                         }
                                         udp_relay_send_attempts =
                                             udp_relay_send_attempts.saturating_add(1);
-                                        match socket.send_to(packet_bytes.as_slice(), peer) {
+                                        match socket.send_to(packet_bytes.as_ref(), peer) {
                                             Ok(_) => {
                                                 udp_relay_send_error_streak = 0;
                                                 udp_relay_sends_in_window =
@@ -1893,6 +1913,9 @@ async fn run_async_with_hosts_inner(
                 let dataset_jobs_started = dataset_jobs_started_count.load(Ordering::Relaxed);
                 let dataset_jobs_completed = dataset_jobs_completed_count.load(Ordering::Relaxed);
                 let dataset_queue_drops = dataset_queue_drop_count.load(Ordering::Relaxed);
+                let dataset_worker_count = dataset_worker_pool.queues().len();
+                let dataset_queue_capacity_total =
+                    dataset_queue_capacity.saturating_mul(dataset_worker_count);
                 let dataset_jobs_pending = dataset_jobs_enqueued
                     .saturating_sub(dataset_jobs_completed.saturating_add(dataset_queue_drops));
                 let dataset_queue_depth = dataset_worker_pool
@@ -1968,7 +1991,277 @@ async fn run_async_with_hosts_inner(
                 let derived_state_replay_telemetry =
                     derived_state_host.replay_telemetry().unwrap_or_default();
                 let runtime_stage_metrics = crate::runtime_metrics::snapshot();
-                tracing::info!(
+                telemetry_tick_count = telemetry_tick_count.saturating_add(1);
+                let dataset_queue_pressure = dataset_queue_capacity_total > 0
+                    && dataset_queue_depth >= (dataset_queue_capacity_total / 2).max(1);
+                let packet_worker_queue_pressure = packet_worker_queue_capacity > 0
+                    && runtime_stage_metrics.packet_worker_queue_depth
+                        >= u64::try_from((packet_worker_queue_capacity / 2).max(1))
+                            .unwrap_or(u64::MAX);
+                let telemetry_requires_warning = ingest_dropped_packets > 0
+                    || ingest_dropped_batches > 0
+                    || ingest_rxq_ovfl_drops > 0
+                    || dataset_queue_drops > 0
+                    || dataset_queue_pressure
+                    || packet_worker_queue_pressure
+                    || runtime_stage_metrics.packet_worker_dropped_batches_total > 0
+                    || runtime_stage_metrics.packet_worker_dropped_packets_total > 0
+                    || tx_event_drop_count.load(Ordering::Relaxed) > 0
+                    || extension_dispatch.dropped_events > 0
+                    || derived_state_unhealthy_consumers > 0
+                    || derived_state_pending_recovery > 0
+                    || derived_state_rebuild_required > 0
+                    || derived_state_fault_total > 0;
+                let telemetry_log_now = telemetry_requires_warning
+                    || telemetry_tick_count.checked_rem(TELEMETRY_INFO_EVERY_TICKS).unwrap_or(0)
+                        == 0;
+                if telemetry_log_now && telemetry_requires_warning {
+                    tracing::warn!(
+                        packets = packet_count,
+                        source_8899_packets = source_port_8899_packets,
+                        source_8900_packets = source_port_8900_packets,
+                        source_other_packets = source_port_other_packets,
+                        data = data_count,
+                        code = code_count,
+                        source_8899_data = source_port_8899_data,
+                        source_8900_data = source_port_8900_data,
+                        source_other_data = source_port_other_data,
+                        source_8899_code = source_port_8899_code,
+                        source_8900_code = source_port_8900_code,
+                        source_other_code = source_port_other_code,
+                        ingest_packets_seen,
+                        ingest_sent_packets,
+                        ingest_sent_batches,
+                        ingest_dropped_packets,
+                        ingest_dropped_batches,
+                        ingest_rxq_ovfl_drops,
+                        ingest_last_packet_age_ms,
+                        recovered_data = recovered_data_count,
+                        data_complete = data_complete_count,
+                        last_in_slot = last_in_slot_count,
+                        dataset_ranges_emitted,
+                        dataset_ranges_emitted_from_recovered,
+                        parse_errors = parse_error_count,
+                        parse_too_short = parse_too_short_count,
+                        parse_invalid_variant = parse_invalid_variant_count,
+                        parse_invalid_data_size = parse_invalid_data_size_count,
+                        parse_invalid_coding = parse_invalid_coding_header_count,
+                        parse_other = parse_other_count,
+                        relay_cache_enabled = relay_cache.is_some(),
+                        relay_cache_window_ms = relay_cache_window_ms,
+                        relay_cache_max_shreds = relay_cache_max_shreds,
+                        relay_cache_entries = relay_cache.as_ref().map_or(0, SharedRelayCache::len),
+                        relay_cache_inserts = relay_cache_inserts,
+                        relay_cache_replacements = relay_cache_replacements,
+                        relay_cache_evictions = relay_cache_evictions,
+                        udp_relay_enabled = udp_relay_enabled,
+                        udp_relay_refresh_ms = udp_relay_refresh_ms_telemetry,
+                        udp_relay_peer_candidates = udp_relay_peer_candidates_telemetry,
+                        udp_relay_fanout = udp_relay_fanout_telemetry,
+                        udp_relay_max_sends_per_sec =
+                            udp_relay_max_sends_per_sec_telemetry,
+                        udp_relay_max_peers_per_ip = udp_relay_max_peers_per_ip_telemetry,
+                        udp_relay_require_turbine_source_ports =
+                            udp_relay_require_turbine_source_ports_telemetry,
+                        udp_relay_send_error_backoff_ms =
+                            udp_relay_send_error_backoff_ms_telemetry,
+                        udp_relay_send_error_backoff_threshold =
+                            udp_relay_send_error_backoff_threshold_telemetry,
+                        udp_relay_candidates = udp_relay_candidates,
+                        udp_relay_peers = udp_relay_peers_telemetry,
+                        udp_relay_refreshes = udp_relay_refreshes,
+                        udp_relay_forwarded_packets = udp_relay_forwarded_packets,
+                        udp_relay_send_attempts = udp_relay_send_attempts,
+                        udp_relay_send_errors = udp_relay_send_errors,
+                        udp_relay_rate_limited_packets =
+                            udp_relay_rate_limited_packets,
+                        udp_relay_source_filtered_packets = udp_relay_source_filtered_packets,
+                        udp_relay_backoff_events = udp_relay_backoff_events,
+                        udp_relay_backoff_drops = udp_relay_backoff_drops,
+                        dedupe_enabled = dedupe_cache.is_some(),
+                        dedupe_capacity = dedupe_capacity,
+                        dedupe_ttl_ms = dedupe_ttl_ms,
+                        dedupe_entries = dedupe_cache.as_ref().map_or(0, RecentShredCache::len),
+                        dedupe_drops = dedupe_drop_count,
+                        tx_event_drops = tx_event_drop_count.load(Ordering::Relaxed),
+                        runtime_extension_active = extension_dispatch.active_extensions,
+                        runtime_extension_dispatched = extension_dispatch.dispatched_events,
+                        runtime_extension_dropped = extension_dispatch.dropped_events,
+                        runtime_extension_queue_depth = extension_dispatch.queue_depth,
+                        runtime_extension_max_queue_depth = extension_dispatch.max_queue_depth,
+                        runtime_extension_max_avg_dispatch_lag_us =
+                            extension_dispatch.max_avg_dispatch_lag_us,
+                        runtime_extension_max_dispatch_lag_us =
+                            extension_dispatch.max_dispatch_lag_us,
+                        derived_state_enabled = derived_state_hooks_enabled,
+                        derived_state_checkpoint_interval_ms = derived_state_checkpoint_interval_ms,
+                        derived_state_recovery_interval_ms = derived_state_recovery_interval_ms,
+                        derived_state_healthy_consumers = derived_state_healthy_consumers,
+                        derived_state_unhealthy_consumers = derived_state_unhealthy_consumers,
+                        derived_state_pending_recovery = derived_state_pending_recovery,
+                        derived_state_rebuild_required = derived_state_rebuild_required,
+                        derived_state_fault_total = derived_state_fault_total,
+                        derived_state_last_sequence = derived_state_last_sequence,
+                        derived_state_replay_enabled = derived_state_replay_telemetry.enabled,
+                        derived_state_replay_backend = %derived_state_replay_telemetry.backend,
+                        derived_state_replay_retained_sessions =
+                            derived_state_replay_telemetry.retained_sessions,
+                        derived_state_replay_retained_envelopes =
+                            derived_state_replay_telemetry.retained_envelopes,
+                        derived_state_replay_truncated_envelopes =
+                            derived_state_replay_telemetry.truncated_envelopes,
+                        derived_state_replay_append_failures =
+                            derived_state_replay_telemetry.append_failures,
+                        derived_state_replay_load_failures =
+                            derived_state_replay_telemetry.load_failures,
+                        derived_state_replay_compactions =
+                            derived_state_replay_telemetry.compactions,
+                        derived_state_pending_recovery_consumers =
+                            ?derived_state_pending_recovery_names,
+                        derived_state_rebuild_consumers = ?derived_state_rebuild_names,
+                        derived_state_consumers = ?derived_state_consumer_telemetry,
+                        dataset_decode_failures = dataset_decode_fail_count.load(Ordering::Relaxed),
+                        dataset_tail_skips = dataset_tail_skip_count.load(Ordering::Relaxed),
+                        dataset_duplicate_drops = dataset_duplicate_drop_count.load(Ordering::Relaxed),
+                        dataset_queue_capacity_per_worker = dataset_queue_capacity,
+                        dataset_queue_capacity_total = dataset_queue_capacity_total,
+                        dataset_worker_count = dataset_worker_count,
+                        dataset_queue_drops = dataset_queue_drops,
+                        dataset_queue_depth = dataset_queue_depth,
+                        dataset_jobs_enqueued,
+                        dataset_jobs_started,
+                        dataset_jobs_completed,
+                        dataset_jobs_pending,
+                        packet_worker_queue_depth = runtime_stage_metrics.packet_worker_queue_depth,
+                        packet_worker_max_queue_depth =
+                            runtime_stage_metrics.packet_worker_max_queue_depth,
+                        packet_worker_queue_depth_local = packet_worker_pool.queue_depth(),
+                        packet_worker_max_queue_depth_local = packet_worker_pool.max_queue_depth(),
+                        packet_worker_queue_overflow_policy =
+                            PACKET_WORKER_QUEUE_OVERFLOW_POLICY,
+                        packet_worker_queue_depths = ?packet_worker_pool.worker_queue_depths(),
+                        packet_worker_dropped_batches =
+                            runtime_stage_metrics.packet_worker_dropped_batches_total,
+                        packet_worker_dropped_packets =
+                            runtime_stage_metrics.packet_worker_dropped_packets_total,
+                        dataset_slots_tracked = dataset_reassembler.tracked_slots(),
+                        dataset_max_tracked_slots = dataset_max_tracked_slots,
+                        fec_sets_tracked = packet_worker_pool.tracked_fec_sets(),
+                        fec_sets_tracked_by_worker = ?packet_worker_pool.tracked_fec_sets_by_worker(),
+                        fec_max_tracked_sets = fec_max_tracked_sets,
+                        vote_only = vote_only_count,
+                        mixed = mixed_count,
+                        non_vote = non_vote_count,
+                        verify_verified = verify_verified_count,
+                        verify_unknown_leader = verify_unknown_leader_count,
+                        verify_invalid_merkle = verify_invalid_merkle_count,
+                        verify_invalid_signature = verify_invalid_signature_count,
+                        verify_malformed = verify_malformed_count,
+                        verify_dropped = verify_dropped_count,
+                        verify_recovered_enabled = verify_recovered_shreds,
+                        repair_requests_total = repair_requests_total,
+                        repair_requests_enqueued = repair_requests_enqueued,
+                        repair_requests_sent = repair_requests_sent,
+                        repair_requests_no_peer = repair_requests_no_peer,
+                        repair_request_errors = repair_request_errors,
+                        repair_request_queue_drops = repair_request_queue_drops,
+                        repair_requests_port_8899 = repair_requests_port_8899,
+                        repair_requests_port_8900 = repair_requests_port_8900,
+                        repair_requests_port_other = repair_requests_port_other,
+                        repair_requests_window_index = repair_requests_window_index,
+                        repair_requests_highest_window_index = repair_requests_highest_window_index,
+                        repair_requests_skipped_outstanding = repair_requests_skipped_outstanding,
+                        repair_outstanding_entries = outstanding_repairs
+                            .as_ref()
+                            .map_or(0, OutstandingRepairRequests::len),
+                        repair_outstanding_purged = repair_outstanding_purged,
+                        repair_outstanding_cleared_on_receive = repair_outstanding_cleared_on_receive,
+                        repair_outstanding_timeout_ms = repair_outstanding_timeout_ms,
+                        repair_tip_stall_ms = repair_tip_stall_ms,
+                        repair_dataset_stall_ms = repair_dataset_stall_ms,
+                        repair_stall_sustain_ms = repair_stall_sustain_ms,
+                        repair_tip_probe_ahead_slots = repair_tip_probe_ahead_slots,
+                        repair_min_slot_lag = repair_min_slot_lag,
+                        repair_min_slot_lag_stalled = repair_min_slot_lag_stalled,
+                        repair_dynamic_stalled = repair_dynamic_stalled,
+                        repair_dynamic_dataset_stalled = repair_dynamic_dataset_stalled,
+                        repair_dynamic_stream_progress = repair_dynamic_stream_progress,
+                        repair_dynamic_stream_healthy = repair_dynamic_stream_healthy,
+                        repair_dynamic_min_slot_lag = repair_dynamic_min_slot_lag,
+                        repair_per_slot_cap = repair_per_slot_cap,
+                        repair_per_slot_cap_stalled = repair_per_slot_cap_stalled,
+                        repair_dynamic_per_slot_cap = repair_dynamic_per_slot_cap,
+                        repair_max_requests_per_tick = repair_max_requests_per_tick,
+                        repair_max_requests_per_tick_stalled = repair_max_requests_per_tick_stalled,
+                        repair_dynamic_max_requests_per_tick = repair_dynamic_max_requests_per_tick,
+                        repair_max_highest_per_tick = repair_max_highest_per_tick,
+                        repair_max_highest_per_tick_stalled = repair_max_highest_per_tick_stalled,
+                        repair_dynamic_max_highest_per_tick = repair_dynamic_max_highest_per_tick,
+                        repair_max_forward_probe_per_tick = repair_max_forward_probe_per_tick,
+                        repair_max_forward_probe_per_tick_stalled = repair_max_forward_probe_per_tick_stalled,
+                        repair_dynamic_max_forward_probe_per_tick = repair_dynamic_max_forward_probe_per_tick,
+                        repair_seed_slot = 0,
+                        repair_seed_slots = 0,
+                        repair_seed_failures = 0,
+                        repair_response_pings = repair_response_pings,
+                        repair_response_ping_errors = repair_response_ping_errors,
+                        repair_ping_queue_drops = repair_ping_queue_drops,
+                        repair_serve_requests_enqueued = repair_serve_requests_enqueued,
+                        repair_serve_requests_handled = repair_serve_requests_handled,
+                        repair_serve_responses_sent = repair_serve_responses_sent,
+                        repair_serve_cache_misses = repair_serve_cache_misses,
+                        repair_serve_rate_limited = repair_serve_rate_limited,
+                        repair_serve_rate_limited_peer = repair_serve_rate_limited_peer,
+                        repair_serve_rate_limited_bytes = repair_serve_rate_limited_bytes,
+                        repair_serve_errors = repair_serve_errors,
+                        repair_serve_queue_drops = repair_serve_queue_drops,
+                        repair_source_hint_enqueued = repair_source_hint_enqueued,
+                        repair_source_hint_drops = repair_source_hint_drops,
+                        repair_source_hint_buffer_drops = repair_source_hint_buffer_drops,
+                        gossip_active_entrypoint = gossip_active_entrypoint,
+                        gossip_runtime_switch_enabled = gossip_switch_enabled,
+                        gossip_runtime_switch_stall_ms = gossip_switch_stall_ms,
+                        gossip_runtime_switch_dataset_stall_ms = gossip_switch_dataset_stall_ms,
+                        gossip_runtime_switch_warmup_ms = gossip_switch_warmup_ms,
+                        gossip_runtime_switch_overlap_ms = gossip_switch_overlap_ms,
+                        gossip_runtime_switch_sustain_ms = gossip_switch_sustain_ms,
+                        gossip_runtime_switch_attempts = gossip_switch_attempts,
+                        gossip_runtime_switch_successes = gossip_switch_successes,
+                        gossip_runtime_switch_failures = gossip_switch_fails,
+                        repair_peer_total = repair_peer_total,
+                        repair_peer_active = repair_peer_active,
+                        latest_shred_slot = latest_shred_slot.unwrap_or_default(),
+                        fork_window_slots = fork_window_slots,
+                        fork_slots_tracked = u64::try_from(fork_snapshot.tracked_slots).unwrap_or(u64::MAX),
+                        fork_tip_slot = fork_snapshot.tip_slot.unwrap_or_default(),
+                        fork_confirmed_slot = fork_snapshot.confirmed_slot.unwrap_or_default(),
+                        fork_finalized_slot = fork_snapshot.finalized_slot.unwrap_or_default(),
+                        fork_status_transitions = fork_status_transitions_total,
+                        fork_reorgs = fork_reorg_count,
+                        fork_orphaned_slots = fork_orphaned_slots_total,
+                        tx_confirmed_slot =
+                            tx_commitment_tracker.snapshot().confirmed_slot.unwrap_or_default(),
+                        tx_finalized_slot =
+                            tx_commitment_tracker.snapshot().finalized_slot.unwrap_or_default(),
+                        latest_shred_age_ms = duration_to_ms_u64(
+                            Instant::now().saturating_duration_since(latest_shred_updated_at)
+                        ),
+                        latest_dataset_age_ms = duration_to_ms_u64(
+                            Instant::now().saturating_duration_since(last_dataset_reconstructed_at)
+                        ),
+                        gossip_runtime_age_ms = gossip_runtime_age_ms,
+                        gossip_runtime_stall_age_ms = gossip_runtime_stall_age_ms,
+                        window_slots = coverage.slots_tracked,
+                        window_slots_with_tx = coverage.slots_with_tx,
+                        window_tx_total = coverage.tx_total,
+                        window_dataset_total = coverage.dataset_total,
+                        window_data_shreds = coverage.data_shreds,
+                        window_code_shreds = coverage.code_shreds,
+                        window_recovered_data = coverage.recovered_data_shreds,
+                        "ingest telemetry pressure detected"
+                    );
+                } else if telemetry_log_now {
+                    tracing::info!(
                     packets = packet_count,
                     source_8899_packets = source_port_8899_packets,
                     source_8900_packets = source_port_8900_packets,
@@ -2075,7 +2368,9 @@ async fn run_async_with_hosts_inner(
                     dataset_decode_failures = dataset_decode_fail_count.load(Ordering::Relaxed),
                     dataset_tail_skips = dataset_tail_skip_count.load(Ordering::Relaxed),
                     dataset_duplicate_drops = dataset_duplicate_drop_count.load(Ordering::Relaxed),
-                    dataset_queue_capacity = dataset_queue_capacity,
+                    dataset_queue_capacity_per_worker = dataset_queue_capacity,
+                    dataset_queue_capacity_total = dataset_queue_capacity_total,
+                    dataset_worker_count = dataset_worker_count,
                     dataset_queue_drops = dataset_queue_drops,
                     dataset_queue_depth = dataset_queue_depth,
                     dataset_jobs_enqueued,
@@ -2208,8 +2503,9 @@ async fn run_async_with_hosts_inner(
                     window_data_shreds = coverage.data_shreds,
                     window_code_shreds = coverage.code_shreds,
                     window_recovered_data = coverage.recovered_data_shreds,
-                    "ingest telemetry"
-                );
+                        "ingest telemetry"
+                    );
+                }
                 if derived_state_hooks_enabled && !derived_state_unhealthy_names.is_empty() {
                     tracing::warn!(
                         unhealthy_consumers = ?derived_state_unhealthy_names,
@@ -2259,27 +2555,51 @@ async fn run_async_with_hosts_inner(
                     }
                     continue;
                 };
-                match event.kind {
-                    TxKind::VoteOnly => {
-                        vote_only_count = vote_only_count.saturating_add(1);
+                match event {
+                    TxObservedEvent::Detailed {
+                        slot,
+                        signature,
+                        kind,
+                        commitment_status,
+                    } => {
+                        match kind {
+                            TxKind::VoteOnly => {
+                                vote_only_count = vote_only_count.saturating_add(1);
+                            }
+                            TxKind::Mixed => {
+                                mixed_count = mixed_count.saturating_add(1);
+                            }
+                            TxKind::NonVote => {
+                                non_vote_count = non_vote_count.saturating_add(1);
+                            }
+                        }
+                        coverage_window.on_tx(slot);
+                        last_dataset_reconstructed_at = Instant::now();
+                        if log_all_txs || (log_non_vote_txs && !matches!(kind, TxKind::VoteOnly)) {
+                            tracing::info!(
+                                slot,
+                                signature = %signature,
+                                kind = ?kind,
+                                commitment_status = ?commitment_status,
+                                "tx observed"
+                            );
+                        }
                     }
-                    TxKind::Mixed => {
-                        mixed_count = mixed_count.saturating_add(1);
+                    TxObservedEvent::Summary {
+                        slot,
+                        vote_only,
+                        mixed,
+                        non_vote,
+                    } => {
+                        vote_only_count = vote_only_count.saturating_add(vote_only);
+                        mixed_count = mixed_count.saturating_add(mixed);
+                        non_vote_count = non_vote_count.saturating_add(non_vote);
+                        coverage_window.on_tx_count(
+                            slot,
+                            vote_only.saturating_add(mixed).saturating_add(non_vote),
+                        );
+                        last_dataset_reconstructed_at = Instant::now();
                     }
-                    TxKind::NonVote => {
-                        non_vote_count = non_vote_count.saturating_add(1);
-                    }
-                }
-                coverage_window.on_tx(event.slot);
-                last_dataset_reconstructed_at = Instant::now();
-                if log_all_txs || (log_non_vote_txs && !matches!(event.kind, TxKind::VoteOnly)) {
-                    tracing::info!(
-                        slot = event.slot,
-                        signature = %event.signature,
-                        kind = ?event.kind,
-                        commitment_status = ?event.commitment_status,
-                        "tx observed"
-                    );
                 }
             }
         }
@@ -2359,6 +2679,7 @@ struct PacketWorkerResultContext<'context> {
     outstanding_repairs: &'context mut Option<OutstandingRepairRequests>,
     repair_outstanding_cleared_on_receive: &'context mut u64,
     dataset_reassembler: &'context mut DataSetReassembler,
+    dataset_retained_slot_lag: u64,
     dataset_worker_queues: &'context [DatasetDispatchQueue],
     dataset_jobs_enqueued_count: &'context AtomicU64,
     dataset_queue_drop_count: &'context AtomicU64,
@@ -2442,7 +2763,7 @@ impl PacketWorkerResultContext<'_> {
                     data_complete,
                     last_in_slot,
                     reference_tick,
-                    shred.serialized_shred,
+                    shred.payload_fragment,
                     observed_at,
                     Some(source_addr),
                     false,
@@ -2473,7 +2794,7 @@ impl PacketWorkerResultContext<'_> {
                     data_complete,
                     last_in_slot,
                     reference_tick,
-                    shred.serialized_shred,
+                    shred.payload_fragment,
                     observed_at,
                     None,
                     true,
@@ -2493,7 +2814,7 @@ impl PacketWorkerResultContext<'_> {
         data_complete: bool,
         last_in_slot: bool,
         reference_tick: u8,
-        serialized_shred: Option<Vec<u8>>,
+        payload_fragment: Option<crate::reassembly::dataset::SharedPayloadFragment>,
         observed_at: Instant,
         source_addr: Option<SocketAddr>,
         recovered: bool,
@@ -2555,13 +2876,19 @@ impl PacketWorkerResultContext<'_> {
             }
         }
 
-        if let Some(serialized_shred) = serialized_shred {
+        if let Some(payload_fragment) = payload_fragment {
+            if let Some(slot_floor) = self.dataset_slot_floor() {
+                self.dataset_reassembler.purge_older_than(slot_floor);
+                if slot < slot_floor {
+                    return;
+                }
+            }
             let completed_datasets = self.dataset_reassembler.ingest_data_shred_meta(
                 slot,
                 index,
                 data_complete,
                 last_in_slot,
-                serialized_shred,
+                payload_fragment,
             );
             let completed_count = self.dispatch_completed_datasets(completed_datasets, observed_at);
             summary.completed_dataset_count = summary
@@ -2608,22 +2935,33 @@ impl PacketWorkerResultContext<'_> {
         completed_datasets: Vec<CompletedDataSet>,
         observed_at: Instant,
     ) -> u64 {
-        let completed_count = u64::try_from(completed_datasets.len()).unwrap_or(u64::MAX);
+        let slot_floor = self.dataset_slot_floor();
+        let mut completed_count = 0_u64;
+        let mut dispatchable = Vec::with_capacity(completed_datasets.len());
         for dataset in completed_datasets {
+            if slot_floor.is_some_and(|floor| dataset.slot < floor) {
+                continue;
+            }
+            completed_count = completed_count.saturating_add(1);
             self.coverage_window.on_dataset_completed(dataset.slot);
             let substantial_dataset =
-                dataset.serialized_shreds.len() >= SUBSTANTIAL_DATASET_MIN_SHREDS;
-            dispatch_completed_dataset(
-                self.dataset_worker_queues,
-                dataset,
-                self.dataset_jobs_enqueued_count,
-                self.dataset_queue_drop_count,
-            );
+                dataset.payload_fragments.len() >= SUBSTANTIAL_DATASET_MIN_SHREDS;
+            dispatchable.push(dataset);
             if substantial_dataset {
                 *self.last_dataset_reconstructed_at = observed_at;
             }
         }
+        dispatch_completed_dataset(
+            self.dataset_worker_queues,
+            dispatchable,
+            self.dataset_jobs_enqueued_count,
+            self.dataset_queue_drop_count,
+        );
         completed_count
+    }
+
+    fn dataset_slot_floor(&self) -> Option<u64> {
+        (*self.latest_shred_slot).map(|slot| slot.saturating_sub(self.dataset_retained_slot_lag))
     }
 
     const fn note_slot(&mut self, slot: u64, observed_at: Instant) {
@@ -2799,6 +3137,25 @@ fn select_least_loaded_worker(worker_loads: &[u64], preferred_worker: usize) -> 
         }
     }
     best_worker
+}
+
+fn combine_packet_worker_pressure(
+    worker_queue_depths: &[u64],
+    tracked_fec_sets: &[u64],
+) -> Vec<u64> {
+    let worker_count = worker_queue_depths.len().max(tracked_fec_sets.len());
+    let mut combined = Vec::with_capacity(worker_count);
+    for worker_index in 0..worker_count {
+        let queue_depth = worker_queue_depths.get(worker_index).copied().unwrap_or(0);
+        let fec_pressure = tracked_fec_sets
+            .get(worker_index)
+            .copied()
+            .unwrap_or(0)
+            .checked_div(PACKET_WORKER_FEC_PRESSURE_DIVISOR)
+            .unwrap_or(0);
+        combined.push(queue_depth.saturating_add(fec_pressure));
+    }
+    combined
 }
 
 fn source_addr_or_unspecified(source_addr: Option<SocketAddr>) -> SocketAddr {
@@ -3077,7 +3434,7 @@ mod tests {
 
         fn apply(
             &mut self,
-            envelope: DerivedStateFeedEnvelope,
+            envelope: &DerivedStateFeedEnvelope,
         ) -> Result<(), DerivedStateConsumerFault> {
             self.state
                 .lock()
@@ -3088,7 +3445,7 @@ mod tests {
                         "driver recording state mutex poisoned during apply",
                     )
                 })?
-                .push(envelope);
+                .push(envelope.clone());
             Ok(())
         }
 

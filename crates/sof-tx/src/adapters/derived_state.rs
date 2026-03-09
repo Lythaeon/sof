@@ -1,10 +1,8 @@
 //! `sof` derived-state adapter that bridges replayable control-plane state into `sof-tx` providers.
 
-use std::{
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::path::PathBuf;
 
+use arcshift::ArcShift;
 use sof::framework::{
     DerivedStateCheckpoint, DerivedStateCheckpointStore, DerivedStateConsumer,
     DerivedStateConsumerFault, DerivedStateControlPlaneQuality, DerivedStateControlPlaneStateEvent,
@@ -62,9 +60,9 @@ pub struct DerivedStateTxProviderAdapter {
     /// Optional on-disk checkpoint persistence.
     persistence: Option<DerivedStateTxProviderAdapterPersistence>,
     /// Latest checkpoint visible to recovery logic.
-    checkpoint: Arc<Mutex<Option<DerivedStateCheckpoint>>>,
+    checkpoint: ArcShift<Option<DerivedStateCheckpoint>>,
     /// Latest canonical observer-side control-plane state when present in the feed.
-    latest_control_plane_state: Arc<Mutex<Option<DerivedStateControlPlaneStateEvent>>>,
+    latest_control_plane_state: ArcShift<Option<DerivedStateControlPlaneStateEvent>>,
 }
 
 impl DerivedStateTxProviderAdapter {
@@ -74,8 +72,8 @@ impl DerivedStateTxProviderAdapter {
         Self {
             core: TxProviderAdapterCore::new(config),
             persistence: None,
-            checkpoint: Arc::new(Mutex::new(None)),
-            latest_control_plane_state: Arc::new(Mutex::new(None)),
+            checkpoint: ArcShift::new(None),
+            latest_control_plane_state: ArcShift::new(None),
         }
     }
 
@@ -88,8 +86,8 @@ impl DerivedStateTxProviderAdapter {
         Self {
             core: TxProviderAdapterCore::new(config),
             persistence: Some(persistence),
-            checkpoint: Arc::new(Mutex::new(None)),
-            latest_control_plane_state: Arc::new(Mutex::new(None)),
+            checkpoint: ArcShift::new(None),
+            latest_control_plane_state: ArcShift::new(None),
         }
     }
 
@@ -139,18 +137,12 @@ impl DerivedStateTxProviderAdapter {
 
     /// Returns the latest in-memory checkpoint observed by the adapter.
     fn current_checkpoint(&self) -> Option<DerivedStateCheckpoint> {
-        self.checkpoint
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+        self.checkpoint.shared_get().clone()
     }
 
     /// Replaces the latest in-memory checkpoint visible to recovery logic.
-    fn set_checkpoint(&self, checkpoint: Option<DerivedStateCheckpoint>) {
-        *self
-            .checkpoint
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = checkpoint;
+    fn set_checkpoint(&mut self, checkpoint: Option<DerivedStateCheckpoint>) {
+        self.checkpoint.update(checkpoint);
     }
 
     /// Loads one compatible persisted checkpoint and state snapshot, when configured.
@@ -183,10 +175,7 @@ impl DerivedStateTxProviderAdapter {
 
     /// Returns the latest observer-side control-plane snapshot when the feed has emitted one.
     fn latest_control_plane_state(&self) -> Option<DerivedStateControlPlaneStateEvent> {
-        *self
-            .latest_control_plane_state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        *self.latest_control_plane_state.shared_get()
     }
 }
 
@@ -318,29 +307,26 @@ impl DerivedStateConsumer for DerivedStateTxProviderAdapter {
 
     fn apply(
         &mut self,
-        envelope: DerivedStateFeedEnvelope,
+        envelope: &DerivedStateFeedEnvelope,
     ) -> Result<(), DerivedStateConsumerFault> {
-        match envelope.event {
+        match &envelope.event {
             DerivedStateFeedEvent::RecentBlockhashObserved(event) => {
-                self.core.apply_recent_blockhash(&event);
+                self.core.apply_recent_blockhash(event);
             }
             DerivedStateFeedEvent::ClusterTopologyChanged(event) => {
-                self.core.apply_cluster_topology(&event);
+                self.core.apply_cluster_topology(event);
             }
             DerivedStateFeedEvent::LeaderScheduleUpdated(event) => {
-                self.core.apply_leader_schedule(&event);
+                self.core.apply_leader_schedule(event);
             }
             DerivedStateFeedEvent::SlotStatusChanged(event) => {
-                self.core.apply_slot_status(event);
+                self.core.apply_slot_status(*event);
             }
             DerivedStateFeedEvent::BranchReorged(event) => {
-                self.core.apply_reorg(&event);
+                self.core.apply_reorg(event);
             }
             DerivedStateFeedEvent::ControlPlaneStateUpdated(event) => {
-                *self
-                    .latest_control_plane_state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(event);
+                self.latest_control_plane_state.update(Some(*event));
             }
             DerivedStateFeedEvent::StateInvalidated(_)
             | DerivedStateFeedEvent::TxOutcomeObserved(_)
@@ -464,7 +450,7 @@ mod tests {
         let leader_b = Pubkey::new_unique();
 
         must(
-            adapter.apply(envelope(DerivedStateFeedEvent::ClusterTopologyChanged(
+            adapter.apply(&envelope(DerivedStateFeedEvent::ClusterTopologyChanged(
                 ClusterTopologyEvent {
                     source: ControlPlaneSource::Direct,
                     slot: Some(40),
@@ -479,7 +465,7 @@ mod tests {
             ))),
         );
         must(
-            adapter.apply(envelope(DerivedStateFeedEvent::LeaderScheduleUpdated(
+            adapter.apply(&envelope(DerivedStateFeedEvent::LeaderScheduleUpdated(
                 LeaderScheduleEvent {
                     source: ControlPlaneSource::Direct,
                     slot: Some(40),
@@ -501,7 +487,7 @@ mod tests {
             ))),
         );
         must(
-            adapter.apply(envelope(DerivedStateFeedEvent::RecentBlockhashObserved(
+            adapter.apply(&envelope(DerivedStateFeedEvent::RecentBlockhashObserved(
                 ObservedRecentBlockhashEvent {
                     slot: 40,
                     recent_blockhash: [5_u8; 32],
@@ -510,7 +496,7 @@ mod tests {
             ))),
         );
         must(
-            adapter.apply(envelope(DerivedStateFeedEvent::SlotStatusChanged(
+            adapter.apply(&envelope(DerivedStateFeedEvent::SlotStatusChanged(
                 SlotStatusChangedEvent {
                     slot: 41,
                     parent_slot: Some(40),
@@ -532,7 +518,7 @@ mod tests {
         let mut adapter = DerivedStateTxProviderAdapter::default();
         let leader = Pubkey::new_unique();
         must(
-            adapter.apply(envelope(DerivedStateFeedEvent::ClusterTopologyChanged(
+            adapter.apply(&envelope(DerivedStateFeedEvent::ClusterTopologyChanged(
                 ClusterTopologyEvent {
                     source: ControlPlaneSource::Direct,
                     slot: Some(77),
@@ -547,7 +533,7 @@ mod tests {
             ))),
         );
         must(
-            adapter.apply(envelope(DerivedStateFeedEvent::LeaderScheduleUpdated(
+            adapter.apply(&envelope(DerivedStateFeedEvent::LeaderScheduleUpdated(
                 LeaderScheduleEvent {
                     source: ControlPlaneSource::Direct,
                     slot: Some(77),
@@ -579,7 +565,7 @@ mod tests {
             &checkpoint_path,
         );
         must(
-            adapter.apply(envelope(DerivedStateFeedEvent::ClusterTopologyChanged(
+            adapter.apply(&envelope(DerivedStateFeedEvent::ClusterTopologyChanged(
                 ClusterTopologyEvent {
                     source: ControlPlaneSource::Direct,
                     slot: Some(88),
@@ -594,7 +580,7 @@ mod tests {
             ))),
         );
         must(
-            adapter.apply(envelope(DerivedStateFeedEvent::LeaderScheduleUpdated(
+            adapter.apply(&envelope(DerivedStateFeedEvent::LeaderScheduleUpdated(
                 LeaderScheduleEvent {
                     source: ControlPlaneSource::Direct,
                     slot: Some(88),
@@ -607,7 +593,7 @@ mod tests {
             ))),
         );
         must(
-            adapter.apply(envelope(DerivedStateFeedEvent::RecentBlockhashObserved(
+            adapter.apply(&envelope(DerivedStateFeedEvent::RecentBlockhashObserved(
                 ObservedRecentBlockhashEvent {
                     slot: 88,
                     recent_blockhash: [9_u8; 32],
@@ -679,22 +665,24 @@ mod tests {
     fn derived_state_adapter_ignores_non_control_plane_events() {
         let mut adapter = DerivedStateTxProviderAdapter::default();
         must(
-            adapter.apply(envelope(DerivedStateFeedEvent::CheckpointBarrier(
+            adapter.apply(&envelope(DerivedStateFeedEvent::CheckpointBarrier(
                 CheckpointBarrierEvent {
                     barrier_sequence: FeedSequence(1),
                     reason: CheckpointBarrierReason::Periodic,
                 },
             ))),
         );
-        must(adapter.apply(envelope(DerivedStateFeedEvent::BranchReorged(
-            BranchReorgedEvent {
-                old_tip: 80,
-                new_tip: 81,
-                common_ancestor: Some(79),
-                detached_slots: Arc::from(vec![80]),
-                attached_slots: Arc::from(vec![81]),
-            },
-        ))));
+        must(
+            adapter.apply(&envelope(DerivedStateFeedEvent::BranchReorged(
+                BranchReorgedEvent {
+                    old_tip: 80,
+                    new_tip: 81,
+                    common_ancestor: Some(79),
+                    detached_slots: Arc::from(vec![80]),
+                    attached_slots: Arc::from(vec![81]),
+                },
+            ))),
+        );
         assert_eq!(adapter.current_leader(), None);
     }
 }

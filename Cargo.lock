@@ -5238,7 +5238,7 @@ dependencies = [
 
 [[package]]
 name = "sof"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "arcshift",
  "async-trait",
@@ -5277,7 +5277,7 @@ dependencies = [
 
 [[package]]
 name = "sof-gossip-tuning"
-version = "0.7.1"
+version = "0.8.0"
 
 [[package]]
 name = "sof-solana-gossip"
@@ -5346,7 +5346,7 @@ dependencies = [
 
 [[package]]
 name = "sof-tx"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "arcshift",
  "async-trait",

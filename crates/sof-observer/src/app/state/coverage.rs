@@ -63,6 +63,11 @@ impl SlotCoverageWindow {
         counters.txs = counters.txs.saturating_add(1);
     }
 
+    pub fn on_tx_count(&mut self, slot: u64, count: u64) {
+        let counters = self.touch(slot);
+        counters.txs = counters.txs.saturating_add(count);
+    }
+
     pub fn snapshot(&self) -> CoverageSnapshot {
         let mut snapshot = CoverageSnapshot {
             slots_tracked: self.slots.len() as u64,

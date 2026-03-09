@@ -29,9 +29,10 @@ pub use derived_state::{
     InMemoryDerivedStateReplaySource, SlotStatusChangedEvent, TransactionAppliedEvent,
 };
 pub use events::{
-    AccountTouchEvent, ClusterNodeInfo, ClusterTopologyEvent, ControlPlaneSource, DatasetEvent,
-    LeaderScheduleEntry, LeaderScheduleEvent, ObservedRecentBlockhashEvent, RawPacketEvent,
-    ReorgEvent, ShredEvent, SlotStatusEvent, TransactionEvent,
+    AccountTouchEvent, AccountTouchEventRef, ClusterNodeInfo, ClusterTopologyEvent,
+    ControlPlaneSource, DatasetEvent, LeaderScheduleEntry, LeaderScheduleEvent,
+    ObservedRecentBlockhashEvent, RawPacketEvent, ReorgEvent, ShredEvent, SlotStatusEvent,
+    TransactionEvent, TransactionEventRef,
 };
 pub use extension::{
     ExtensionCapability, ExtensionManifest, ExtensionResourceSpec, ExtensionShutdownContext,
@@ -45,5 +46,5 @@ pub use extension_host::{
     RuntimeExtensionHostBuilder, RuntimeExtensionStartupFailure, RuntimeExtensionStartupReport,
 };
 pub use host::{PluginDispatchMode, PluginHost, PluginHostBuilder};
-pub use plugin::ObserverPlugin;
 pub use plugin::ObserverPlugin as Plugin;
+pub use plugin::{ObserverPlugin, TransactionInterest};

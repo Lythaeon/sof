@@ -297,6 +297,12 @@ impl RuntimeSetup {
         )
     }
 
+    /// Sets `SOF_DATASET_RETAINED_SLOT_LAG`.
+    #[must_use]
+    pub fn with_dataset_retained_slot_lag(self, slot_lag: u64) -> Self {
+        self.with_env("SOF_DATASET_RETAINED_SLOT_LAG", slot_lag.to_string())
+    }
+
     /// Sets `SOF_DATASET_QUEUE_CAPACITY`.
     #[must_use]
     pub fn with_dataset_queue_capacity(self, queue_capacity: usize) -> Self {
@@ -309,6 +315,12 @@ impl RuntimeSetup {
         self.with_env("SOF_FEC_MAX_TRACKED_SETS", max_tracked_sets.to_string())
     }
 
+    /// Sets `SOF_FEC_RETAINED_SLOT_LAG`.
+    #[must_use]
+    pub fn with_fec_retained_slot_lag(self, slot_lag: u64) -> Self {
+        self.with_env("SOF_FEC_RETAINED_SLOT_LAG", slot_lag.to_string())
+    }
+
     /// Sets `SOF_LOG_ALL_TXS`.
     #[must_use]
     pub fn with_log_all_txs(self, enabled: bool) -> Self {
@@ -319,6 +331,12 @@ impl RuntimeSetup {
     #[must_use]
     pub fn with_log_non_vote_txs(self, enabled: bool) -> Self {
         self.with_env("SOF_LOG_NON_VOTE_TXS", enabled.to_string())
+    }
+
+    /// Sets `SOF_SKIP_VOTE_ONLY_TX_DETAIL_PATH`.
+    #[must_use]
+    pub fn with_skip_vote_only_tx_detail_path(self, enabled: bool) -> Self {
+        self.with_env("SOF_SKIP_VOTE_ONLY_TX_DETAIL_PATH", enabled.to_string())
     }
 
     /// Sets `SOF_LOG_DATASET_RECONSTRUCTION`.

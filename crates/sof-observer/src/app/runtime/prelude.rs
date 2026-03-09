@@ -38,7 +38,6 @@ pub(super) use crate::{
         FeedWatermarks, InMemoryDerivedStateReplaySource, ObservedRecentBlockhashEvent, PluginHost,
         PluginHostBuilder, RawPacketEvent, ReorgEvent, RuntimeExtensionDispatchMetrics,
         RuntimeExtensionHost, RuntimeExtensionHostBuilder, ShredEvent, SlotStatusEvent,
-        TransactionEvent,
     },
     ingest,
     reassembly::dataset::DataSetReassembler,
@@ -74,11 +73,7 @@ pub(super) use solana_sdk_ids::{compute_budget, vote};
 pub(super) use solana_signer::Signer;
 #[cfg(feature = "gossip-bootstrap")]
 pub(super) use solana_streamer::{quic::DEFAULT_QUIC_ENDPOINTS, socket::SocketAddrSpace};
-pub(super) use tokio::{
-    sync::{Notify, mpsc},
-    task::JoinHandle,
-    time::interval,
-};
+pub(super) use tokio::{sync::mpsc, task::JoinHandle, time::interval};
 pub(super) use wincode::{
     Deserialize as _,
     containers::{Elem, Vec as WincodeVec},

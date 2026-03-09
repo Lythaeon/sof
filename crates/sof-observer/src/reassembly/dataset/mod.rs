@@ -4,4 +4,4 @@ mod stream;
 #[cfg(test)]
 mod tests;
 
-pub use core::{CompletedDataSet, DataSetReassembler};
+pub use core::{CompletedDataSet, DataSetReassembler, PayloadFragmentBatch, SharedPayloadFragment};

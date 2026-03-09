@@ -1,4 +1,4 @@
-use super::dispatch::PluginDispatcher;
+use super::dispatch::{PluginDispatcher, TransactionPluginDispatcher};
 use super::*;
 
 /// Builder for constructing an immutable [`PluginHost`].
@@ -9,6 +9,8 @@ pub struct PluginHostBuilder {
     event_queue_capacity: usize,
     /// Callback execution strategy used by the async dispatch worker.
     dispatch_mode: PluginDispatchMode,
+    /// Number of accepted-transaction dispatch workers.
+    transaction_dispatch_workers: usize,
 }
 
 impl Default for PluginHostBuilder {
@@ -17,6 +19,7 @@ impl Default for PluginHostBuilder {
             plugins: Vec::new(),
             event_queue_capacity: DEFAULT_EVENT_QUEUE_CAPACITY,
             dispatch_mode: PluginDispatchMode::default(),
+            transaction_dispatch_workers: default_transaction_dispatch_workers(),
         }
     }
 }
@@ -39,6 +42,13 @@ impl PluginHostBuilder {
     #[must_use]
     pub fn with_dispatch_mode(mut self, mode: PluginDispatchMode) -> Self {
         self.dispatch_mode = mode.normalized();
+        self
+    }
+
+    /// Sets accepted-transaction dispatch worker count.
+    #[must_use]
+    pub fn with_transaction_dispatch_workers(mut self, workers: usize) -> Self {
+        self.transaction_dispatch_workers = workers.max(1);
         self
     }
 
@@ -143,12 +153,20 @@ impl PluginHostBuilder {
             self.event_queue_capacity,
             self.dispatch_mode,
         );
+        let transaction_dispatcher = subscriptions.transaction.then(|| {
+            TransactionPluginDispatcher::new(
+                self.event_queue_capacity,
+                self.transaction_dispatch_workers,
+                self.dispatch_mode,
+            )
+        });
         PluginHost {
             plugins,
             dispatcher,
+            transaction_dispatcher,
             subscriptions,
-            latest_observed_recent_blockhash: Arc::new(RwLock::new(None)),
-            latest_observed_tpu_leader: Arc::new(RwLock::new(None)),
+            latest_observed_recent_blockhash: ArcShift::new(None),
+            latest_observed_tpu_leader: ArcShift::new(None),
         }
     }
 }

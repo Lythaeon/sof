@@ -195,7 +195,7 @@ impl ObserverPlugin for RawIngressMetricsPlugin {
         }
     }
 
-    async fn on_transaction(&self, event: sof::framework::TransactionEvent) {
+    async fn on_transaction(&self, event: &sof::framework::TransactionEvent) {
         self.tx_total.fetch_add(1, Ordering::Relaxed);
         match event.kind {
             TxKind::VoteOnly => {
@@ -460,7 +460,8 @@ pub(crate) fn parse_udp_payload_to_raw_packet(
         bytes: frame
             .get(payload_start..payload_end)
             .ok_or(FrameParseOutcome::ParseError)?
-            .to_vec(),
+            .to_vec()
+            .into(),
     }))
 }
 

@@ -55,16 +55,30 @@ impl TxCommitmentStatus {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-/// Event emitted by runtime when a transaction is observed.
-pub struct TxObservedEvent {
-    /// Slot where transaction was observed.
-    pub slot: u64,
-    /// Transaction signature.
-    pub signature: Signature,
-    /// Transaction kind classification.
-    pub kind: TxKind,
-    /// Commitment status at observation time.
-    pub commitment_status: TxCommitmentStatus,
+/// Event emitted by runtime when transaction observations should reach the main event loop.
+pub enum TxObservedEvent {
+    /// Detailed per-transaction event, used when explicit tx logging is enabled.
+    Detailed {
+        /// Slot where transaction was observed.
+        slot: u64,
+        /// Transaction signature.
+        signature: Signature,
+        /// Transaction kind classification.
+        kind: TxKind,
+        /// Commitment status at observation time.
+        commitment_status: TxCommitmentStatus,
+    },
+    /// Aggregated per-dataset summary used for normal telemetry paths.
+    Summary {
+        /// Slot where the transactions were observed.
+        slot: u64,
+        /// Number of vote-only transactions in the dataset.
+        vote_only: u64,
+        /// Number of mixed vote/non-vote transactions in the dataset.
+        mixed: u64,
+        /// Number of non-vote transactions in the dataset.
+        non_vote: u64,
+    },
 }
 
 #[cfg(test)]

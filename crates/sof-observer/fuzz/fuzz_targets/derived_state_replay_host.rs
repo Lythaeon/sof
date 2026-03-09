@@ -52,7 +52,7 @@ impl DerivedStateConsumer for FuzzConsumer {
 
     fn apply(
         &mut self,
-        envelope: sof::framework::DerivedStateFeedEnvelope,
+        envelope: &sof::framework::DerivedStateFeedEnvelope,
     ) -> Result<(), DerivedStateConsumerFault> {
         let mut state = self.state.lock().map_err(|_poison| {
             DerivedStateConsumerFault::new(

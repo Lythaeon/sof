@@ -1,4 +1,5 @@
 use super::DataSetReassembler;
+use super::PayloadFragmentBatch;
 
 #[test]
 fn completes_dataset_on_data_complete() {
@@ -7,7 +8,10 @@ fn completes_dataset_on_data_complete() {
     assert!(out0.is_empty());
     let out1 = ingest(&mut reassembler, 7, 1, true, false, vec![1]);
     assert_eq!(out1.len(), 1);
-    assert_eq!(out1[0].serialized_shreds, vec![vec![0], vec![1]]);
+    assert_eq!(
+        out1[0].payload_fragments,
+        PayloadFragmentBatch::from_owned_fragments(vec![vec![0], vec![1]])
+    );
     assert_eq!(out1[0].start_index, 0);
     assert_eq!(out1[0].end_index, 1);
 }
@@ -21,7 +25,10 @@ fn handles_out_of_order_fragments() {
     assert_eq!(out1.len(), 1);
     assert_eq!(out1[0].start_index, 0);
     assert_eq!(out1[0].end_index, 1);
-    assert_eq!(out1[0].serialized_shreds, vec![vec![0], vec![1]]);
+    assert_eq!(
+        out1[0].payload_fragments,
+        PayloadFragmentBatch::from_owned_fragments(vec![vec![0], vec![1]])
+    );
 }
 
 #[test]
@@ -39,7 +46,10 @@ fn reanchors_after_late_prefix_arrival() {
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].start_index, 0);
     assert_eq!(out[0].end_index, 1);
-    assert_eq!(out[0].serialized_shreds, vec![vec![0], vec![1]]);
+    assert_eq!(
+        out[0].payload_fragments,
+        PayloadFragmentBatch::from_owned_fragments(vec![vec![0], vec![1]])
+    );
 }
 
 #[test]
@@ -51,7 +61,10 @@ fn reanchors_on_consecutive_completed_boundaries() {
     assert_eq!(out1.len(), 1);
     assert_eq!(out1[0].start_index, 2);
     assert_eq!(out1[0].end_index, 3);
-    assert_eq!(out1[0].serialized_shreds, vec![vec![2], vec![3]]);
+    assert_eq!(
+        out1[0].payload_fragments,
+        PayloadFragmentBatch::from_owned_fragments(vec![vec![2], vec![3]])
+    );
 
     let out2 = ingest(&mut reassembler, 12, 0, false, false, vec![0]);
     assert!(out2.is_empty());
@@ -59,7 +72,10 @@ fn reanchors_on_consecutive_completed_boundaries() {
     assert_eq!(out3.len(), 1);
     assert_eq!(out3[0].start_index, 0);
     assert_eq!(out3[0].end_index, 1);
-    assert_eq!(out3[0].serialized_shreds, vec![vec![0], vec![1]]);
+    assert_eq!(
+        out3[0].payload_fragments,
+        PayloadFragmentBatch::from_owned_fragments(vec![vec![0], vec![1]])
+    );
 }
 
 #[test]
@@ -71,7 +87,10 @@ fn emits_tail_without_known_boundary_anchor() {
     assert_eq!(out1.len(), 1);
     assert_eq!(out1[0].start_index, 5);
     assert_eq!(out1[0].end_index, 6);
-    assert_eq!(out1[0].serialized_shreds, vec![vec![5], vec![6]]);
+    assert_eq!(
+        out1[0].payload_fragments,
+        PayloadFragmentBatch::from_owned_fragments(vec![vec![5], vec![6]])
+    );
 }
 
 #[test]
@@ -85,7 +104,10 @@ fn emits_following_dataset_with_missing_prefix_dataset() {
     assert_eq!(out2.len(), 1);
     assert_eq!(out2[0].start_index, 2);
     assert_eq!(out2[0].end_index, 3);
-    assert_eq!(out2[0].serialized_shreds, vec![vec![2], vec![3]]);
+    assert_eq!(
+        out2[0].payload_fragments,
+        PayloadFragmentBatch::from_owned_fragments(vec![vec![2], vec![3]])
+    );
 }
 
 #[test]
@@ -99,7 +121,10 @@ fn emits_missing_prefix_dataset_if_gap_arrives_later() {
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].start_index, 0);
     assert_eq!(out[0].end_index, 1);
-    assert_eq!(out[0].serialized_shreds, vec![vec![0], vec![1]]);
+    assert_eq!(
+        out[0].payload_fragments,
+        PayloadFragmentBatch::from_owned_fragments(vec![vec![0], vec![1]])
+    );
 }
 
 fn ingest(
@@ -110,5 +135,11 @@ fn ingest(
     last_in_slot: bool,
     serialized_shred: Vec<u8>,
 ) -> Vec<super::CompletedDataSet> {
-    reassembler.ingest_data_shred_meta(slot, index, data_complete, last_in_slot, serialized_shred)
+    reassembler.ingest_data_shred_meta(
+        slot,
+        index,
+        data_complete,
+        last_in_slot,
+        super::SharedPayloadFragment::owned(serialized_shred),
+    )
 }

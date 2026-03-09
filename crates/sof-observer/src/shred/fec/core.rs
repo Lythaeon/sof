@@ -17,6 +17,8 @@ pub struct FecRecoverer {
     sets: HashMap<(u64, u32), ErasureSet>,
     reed_solomon_cache: HashMap<(usize, usize), ReedSolomon>,
     max_tracked_sets: usize,
+    retained_slot_lag: u64,
+    last_pruned_floor: u64,
 }
 
 struct ErasureSet {
@@ -53,11 +55,13 @@ impl ErasureSet {
 
 impl FecRecoverer {
     #[must_use]
-    pub fn new(max_tracked_sets: usize) -> Self {
+    pub fn new(max_tracked_sets: usize, retained_slot_lag: u64) -> Self {
         Self {
             sets: HashMap::new(),
             reed_solomon_cache: HashMap::new(),
             max_tracked_sets,
+            retained_slot_lag: retained_slot_lag.max(1),
+            last_pruned_floor: 0,
         }
     }
 
@@ -85,6 +89,7 @@ impl FecRecoverer {
         };
 
         let set_id = (slot, fec_set_index);
+        self.purge_older_than(slot.saturating_sub(self.retained_slot_lag));
         self.evict_if_needed(set_id);
 
         let mut recovered = Vec::new();
@@ -122,6 +127,16 @@ impl FecRecoverer {
         {
             let _ = self.sets.remove(&oldest_key);
         }
+    }
+
+    pub fn purge_older_than(&mut self, slot_floor: u64) -> usize {
+        if slot_floor <= self.last_pruned_floor {
+            return 0;
+        }
+        let before = self.sets.len();
+        self.sets.retain(|(slot, _), _| *slot >= slot_floor);
+        self.last_pruned_floor = slot_floor;
+        before.saturating_sub(self.sets.len())
     }
 
     #[must_use]
@@ -193,5 +208,30 @@ impl From<ShredVariant> for SetVariant {
             proof_size: value.proof_size,
             resigned: value.resigned,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn purge_older_than_removes_old_sets() {
+        let mut recoverer = FecRecoverer::new(16, 64);
+        let _ = recoverer
+            .sets
+            .insert((100, 0), ErasureSet::new([0; SIZE_OF_SIGNATURE]));
+        let _ = recoverer
+            .sets
+            .insert((120, 0), ErasureSet::new([0; SIZE_OF_SIGNATURE]));
+        let _ = recoverer
+            .sets
+            .insert((140, 0), ErasureSet::new([0; SIZE_OF_SIGNATURE]));
+
+        let purged = recoverer.purge_older_than(121);
+
+        assert_eq!(purged, 2);
+        assert_eq!(recoverer.tracked_sets(), 1);
+        assert!(recoverer.sets.contains_key(&(140, 0)));
     }
 }

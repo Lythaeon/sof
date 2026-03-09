@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{Arc, RwLock},
 };
 
 use serde::{Deserialize, Serialize};
@@ -267,7 +267,7 @@ pub struct TxProviderIngressSnapshot {
 #[derive(Debug, Clone)]
 pub(crate) struct TxProviderAdapterCore {
     /// Shared adapter state updated from plugin or derived-state events.
-    state: Arc<Mutex<AdapterState>>,
+    state: Arc<RwLock<AdapterState>>,
     /// Normalized adapter limits used for leader-window and snapshot retention.
     config: TxProviderAdapterConfig,
 }
@@ -277,7 +277,7 @@ impl TxProviderAdapterCore {
     #[must_use]
     pub(crate) fn new(config: TxProviderAdapterConfig) -> Self {
         Self {
-            state: Arc::new(Mutex::new(AdapterState::default())),
+            state: Arc::new(RwLock::new(AdapterState::default())),
             config: config.normalized(),
         }
     }
@@ -410,7 +410,7 @@ impl TxProviderAdapterCore {
     pub(crate) fn snapshot_state(&self) -> TxProviderAdapterSnapshot {
         let state = self
             .state
-            .lock()
+            .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         TxProviderAdapterSnapshot {
             latest_recent_blockhash: state.latest_recent_blockhash,
@@ -442,7 +442,7 @@ impl TxProviderAdapterCore {
     #[must_use]
     pub(crate) fn latest_blockhash(&self) -> Option<[u8; 32]> {
         self.state
-            .lock()
+            .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .latest_recent_blockhash
     }
@@ -452,7 +452,7 @@ impl TxProviderAdapterCore {
     pub(crate) fn control_plane_snapshot(&self) -> TxProviderControlPlaneSnapshot {
         let state = self
             .state
-            .lock()
+            .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let routable_targets = collect_leader_targets_from_state(
             &state,
@@ -496,7 +496,7 @@ impl TxProviderAdapterCore {
         collect_leader_targets_from_state(
             &self
                 .state
-                .lock()
+                .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
             requested_targets,
         )
@@ -509,7 +509,7 @@ impl TxProviderAdapterCore {
     {
         let mut next = self
             .state
-            .lock()
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         apply(&mut next);
     }

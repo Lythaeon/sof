@@ -71,8 +71,8 @@ impl Plugin for RaydiumTxFilterLoggerPlugin {
         true
     }
 
-    async fn on_transaction(&self, event: TransactionEvent) {
-        let Some(touched) = classify_raydium_transaction(&event) else {
+    async fn on_transaction(&self, event: &TransactionEvent) {
+        let Some(touched) = classify_raydium_transaction(event) else {
             return;
         };
 
