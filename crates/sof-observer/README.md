@@ -17,9 +17,11 @@ Core responsibilities:
 - Embed SOF directly inside a Tokio application
 - Attach `Plugin` or `RuntimeExtension` consumers
 - Run with built-in UDP ingress or external kernel-bypass ingress
+- Use packet-worker and dataset-worker fanout to keep multi-core hosts busy under sustained shred load
 - Consume local slot/reorg/transaction/account-touch signals
 - Use the replayable derived-state feed for restart-safe stateful consumers
 - Apply typed gossip and ingest tuning profiles instead of env-string bundles
+- Keep more runtime work on borrowed/shared data instead of eagerly allocating owned transaction or dataset payload copies
 
 ## Install
 

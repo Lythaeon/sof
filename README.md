@@ -10,9 +10,10 @@ It is split into three user-facing crates:
 
 ## Highlights
 
-- Low-latency shred ingest and dataset reconstruction
+- Multi-core packet ingest, FEC recovery, and dataset reconstruction
 - Local `processed` / `confirmed` / `finalized` transaction tagging
 - Plugin hooks and runtime extensions for downstream logic
+- Lower-copy hot paths through shared dataset payload fragments and borrowed transaction classification
 - Replayable derived-state feed for restart-safe stateful services
 - First-class `sof-tx` adapters for live plugin and replayable derived-state control-plane inputs
 - Flow-safety policy evaluation for stale or degraded tx-control-plane state

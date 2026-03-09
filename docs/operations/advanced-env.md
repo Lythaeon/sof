@@ -5,7 +5,7 @@ These variables are intentionally undocumented in the quick-start path because t
 Use these only when you are measuring changes and can roll back quickly.
 
 - Source of truth: `crates/sof-observer/src/app/config/*`, `crates/sof-observer/src/app/runtime/*`, `crates/sof-observer/src/ingest/core.rs`
-- Snapshot date: 2026-03-02
+- Snapshot date: 2026-03-09
 
 ## Safe baseline
 
@@ -35,6 +35,12 @@ If you configure SOF programmatically, prefer the typed control surface from
 That path now applies both SOF runtime knobs and the bundled patched gossip queue capacities used by
 SOF's bootstrap path. Downstream users do not need a separate workspace-root
 `[patch.crates-io]` override for those queue controls.
+
+Important scope note:
+
+- SOF's bundled `sof-solana-gossip` fork currently exposes queue-capacity and Rayon worker-count knobs for gossip bootstrap.
+- `arb-bot` carries an additional private patch layer on top of the same fork with extra gossip-thread pinning and Rayon parallel-threshold tuning.
+- Those extra `arb-bot` knobs are not part of SOF's public `0.8.0` surface unless they are ported explicitly.
 
 ## Runtime and dataset tuning
 
@@ -103,6 +109,7 @@ SOF's bootstrap path. Downstream users do not need a separate workspace-root
 | `SOF_GOSSIP_CHANNEL_CONSUME_CAPACITY` | `1024` | Max packet batches one gossip worker pass will drain before yielding; larger values favor throughput over fairness/latency. |
 | `SOF_GOSSIP_CONSUME_THREADS` | host parallelism, clamped to `8` | Thread count for gossip socket-consume workers in the bundled backend. |
 | `SOF_GOSSIP_LISTEN_THREADS` | host parallelism, clamped to `8` | Thread count for gossip listen workers in the bundled backend. |
+| `SOF_GOSSIP_SOCKET_CONSUME_PARALLEL_PACKET_THRESHOLD` | not currently exposed by SOF | Present in `arb-bot`'s private gossip patch, but not in SOF's bundled `0.8.0` backend. |
 | `SOF_SHRED_VERSION` | unset | Bad override can reject valid cluster traffic. |
 | `SOF_GOSSIP_VALIDATORS` | unset | Optional comma-separated validator identity pubkeys passed to Agave gossip `gossip_validators`; constrains push/pull targets to this set and can materially lower control-plane traffic/CPU at the cost of narrower gossip mesh. |
 | `SOF_GOSSIP_ENTRYPOINT_PROBE` | `false` | Adds startup probing behavior that can delay launch. |

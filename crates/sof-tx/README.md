@@ -18,6 +18,7 @@ It provides:
 - Submit through RPC, direct leader routing, or hybrid fallback
 - Attach live `sof` runtime adapters when you want local leader/blockhash signals
 - Use replayable derived-state adapters when your service must survive restart or replay
+- Read control-plane snapshots from lower-contention adapter state instead of serializing all readers through one mutex
 - Evaluate typed flow-safety policies before acting on local control-plane state
 - Use optional kernel-bypass direct transports for custom low-latency networking
 
