@@ -11,11 +11,11 @@ pub(crate) enum RepairCommand {
         sources: Vec<(SocketAddr, u16)>,
     },
     HandleResponsePing {
-        packet: Vec<u8>,
+        packet: Arc<[u8]>,
         from_addr: SocketAddr,
     },
     HandleServeRequest {
-        packet: Vec<u8>,
+        packet: Arc<[u8]>,
         from_addr: SocketAddr,
     },
 }
@@ -179,7 +179,10 @@ pub(crate) fn spawn_repair_driver(
                             let _ = repair_client.note_shred_sources(&sources);
                         }
                         RepairCommand::HandleResponsePing { packet, from_addr } => {
-                            match repair_client.maybe_handle_response_ping(&packet, from_addr).await {
+                            match repair_client
+                                .maybe_handle_response_ping(packet.as_ref(), from_addr)
+                                .await
+                            {
                                 Ok(true) => {
                                     if result_tx
                                         .try_send(RepairOutcome::ResponsePingHandledFrom {
@@ -206,7 +209,11 @@ pub(crate) fn spawn_repair_driver(
                         }
                         RepairCommand::HandleServeRequest { packet, from_addr } => {
                             match repair_client
-                                .maybe_serve_repair_request(&packet, from_addr, relay_cache.as_ref())
+                                .maybe_serve_repair_request(
+                                    packet.as_ref(),
+                                    from_addr,
+                                    relay_cache.as_ref(),
+                                )
                                 .await
                             {
                                 Ok(Some(request)) => {

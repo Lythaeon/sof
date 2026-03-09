@@ -1057,7 +1057,7 @@ async fn run_async_with_hosts_inner(
                         && let Some(command_tx) = repair_command_tx.as_ref()
                     {
                         match command_tx.try_send(RepairCommand::HandleResponsePing {
-                            packet: packet_bytes.as_ref().to_vec(),
+                            packet: Arc::clone(&packet_bytes),
                             from_addr: source_addr,
                         }) {
                             Ok(()) => {
@@ -1078,7 +1078,7 @@ async fn run_async_with_hosts_inner(
                         && let Some(command_tx) = repair_command_tx.as_ref()
                     {
                         match command_tx.try_send(RepairCommand::HandleServeRequest {
-                            packet: packet_bytes.as_ref().to_vec(),
+                            packet: Arc::clone(&packet_bytes),
                             from_addr: source_addr,
                         }) {
                             Ok(()) => {

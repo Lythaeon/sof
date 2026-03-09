@@ -66,6 +66,60 @@ impl PluginDispatchFailureReason {
     }
 }
 
+/// Precomputed plugin targets per hook family so queued events only touch interested plugins.
+#[derive(Clone)]
+pub(super) struct PluginDispatchTargets {
+    /// Plugins interested in raw-packet callbacks.
+    pub(super) raw_packet: Arc<[Arc<dyn ObserverPlugin>]>,
+    /// Plugins interested in shred callbacks.
+    pub(super) shred: Arc<[Arc<dyn ObserverPlugin>]>,
+    /// Plugins interested in dataset callbacks.
+    pub(super) dataset: Arc<[Arc<dyn ObserverPlugin>]>,
+    /// Plugins interested in account-touch callbacks.
+    pub(super) account_touch: Arc<[Arc<dyn ObserverPlugin>]>,
+    /// Plugins interested in slot-status callbacks.
+    pub(super) slot_status: Arc<[Arc<dyn ObserverPlugin>]>,
+    /// Plugins interested in reorg callbacks.
+    pub(super) reorg: Arc<[Arc<dyn ObserverPlugin>]>,
+    /// Plugins interested in recent-blockhash callbacks.
+    pub(super) recent_blockhash: Arc<[Arc<dyn ObserverPlugin>]>,
+    /// Plugins interested in cluster-topology callbacks.
+    pub(super) cluster_topology: Arc<[Arc<dyn ObserverPlugin>]>,
+    /// Plugins interested in leader-schedule callbacks.
+    pub(super) leader_schedule: Arc<[Arc<dyn ObserverPlugin>]>,
+}
+
+impl PluginDispatchTargets {
+    /// Returns true when no non-transaction hooks are registered.
+    pub(super) fn is_empty(&self) -> bool {
+        self.raw_packet.is_empty()
+            && self.shred.is_empty()
+            && self.dataset.is_empty()
+            && self.account_touch.is_empty()
+            && self.slot_status.is_empty()
+            && self.reorg.is_empty()
+            && self.recent_blockhash.is_empty()
+            && self.cluster_topology.is_empty()
+            && self.leader_schedule.is_empty()
+    }
+
+    /// Returns the interested plugin slice for one hook family.
+    fn plugins_for(&self, hook: PluginHookKind) -> &[Arc<dyn ObserverPlugin>] {
+        match hook {
+            PluginHookKind::RawPacket => &self.raw_packet,
+            PluginHookKind::Shred => &self.shred,
+            PluginHookKind::Dataset => &self.dataset,
+            PluginHookKind::Transaction => &[],
+            PluginHookKind::AccountTouch => &self.account_touch,
+            PluginHookKind::SlotStatus => &self.slot_status,
+            PluginHookKind::Reorg => &self.reorg,
+            PluginHookKind::RecentBlockhash => &self.recent_blockhash,
+            PluginHookKind::ClusterTopology => &self.cluster_topology,
+            PluginHookKind::LeaderSchedule => &self.leader_schedule,
+        }
+    }
+}
+
 #[derive(Clone)]
 /// Shared sender/counters for asynchronous plugin event delivery.
 pub(super) struct PluginDispatcher {
@@ -78,16 +132,16 @@ pub(super) struct PluginDispatcher {
 impl PluginDispatcher {
     /// Creates a dispatcher and background worker when at least one plugin is registered.
     pub(super) fn new(
-        plugins: Arc<[Arc<dyn ObserverPlugin>]>,
+        targets: PluginDispatchTargets,
         queue_capacity: usize,
         dispatch_mode: PluginDispatchMode,
     ) -> Option<Self> {
-        if plugins.is_empty() {
+        if targets.is_empty() {
             return None;
         }
         let (tx, rx) = mpsc::channel(queue_capacity.max(1));
         let dropped_events = Arc::new(AtomicU64::new(0));
-        spawn_dispatch_worker(plugins, rx, dispatch_mode.normalized());
+        spawn_dispatch_worker(targets, rx, dispatch_mode.normalized());
         Some(Self { tx, dropped_events })
     }
 
@@ -463,7 +517,7 @@ impl SelectedAccountTouchDispatch {
 
 /// Spawns a dedicated worker thread that drains non-transaction hook events.
 fn spawn_dispatch_worker(
-    plugins: Arc<[Arc<dyn ObserverPlugin>]>,
+    targets: PluginDispatchTargets,
     mut rx: mpsc::Receiver<PluginDispatchEvent>,
     dispatch_mode: PluginDispatchMode,
 ) {
@@ -479,7 +533,7 @@ fn spawn_dispatch_worker(
             };
             runtime.block_on(async move {
                 while let Some(event) = rx.recv().await {
-                    dispatch_event(&plugins, event, dispatch_mode).await;
+                    dispatch_event(&targets, event, dispatch_mode).await;
                 }
             });
         });
@@ -524,14 +578,14 @@ fn spawn_transaction_dispatch_worker(
 
 /// Dispatches one queued event to all registered plugins in registration order.
 async fn dispatch_event(
-    plugins: &[Arc<dyn ObserverPlugin>],
+    targets: &PluginDispatchTargets,
     event: PluginDispatchEvent,
     dispatch_mode: PluginDispatchMode,
 ) {
     match event {
         PluginDispatchEvent::RawPacket(event) => {
             dispatch_hook_event(
-                plugins,
+                targets.plugins_for(PluginHookKind::RawPacket),
                 PluginHookKind::RawPacket,
                 event,
                 dispatch_mode,
@@ -543,7 +597,7 @@ async fn dispatch_event(
         }
         PluginDispatchEvent::Shred(event) => {
             dispatch_hook_event(
-                plugins,
+                targets.plugins_for(PluginHookKind::Shred),
                 PluginHookKind::Shred,
                 event,
                 dispatch_mode,
@@ -555,7 +609,7 @@ async fn dispatch_event(
         }
         PluginDispatchEvent::Dataset(event) => {
             dispatch_hook_event(
-                plugins,
+                targets.plugins_for(PluginHookKind::Dataset),
                 PluginHookKind::Dataset,
                 event,
                 dispatch_mode,
@@ -567,7 +621,7 @@ async fn dispatch_event(
         }
         PluginDispatchEvent::AccountTouch(event) => {
             dispatch_hook_event(
-                plugins,
+                targets.plugins_for(PluginHookKind::AccountTouch),
                 PluginHookKind::AccountTouch,
                 event,
                 dispatch_mode,
@@ -582,7 +636,7 @@ async fn dispatch_event(
         }
         PluginDispatchEvent::SlotStatus(event) => {
             dispatch_hook_event(
-                plugins,
+                targets.plugins_for(PluginHookKind::SlotStatus),
                 PluginHookKind::SlotStatus,
                 event,
                 dispatch_mode,
@@ -594,7 +648,7 @@ async fn dispatch_event(
         }
         PluginDispatchEvent::Reorg(event) => {
             dispatch_hook_event(
-                plugins,
+                targets.plugins_for(PluginHookKind::Reorg),
                 PluginHookKind::Reorg,
                 event,
                 dispatch_mode,
@@ -606,7 +660,7 @@ async fn dispatch_event(
         }
         PluginDispatchEvent::ObservedRecentBlockhash(event) => {
             dispatch_hook_event(
-                plugins,
+                targets.plugins_for(PluginHookKind::RecentBlockhash),
                 PluginHookKind::RecentBlockhash,
                 event,
                 dispatch_mode,
@@ -618,7 +672,7 @@ async fn dispatch_event(
         }
         PluginDispatchEvent::ClusterTopology(event) => {
             dispatch_hook_event(
-                plugins,
+                targets.plugins_for(PluginHookKind::ClusterTopology),
                 PluginHookKind::ClusterTopology,
                 event,
                 dispatch_mode,
@@ -630,7 +684,7 @@ async fn dispatch_event(
         }
         PluginDispatchEvent::LeaderSchedule(event) => {
             dispatch_hook_event(
-                plugins,
+                targets.plugins_for(PluginHookKind::LeaderSchedule),
                 PluginHookKind::LeaderSchedule,
                 event,
                 dispatch_mode,
