@@ -203,6 +203,8 @@ Programmatic equivalent for the currently supported subset:
 - `RuntimeSetup::with_gossip_channel_consume_capacity(...)`
 - `RuntimeSetup::with_gossip_consume_threads(...)`
 - `RuntimeSetup::with_gossip_listen_threads(...)`
+- `RuntimeSetup::with_gossip_socket_consume_parallel_packet_threshold(...)`
+- `RuntimeSetup::with_gossip_stats_interval_secs(...)`
 - `RuntimeSetup::with_ingest_queue_mode_typed(...)`
 - `RuntimeSetup::with_sof_gossip_runtime_tuning(...)`
 - `RuntimeSetup::with_gossip_tuning_profile(...)`
