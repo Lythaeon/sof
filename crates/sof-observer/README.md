@@ -32,13 +32,13 @@ cargo add sof
 Optional gossip bootstrap support at compile time:
 
 ```toml
-sof = { version = "0.8.0", features = ["gossip-bootstrap"] }
+sof = { version = "0.8.1", features = ["gossip-bootstrap"] }
 ```
 
 Optional external `kernel-bypass` ingress support:
 
 ```toml
-sof = { version = "0.8.0", features = ["kernel-bypass"] }
+sof = { version = "0.8.1", features = ["kernel-bypass"] }
 ```
 
 ## Quick Start
