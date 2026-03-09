@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::event::TxKind;
-use crate::framework::{TransactionInterest, TxCommitmentStatus};
+use crate::framework::{TransactionEventRef, TransactionInterest, TxCommitmentStatus};
 
 #[derive(Clone, Copy)]
 struct PluginA;
@@ -151,7 +151,7 @@ impl ObserverPlugin for FilteringTransactionPlugin {
         true
     }
 
-    fn accepts_transaction(&self, event: &TransactionEvent) -> bool {
+    fn accepts_transaction_ref(&self, event: TransactionEventRef<'_>) -> bool {
         let accept = event.slot.is_multiple_of(2);
         if accept {
             self.accepted.fetch_add(1, Ordering::Relaxed);
@@ -159,6 +159,14 @@ impl ObserverPlugin for FilteringTransactionPlugin {
             self.rejected.fetch_add(1, Ordering::Relaxed);
         }
         accept
+    }
+
+    fn transaction_interest_ref(&self, event: TransactionEventRef<'_>) -> TransactionInterest {
+        if self.accepts_transaction_ref(event) {
+            TransactionInterest::Critical
+        } else {
+            TransactionInterest::Ignore
+        }
     }
 
     async fn on_transaction(&self, _event: &TransactionEvent) {
@@ -183,7 +191,7 @@ impl ObserverPlugin for PriorityTransactionPlugin {
         true
     }
 
-    fn transaction_interest(&self, event: &TransactionEvent) -> TransactionInterest {
+    fn transaction_interest_ref(&self, event: TransactionEventRef<'_>) -> TransactionInterest {
         if event.slot.is_multiple_of(2) {
             TransactionInterest::Critical
         } else {

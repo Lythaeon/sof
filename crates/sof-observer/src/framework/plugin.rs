@@ -71,6 +71,9 @@ pub trait ObserverPlugin: Send + Sync + 'static {
     ///
     /// Override this to avoid constructing an owned [`TransactionEvent`] for
     /// transactions that will be ignored anyway.
+    ///
+    /// Plugins that only need borrowed fields should prefer this hook over
+    /// [`Self::accepts_transaction`].
     fn accepts_transaction_ref(&self, event: TransactionEventRef<'_>) -> bool {
         self.accepts_transaction(&event.to_owned())
     }
@@ -91,6 +94,9 @@ pub trait ObserverPlugin: Send + Sync + 'static {
     ///
     /// Override this when classification can run directly on borrowed message
     /// data without first allocating an owned [`TransactionEvent`].
+    ///
+    /// Priority-sensitive plugins should implement this hook directly so the
+    /// dataset hot path can classify traffic without allocating.
     fn transaction_interest_ref(&self, event: TransactionEventRef<'_>) -> TransactionInterest {
         self.transaction_interest(&event.to_owned())
     }
