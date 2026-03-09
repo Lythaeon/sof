@@ -45,7 +45,7 @@ use {
     },
     arc_swap::ArcSwap,
     core_affinity::CoreId,
-    crossbeam_channel::{Receiver, TrySendError},
+    crossbeam_channel::{Receiver, Sender, TrySendError},
     itertools::{Either, Itertools},
     rand::{seq::SliceRandom, CryptoRng, Rng},
     rayon::{prelude::*, ThreadPool, ThreadPoolBuilder},
@@ -91,7 +91,7 @@ use {
         rc::Rc,
         result::Result,
         sync::{
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicU64, Ordering},
             Arc, Mutex, OnceLock, RwLock, RwLockReadGuard,
         },
         thread::{sleep, Builder, JoinHandle},
@@ -148,6 +148,7 @@ pub const MINIMUM_NUM_TVU_RECEIVE_SOCKETS: NonZeroUsize = NonZeroUsize::new(1).u
 pub const DEFAULT_NUM_TVU_RECEIVE_SOCKETS: NonZeroUsize = MINIMUM_NUM_TVU_RECEIVE_SOCKETS;
 pub const MINIMUM_NUM_TVU_RETRANSMIT_SOCKETS: NonZeroUsize = NonZeroUsize::new(1).unwrap();
 pub const DEFAULT_NUM_TVU_RETRANSMIT_SOCKETS: NonZeroUsize = NonZeroUsize::new(12).unwrap();
+const TRIM_CRDS_TABLE_INTERVAL_MS: u64 = 250;
 
 struct ProcessPacketsScratch {
     pings: Vec<(SocketAddr, Ping)>,
@@ -181,6 +182,10 @@ impl ProcessPacketsScratch {
         self.ping_messages.clear();
         self.pong_messages.clear();
     }
+}
+
+pub(crate) struct VerifiedPacketBatch {
+    packets: Vec<(SocketAddr, Protocol)>,
 }
 
 struct SocketConsumeScratch {
@@ -350,6 +355,7 @@ pub struct ClusterInfo {
     ping_cache: Mutex<PingCache>,
     pub(crate) stats: GossipStats,
     local_message_pending_push_queue: Mutex<Vec<CrdsValue>>,
+    last_trim_crds_table_ms: AtomicU64,
     contact_debug_interval: u64, // milliseconds, 0 = disabled
     contact_save_interval: u64,  // milliseconds, 0 = disabled
     contact_info_path: PathBuf,
@@ -379,6 +385,7 @@ impl ClusterInfo {
             )),
             stats: GossipStats::default(),
             local_message_pending_push_queue: Mutex::default(),
+            last_trim_crds_table_ms: AtomicU64::new(0),
             contact_debug_interval: DEFAULT_CONTACT_DEBUG_INTERVAL_MILLIS,
             contact_info_path: PathBuf::default(),
             contact_save_interval: 0, // disabled
@@ -1615,6 +1622,18 @@ impl ClusterInfo {
     // Trims the CRDS table by dropping all values associated with the pubkeys
     // with the lowest stake, so that the number of unique pubkeys are bounded.
     fn trim_crds_table(&self, cap: usize, stakes: &HashMap<Pubkey, u64>) {
+        let now = timestamp();
+        let last_trim = self.last_trim_crds_table_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last_trim) < TRIM_CRDS_TABLE_INTERVAL_MS {
+            return;
+        }
+        if self
+            .last_trim_crds_table_ms
+            .compare_exchange(last_trim, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
         if !self.gossip.crds.read().unwrap().should_trim(cap) {
             return;
         }
@@ -1629,7 +1648,7 @@ impl ClusterInfo {
             .collect();
         self.stats.trim_crds_table.add_relaxed(1);
         let mut gossip_crds = self.gossip.crds.write().unwrap();
-        match gossip_crds.trim(cap, &keep, stakes, timestamp()) {
+        match gossip_crds.trim(cap, &keep, stakes, now) {
             Err(err) => {
                 self.stats.trim_crds_table_failed.add_relaxed(1);
                 // TODO: Stakes are coming from the root-bank. Debug why/when
@@ -2178,7 +2197,7 @@ impl ClusterInfo {
 
     fn process_packets(
         &self,
-        packets: &mut Vec<Vec<(/*from:*/ SocketAddr, Protocol)>>,
+        packets: &mut Vec<VerifiedPacketBatch>,
         scratch: &mut ProcessPacketsScratch,
         thread_pool: &ThreadPool,
         recycler: &PacketBatchRecycler,
@@ -2197,18 +2216,21 @@ impl ClusterInfo {
             let discard_different_shred_version = |msg| {
                 discard_different_shred_version(msg, self_shred_version, &gossip_crds, &self.stats)
             };
-            let total_messages = packets.iter().map(Vec::len).sum::<usize>();
+            let total_messages = packets.iter().map(|batch| batch.packets.len()).sum::<usize>();
             if packets.len() < gossip_listen_parallel_batch_threshold()
                 && total_messages < gossip_listen_parallel_message_threshold()
             {
-                for (_, msg) in packets.iter_mut().flatten() {
+                for (_, msg) in packets
+                    .iter_mut()
+                    .flat_map(|batch| batch.packets.iter_mut())
+                {
                     discard_different_shred_version(msg);
                 }
             } else {
                 thread_pool.install(|| {
                     packets
                         .par_iter_mut()
-                        .flatten()
+                        .flat_map_iter(|batch| batch.packets.iter_mut())
                         .for_each(|(_, msg)| discard_different_shred_version(msg))
                 })
             }
@@ -2244,7 +2266,10 @@ impl ClusterInfo {
             }
         };
         // Split packets based on their types.
-        for (from_addr, packet) in packets.drain(..).flatten() {
+        for (from_addr, packet) in packets
+            .iter_mut()
+            .flat_map(|batch| batch.packets.drain(..))
+        {
             match packet {
                 Protocol::PullRequest(filter, caller) => {
                     if !check_pull_request_shred_version(self_shred_version, &caller) {
@@ -2328,7 +2353,8 @@ impl ClusterInfo {
         thread_pool: Option<&ThreadPool>,
         mut epoch_specs: Option<&mut EpochSpecs>,
         receiver: &PacketBatchReceiver,
-        sender: &impl ChannelSend<Vec<(/*from:*/ SocketAddr, Protocol)>>,
+        sender: &impl ChannelSend<VerifiedPacketBatch>,
+        recycle_receiver: &Receiver<Vec<(/*from:*/ SocketAddr, Protocol)>>,
         packet_buf: &mut Vec<PacketBatch>,
         scratch: &mut SocketConsumeScratch,
     ) -> Result<(), GossipError> {
@@ -2382,6 +2408,12 @@ impl ClusterInfo {
                 || thread_pool.is_none()
             {
                 scratch.verified_packets.clear();
+                while let Ok(mut recycled) = recycle_receiver.try_recv() {
+                    recycled.clear();
+                    if recycled.capacity() > scratch.verified_packets.capacity() {
+                        scratch.verified_packets = recycled;
+                    }
+                }
                 if scratch.verified_packets.capacity() < num_packets {
                     scratch
                         .verified_packets
@@ -2428,7 +2460,11 @@ impl ClusterInfo {
             packet_buf.clear();
             return Ok(());
         }
-        if let Err(TrySendError::Full(_)) = sender.try_send(packets_verified) {
+        if let Err(TrySendError::Full(batch)) = sender.try_send(VerifiedPacketBatch {
+            packets: packets_verified,
+        }) {
+            scratch.verified_packets = batch.packets;
+            scratch.verified_packets.clear();
             self.stats.gossip_packets_dropped_count.add_relaxed(
                 packet_buf
                     .iter()
@@ -2444,11 +2480,12 @@ impl ClusterInfo {
         &self,
         recycler: &PacketBatchRecycler,
         mut epoch_specs: Option<&mut EpochSpecs>,
-        receiver: &Receiver<Vec<(/*from:*/ SocketAddr, Protocol)>>,
+        receiver: &Receiver<VerifiedPacketBatch>,
+        recycle_sender: &Sender<Vec<(/*from:*/ SocketAddr, Protocol)>>,
         response_sender: &impl ChannelSend<PacketBatch>,
         thread_pool: &ThreadPool,
         should_check_duplicate_instance: bool,
-        packet_buf: &mut Vec<Vec<(/*from:*/ SocketAddr, Protocol)>>,
+        packet_buf: &mut Vec<VerifiedPacketBatch>,
         scratch: &mut ProcessPacketsScratch,
     ) -> Result<(), GossipError> {
         let _st = ScopedTimer::from(&self.stats.gossip_listen_loop_time);
@@ -2482,7 +2519,9 @@ impl ClusterInfo {
             epoch_duration,
             should_check_duplicate_instance,
         )?;
-        packet_buf.clear();
+        for batch in packet_buf.drain(..) {
+            let _ = recycle_sender.try_send(batch.packets);
+        }
         self.stats
             .gossip_listen_loop_iterations_since_last_report
             .add_relaxed(1);
@@ -2493,7 +2532,8 @@ impl ClusterInfo {
         self: Arc<Self>,
         bank_forks: Option<Arc<RwLock<BankForks>>>,
         receiver: PacketBatchReceiver,
-        sender: impl ChannelSend<Vec<(/*from:*/ SocketAddr, Protocol)>>,
+        sender: impl ChannelSend<VerifiedPacketBatch>,
+        recycle_receiver: Receiver<Vec<(/*from:*/ SocketAddr, Protocol)>>,
         exit: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
         let allowed_core_ids = allowed_gossip_core_ids();
@@ -2536,6 +2576,7 @@ impl ClusterInfo {
                     epoch_specs.as_mut(),
                     &receiver,
                     &sender,
+                    &recycle_receiver,
                     &mut packet_buf,
                     &mut scratch,
                 );
@@ -2558,7 +2599,8 @@ impl ClusterInfo {
     pub(crate) fn listen(
         self: Arc<Self>,
         bank_forks: Option<Arc<RwLock<BankForks>>>,
-        requests_receiver: Receiver<Vec<(/*from:*/ SocketAddr, Protocol)>>,
+        requests_receiver: Receiver<VerifiedPacketBatch>,
+        recycle_sender: Sender<Vec<(/*from:*/ SocketAddr, Protocol)>>,
         response_sender: impl ChannelSend<PacketBatch>,
         should_check_duplicate_instance: bool,
         exit: Arc<AtomicBool>,
@@ -2598,6 +2640,7 @@ impl ClusterInfo {
                         &recycler,
                         epoch_specs.as_mut(),
                         &requests_receiver,
+                        &recycle_sender,
                         &response_sender,
                         &thread_pool,
                         should_check_duplicate_instance,

@@ -122,8 +122,8 @@ pub struct AccountTouchEvent {
     pub writable_account_keys: Arc<Vec<Pubkey>>,
     /// Read-only static message account keys inferred from the versioned message header.
     pub readonly_account_keys: Arc<Vec<Pubkey>>,
-    /// Count of lookup table account pubkeys referenced by the message itself.
-    pub lookup_table_account_key_count: usize,
+    /// Lookup table account pubkeys referenced by the message itself.
+    pub lookup_table_account_keys: Arc<Vec<Pubkey>>,
 }
 
 #[derive(Debug, Clone, Copy)]

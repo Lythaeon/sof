@@ -4,7 +4,8 @@ use {
     crate::{
         cluster_info::{
             gossip_receiver_channel_capacity, gossip_response_channel_capacity,
-            gossip_socket_consume_channel_capacity, ClusterInfo, GOSSIP_CHANNEL_CAPACITY,
+            gossip_socket_consume_channel_capacity, ClusterInfo, VerifiedPacketBatch,
+            GOSSIP_CHANNEL_CAPACITY,
         },
         cluster_info_metrics::submit_gossip_stats,
         contact_info::ContactInfo,
@@ -98,11 +99,14 @@ impl GossipService {
             false,
         );
         let (consume_sender, listen_receiver) =
-            EvictingSender::new_bounded(socket_consume_channel_capacity);
+            EvictingSender::<VerifiedPacketBatch>::new_bounded(socket_consume_channel_capacity);
+        let (consume_recycle_sender, consume_recycle_receiver) =
+            crossbeam_channel::bounded(socket_consume_channel_capacity.max(1));
         let t_socket_consume = cluster_info.clone().start_socket_consume_thread(
             bank_forks.clone(),
             request_receiver,
             consume_sender,
+            consume_recycle_receiver,
             exit.clone(),
         );
         let (response_sender, response_receiver) =
@@ -110,6 +114,7 @@ impl GossipService {
         let t_listen = cluster_info.clone().listen(
             bank_forks.clone(),
             listen_receiver,
+            consume_recycle_sender,
             response_sender.clone(),
             should_check_duplicate_instance,
             exit.clone(),

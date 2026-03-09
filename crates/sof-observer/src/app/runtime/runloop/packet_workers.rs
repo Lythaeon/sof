@@ -9,6 +9,7 @@ pub(super) struct PacketWorkerInput {
 
 #[derive(Debug)]
 struct PacketWorkerBatch {
+    worker_index: usize,
     packets: Vec<PacketWorkerInput>,
 }
 
@@ -43,6 +44,8 @@ pub(super) struct WorkerAcceptedShred {
 
 #[derive(Debug)]
 pub(super) struct PacketWorkerBatchResult {
+    pub(super) worker_index: usize,
+    pub(super) reusable_packets: Vec<PacketWorkerInput>,
     pub(super) accepted_shreds: Vec<WorkerAcceptedShred>,
     #[cfg(feature = "gossip-bootstrap")]
     pub(super) leader_diff: crate::verify::SlotLeaderDiff,
@@ -54,6 +57,12 @@ pub(super) struct PacketWorkerBatchResult {
     pub(super) verify_invalid_signature_count: u64,
     pub(super) verify_malformed_count: u64,
     pub(super) verify_dropped_count: u64,
+}
+
+pub(super) enum DispatchWorkerBatchOutcome {
+    Enqueued,
+    Dropped(Vec<PacketWorkerInput>),
+    Closed(Vec<PacketWorkerInput>),
 }
 
 #[derive(Clone, Copy)]
@@ -276,15 +285,18 @@ impl PacketWorkerPool {
         &self,
         worker_index: usize,
         packets: Vec<PacketWorkerInput>,
-    ) -> bool {
+    ) -> DispatchWorkerBatchOutcome {
         if packets.is_empty() {
-            return true;
+            return DispatchWorkerBatchOutcome::Enqueued;
         }
         let Some(sender) = self.senders.get(worker_index) else {
-            return false;
+            return DispatchWorkerBatchOutcome::Closed(packets);
         };
         let packet_count = u64::try_from(packets.len()).unwrap_or(u64::MAX);
-        match sender.try_send(PacketWorkerBatch { packets }) {
+        match sender.try_send(PacketWorkerBatch {
+            worker_index,
+            packets,
+        }) {
             Ok(()) => {
                 let worker_depth_after = sender.max_capacity().saturating_sub(sender.capacity());
                 let depth_after = self
@@ -314,13 +326,15 @@ impl PacketWorkerPool {
                 crate::runtime_metrics::observe_packet_worker_max_queue_depth(
                     self.max_queue_depth.load(Ordering::Relaxed),
                 );
-                true
+                DispatchWorkerBatchOutcome::Enqueued
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            Err(tokio::sync::mpsc::error::TrySendError::Full(batch)) => {
                 crate::runtime_metrics::observe_packet_worker_queue_drops(1, packet_count);
-                true
+                DispatchWorkerBatchOutcome::Dropped(batch.packets)
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(batch)) => {
+                DispatchWorkerBatchOutcome::Closed(batch.packets)
+            }
         }
     }
 
@@ -420,12 +434,16 @@ fn process_packet_batch(
     verify_strict_unknown: bool,
     fec_recoverer: &mut FecRecoverer,
 ) -> PacketWorkerBatchResult {
+    let PacketWorkerBatch {
+        worker_index,
+        mut packets,
+    } = batch;
     let mut accepted_shreds = Vec::new();
     #[cfg(feature = "gossip-bootstrap")]
     let mut observed_slot_leaders = HashMap::<u64, [u8; 32]>::new();
     let mut verify_counters = WorkerVerifyCounters::default();
 
-    for packet in batch.packets {
+    for packet in packets.drain(..) {
         let observed_at = Instant::now();
         let accepted = match verify_packet_with_counters(
             shred_verifier.as_deref_mut(),
@@ -505,6 +523,8 @@ fn process_packet_batch(
         });
 
     PacketWorkerBatchResult {
+        worker_index,
+        reusable_packets: packets,
         accepted_shreds,
         #[cfg(feature = "gossip-bootstrap")]
         leader_diff,
@@ -676,13 +696,16 @@ mod tests {
             fec_retained_slot_lag: 16,
         });
 
-        assert!(pool.dispatch_worker_batch(
-            0,
-            vec![PacketWorkerInput {
-                source: SocketAddr::from(([127, 0, 0, 1], 8_899)),
-                packet_bytes: Arc::from(packet_bytes),
-                parsed_header,
-            }],
+        assert!(matches!(
+            pool.dispatch_worker_batch(
+                0,
+                vec![PacketWorkerInput {
+                    source: SocketAddr::from(([127, 0, 0, 1], 8_899)),
+                    packet_bytes: Arc::from(packet_bytes),
+                    parsed_header,
+                }],
+            ),
+            DispatchWorkerBatchOutcome::Enqueued
         ));
 
         pool.close_inputs();

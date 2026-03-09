@@ -3,8 +3,8 @@ use super::control_plane::{
     ClusterTopologyTracker, emit_observed_slot_leader_bytes_event, emit_slot_leader_diff_event,
 };
 use super::packet_workers::{
-    PacketWorkerBatchResult, PacketWorkerInput, PacketWorkerPool, PacketWorkerPoolConfig,
-    WorkerAcceptedShred, WorkerAcceptedShredKind,
+    DispatchWorkerBatchOutcome, PacketWorkerBatchResult, PacketWorkerInput, PacketWorkerPool,
+    PacketWorkerPoolConfig, WorkerAcceptedShred, WorkerAcceptedShredKind,
 };
 use super::*;
 use crate::reassembly::dataset::CompletedDataSet;
@@ -993,7 +993,11 @@ async fn run_async_with_hosts_inner(
                     #[cfg(feature = "gossip-bootstrap")]
                     repair_source_hint_last_flush: &mut repair_source_hint_last_flush,
                 }
-                .process(worker_result, observed_at);
+                .process(
+                    worker_result,
+                    observed_at,
+                    &mut packet_batch_dispatch_scratch,
+                );
                 crate::runtime_metrics::observe_recovered_data_packets(
                     summary.recovered_data_packets,
                 );
@@ -1285,10 +1289,17 @@ async fn run_async_with_hosts_inner(
                 }
                 for worker_index in 0..packet_batch_dispatch_scratch.worker_count() {
                     let packets = packet_batch_dispatch_scratch.take_worker_batch(worker_index);
-                    if !packet_worker_pool
-                        .dispatch_worker_batch(worker_index, packets)
-                    {
-                        break 'event_loop;
+                    match packet_worker_pool.dispatch_worker_batch(worker_index, packets) {
+                        DispatchWorkerBatchOutcome::Enqueued => {}
+                        DispatchWorkerBatchOutcome::Dropped(packets) => {
+                            packet_batch_dispatch_scratch
+                                .recycle_worker_batch(worker_index, packets);
+                        }
+                        DispatchWorkerBatchOutcome::Closed(packets) => {
+                            packet_batch_dispatch_scratch
+                                .recycle_worker_batch(worker_index, packets);
+                            break 'event_loop;
+                        }
                     }
                 }
             }
@@ -2724,17 +2735,31 @@ impl PacketWorkerResultContext<'_> {
         mut self,
         worker_result: PacketWorkerBatchResult,
         observed_at: Instant,
+        packet_batch_dispatch_scratch: &mut PacketBatchDispatchScratch,
     ) -> PacketWorkerResultSummary {
+        let PacketWorkerBatchResult {
+            worker_index,
+            reusable_packets,
+            accepted_shreds,
+            #[cfg(feature = "gossip-bootstrap")]
+            leader_diff,
+            #[cfg(feature = "gossip-bootstrap")]
+            observed_slot_leaders,
+            verify_verified_count: _,
+            verify_unknown_leader_count: _,
+            verify_invalid_merkle_count: _,
+            verify_invalid_signature_count: _,
+            verify_malformed_count: _,
+            verify_dropped_count: _,
+        } = worker_result;
         #[cfg(feature = "gossip-bootstrap")]
-        self.emit_leader_events(
-            worker_result.leader_diff,
-            worker_result.observed_slot_leaders,
-        );
+        self.emit_leader_events(leader_diff, observed_slot_leaders);
 
         let mut summary = PacketWorkerResultSummary::default();
-        for shred in worker_result.accepted_shreds {
+        for shred in accepted_shreds {
             self.process_accepted_shred(shred, observed_at, &mut summary);
         }
+        packet_batch_dispatch_scratch.recycle_worker_batch(worker_index, reusable_packets);
         summary
     }
 
@@ -3163,14 +3188,21 @@ impl PacketBatchDispatchScratch {
         }
     }
 
-    /// Swaps one staged worker batch out while keeping the retained batch capacity hot.
+    /// Moves one staged worker batch out so the worker can process it.
     fn take_worker_batch(&mut self, worker_index: usize) -> Vec<PacketWorkerInput> {
         let Some(batch) = self.worker_batches.get_mut(worker_index) else {
             return Vec::new();
         };
-        let mut outgoing = Vec::with_capacity(batch.capacity());
-        std::mem::swap(&mut outgoing, batch);
-        outgoing
+        std::mem::take(batch)
+    }
+
+    /// Recycles one drained worker batch back into retained scratch storage.
+    fn recycle_worker_batch(&mut self, worker_index: usize, mut batch: Vec<PacketWorkerInput>) {
+        let Some(slot) = self.worker_batches.get_mut(worker_index) else {
+            return;
+        };
+        batch.clear();
+        *slot = batch;
     }
 
     /// Returns number of staged worker batches.

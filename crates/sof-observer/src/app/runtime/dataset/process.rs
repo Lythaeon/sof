@@ -200,7 +200,7 @@ pub(super) fn process_completed_dataset(
                     account_keys: static_account_keys,
                     writable_account_keys,
                     readonly_account_keys,
-                    lookup_table_account_key_count: lookup_table_account_key_count(tx_ref),
+                    lookup_table_account_keys: lookup_table_account_keys(tx_ref),
                 }
             });
             let tx_index = dataset_tx_index_base.saturating_add(dataset_tx_offset);
@@ -396,6 +396,16 @@ fn lookup_table_account_key_count(tx: &VersionedTransaction) -> usize {
     tx.message
         .address_table_lookups()
         .map_or(0, |lookups| lookups.len())
+}
+
+fn lookup_table_account_keys(tx: &VersionedTransaction) -> Arc<Vec<Pubkey>> {
+    let Some(lookups) = tx.message.address_table_lookups() else {
+        return empty_pubkey_vec();
+    };
+    if lookups.is_empty() {
+        return empty_pubkey_vec();
+    }
+    Arc::new(lookups.iter().map(|lookup| lookup.account_key).collect())
 }
 
 fn decode_entries_from_payload_fragments(
