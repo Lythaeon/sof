@@ -127,6 +127,23 @@ fn emits_missing_prefix_dataset_if_gap_arrives_later() {
     );
 }
 
+#[test]
+fn late_prefix_after_last_boundary_still_finishes_slot() {
+    let mut reassembler = DataSetReassembler::new(16);
+    let _ = ingest(&mut reassembler, 40, 1, true, false, vec![1]);
+    let tail_out = ingest(&mut reassembler, 40, 2, false, true, vec![2]);
+    assert_eq!(tail_out.len(), 1);
+    assert_eq!(tail_out[0].start_index, 2);
+    assert_eq!(tail_out[0].end_index, 2);
+    assert_eq!(reassembler.tracked_slots(), 1);
+
+    let prefix_out = ingest(&mut reassembler, 40, 0, false, false, vec![0]);
+    assert_eq!(prefix_out.len(), 1);
+    assert_eq!(prefix_out[0].start_index, 0);
+    assert_eq!(prefix_out[0].end_index, 1);
+    assert_eq!(reassembler.tracked_slots(), 0);
+}
+
 fn ingest(
     reassembler: &mut DataSetReassembler,
     slot: u64,
