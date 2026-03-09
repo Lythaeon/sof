@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use sof::reassembly::dataset::DataSetReassembler;
+use sof::reassembly::dataset::{DataSetReassembler, SharedPayloadFragment};
 
 fn take_bytes<'a>(input: &mut &'a [u8], len: usize) -> Option<&'a [u8]> {
     if input.len() < len {
@@ -59,7 +59,7 @@ fuzz_target!(|bytes: &[u8]| {
             index,
             data_complete,
             last_in_slot,
-            payload.to_vec(),
+            SharedPayloadFragment::owned(payload.to_vec()),
         );
 
         assert!(reassembler.tracked_slots() <= max_tracked_slots);
@@ -71,8 +71,8 @@ fuzz_target!(|bytes: &[u8]| {
                 u64::from(dataset.end_index).saturating_sub(u64::from(dataset.start_index)) + 1;
             let expected_len = usize::try_from(expected_len_u64).unwrap_or(usize::MAX);
 
-            assert_eq!(dataset.serialized_shreds.len(), expected_len);
-            assert!(!dataset.serialized_shreds.is_empty());
+            assert_eq!(dataset.payload_fragments.len(), expected_len);
+            assert!(!dataset.payload_fragments.is_empty());
         }
     }
 });
