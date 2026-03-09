@@ -11,6 +11,7 @@ It is split into three user-facing crates:
 ## Highlights
 
 - Multi-core packet ingest, FEC recovery, and dataset reconstruction
+- Bundled gossip backend tuning for queue depths, worker counts, CPU pinning, and small-batch serial fallbacks
 - Local `processed` / `confirmed` / `finalized` transaction tagging
 - Plugin hooks and runtime extensions for downstream logic
 - Lower-copy hot paths through shared dataset payload fragments and borrowed transaction classification

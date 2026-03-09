@@ -145,6 +145,7 @@ Notes for high-ingest runs:
 
 - The example configures `SOF_PORT_RANGE=12000-12100` and `SOF_GOSSIP_PORT=8001`.
 - It defaults live gossip mode to `SOF_INGEST_QUEUE_MODE=lockfree` with `SOF_INGEST_QUEUE_CAPACITY=262144`.
+- The bundled gossip backend also exposes `SOF_GOSSIP_CONSUME_THREADS`, `SOF_GOSSIP_LISTEN_THREADS`, `SOF_GOSSIP_SOCKET_CONSUME_PARALLEL_PACKET_THRESHOLD`, and `SOF_GOSSIP_STATS_INTERVAL_SECS` for host-specific tuning.
 - `SOF_UDP_DROP_ON_CHANNEL_FULL` only applies to SOF's built-in UDP receiver path (non-external ingress).
 - Queue mode is configurable with `SOF_INGEST_QUEUE_MODE`:
   - `bounded` (default): Tokio bounded channel.

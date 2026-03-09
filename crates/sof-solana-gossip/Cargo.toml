@@ -102,6 +102,9 @@ version = "2.33.1"
 [dependencies.crossbeam-channel]
 version = "0.5.15"
 
+[dependencies.core_affinity]
+version = "0.8"
+
 [dependencies.flate2]
 version = "1.0.31"
 
