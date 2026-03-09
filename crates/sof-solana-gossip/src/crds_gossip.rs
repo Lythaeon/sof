@@ -51,7 +51,7 @@ impl CrdsGossip {
     /// Returns unique origins' pubkeys of upserted values.
     pub fn process_push_message(
         &self,
-        messages: Vec<(/*from:*/ Pubkey, Vec<CrdsValue>)>,
+        messages: &mut Vec<(/*from:*/ Pubkey, Vec<CrdsValue>)>,
         now: u64,
     ) -> HashSet<Pubkey> {
         self.push.process_push_message(&self.crds, messages, now)

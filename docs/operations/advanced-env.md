@@ -110,6 +110,8 @@ Important scope note:
 | `SOF_GOSSIP_LISTEN_THREADS` | host parallelism, clamped to `8` | Thread count for gossip listen workers in the bundled backend. |
 | `SOF_GOSSIP_RUN_THREADS` | host parallelism, clamped to `8` | Thread count for the bundled gossip run/push-pull Rayon pool. Useful when the run loop is still underutilizing cores after listen/consume tuning. |
 | `SOF_GOSSIP_SOCKET_CONSUME_PARALLEL_PACKET_THRESHOLD` | `1024` | Below this packet count, socket-consume verification stays serial to avoid paying Rayon overhead on small batches. |
+| `SOF_GOSSIP_LISTEN_PARALLEL_BATCH_THRESHOLD` | `32` | Below this batch count, the listen loop keeps shred-version filtering serial to avoid paying Rayon overhead on small gossip drains. |
+| `SOF_GOSSIP_LISTEN_PARALLEL_MESSAGE_THRESHOLD` | `256` | Below this message count, the listen loop keeps shred-version filtering serial even when several small batches arrive together. |
 | `SOF_GOSSIP_STATS_INTERVAL_SECS` | `10` | Controls gossip metrics reporting interval inside the bundled backend. Set to `0` to disable the metrics thread when measuring hot-path overhead. |
 | `SOF_GOSSIP_SAMPLE_LOGS_ENABLED` | `true` | Enables sampled gossip/ping datapoint logging. Set to `false` when measuring pure hot-path behavior and you do not want sampled metrics/log noise. |
 | `SOF_SHRED_VERSION` | unset | Bad override can reject valid cluster traffic. |

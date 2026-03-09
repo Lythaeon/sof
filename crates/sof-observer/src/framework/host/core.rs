@@ -13,6 +13,10 @@ use crate::framework::events::TransactionEventRef;
 pub struct PluginHost {
     /// Immutable plugin collection in registration order.
     pub(super) plugins: Arc<[Arc<dyn ObserverPlugin>]>,
+    /// Plugins interested in transaction callbacks.
+    pub(super) transaction_plugins: Arc<[Arc<dyn ObserverPlugin>]>,
+    /// Plugins interested in account-touch callbacks.
+    pub(super) account_touch_plugins: Arc<[Arc<dyn ObserverPlugin>]>,
     /// Optional async dispatcher state (absent when no plugins are registered).
     pub(super) dispatcher: Option<PluginDispatcher>,
     /// Optional sharded accepted-transaction dispatcher.
@@ -29,6 +33,8 @@ impl Default for PluginHost {
     fn default() -> Self {
         Self {
             plugins: Arc::from(Vec::<Arc<dyn ObserverPlugin>>::new()),
+            transaction_plugins: Arc::from(Vec::<Arc<dyn ObserverPlugin>>::new()),
+            account_touch_plugins: Arc::from(Vec::<Arc<dyn ObserverPlugin>>::new()),
             dispatcher: None,
             transaction_dispatcher: None,
             subscriptions: PluginHookSubscriptions::default(),
@@ -149,11 +155,9 @@ impl PluginHost {
         if !self.subscriptions.transaction || self.transaction_dispatcher.is_none() {
             return ClassifiedTransactionDispatch::empty();
         }
-        let mut dispatch = ClassifiedTransactionDispatch::empty();
-        for plugin in self.plugins.iter() {
-            if !plugin.wants_transaction() {
-                continue;
-            }
+        let mut dispatch =
+            ClassifiedTransactionDispatch::with_capacity(self.transaction_plugins.len());
+        for plugin in self.transaction_plugins.iter() {
             dispatch.push(plugin.transaction_interest_ref(event), Arc::clone(plugin));
         }
         dispatch
@@ -189,9 +193,9 @@ impl PluginHost {
         if !self.subscriptions.account_touch || self.dispatcher.is_none() {
             return Vec::new();
         }
-        let mut selected = Vec::new();
-        for plugin in self.plugins.iter() {
-            if plugin.wants_account_touch() && plugin.accepts_account_touch_ref(event) {
+        let mut selected = Vec::with_capacity(self.account_touch_plugins.len().min(4));
+        for plugin in self.account_touch_plugins.iter() {
+            if plugin.accepts_account_touch_ref(event) {
                 selected.push(Arc::clone(plugin));
             }
         }

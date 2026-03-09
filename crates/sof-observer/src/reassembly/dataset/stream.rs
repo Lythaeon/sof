@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeSet, HashMap};
 
 use super::{CompletedDataSet, PayloadFragmentBatch, SharedPayloadFragment};
 
@@ -6,21 +6,19 @@ use super::{CompletedDataSet, PayloadFragmentBatch, SharedPayloadFragment};
 pub(super) struct SlotStream {
     slot: u64,
     tail_min_shreds_without_anchor: usize,
-    fragments: BTreeMap<u32, DataFragment>,
+    fragments: HashMap<u32, DataFragment>,
     dataset_boundaries: BTreeSet<u32>,
-    emitted_boundaries: BTreeSet<u32>,
     last_index: Option<u32>,
     pub(super) finished: bool,
 }
 
 impl SlotStream {
-    pub(super) const fn new(slot: u64, tail_min_shreds_without_anchor: usize) -> Self {
+    pub(super) fn new(slot: u64, tail_min_shreds_without_anchor: usize) -> Self {
         Self {
             slot,
             tail_min_shreds_without_anchor,
-            fragments: BTreeMap::new(),
+            fragments: HashMap::new(),
             dataset_boundaries: BTreeSet::new(),
-            emitted_boundaries: BTreeSet::new(),
             last_index: None,
             finished: false,
         }
@@ -42,7 +40,7 @@ impl SlotStream {
             self.last_index = Some(self.last_index.map_or(index, |prev| prev.max(index)));
         }
 
-        if let std::collections::btree_map::Entry::Vacant(vacant) = self.fragments.entry(index) {
+        if let std::collections::hash_map::Entry::Vacant(vacant) = self.fragments.entry(index) {
             let _ = vacant.insert(DataFragment {
                 payload_fragment,
                 last_in_slot,
@@ -56,9 +54,6 @@ impl SlotStream {
         let mut completed = Vec::new();
         let boundaries: Vec<u32> = self.dataset_boundaries.iter().copied().collect();
         for complete_index in boundaries {
-            if self.emitted_boundaries.contains(&complete_index) {
-                continue;
-            }
             let Some(start_index) = self.start_index_for_boundary(complete_index) else {
                 continue;
             };
@@ -75,7 +70,7 @@ impl SlotStream {
                     fragments.push(fragment.payload_fragment);
                 }
             }
-            let _ = self.emitted_boundaries.insert(complete_index);
+            let _ = self.dataset_boundaries.remove(&complete_index);
             completed.push(CompletedDataSet {
                 slot: self.slot,
                 start_index,
@@ -85,8 +80,9 @@ impl SlotStream {
             });
         }
 
-        if let Some(last_index) = self.last_index
-            && self.emitted_boundaries.contains(&last_index)
+        if self
+            .last_index
+            .is_some_and(|last_index| !self.dataset_boundaries.contains(&last_index))
             && self.fragments.is_empty()
         {
             self.finished = true;

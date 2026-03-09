@@ -1,7 +1,7 @@
 [package]
 name = "sof-solana-gossip"
 documentation = "https://docs.rs/solana-gossip"
-version = "3.1.8-sof.1"
+version = "3.1.8-sof.2"
 authors = { workspace = true }
 description = { workspace = true }
 repository = { workspace = true }

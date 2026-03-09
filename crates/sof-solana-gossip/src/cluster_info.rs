@@ -45,7 +45,7 @@ use {
     },
     arc_swap::ArcSwap,
     core_affinity::CoreId,
-    crossbeam_channel::{Receiver, TrySendError},
+    crossbeam_channel::{Receiver, Sender, TrySendError},
     itertools::{Either, Itertools},
     rand::{seq::SliceRandom, CryptoRng, Rng},
     rayon::{prelude::*, ThreadPool, ThreadPoolBuilder},
@@ -91,8 +91,8 @@ use {
         rc::Rc,
         result::Result,
         sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc, Mutex, RwLock, RwLockReadGuard,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+            Arc, Mutex, OnceLock, RwLock, RwLockReadGuard,
         },
         thread::{sleep, Builder, JoinHandle},
         time::{Duration, Instant},
@@ -121,8 +121,8 @@ const GOSSIP_RUN_WORK_CORE_OFFSET: usize = 0;
 /// to the processing loop are avoided.
 const CHANNEL_CONSUME_CAPACITY: usize = 1024;
 const DEFAULT_GOSSIP_SOCKET_CONSUME_PARALLEL_PACKET_THRESHOLD: usize = 1024;
-const GOSSIP_LISTEN_PARALLEL_BATCH_THRESHOLD: usize = 32;
-const GOSSIP_LISTEN_PARALLEL_MESSAGE_THRESHOLD: usize = 256;
+const DEFAULT_GOSSIP_LISTEN_PARALLEL_BATCH_THRESHOLD: usize = 32;
+const DEFAULT_GOSSIP_LISTEN_PARALLEL_MESSAGE_THRESHOLD: usize = 256;
 /// Channel capacity for gossip channels.
 ///
 /// A hard limit on incoming gossip messages.
@@ -148,6 +148,57 @@ pub const MINIMUM_NUM_TVU_RECEIVE_SOCKETS: NonZeroUsize = NonZeroUsize::new(1).u
 pub const DEFAULT_NUM_TVU_RECEIVE_SOCKETS: NonZeroUsize = MINIMUM_NUM_TVU_RECEIVE_SOCKETS;
 pub const MINIMUM_NUM_TVU_RETRANSMIT_SOCKETS: NonZeroUsize = NonZeroUsize::new(1).unwrap();
 pub const DEFAULT_NUM_TVU_RETRANSMIT_SOCKETS: NonZeroUsize = NonZeroUsize::new(12).unwrap();
+const TRIM_CRDS_TABLE_INTERVAL_MS: u64 = 250;
+
+struct ProcessPacketsScratch {
+    pings: Vec<(SocketAddr, Ping)>,
+    pull_requests: Vec<PullRequest>,
+    pull_responses: Vec<CrdsValue>,
+    push_messages: Vec<(Pubkey, Vec<CrdsValue>)>,
+    prune_messages: Vec<PruneData>,
+    ping_messages: Vec<(SocketAddr, Ping)>,
+    pong_messages: Vec<(SocketAddr, Pong)>,
+}
+
+impl ProcessPacketsScratch {
+    fn new() -> Self {
+        Self {
+            pings: Vec::with_capacity(64),
+            pull_requests: Vec::with_capacity(64),
+            pull_responses: Vec::with_capacity(256),
+            push_messages: Vec::with_capacity(64),
+            prune_messages: Vec::with_capacity(64),
+            ping_messages: Vec::with_capacity(64),
+            pong_messages: Vec::with_capacity(64),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.pings.clear();
+        self.pull_requests.clear();
+        self.pull_responses.clear();
+        self.push_messages.clear();
+        self.prune_messages.clear();
+        self.ping_messages.clear();
+        self.pong_messages.clear();
+    }
+}
+
+pub(crate) struct VerifiedPacketBatch {
+    packets: Vec<(SocketAddr, Protocol)>,
+}
+
+struct SocketConsumeScratch {
+    verified_packets: Vec<(SocketAddr, Protocol)>,
+}
+
+impl SocketConsumeScratch {
+    fn new() -> Self {
+        Self {
+            verified_packets: Vec::with_capacity(1024),
+        }
+    }
+}
 
 fn allowed_gossip_core_ids() -> Vec<CoreId> {
     let parsed_allowed_core_ids = std::fs::read_to_string("/proc/self/status")
@@ -241,6 +292,28 @@ fn gossip_socket_consume_parallel_packet_threshold() -> usize {
         .unwrap_or(DEFAULT_GOSSIP_SOCKET_CONSUME_PARALLEL_PACKET_THRESHOLD)
 }
 
+fn gossip_listen_parallel_batch_threshold() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("SOF_GOSSIP_LISTEN_PARALLEL_BATCH_THRESHOLD")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_GOSSIP_LISTEN_PARALLEL_BATCH_THRESHOLD)
+    })
+}
+
+fn gossip_listen_parallel_message_threshold() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("SOF_GOSSIP_LISTEN_PARALLEL_MESSAGE_THRESHOLD")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_GOSSIP_LISTEN_PARALLEL_MESSAGE_THRESHOLD)
+    })
+}
+
 fn gossip_socket_consume_threads() -> usize {
     let default = get_thread_count().min(8);
     read_usize_env("SOF_GOSSIP_CONSUME_THREADS").unwrap_or(default)
@@ -282,6 +355,7 @@ pub struct ClusterInfo {
     ping_cache: Mutex<PingCache>,
     pub(crate) stats: GossipStats,
     local_message_pending_push_queue: Mutex<Vec<CrdsValue>>,
+    last_trim_crds_table_ms: AtomicU64,
     contact_debug_interval: u64, // milliseconds, 0 = disabled
     contact_save_interval: u64,  // milliseconds, 0 = disabled
     contact_info_path: PathBuf,
@@ -311,6 +385,7 @@ impl ClusterInfo {
             )),
             stats: GossipStats::default(),
             local_message_pending_push_queue: Mutex::default(),
+            last_trim_crds_table_ms: AtomicU64::new(0),
             contact_debug_interval: DEFAULT_CONTACT_DEBUG_INTERVAL_MILLIS,
             contact_info_path: PathBuf::default(),
             contact_save_interval: 0, // disabled
@@ -1547,6 +1622,18 @@ impl ClusterInfo {
     // Trims the CRDS table by dropping all values associated with the pubkeys
     // with the lowest stake, so that the number of unique pubkeys are bounded.
     fn trim_crds_table(&self, cap: usize, stakes: &HashMap<Pubkey, u64>) {
+        let now = timestamp();
+        let last_trim = self.last_trim_crds_table_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last_trim) < TRIM_CRDS_TABLE_INTERVAL_MS {
+            return;
+        }
+        if self
+            .last_trim_crds_table_ms
+            .compare_exchange(last_trim, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
         if !self.gossip.crds.read().unwrap().should_trim(cap) {
             return;
         }
@@ -1561,7 +1648,7 @@ impl ClusterInfo {
             .collect();
         self.stats.trim_crds_table.add_relaxed(1);
         let mut gossip_crds = self.gossip.crds.write().unwrap();
-        match gossip_crds.trim(cap, &keep, stakes, timestamp()) {
+        match gossip_crds.trim(cap, &keep, stakes, now) {
             Err(err) => {
                 self.stats.trim_crds_table_failed.add_relaxed(1);
                 // TODO: Stakes are coming from the root-bank. Debug why/when
@@ -1616,6 +1703,7 @@ impl ClusterInfo {
                 let mut last_contact_info_save = timestamp();
                 let mut entrypoints_processed = false;
                 let recycler = PacketBatchRecycler::default();
+                let empty_stakes = HashMap::new();
 
                 for gossip_round in 0usize.. {
                     if exit.load(Ordering::Relaxed) {
@@ -1640,26 +1728,26 @@ impl ClusterInfo {
                         self.save_contact_info();
                         last_contact_info_save = start;
                     }
-                    let stakes = epoch_specs
-                        .as_mut()
-                        .map(EpochSpecs::current_epoch_staked_nodes)
-                        .cloned()
-                        .unwrap_or_default();
+                    let (stakes, epoch_duration) = if let Some(epoch_specs) = epoch_specs.as_mut() {
+                        let epoch_duration = epoch_specs.epoch_duration();
+                        (
+                            epoch_specs.current_epoch_staked_nodes().as_ref(),
+                            epoch_duration,
+                        )
+                    } else {
+                        (&empty_stakes, DEFAULT_EPOCH_DURATION)
+                    };
 
                     let _ = self.run_gossip(
                         &thread_pool,
                         gossip_validators.as_ref(),
                         &recycler,
-                        &stakes,
+                        stakes,
                         &sender,
                         // Make pull requests every PULL_REQUEST_PERIOD rounds
                         gossip_round % PULL_REQUEST_PERIOD == 0,
                     );
-                    let epoch_duration = epoch_specs
-                        .as_mut()
-                        .map(EpochSpecs::epoch_duration)
-                        .unwrap_or(DEFAULT_EPOCH_DURATION);
-                    self.handle_purge(&thread_pool, epoch_duration, &stakes);
+                    self.handle_purge(&thread_pool, epoch_duration, stakes);
                     entrypoints_processed = entrypoints_processed || self.process_entrypoints();
                     //TODO: possibly tune this parameter
                     //we saw a deadlock passing an self.read().unwrap().timeout into sleep
@@ -1667,7 +1755,7 @@ impl ClusterInfo {
                         self.refresh_my_gossip_contact_info();
                         self.refresh_push_active_set(
                             &recycler,
-                            &stakes,
+                            stakes,
                             gossip_validators.as_ref(),
                             &sender,
                         );
@@ -1683,7 +1771,11 @@ impl ClusterInfo {
             .unwrap()
     }
 
-    fn handle_batch_prune_messages(&self, messages: Vec<PruneData>, stakes: &HashMap<Pubkey, u64>) {
+    fn handle_batch_prune_messages(
+        &self,
+        messages: &mut Vec<PruneData>,
+        stakes: &HashMap<Pubkey, u64>,
+    ) {
         let _st = ScopedTimer::from(&self.stats.handle_batch_prune_messages_time);
         if messages.is_empty() {
             return;
@@ -1697,7 +1789,7 @@ impl ClusterInfo {
         {
             let _st = ScopedTimer::from(&self.stats.process_prune);
             let now = timestamp();
-            for data in messages {
+            for data in messages.drain(..) {
                 match self.gossip.process_prune_msg(
                     &self_pubkey,
                     &data.pubkey,
@@ -1731,7 +1823,7 @@ impl ClusterInfo {
 
     fn handle_batch_pull_requests(
         &self,
-        requests: Vec<PullRequest>,
+        requests: &mut Vec<PullRequest>,
         thread_pool: &ThreadPool,
         recycler: &PacketBatchRecycler,
         stakes: &HashMap<Pubkey, u64>,
@@ -1812,7 +1904,7 @@ impl ClusterInfo {
         &self,
         thread_pool: &ThreadPool,
         recycler: &PacketBatchRecycler,
-        mut requests: Vec<PullRequest>,
+        requests: &mut Vec<PullRequest>,
         stakes: &HashMap<Pubkey, u64>,
     ) -> PinnedPacketBatch {
         const DEFAULT_EPOCH_DURATION_MS: u64 = DEFAULT_SLOTS_PER_EPOCH * DEFAULT_MS_PER_SLOT;
@@ -1831,7 +1923,7 @@ impl ClusterInfo {
             let _st = ScopedTimer::from(&self.stats.generate_pull_responses);
             self.gossip.generate_pull_responses(
                 thread_pool,
-                &requests,
+                requests,
                 output_size_limit,
                 now,
                 |value| {
@@ -1911,7 +2003,7 @@ impl ClusterInfo {
 
     fn handle_batch_pull_responses(
         &self,
-        responses: Vec<CrdsValue>,
+        responses: &mut Vec<CrdsValue>,
         stakes: &HashMap<Pubkey, u64>,
         epoch_duration: Duration,
     ) {
@@ -1928,7 +2020,7 @@ impl ClusterInfo {
     // Returns (failed, timeout, success)
     fn handle_pull_response(
         &self,
-        crds_values: Vec<CrdsValue>,
+        crds_values: &mut Vec<CrdsValue>,
         timeouts: &CrdsTimeouts,
     ) -> (usize, usize, usize) {
         let len = crds_values.len();
@@ -1936,7 +2028,12 @@ impl ClusterInfo {
         let (filtered_pulls, filtered_pulls_expired_timeout, failed_inserts) = {
             let _st = ScopedTimer::from(&self.stats.filter_pull_response);
             self.gossip
-                .filter_pull_responses(timeouts, crds_values, timestamp(), &mut pull_stats)
+                .filter_pull_responses(
+                    timeouts,
+                    crds_values.drain(..).collect(),
+                    timestamp(),
+                    &mut pull_stats,
+                )
         };
         if !filtered_pulls.is_empty()
             || !filtered_pulls_expired_timeout.is_empty()
@@ -2001,7 +2098,7 @@ impl ClusterInfo {
 
     fn handle_batch_push_messages(
         &self,
-        messages: Vec<(Pubkey, Vec<CrdsValue>)>,
+        messages: &mut Vec<(Pubkey, Vec<CrdsValue>)>,
         thread_pool: &ThreadPool,
         recycler: &PacketBatchRecycler,
         stakes: &HashMap<Pubkey, u64>,
@@ -2100,7 +2197,8 @@ impl ClusterInfo {
 
     fn process_packets(
         &self,
-        packets: &mut Vec<Vec<(/*from:*/ SocketAddr, Protocol)>>,
+        packets: &mut Vec<VerifiedPacketBatch>,
+        scratch: &mut ProcessPacketsScratch,
         thread_pool: &ThreadPool,
         recycler: &PacketBatchRecycler,
         response_sender: &impl ChannelSend<PacketBatch>,
@@ -2109,6 +2207,7 @@ impl ClusterInfo {
         should_check_duplicate_instance: bool,
     ) -> Result<(), GossipError> {
         let _st = ScopedTimer::from(&self.stats.process_gossip_packets_time);
+        scratch.clear();
         let self_pubkey = self.id();
         // Filter out values if the shred-versions are different.
         let self_shred_version = self.my_shred_version();
@@ -2117,18 +2216,21 @@ impl ClusterInfo {
             let discard_different_shred_version = |msg| {
                 discard_different_shred_version(msg, self_shred_version, &gossip_crds, &self.stats)
             };
-            let total_messages = packets.iter().map(Vec::len).sum::<usize>();
-            if packets.len() < GOSSIP_LISTEN_PARALLEL_BATCH_THRESHOLD
-                && total_messages < GOSSIP_LISTEN_PARALLEL_MESSAGE_THRESHOLD
+            let total_messages = packets.iter().map(|batch| batch.packets.len()).sum::<usize>();
+            if packets.len() < gossip_listen_parallel_batch_threshold()
+                && total_messages < gossip_listen_parallel_message_threshold()
             {
-                for (_, msg) in packets.iter_mut().flatten() {
+                for (_, msg) in packets
+                    .iter_mut()
+                    .flat_map(|batch| batch.packets.iter_mut())
+                {
                     discard_different_shred_version(msg);
                 }
             } else {
                 thread_pool.install(|| {
                     packets
                         .par_iter_mut()
-                        .flatten()
+                        .flat_map_iter(|batch| batch.packets.iter_mut())
                         .for_each(|(_, msg)| discard_different_shred_version(msg))
                 })
             }
@@ -2146,7 +2248,6 @@ impl ClusterInfo {
                 }
             }
         };
-        let mut pings = Vec::new();
         let mut rng = rand::thread_rng();
         let keypair = self.keypair();
         let mut verify_gossip_addr = |value: &CrdsValue| {
@@ -2156,7 +2257,7 @@ impl ClusterInfo {
                 value,
                 &self.socket_addr_space,
                 &self.ping_cache,
-                &mut pings,
+                &mut scratch.pings,
             ) {
                 true
             } else {
@@ -2165,13 +2266,10 @@ impl ClusterInfo {
             }
         };
         // Split packets based on their types.
-        let mut pull_requests = vec![];
-        let mut pull_responses = vec![];
-        let mut push_messages = vec![];
-        let mut prune_messages = vec![];
-        let mut ping_messages = vec![];
-        let mut pong_messages = vec![];
-        for (from_addr, packet) in packets.drain(..).flatten() {
+        for (from_addr, packet) in packets
+            .iter_mut()
+            .flat_map(|batch| batch.packets.drain(..))
+        {
             match packet {
                 Protocol::PullRequest(filter, caller) => {
                     if !check_pull_request_shred_version(self_shred_version, &caller) {
@@ -2187,7 +2285,7 @@ impl ClusterInfo {
                     if request.pubkey == self_pubkey {
                         self.stats.window_request_loopback.add_relaxed(1);
                     } else {
-                        pull_requests.push(request);
+                        scratch.pull_requests.push(request);
                     }
                 }
                 Protocol::PullResponse(_, mut data) => {
@@ -2196,7 +2294,7 @@ impl ClusterInfo {
                     }
                     data.retain(&mut verify_gossip_addr);
                     if !data.is_empty() {
-                        pull_responses.append(&mut data);
+                        scratch.pull_responses.append(&mut data);
                     }
                 }
                 Protocol::PushMessage(from, mut data) => {
@@ -2208,32 +2306,37 @@ impl ClusterInfo {
                         self.stats
                             .push_message_value_count
                             .add_relaxed(data.len() as u64);
-                        push_messages.push((from, data));
+                        scratch.push_messages.push((from, data));
                     }
                 }
-                Protocol::PruneMessage(_from, data) => prune_messages.push(data),
-                Protocol::PingMessage(ping) => ping_messages.push((from_addr, ping)),
-                Protocol::PongMessage(pong) => pong_messages.push((from_addr, pong)),
+                Protocol::PruneMessage(_from, data) => scratch.prune_messages.push(data),
+                Protocol::PingMessage(ping) => scratch.ping_messages.push((from_addr, ping)),
+                Protocol::PongMessage(pong) => scratch.pong_messages.push((from_addr, pong)),
             }
         }
-        let pings = pings
-            .into_iter()
+        let pings = scratch
+            .pings
+            .drain(..)
             .map(|(addr, ping)| (addr, Protocol::PingMessage(ping)));
         send_gossip_packets(pings, recycler, response_sender, &self.stats);
-        self.handle_batch_ping_messages(ping_messages, recycler, response_sender);
-        self.handle_batch_prune_messages(prune_messages, stakes);
+        self.handle_batch_ping_messages(scratch.ping_messages.drain(..), recycler, response_sender);
+        self.handle_batch_prune_messages(&mut scratch.prune_messages, stakes);
         self.handle_batch_push_messages(
-            push_messages,
+            &mut scratch.push_messages,
             thread_pool,
             recycler,
             stakes,
             response_sender,
         );
-        self.handle_batch_pull_responses(pull_responses, stakes, epoch_duration);
+        self.handle_batch_pull_responses(
+            &mut scratch.pull_responses,
+            stakes,
+            epoch_duration,
+        );
         self.trim_crds_table(CRDS_UNIQUE_PUBKEY_CAPACITY, stakes);
-        self.handle_batch_pong_messages(pong_messages, Instant::now());
+        self.handle_batch_pong_messages(scratch.pong_messages.drain(..), Instant::now());
         self.handle_batch_pull_requests(
-            pull_requests,
+            &mut scratch.pull_requests,
             thread_pool,
             recycler,
             stakes,
@@ -2247,11 +2350,13 @@ impl ClusterInfo {
     // handling of requests/messages.
     fn run_socket_consume(
         &self,
-        thread_pool: &ThreadPool,
+        thread_pool: Option<&ThreadPool>,
         mut epoch_specs: Option<&mut EpochSpecs>,
         receiver: &PacketBatchReceiver,
-        sender: &impl ChannelSend<Vec<(/*from:*/ SocketAddr, Protocol)>>,
+        sender: &impl ChannelSend<VerifiedPacketBatch>,
+        recycle_receiver: &Receiver<Vec<(/*from:*/ SocketAddr, Protocol)>>,
         packet_buf: &mut Vec<PacketBatch>,
+        scratch: &mut SocketConsumeScratch,
     ) -> Result<(), GossipError> {
         let mut num_packets = 0;
         for packet_batch in receiver
@@ -2299,26 +2404,39 @@ impl ClusterInfo {
         };
         let packets_verified: Vec<_> = {
             let _st = ScopedTimer::from(&self.stats.verify_gossip_packets_time);
-            if num_packets < gossip_socket_consume_parallel_packet_threshold() {
-                let mut verified = Vec::with_capacity(num_packets);
+            if num_packets < gossip_socket_consume_parallel_packet_threshold()
+                || thread_pool.is_none()
+            {
+                scratch.verified_packets.clear();
+                while let Ok(mut recycled) = recycle_receiver.try_recv() {
+                    recycled.clear();
+                    if recycled.capacity() > scratch.verified_packets.capacity() {
+                        scratch.verified_packets = recycled;
+                    }
+                }
+                if scratch.verified_packets.capacity() < num_packets {
+                    scratch
+                        .verified_packets
+                        .reserve(num_packets - scratch.verified_packets.capacity());
+                }
                 if packet_buf.len() == 1 {
                     for packet in packet_buf[0].iter() {
                         if let Some(packet) = verify_packet(packet, stakes, &self.stats) {
-                            verified.push(packet);
+                            scratch.verified_packets.push(packet);
                         }
                     }
                 } else {
                     for packet_batch in packet_buf.iter() {
                         for packet in packet_batch.iter() {
                             if let Some(packet) = verify_packet(packet, stakes, &self.stats) {
-                                verified.push(packet);
+                                scratch.verified_packets.push(packet);
                             }
                         }
                     }
                 }
-                verified
+                std::mem::take(&mut scratch.verified_packets)
             } else {
-                thread_pool.install(|| {
+                thread_pool.unwrap().install(|| {
                     if packet_buf.len() == 1 {
                         packet_buf[0]
                             .par_iter()
@@ -2342,7 +2460,11 @@ impl ClusterInfo {
             packet_buf.clear();
             return Ok(());
         }
-        if let Err(TrySendError::Full(_)) = sender.try_send(packets_verified) {
+        if let Err(TrySendError::Full(batch)) = sender.try_send(VerifiedPacketBatch {
+            packets: packets_verified,
+        }) {
+            scratch.verified_packets = batch.packets;
+            scratch.verified_packets.clear();
             self.stats.gossip_packets_dropped_count.add_relaxed(
                 packet_buf
                     .iter()
@@ -2358,11 +2480,13 @@ impl ClusterInfo {
         &self,
         recycler: &PacketBatchRecycler,
         mut epoch_specs: Option<&mut EpochSpecs>,
-        receiver: &Receiver<Vec<(/*from:*/ SocketAddr, Protocol)>>,
+        receiver: &Receiver<VerifiedPacketBatch>,
+        recycle_sender: &Sender<Vec<(/*from:*/ SocketAddr, Protocol)>>,
         response_sender: &impl ChannelSend<PacketBatch>,
         thread_pool: &ThreadPool,
         should_check_duplicate_instance: bool,
-        packet_buf: &mut Vec<Vec<(/*from:*/ SocketAddr, Protocol)>>,
+        packet_buf: &mut Vec<VerifiedPacketBatch>,
+        scratch: &mut ProcessPacketsScratch,
     ) -> Result<(), GossipError> {
         let _st = ScopedTimer::from(&self.stats.gossip_listen_loop_time);
         for pkts in receiver
@@ -2387,6 +2511,7 @@ impl ClusterInfo {
         };
         self.process_packets(
             packet_buf,
+            scratch,
             thread_pool,
             recycler,
             response_sender,
@@ -2394,7 +2519,9 @@ impl ClusterInfo {
             epoch_duration,
             should_check_duplicate_instance,
         )?;
-        packet_buf.clear();
+        for batch in packet_buf.drain(..) {
+            let _ = recycle_sender.try_send(batch.packets);
+        }
         self.stats
             .gossip_listen_loop_iterations_since_last_report
             .add_relaxed(1);
@@ -2405,28 +2532,37 @@ impl ClusterInfo {
         self: Arc<Self>,
         bank_forks: Option<Arc<RwLock<BankForks>>>,
         receiver: PacketBatchReceiver,
-        sender: impl ChannelSend<Vec<(/*from:*/ SocketAddr, Protocol)>>,
+        sender: impl ChannelSend<VerifiedPacketBatch>,
+        recycle_receiver: Receiver<Vec<(/*from:*/ SocketAddr, Protocol)>>,
         exit: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
         let allowed_core_ids = allowed_gossip_core_ids();
-        let thread_pool = ThreadPoolBuilder::new()
-            .num_threads(gossip_socket_consume_threads())
-            .thread_name(|i| format!("solGossipCons{i:02}"))
-            .start_handler({
-                let allowed_core_ids = allowed_core_ids.clone();
-                move |index| {
-                    maybe_pin_gossip_thread(
-                        "solGossipCons",
-                        index,
-                        GOSSIP_SOCKET_CONSUME_CORE_OFFSET,
-                        &allowed_core_ids,
-                    );
-                }
-            })
-            .build()
-            .unwrap();
+        let consume_threads = gossip_socket_consume_threads();
+        let thread_pool = if consume_threads > 1 {
+            Some(
+                ThreadPoolBuilder::new()
+                    .num_threads(consume_threads)
+                    .thread_name(|i| format!("solGossipCons{i:02}"))
+                    .start_handler({
+                        let allowed_core_ids = allowed_core_ids.clone();
+                        move |index| {
+                            maybe_pin_gossip_thread(
+                                "solGossipCons",
+                                index,
+                                GOSSIP_SOCKET_CONSUME_CORE_OFFSET,
+                                &allowed_core_ids,
+                            );
+                        }
+                    })
+                    .build()
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
         let mut epoch_specs = bank_forks.map(EpochSpecs::from);
         let mut packet_buf = Vec::with_capacity(gossip_channel_consume_capacity());
+        let mut scratch = SocketConsumeScratch::new();
         let run_consume = move || {
             maybe_pin_gossip_thread(
                 "solGossipConsum",
@@ -2436,11 +2572,13 @@ impl ClusterInfo {
             );
             while !exit.load(Ordering::Relaxed) {
                 let result = self.run_socket_consume(
-                    &thread_pool,
+                    thread_pool.as_ref(),
                     epoch_specs.as_mut(),
                     &receiver,
                     &sender,
+                    &recycle_receiver,
                     &mut packet_buf,
+                    &mut scratch,
                 );
                 match result {
                     // A recv operation can only fail if the sending end of a
@@ -2461,7 +2599,8 @@ impl ClusterInfo {
     pub(crate) fn listen(
         self: Arc<Self>,
         bank_forks: Option<Arc<RwLock<BankForks>>>,
-        requests_receiver: Receiver<Vec<(/*from:*/ SocketAddr, Protocol)>>,
+        requests_receiver: Receiver<VerifiedPacketBatch>,
+        recycle_sender: Sender<Vec<(/*from:*/ SocketAddr, Protocol)>>,
         response_sender: impl ChannelSend<PacketBatch>,
         should_check_duplicate_instance: bool,
         exit: Arc<AtomicBool>,
@@ -2486,6 +2625,7 @@ impl ClusterInfo {
             .unwrap();
         let mut epoch_specs = bank_forks.map(EpochSpecs::from);
         let mut packet_buf = Vec::with_capacity(gossip_channel_consume_capacity());
+        let mut scratch = ProcessPacketsScratch::new();
         Builder::new()
             .name("solGossipListen".to_string())
             .spawn(move || {
@@ -2500,10 +2640,12 @@ impl ClusterInfo {
                         &recycler,
                         epoch_specs.as_mut(),
                         &requests_receiver,
+                        &recycle_sender,
                         &response_sender,
                         &thread_pool,
                         should_check_duplicate_instance,
                         &mut packet_buf,
+                        &mut scratch,
                     );
                     if let Err(err) = result {
                         match err {
@@ -2879,13 +3021,15 @@ mod tests {
             Duration::from_secs(48 * 3600),   // epoch_duration
             &stakes,
         );
+        let mut data_once = data.clone();
         assert_eq!(
             (0, 0, 1),
-            cluster_info.handle_pull_response(data.clone(), &timeouts)
+            cluster_info.handle_pull_response(&mut data_once, &timeouts)
         );
+        let mut data_twice = data;
         assert_eq!(
             (1, 0, 0),
-            cluster_info.handle_pull_response(data, &timeouts)
+            cluster_info.handle_pull_response(&mut data_twice, &timeouts)
         );
     }
 
@@ -3546,7 +3690,8 @@ mod tests {
             &stakes,
             Duration::from_millis(cluster_info.gossip.pull.crds_timeout),
         );
-        cluster_info.handle_pull_response(vec![entrypoint_crdsvalue], &timeouts);
+        let mut entrypoint_pull = vec![entrypoint_crdsvalue];
+        cluster_info.handle_pull_response(&mut entrypoint_pull, &timeouts);
         let (pings, pulls) = cluster_info.old_pull_requests(&thread_pool, None, &HashMap::new());
         assert_eq!(pings.len(), 1);
         assert_eq!(pulls.len(), MIN_NUM_BLOOM_FILTERS);
@@ -3781,9 +3926,10 @@ mod tests {
             Duration::from_secs(48 * 3600),       // epoch_duration
             &stakes,
         );
+        let mut data = data;
         assert_eq!(
             (0, 0, NO_ENTRIES),
-            cluster_info.handle_pull_response(data, &timeouts)
+            cluster_info.handle_pull_response(&mut data, &timeouts)
         );
     }
 

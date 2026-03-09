@@ -1,5 +1,19 @@
-use super::dispatch::{PluginDispatcher, TransactionPluginDispatcher};
+use super::dispatch::{PluginDispatchTargets, PluginDispatcher, TransactionPluginDispatcher};
 use super::*;
+
+/// Collects plugins that subscribed to one hook family while preserving registration order.
+fn collect_hook_plugins(
+    plugins: &Arc<[Arc<dyn ObserverPlugin>]>,
+    wants_hook: impl Fn(&Arc<dyn ObserverPlugin>) -> bool,
+) -> Arc<[Arc<dyn ObserverPlugin>]> {
+    Arc::from(
+        plugins
+            .iter()
+            .filter(|plugin| wants_hook(plugin))
+            .cloned()
+            .collect::<Vec<_>>(),
+    )
+}
 
 /// Builder for constructing an immutable [`PluginHost`].
 pub struct PluginHostBuilder {
@@ -136,20 +150,46 @@ impl PluginHostBuilder {
     #[must_use]
     pub fn build(self) -> PluginHost {
         let plugins: Arc<[Arc<dyn ObserverPlugin>]> = Arc::from(self.plugins);
+        let raw_packet_plugins = collect_hook_plugins(&plugins, |plugin| plugin.wants_raw_packet());
+        let shred_plugins = collect_hook_plugins(&plugins, |plugin| plugin.wants_shred());
+        let dataset_plugins = collect_hook_plugins(&plugins, |plugin| plugin.wants_dataset());
+        let transaction_plugins =
+            collect_hook_plugins(&plugins, |plugin| plugin.wants_transaction());
+        let account_touch_plugins =
+            collect_hook_plugins(&plugins, |plugin| plugin.wants_account_touch());
+        let slot_status_plugins =
+            collect_hook_plugins(&plugins, |plugin| plugin.wants_slot_status());
+        let reorg_plugins = collect_hook_plugins(&plugins, |plugin| plugin.wants_reorg());
+        let recent_blockhash_plugins =
+            collect_hook_plugins(&plugins, |plugin| plugin.wants_recent_blockhash());
+        let cluster_topology_plugins =
+            collect_hook_plugins(&plugins, |plugin| plugin.wants_cluster_topology());
+        let leader_schedule_plugins =
+            collect_hook_plugins(&plugins, |plugin| plugin.wants_leader_schedule());
         let subscriptions = PluginHookSubscriptions {
-            raw_packet: plugins.iter().any(|plugin| plugin.wants_raw_packet()),
-            shred: plugins.iter().any(|plugin| plugin.wants_shred()),
-            dataset: plugins.iter().any(|plugin| plugin.wants_dataset()),
-            transaction: plugins.iter().any(|plugin| plugin.wants_transaction()),
-            account_touch: plugins.iter().any(|plugin| plugin.wants_account_touch()),
-            slot_status: plugins.iter().any(|plugin| plugin.wants_slot_status()),
-            reorg: plugins.iter().any(|plugin| plugin.wants_reorg()),
-            recent_blockhash: plugins.iter().any(|plugin| plugin.wants_recent_blockhash()),
-            cluster_topology: plugins.iter().any(|plugin| plugin.wants_cluster_topology()),
-            leader_schedule: plugins.iter().any(|plugin| plugin.wants_leader_schedule()),
+            raw_packet: !raw_packet_plugins.is_empty(),
+            shred: !shred_plugins.is_empty(),
+            dataset: !dataset_plugins.is_empty(),
+            transaction: !transaction_plugins.is_empty(),
+            account_touch: !account_touch_plugins.is_empty(),
+            slot_status: !slot_status_plugins.is_empty(),
+            reorg: !reorg_plugins.is_empty(),
+            recent_blockhash: !recent_blockhash_plugins.is_empty(),
+            cluster_topology: !cluster_topology_plugins.is_empty(),
+            leader_schedule: !leader_schedule_plugins.is_empty(),
         };
         let dispatcher = PluginDispatcher::new(
-            plugins.clone(),
+            PluginDispatchTargets {
+                raw_packet: raw_packet_plugins,
+                shred: shred_plugins,
+                dataset: dataset_plugins,
+                account_touch: account_touch_plugins.clone(),
+                slot_status: slot_status_plugins,
+                reorg: reorg_plugins,
+                recent_blockhash: recent_blockhash_plugins,
+                cluster_topology: cluster_topology_plugins,
+                leader_schedule: leader_schedule_plugins,
+            },
             self.event_queue_capacity,
             self.dispatch_mode,
         );
@@ -162,6 +202,8 @@ impl PluginHostBuilder {
         });
         PluginHost {
             plugins,
+            transaction_plugins,
+            account_touch_plugins,
             dispatcher,
             transaction_dispatcher,
             subscriptions,

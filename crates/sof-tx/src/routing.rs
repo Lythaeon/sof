@@ -44,19 +44,26 @@ impl RoutingPolicy {
 
 /// Selects leader/backup targets in deterministic order.
 #[must_use]
-pub fn select_targets(
-    leader_provider: &dyn LeaderProvider,
+pub fn select_targets<P>(
+    leader_provider: &P,
     backups: &[LeaderTarget],
     policy: RoutingPolicy,
-) -> Vec<LeaderTarget> {
+) -> Vec<LeaderTarget>
+where
+    P: LeaderProvider + ?Sized,
+{
     let policy = policy.normalized();
-    let mut seen = HashSet::new();
-    let mut selected = Vec::new();
     let dynamic_backup_count = if backups.is_empty() {
         policy.backup_validators
     } else {
         0
     };
+    let requested_next = policy.next_leaders.saturating_add(dynamic_backup_count);
+    let estimated_targets = 1_usize
+        .saturating_add(requested_next)
+        .saturating_add(policy.backup_validators);
+    let mut seen = HashSet::with_capacity(estimated_targets);
+    let mut selected = Vec::with_capacity(estimated_targets);
 
     if let Some(current) = leader_provider.current_leader()
         && seen.insert(current.tpu_addr)
@@ -64,7 +71,6 @@ pub fn select_targets(
         selected.push(current);
     }
 
-    let requested_next = policy.next_leaders.saturating_add(dynamic_backup_count);
     for target in leader_provider.next_leaders(requested_next) {
         if seen.insert(target.tpu_addr) {
             selected.push(target);

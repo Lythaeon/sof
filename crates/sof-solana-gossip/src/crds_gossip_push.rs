@@ -124,14 +124,14 @@ impl CrdsGossipPush {
     pub(crate) fn process_push_message(
         &self,
         crds: &RwLock<Crds>,
-        messages: Vec<(/*from:*/ Pubkey, Vec<CrdsValue>)>,
+        messages: &mut Vec<(/*from:*/ Pubkey, Vec<CrdsValue>)>,
         now: u64,
     ) -> HashSet<Pubkey> {
         let mut received_cache = self.received_cache.lock().unwrap();
         let mut crds = crds.write().unwrap();
         let wallclock_window = self.wallclock_window(now);
         let mut origins = HashSet::new();
-        for (from, values) in messages {
+        for (from, values) in messages.drain(..) {
             self.num_total.fetch_add(values.len(), Ordering::Relaxed);
             for value in values {
                 if !wallclock_window.contains(&value.wallclock()) {

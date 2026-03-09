@@ -529,7 +529,7 @@ impl TxSubmitClient {
                             .and_then(|source| source.toxic_flow_snapshot().current_state_version),
                         opportunity_age_ms: None,
                     });
-                    self.spawn_agave_rebroadcast(tx_bytes.clone(), &direct_config);
+                    self.spawn_agave_rebroadcast(Arc::from(tx_bytes), &direct_config);
                     return Ok(SubmitResult {
                         signature,
                         mode,
@@ -593,9 +593,11 @@ impl TxSubmitClient {
             )
             .await
             {
-                self.spawn_agave_rebroadcast(tx_bytes.clone(), &direct_config);
+                let tx_bytes = Arc::<[u8]>::from(tx_bytes);
+                self.spawn_agave_rebroadcast(Arc::clone(&tx_bytes), &direct_config);
                 if direct_config.hybrid_rpc_broadcast
-                    && let Ok(rpc_signature) = rpc.submit_rpc(&tx_bytes, &self.rpc_config).await
+                    && let Ok(rpc_signature) =
+                        rpc.submit_rpc(tx_bytes.as_ref(), &self.rpc_config).await
                 {
                     self.record_external_outcome(&TxSubmitOutcome {
                         kind: TxSubmitOutcomeKind::DirectAccepted,
@@ -679,7 +681,7 @@ impl TxSubmitClient {
     }
 
     /// Starts the post-ack rebroadcast worker when that reliability mode is enabled.
-    fn spawn_agave_rebroadcast(&self, tx_bytes: Vec<u8>, direct_config: &DirectSubmitConfig) {
+    fn spawn_agave_rebroadcast(&self, tx_bytes: Arc<[u8]>, direct_config: &DirectSubmitConfig) {
         if !direct_config.agave_rebroadcast_enabled
             || direct_config.agave_rebroadcast_window.is_zero()
         {
@@ -702,7 +704,7 @@ impl TxSubmitClient {
 #[cfg(not(test))]
 /// Replays successful direct submissions for a bounded Agave-like persistence window.
 fn spawn_agave_rebroadcast_task(
-    tx_bytes: Vec<u8>,
+    tx_bytes: Arc<[u8]>,
     direct_transport: Arc<dyn DirectSubmitTransport>,
     leader_provider: Arc<dyn LeaderProvider>,
     backups: Vec<LeaderTarget>,
@@ -744,7 +746,12 @@ fn spawn_agave_rebroadcast_task(
             drop(
                 timeout(
                     direct_attempt_timeout(&direct_config),
-                    direct_transport.submit_direct(&tx_bytes, &targets, policy, &direct_config),
+                    direct_transport.submit_direct(
+                        tx_bytes.as_ref(),
+                        &targets,
+                        policy,
+                        &direct_config,
+                    ),
                 )
                 .await,
             );
@@ -755,7 +762,7 @@ fn spawn_agave_rebroadcast_task(
 #[cfg(test)]
 /// Test-only stub that disables background rebroadcasting for deterministic assertions.
 fn spawn_agave_rebroadcast_task(
-    _tx_bytes: Vec<u8>,
+    _tx_bytes: Arc<[u8]>,
     _direct_transport: Arc<dyn DirectSubmitTransport>,
     _leader_provider: Arc<dyn LeaderProvider>,
     _backups: Vec<LeaderTarget>,
@@ -766,7 +773,7 @@ fn spawn_agave_rebroadcast_task(
 
 /// Selects routing targets and applies optional latency-aware ranking.
 async fn select_and_rank_targets(
-    leader_provider: &dyn LeaderProvider,
+    leader_provider: &(impl LeaderProvider + ?Sized),
     backups: &[LeaderTarget],
     policy: RoutingPolicy,
     direct_config: &DirectSubmitConfig,
@@ -784,14 +791,20 @@ async fn rank_targets_by_latency(
         return targets;
     }
 
+    let probe_timeout = direct_config.latency_probe_timeout;
+    let probe_port = direct_config.latency_probe_port;
     let probe_count = targets
         .len()
         .min(direct_config.latency_probe_max_targets.max(1));
     let mut latencies = vec![None; probe_count];
     let mut probes = JoinSet::new();
     for (idx, target) in targets.iter().take(probe_count).cloned().enumerate() {
-        let cfg = direct_config.clone();
-        probes.spawn(async move { (idx, probe_target_latency(&target, &cfg).await) });
+        probes.spawn(async move {
+            (
+                idx,
+                probe_target_latency(&target, probe_port, probe_timeout).await,
+            )
+        });
     }
     while let Some(result) = probes.join_next().await {
         if let Ok((idx, latency)) = result
@@ -826,10 +839,11 @@ async fn rank_targets_by_latency(
 /// Probes a target's candidate ports and keeps the best observed connect latency.
 async fn probe_target_latency(
     target: &LeaderTarget,
-    direct_config: &DirectSubmitConfig,
+    probe_port: Option<u16>,
+    probe_timeout: Duration,
 ) -> Option<u128> {
     let mut ports = vec![target.tpu_addr.port()];
-    if let Some(port) = direct_config.latency_probe_port
+    if let Some(port) = probe_port
         && port != target.tpu_addr.port()
     {
         ports.push(port);
@@ -838,9 +852,7 @@ async fn probe_target_latency(
     let ip = target.tpu_addr.ip();
     let mut best = None::<u128>;
     for port in ports {
-        if let Some(latency) =
-            probe_tcp_latency(ip, port, direct_config.latency_probe_timeout).await
-        {
+        if let Some(latency) = probe_tcp_latency(ip, port, probe_timeout).await {
             best = Some(best.map_or(latency, |current| current.min(latency)));
         }
     }
