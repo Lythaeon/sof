@@ -359,11 +359,31 @@ impl PacketWorkerPool {
             .collect()
     }
 
+    /// Fills `out` with one queue-depth sample per worker without reallocating caller storage.
+    pub(super) fn fill_worker_queue_depths(&self, out: &mut Vec<u64>) {
+        out.clear();
+        out.extend(
+            self.telemetry
+                .iter()
+                .map(PacketWorkerTelemetry::queue_depth),
+        );
+    }
+
     pub(super) fn tracked_fec_sets_by_worker(&self) -> Vec<u64> {
         self.telemetry
             .iter()
             .map(PacketWorkerTelemetry::tracked_fec_sets)
             .collect()
+    }
+
+    /// Fills `out` with one tracked-FEC-set sample per worker without reallocating caller storage.
+    pub(super) fn fill_tracked_fec_sets_by_worker(&self, out: &mut Vec<u64>) {
+        out.clear();
+        out.extend(
+            self.telemetry
+                .iter()
+                .map(PacketWorkerTelemetry::tracked_fec_sets),
+        );
     }
 
     pub(super) async fn shutdown(&mut self) {

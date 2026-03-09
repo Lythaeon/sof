@@ -572,6 +572,8 @@ async fn run_async_with_hosts_inner(
         usize::try_from(fec_retained_slot_lag.max(32)).unwrap_or(usize::MAX);
     let mut packet_worker_assignments =
         PacketWorkerAssignments::new(packet_worker_assignment_slot_window);
+    let mut packet_batch_dispatch_scratch =
+        PacketBatchDispatchScratch::new(packet_worker_pool.worker_count());
     let mut dataset_reassembler = DataSetReassembler::new(dataset_max_tracked_slots)
         .with_retained_slot_lag(dataset_retained_slot_lag)
         .with_tail_min_shreds_without_anchor(dataset_tail_min_shreds_without_anchor);
@@ -1010,13 +1012,7 @@ async fn run_async_with_hosts_inner(
                     packet_worker_pool.close_inputs();
                     continue;
                 };
-                let mut worker_loads = combine_packet_worker_pressure(
-                    &packet_worker_pool.worker_queue_depths(),
-                    &packet_worker_pool.tracked_fec_sets_by_worker(),
-                );
-                let mut worker_batches: Vec<Vec<PacketWorkerInput>> = (0..packet_worker_pool.worker_count())
-                    .map(|_| Vec::new())
-                    .collect();
+                packet_batch_dispatch_scratch.refresh(&packet_worker_pool);
                 for packet in packet_batch {
                     let observed_at = Instant::now();
                     let source_addr = packet.source;
@@ -1274,20 +1270,21 @@ async fn run_async_with_hosts_inner(
                     let worker_index = packet_worker_assignments.worker_for(
                         parsed_shred_slot(&parsed_shred),
                         parsed_shred_fec_set_index(&parsed_shred),
-                        &worker_loads,
+                        packet_batch_dispatch_scratch.worker_loads(),
                     );
-                    if let Some(batch) = worker_batches.get_mut(worker_index) {
+                    if let Some(batch) =
+                        packet_batch_dispatch_scratch.worker_batch_mut(worker_index)
+                    {
                         batch.push(PacketWorkerInput {
                             source: source_addr,
                             packet_bytes,
                             parsed_header: parsed_shred,
                         });
-                        if let Some(load) = worker_loads.get_mut(worker_index) {
-                            *load = load.saturating_add(1);
-                        }
+                        packet_batch_dispatch_scratch.bump_worker_load(worker_index);
                     }
                 }
-                for (worker_index, packets) in worker_batches.into_iter().enumerate() {
+                for worker_index in 0..packet_batch_dispatch_scratch.worker_count() {
+                    let packets = packet_batch_dispatch_scratch.take_worker_batch(worker_index);
                     if !packet_worker_pool
                         .dispatch_worker_batch(worker_index, packets)
                     {
@@ -3104,6 +3101,84 @@ impl PacketWorkerAssignments {
     }
 }
 
+/// Reusable coordinator scratch buffers for routing one ingress packet batch to worker queues.
+struct PacketBatchDispatchScratch {
+    /// Snapshot of current worker queue depths.
+    worker_queue_depths: Vec<u64>,
+    /// Snapshot of currently tracked FEC sets per worker.
+    tracked_fec_sets: Vec<u64>,
+    /// Combined worker pressure scores used for worker selection.
+    worker_loads: Vec<u64>,
+    /// Outbound packet batches staged per worker.
+    worker_batches: Vec<Vec<PacketWorkerInput>>,
+}
+
+impl PacketBatchDispatchScratch {
+    /// Creates scratch storage sized for the current worker count.
+    fn new(worker_count: usize) -> Self {
+        let worker_count = worker_count.max(1);
+        let mut worker_batches = Vec::with_capacity(worker_count);
+        worker_batches.resize_with(worker_count, Vec::new);
+        Self {
+            worker_queue_depths: Vec::with_capacity(worker_count),
+            tracked_fec_sets: Vec::with_capacity(worker_count),
+            worker_loads: Vec::with_capacity(worker_count),
+            worker_batches,
+        }
+    }
+
+    /// Refreshes queue/fec pressure snapshots and clears staged worker batches.
+    fn refresh(&mut self, packet_worker_pool: &PacketWorkerPool) {
+        packet_worker_pool.fill_worker_queue_depths(&mut self.worker_queue_depths);
+        packet_worker_pool.fill_tracked_fec_sets_by_worker(&mut self.tracked_fec_sets);
+        combine_packet_worker_pressure_into(
+            &self.worker_queue_depths,
+            &self.tracked_fec_sets,
+            &mut self.worker_loads,
+        );
+        let worker_count = packet_worker_pool.worker_count();
+        if self.worker_batches.len() != worker_count {
+            self.worker_batches.clear();
+            self.worker_batches.resize_with(worker_count, Vec::new);
+        }
+        for batch in &mut self.worker_batches {
+            batch.clear();
+        }
+    }
+
+    /// Returns the current combined worker pressure view.
+    fn worker_loads(&self) -> &[u64] {
+        &self.worker_loads
+    }
+
+    /// Returns one mutable staged batch for `worker_index`.
+    fn worker_batch_mut(&mut self, worker_index: usize) -> Option<&mut Vec<PacketWorkerInput>> {
+        self.worker_batches.get_mut(worker_index)
+    }
+
+    /// Increments the pressure score for one worker after staging another packet there.
+    fn bump_worker_load(&mut self, worker_index: usize) {
+        if let Some(load) = self.worker_loads.get_mut(worker_index) {
+            *load = load.saturating_add(1);
+        }
+    }
+
+    /// Swaps one staged worker batch out while keeping the retained batch capacity hot.
+    fn take_worker_batch(&mut self, worker_index: usize) -> Vec<PacketWorkerInput> {
+        let Some(batch) = self.worker_batches.get_mut(worker_index) else {
+            return Vec::new();
+        };
+        let mut outgoing = Vec::with_capacity(batch.capacity());
+        std::mem::swap(&mut outgoing, batch);
+        outgoing
+    }
+
+    /// Returns number of staged worker batches.
+    const fn worker_count(&self) -> usize {
+        self.worker_batches.len()
+    }
+}
+
 fn shard_fec_set_to_worker(slot: u64, fec_set_index: u32, worker_count: usize) -> usize {
     let worker_count = worker_count.max(1);
     let slot_mix = slot.wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -3139,12 +3214,15 @@ fn select_least_loaded_worker(worker_loads: &[u64], preferred_worker: usize) -> 
     best_worker
 }
 
-fn combine_packet_worker_pressure(
+/// Recomputes combined worker pressure into caller-owned scratch storage.
+fn combine_packet_worker_pressure_into(
     worker_queue_depths: &[u64],
     tracked_fec_sets: &[u64],
-) -> Vec<u64> {
+    out: &mut Vec<u64>,
+) {
     let worker_count = worker_queue_depths.len().max(tracked_fec_sets.len());
-    let mut combined = Vec::with_capacity(worker_count);
+    out.clear();
+    out.reserve(worker_count.saturating_sub(out.capacity()));
     for worker_index in 0..worker_count {
         let queue_depth = worker_queue_depths.get(worker_index).copied().unwrap_or(0);
         let fec_pressure = tracked_fec_sets
@@ -3153,9 +3231,8 @@ fn combine_packet_worker_pressure(
             .unwrap_or(0)
             .checked_div(PACKET_WORKER_FEC_PRESSURE_DIVISOR)
             .unwrap_or(0);
-        combined.push(queue_depth.saturating_add(fec_pressure));
+        out.push(queue_depth.saturating_add(fec_pressure));
     }
-    combined
 }
 
 fn source_addr_or_unspecified(source_addr: Option<SocketAddr>) -> SocketAddr {
