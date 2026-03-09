@@ -60,9 +60,9 @@ impl DerivedStateConsumer for SlotMirrorConsumer {
 
     fn apply(
         &mut self,
-        envelope: DerivedStateFeedEnvelope,
+        envelope: &DerivedStateFeedEnvelope,
     ) -> Result<(), DerivedStateConsumerFault> {
-        if let DerivedStateFeedEvent::SlotStatusChanged(event) = envelope.event {
+        if let DerivedStateFeedEvent::SlotStatusChanged(event) = &envelope.event {
             let mut state = self.state.lock().map_err(|_poison| {
                 DerivedStateConsumerFault::new(
                     DerivedStateConsumerFaultKind::ConsumerApplyFailed,

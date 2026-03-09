@@ -44,6 +44,7 @@ use {
         weighted_shuffle::WeightedShuffle,
     },
     arc_swap::ArcSwap,
+    core_affinity::CoreId,
     crossbeam_channel::{Receiver, TrySendError},
     itertools::{Either, Itertools},
     rand::{seq::SliceRandom, CryptoRng, Rng},
@@ -105,6 +106,11 @@ const DEFAULT_EPOCH_DURATION: Duration =
 pub const GOSSIP_SLEEP_MILLIS: u64 = 100;
 /// Interval between pull requests (in gossip rounds)
 const PULL_REQUEST_PERIOD: usize = 5;
+const GOSSIP_SOCKET_CONSUME_CORE_OFFSET: usize = 0;
+const GOSSIP_LISTEN_LOOP_CORE_OFFSET: usize = 1;
+const GOSSIP_LISTEN_WORK_CORE_OFFSET: usize = 2;
+const GOSSIP_RUN_LOOP_CORE_OFFSET: usize = 3;
+const GOSSIP_RUN_WORK_CORE_OFFSET: usize = 0;
 
 /// Capacity for the [`ClusterInfo::run_socket_consume`] and [`ClusterInfo::run_listen`]
 /// intermediate packet batch buffers.
@@ -114,6 +120,9 @@ const PULL_REQUEST_PERIOD: usize = 5;
 /// This ensures that the number of `madvise` system calls is minimized and, as such, that large interruptions
 /// to the processing loop are avoided.
 const CHANNEL_CONSUME_CAPACITY: usize = 1024;
+const DEFAULT_GOSSIP_SOCKET_CONSUME_PARALLEL_PACKET_THRESHOLD: usize = 1024;
+const GOSSIP_LISTEN_PARALLEL_BATCH_THRESHOLD: usize = 32;
+const GOSSIP_LISTEN_PARALLEL_MESSAGE_THRESHOLD: usize = 256;
 /// Channel capacity for gossip channels.
 ///
 /// A hard limit on incoming gossip messages.
@@ -127,7 +136,9 @@ pub(crate) const GOSSIP_CHANNEL_CAPACITY: usize = 8192; // 2^13
 const GOSSIP_PING_CACHE_CAPACITY: usize = 126976;
 const GOSSIP_PING_CACHE_TTL: Duration = Duration::from_secs(1280);
 const GOSSIP_PING_CACHE_RATE_LIMIT_DELAY: Duration = Duration::from_secs(1280 / 64);
-pub const DEFAULT_CONTACT_DEBUG_INTERVAL_MILLIS: u64 = 10_000;
+// Default to disabled. The full contact/rpc trace is expensive on busy
+// observers and should only be enabled explicitly for focused debugging.
+pub const DEFAULT_CONTACT_DEBUG_INTERVAL_MILLIS: u64 = 0;
 pub const DEFAULT_CONTACT_SAVE_INTERVAL_MILLIS: u64 = 60_000;
 // Limit number of unique pubkeys in the crds table.
 pub(crate) const CRDS_UNIQUE_PUBKEY_CAPACITY: usize = 8192;
@@ -137,6 +148,70 @@ pub const MINIMUM_NUM_TVU_RECEIVE_SOCKETS: NonZeroUsize = NonZeroUsize::new(1).u
 pub const DEFAULT_NUM_TVU_RECEIVE_SOCKETS: NonZeroUsize = MINIMUM_NUM_TVU_RECEIVE_SOCKETS;
 pub const MINIMUM_NUM_TVU_RETRANSMIT_SOCKETS: NonZeroUsize = NonZeroUsize::new(1).unwrap();
 pub const DEFAULT_NUM_TVU_RETRANSMIT_SOCKETS: NonZeroUsize = NonZeroUsize::new(12).unwrap();
+
+fn allowed_gossip_core_ids() -> Vec<CoreId> {
+    let parsed_allowed_core_ids = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| parse_allowed_core_ids_from_proc_status(&status));
+    if let Some(allowed_core_ids) = parsed_allowed_core_ids {
+        return allowed_core_ids
+            .into_iter()
+            .map(|id| CoreId { id })
+            .collect();
+    }
+    core_affinity::get_core_ids().unwrap_or_default()
+}
+
+fn maybe_pin_gossip_thread(
+    thread_name: &str,
+    thread_index: usize,
+    core_offset: usize,
+    allowed_core_ids: &[CoreId],
+) {
+    if allowed_core_ids.is_empty() {
+        return;
+    }
+    let selected = allowed_core_ids[(core_offset + thread_index) % allowed_core_ids.len()];
+    if core_affinity::set_for_current(selected) {
+        info!(
+            "pinned gossip thread to CPU core: name={thread_name} index={thread_index} core={}",
+            selected.id
+        );
+    } else {
+        warn!(
+            "failed to pin gossip thread to CPU core: name={thread_name} index={thread_index} core={}",
+            selected.id
+        );
+    }
+}
+
+fn parse_allowed_core_ids_from_proc_status(status: &str) -> Option<Vec<usize>> {
+    let cpus_line = status
+        .lines()
+        .find(|line| line.starts_with("Cpus_allowed_list:"))?;
+    let raw = cpus_line.split_once(':')?.1.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let mut cores = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((start, end)) = part.split_once('-') {
+            let start = start.trim().parse::<usize>().ok()?;
+            let end = end.trim().parse::<usize>().ok()?;
+            if start > end {
+                return None;
+            }
+            cores.extend(start..=end);
+        } else {
+            cores.push(part.parse::<usize>().ok()?);
+        }
+    }
+    (!cores.is_empty()).then_some(cores)
+}
 
 fn read_usize_env(key: &str) -> Option<usize> {
     crate::read_runtime_env_override(key)
@@ -161,6 +236,11 @@ fn gossip_channel_consume_capacity() -> usize {
     read_usize_env("SOF_GOSSIP_CHANNEL_CONSUME_CAPACITY").unwrap_or(CHANNEL_CONSUME_CAPACITY)
 }
 
+fn gossip_socket_consume_parallel_packet_threshold() -> usize {
+    read_usize_env("SOF_GOSSIP_SOCKET_CONSUME_PARALLEL_PACKET_THRESHOLD")
+        .unwrap_or(DEFAULT_GOSSIP_SOCKET_CONSUME_PARALLEL_PACKET_THRESHOLD)
+}
+
 fn gossip_socket_consume_threads() -> usize {
     let default = get_thread_count().min(8);
     read_usize_env("SOF_GOSSIP_CONSUME_THREADS").unwrap_or(default)
@@ -169,6 +249,11 @@ fn gossip_socket_consume_threads() -> usize {
 fn gossip_listen_threads() -> usize {
     let default = get_thread_count().min(8);
     read_usize_env("SOF_GOSSIP_LISTEN_THREADS").unwrap_or(default)
+}
+
+fn gossip_run_threads() -> usize {
+    let default = get_thread_count().min(8);
+    read_usize_env("SOF_GOSSIP_RUN_THREADS").unwrap_or(default)
 }
 
 #[derive(Debug, PartialEq, Eq, Error)]
@@ -1499,15 +1584,33 @@ impl ClusterInfo {
         gossip_validators: Option<HashSet<Pubkey>>,
         exit: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
+        let allowed_core_ids = allowed_gossip_core_ids();
         let thread_pool = ThreadPoolBuilder::new()
-            .num_threads(std::cmp::min(get_thread_count(), 8))
+            .num_threads(gossip_run_threads())
             .thread_name(|i| format!("solGossipRun{i:02}"))
+            .start_handler({
+                let allowed_core_ids = allowed_core_ids.clone();
+                move |index| {
+                    maybe_pin_gossip_thread(
+                        "solGossipRun",
+                        index,
+                        GOSSIP_RUN_WORK_CORE_OFFSET,
+                        &allowed_core_ids,
+                    );
+                }
+            })
             .build()
             .unwrap();
         let mut epoch_specs = bank_forks.map(EpochSpecs::from);
         Builder::new()
             .name("solGossip".to_string())
             .spawn(move || {
+                maybe_pin_gossip_thread(
+                    "solGossip",
+                    0,
+                    GOSSIP_RUN_LOOP_CORE_OFFSET,
+                    &allowed_core_ids,
+                );
                 let mut last_push = 0;
                 let mut last_contact_info_trace = timestamp();
                 let mut last_contact_info_save = timestamp();
@@ -2014,7 +2117,10 @@ impl ClusterInfo {
             let discard_different_shred_version = |msg| {
                 discard_different_shred_version(msg, self_shred_version, &gossip_crds, &self.stats)
             };
-            if packets.len() < 4 && packets.iter().map(Vec::len).sum::<usize>() < 16 {
+            let total_messages = packets.iter().map(Vec::len).sum::<usize>();
+            if packets.len() < GOSSIP_LISTEN_PARALLEL_BATCH_THRESHOLD
+                && total_messages < GOSSIP_LISTEN_PARALLEL_MESSAGE_THRESHOLD
+            {
                 for (_, msg) in packets.iter_mut().flatten() {
                     discard_different_shred_version(msg);
                 }
@@ -2142,7 +2248,7 @@ impl ClusterInfo {
     fn run_socket_consume(
         &self,
         thread_pool: &ThreadPool,
-        epoch_specs: Option<&mut EpochSpecs>,
+        mut epoch_specs: Option<&mut EpochSpecs>,
         receiver: &PacketBatchReceiver,
         sender: &impl ChannelSend<Vec<(/*from:*/ SocketAddr, Protocol)>>,
         packet_buf: &mut Vec<PacketBatch>,
@@ -2185,27 +2291,57 @@ impl ClusterInfo {
                 (packet.meta().socket_addr(), protocol)
             })
         }
-        let stakes = epoch_specs
-            .map(EpochSpecs::current_epoch_staked_nodes)
-            .cloned()
-            .unwrap_or_default();
+        let empty_stakes = HashMap::new();
+        let stakes = if let Some(epoch_specs) = epoch_specs.as_deref_mut() {
+            epoch_specs.current_epoch_staked_nodes().as_ref()
+        } else {
+            &empty_stakes
+        };
         let packets_verified: Vec<_> = {
             let _st = ScopedTimer::from(&self.stats.verify_gossip_packets_time);
-            thread_pool.install(|| {
+            if num_packets < gossip_socket_consume_parallel_packet_threshold() {
+                let mut verified = Vec::with_capacity(num_packets);
                 if packet_buf.len() == 1 {
-                    packet_buf[0]
-                        .par_iter()
-                        .filter_map(|packet| verify_packet(packet, &stakes, &self.stats))
-                        .collect()
+                    for packet in packet_buf[0].iter() {
+                        if let Some(packet) = verify_packet(packet, stakes, &self.stats) {
+                            verified.push(packet);
+                        }
+                    }
                 } else {
-                    packet_buf
-                        .par_iter()
-                        .flatten()
-                        .filter_map(|packet| verify_packet(packet, &stakes, &self.stats))
-                        .collect()
+                    for packet_batch in packet_buf.iter() {
+                        for packet in packet_batch.iter() {
+                            if let Some(packet) = verify_packet(packet, stakes, &self.stats) {
+                                verified.push(packet);
+                            }
+                        }
+                    }
                 }
-            })
+                verified
+            } else {
+                thread_pool.install(|| {
+                    if packet_buf.len() == 1 {
+                        packet_buf[0]
+                            .par_iter()
+                            .filter_map(|packet| {
+                                verify_packet(packet, stakes, &self.stats)
+                            })
+                            .collect()
+                    } else {
+                        packet_buf
+                            .par_iter()
+                            .flatten()
+                            .filter_map(|packet| {
+                                verify_packet(packet, stakes, &self.stats)
+                            })
+                            .collect()
+                    }
+                })
+            }
         };
+        if packets_verified.is_empty() {
+            packet_buf.clear();
+            return Ok(());
+        }
         if let Err(TrySendError::Full(_)) = sender.try_send(packets_verified) {
             self.stats.gossip_packets_dropped_count.add_relaxed(
                 packet_buf
@@ -2239,20 +2375,22 @@ impl ClusterInfo {
                 break;
             }
         }
-        let stakes = epoch_specs
-            .as_mut()
-            .map(|epoch_specs| epoch_specs.current_epoch_staked_nodes())
-            .cloned()
-            .unwrap_or_default();
         let epoch_duration = epoch_specs
+            .as_deref_mut()
             .map(EpochSpecs::epoch_duration)
             .unwrap_or(DEFAULT_EPOCH_DURATION);
+        let empty_stakes = HashMap::new();
+        let stakes = if let Some(epoch_specs) = epoch_specs.as_deref_mut() {
+            epoch_specs.current_epoch_staked_nodes().as_ref()
+        } else {
+            &empty_stakes
+        };
         self.process_packets(
             packet_buf,
             thread_pool,
             recycler,
             response_sender,
-            &stakes,
+            stakes,
             epoch_duration,
             should_check_duplicate_instance,
         )?;
@@ -2270,14 +2408,32 @@ impl ClusterInfo {
         sender: impl ChannelSend<Vec<(/*from:*/ SocketAddr, Protocol)>>,
         exit: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
+        let allowed_core_ids = allowed_gossip_core_ids();
         let thread_pool = ThreadPoolBuilder::new()
             .num_threads(gossip_socket_consume_threads())
             .thread_name(|i| format!("solGossipCons{i:02}"))
+            .start_handler({
+                let allowed_core_ids = allowed_core_ids.clone();
+                move |index| {
+                    maybe_pin_gossip_thread(
+                        "solGossipCons",
+                        index,
+                        GOSSIP_SOCKET_CONSUME_CORE_OFFSET,
+                        &allowed_core_ids,
+                    );
+                }
+            })
             .build()
             .unwrap();
         let mut epoch_specs = bank_forks.map(EpochSpecs::from);
         let mut packet_buf = Vec::with_capacity(gossip_channel_consume_capacity());
         let run_consume = move || {
+            maybe_pin_gossip_thread(
+                "solGossipConsum",
+                0,
+                GOSSIP_SOCKET_CONSUME_CORE_OFFSET,
+                &allowed_core_ids,
+            );
             while !exit.load(Ordering::Relaxed) {
                 let result = self.run_socket_consume(
                     &thread_pool,
@@ -2311,9 +2467,21 @@ impl ClusterInfo {
         exit: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
         let recycler = PacketBatchRecycler::default();
+        let allowed_core_ids = allowed_gossip_core_ids();
         let thread_pool = ThreadPoolBuilder::new()
             .num_threads(gossip_listen_threads())
             .thread_name(|i| format!("solGossipWork{i:02}"))
+            .start_handler({
+                let allowed_core_ids = allowed_core_ids.clone();
+                move |index| {
+                    maybe_pin_gossip_thread(
+                        "solGossipWork",
+                        index,
+                        GOSSIP_LISTEN_WORK_CORE_OFFSET,
+                        &allowed_core_ids,
+                    );
+                }
+            })
             .build()
             .unwrap();
         let mut epoch_specs = bank_forks.map(EpochSpecs::from);
@@ -2321,6 +2489,12 @@ impl ClusterInfo {
         Builder::new()
             .name("solGossipListen".to_string())
             .spawn(move || {
+                maybe_pin_gossip_thread(
+                    "solGossipListen",
+                    0,
+                    GOSSIP_LISTEN_LOOP_CORE_OFFSET,
+                    &allowed_core_ids,
+                );
                 while !exit.load(Ordering::Relaxed) {
                     let result = self.run_listen(
                         &recycler,
@@ -2662,6 +2836,14 @@ mod tests {
                     }
                 })
         }
+    }
+
+    #[test]
+    fn test_parse_allowed_core_ids_from_proc_status() {
+        let status = "Name:\tsof-solana-gossip\nCpus_allowed_list:\t0-1,3,5-6\n";
+        let parsed = parse_allowed_core_ids_from_proc_status(status)
+            .expect("expected allowed core ids from proc status");
+        assert_eq!(parsed, vec![0, 1, 3, 5, 6]);
     }
 
     #[test]

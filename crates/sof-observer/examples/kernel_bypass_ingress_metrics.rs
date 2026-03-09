@@ -175,7 +175,7 @@ impl ObserverPlugin for RawIngressMetricsPlugin {
         }
     }
 
-    async fn on_transaction(&self, event: sof::framework::TransactionEvent) {
+    async fn on_transaction(&self, event: &sof::framework::TransactionEvent) {
         self.tx_total.fetch_add(1, Ordering::Relaxed);
         match event.kind {
             TxKind::VoteOnly => {
@@ -246,7 +246,7 @@ pub(crate) fn build_raw_packet(sequence: u64, source_port: u16) -> RawPacket {
     RawPacket {
         source: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), source_port),
         ingress: RawPacketIngress::Udp,
-        bytes,
+        bytes: bytes.into(),
     }
 }
 

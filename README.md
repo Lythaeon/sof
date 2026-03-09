@@ -10,9 +10,11 @@ It is split into three user-facing crates:
 
 ## Highlights
 
-- Low-latency shred ingest and dataset reconstruction
+- Multi-core packet ingest, FEC recovery, and dataset reconstruction
+- Bundled gossip backend tuning for queue depths, worker counts, CPU pinning, and small-batch serial fallbacks
 - Local `processed` / `confirmed` / `finalized` transaction tagging
 - Plugin hooks and runtime extensions for downstream logic
+- Lower-copy hot paths through shared dataset payload fragments and borrowed transaction classification
 - Replayable derived-state feed for restart-safe stateful services
 - First-class `sof-tx` adapters for live plugin and replayable derived-state control-plane inputs
 - Flow-safety policy evaluation for stale or degraded tx-control-plane state
@@ -63,8 +65,8 @@ cargo add sof-gossip-tuning
 Feature examples:
 
 ```toml
-sof = { version = "0.7.1", features = ["gossip-bootstrap"] }
-sof-tx = { version = "0.7.1", features = ["sof-adapters"] }
+sof = { version = "0.8.0", features = ["gossip-bootstrap"] }
+sof-tx = { version = "0.8.0", features = ["sof-adapters"] }
 ```
 
 Kernel-bypass integrations:

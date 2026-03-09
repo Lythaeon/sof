@@ -288,6 +288,38 @@ impl RuntimeSetup {
         self.with_env("SOF_GOSSIP_LISTEN_THREADS", thread_count.to_string())
     }
 
+    /// Sets `SOF_GOSSIP_RUN_THREADS`.
+    #[must_use]
+    pub fn with_gossip_run_threads(self, thread_count: usize) -> Self {
+        self.with_env("SOF_GOSSIP_RUN_THREADS", thread_count.to_string())
+    }
+
+    /// Sets `SOF_GOSSIP_SOCKET_CONSUME_PARALLEL_PACKET_THRESHOLD`.
+    #[must_use]
+    pub fn with_gossip_socket_consume_parallel_packet_threshold(
+        self,
+        packet_threshold: usize,
+    ) -> Self {
+        self.with_env(
+            "SOF_GOSSIP_SOCKET_CONSUME_PARALLEL_PACKET_THRESHOLD",
+            packet_threshold.to_string(),
+        )
+    }
+
+    /// Sets `SOF_GOSSIP_STATS_INTERVAL_SECS`.
+    ///
+    /// Use `0` to disable the gossip metrics thread.
+    #[must_use]
+    pub fn with_gossip_stats_interval_secs(self, interval_secs: u64) -> Self {
+        self.with_env("SOF_GOSSIP_STATS_INTERVAL_SECS", interval_secs.to_string())
+    }
+
+    /// Sets `SOF_GOSSIP_SAMPLE_LOGS_ENABLED`.
+    #[must_use]
+    pub fn with_gossip_sample_logs_enabled(self, enabled: bool) -> Self {
+        self.with_env("SOF_GOSSIP_SAMPLE_LOGS_ENABLED", enabled.to_string())
+    }
+
     /// Sets `SOF_DATASET_MAX_TRACKED_SLOTS`.
     #[must_use]
     pub fn with_dataset_max_tracked_slots(self, max_tracked_slots: usize) -> Self {
@@ -295,6 +327,12 @@ impl RuntimeSetup {
             "SOF_DATASET_MAX_TRACKED_SLOTS",
             max_tracked_slots.to_string(),
         )
+    }
+
+    /// Sets `SOF_DATASET_RETAINED_SLOT_LAG`.
+    #[must_use]
+    pub fn with_dataset_retained_slot_lag(self, slot_lag: u64) -> Self {
+        self.with_env("SOF_DATASET_RETAINED_SLOT_LAG", slot_lag.to_string())
     }
 
     /// Sets `SOF_DATASET_QUEUE_CAPACITY`.
@@ -309,6 +347,12 @@ impl RuntimeSetup {
         self.with_env("SOF_FEC_MAX_TRACKED_SETS", max_tracked_sets.to_string())
     }
 
+    /// Sets `SOF_FEC_RETAINED_SLOT_LAG`.
+    #[must_use]
+    pub fn with_fec_retained_slot_lag(self, slot_lag: u64) -> Self {
+        self.with_env("SOF_FEC_RETAINED_SLOT_LAG", slot_lag.to_string())
+    }
+
     /// Sets `SOF_LOG_ALL_TXS`.
     #[must_use]
     pub fn with_log_all_txs(self, enabled: bool) -> Self {
@@ -319,6 +363,12 @@ impl RuntimeSetup {
     #[must_use]
     pub fn with_log_non_vote_txs(self, enabled: bool) -> Self {
         self.with_env("SOF_LOG_NON_VOTE_TXS", enabled.to_string())
+    }
+
+    /// Sets `SOF_SKIP_VOTE_ONLY_TX_DETAIL_PATH`.
+    #[must_use]
+    pub fn with_skip_vote_only_tx_detail_path(self, enabled: bool) -> Self {
+        self.with_env("SOF_SKIP_VOTE_ONLY_TX_DETAIL_PATH", enabled.to_string())
     }
 
     /// Sets `SOF_LOG_DATASET_RECONSTRUCTION`.
@@ -1338,6 +1388,34 @@ mod tests {
         assert!(setup.env_overrides.contains(&(
             String::from("SOF_UDP_RECEIVER_PIN_BY_PORT"),
             String::from("true")
+        )));
+    }
+
+    #[test]
+    fn direct_gossip_backend_tuning_sets_expected_env_overrides() {
+        let setup = RuntimeSetup::new()
+            .with_gossip_run_threads(6)
+            .with_gossip_socket_consume_parallel_packet_threshold(2048)
+            .with_gossip_stats_interval_secs(0)
+            .with_gossip_sample_logs_enabled(false);
+
+        assert!(
+            setup
+                .env_overrides
+                .contains(&(String::from("SOF_GOSSIP_RUN_THREADS"), String::from("6")))
+        );
+
+        assert!(setup.env_overrides.contains(&(
+            String::from("SOF_GOSSIP_SOCKET_CONSUME_PARALLEL_PACKET_THRESHOLD"),
+            String::from("2048")
+        )));
+        assert!(setup.env_overrides.contains(&(
+            String::from("SOF_GOSSIP_STATS_INTERVAL_SECS"),
+            String::from("0")
+        )));
+        assert!(setup.env_overrides.contains(&(
+            String::from("SOF_GOSSIP_SAMPLE_LOGS_ENABLED"),
+            String::from("false")
         )));
     }
 

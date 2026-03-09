@@ -67,7 +67,7 @@ impl Plugin for NonVoteTxLoggerPlugin {
         }
     }
 
-    async fn on_transaction(&self, event: TransactionEvent) {
+    async fn on_transaction(&self, event: &TransactionEvent) {
         if event.kind == TxKind::VoteOnly {
             let seen = VOTE_TX_COUNT
                 .fetch_add(1, Ordering::Relaxed)

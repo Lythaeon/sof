@@ -17,9 +17,11 @@ Core responsibilities:
 - Embed SOF directly inside a Tokio application
 - Attach `Plugin` or `RuntimeExtension` consumers
 - Run with built-in UDP ingress or external kernel-bypass ingress
+- Use packet-worker and dataset-worker fanout to keep multi-core hosts busy under sustained shred load
 - Consume local slot/reorg/transaction/account-touch signals
 - Use the replayable derived-state feed for restart-safe stateful consumers
 - Apply typed gossip and ingest tuning profiles instead of env-string bundles
+- Keep more runtime work on borrowed/shared data instead of eagerly allocating owned transaction or dataset payload copies
 
 ## Install
 
@@ -30,13 +32,13 @@ cargo add sof
 Optional gossip bootstrap support at compile time:
 
 ```toml
-sof = { version = "0.7.1", features = ["gossip-bootstrap"] }
+sof = { version = "0.8.0", features = ["gossip-bootstrap"] }
 ```
 
 Optional external `kernel-bypass` ingress support:
 
 ```toml
-sof = { version = "0.7.1", features = ["kernel-bypass"] }
+sof = { version = "0.8.0", features = ["kernel-bypass"] }
 ```
 
 ## Quick Start
@@ -143,6 +145,7 @@ Notes for high-ingest runs:
 
 - The example configures `SOF_PORT_RANGE=12000-12100` and `SOF_GOSSIP_PORT=8001`.
 - It defaults live gossip mode to `SOF_INGEST_QUEUE_MODE=lockfree` with `SOF_INGEST_QUEUE_CAPACITY=262144`.
+- The bundled gossip backend also exposes `SOF_GOSSIP_CONSUME_THREADS`, `SOF_GOSSIP_LISTEN_THREADS`, `SOF_GOSSIP_SOCKET_CONSUME_PARALLEL_PACKET_THRESHOLD`, and `SOF_GOSSIP_STATS_INTERVAL_SECS` for host-specific tuning.
 - `SOF_UDP_DROP_ON_CHANNEL_FULL` only applies to SOF's built-in UDP receiver path (non-external ingress).
 - Queue mode is configurable with `SOF_INGEST_QUEUE_MODE`:
   - `bounded` (default): Tokio bounded channel.

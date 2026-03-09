@@ -53,6 +53,10 @@ use {
     },
 };
 
+fn gossip_sample_logging_enabled() -> bool {
+    crate::read_runtime_env_bool("SOF_GOSSIP_SAMPLE_LOGS_ENABLED").unwrap_or(true)
+}
+
 const CRDS_SHARDS_BITS: u32 = 12;
 // Number of vote slots to track in an lru-cache for metrics.
 const VOTE_SLOTS_METRICS_CAP: usize = 100;
@@ -706,7 +710,11 @@ impl CrdsDataStats {
             return;
         };
 
-        if should_report_message_signature(entry.value.signature(), SIGNATURE_SAMPLE_LEADING_ZEROS)
+        if gossip_sample_logging_enabled()
+            && should_report_message_signature(
+                entry.value.signature(),
+                SIGNATURE_SAMPLE_LEADING_ZEROS,
+            )
         {
             datapoint_info!(
                 "gossip_crds_sample",

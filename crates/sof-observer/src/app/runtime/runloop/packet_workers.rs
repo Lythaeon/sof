@@ -1,11 +1,9 @@
 use super::*;
-#[cfg(feature = "gossip-bootstrap")]
-use std::sync::RwLock;
 
 #[derive(Debug)]
 pub(super) struct PacketWorkerInput {
     pub(super) source: SocketAddr,
-    pub(super) packet_bytes: Vec<u8>,
+    pub(super) packet_bytes: Arc<[u8]>,
     pub(super) parsed_header: ParsedShredHeader,
 }
 
@@ -40,7 +38,7 @@ pub(super) struct WorkerAcceptedShred {
     pub(super) index: u32,
     pub(super) fec_set_index: u32,
     pub(super) kind: WorkerAcceptedShredKind,
-    pub(super) serialized_shred: Option<Vec<u8>>,
+    pub(super) payload_fragment: Option<crate::reassembly::dataset::SharedPayloadFragment>,
 }
 
 #[derive(Debug)]
@@ -69,6 +67,7 @@ pub(super) struct PacketWorkerPoolConfig {
     pub(super) verify_slot_leader_window: u64,
     pub(super) verify_unknown_retry: Duration,
     pub(super) fec_max_tracked_sets: usize,
+    pub(super) fec_retained_slot_lag: u64,
 }
 
 #[derive(Default)]
@@ -107,27 +106,22 @@ impl WorkerVerifyCounters {
 #[cfg(feature = "gossip-bootstrap")]
 pub(super) struct SharedKnownPubkeys {
     generation: Arc<AtomicU64>,
-    pubkeys: Arc<RwLock<Arc<Vec<[u8; 32]>>>>,
+    pubkeys: ArcShift<Arc<Vec<[u8; 32]>>>,
 }
 
 #[cfg(feature = "gossip-bootstrap")]
 impl SharedKnownPubkeys {
     #[cfg(feature = "gossip-bootstrap")]
     pub(super) fn update(&self, pubkeys: Vec<[u8; 32]>) {
-        if let Ok(mut guard) = self.pubkeys.write() {
-            *guard = Arc::new(pubkeys);
-            self.generation.fetch_add(1, Ordering::Relaxed);
-        }
+        let mut shared_pubkeys = self.pubkeys.clone();
+        shared_pubkeys.update(Arc::new(pubkeys));
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     fn snapshot(&self) -> (u64, Arc<Vec<[u8; 32]>>) {
         let generation = self.generation.load(Ordering::Relaxed);
-        let pubkeys = self
-            .pubkeys
-            .read()
-            .ok()
-            .map(|guard| Arc::clone(&guard))
-            .unwrap_or_else(|| Arc::new(Vec::new()));
+        let pubkeys = self.pubkeys.shared_get();
+        let pubkeys = Arc::clone(&pubkeys);
         (generation, pubkeys)
     }
 }
@@ -189,6 +183,7 @@ impl PacketWorkerPool {
             verify_slot_leader_window,
             verify_unknown_retry,
             fec_max_tracked_sets,
+            fec_retained_slot_lag,
         } = config;
         let worker_count = workers.max(1);
         let sender_capacity = queue_capacity.max(1);
@@ -222,7 +217,8 @@ impl PacketWorkerPool {
                 });
                 #[cfg(feature = "gossip-bootstrap")]
                 let mut verifier_generation: u64 = u64::MAX;
-                let mut fec_recoverer = FecRecoverer::new(fec_max_tracked_sets);
+                let mut fec_recoverer =
+                    FecRecoverer::new(fec_max_tracked_sets, fec_retained_slot_lag);
 
                 loop {
                     let maybe_batch = worker_runtime_handle.block_on(worker_rx.recv());
@@ -410,7 +406,7 @@ fn process_packet_batch(
         let observed_at = Instant::now();
         let accepted = match verify_packet_with_counters(
             shred_verifier.as_deref_mut(),
-            &packet.packet_bytes,
+            packet.packet_bytes.as_ref(),
             observed_at,
             verify_strict_unknown,
             &mut verify_counters,
@@ -427,7 +423,7 @@ fn process_packet_batch(
             parsed_header_slot(&packet.parsed_header),
             &mut observed_slot_leaders,
         );
-        let recovered_packets = fec_recoverer.ingest_packet(&packet.packet_bytes);
+        let recovered_packets = fec_recoverer.ingest_packet(packet.packet_bytes.as_ref());
         push_primary_shred(packet, &mut accepted_shreds);
 
         for recovered in recovered_packets {
@@ -471,7 +467,9 @@ fn process_packet_batch(
                         last_in_slot: data.data_header.last_in_slot(),
                         reference_tick: data.data_header.reference_tick(),
                     },
-                    serialized_shred: Some(recovered),
+                    payload_fragment: Some(
+                        crate::reassembly::dataset::SharedPayloadFragment::owned(data.payload),
+                    ),
                 });
             }
         }
@@ -515,6 +513,11 @@ fn maybe_record_observed_leader(
 fn push_primary_shred(packet: PacketWorkerInput, accepted_shreds: &mut Vec<WorkerAcceptedShred>) {
     match packet.parsed_header {
         ParsedShredHeader::Data(data) => {
+            let payload_fragment = crate::reassembly::dataset::SharedPayloadFragment::borrowed(
+                Arc::clone(&packet.packet_bytes),
+                data.payload_offset,
+                data.payload_len,
+            );
             accepted_shreds.push(WorkerAcceptedShred {
                 source: Some(packet.source),
                 slot: data.common.slot,
@@ -529,7 +532,7 @@ fn push_primary_shred(packet: PacketWorkerInput, accepted_shreds: &mut Vec<Worke
                     last_in_slot: data.data_header.last_in_slot(),
                     reference_tick: data.data_header.reference_tick(),
                 },
-                serialized_shred: Some(packet.packet_bytes),
+                payload_fragment,
             });
         }
         ParsedShredHeader::Code(code) => {
@@ -541,7 +544,7 @@ fn push_primary_shred(packet: PacketWorkerInput, accepted_shreds: &mut Vec<Worke
                 kind: WorkerAcceptedShredKind::Code {
                     num_data_shreds: code.coding_header.num_data_shreds,
                 },
-                serialized_shred: None,
+                payload_fragment: None,
             });
         }
     }
@@ -647,13 +650,14 @@ mod tests {
             verify_slot_leader_window: 64,
             verify_unknown_retry: Duration::from_millis(100),
             fec_max_tracked_sets: 8,
+            fec_retained_slot_lag: 16,
         });
 
         assert!(pool.dispatch_worker_batch(
             0,
             vec![PacketWorkerInput {
                 source: SocketAddr::from(([127, 0, 0, 1], 8_899)),
-                packet_bytes,
+                packet_bytes: Arc::from(packet_bytes),
                 parsed_header,
             }],
         ));

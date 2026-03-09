@@ -38,7 +38,16 @@ use {
     },
 };
 
-const SUBMIT_GOSSIP_STATS_INTERVAL: Duration = Duration::from_secs(2);
+const DEFAULT_SUBMIT_GOSSIP_STATS_INTERVAL: Duration = Duration::from_secs(10);
+
+fn gossip_stats_interval() -> Option<Duration> {
+    crate::read_runtime_env_override("SOF_GOSSIP_STATS_INTERVAL_SECS")
+        .or_else(|| std::env::var("SOF_GOSSIP_STATS_INTERVAL_SECS").ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .or(Some(DEFAULT_SUBMIT_GOSSIP_STATS_INTERVAL))
+        .filter(|interval| !interval.is_zero())
+}
 
 pub struct GossipService {
     thread_hdls: Vec<JoinHandle<()>>,
@@ -119,34 +128,38 @@ impl GossipService {
             socket_addr_space,
             stats_reporter_sender,
         );
-        let t_metrics = Builder::new()
-            .name("solGossipMetr".to_string())
-            .spawn({
-                let cluster_info = cluster_info.clone();
-                let mut epoch_specs = bank_forks.map(EpochSpecs::from);
-                move || {
-                    while !exit.load(Ordering::Relaxed) {
-                        sleep(SUBMIT_GOSSIP_STATS_INTERVAL);
-                        let stakes = epoch_specs
-                            .as_mut()
-                            .map(|epoch_specs| epoch_specs.current_epoch_staked_nodes())
-                            .cloned()
-                            .unwrap_or_default();
-
-                        submit_gossip_stats(&cluster_info.stats, &cluster_info.gossip, &stakes);
-                        gossip_receiver_stats.report();
-                    }
-                }
-            })
-            .unwrap();
-        let thread_hdls = vec![
+        let mut thread_hdls = vec![
             t_receiver,
             t_responder,
             t_socket_consume,
             t_listen,
             t_gossip,
-            t_metrics,
         ];
+        if let Some(stats_interval) = gossip_stats_interval() {
+            let t_metrics = Builder::new()
+                .name("solGossipMetr".to_string())
+                .spawn({
+                    let cluster_info = cluster_info.clone();
+                    let mut epoch_specs = bank_forks.map(EpochSpecs::from);
+                    move || {
+                        while !exit.load(Ordering::Relaxed) {
+                            sleep(stats_interval);
+                            let stakes = epoch_specs
+                                .as_mut()
+                                .map(|epoch_specs| epoch_specs.current_epoch_staked_nodes())
+                                .cloned()
+                                .unwrap_or_default();
+
+                            submit_gossip_stats(&cluster_info.stats, &cluster_info.gossip, &stakes);
+                            gossip_receiver_stats.report();
+                        }
+                    }
+                })
+                .unwrap();
+            thread_hdls.push(t_metrics);
+        } else {
+            info!("gossip metrics reporting disabled");
+        }
         Self { thread_hdls }
     }
 

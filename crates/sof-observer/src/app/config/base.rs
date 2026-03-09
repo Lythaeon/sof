@@ -47,12 +47,36 @@ pub fn read_dataset_max_tracked_slots() -> usize {
         .unwrap_or(2_048)
 }
 
+pub fn read_dataset_retained_slot_lag() -> u64 {
+    read_env_var("SOF_DATASET_RETAINED_SLOT_LAG")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.clamp(32, 8_192))
+        .unwrap_or_else(|| {
+            u64::try_from(read_dataset_max_tracked_slots() / 4)
+                .unwrap_or(u64::MAX)
+                .clamp(64, 256)
+        })
+}
+
 pub fn read_fec_max_tracked_sets() -> usize {
     read_env_var("SOF_FEC_MAX_TRACKED_SETS")
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .map(|value| value.clamp(512, 131_072))
         .unwrap_or(8_192)
+}
+
+pub fn read_fec_retained_slot_lag() -> u64 {
+    read_env_var("SOF_FEC_RETAINED_SLOT_LAG")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.clamp(16, 8_192))
+        .unwrap_or_else(|| {
+            u64::try_from(read_fec_max_tracked_sets() / 16)
+                .unwrap_or(u64::MAX)
+                .clamp(32, 128)
+        })
 }
 
 pub fn read_dataset_queue_capacity() -> usize {
@@ -118,6 +142,10 @@ pub fn read_log_startup_steps() -> bool {
 
 pub fn read_log_non_vote_txs() -> bool {
     read_bool_env("SOF_LOG_NON_VOTE_TXS", false)
+}
+
+pub fn read_skip_vote_only_tx_detail_path() -> bool {
+    read_bool_env("SOF_SKIP_VOTE_ONLY_TX_DETAIL_PATH", false)
 }
 
 pub fn read_log_dataset_reconstruction() -> bool {

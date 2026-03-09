@@ -1,9 +1,13 @@
 use super::*;
 use async_trait::async_trait;
+use solana_transaction::Transaction;
 use std::{
     sync::atomic::AtomicUsize,
     time::{Duration, Instant},
 };
+
+use crate::event::TxKind;
+use crate::framework::{TransactionEventRef, TransactionInterest, TxCommitmentStatus};
 
 #[derive(Clone, Copy)]
 struct PluginA;
@@ -127,6 +131,81 @@ impl ObserverPlugin for ForkHookCounterPlugin {
 
     async fn on_reorg(&self, _event: ReorgEvent) {
         self.reorg_counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone)]
+struct FilteringTransactionPlugin {
+    accepted: Arc<AtomicUsize>,
+    rejected: Arc<AtomicUsize>,
+    handled: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ObserverPlugin for FilteringTransactionPlugin {
+    fn name(&self) -> &'static str {
+        "filtering-transaction-plugin"
+    }
+
+    fn wants_transaction(&self) -> bool {
+        true
+    }
+
+    fn accepts_transaction_ref(&self, event: TransactionEventRef<'_>) -> bool {
+        let accept = event.slot.is_multiple_of(2);
+        if accept {
+            self.accepted.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.rejected.fetch_add(1, Ordering::Relaxed);
+        }
+        accept
+    }
+
+    fn transaction_interest_ref(&self, event: TransactionEventRef<'_>) -> TransactionInterest {
+        if self.accepts_transaction_ref(event) {
+            TransactionInterest::Critical
+        } else {
+            TransactionInterest::Ignore
+        }
+    }
+
+    async fn on_transaction(&self, _event: &TransactionEvent) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        self.handled.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone)]
+struct PriorityTransactionPlugin {
+    critical_handled: Arc<AtomicUsize>,
+    background_handled: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ObserverPlugin for PriorityTransactionPlugin {
+    fn name(&self) -> &'static str {
+        "priority-transaction-plugin"
+    }
+
+    fn wants_transaction(&self) -> bool {
+        true
+    }
+
+    fn transaction_interest_ref(&self, event: TransactionEventRef<'_>) -> TransactionInterest {
+        if event.slot.is_multiple_of(2) {
+            TransactionInterest::Critical
+        } else {
+            TransactionInterest::Background
+        }
+    }
+
+    async fn on_transaction(&self, event: &TransactionEvent) {
+        if event.slot.is_multiple_of(2) {
+            self.critical_handled.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        self.background_handled.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -413,6 +492,111 @@ fn latest_observed_tpu_leader_is_stateful() {
     );
 }
 
+#[test]
+fn transaction_prefilter_runs_before_queue_dispatch() {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let rejected = Arc::new(AtomicUsize::new(0));
+    let handled = Arc::new(AtomicUsize::new(0));
+    let host = PluginHostBuilder::new()
+        .with_event_queue_capacity(1)
+        .add_plugin(FilteringTransactionPlugin {
+            accepted: Arc::clone(&accepted),
+            rejected: Arc::clone(&rejected),
+            handled: Arc::clone(&handled),
+        })
+        .build();
+
+    host.on_transaction(test_transaction_event(2));
+    for slot in (1..=199).step_by(2) {
+        host.on_transaction(test_transaction_event(slot));
+    }
+
+    assert!(wait_until_counter(
+        handled.as_ref(),
+        1,
+        Duration::from_secs(3),
+    ));
+    assert_eq!(rejected.load(Ordering::Relaxed), 100);
+    assert_eq!(handled.load(Ordering::Relaxed), 1);
+    assert_eq!(host.dropped_event_count(), 0);
+}
+
+#[test]
+fn sharded_transaction_dispatch_is_consistent() {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let rejected = Arc::new(AtomicUsize::new(0));
+    let handled = Arc::new(AtomicUsize::new(0));
+    let threads = 8_usize;
+    let iterations = 40_usize;
+    let expected = threads.saturating_mul(iterations);
+    let host = Arc::new(
+        PluginHostBuilder::new()
+            .with_event_queue_capacity(expected.saturating_mul(2))
+            .with_transaction_dispatch_workers(4)
+            .add_plugin(FilteringTransactionPlugin {
+                accepted: Arc::clone(&accepted),
+                rejected: Arc::clone(&rejected),
+                handled: Arc::clone(&handled),
+            })
+            .build(),
+    );
+
+    let mut joins = Vec::with_capacity(threads);
+    for worker_index in 0..threads {
+        let worker_host = Arc::clone(&host);
+        joins.push(thread::spawn(move || {
+            for iteration in 0..iterations {
+                let slot = ((worker_index * iterations) + iteration) as u64 * 2;
+                worker_host.on_transaction(test_transaction_event(slot));
+            }
+        }));
+    }
+    for join in joins {
+        assert!(join.join().is_ok());
+    }
+
+    assert!(wait_until_counter(
+        handled.as_ref(),
+        expected,
+        Duration::from_secs(8),
+    ));
+    assert_eq!(accepted.load(Ordering::Relaxed), expected);
+    assert_eq!(rejected.load(Ordering::Relaxed), 0);
+    assert_eq!(host.transaction_dropped_event_count(), 0);
+    assert_eq!(host.general_dropped_event_count(), 0);
+}
+
+#[test]
+fn critical_transaction_lane_stays_isolated_from_background_pressure() {
+    let critical_handled = Arc::new(AtomicUsize::new(0));
+    let background_handled = Arc::new(AtomicUsize::new(0));
+    let host = PluginHostBuilder::new()
+        .with_event_queue_capacity(8)
+        .with_transaction_dispatch_workers(4)
+        .add_plugin(PriorityTransactionPlugin {
+            critical_handled: Arc::clone(&critical_handled),
+            background_handled: Arc::clone(&background_handled),
+        })
+        .build();
+
+    for slot in (1..=119).step_by(2) {
+        host.on_transaction(test_transaction_event(slot));
+    }
+    for (slot, signature_seed) in [(2_u64, 1_u8), (4, 2), (6, 3), (8, 4)] {
+        host.on_transaction(test_transaction_event_with_signature(slot, signature_seed));
+    }
+
+    assert!(wait_until_counter(
+        critical_handled.as_ref(),
+        4,
+        Duration::from_secs(5),
+    ));
+    assert_eq!(host.transaction_dropped_event_count(), 0);
+    assert_eq!(host.general_dropped_event_count(), 0);
+    assert!(host.background_transaction_dropped_event_count() > 0);
+    assert!(background_handled.load(Ordering::Relaxed) < 60);
+}
+
 fn wait_until_counter(counter: &AtomicUsize, expected: usize, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -422,4 +606,24 @@ fn wait_until_counter(counter: &AtomicUsize, expected: usize, timeout: Duration)
         thread::sleep(Duration::from_millis(10));
     }
     false
+}
+
+fn test_transaction_event(slot: u64) -> TransactionEvent {
+    test_transaction_event_with_signature(slot, 0)
+}
+
+fn test_transaction_event_with_signature(slot: u64, signature_seed: u8) -> TransactionEvent {
+    let tx = solana_transaction::versioned::VersionedTransaction::from(
+        Transaction::new_with_payer(&[], None),
+    );
+    TransactionEvent {
+        slot,
+        commitment_status: TxCommitmentStatus::Processed,
+        confirmed_slot: None,
+        finalized_slot: None,
+        signature: (signature_seed != 0)
+            .then(|| solana_signature::Signature::from([signature_seed; 64])),
+        tx: Arc::new(tx),
+        kind: TxKind::NonVote,
+    }
 }

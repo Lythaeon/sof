@@ -1,10 +1,21 @@
 use async_trait::async_trait;
 
 use crate::framework::events::{
-    AccountTouchEvent, ClusterTopologyEvent, DatasetEvent, LeaderScheduleEvent,
-    ObservedRecentBlockhashEvent, RawPacketEvent, ReorgEvent, ShredEvent, SlotStatusEvent,
-    TransactionEvent,
+    AccountTouchEvent, AccountTouchEventRef, ClusterTopologyEvent, DatasetEvent,
+    LeaderScheduleEvent, ObservedRecentBlockhashEvent, RawPacketEvent, ReorgEvent, ShredEvent,
+    SlotStatusEvent, TransactionEvent, TransactionEventRef,
 };
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+/// Priority class for accepted transaction callbacks.
+pub enum TransactionInterest {
+    /// Ignore the transaction entirely.
+    Ignore,
+    /// Lower-priority transaction visibility that may be isolated from HFT-critical traffic.
+    Background,
+    /// HFT-critical transaction visibility that should stay on the fast lane.
+    Critical,
+}
 
 /// Extension point for SOF runtime event hooks.
 ///
@@ -56,16 +67,70 @@ pub trait ObserverPlugin: Send + Sync + 'static {
         true
     }
 
+    /// Borrowed transaction prefilter used on the dataset hot path.
+    ///
+    /// Override this to avoid constructing an owned [`TransactionEvent`] for
+    /// transactions that will be ignored anyway.
+    ///
+    /// Plugins that only need borrowed fields should prefer this hook over
+    /// [`Self::accepts_transaction`].
+    fn accepts_transaction_ref(&self, event: TransactionEventRef<'_>) -> bool {
+        self.accepts_transaction(&event.to_owned())
+    }
+
+    /// Returns transaction-interest priority for one decoded transaction callback.
+    ///
+    /// The default preserves the historical API: accepted transactions are treated
+    /// as critical and rejected transactions are ignored.
+    fn transaction_interest(&self, event: &TransactionEvent) -> TransactionInterest {
+        if self.accepts_transaction(event) {
+            TransactionInterest::Critical
+        } else {
+            TransactionInterest::Ignore
+        }
+    }
+
+    /// Borrowed transaction-interest classifier used on the dataset hot path.
+    ///
+    /// Override this when classification can run directly on borrowed message
+    /// data without first allocating an owned [`TransactionEvent`].
+    ///
+    /// Priority-sensitive plugins should implement this hook directly so the
+    /// dataset hot path can classify traffic without allocating.
+    fn transaction_interest_ref(&self, event: TransactionEventRef<'_>) -> TransactionInterest {
+        self.transaction_interest(&event.to_owned())
+    }
+
     /// Called for each decoded transaction emitted from a dataset.
-    async fn on_transaction(&self, _event: TransactionEvent) {}
+    async fn on_transaction(&self, _event: &TransactionEvent) {}
+
+    /// Called for each accepted decoded transaction with the already-computed routing lane.
+    ///
+    /// Implement this when the plugin wants to avoid recomputing the same synchronous
+    /// routing/classification work inside [`Self::on_transaction`].
+    async fn on_transaction_with_interest(
+        &self,
+        event: &TransactionEvent,
+        _interest: TransactionInterest,
+    ) {
+        self.on_transaction(event).await;
+    }
 
     /// Returns true when this plugin wants account-touch callbacks.
     fn wants_account_touch(&self) -> bool {
         false
     }
 
+    /// Borrowed account-touch prefilter used on the dataset hot path.
+    ///
+    /// Override this to reject irrelevant account-touch callbacks before the
+    /// runtime allocates owned account-key vectors.
+    fn accepts_account_touch_ref(&self, _event: AccountTouchEventRef<'_>) -> bool {
+        true
+    }
+
     /// Called for each decoded transaction's static touched-account set.
-    async fn on_account_touch(&self, _event: AccountTouchEvent) {}
+    async fn on_account_touch(&self, _event: &AccountTouchEvent) {}
 
     /// Returns true when this plugin wants slot-status callbacks.
     fn wants_slot_status(&self) -> bool {

@@ -2,12 +2,13 @@ use std::{
     any::Any,
     future::Future,
     sync::{
-        Arc, RwLock,
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
     thread,
 };
 
+use arcshift::ArcShift;
 use solana_pubkey::Pubkey;
 use tokio::sync::{Semaphore, mpsc};
 
@@ -36,10 +37,20 @@ pub use core::PluginHost;
 
 /// Default bounded queue capacity for asynchronous plugin hook dispatch.
 const DEFAULT_EVENT_QUEUE_CAPACITY: usize = 8_192;
+/// Default number of transaction-dispatch workers for accepted transaction callbacks.
+const DEFAULT_TRANSACTION_DISPATCH_WORKERS_CAP: usize = 8;
 /// Number of initial dropped-event warnings emitted without sampling.
 const INITIAL_DROP_LOG_LIMIT: u64 = 5;
 /// Warning sample cadence after the initial dropped-event warning burst.
 const DROP_LOG_SAMPLE_EVERY: u64 = 1_000;
+
+/// Chooses a bounded default worker count for accepted-transaction dispatch.
+fn default_transaction_dispatch_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .clamp(1, DEFAULT_TRANSACTION_DISPATCH_WORKERS_CAP)
+}
 
 /// Dispatch strategy used by the async plugin worker.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]

@@ -88,3 +88,13 @@ pub(crate) fn read_runtime_env_override(name: &str) -> Option<String> {
         .as_ref()
         .and_then(|overrides| overrides.get(name).cloned())
 }
+
+pub(crate) fn read_runtime_env_bool(name: &str) -> Option<bool> {
+    read_runtime_env_override(name)
+        .or_else(|| std::env::var(name).ok())
+        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
+}

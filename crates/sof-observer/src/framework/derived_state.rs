@@ -6,6 +6,7 @@
 //! fault types without yet wiring a runtime producer.
 
 use std::{
+    cell::RefCell,
     collections::HashMap,
     fmt,
     fs::{self, File, OpenOptions},
@@ -13,11 +14,16 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
+        mpsc,
     },
+    thread::JoinHandle,
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use arcshift::ArcShift;
+use crossbeam_queue::ArrayQueue;
+use crossbeam_skiplist::SkipMap;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
@@ -908,6 +914,22 @@ pub trait DerivedStateReplaySource: Send + Sync + 'static {
     /// Records one emitted envelope into the replay source.
     fn append(&self, envelope: DerivedStateFeedEnvelope);
 
+    /// Records a batch of emitted envelopes into the replay source.
+    fn append_batch(&self, envelopes: &[DerivedStateFeedEnvelope]) {
+        for envelope in envelopes {
+            self.append(envelope.clone());
+        }
+    }
+
+    /// Records a shared batch of emitted envelopes into the replay source.
+    fn append_shared_batch(&self, envelopes: &[Arc<DerivedStateFeedEnvelope>]) {
+        let owned = envelopes
+            .iter()
+            .map(|envelope| envelope.as_ref().clone())
+            .collect::<Vec<_>>();
+        self.append_batch(owned.as_slice());
+    }
+
     /// Returns retained envelopes starting at the requested sequence boundary.
     ///
     /// # Errors
@@ -1039,15 +1061,19 @@ pub struct DiskDerivedStateReplaySource {
     /// Durability policy used for disk writes.
     durability: DerivedStateReplayDurability,
     /// Lightweight per-session metadata cached in-process.
-    session_metadata: Mutex<HashMap<FeedSessionId, DiskDerivedStateSessionMetadata>>,
+    session_metadata: Arc<Mutex<HashMap<FeedSessionId, DiskDerivedStateSessionMetadata>>>,
     /// Total number of envelopes truncated by the retention policy.
-    truncated_envelopes: AtomicU64,
+    truncated_envelopes: Arc<AtomicU64>,
     /// Total number of backend append failures.
-    append_failures: AtomicU64,
+    append_failures: Arc<AtomicU64>,
     /// Total number of backend load failures.
-    load_failures: AtomicU64,
+    load_failures: Arc<AtomicU64>,
     /// Total number of disk compaction runs.
-    compactions: AtomicU64,
+    compactions: Arc<AtomicU64>,
+    /// Dedicated writer path for replay appends so dataset workers do not block on disk IO.
+    writer_tx: mpsc::Sender<Vec<Arc<DerivedStateFeedEnvelope>>>,
+    /// Join handle for the dedicated replay writer thread.
+    writer_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Lightweight retained-session metadata for the disk replay backend.
@@ -1074,6 +1100,11 @@ struct DiskDerivedStateSegmentMetadata {
 
 /// Target number of envelopes kept in one disk replay segment before rolling to a new file.
 const DISK_REPLAY_TARGET_SEGMENT_ENVELOPES: usize = 256;
+
+thread_local! {
+    /// Per-thread cache of open replay segment append handles.
+    static DISK_REPLAY_APPENDERS: RefCell<HashMap<PathBuf, File>> = RefCell::new(HashMap::new());
+}
 
 /// Durability policy for the disk-backed replay source.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -1140,16 +1171,66 @@ impl DiskDerivedStateReplaySource {
     ) -> io::Result<Self> {
         let root_dir = root_dir.into();
         fs::create_dir_all(&root_dir)?;
+        let session_metadata = Arc::new(Mutex::new(HashMap::new()));
+        let truncated_envelopes = Arc::new(AtomicU64::new(0));
+        let append_failures = Arc::new(AtomicU64::new(0));
+        let load_failures = Arc::new(AtomicU64::new(0));
+        let compactions = Arc::new(AtomicU64::new(0));
+        let (writer_tx, writer_rx) = mpsc::channel::<Vec<Arc<DerivedStateFeedEnvelope>>>();
+        let writer_root_dir = root_dir.clone();
+        let writer_session_metadata = Arc::clone(&session_metadata);
+        let writer_truncated_envelopes = Arc::clone(&truncated_envelopes);
+        let writer_append_failures = Arc::clone(&append_failures);
+        let writer_compactions = Arc::clone(&compactions);
+        let thread_name = String::from("sof-ds-replay");
+        let writer_handle = std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                let (dummy_tx, _dummy_rx) = mpsc::channel::<Vec<Arc<DerivedStateFeedEnvelope>>>();
+                let writer_backend = Self {
+                    root_dir: writer_root_dir,
+                    max_envelopes_per_session,
+                    max_retained_sessions: max_retained_sessions.max(1),
+                    durability,
+                    session_metadata: writer_session_metadata,
+                    truncated_envelopes: writer_truncated_envelopes,
+                    append_failures: Arc::clone(&writer_append_failures),
+                    load_failures: Arc::new(AtomicU64::new(0)),
+                    compactions: writer_compactions,
+                    writer_tx: dummy_tx,
+                    writer_handle: None,
+                };
+                while let Ok(envelopes) = writer_rx.recv() {
+                    let Some(first_envelope) = envelopes.first() else {
+                        continue;
+                    };
+                    let session_id = first_envelope.session_id;
+                    let owned = envelopes
+                        .iter()
+                        .map(|envelope| envelope.as_ref().clone())
+                        .collect::<Vec<_>>();
+                    if let Err(error) = writer_backend.append_batch_inline(owned.as_slice()) {
+                        let _ = writer_append_failures.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            session_id = ?session_id,
+                            error = %error,
+                            "failed to append derived-state replay envelope batch to disk"
+                        );
+                    }
+                }
+            })?;
         Ok(Self {
             root_dir,
             max_envelopes_per_session,
             max_retained_sessions: max_retained_sessions.max(1),
             durability,
-            session_metadata: Mutex::new(HashMap::new()),
-            truncated_envelopes: AtomicU64::new(0),
-            append_failures: AtomicU64::new(0),
-            load_failures: AtomicU64::new(0),
-            compactions: AtomicU64::new(0),
+            session_metadata,
+            truncated_envelopes,
+            append_failures,
+            load_failures,
+            compactions,
+            writer_tx,
+            writer_handle: Some(writer_handle),
         })
     }
 
@@ -1215,20 +1296,106 @@ impl DiskDerivedStateReplaySource {
     }
 
     /// Appends one length-prefixed record to an existing session log.
-    fn append_record(&self, path: &Path, envelope: &DerivedStateFeedEnvelope) -> io::Result<()> {
-        let encoded = Self::encode_envelope(envelope)?;
-        let encoded_len = u32::try_from(encoded.len()).map_err(|_error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "derived-state replay envelope exceeded u32 record length",
-            )
+    fn append_encoded_records(&self, path: &Path, encoded_records: &[Vec<u8>]) -> io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let total_len = encoded_records
+            .iter()
+            .map(Vec::len)
+            .fold(0_usize, usize::saturating_add);
+        let mut record = Vec::with_capacity(total_len);
+        for encoded in encoded_records {
+            record.extend_from_slice(encoded);
+        }
+        DISK_REPLAY_APPENDERS.with(|appenders| -> io::Result<()> {
+            let mut appenders = appenders.borrow_mut();
+            let file = if let Some(file) = appenders.get_mut(path) {
+                file
+            } else {
+                appenders
+                    .entry(path.to_path_buf())
+                    .or_insert(OpenOptions::new().create(true).append(true).open(path)?)
+            };
+            file.write_all(&record)?;
+            file.flush()?;
+            self.sync_file(file)
         })?;
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-        file.write_all(&encoded_len.to_le_bytes())?;
-        file.write_all(&encoded)?;
-        file.flush()?;
-        self.sync_file(&file)?;
         Ok(())
+    }
+
+    /// Inline batch append used by the dedicated replay writer thread.
+    fn append_batch_inline(&self, envelopes: &[DerivedStateFeedEnvelope]) -> io::Result<()> {
+        let Some(first_envelope) = envelopes.first() else {
+            return Ok(());
+        };
+        let session_id = first_envelope.session_id;
+        let mut metadata = self.session_metadata(session_id)?;
+        fs::create_dir_all(self.session_path(session_id))?;
+        let segment_capacity = self.segment_envelope_capacity();
+        let mut envelope_index = 0_usize;
+        while envelope_index < envelopes.len() {
+            let current_path = if let Some(segment) = metadata.segments.last()
+                && segment.retained_envelopes < segment_capacity
+            {
+                segment.path.clone()
+            } else {
+                let Some(envelope) = envelopes.get(envelope_index) else {
+                    break;
+                };
+                let path = self.segment_path(session_id, envelope.sequence);
+                metadata.segments.push(DiskDerivedStateSegmentMetadata {
+                    path: path.clone(),
+                    first_sequence: envelope.sequence,
+                    last_sequence: envelope.sequence,
+                    retained_envelopes: 0,
+                });
+                path
+            };
+            let Some(segment) = metadata.segments.last_mut() else {
+                break;
+            };
+            let remaining_capacity = segment_capacity.saturating_sub(segment.retained_envelopes);
+            let batch_len = remaining_capacity.min(envelopes.len().saturating_sub(envelope_index));
+            let Some(batch) =
+                envelopes.get(envelope_index..envelope_index.saturating_add(batch_len))
+            else {
+                break;
+            };
+            let mut encoded_records = Vec::with_capacity(batch.len());
+            for envelope in batch {
+                let encoded = Self::encode_envelope(envelope)?;
+                let encoded_len = u32::try_from(encoded.len()).map_err(|_error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "derived-state replay envelope exceeded u32 record length",
+                    )
+                })?;
+                let mut record = Vec::with_capacity(encoded.len().saturating_add(4));
+                record.extend_from_slice(&encoded_len.to_le_bytes());
+                record.extend_from_slice(&encoded);
+                encoded_records.push(record);
+            }
+            self.append_encoded_records(&current_path, &encoded_records)?;
+            segment.last_sequence = batch
+                .last()
+                .map(|envelope| envelope.sequence)
+                .unwrap_or(segment.last_sequence);
+            segment.retained_envelopes = segment.retained_envelopes.saturating_add(batch.len());
+            metadata.retained_envelopes = metadata.retained_envelopes.saturating_add(batch.len());
+            envelope_index = envelope_index.saturating_add(batch.len());
+        }
+        let overflow = metadata
+            .retained_envelopes
+            .saturating_sub(self.max_envelopes_per_session.max(1));
+        if overflow > 0 {
+            let truncated = self.truncate_oldest_envelopes(session_id, &mut metadata, overflow)?;
+            let _ = self
+                .truncated_envelopes
+                .fetch_add(truncated as u64, Ordering::Relaxed);
+        }
+        self.update_session_metadata(session_id, metadata);
+        self.compact_sessions(session_id)
     }
 
     /// Rewrites one retained segment from the currently in-memory tail.
@@ -1531,49 +1698,59 @@ impl DiskDerivedStateReplaySource {
     }
 }
 
+impl Drop for DiskDerivedStateReplaySource {
+    fn drop(&mut self) {
+        let (dummy_tx, _dummy_rx) = mpsc::channel::<Vec<Arc<DerivedStateFeedEnvelope>>>();
+        let writer_tx = std::mem::replace(&mut self.writer_tx, dummy_tx);
+        drop(writer_tx);
+        if let Some(writer_handle) = self.writer_handle.take()
+            && writer_handle.join().is_err()
+        {
+            tracing::warn!("derived-state replay writer thread panicked during shutdown");
+        }
+    }
+}
+
 impl DerivedStateReplaySource for DiskDerivedStateReplaySource {
     fn append(&self, envelope: DerivedStateFeedEnvelope) {
         let session_id = envelope.session_id;
-        let append_result = (|| -> io::Result<()> {
-            let mut metadata = self.session_metadata(session_id)?;
-            fs::create_dir_all(self.session_path(session_id))?;
-            let segment_capacity = self.segment_envelope_capacity();
-            if let Some(segment) = metadata.segments.last_mut()
-                && segment.retained_envelopes < segment_capacity
-            {
-                self.append_record(&segment.path, &envelope)?;
-                segment.last_sequence = envelope.sequence;
-                segment.retained_envelopes = segment.retained_envelopes.saturating_add(1);
-            } else {
-                let path = self.segment_path(session_id, envelope.sequence);
-                self.append_record(&path, &envelope)?;
-                metadata.segments.push(DiskDerivedStateSegmentMetadata {
-                    path,
-                    first_sequence: envelope.sequence,
-                    last_sequence: envelope.sequence,
-                    retained_envelopes: 1,
-                });
-            }
-            metadata.retained_envelopes = metadata.retained_envelopes.saturating_add(1);
-            let overflow = metadata
-                .retained_envelopes
-                .saturating_sub(self.max_envelopes_per_session.max(1));
-            if overflow > 0 {
-                let truncated =
-                    self.truncate_oldest_envelopes(session_id, &mut metadata, overflow)?;
-                let _ = self
-                    .truncated_envelopes
-                    .fetch_add(truncated as u64, Ordering::Relaxed);
-            }
-            self.update_session_metadata(session_id, metadata);
-            self.compact_sessions(session_id)
-        })();
-        if let Err(error) = append_result {
+        if let Err(error) = self.writer_tx.send(vec![Arc::new(envelope)]) {
             let _ = self.append_failures.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 session_id = ?session_id,
                 error = %error,
-                "failed to append derived-state replay envelope to disk"
+                "failed to enqueue derived-state replay envelope for disk append"
+            );
+        }
+    }
+
+    fn append_batch(&self, envelopes: &[DerivedStateFeedEnvelope]) {
+        let Some(first_envelope) = envelopes.first() else {
+            return;
+        };
+        let session_id = first_envelope.session_id;
+        let shared = envelopes.iter().cloned().map(Arc::new).collect::<Vec<_>>();
+        if let Err(error) = self.writer_tx.send(shared) {
+            let _ = self.append_failures.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                session_id = ?session_id,
+                error = %error,
+                "failed to enqueue derived-state replay envelope batch for disk append"
+            );
+        }
+    }
+
+    fn append_shared_batch(&self, envelopes: &[Arc<DerivedStateFeedEnvelope>]) {
+        let Some(first_envelope) = envelopes.first() else {
+            return;
+        };
+        let session_id = first_envelope.session_id;
+        if let Err(error) = self.writer_tx.send(envelopes.to_vec()) {
+            let _ = self.append_failures.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                session_id = ?session_id,
+                error = %error,
+                "failed to enqueue shared derived-state replay envelope batch for disk append"
             );
         }
     }
@@ -1765,13 +1942,18 @@ pub trait DerivedStateConsumer: Send + Sync + 'static {
         self.wants_account_touch_observed()
     }
 
+    /// Returns true when this consumer wants observer-side control-plane events.
+    fn wants_control_plane_observed(&self) -> bool {
+        true
+    }
+
     /// Applies one feed envelope in canonical sequence order.
     ///
     /// # Errors
     /// Returns a structured fault when the consumer cannot apply the event.
     fn apply(
         &mut self,
-        envelope: DerivedStateFeedEnvelope,
+        envelope: &DerivedStateFeedEnvelope,
     ) -> Result<(), DerivedStateConsumerFault>;
 
     /// Persists a durable checkpoint for later replay or recovery.
@@ -1782,6 +1964,337 @@ pub trait DerivedStateConsumer: Send + Sync + 'static {
         &mut self,
         checkpoint: DerivedStateCheckpoint,
     ) -> Result<(), DerivedStateConsumerFault>;
+}
+
+/// Bounded command queue capacity for each dedicated derived-state consumer worker.
+const DERIVED_STATE_CONSUMER_QUEUE_CAPACITY: usize = 1024;
+
+/// Commands sent from the host thread into one consumer-owned worker thread.
+enum DerivedStateConsumerCommand {
+    /// Loads the latest durable checkpoint from the consumer.
+    LoadCheckpoint {
+        /// One-shot reply channel for the checkpoint result.
+        response:
+            mpsc::SyncSender<Result<Option<DerivedStateCheckpoint>, DerivedStateConsumerFault>>,
+    },
+    /// Applies a preordered live batch of shared envelopes.
+    ApplySharedBatch {
+        /// Live batch to apply in sequence order.
+        envelopes: Vec<Arc<DerivedStateFeedEnvelope>>,
+        /// One-shot reply channel for batch progress and any fault.
+        response: mpsc::SyncSender<DerivedStateConsumerBatchApplyReply>,
+    },
+    /// Applies a preordered replay batch.
+    ApplyBatch {
+        /// Replay batch to apply in sequence order.
+        envelopes: Vec<DerivedStateFeedEnvelope>,
+        /// One-shot reply channel for batch progress and any fault.
+        response: mpsc::SyncSender<DerivedStateConsumerBatchApplyReply>,
+    },
+    /// Applies one final envelope and then persists a checkpoint.
+    FlushCheckpoint {
+        /// Final envelope that advances the consumer before checkpointing.
+        envelope: Arc<DerivedStateFeedEnvelope>,
+        /// Active host session id written into the checkpoint.
+        session_id: FeedSessionId,
+        /// Watermarks paired with the checkpoint barrier.
+        watermarks: FeedWatermarks,
+        /// One-shot reply channel for the checkpoint flush outcome.
+        response: mpsc::SyncSender<Option<DerivedStateConsumerFault>>,
+    },
+    /// Requests cooperative worker shutdown.
+    Shutdown,
+}
+
+/// Result summary returned from replay-batch application.
+struct DerivedStateConsumerBatchApplyReply {
+    /// Number of envelopes the consumer applied before stopping.
+    applied_events: u64,
+    /// Highest successfully applied sequence in the batch, when known.
+    last_sequence: Option<FeedSequence>,
+    /// First consumer fault encountered during the batch, when any.
+    fault: Option<DerivedStateConsumerFault>,
+}
+
+/// Dedicated worker state for one derived-state consumer instance.
+struct DerivedStateConsumerWorker {
+    /// Bounded command queue feeding the worker thread.
+    queue: Arc<ArrayQueue<DerivedStateConsumerCommand>>,
+    /// Handle to the worker thread for direct unparking.
+    worker_thread: Arc<OnceLock<std::thread::Thread>>,
+    /// Cooperative shutdown flag shared with the worker thread.
+    shutdown: Arc<AtomicBool>,
+    /// Structured startup fault captured when the worker could not be spawned.
+    startup_fault: Option<DerivedStateConsumerFault>,
+    /// Join handle for the worker thread when startup succeeded.
+    worker_handle: Option<JoinHandle<()>>,
+}
+
+impl DerivedStateConsumerWorker {
+    /// Spawns one dedicated worker thread for one derived-state consumer.
+    fn spawn(name: &'static str, mut consumer: Box<dyn DerivedStateConsumer>) -> Self {
+        let queue = Arc::new(ArrayQueue::new(DERIVED_STATE_CONSUMER_QUEUE_CAPACITY));
+        let worker_thread = Arc::new(OnceLock::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_queue = queue.clone();
+        let worker_thread_ref = worker_thread.clone();
+        let worker_shutdown = shutdown.clone();
+        let worker_handle = std::thread::Builder::new()
+            .name(format!("derived-state-{name}"))
+            .spawn(move || {
+                drop(worker_thread_ref.set(std::thread::current()));
+                while !worker_shutdown.load(Ordering::Relaxed) {
+                    let Some(command) = worker_queue.pop() else {
+                        std::thread::park();
+                        continue;
+                    };
+                    match command {
+                        DerivedStateConsumerCommand::LoadCheckpoint { response } => {
+                            drop(response.send(consumer.load_checkpoint()));
+                        }
+                        DerivedStateConsumerCommand::ApplySharedBatch {
+                            envelopes,
+                            response,
+                        } => {
+                            let mut applied_events = 0_u64;
+                            let mut last_sequence = None;
+                            let mut fault = None;
+                            for envelope in envelopes {
+                                match consumer.apply(envelope.as_ref()) {
+                                    Ok(()) => {
+                                        applied_events = applied_events.saturating_add(1);
+                                        last_sequence = Some(envelope.sequence);
+                                    }
+                                    Err(error) => {
+                                        fault = Some(error);
+                                        break;
+                                    }
+                                }
+                            }
+                            drop(response.send(DerivedStateConsumerBatchApplyReply {
+                                applied_events,
+                                last_sequence,
+                                fault,
+                            }));
+                        }
+                        DerivedStateConsumerCommand::ApplyBatch {
+                            envelopes,
+                            response,
+                        } => {
+                            let mut applied_events = 0_u64;
+                            let mut last_sequence = None;
+                            let mut fault = None;
+                            for envelope in envelopes {
+                                match consumer.apply(&envelope) {
+                                    Ok(()) => {
+                                        applied_events = applied_events.saturating_add(1);
+                                        last_sequence = Some(envelope.sequence);
+                                    }
+                                    Err(error) => {
+                                        fault = Some(error);
+                                        break;
+                                    }
+                                }
+                            }
+                            drop(response.send(DerivedStateConsumerBatchApplyReply {
+                                applied_events,
+                                last_sequence,
+                                fault,
+                            }));
+                        }
+                        DerivedStateConsumerCommand::FlushCheckpoint {
+                            envelope,
+                            session_id,
+                            watermarks,
+                            response,
+                        } => {
+                            let fault = match consumer.apply(envelope.as_ref()) {
+                                Ok(()) => consumer
+                                    .flush_checkpoint(DerivedStateCheckpoint {
+                                        session_id,
+                                        last_applied_sequence: envelope.sequence,
+                                        watermarks,
+                                        state_version: consumer.state_version(),
+                                        extension_version: consumer.extension_version().to_owned(),
+                                    })
+                                    .err(),
+                                Err(error) => Some(error),
+                            };
+                            drop(response.send(fault));
+                        }
+                        DerivedStateConsumerCommand::Shutdown => break,
+                    }
+                }
+            });
+        let (startup_fault, worker_handle) = match worker_handle {
+            Ok(handle) => (None, Some(handle)),
+            Err(error) => (
+                Some(DerivedStateConsumerFault::new(
+                    DerivedStateConsumerFaultKind::ConsumerApplyFailed,
+                    None,
+                    format!("failed to spawn derived-state consumer worker: {error}"),
+                )),
+                None,
+            ),
+        };
+        Self {
+            queue,
+            worker_thread,
+            shutdown,
+            startup_fault,
+            worker_handle,
+        }
+    }
+
+    /// Enqueues one command and blocks until the worker accepts it.
+    fn push_blocking(&self, command: DerivedStateConsumerCommand) {
+        if self.startup_fault.is_some() {
+            return;
+        }
+        let mut command = command;
+        loop {
+            match self.queue.push(command) {
+                Ok(()) => {
+                    self.notify();
+                    return;
+                }
+                Err(returned) => {
+                    command = returned;
+                    self.notify();
+                    std::thread::yield_now();
+                }
+            }
+        }
+    }
+
+    /// Loads the most recent checkpoint through the consumer worker.
+    fn load_checkpoint(&self) -> Result<Option<DerivedStateCheckpoint>, DerivedStateConsumerFault> {
+        if let Some(fault) = self.startup_fault.as_ref() {
+            return Err(fault.clone());
+        }
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.push_blocking(DerivedStateConsumerCommand::LoadCheckpoint {
+            response: response_tx,
+        });
+        response_rx.recv().unwrap_or_else(|_| {
+            Err(DerivedStateConsumerFault::new(
+                DerivedStateConsumerFaultKind::ConsumerApplyFailed,
+                None,
+                "derived-state consumer worker exited during checkpoint load",
+            ))
+        })
+    }
+
+    /// Applies one replay batch through the consumer worker.
+    fn apply_batch(
+        &self,
+        envelopes: Vec<DerivedStateFeedEnvelope>,
+    ) -> DerivedStateConsumerBatchApplyReply {
+        let last_sequence = envelopes.last().map(|envelope| envelope.sequence);
+        if let Some(fault) = self.startup_fault.as_ref() {
+            return DerivedStateConsumerBatchApplyReply {
+                applied_events: 0,
+                last_sequence,
+                fault: Some(fault.clone()),
+            };
+        }
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.push_blocking(DerivedStateConsumerCommand::ApplyBatch {
+            envelopes,
+            response: response_tx,
+        });
+        response_rx
+            .recv()
+            .unwrap_or_else(|_| DerivedStateConsumerBatchApplyReply {
+                applied_events: 0,
+                last_sequence,
+                fault: Some(DerivedStateConsumerFault::new(
+                    DerivedStateConsumerFaultKind::ConsumerApplyFailed,
+                    last_sequence,
+                    "derived-state consumer worker exited during batch apply",
+                )),
+            })
+    }
+
+    /// Applies one live shared batch through the consumer worker.
+    fn apply_shared_batch(
+        &self,
+        envelopes: Vec<Arc<DerivedStateFeedEnvelope>>,
+    ) -> DerivedStateConsumerBatchApplyReply {
+        let last_sequence = envelopes.last().map(|envelope| envelope.sequence);
+        if let Some(fault) = self.startup_fault.as_ref() {
+            return DerivedStateConsumerBatchApplyReply {
+                applied_events: 0,
+                last_sequence,
+                fault: Some(fault.clone()),
+            };
+        }
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.push_blocking(DerivedStateConsumerCommand::ApplySharedBatch {
+            envelopes,
+            response: response_tx,
+        });
+        response_rx
+            .recv()
+            .unwrap_or_else(|_| DerivedStateConsumerBatchApplyReply {
+                applied_events: 0,
+                last_sequence,
+                fault: Some(DerivedStateConsumerFault::new(
+                    DerivedStateConsumerFaultKind::ConsumerApplyFailed,
+                    last_sequence,
+                    "derived-state consumer worker exited during shared batch apply",
+                )),
+            })
+    }
+
+    /// Flushes one checkpoint barrier through the consumer worker.
+    fn flush_checkpoint(
+        &self,
+        envelope: Arc<DerivedStateFeedEnvelope>,
+        session_id: FeedSessionId,
+        watermarks: FeedWatermarks,
+    ) -> Result<(), DerivedStateConsumerFault> {
+        if let Some(fault) = self.startup_fault.as_ref() {
+            return Err(fault.clone());
+        }
+        let sequence = envelope.sequence;
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        self.push_blocking(DerivedStateConsumerCommand::FlushCheckpoint {
+            envelope,
+            session_id,
+            watermarks,
+            response: response_tx,
+        });
+        match response_rx.recv() {
+            Ok(Some(fault)) => Err(fault),
+            Ok(None) => Ok(()),
+            Err(_) => Err(DerivedStateConsumerFault::new(
+                DerivedStateConsumerFaultKind::ConsumerApplyFailed,
+                Some(sequence),
+                "derived-state consumer worker exited during checkpoint flush",
+            )),
+        }
+    }
+
+    /// Wakes the worker thread after enqueueing a new command.
+    fn notify(&self) {
+        if let Some(thread) = self.worker_thread.get() {
+            thread.unpark();
+        }
+    }
+}
+
+impl Drop for DerivedStateConsumerWorker {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        drop(self.queue.push(DerivedStateConsumerCommand::Shutdown));
+        self.notify();
+        if let Some(handle) = self.worker_handle.take()
+            && handle.join().is_err()
+        {
+            tracing::error!("derived-state consumer worker panicked during shutdown");
+        }
+    }
 }
 
 /// Builder for [`DerivedStateHost`].
@@ -1817,10 +2330,11 @@ impl DerivedStateHostBuilder {
             transaction_applied: consumer.wants_transaction_applied(),
             account_touch_observed: consumer.wants_account_touch_observed(),
             account_touch_key_partitions: consumer.wants_account_touch_key_partitions(),
+            control_plane_observed: consumer.wants_control_plane_observed(),
         };
         self.consumers.push(RegisteredDerivedStateConsumer {
             name,
-            consumer: Arc::new(Mutex::new(Box::new(consumer))),
+            worker: DerivedStateConsumerWorker::spawn(name, Box::new(consumer)),
             subscriptions,
             unhealthy: AtomicBool::new(false),
             recovery_state: AtomicU8::new(DerivedStateConsumerRecoveryState::Live.into_u8()),
@@ -1860,10 +2374,16 @@ impl DerivedStateHostBuilder {
                 session_id: self.session_id.unwrap_or_else(generate_session_id),
                 replay_source: self.replay_source,
                 runtime_replay_source: OnceLock::new(),
-                dispatch_state: Mutex::new(DerivedStateDispatchState::default()),
+                dispatch_ticket_cursor: AtomicU64::new(0),
+                next_dispatch_ticket: AtomicU64::new(0),
+                next_sequence: AtomicU64::new(0),
+                last_sequence: AtomicU64::new(0),
+                has_last_sequence: AtomicBool::new(false),
+                last_watermarks: AtomicFeedWatermarks::default(),
+                control_plane_state: ArcShift::new(DerivedStateControlPlaneTracker::default()),
                 fault_count: AtomicU64::new(0),
                 initialized: AtomicBool::new(false),
-                slot_tx_indexes: Mutex::new(HashMap::new()),
+                slot_tx_indexes: SkipMap::new(),
             }),
         }
     }
@@ -1995,6 +2515,15 @@ impl DerivedStateHost {
             .any(|consumer| consumer.subscriptions.account_touch_key_partitions)
     }
 
+    /// Returns true when at least one consumer wants control-plane observed events.
+    #[must_use]
+    pub fn wants_control_plane_observed(&self) -> bool {
+        self.inner
+            .consumers
+            .iter()
+            .any(|consumer| consumer.subscriptions.control_plane_observed)
+    }
+
     /// Returns registered consumer names in registration order.
     #[must_use]
     pub fn consumer_names(&self) -> Vec<&'static str> {
@@ -2121,20 +2650,15 @@ impl DerivedStateHost {
     #[must_use]
     pub fn last_emitted_sequence(&self) -> Option<FeedSequence> {
         self.inner
-            .dispatch_state
-            .lock()
-            .map(|state| state.last_sequence)
-            .unwrap_or(None)
+            .has_last_sequence
+            .load(Ordering::Relaxed)
+            .then(|| FeedSequence(self.inner.last_sequence.load(Ordering::Relaxed)))
     }
 
     /// Returns the latest runtime watermarks recorded by this host.
     #[must_use]
     pub fn current_watermarks(&self) -> FeedWatermarks {
-        self.inner
-            .dispatch_state
-            .lock()
-            .map(|state| state.last_watermarks)
-            .unwrap_or_default()
+        self.inner.last_watermarks.load()
     }
 
     /// Initializes registered consumers by attempting to load their durable checkpoints once.
@@ -2152,18 +2676,7 @@ impl DerivedStateHost {
             if registered.is_unhealthy() {
                 continue;
             }
-            let Ok(mut consumer) = registered.consumer.lock() else {
-                self.record_consumer_fault(
-                    registered,
-                    &DerivedStateConsumerFault::new(
-                        DerivedStateConsumerFaultKind::ConsumerApplyFailed,
-                        None,
-                        "derived-state consumer mutex poisoned during initialization",
-                    ),
-                );
-                continue;
-            };
-            match consumer.load_checkpoint() {
+            match registered.worker.load_checkpoint() {
                 Ok(Some(checkpoint)) => {
                     let Some(next_sequence) = checkpoint.next_sequence() else {
                         continue;
@@ -2171,13 +2684,11 @@ impl DerivedStateHost {
                     if let Some(replay_source) = self.replay_source() {
                         match replay_source.replay_from(checkpoint.session_id, next_sequence) {
                             Ok(replayed) => {
-                                for envelope in replayed {
-                                    let sequence = envelope.sequence;
-                                    if let Err(fault) = consumer.apply(envelope) {
-                                        self.record_consumer_fault(registered, &fault);
-                                        break;
-                                    }
-                                    registered.note_applied(sequence);
+                                let reply = registered.worker.apply_batch(replayed);
+                                registered
+                                    .note_applied_batch(reply.applied_events, reply.last_sequence);
+                                if let Some(fault) = reply.fault.as_ref() {
+                                    self.record_consumer_fault(registered, fault);
                                 }
                             }
                             Err(error) => {
@@ -2215,19 +2726,7 @@ impl DerivedStateHost {
             }
             report.attempted = report.attempted.saturating_add(1);
 
-            let Ok(mut consumer) = registered.consumer.lock() else {
-                self.record_consumer_fault(
-                    registered,
-                    &DerivedStateConsumerFault::new(
-                        DerivedStateConsumerFaultKind::ConsumerApplyFailed,
-                        None,
-                        "derived-state consumer mutex poisoned during recovery",
-                    ),
-                );
-                report.still_pending = report.still_pending.saturating_add(1);
-                continue;
-            };
-            let checkpoint = match consumer.load_checkpoint() {
+            let checkpoint = match registered.worker.load_checkpoint() {
                 Ok(Some(checkpoint)) => checkpoint,
                 Ok(None) => {
                     registered
@@ -2253,18 +2752,15 @@ impl DerivedStateHost {
             };
             match replay_source.replay_from(checkpoint.session_id, next_sequence) {
                 Ok(replayed) => {
-                    let mut recovered = true;
-                    if replayed.is_empty() {
+                    let reply = registered.worker.apply_batch(replayed);
+                    registered.note_applied_batch(reply.applied_events, reply.last_sequence);
+                    let mut recovered = reply.fault.is_none();
+                    if reply.applied_events == 0 && reply.last_sequence.is_none() && recovered {
                         registered.note_recovered_checkpoint(checkpoint.last_applied_sequence);
                     } else {
-                        for envelope in replayed {
-                            let sequence = envelope.sequence;
-                            if let Err(fault) = consumer.apply(envelope) {
-                                self.record_consumer_fault(registered, &fault);
-                                recovered = false;
-                                break;
-                            }
-                            registered.note_applied(sequence);
+                        if let Some(fault) = reply.fault.as_ref() {
+                            self.record_consumer_fault(registered, fault);
+                            recovered = false;
                         }
                         if recovered {
                             registered.mark_live();
@@ -2302,16 +2798,18 @@ impl DerivedStateHost {
         report
     }
 
-    /// Allocates the next per-slot transaction index for feed events.
+    /// Reserves a contiguous per-slot transaction-index range for feed events.
+    ///
+    /// Returns the starting index for the reserved range. Callers should assign
+    /// offsets from that base locally to avoid one mutex round-trip per
+    /// transaction on the dataset hot path.
     #[must_use]
-    pub fn next_slot_tx_index(&self, slot: u64) -> u32 {
-        let Ok(mut indexes) = self.inner.slot_tx_indexes.lock() else {
-            return 0;
-        };
-        let entry = indexes.entry(slot).or_insert(0);
-        let current = *entry;
-        *entry = entry.saturating_add(1);
-        current
+    pub fn reserve_slot_tx_indexes(&self, slot: u64, count: u32) -> u32 {
+        let entry = self
+            .inner
+            .slot_tx_indexes
+            .get_or_insert(slot, AtomicU32::new(0));
+        entry.value().fetch_add(count, Ordering::Relaxed)
     }
 
     /// Emits one transaction-applied record into the derived-state feed.
@@ -2346,6 +2844,44 @@ impl DerivedStateHost {
         );
     }
 
+    /// Emits a prebuilt batch of derived-state events using shared watermarks and one dispatch turn.
+    pub fn on_events(&self, watermarks: FeedWatermarks, events: Vec<DerivedStateFeedEvent>) {
+        if self.is_empty() || events.is_empty() {
+            return;
+        }
+        let dispatch_ticket = self.reserve_dispatch_ticket();
+        self.wait_for_dispatch_turn(dispatch_ticket);
+        let first_sequence = self.reserve_sequence_block(events.len());
+        self.dispatch_vec_unlocked(watermarks, dispatch_ticket, first_sequence, events);
+    }
+
+    /// Emits one reusable batch of derived-state events and keeps the caller-owned buffer capacity.
+    pub fn on_events_drain(
+        &self,
+        watermarks: FeedWatermarks,
+        events: &mut Vec<DerivedStateFeedEvent>,
+    ) {
+        if self.is_empty() || events.is_empty() {
+            return;
+        }
+        let dispatch_ticket = self.reserve_dispatch_ticket();
+        self.wait_for_dispatch_turn(dispatch_ticket);
+        let first_sequence = self.reserve_sequence_block(events.len());
+        let envelopes = self.build_shared_envelopes(
+            watermarks,
+            events
+                .drain(..)
+                .enumerate()
+                .map(|(index, event)| (sequence_offset(first_sequence, index), event)),
+        );
+        let last_sequence = envelopes
+            .last()
+            .map(|envelope| envelope.sequence)
+            .unwrap_or(first_sequence);
+        self.dispatch_shared_envelopes(&envelopes);
+        self.finish_dispatch_turn(dispatch_ticket, last_sequence, watermarks);
+    }
+
     /// Emits one observed recent blockhash record into the derived-state feed.
     pub fn on_recent_blockhash(&self, event: ObservedRecentBlockhashEvent) {
         if self.is_empty() {
@@ -2358,11 +2894,34 @@ impl DerivedStateHost {
             confirmed_slot: None,
             finalized_slot: None,
         };
-        self.dispatch_with_control_plane_update(
-            watermarks,
-            DerivedStateFeedEvent::RecentBlockhashObserved(event),
-            |state| state.control_plane_state.apply_recent_blockhash(slot),
+        let dispatch_ticket = self.reserve_dispatch_ticket();
+        self.wait_for_dispatch_turn(dispatch_ticket);
+        let mut control_plane_state = self.inner.control_plane_state.clone();
+        let mut next_control_plane_state = control_plane_state.shared_get().clone();
+        let recent_blockhash_update =
+            next_control_plane_state.apply_recent_blockhash(slot, event.recent_blockhash);
+        if !recent_blockhash_update.state_changed {
+            self.finish_dispatch_turn_without_events(dispatch_ticket, watermarks);
+            return;
+        }
+        let control_plane_event = next_control_plane_state.snapshot(watermarks);
+        let invalidation_event = invalidation_from_control_plane_state(
+            &mut next_control_plane_state,
+            control_plane_event,
         );
+        control_plane_state.update(next_control_plane_state);
+        let mut events = Vec::with_capacity(3);
+        if recent_blockhash_update.hash_changed {
+            events.push(DerivedStateFeedEvent::RecentBlockhashObserved(event));
+        }
+        events.push(DerivedStateFeedEvent::ControlPlaneStateUpdated(
+            control_plane_event,
+        ));
+        if let Some(invalidation_event) = invalidation_event {
+            events.push(DerivedStateFeedEvent::StateInvalidated(invalidation_event));
+        }
+        let first_sequence = self.reserve_sequence_block(events.len());
+        self.dispatch_vec_unlocked(watermarks, dispatch_ticket, first_sequence, events);
     }
 
     /// Emits one cluster topology record into the derived-state feed.
@@ -2388,12 +2947,7 @@ impl DerivedStateHost {
             watermarks,
             DerivedStateFeedEvent::ClusterTopologyChanged(event),
             |state| {
-                state.control_plane_state.apply_cluster_topology(
-                    slot,
-                    known_cluster_nodes,
-                    source,
-                    wallclock_skew_ms,
-                )
+                state.apply_cluster_topology(slot, known_cluster_nodes, source, wallclock_skew_ms)
             },
         );
     }
@@ -2418,7 +2972,7 @@ impl DerivedStateHost {
             watermarks,
             DerivedStateFeedEvent::LeaderScheduleUpdated(event),
             |state| {
-                state.control_plane_state.apply_leader_schedule(
+                state.apply_leader_schedule(
                     slot,
                     snapshot_leader_count,
                     added_leader_count,
@@ -2437,9 +2991,8 @@ impl DerivedStateHost {
         if matches!(
             event.status,
             ForkSlotStatus::Finalized | ForkSlotStatus::Orphaned
-        ) && let Ok(mut indexes) = self.inner.slot_tx_indexes.lock()
-        {
-            let _ = indexes.remove(&event.slot);
+        ) {
+            let _ = self.inner.slot_tx_indexes.remove(&event.slot);
         }
         let watermarks = FeedWatermarks::from_slot_status(event);
         self.dispatch_with_control_plane_update(
@@ -2500,12 +3053,9 @@ impl DerivedStateHost {
             return;
         }
 
-        let Ok(mut dispatch_state) = self.inner.dispatch_state.lock() else {
-            self.record_internal_fault("derived-state dispatch mutex poisoned during checkpoint");
-            return;
-        };
-        let sequence = FeedSequence(dispatch_state.next_sequence);
-        dispatch_state.next_sequence = dispatch_state.next_sequence.saturating_add(1);
+        let dispatch_ticket = self.reserve_dispatch_ticket();
+        self.wait_for_dispatch_turn(dispatch_ticket);
+        let sequence = self.reserve_sequence_block(1);
         let envelope = DerivedStateFeedEnvelope {
             session_id: self.inner.session_id,
             sequence,
@@ -2519,6 +3069,7 @@ impl DerivedStateHost {
         if let Some(replay_source) = self.replay_source() {
             replay_source.append(envelope.clone());
         }
+        let envelope = Arc::new(envelope);
 
         for registered in self.inner.consumers.iter() {
             if registered.is_unhealthy() {
@@ -2527,38 +3078,18 @@ impl DerivedStateHost {
             if !registered.accepts_event(&envelope.event) {
                 continue;
             }
-            let Ok(mut consumer) = registered.consumer.lock() else {
-                self.record_consumer_fault(
-                    registered,
-                    &DerivedStateConsumerFault::new(
-                        DerivedStateConsumerFaultKind::ConsumerApplyFailed,
-                        Some(sequence),
-                        "derived-state consumer mutex poisoned during checkpoint apply",
-                    ),
-                );
-                continue;
-            };
-            if let Err(fault) = consumer.apply(envelope.clone()) {
+            if let Err(fault) = registered.worker.flush_checkpoint(
+                envelope.clone(),
+                self.inner.session_id,
+                watermarks,
+            ) {
                 self.record_consumer_fault(registered, &fault);
                 continue;
             }
             registered.note_applied(sequence);
-            let checkpoint = DerivedStateCheckpoint {
-                session_id: self.inner.session_id,
-                last_applied_sequence: sequence,
-                watermarks,
-                state_version: consumer.state_version(),
-                extension_version: consumer.extension_version().to_owned(),
-            };
-            if let Err(fault) = consumer.flush_checkpoint(checkpoint) {
-                self.record_consumer_fault(registered, &fault);
-            } else {
-                registered.note_checkpoint_flush();
-            }
+            registered.note_checkpoint_flush();
         }
-
-        dispatch_state.last_sequence = Some(sequence);
-        dispatch_state.last_watermarks = watermarks;
+        self.finish_dispatch_turn(dispatch_ticket, sequence, watermarks);
     }
 
     /// Emits a shutdown checkpoint barrier using the latest runtime watermarks.
@@ -2578,18 +3109,19 @@ impl DerivedStateHost {
         primary_event: DerivedStateFeedEvent,
         update_state: F,
     ) where
-        F: FnOnce(&mut DerivedStateDispatchState),
+        F: FnOnce(&mut DerivedStateControlPlaneTracker),
     {
-        let Ok(mut dispatch_state) = self.inner.dispatch_state.lock() else {
-            self.record_internal_fault("derived-state dispatch mutex poisoned during apply");
-            return;
-        };
-        update_state(&mut dispatch_state);
-        let control_plane_event = dispatch_state.control_plane_state.snapshot(watermarks);
+        let dispatch_ticket = self.reserve_dispatch_ticket();
+        self.wait_for_dispatch_turn(dispatch_ticket);
+        let mut control_plane_state = self.inner.control_plane_state.clone();
+        let mut next_control_plane_state = control_plane_state.shared_get().clone();
+        update_state(&mut next_control_plane_state);
+        let control_plane_event = next_control_plane_state.snapshot(watermarks);
         let invalidation_event = invalidation_from_control_plane_state(
-            &mut dispatch_state.control_plane_state,
+            &mut next_control_plane_state,
             control_plane_event,
         );
+        control_plane_state.update(next_control_plane_state);
         let events = if let Some(invalidation_event) = invalidation_event {
             vec![
                 primary_event,
@@ -2602,90 +3134,178 @@ impl DerivedStateHost {
                 DerivedStateFeedEvent::ControlPlaneStateUpdated(control_plane_event),
             ]
         };
-        self.dispatch_vec_locked(&mut dispatch_state, watermarks, events);
+        let first_sequence = self.reserve_sequence_block(events.len());
+        self.dispatch_vec_unlocked(watermarks, dispatch_ticket, first_sequence, events);
     }
 
-    /// Emits a fixed batch of feed events under one dispatch lock.
+    /// Emits a fixed batch of feed events while preserving global sequence order.
     fn dispatch_many<const N: usize>(
         &self,
         watermarks: FeedWatermarks,
         events: [DerivedStateFeedEvent; N],
     ) {
-        let Ok(mut dispatch_state) = self.inner.dispatch_state.lock() else {
-            self.record_internal_fault("derived-state dispatch mutex poisoned during apply");
-            return;
-        };
-        self.dispatch_many_locked(&mut dispatch_state, watermarks, events);
+        let dispatch_ticket = self.reserve_dispatch_ticket();
+        self.wait_for_dispatch_turn(dispatch_ticket);
+        let first_sequence = self.reserve_sequence_block(N);
+        self.dispatch_many_unlocked(watermarks, dispatch_ticket, first_sequence, events);
     }
 
-    /// Emits an owned event list using an already-held dispatch lock.
-    fn dispatch_vec_locked(
+    /// Emits a fixed batch of feed events after the caller acquired dispatch order.
+    fn dispatch_many_unlocked<const N: usize>(
         &self,
-        dispatch_state: &mut DerivedStateDispatchState,
         watermarks: FeedWatermarks,
-        events: Vec<DerivedStateFeedEvent>,
-    ) {
-        for event in events {
-            self.dispatch_one_locked(dispatch_state, watermarks, event);
-        }
-    }
-
-    /// Emits a fixed batch of feed events using an already-held dispatch lock.
-    fn dispatch_many_locked<const N: usize>(
-        &self,
-        dispatch_state: &mut DerivedStateDispatchState,
-        watermarks: FeedWatermarks,
+        dispatch_ticket: u64,
+        first_sequence: FeedSequence,
         events: [DerivedStateFeedEvent; N],
     ) {
-        for event in events {
-            self.dispatch_one_locked(dispatch_state, watermarks, event);
-        }
+        let envelopes = self.build_shared_envelopes(
+            watermarks,
+            events
+                .into_iter()
+                .enumerate()
+                .map(|(index, event)| (sequence_offset(first_sequence, index), event)),
+        );
+        let last_sequence = envelopes
+            .last()
+            .map(|envelope| envelope.sequence)
+            .unwrap_or(first_sequence);
+        self.dispatch_shared_envelopes(&envelopes);
+        self.finish_dispatch_turn(dispatch_ticket, last_sequence, watermarks);
     }
 
-    /// Emits one event using an already-held dispatch lock.
-    fn dispatch_one_locked(
+    /// Emits an owned event list after the caller acquired dispatch order.
+    fn dispatch_vec_unlocked(
         &self,
-        dispatch_state: &mut DerivedStateDispatchState,
         watermarks: FeedWatermarks,
-        event: DerivedStateFeedEvent,
+        dispatch_ticket: u64,
+        first_sequence: FeedSequence,
+        events: Vec<DerivedStateFeedEvent>,
     ) {
-        let sequence = FeedSequence(dispatch_state.next_sequence);
-        dispatch_state.next_sequence = dispatch_state.next_sequence.saturating_add(1);
-        let envelope = DerivedStateFeedEnvelope {
-            session_id: self.inner.session_id,
-            sequence,
-            emitted_at: SystemTime::now(),
+        let envelopes = self.build_shared_envelopes(
             watermarks,
-            event,
-        };
-        if let Some(replay_source) = self.replay_source() {
-            replay_source.append(envelope.clone());
-        }
+            events
+                .into_iter()
+                .enumerate()
+                .map(|(index, event)| (sequence_offset(first_sequence, index), event)),
+        );
+        let last_sequence = envelopes
+            .last()
+            .map(|envelope| envelope.sequence)
+            .unwrap_or(first_sequence);
+        self.dispatch_shared_envelopes(&envelopes);
+        self.finish_dispatch_turn(dispatch_ticket, last_sequence, watermarks);
+    }
 
+    /// Builds shared feed envelopes for one reserved publish batch.
+    fn build_shared_envelopes<I>(
+        &self,
+        watermarks: FeedWatermarks,
+        events: I,
+    ) -> Vec<Arc<DerivedStateFeedEnvelope>>
+    where
+        I: IntoIterator<Item = (FeedSequence, DerivedStateFeedEvent)>,
+    {
+        let mut envelopes = Vec::new();
+        for (sequence, event) in events {
+            let envelope = DerivedStateFeedEnvelope {
+                session_id: self.inner.session_id,
+                sequence,
+                emitted_at: SystemTime::now(),
+                watermarks,
+                event,
+            };
+            envelopes.push(envelope);
+        }
+        let shared = envelopes.into_iter().map(Arc::new).collect::<Vec<_>>();
+        if let Some(replay_source) = self.replay_source() {
+            replay_source.append_shared_batch(shared.as_slice());
+        }
+        shared
+    }
+
+    /// Dispatches one shared publish batch to every registered consumer.
+    fn dispatch_shared_envelopes(&self, envelopes: &[Arc<DerivedStateFeedEnvelope>]) {
         for registered in self.inner.consumers.iter() {
             if registered.is_unhealthy() {
                 continue;
             }
-            let Ok(mut consumer) = registered.consumer.lock() else {
-                self.record_consumer_fault(
-                    registered,
-                    &DerivedStateConsumerFault::new(
-                        DerivedStateConsumerFaultKind::ConsumerApplyFailed,
-                        Some(sequence),
-                        "derived-state consumer mutex poisoned during apply",
-                    ),
-                );
+            let filtered: Vec<_> = envelopes
+                .iter()
+                .filter(|envelope| registered.accepts_event(&envelope.event))
+                .cloned()
+                .collect();
+            if filtered.is_empty() {
                 continue;
-            };
-            if let Err(fault) = consumer.apply(envelope.clone()) {
-                self.record_consumer_fault(registered, &fault);
-            } else {
-                registered.note_applied(sequence);
+            }
+            let reply = registered.worker.apply_shared_batch(filtered);
+            registered.note_applied_batch(reply.applied_events, reply.last_sequence);
+            if let Some(fault) = reply.fault.as_ref() {
+                self.record_consumer_fault(registered, fault);
             }
         }
+    }
 
-        dispatch_state.last_sequence = Some(sequence);
-        dispatch_state.last_watermarks = watermarks;
+    /// Records the latest emitted sequence and watermarks for recovery bookkeeping.
+    fn note_emitted_sequence(&self, sequence: FeedSequence, watermarks: FeedWatermarks) {
+        self.inner
+            .last_sequence
+            .store(sequence.0, Ordering::Relaxed);
+        self.inner.has_last_sequence.store(true, Ordering::Relaxed);
+        self.inner.last_watermarks.store(watermarks);
+    }
+
+    /// Reserves one global dispatch ticket for one publish batch.
+    fn reserve_dispatch_ticket(&self) -> u64 {
+        self.inner
+            .next_dispatch_ticket
+            .fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Reserves one contiguous sequence range for one dispatch batch.
+    fn reserve_sequence_block(&self, event_count: usize) -> FeedSequence {
+        let event_count = u64::try_from(event_count).unwrap_or(1).max(1);
+        FeedSequence(
+            self.inner
+                .next_sequence
+                .fetch_add(event_count, Ordering::Relaxed),
+        )
+    }
+
+    /// Waits until earlier dispatch batches have published their reserved range.
+    fn wait_for_dispatch_turn(&self, dispatch_ticket: u64) {
+        let mut spins = 0_u32;
+        while self.inner.dispatch_ticket_cursor.load(Ordering::Acquire) != dispatch_ticket {
+            std::hint::spin_loop();
+            spins = spins.saturating_add(1);
+            if spins.is_multiple_of(1_024) {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    /// Marks one reserved dispatch batch as fully published.
+    fn finish_dispatch_turn(
+        &self,
+        dispatch_ticket: u64,
+        last_sequence: FeedSequence,
+        watermarks: FeedWatermarks,
+    ) {
+        self.note_emitted_sequence(last_sequence, watermarks);
+        self.inner
+            .dispatch_ticket_cursor
+            .store(dispatch_ticket.saturating_add(1), Ordering::Release);
+    }
+
+    /// Marks one reserved dispatch batch as complete when it emitted no feed events.
+    fn finish_dispatch_turn_without_events(
+        &self,
+        dispatch_ticket: u64,
+        watermarks: FeedWatermarks,
+    ) {
+        self.inner.last_watermarks.store(watermarks);
+        self.inner
+            .dispatch_ticket_cursor
+            .store(dispatch_ticket.saturating_add(1), Ordering::Release);
     }
 
     /// Records one consumer fault for telemetry and structured logs.
@@ -2729,12 +3349,6 @@ impl DerivedStateHost {
             "derived-state consumer fault"
         );
     }
-
-    /// Records one host-internal fault that is not attributable to a single consumer.
-    fn record_internal_fault(&self, message: &'static str) {
-        let _ = self.inner.fault_count.fetch_add(1, Ordering::Relaxed);
-        tracing::warn!(message, "derived-state host fault");
-    }
 }
 
 /// Shared dispatch state for one immutable derived-state host.
@@ -2747,27 +3361,102 @@ struct DerivedStateHostInner {
     replay_source: Option<Arc<dyn DerivedStateReplaySource>>,
     /// Runtime-installed replay source used when the builder did not configure one.
     runtime_replay_source: OnceLock<Arc<dyn DerivedStateReplaySource>>,
-    /// Serialized feed cursor and watermark state.
-    dispatch_state: Mutex<DerivedStateDispatchState>,
+    /// Next dispatch ticket currently allowed to publish into the feed.
+    dispatch_ticket_cursor: AtomicU64,
+    /// Next dispatch ticket assigned to a publish batch.
+    next_dispatch_ticket: AtomicU64,
+    /// Next sequence number assigned to emitted feed envelopes.
+    next_sequence: AtomicU64,
+    /// Highest emitted sequence when one exists.
+    last_sequence: AtomicU64,
+    /// Whether `last_sequence` is initialized.
+    has_last_sequence: AtomicBool,
+    /// Latest runtime watermarks observed by the host.
+    last_watermarks: AtomicFeedWatermarks,
+    /// Control-plane tracker state shared by control-plane update paths.
+    control_plane_state: ArcShift<DerivedStateControlPlaneTracker>,
     /// Total number of structured faults recorded across all consumers.
     fault_count: AtomicU64,
     /// Ensures checkpoint loading runs only once per host.
     initialized: AtomicBool,
     /// Per-slot transaction indexes used to stabilize event ordering.
-    slot_tx_indexes: Mutex<HashMap<u64, u32>>,
+    slot_tx_indexes: SkipMap<u64, AtomicU32>,
 }
 
-/// Serialized derived-state feed cursor shared by all producer paths.
-#[derive(Default)]
-struct DerivedStateDispatchState {
-    /// Next sequence number assigned to an emitted feed envelope.
-    next_sequence: u64,
-    /// Highest emitted sequence when at least one envelope has been dispatched.
-    last_sequence: Option<FeedSequence>,
-    /// Latest runtime watermarks observed by the host.
-    last_watermarks: FeedWatermarks,
-    /// Latest observer-side control-plane tracker state.
-    control_plane_state: DerivedStateControlPlaneTracker,
+/// Atomically published watermarks snapshot shared across dispatch paths.
+struct AtomicFeedWatermarks {
+    /// Last canonical tip slot, or unset sentinel.
+    canonical_tip_slot: AtomicU64,
+    /// Last processed slot, or unset sentinel.
+    processed_slot: AtomicU64,
+    /// Last confirmed slot, or unset sentinel.
+    confirmed_slot: AtomicU64,
+    /// Last finalized slot, or unset sentinel.
+    finalized_slot: AtomicU64,
+}
+
+impl AtomicFeedWatermarks {
+    /// Sentinel encoding for absent optional watermarks.
+    const UNSET: u64 = u64::MAX;
+
+    /// Loads the current atomically published watermark snapshot.
+    fn load(&self) -> FeedWatermarks {
+        FeedWatermarks {
+            canonical_tip_slot: decode_optional_u64(
+                self.canonical_tip_slot.load(Ordering::Relaxed),
+            ),
+            processed_slot: decode_optional_u64(self.processed_slot.load(Ordering::Relaxed)),
+            confirmed_slot: decode_optional_u64(self.confirmed_slot.load(Ordering::Relaxed)),
+            finalized_slot: decode_optional_u64(self.finalized_slot.load(Ordering::Relaxed)),
+        }
+    }
+
+    /// Stores a new atomically published watermark snapshot.
+    fn store(&self, watermarks: FeedWatermarks) {
+        self.canonical_tip_slot.store(
+            encode_optional_u64(watermarks.canonical_tip_slot),
+            Ordering::Relaxed,
+        );
+        self.processed_slot.store(
+            encode_optional_u64(watermarks.processed_slot),
+            Ordering::Relaxed,
+        );
+        self.confirmed_slot.store(
+            encode_optional_u64(watermarks.confirmed_slot),
+            Ordering::Relaxed,
+        );
+        self.finalized_slot.store(
+            encode_optional_u64(watermarks.finalized_slot),
+            Ordering::Relaxed,
+        );
+    }
+}
+
+impl Default for AtomicFeedWatermarks {
+    fn default() -> Self {
+        Self {
+            canonical_tip_slot: AtomicU64::new(Self::UNSET),
+            processed_slot: AtomicU64::new(Self::UNSET),
+            confirmed_slot: AtomicU64::new(Self::UNSET),
+            finalized_slot: AtomicU64::new(Self::UNSET),
+        }
+    }
+}
+
+/// Encodes optional watermark fields into an atomic-friendly sentinel form.
+fn encode_optional_u64(value: Option<u64>) -> u64 {
+    value.unwrap_or(AtomicFeedWatermarks::UNSET)
+}
+
+/// Decodes optional watermark fields from the atomic sentinel representation.
+fn decode_optional_u64(value: u64) -> Option<u64> {
+    (value != AtomicFeedWatermarks::UNSET).then_some(value)
+}
+
+/// Computes one sequence inside a reserved contiguous dispatch block.
+fn sequence_offset(first_sequence: FeedSequence, offset: usize) -> FeedSequence {
+    let offset = u64::try_from(offset).unwrap_or(0);
+    FeedSequence(first_sequence.0.saturating_add(offset))
 }
 
 /// Observer-side control-plane tracker used to classify feed freshness and quality.
@@ -2775,6 +3464,8 @@ struct DerivedStateDispatchState {
 struct DerivedStateControlPlaneTracker {
     /// Slot of the most recent recent-blockhash observation.
     recent_blockhash_slot: Option<u64>,
+    /// Latest observed recent blockhash bytes when known.
+    recent_blockhash: Option<[u8; 32]>,
     /// Slot of the most recent cluster-topology update.
     cluster_topology_slot: Option<u64>,
     /// Slot of the most recent leader-schedule update.
@@ -2795,10 +3486,40 @@ struct DerivedStateControlPlaneTracker {
     last_quality: Option<DerivedStateControlPlaneQuality>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+/// Outcome flags returned after applying one recent-blockhash observation.
+struct RecentBlockhashUpdate {
+    /// Whether the tracked recent blockhash changed.
+    hash_changed: bool,
+    /// Whether any tracked control-plane field changed.
+    state_changed: bool,
+}
+
 impl DerivedStateControlPlaneTracker {
     /// Updates the tracker from one recent-blockhash observation.
-    const fn apply_recent_blockhash(&mut self, slot: u64) {
+    fn apply_recent_blockhash(
+        &mut self,
+        slot: u64,
+        recent_blockhash: [u8; 32],
+    ) -> RecentBlockhashUpdate {
+        if self
+            .recent_blockhash_slot
+            .is_some_and(|previous_slot| slot < previous_slot)
+        {
+            self.conflict_count = self.conflict_count.saturating_add(1);
+            return RecentBlockhashUpdate {
+                hash_changed: false,
+                state_changed: true,
+            };
+        }
+        let slot_changed = self.recent_blockhash_slot != Some(slot);
+        let hash_changed = self.recent_blockhash != Some(recent_blockhash);
         self.recent_blockhash_slot = Some(slot);
+        self.recent_blockhash = Some(recent_blockhash);
+        RecentBlockhashUpdate {
+            hash_changed,
+            state_changed: slot_changed || hash_changed,
+        }
     }
 
     /// Updates the tracker from one cluster-topology observation.
@@ -3059,8 +3780,8 @@ fn topology_max_wallclock_skew_ms(event: &ClusterTopologyEvent) -> Option<u64> {
 struct RegisteredDerivedStateConsumer {
     /// Stable consumer name used in logs and telemetry.
     name: &'static str,
-    /// Boxed consumer behind a mutex so the host can serialize callbacks.
-    consumer: Arc<Mutex<Box<dyn DerivedStateConsumer>>>,
+    /// Dedicated worker that owns the consumer and preserves callback order without a mutex.
+    worker: DerivedStateConsumerWorker,
     /// Immutable event-interest bitmap so ignored event classes never lock/apply.
     subscriptions: DerivedStateConsumerSubscriptions,
     /// Whether the consumer has lost live continuity and should stop receiving events.
@@ -3096,6 +3817,8 @@ struct DerivedStateConsumerSubscriptions {
     account_touch_observed: bool,
     /// Whether the consumer wants partitioned account-touch key sets.
     account_touch_key_partitions: bool,
+    /// Whether the consumer wants control-plane feed events.
+    control_plane_observed: bool,
 }
 
 impl RegisteredDerivedStateConsumer {
@@ -3124,8 +3847,10 @@ impl RegisteredDerivedStateConsumer {
             | DerivedStateFeedEvent::LeaderScheduleUpdated(_)
             | DerivedStateFeedEvent::ControlPlaneStateUpdated(_)
             | DerivedStateFeedEvent::StateInvalidated(_)
-            | DerivedStateFeedEvent::TxOutcomeObserved(_)
-            | DerivedStateFeedEvent::SlotStatusChanged(_)
+            | DerivedStateFeedEvent::TxOutcomeObserved(_) => {
+                self.subscriptions.control_plane_observed
+            }
+            DerivedStateFeedEvent::SlotStatusChanged(_)
             | DerivedStateFeedEvent::BranchReorged(_)
             | DerivedStateFeedEvent::CheckpointBarrier(_) => true,
         }
@@ -3160,6 +3885,22 @@ impl RegisteredDerivedStateConsumer {
         self.has_last_applied_sequence
             .store(true, Ordering::Release);
         if !self.is_unhealthy() {
+            self.set_recovery_state(DerivedStateConsumerRecoveryState::Live);
+        }
+    }
+
+    /// Records a batch of successfully applied envelopes.
+    fn note_applied_batch(&self, applied_events: u64, last_sequence: Option<FeedSequence>) {
+        let _ = self
+            .applied_events
+            .fetch_add(applied_events, Ordering::Relaxed);
+        if let Some(sequence) = last_sequence {
+            self.last_applied_sequence
+                .store(sequence.0, Ordering::Release);
+            self.has_last_applied_sequence
+                .store(true, Ordering::Release);
+        }
+        if applied_events > 0 && !self.is_unhealthy() {
             self.set_recovery_state(DerivedStateConsumerRecoveryState::Live);
         }
     }
@@ -3465,7 +4206,7 @@ mod tests {
 
         fn apply(
             &mut self,
-            envelope: DerivedStateFeedEnvelope,
+            envelope: &DerivedStateFeedEnvelope,
         ) -> Result<(), DerivedStateConsumerFault> {
             self.state
                 .lock()
@@ -3477,7 +4218,7 @@ mod tests {
                     )
                 })?
                 .envelopes
-                .push(envelope);
+                .push(envelope.clone());
             Ok(())
         }
 
@@ -3787,7 +4528,7 @@ mod tests {
 
         fn apply(
             &mut self,
-            envelope: DerivedStateFeedEnvelope,
+            envelope: &DerivedStateFeedEnvelope,
         ) -> Result<(), DerivedStateConsumerFault> {
             let _ = self.apply_calls.fetch_add(1, AtomicOrdering::Relaxed);
             Err(DerivedStateConsumerFault::new(
@@ -3884,7 +4625,7 @@ mod tests {
 
         fn apply(
             &mut self,
-            _envelope: DerivedStateFeedEnvelope,
+            _envelope: &DerivedStateFeedEnvelope,
         ) -> Result<(), DerivedStateConsumerFault> {
             let _ = self.apply_calls.fetch_add(1, AtomicOrdering::Relaxed);
             Ok(())
@@ -3956,7 +4697,7 @@ mod tests {
                 name: "failing-checkpoint",
                 unhealthy: false,
                 recovery_state: DerivedStateConsumerRecoveryState::Live,
-                applied_events: 6,
+                applied_events: 5,
                 checkpoint_flushes: 0,
                 fault_count: 1,
                 last_applied_sequence: Some(FeedSequence(5)),
@@ -3992,7 +4733,7 @@ mod tests {
 
         fn apply(
             &mut self,
-            envelope: DerivedStateFeedEnvelope,
+            envelope: &DerivedStateFeedEnvelope,
         ) -> Result<(), DerivedStateConsumerFault> {
             self.state
                 .lock()
@@ -4004,7 +4745,7 @@ mod tests {
                     )
                 })?
                 .envelopes
-                .push(envelope);
+                .push(envelope.clone());
             Ok(())
         }
 
@@ -4065,7 +4806,7 @@ mod tests {
 
         fn apply(
             &mut self,
-            envelope: DerivedStateFeedEnvelope,
+            envelope: &DerivedStateFeedEnvelope,
         ) -> Result<(), DerivedStateConsumerFault> {
             let mut state = self.state.lock().map_err(|_poison| {
                 DerivedStateConsumerFault::new(

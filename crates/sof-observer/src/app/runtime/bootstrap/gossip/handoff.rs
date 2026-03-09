@@ -184,13 +184,17 @@ pub(super) fn format_port_range(range: PortRange) -> String {
 
 #[cfg(feature = "gossip-bootstrap")]
 fn apply_gossip_runtime_env_overrides() {
-    const GOSSIP_OVERRIDE_KEYS: [&str; 6] = [
+    const GOSSIP_OVERRIDE_KEYS: [&str; 10] = [
         "SOF_GOSSIP_RECEIVER_CHANNEL_CAPACITY",
         "SOF_GOSSIP_SOCKET_CONSUME_CHANNEL_CAPACITY",
         "SOF_GOSSIP_RESPONSE_CHANNEL_CAPACITY",
         "SOF_GOSSIP_CHANNEL_CONSUME_CAPACITY",
         "SOF_GOSSIP_CONSUME_THREADS",
         "SOF_GOSSIP_LISTEN_THREADS",
+        "SOF_GOSSIP_RUN_THREADS",
+        "SOF_GOSSIP_SOCKET_CONSUME_PARALLEL_PACKET_THRESHOLD",
+        "SOF_GOSSIP_STATS_INTERVAL_SECS",
+        "SOF_GOSSIP_SAMPLE_LOGS_ENABLED",
     ];
 
     let overrides = GOSSIP_OVERRIDE_KEYS

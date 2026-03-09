@@ -139,7 +139,7 @@ fn build_raw_packet(sequence: u64, source_port: u16) -> RawPacket {
     RawPacket {
         source: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), source_port),
         ingress: RawPacketIngress::Udp,
-        bytes,
+        bytes: bytes.into(),
     }
 }
 

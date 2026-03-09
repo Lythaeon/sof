@@ -68,6 +68,41 @@ pub struct TransactionEvent {
     pub kind: TxKind,
 }
 
+#[derive(Debug, Clone, Copy)]
+/// Borrowed runtime transaction view used for cheap hot-path preclassification.
+pub struct TransactionEventRef<'event> {
+    /// Slot containing this transaction.
+    pub slot: u64,
+    /// Commitment status for this transaction slot when event was emitted.
+    pub commitment_status: TxCommitmentStatus,
+    /// Latest observed confirmed slot watermark when event was emitted.
+    pub confirmed_slot: Option<u64>,
+    /// Latest observed finalized slot watermark when event was emitted.
+    pub finalized_slot: Option<u64>,
+    /// Transaction signature if present.
+    pub signature: Option<Signature>,
+    /// Borrowed decoded Solana transaction object.
+    pub tx: &'event VersionedTransaction,
+    /// SOF transaction kind classification.
+    pub kind: TxKind,
+}
+
+impl TransactionEventRef<'_> {
+    /// Materializes one owned transaction event only when downstream actually needs it.
+    #[must_use]
+    pub fn to_owned(self) -> TransactionEvent {
+        TransactionEvent {
+            slot: self.slot,
+            commitment_status: self.commitment_status,
+            confirmed_slot: self.confirmed_slot,
+            finalized_slot: self.finalized_slot,
+            signature: self.signature,
+            tx: Arc::new(self.tx.clone()),
+            kind: self.kind,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 /// Runtime event emitted for each decoded transaction's touched account set.
 pub struct AccountTouchEvent {
@@ -89,6 +124,25 @@ pub struct AccountTouchEvent {
     pub readonly_account_keys: Arc<Vec<Pubkey>>,
     /// Lookup table account pubkeys referenced by the message itself.
     pub lookup_table_account_keys: Arc<Vec<Pubkey>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+/// Borrowed transaction account-touch view used for cheap hot-path preclassification.
+pub struct AccountTouchEventRef<'event> {
+    /// Slot containing this transaction.
+    pub slot: u64,
+    /// Commitment status for this transaction slot when event was emitted.
+    pub commitment_status: TxCommitmentStatus,
+    /// Latest observed confirmed slot watermark when event was emitted.
+    pub confirmed_slot: Option<u64>,
+    /// Latest observed finalized slot watermark when event was emitted.
+    pub finalized_slot: Option<u64>,
+    /// Transaction signature if present.
+    pub signature: Option<Signature>,
+    /// Borrowed static message account keys present on the transaction.
+    pub account_keys: &'event [Pubkey],
+    /// Count of lookup-table account pubkeys referenced by the message itself.
+    pub lookup_table_account_key_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

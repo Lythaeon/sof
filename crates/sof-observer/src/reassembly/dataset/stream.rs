@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::CompletedDataSet;
+use super::{CompletedDataSet, PayloadFragmentBatch, SharedPayloadFragment};
 
 #[derive(Debug)]
 pub(super) struct SlotStream {
@@ -31,7 +31,7 @@ impl SlotStream {
         index: u32,
         data_complete: bool,
         last_in_slot: bool,
-        serialized_shred: Vec<u8>,
+        payload_fragment: SharedPayloadFragment,
     ) {
         let data_complete = data_complete || last_in_slot;
 
@@ -44,7 +44,7 @@ impl SlotStream {
 
         if let std::collections::btree_map::Entry::Vacant(vacant) = self.fragments.entry(index) {
             let _ = vacant.insert(DataFragment {
-                serialized_shred,
+                payload_fragment,
                 last_in_slot,
             });
         } else if last_in_slot && let Some(fragment) = self.fragments.get_mut(&index) {
@@ -67,12 +67,12 @@ impl SlotStream {
             }
             let mut last_in_slot = false;
             let range_len = complete_index.saturating_sub(start_index).saturating_add(1);
-            let mut serialized_shreds =
+            let mut fragments =
                 Vec::with_capacity(usize::try_from(range_len).unwrap_or(usize::MAX));
             for index in start_index..=complete_index {
                 if let Some(fragment) = self.fragments.remove(&index) {
                     last_in_slot |= fragment.last_in_slot;
-                    serialized_shreds.push(fragment.serialized_shred);
+                    fragments.push(fragment.payload_fragment);
                 }
             }
             let _ = self.emitted_boundaries.insert(complete_index);
@@ -80,7 +80,7 @@ impl SlotStream {
                 slot: self.slot,
                 start_index,
                 end_index: complete_index,
-                serialized_shreds,
+                payload_fragments: PayloadFragmentBatch::new(fragments),
                 last_in_slot,
             });
         }
@@ -126,6 +126,6 @@ impl SlotStream {
 
 #[derive(Debug)]
 struct DataFragment {
-    serialized_shred: Vec<u8>,
+    payload_fragment: SharedPayloadFragment,
     last_in_slot: bool,
 }

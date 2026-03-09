@@ -29,7 +29,7 @@ pub enum RawPacketIngress {
 pub struct RawPacket {
     pub source: SocketAddr,
     pub ingress: RawPacketIngress,
-    pub bytes: Vec<u8>,
+    pub bytes: Arc<[u8]>,
 }
 
 pub type RawPacketBatch = Vec<RawPacket>;
@@ -223,7 +223,7 @@ fn run_udp_receiver_with_socket(
                 batch.push(RawPacket {
                     source: packet.source,
                     ingress: RawPacketIngress::Udp,
-                    bytes: bytes.to_vec(),
+                    bytes: Arc::from(bytes),
                 });
                 let batch_elapsed = batch_started_at
                     .map(|started_at| started_at.elapsed())

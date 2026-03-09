@@ -21,7 +21,7 @@ impl Plugin for NonVoteTxLoggerPlugin {
         true
     }
 
-    async fn on_transaction(&self, event: TransactionEvent) {
+    async fn on_transaction(&self, event: &TransactionEvent) {
         if event.kind == TxKind::VoteOnly {
             return;
         }

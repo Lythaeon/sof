@@ -145,8 +145,9 @@ fuzz_target!(|bytes: &[u8]| {
     let mut input = bytes;
 
     let max_tracked_sets = usize::from(take_u8(&mut input).unwrap_or(16) % 64).max(1);
+    let retained_slot_lag = u64::from(take_u8(&mut input).unwrap_or(16)).max(1);
     let op_count = usize::from(take_u8(&mut input).unwrap_or(0));
-    let mut recoverer = FecRecoverer::new(max_tracked_sets);
+    let mut recoverer = FecRecoverer::new(max_tracked_sets, retained_slot_lag);
 
     for _ in 0..op_count {
         let Some(mode) = take_u8(&mut input) else {

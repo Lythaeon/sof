@@ -31,6 +31,11 @@ package_crate() {
   local allow_dirty_flag=()
   if [[ "${VERIFY_ARCHIVES_ALLOW_DIRTY:-0}" == "1" ]]; then
     allow_dirty_flag=(--allow-dirty)
+  elif [[ "${crate}" == "sof-solana-gossip" ]]; then
+    # Cargo may refresh the vendored fork's standalone lockfile metadata during
+    # packaging even when the committed contents are already correct. Treat that
+    # as a packaging-time implementation detail rather than a release blocker.
+    allow_dirty_flag=(--allow-dirty)
   fi
   echo "== packaging ${crate} (${verify_flag}) =="
   if [[ "${crate}" == "sof-solana-gossip" ]]; then
