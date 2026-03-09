@@ -166,6 +166,14 @@ impl ClassifiedTransactionDispatch {
         }
     }
 
+    /// Builds an empty routing table with preallocated plugin capacity.
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            critical_plugins: Vec::with_capacity(capacity.min(4)),
+            background_plugins: Vec::with_capacity(capacity.min(4)),
+        }
+    }
+
     /// Returns true when no plugin is interested in this transaction.
     pub(crate) fn is_empty(&self) -> bool {
         self.critical_plugins.is_empty() && self.background_plugins.is_empty()

@@ -136,12 +136,26 @@ impl PluginHostBuilder {
     #[must_use]
     pub fn build(self) -> PluginHost {
         let plugins: Arc<[Arc<dyn ObserverPlugin>]> = Arc::from(self.plugins);
+        let transaction_plugins: Arc<[Arc<dyn ObserverPlugin>]> = Arc::from(
+            plugins
+                .iter()
+                .filter(|plugin| plugin.wants_transaction())
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        let account_touch_plugins: Arc<[Arc<dyn ObserverPlugin>]> = Arc::from(
+            plugins
+                .iter()
+                .filter(|plugin| plugin.wants_account_touch())
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
         let subscriptions = PluginHookSubscriptions {
             raw_packet: plugins.iter().any(|plugin| plugin.wants_raw_packet()),
             shred: plugins.iter().any(|plugin| plugin.wants_shred()),
             dataset: plugins.iter().any(|plugin| plugin.wants_dataset()),
-            transaction: plugins.iter().any(|plugin| plugin.wants_transaction()),
-            account_touch: plugins.iter().any(|plugin| plugin.wants_account_touch()),
+            transaction: !transaction_plugins.is_empty(),
+            account_touch: !account_touch_plugins.is_empty(),
             slot_status: plugins.iter().any(|plugin| plugin.wants_slot_status()),
             reorg: plugins.iter().any(|plugin| plugin.wants_reorg()),
             recent_blockhash: plugins.iter().any(|plugin| plugin.wants_recent_blockhash()),
@@ -162,6 +176,8 @@ impl PluginHostBuilder {
         });
         PluginHost {
             plugins,
+            transaction_plugins,
+            account_touch_plugins,
             dispatcher,
             transaction_dispatcher,
             subscriptions,

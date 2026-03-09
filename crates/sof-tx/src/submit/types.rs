@@ -553,25 +553,47 @@ pub struct TxToxicFlowTelemetrySnapshot {
     pub suppressed_submissions: u64,
 }
 
+/// One cache-line-aligned atomic counter used by hot telemetry updates.
+#[derive(Debug, Default)]
+#[repr(align(64))]
+struct CacheAlignedAtomicU64(AtomicU64);
+
+impl CacheAlignedAtomicU64 {
+    /// Loads the current counter value.
+    fn load(&self, ordering: Ordering) -> u64 {
+        self.0.load(ordering)
+    }
+
+    /// Stores a new value and returns the previous one.
+    fn swap(&self, value: u64, ordering: Ordering) -> u64 {
+        self.0.swap(value, ordering)
+    }
+
+    /// Increments the counter and returns the previous value.
+    fn fetch_add(&self, value: u64, ordering: Ordering) -> u64 {
+        self.0.fetch_add(value, ordering)
+    }
+}
+
 /// In-memory telemetry counters for toxic-flow outcomes.
 #[derive(Debug, Default)]
 pub struct TxToxicFlowTelemetry {
     /// Number of stale-input rejections.
-    rejected_due_to_staleness: AtomicU64,
+    rejected_due_to_staleness: CacheAlignedAtomicU64,
     /// Number of reorg-risk rejections.
-    rejected_due_to_reorg_risk: AtomicU64,
+    rejected_due_to_reorg_risk: CacheAlignedAtomicU64,
     /// Number of state-drift rejections.
-    rejected_due_to_state_drift: AtomicU64,
+    rejected_due_to_state_drift: CacheAlignedAtomicU64,
     /// Number of accepted submits observed with stale blockhash state.
-    submit_on_stale_blockhash: AtomicU64,
+    submit_on_stale_blockhash: CacheAlignedAtomicU64,
     /// Number of leader-route misses.
-    leader_route_miss_rate: AtomicU64,
+    leader_route_miss_rate: CacheAlignedAtomicU64,
     /// Last opportunity age seen by the client.
-    opportunity_age_at_send_ms: AtomicU64,
+    opportunity_age_at_send_ms: CacheAlignedAtomicU64,
     /// Number of replay-recovery rejections.
-    rejected_due_to_replay_recovery: AtomicU64,
+    rejected_due_to_replay_recovery: CacheAlignedAtomicU64,
     /// Number of suppressed submissions.
-    suppressed_submissions: AtomicU64,
+    suppressed_submissions: CacheAlignedAtomicU64,
 }
 
 impl TxToxicFlowTelemetry {
