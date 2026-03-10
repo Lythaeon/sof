@@ -223,9 +223,6 @@ impl DirectSubmitTransport for UdpDirectTransport {
                                 return Ok(target);
                             }
                         }
-                        if quic_cache.is_none() && send_result.udp_success {
-                            return Ok(send_result.target);
-                        }
                         if quic_cache.is_none()
                             && udp_successes >= MIN_UDP_SUCCESSES_FOR_ACCEPT
                             && let Some(target) = first_udp_success.clone()
