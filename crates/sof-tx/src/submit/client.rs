@@ -17,11 +17,11 @@ use tokio::{
 };
 
 use super::{
-    DirectSubmitConfig, DirectSubmitTransport, RpcSubmitConfig, RpcSubmitTransport, SignedTx,
-    SubmitError, SubmitMode, SubmitReliability, SubmitResult, TxFlowSafetyQuality,
-    TxFlowSafetySource, TxSubmitContext, TxSubmitGuardPolicy, TxSubmitOutcome, TxSubmitOutcomeKind,
-    TxSubmitOutcomeReporter, TxToxicFlowRejectionReason, TxToxicFlowTelemetry,
-    TxToxicFlowTelemetrySnapshot,
+    DirectSubmitConfig, DirectSubmitTransport, JitoSubmitConfig, JitoSubmitTransport,
+    RpcSubmitConfig, RpcSubmitTransport, SignedTx, SubmitError, SubmitMode, SubmitReliability,
+    SubmitResult, TxFlowSafetyQuality, TxFlowSafetySource, TxSubmitContext, TxSubmitGuardPolicy,
+    TxSubmitOutcome, TxSubmitOutcomeKind, TxSubmitOutcomeReporter, TxToxicFlowRejectionReason,
+    TxToxicFlowTelemetry, TxToxicFlowTelemetrySnapshot,
 };
 use crate::{
     builder::TxBuilder,
@@ -46,8 +46,12 @@ pub struct TxSubmitClient {
     rpc_transport: Option<Arc<dyn RpcSubmitTransport>>,
     /// Optional direct transport.
     direct_transport: Option<Arc<dyn DirectSubmitTransport>>,
+    /// Optional Jito transport.
+    jito_transport: Option<Arc<dyn JitoSubmitTransport>>,
     /// RPC tuning.
     rpc_config: RpcSubmitConfig,
+    /// Jito tuning.
+    jito_config: JitoSubmitConfig,
     /// Direct tuning.
     direct_config: DirectSubmitConfig,
     /// Optional toxic-flow guard source.
@@ -77,7 +81,9 @@ impl TxSubmitClient {
             deduper: SignatureDeduper::new(Duration::from_secs(10)),
             rpc_transport: None,
             direct_transport: None,
+            jito_transport: None,
             rpc_config: RpcSubmitConfig::default(),
+            jito_config: JitoSubmitConfig::default(),
             direct_config: DirectSubmitConfig::default(),
             flow_safety_source: None,
             guard_policy: TxSubmitGuardPolicy::default(),
@@ -122,10 +128,24 @@ impl TxSubmitClient {
         self
     }
 
+    /// Sets Jito transport.
+    #[must_use]
+    pub fn with_jito_transport(mut self, transport: Arc<dyn JitoSubmitTransport>) -> Self {
+        self.jito_transport = Some(transport);
+        self
+    }
+
     /// Sets RPC submit tuning.
     #[must_use]
     pub fn with_rpc_config(mut self, config: RpcSubmitConfig) -> Self {
         self.rpc_config = config;
+        self
+    }
+
+    /// Sets Jito submit tuning.
+    #[must_use]
+    pub const fn with_jito_config(mut self, config: JitoSubmitConfig) -> Self {
+        self.jito_config = config;
         self
     }
 
@@ -311,6 +331,7 @@ impl TxSubmitClient {
         self.enforce_dedupe(signature)?;
         match mode {
             SubmitMode::RpcOnly => self.submit_rpc_only(tx_bytes, signature, mode).await,
+            SubmitMode::JitoOnly => self.submit_jito_only(tx_bytes, signature, mode).await,
             SubmitMode::DirectOnly => self.submit_direct_only(tx_bytes, signature, mode).await,
             SubmitMode::Hybrid => self.submit_hybrid(tx_bytes, signature, mode).await,
         }
@@ -484,6 +505,44 @@ impl TxSubmitClient {
             mode,
             direct_target: None,
             rpc_signature: Some(rpc_signature),
+            jito_signature: None,
+            used_rpc_fallback: false,
+            selected_target_count: 0,
+            selected_identity_count: 0,
+        })
+    }
+
+    /// Submits through Jito block-engine path only.
+    async fn submit_jito_only(
+        &self,
+        tx_bytes: Vec<u8>,
+        signature: Option<Signature>,
+        mode: SubmitMode,
+    ) -> Result<SubmitResult, SubmitError> {
+        let jito = self
+            .jito_transport
+            .as_ref()
+            .ok_or(SubmitError::MissingJitoTransport)?;
+        let jito_signature = jito
+            .submit_jito(&tx_bytes, &self.jito_config)
+            .await
+            .map_err(|source| SubmitError::Jito { source })?;
+        self.record_external_outcome(&TxSubmitOutcome {
+            kind: TxSubmitOutcomeKind::JitoAccepted,
+            signature,
+            mode,
+            state_version: self
+                .flow_safety_source
+                .as_ref()
+                .and_then(|source| source.toxic_flow_snapshot().current_state_version),
+            opportunity_age_ms: None,
+        });
+        Ok(SubmitResult {
+            signature,
+            mode,
+            direct_target: None,
+            rpc_signature: None,
+            jito_signature: Some(jito_signature),
             used_rpc_fallback: false,
             selected_target_count: 0,
             selected_identity_count: 0,
@@ -535,6 +594,7 @@ impl TxSubmitClient {
                         mode,
                         direct_target: Some(target),
                         rpc_signature: None,
+                        jito_signature: None,
                         used_rpc_fallback: false,
                         selected_target_count,
                         selected_identity_count,
@@ -614,6 +674,7 @@ impl TxSubmitClient {
                         mode,
                         direct_target: Some(target),
                         rpc_signature: Some(rpc_signature),
+                        jito_signature: None,
                         used_rpc_fallback: false,
                         selected_target_count,
                         selected_identity_count,
@@ -634,6 +695,7 @@ impl TxSubmitClient {
                     mode,
                     direct_target: Some(target),
                     rpc_signature: None,
+                    jito_signature: None,
                     used_rpc_fallback: false,
                     selected_target_count,
                     selected_identity_count,
@@ -663,6 +725,7 @@ impl TxSubmitClient {
             mode,
             direct_target: None,
             rpc_signature: Some(rpc_signature),
+            jito_signature: None,
             used_rpc_fallback: true,
             selected_target_count: 0,
             selected_identity_count: 0,

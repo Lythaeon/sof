@@ -8,6 +8,7 @@ It provides:
 - signed and pre-signed submission APIs
 - runtime mode selection:
   - `RpcOnly`
+  - `JitoOnly`
   - `DirectOnly` (leader-targeted UDP send)
   - `Hybrid` (direct first, RPC fallback)
 - routing policy and signature-level dedupe
@@ -15,7 +16,7 @@ It provides:
 ## At a Glance
 
 - Build `V0` or legacy Solana transactions
-- Submit through RPC, direct leader routing, or hybrid fallback
+- Submit through RPC, Jito block engine, direct leader routing, or hybrid fallback
 - Attach live `sof` runtime adapters when you want local leader/blockhash signals
 - Use replayable derived-state adapters when your service must survive restart or replay
 - Read control-plane snapshots from lower-contention adapter state instead of serializing all readers through one mutex
@@ -48,9 +49,9 @@ Basic client setup:
 use std::sync::Arc;
 
 use sof_tx::{
-    SubmitMode, SubmitReliability, TxBuilder, TxSubmitClient,
+    JitoTransportConfig, SubmitMode, SubmitReliability, TxBuilder, TxSubmitClient,
     providers::{StaticLeaderProvider, StaticRecentBlockhashProvider},
-    submit::{JsonRpcTransport, UdpDirectTransport},
+    submit::{JitoJsonRpcTransport, JsonRpcTransport, UdpDirectTransport},
 };
 use solana_keypair::Keypair;
 use solana_signer::Signer;
@@ -67,6 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = TxSubmitClient::new(blockhash_provider, leader_provider)
         .with_reliability(SubmitReliability::Balanced)
         .with_rpc_transport(Arc::new(JsonRpcTransport::new("https://api.mainnet-beta.solana.com")?))
+        .with_jito_transport(Arc::new(JitoJsonRpcTransport::new()?))
         .with_direct_transport(Arc::new(UdpDirectTransport));
 
     let builder = TxBuilder::new(payer.pubkey()).add_instruction(
@@ -84,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Core Types
 
 - `TxBuilder`: compose transaction instructions and signing inputs.
-- `TxSubmitClient`: submit through RPC/direct/hybrid.
+- `TxSubmitClient`: submit through RPC/Jito/direct/hybrid.
 - `SubmitMode`: runtime mode switch.
 - `SignedTx`: submit externally signed transaction bytes.
 - `RoutingPolicy`: leader/backup fanout controls.
@@ -119,7 +121,7 @@ use sof::framework::{ObserverPlugin, PluginHost};
 use sof_tx::{
     SubmitMode, SubmitReliability, TxBuilder, TxSubmitClient,
     adapters::PluginHostTxProviderAdapter,
-    submit::{JsonRpcTransport, UdpDirectTransport},
+    submit::{JitoJsonRpcTransport, JsonRpcTransport, UdpDirectTransport},
 };
 use solana_keypair::Keypair;
 use solana_signer::Signer;
@@ -137,6 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = TxSubmitClient::new(adapter.clone(), adapter.clone())
         .with_reliability(SubmitReliability::Balanced)
         .with_rpc_transport(Arc::new(JsonRpcTransport::new("https://api.mainnet-beta.solana.com")?))
+        .with_jito_transport(Arc::new(JitoJsonRpcTransport::new()?))
         .with_direct_transport(Arc::new(UdpDirectTransport));
 
     let payer = Keypair::new();
@@ -192,7 +195,7 @@ use std::sync::Arc;
 use sof_tx::{
     SubmitMode, SubmitReliability, TxBuilder, TxSubmitClient,
     providers::{LeaderProvider, LeaderTarget, RecentBlockhashProvider, StaticLeaderProvider, StaticRecentBlockhashProvider},
-    submit::{JsonRpcTransport, UdpDirectTransport},
+    submit::{JitoJsonRpcTransport, JsonRpcTransport, UdpDirectTransport},
 };
 use solana_keypair::Keypair;
 use solana_signer::Signer;
@@ -209,6 +212,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = TxSubmitClient::new(blockhash_provider, leader_provider)
         .with_reliability(SubmitReliability::Balanced)
         .with_rpc_transport(Arc::new(JsonRpcTransport::new("https://api.mainnet-beta.solana.com")?))
+        .with_jito_transport(Arc::new(JitoJsonRpcTransport::new()?))
         .with_direct_transport(Arc::new(UdpDirectTransport));
 
     let builder = TxBuilder::new(payer.pubkey())
@@ -302,8 +306,65 @@ Thanks in advance for supporting continued SDK development.
 ## Mode Guidance
 
 - `RpcOnly`: maximum compatibility.
+- `JitoOnly`: send through Jito block engine only when your strategy already includes the
+  right fee/tip shape for that path.
 - `DirectOnly`: lowest path latency when leader targets are reliable.
 - `Hybrid`: practical default for latency + fallback resilience.
+
+## Jito Configuration
+
+Jito is split into two layers on purpose:
+
+- transport-level configuration on `JitoJsonRpcTransport`
+- per-submit behavior on `JitoSubmitConfig`
+
+Default transport settings:
+
+- endpoint: `JitoBlockEngineEndpoint::mainnet()` which resolves to `https://mainnet.block-engine.jito.wtf`
+- `request_timeout = 10s`
+- `auth_token = None`
+
+Default submit settings:
+
+- `bundle_only = false`
+
+That means the default path is:
+
+- standard Jito `sendTransaction`
+- base64 payload encoding
+- no auth header unless you configure one
+- no revert-protection query parameter unless you opt into `bundle_only`
+
+Example with explicit tuning:
+
+```rust
+use std::{sync::Arc, time::Duration};
+
+use sof_tx::{
+    JitoAuthToken, JitoBlockEngineEndpoint, JitoSubmitConfig, JitoTransportConfig,
+    TxSubmitClient, submit::JitoJsonRpcTransport,
+};
+use reqwest::Url;
+
+let block_engine_url = Url::parse("https://amsterdam.mainnet.block-engine.jito.wtf")?;
+
+let jito_transport = Arc::new(JitoJsonRpcTransport::with_config(
+    JitoTransportConfig {
+        endpoint: JitoBlockEngineEndpoint::custom(block_engine_url),
+        request_timeout: Duration::from_secs(3),
+        auth_token: Some(JitoAuthToken::new("your-jito-auth-token")),
+    },
+)?);
+
+let client = TxSubmitClient::new(blockhash_provider, leader_provider)
+    .with_jito_transport(jito_transport)
+    .with_jito_config(JitoSubmitConfig {
+        bundle_only: true,
+    });
+```
+
+Use `bundle_only = true` when you want Jito’s revert-protection behavior. Leave it `false` when
+you want the default `sendTransaction` path.
 
 ## Reliability Profiles
 
@@ -370,7 +431,7 @@ Requirements:
 
 ## Feature Model
 
-Current implementation supports RPC/direct/hybrid runtime modes through one API.
+Current implementation supports RPC/Jito/direct/hybrid runtime modes through one API.
 Compile-time capability flags from ADR-0006 can be introduced incrementally as the SDK stabilizes.
 
 ## Docs

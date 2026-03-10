@@ -22,6 +22,8 @@ use crate::{builder::BuilderError, providers::LeaderTarget, routing::RoutingPoli
 pub enum SubmitMode {
     /// Submit only through JSON-RPC.
     RpcOnly,
+    /// Submit only through Jito block engine.
+    JitoOnly,
     /// Submit only through direct leader/validator targets.
     DirectOnly,
     /// Submit direct first, then RPC fallback on failure.
@@ -65,6 +67,13 @@ impl Default for RpcSubmitConfig {
             preflight_commitment: None,
         }
     }
+}
+
+/// Jito block-engine submit tuning.
+#[derive(Debug, Clone, Eq, PartialEq, Default)]
+pub struct JitoSubmitConfig {
+    /// Enables revert protection by sending through bundle-only mode.
+    pub bundle_only: bool,
 }
 
 /// Direct submit tuning.
@@ -255,6 +264,9 @@ pub enum SubmitError {
     /// RPC mode requested but no RPC transport was configured.
     #[error("rpc transport is not configured")]
     MissingRpcTransport,
+    /// Jito mode requested but no Jito transport was configured.
+    #[error("jito transport is not configured")]
+    MissingJitoTransport,
     /// Direct mode requested but no direct transport was configured.
     #[error("direct transport is not configured")]
     MissingDirectTransport,
@@ -271,6 +283,12 @@ pub enum SubmitError {
     #[error("rpc submit failed: {source}")]
     Rpc {
         /// RPC transport error.
+        source: SubmitTransportError,
+    },
+    /// Jito transport failure.
+    #[error("jito submit failed: {source}")]
+    Jito {
+        /// Jito transport error.
         source: SubmitTransportError,
     },
     /// Internal synchronization failure.
@@ -298,6 +316,8 @@ pub struct SubmitResult {
     pub direct_target: Option<LeaderTarget>,
     /// RPC-returned signature string when RPC path succeeded.
     pub rpc_signature: Option<String>,
+    /// Jito block-engine returned signature string when Jito path succeeded.
+    pub jito_signature: Option<String>,
     /// True when RPC fallback was used from hybrid mode.
     pub used_rpc_fallback: bool,
     /// Number of direct targets selected for submit attempt that succeeded.
@@ -487,6 +507,8 @@ pub enum TxSubmitOutcomeKind {
     DirectAccepted,
     /// RPC path accepted the transaction.
     RpcAccepted,
+    /// Jito block-engine accepted the transaction.
+    JitoAccepted,
     /// Transaction landed on chain.
     Landed,
     /// Transaction expired before landing.
@@ -639,6 +661,7 @@ impl TxToxicFlowTelemetry {
             }
             TxSubmitOutcomeKind::DirectAccepted
             | TxSubmitOutcomeKind::RpcAccepted
+            | TxSubmitOutcomeKind::JitoAccepted
             | TxSubmitOutcomeKind::Landed
             | TxSubmitOutcomeKind::Expired
             | TxSubmitOutcomeKind::Dropped
@@ -720,6 +743,17 @@ pub trait RpcSubmitTransport: Send + Sync {
         &self,
         tx_bytes: &[u8],
         config: &RpcSubmitConfig,
+    ) -> Result<String, SubmitTransportError>;
+}
+
+/// Jito transport interface.
+#[async_trait]
+pub trait JitoSubmitTransport: Send + Sync {
+    /// Submits transaction bytes to Jito block engine and returns signature string.
+    async fn submit_jito(
+        &self,
+        tx_bytes: &[u8],
+        config: &JitoSubmitConfig,
     ) -> Result<String, SubmitTransportError>;
 }
 
