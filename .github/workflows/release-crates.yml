@@ -37,9 +37,6 @@ jobs:
             exit 1
           fi
 
-      - name: Run full CI matrix before publish
-        run: cargo make ci
-
       - name: Verify publishable crate archives
         run: bash scripts/verify-publishable-archives.sh
 
@@ -75,13 +72,29 @@ jobs:
             fi
           }
 
+          wait_until_indexed() {
+            local pkg="$1"
+            local version="$2"
+            local attempt
+            for attempt in $(seq 1 30); do
+              if cargo info --registry crates-io "${pkg}@${version}" >/dev/null 2>&1; then
+                echo ">>> ${pkg} v${version} is visible on crates.io"
+                return 0
+              fi
+              echo ">>> Waiting for ${pkg} v${version} to appear on crates.io (${attempt}/30)..."
+              sleep 10
+            done
+            echo ">>> ${pkg} v${version} did not appear on crates.io in time"
+            return 1
+          }
+
           # Define crates in dependency order
           crates=("sof-gossip-tuning" "sof-solana-gossip" "sof" "sof-tx")
 
           for pkg in "${crates[@]}"; do
             crate_version="$(version_for "$pkg")"
-            
-            if [[ "${crate_version}" != "${tag_version}" ]]; then
+
+            if [[ "${pkg}" != "sof-solana-gossip" && "${crate_version}" != "${tag_version}" ]]; then
               echo ">>> Skipping $pkg: version (${crate_version}) does not match tag (${tag_version})"
               skipped_count=$((skipped_count + 1))
               continue
@@ -115,6 +128,11 @@ jobs:
               already_published_count=$((already_published_count + 1))
             else
               echo ">>> FAILED publish for $pkg v${crate_version}"
+              failed_count=$((failed_count + 1))
+              continue
+            fi
+
+            if ! wait_until_indexed "$pkg" "$crate_version"; then
               failed_count=$((failed_count + 1))
             fi
 
