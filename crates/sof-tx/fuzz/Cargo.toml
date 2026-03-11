@@ -1,0 +1,73 @@
+[package]
+name = "sof-tx-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+async-trait = "0.1"
+bincode = "1.3.3"
+libfuzzer-sys = "0.4"
+sof-tx = { path = ".." }
+solana-keypair = "3.0.1"
+solana-message = "3.0.1"
+solana-pubkey = "3.0.0"
+solana-signature = "3.1.0"
+solana-signer = "3.0.0"
+solana-system-interface = { version = "3.0.0", features = ["bincode"] }
+tokio = { version = "1.48", features = ["rt", "time"] }
+
+[[bin]]
+name = "submit_jito_mode"
+path = "fuzz_targets/submit_jito_mode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "routing_select_targets"
+path = "fuzz_targets/routing_select_targets.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "signature_deduper"
+path = "fuzz_targets/signature_deduper.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "submit_rpc_only"
+path = "fuzz_targets/submit_rpc_only.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "submit_direct_only"
+path = "fuzz_targets/submit_direct_only.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "submit_hybrid"
+path = "fuzz_targets/submit_hybrid.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tx_builder_toggles"
+path = "fuzz_targets/tx_builder_toggles.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
