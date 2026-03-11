@@ -25,6 +25,7 @@ Core responsibilities:
 - Use the replayable derived-state feed for restart-safe stateful consumers
 - Apply typed gossip and ingest tuning profiles instead of env-string bundles
 - Keep more runtime work on borrowed/shared data instead of eagerly allocating owned transaction or dataset payload copies
+- Drop duplicate or conflicting shred observations before they can re-emit duplicate dataset or transaction events downstream
 
 ## Install
 
@@ -43,6 +44,31 @@ Optional external `kernel-bypass` ingress support:
 ```toml
 sof = { version = "0.8.1", features = ["kernel-bypass"] }
 ```
+
+The bundled `sof-solana-gossip` backend defaults to SOF's lightweight in-memory duplicate/conflict
+path. The heavier ledger-backed duplicate-shred tooling remains available behind the vendored
+crate's explicit `solana-ledger` feature.
+
+## Semantic Shred Dedupe
+
+SOF now treats shred dedupe as a semantic correctness boundary, not just a packet-cache hint.
+
+- One shared semantic shred registry is used across both ingest and canonical emission stages.
+- Exact repeats are dropped before they can waste verify/FEC/reassembly work.
+- Conflicting repeats are also suppressed before they can re-emit duplicate downstream events.
+- The HFT/observer contract is that normal downstream consumers should not need their own duplicate
+  shred suppression logic.
+
+The shared registry publishes runtime telemetry for:
+
+- current and max retained shred identities
+- current and max eviction-queue depth
+- capacity-driven vs expiry-driven evictions
+- ingress duplicate/conflict drops
+- canonical duplicate/conflict drops
+
+Those metrics are intended to help tune `SOF_SHRED_DEDUP_CAPACITY` and
+`SOF_SHRED_DEDUP_TTL_MS` under real traffic instead of guessing.
 
 ## Quick Start
 

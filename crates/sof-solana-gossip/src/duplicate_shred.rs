@@ -1,23 +1,28 @@
 use {
     crate::crds_data::sanitize_wallclock,
-    itertools::Itertools,
     serde::{Deserialize, Serialize},
     solana_clock::Slot,
+    solana_pubkey::Pubkey,
+    solana_sanitize::{Sanitize, SanitizeError},
+    std::num::TryFromIntError,
+    thiserror::Error,
+};
+
+#[cfg(feature = "duplicate-shred-tools")]
+use {
+    itertools::Itertools,
     solana_ledger::{
         blockstore::BlockstoreError,
         blockstore_meta::{DuplicateSlotProof, ErasureMeta},
         shred::{self, Shred, ShredType},
     },
-    solana_pubkey::Pubkey,
-    solana_sanitize::{Sanitize, SanitizeError},
     std::{
         collections::{hash_map::Entry, HashMap},
         convert::TryFrom,
-        num::TryFromIntError,
     },
-    thiserror::Error,
 };
 
+#[cfg(feature = "duplicate-shred-tools")]
 const DUPLICATE_SHRED_HEADER_SIZE: usize = 63;
 
 pub(crate) type DuplicateShredIndex = u16;
@@ -42,11 +47,13 @@ pub struct DuplicateShred {
 
 impl DuplicateShred {
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn num_chunks(&self) -> u8 {
         self.num_chunks
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn chunk_index(&self) -> u8 {
         self.chunk_index
     }
@@ -55,6 +62,7 @@ impl DuplicateShred {
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("block store save error")]
+    #[cfg(feature = "duplicate-shred-tools")]
     BlockstoreInsertFailed(#[from] BlockstoreError),
     #[error("data chunk mismatch")]
     DataChunkMismatch,
@@ -71,12 +79,15 @@ pub enum Error {
     #[error("invalid last index conflict")]
     InvalidLastIndexConflict,
     #[error("invalid shred version: {0}")]
+    #[cfg(feature = "duplicate-shred-tools")]
     InvalidShredVersion(u16),
     #[error("invalid signature")]
+    #[cfg(feature = "duplicate-shred-tools")]
     InvalidSignature,
     #[error("invalid size limit")]
     InvalidSizeLimit,
     #[error(transparent)]
+    #[cfg(feature = "duplicate-shred-tools")]
     InvalidShred(#[from] shred::Error),
     #[error("number of chunks mismatch")]
     NumChunksMismatch,
@@ -91,31 +102,34 @@ pub enum Error {
     #[error("type conversion error")]
     TryFromIntError(#[from] TryFromIntError),
     #[error("unknown slot leader: {0}")]
+    #[cfg(feature = "duplicate-shred-tools")]
     UnknownSlotLeader(Slot),
 }
 
 impl Error {
     /// Errors indicating that the initial node submitted an invalid duplicate proof case
+    #[allow(dead_code)]
     pub(crate) fn is_non_critical(&self) -> bool {
         match self {
             Self::SlotMismatch
-            | Self::InvalidShredVersion(_)
-            | Self::InvalidSignature
             | Self::ShredTypeMismatch
             | Self::InvalidDuplicateShreds
             | Self::InvalidLastIndexConflict
             | Self::InvalidErasureMetaConflict => true,
-            Self::BlockstoreInsertFailed(_)
-            | Self::DataChunkMismatch
+            Self::DataChunkMismatch
             | Self::DuplicateSlotSenderFailure
             | Self::InvalidChunkIndex { .. }
             | Self::InvalidDuplicateSlotProof
             | Self::InvalidSizeLimit
-            | Self::InvalidShred(_)
             | Self::NumChunksMismatch
             | Self::MissingDataChunk
             | Self::SerializationError(_)
-            | Self::TryFromIntError(_)
+            | Self::TryFromIntError(_) => false,
+            #[cfg(feature = "duplicate-shred-tools")]
+            Self::InvalidShredVersion(_)
+            | Self::InvalidSignature
+            | Self::BlockstoreInsertFailed(_)
+            | Self::InvalidShred(_)
             | Self::UnknownSlotLeader(_) => false,
         }
     }
@@ -133,6 +147,7 @@ impl Error {
 ///       LAST_SHRED_IN_SLOT, however the other shred must have a higher index.
 ///     - If `shred1` and `shred2` do not share the same index and are coding shreds
 ///       verify that they have conflicting erasure metas
+#[cfg(feature = "duplicate-shred-tools")]
 fn check_shreds<F>(
     leader_schedule: Option<F>,
     shred1: &Shred,
@@ -205,6 +220,7 @@ where
     Err(Error::InvalidErasureMetaConflict)
 }
 
+#[cfg(feature = "duplicate-shred-tools")]
 pub(crate) fn from_shred<T: AsRef<[u8]>, F>(
     shred: Shred,
     self_pubkey: Pubkey, // Pubkey of my node broadcasting crds value.
@@ -254,6 +270,7 @@ where
 
 // Returns a predicate checking if a duplicate-shred chunk matches
 // the slot and has valid chunk_index.
+#[cfg(feature = "duplicate-shred-tools")]
 fn check_chunk(slot: Slot, num_chunks: u8) -> impl Fn(&DuplicateShred) -> Result<(), Error> {
     move |dup| {
         if dup.slot != slot {
@@ -272,6 +289,7 @@ fn check_chunk(slot: Slot, num_chunks: u8) -> impl Fn(&DuplicateShred) -> Result
 }
 
 /// Reconstructs the duplicate shreds from chunks of DuplicateShred.
+#[cfg(feature = "duplicate-shred-tools")]
 pub(crate) fn into_shreds(
     slot_leader: &Pubkey,
     chunks: impl IntoIterator<Item = DuplicateShred>,
@@ -335,7 +353,7 @@ impl Sanitize for DuplicateShred {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "duplicate-shred-tools"))]
 pub(crate) mod tests {
     use {
         super::*,

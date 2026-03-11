@@ -46,6 +46,26 @@ pub struct ObserverRuntimeMetricsSnapshot {
     pub packet_worker_dropped_batches_total: u64,
     /// Total packets dropped due to full packet-worker queues.
     pub packet_worker_dropped_packets_total: u64,
+    /// Current shared semantic shred dedupe cache entry count.
+    pub shred_dedupe_entries: u64,
+    /// Maximum shared semantic shred dedupe cache entry count observed since startup.
+    pub shred_dedupe_max_entries: u64,
+    /// Current shared semantic shred dedupe eviction-queue depth.
+    pub shred_dedupe_queue_depth: u64,
+    /// Maximum shared semantic shred dedupe eviction-queue depth observed since startup.
+    pub shred_dedupe_max_queue_depth: u64,
+    /// Total shared semantic shred dedupe evictions caused by capacity pressure.
+    pub shred_dedupe_capacity_evictions_total: u64,
+    /// Total shared semantic shred dedupe evictions caused by expiry.
+    pub shred_dedupe_expired_evictions_total: u64,
+    /// Total duplicate semantic shreds dropped at the ingress boundary.
+    pub shred_dedupe_ingress_duplicate_drops_total: u64,
+    /// Total conflicting semantic shreds dropped at the ingress boundary.
+    pub shred_dedupe_ingress_conflict_drops_total: u64,
+    /// Total duplicate semantic shreds dropped at the canonical emission boundary.
+    pub shred_dedupe_canonical_duplicate_drops_total: u64,
+    /// Total conflicting semantic shreds dropped at the canonical emission boundary.
+    pub shred_dedupe_canonical_conflict_drops_total: u64,
     /// Total completed datasets emitted from the reassembly stage.
     pub completed_datasets_total: u64,
     /// Total completed datasets successfully decoded into entries.
@@ -80,6 +100,33 @@ static PACKET_WORKER_DROPPED_BATCHES_TOTAL: CacheAlignedAtomicU64 =
 /// Total packets dropped due to packet-worker queue pressure.
 static PACKET_WORKER_DROPPED_PACKETS_TOTAL: CacheAlignedAtomicU64 =
     CacheAlignedAtomicU64(AtomicU64::new(0));
+/// Current shared semantic shred dedupe cache entry count.
+static SHRED_DEDUPE_ENTRIES: CacheAlignedAtomicU64 = CacheAlignedAtomicU64(AtomicU64::new(0));
+/// Maximum shared semantic shred dedupe cache entry count observed since startup.
+static SHRED_DEDUPE_MAX_ENTRIES: CacheAlignedAtomicU64 = CacheAlignedAtomicU64(AtomicU64::new(0));
+/// Current shared semantic shred dedupe eviction-queue depth.
+static SHRED_DEDUPE_QUEUE_DEPTH: CacheAlignedAtomicU64 = CacheAlignedAtomicU64(AtomicU64::new(0));
+/// Maximum shared semantic shred dedupe eviction-queue depth observed since startup.
+static SHRED_DEDUPE_MAX_QUEUE_DEPTH: CacheAlignedAtomicU64 =
+    CacheAlignedAtomicU64(AtomicU64::new(0));
+/// Total shared semantic shred dedupe evictions caused by capacity pressure.
+static SHRED_DEDUPE_CAPACITY_EVICTIONS_TOTAL: CacheAlignedAtomicU64 =
+    CacheAlignedAtomicU64(AtomicU64::new(0));
+/// Total shared semantic shred dedupe evictions caused by expiry.
+static SHRED_DEDUPE_EXPIRED_EVICTIONS_TOTAL: CacheAlignedAtomicU64 =
+    CacheAlignedAtomicU64(AtomicU64::new(0));
+/// Total duplicate semantic shreds dropped at the ingress boundary.
+static SHRED_DEDUPE_INGRESS_DUPLICATE_DROPS_TOTAL: CacheAlignedAtomicU64 =
+    CacheAlignedAtomicU64(AtomicU64::new(0));
+/// Total conflicting semantic shreds dropped at the ingress boundary.
+static SHRED_DEDUPE_INGRESS_CONFLICT_DROPS_TOTAL: CacheAlignedAtomicU64 =
+    CacheAlignedAtomicU64(AtomicU64::new(0));
+/// Total duplicate semantic shreds dropped at the canonical emission boundary.
+static SHRED_DEDUPE_CANONICAL_DUPLICATE_DROPS_TOTAL: CacheAlignedAtomicU64 =
+    CacheAlignedAtomicU64(AtomicU64::new(0));
+/// Total conflicting semantic shreds dropped at the canonical emission boundary.
+static SHRED_DEDUPE_CANONICAL_CONFLICT_DROPS_TOTAL: CacheAlignedAtomicU64 =
+    CacheAlignedAtomicU64(AtomicU64::new(0));
 /// Total completed datasets emitted from reassembly.
 static COMPLETED_DATASETS_TOTAL: CacheAlignedAtomicU64 = CacheAlignedAtomicU64(AtomicU64::new(0));
 /// Total datasets successfully decoded into entries.
@@ -113,6 +160,22 @@ pub fn snapshot() -> ObserverRuntimeMetricsSnapshot {
         packet_worker_dropped_batches_total: PACKET_WORKER_DROPPED_BATCHES_TOTAL
             .load(Ordering::Relaxed),
         packet_worker_dropped_packets_total: PACKET_WORKER_DROPPED_PACKETS_TOTAL
+            .load(Ordering::Relaxed),
+        shred_dedupe_entries: SHRED_DEDUPE_ENTRIES.load(Ordering::Relaxed),
+        shred_dedupe_max_entries: SHRED_DEDUPE_MAX_ENTRIES.load(Ordering::Relaxed),
+        shred_dedupe_queue_depth: SHRED_DEDUPE_QUEUE_DEPTH.load(Ordering::Relaxed),
+        shred_dedupe_max_queue_depth: SHRED_DEDUPE_MAX_QUEUE_DEPTH.load(Ordering::Relaxed),
+        shred_dedupe_capacity_evictions_total: SHRED_DEDUPE_CAPACITY_EVICTIONS_TOTAL
+            .load(Ordering::Relaxed),
+        shred_dedupe_expired_evictions_total: SHRED_DEDUPE_EXPIRED_EVICTIONS_TOTAL
+            .load(Ordering::Relaxed),
+        shred_dedupe_ingress_duplicate_drops_total: SHRED_DEDUPE_INGRESS_DUPLICATE_DROPS_TOTAL
+            .load(Ordering::Relaxed),
+        shred_dedupe_ingress_conflict_drops_total: SHRED_DEDUPE_INGRESS_CONFLICT_DROPS_TOTAL
+            .load(Ordering::Relaxed),
+        shred_dedupe_canonical_duplicate_drops_total: SHRED_DEDUPE_CANONICAL_DUPLICATE_DROPS_TOTAL
+            .load(Ordering::Relaxed),
+        shred_dedupe_canonical_conflict_drops_total: SHRED_DEDUPE_CANONICAL_CONFLICT_DROPS_TOTAL
             .load(Ordering::Relaxed),
         completed_datasets_total: COMPLETED_DATASETS_TOTAL.load(Ordering::Relaxed),
         decoded_datasets_total: DECODED_DATASETS_TOTAL.load(Ordering::Relaxed),
@@ -158,6 +221,46 @@ pub(crate) fn observe_packet_worker_queue_drops(batches: u64, packets: u64) {
     PACKET_WORKER_DROPPED_PACKETS_TOTAL.fetch_add(packets, Ordering::Relaxed);
 }
 
+/// Publishes the latest shared semantic shred dedupe cache occupancy.
+pub(crate) fn set_shred_dedupe_metrics(
+    entries: u64,
+    max_entries: u64,
+    queue_depth: u64,
+    max_queue_depth: u64,
+) {
+    SHRED_DEDUPE_ENTRIES.store(entries, Ordering::Relaxed);
+    SHRED_DEDUPE_QUEUE_DEPTH.store(queue_depth, Ordering::Relaxed);
+    observe_max_counter(&SHRED_DEDUPE_MAX_ENTRIES, max_entries);
+    observe_max_counter(&SHRED_DEDUPE_MAX_QUEUE_DEPTH, max_queue_depth);
+}
+
+/// Adds semantic shred dedupe drops for one pipeline stage.
+pub(crate) fn observe_shred_dedupe_drops(
+    stage: crate::app::state::ShredDedupeStage,
+    duplicates: u64,
+    conflicts: u64,
+) {
+    match stage {
+        crate::app::state::ShredDedupeStage::Ingress => {
+            SHRED_DEDUPE_INGRESS_DUPLICATE_DROPS_TOTAL.fetch_add(duplicates, Ordering::Relaxed);
+            SHRED_DEDUPE_INGRESS_CONFLICT_DROPS_TOTAL.fetch_add(conflicts, Ordering::Relaxed);
+        }
+        crate::app::state::ShredDedupeStage::Canonical => {
+            SHRED_DEDUPE_CANONICAL_DUPLICATE_DROPS_TOTAL.fetch_add(duplicates, Ordering::Relaxed);
+            SHRED_DEDUPE_CANONICAL_CONFLICT_DROPS_TOTAL.fetch_add(conflicts, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Publishes the latest shared semantic shred dedupe eviction totals.
+pub(crate) fn set_shred_dedupe_evictions(
+    capacity_evictions_total: u64,
+    expired_evictions_total: u64,
+) {
+    SHRED_DEDUPE_CAPACITY_EVICTIONS_TOTAL.store(capacity_evictions_total, Ordering::Relaxed);
+    SHRED_DEDUPE_EXPIRED_EVICTIONS_TOTAL.store(expired_evictions_total, Ordering::Relaxed);
+}
+
 /// Adds completed datasets emitted from the reassembly stage.
 pub(crate) fn observe_completed_datasets(count: u64) {
     COMPLETED_DATASETS_TOTAL.fetch_add(count, Ordering::Relaxed);
@@ -197,4 +300,15 @@ pub(crate) fn observe_dataset_job_completed() {
 /// Adds dropped transaction events.
 pub(crate) fn observe_tx_event_drops(count: u64) {
     TX_EVENT_DROPPED_TOTAL.fetch_add(count, Ordering::Relaxed);
+}
+
+/// Raises one monotonic runtime counter when `value` exceeds its current maximum.
+fn observe_max_counter(counter: &CacheAlignedAtomicU64, value: u64) {
+    let mut current = counter.load(Ordering::Relaxed);
+    while value > current {
+        match counter.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
 }

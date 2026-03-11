@@ -27,16 +27,15 @@ use {
             CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS,
         },
         crds_value::{CrdsValue, CrdsValueLabel},
-        duplicate_shred::DuplicateShred,
         epoch_slots::EpochSlots,
         epoch_specs::EpochSpecs,
         gossip_error::GossipError,
         ping_pong::Pong,
         protocol::{
             split_gossip_messages, Ping, PingCache, Protocol, PruneData,
-            DUPLICATE_SHRED_MAX_PAYLOAD_SIZE, MAX_INCREMENTAL_SNAPSHOT_HASHES,
-            MAX_PRUNE_DATA_NODES, PULL_RESPONSE_MAX_PAYLOAD_SIZE,
-            PULL_RESPONSE_MIN_SERIALIZED_SIZE, PUSH_MESSAGE_MAX_PAYLOAD_SIZE,
+            MAX_INCREMENTAL_SNAPSHOT_HASHES, MAX_PRUNE_DATA_NODES,
+            PULL_RESPONSE_MAX_PAYLOAD_SIZE, PULL_RESPONSE_MIN_SERIALIZED_SIZE,
+            PUSH_MESSAGE_MAX_PAYLOAD_SIZE,
         },
         restart_crds_values::{
             RestartHeaviestFork, RestartLastVotedForkSlots, RestartLastVotedForkSlotsError,
@@ -52,7 +51,6 @@ use {
     solana_clock::{Slot, DEFAULT_MS_PER_SLOT, DEFAULT_SLOTS_PER_EPOCH},
     solana_hash::Hash,
     solana_keypair::{signable::Signable, Keypair},
-    solana_ledger::shred::Shred,
     solana_net_utils::{
         bind_in_range,
         multihomed_sockets::BindIpAddrs,
@@ -98,6 +96,13 @@ use {
         time::{Duration, Instant},
     },
     thiserror::Error,
+};
+
+#[cfg(feature = "duplicate-shred-tools")]
+use {
+    crate::duplicate_shred::DuplicateShred,
+    crate::protocol::DUPLICATE_SHRED_MAX_PAYLOAD_SIZE,
+    solana_ledger::shred::Shred,
 };
 
 const DEFAULT_EPOCH_DURATION: Duration =
@@ -204,13 +209,36 @@ fn allowed_gossip_core_ids() -> Vec<CoreId> {
     let parsed_allowed_core_ids = std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|status| parse_allowed_core_ids_from_proc_status(&status));
-    if let Some(allowed_core_ids) = parsed_allowed_core_ids {
-        return allowed_core_ids
+    let allowed_core_ids: Vec<CoreId> = if let Some(allowed_core_ids) = parsed_allowed_core_ids {
+        allowed_core_ids
             .into_iter()
             .map(|id| CoreId { id })
-            .collect();
+            .collect()
+    } else {
+        core_affinity::get_core_ids().unwrap_or_default()
+    };
+    if allowed_core_ids.is_empty() {
+        return allowed_core_ids;
     }
-    core_affinity::get_core_ids().unwrap_or_default()
+
+    // Avoid forcing multiple hot gossip threads onto the same small core set.
+    // On compact hosts the scheduler usually does a better job than static
+    // pinning once the number of pinned roles exceeds the number of cores.
+    let required_pinned_threads = 1_usize // solGossipConsum loop
+        .saturating_add(gossip_socket_consume_threads().saturating_sub(1))
+        .saturating_add(1) // solGossipListen loop
+        .saturating_add(gossip_listen_threads())
+        .saturating_add(1) // solGossip loop
+        .saturating_add(gossip_run_threads());
+    if allowed_core_ids.len() < required_pinned_threads {
+        info!(
+            "skipping gossip CPU pinning because available cores are insufficient for dedicated placement: allowed_cores={} required_pinned_threads={}",
+            allowed_core_ids.len(),
+            required_pinned_threads,
+        );
+        return Vec::new();
+    }
+    allowed_core_ids
 }
 
 fn maybe_pin_gossip_thread(
@@ -1144,6 +1172,7 @@ impl ClusterInfo {
         (labels, txs)
     }
 
+    #[cfg(feature = "duplicate-shred-tools")]
     pub fn push_duplicate_shred(
         &self,
         shred: &Shred,
@@ -1221,6 +1250,7 @@ impl ClusterInfo {
     }
 
     /// Returns duplicate-shreds inserted since the given cursor.
+    #[cfg(feature = "duplicate-shred-tools")]
     pub(crate) fn get_duplicate_shreds(&self, cursor: &mut Cursor) -> Vec<DuplicateShred> {
         let gossip_crds = self.gossip.crds.read().unwrap();
         gossip_crds
@@ -2929,7 +2959,6 @@ mod tests {
         crate::{
             crds_gossip_pull::tests::MIN_NUM_BLOOM_FILTERS,
             crds_value::{CrdsValue, CrdsValueLabel},
-            duplicate_shred::tests::new_rand_shred,
             node::Node,
             protocol::tests::new_rand_remote_node,
             socketaddr,
@@ -2937,7 +2966,6 @@ mod tests {
         bincode::serialize,
         itertools::izip,
         solana_keypair::Keypair,
-        solana_ledger::shred::Shredder,
         solana_net_utils::sockets::localhost_port_range_for_tests,
         solana_signer::Signer,
         solana_streamer::quic::DEFAULT_QUIC_ENDPOINTS,
@@ -2952,6 +2980,12 @@ mod tests {
             panic,
             sync::Arc,
         },
+    };
+
+    #[cfg(feature = "duplicate-shred-tools")]
+    use {
+        crate::duplicate_shred::tests::new_rand_shred,
+        solana_ledger::shred::Shredder,
     };
     const DEFAULT_NUM_QUIC_ENDPOINTS: NonZeroUsize =
         NonZeroUsize::new(DEFAULT_QUIC_ENDPOINTS).unwrap();
@@ -3934,6 +3968,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "duplicate-shred-tools")]
     fn test_get_duplicate_shreds() {
         let host1_key = Arc::new(Keypair::new());
         let node = Node::new_localhost_with_pubkey(&host1_key.pubkey());

@@ -20,7 +20,8 @@ pub(super) use std::{
 pub(super) use super::super::config::*;
 pub(super) use super::super::state::{
     CommitmentSlotTracker, ForkTracker, ForkTrackerUpdate, OutstandingRepairRequests,
-    RecentShredCache, SlotCoverageWindow, note_latest_shred_slot,
+    ShredDedupeCache, ShredDedupeIdentity, ShredDedupeObservation, ShredDedupeStage,
+    SlotCoverageWindow, note_latest_shred_slot,
 };
 #[cfg(feature = "gossip-bootstrap")]
 pub(super) use crate::framework::{

@@ -34,8 +34,11 @@ pub mod crds_gossip_push;
 pub mod crds_shards;
 pub mod crds_value;
 mod deprecated;
+#[cfg(feature = "duplicate-shred-tools")]
 pub mod duplicate_shred;
+#[cfg(feature = "duplicate-shred-tools")]
 pub mod duplicate_shred_handler;
+#[cfg(feature = "duplicate-shred-tools")]
 pub mod duplicate_shred_listener;
 pub mod epoch_slots;
 pub mod epoch_specs;

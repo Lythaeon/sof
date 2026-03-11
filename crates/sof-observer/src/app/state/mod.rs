@@ -7,7 +7,10 @@ mod repair;
 
 pub use commitment::CommitmentSlotTracker;
 pub use coverage::SlotCoverageWindow;
-pub use dedupe::RecentShredCache;
+pub use dedupe::{
+    ShredDedupeCache, ShredDedupeCacheMetrics, ShredDedupeIdentity, ShredDedupeObservation,
+    ShredDedupeStage,
+};
 pub use fork::{ForkTracker, ForkTrackerSnapshot, ForkTrackerUpdate};
 pub use latest::note_latest_shred_slot;
 pub use repair::OutstandingRepairRequests;

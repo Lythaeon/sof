@@ -2,7 +2,6 @@ use {
     crate::{
         contact_info::ContactInfo,
         deprecated,
-        duplicate_shred::{DuplicateShred, DuplicateShredIndex, MAX_DUPLICATE_SHREDS},
         epoch_slots::EpochSlots,
         legacy_contact_info::LegacyContactInfo,
         restart_crds_values::{RestartHeaviestFork, RestartLastVotedForkSlots},
@@ -18,6 +17,9 @@ use {
     solana_vote::vote_parser,
     std::collections::BTreeSet,
 };
+
+#[cfg(feature = "duplicate-shred-tools")]
+use crate::duplicate_shred::{DuplicateShred, DuplicateShredIndex, MAX_DUPLICATE_SHREDS};
 
 pub(crate) const MAX_WALLCLOCK: u64 = 1_000_000_000_000_000;
 pub(crate) const MAX_SLOT: u64 = 1_000_000_000_000_000;
@@ -56,6 +58,7 @@ pub enum CrdsData {
     Version(Version),
     #[allow(private_interfaces)]
     NodeInstance(NodeInstance),
+    #[cfg(feature = "duplicate-shred-tools")]
     DuplicateShred(DuplicateShredIndex, DuplicateShred),
     SnapshotHashes(SnapshotHashes),
     ContactInfo(ContactInfo),
@@ -90,6 +93,7 @@ impl Sanitize for CrdsData {
             CrdsData::LegacyVersion(version) => version.sanitize(),
             CrdsData::Version(version) => version.sanitize(),
             CrdsData::NodeInstance(node) => node.sanitize(),
+            #[cfg(feature = "duplicate-shred-tools")]
             CrdsData::DuplicateShred(ix, shred) => {
                 if *ix >= MAX_DUPLICATE_SHREDS {
                     Err(SanitizeError::ValueOutOfBounds)
@@ -147,6 +151,7 @@ impl CrdsData {
             CrdsData::LegacyVersion(version) => version.wallclock,
             CrdsData::Version(version) => version.wallclock,
             CrdsData::NodeInstance(node) => node.wallclock,
+            #[cfg(feature = "duplicate-shred-tools")]
             CrdsData::DuplicateShred(_, shred) => shred.wallclock,
             CrdsData::SnapshotHashes(hash) => hash.wallclock,
             CrdsData::ContactInfo(node) => node.wallclock(),
@@ -166,6 +171,7 @@ impl CrdsData {
             CrdsData::LegacyVersion(version) => version.from,
             CrdsData::Version(version) => version.from,
             CrdsData::NodeInstance(node) => node.from,
+            #[cfg(feature = "duplicate-shred-tools")]
             CrdsData::DuplicateShred(_, shred) => shred.from,
             CrdsData::SnapshotHashes(hash) => hash.from,
             CrdsData::ContactInfo(node) => *node.pubkey(),
@@ -188,6 +194,7 @@ impl CrdsData {
             Self::LegacyVersion(_) => true,
             Self::Version(_) => true,
             Self::NodeInstance(_) => true,
+            #[cfg(feature = "duplicate-shred-tools")]
             Self::DuplicateShred(..) => false,
             Self::SnapshotHashes(_) => false,
             Self::ContactInfo(_) => false,

@@ -38,6 +38,9 @@ pub(super) struct WorkerAcceptedShred {
     pub(super) slot: u64,
     pub(super) index: u32,
     pub(super) fec_set_index: u32,
+    pub(super) version: u16,
+    pub(super) variant: u8,
+    pub(super) signature: [u8; 64],
     pub(super) kind: WorkerAcceptedShredKind,
     pub(super) payload_fragment: Option<crate::reassembly::dataset::SharedPayloadFragment>,
 }
@@ -488,6 +491,12 @@ fn process_packet_batch(
                 }
             }
             if let ParsedShred::Data(data) = parsed_recovered {
+                let Some(signature) = packet_signature_bytes(&recovered) else {
+                    continue;
+                };
+                let Some(variant) = packet_variant_byte(&recovered) else {
+                    continue;
+                };
                 #[cfg(feature = "gossip-bootstrap")]
                 maybe_record_observed_leader(
                     shred_verifier.as_deref(),
@@ -499,6 +508,9 @@ fn process_packet_batch(
                     slot: data.common.slot,
                     index: data.common.index,
                     fec_set_index: data.common.fec_set_index,
+                    version: data.common.version,
+                    variant,
+                    signature,
                     kind: WorkerAcceptedShredKind::RecoveredData {
                         parent_slot: derive_parent_slot(
                             data.common.slot,
@@ -554,6 +566,12 @@ fn maybe_record_observed_leader(
 }
 
 fn push_primary_shred(packet: PacketWorkerInput, accepted_shreds: &mut Vec<WorkerAcceptedShred>) {
+    let Some(signature) = packet_signature_bytes(packet.packet_bytes.as_ref()) else {
+        return;
+    };
+    let Some(variant) = packet_variant_byte(packet.packet_bytes.as_ref()) else {
+        return;
+    };
     match packet.parsed_header {
         ParsedShredHeader::Data(data) => {
             let payload_fragment = crate::reassembly::dataset::SharedPayloadFragment::borrowed(
@@ -566,6 +584,9 @@ fn push_primary_shred(packet: PacketWorkerInput, accepted_shreds: &mut Vec<Worke
                 slot: data.common.slot,
                 index: data.common.index,
                 fec_set_index: data.common.fec_set_index,
+                version: data.common.version,
+                variant,
+                signature,
                 kind: WorkerAcceptedShredKind::Data {
                     parent_slot: derive_parent_slot(
                         data.common.slot,
@@ -584,6 +605,9 @@ fn push_primary_shred(packet: PacketWorkerInput, accepted_shreds: &mut Vec<Worke
                 slot: code.common.slot,
                 index: code.common.index,
                 fec_set_index: code.common.fec_set_index,
+                version: code.common.version,
+                variant,
+                signature,
                 kind: WorkerAcceptedShredKind::Code {
                     num_data_shreds: code.coding_header.num_data_shreds,
                 },
@@ -591,6 +615,14 @@ fn push_primary_shred(packet: PacketWorkerInput, accepted_shreds: &mut Vec<Worke
             });
         }
     }
+}
+
+fn packet_signature_bytes(packet: &[u8]) -> Option<[u8; 64]> {
+    packet.get(0..64)?.try_into().ok()
+}
+
+fn packet_variant_byte(packet: &[u8]) -> Option<u8> {
+    packet.get(64).copied()
 }
 
 enum WorkerVerifyDecision {
