@@ -108,6 +108,7 @@ impl Default for LegacyContactInfo {
     }
 }
 
+#[allow(dead_code)]
 impl LegacyContactInfo {
     #[inline]
     pub(crate) fn pubkey(&self) -> &Pubkey {

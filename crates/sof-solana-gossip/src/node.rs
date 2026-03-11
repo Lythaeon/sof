@@ -132,7 +132,7 @@ impl Node {
             bind_in_range_with_config(bind_ip_addr, port_range, socket_config)
                 .expect("tvu_quic bind");
 
-        let ((tpu_port, tpu_socket), (tpu_port_quic, tpu_quic)) =
+        let ((_tpu_port, tpu_socket), (tpu_port_quic, tpu_quic)) =
             bind_two_in_range_with_offset_and_config(
                 bind_ip_addr,
                 port_range,
@@ -154,7 +154,7 @@ impl Node {
         );
         let tpu_quic_addresses = Self::get_socket_addrs(&tpu_quic);
 
-        let ((tpu_forwards_port, tpu_forwards_socket), (tpu_forwards_quic_port, tpu_forwards_quic)) =
+        let ((_tpu_forwards_port, tpu_forwards_socket), (tpu_forwards_quic_port, tpu_forwards_quic)) =
             bind_two_in_range_with_offset_and_config(
                 bind_ip_addr,
                 port_range,
@@ -297,11 +297,26 @@ impl Node {
         info.set_gossip((advertised_ip, gossip_ports[0])).unwrap();
         info.set_tvu(UDP, (advertised_ip, tvu_port)).unwrap();
         info.set_tvu(QUIC, (advertised_ip, tvu_quic_port)).unwrap();
-        info.set_tpu(public_tpu_addr.unwrap_or_else(|| SocketAddr::new(advertised_ip, tpu_port)))
-            .unwrap();
+        // Keep the legacy UDP tags populated while advertising the actual QUIC endpoints.
+        info.set_tpu(
+            UDP,
+            public_tpu_addr.unwrap_or_else(|| SocketAddr::new(advertised_ip, 1)),
+        )
+        .unwrap();
+        info.set_tpu(
+            QUIC,
+            public_tpu_addr.unwrap_or_else(|| SocketAddr::new(advertised_ip, tpu_port_quic)),
+        )
+        .unwrap();
         info.set_tpu_forwards(
+            UDP,
+            public_tpu_forwards_addr.unwrap_or_else(|| SocketAddr::new(advertised_ip, 1)),
+        )
+        .unwrap();
+        info.set_tpu_forwards(
+            QUIC,
             public_tpu_forwards_addr
-                .unwrap_or_else(|| SocketAddr::new(advertised_ip, tpu_forwards_port)),
+                .unwrap_or_else(|| SocketAddr::new(advertised_ip, tpu_forwards_quic_port)),
         )
         .unwrap();
         info.set_tpu_vote(UDP, (advertised_ip, tpu_vote_port))

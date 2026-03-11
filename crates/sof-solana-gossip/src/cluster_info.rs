@@ -44,7 +44,7 @@ use {
     },
     arc_swap::ArcSwap,
     core_affinity::CoreId,
-    crossbeam_channel::{Receiver, Sender, TrySendError},
+    crossbeam_channel::{Receiver, TrySendError},
     itertools::{Either, Itertools},
     rand::{seq::SliceRandom, CryptoRng, Rng},
     rayon::{prelude::*, ThreadPool, ThreadPoolBuilder},
@@ -98,7 +98,7 @@ use {
     thiserror::Error,
 };
 
-#[cfg(feature = "duplicate-shred-tools")]
+#[cfg(feature = "duplicate-shred-rocksdb")]
 use {
     crate::duplicate_shred::DuplicateShred,
     crate::protocol::DUPLICATE_SHRED_MAX_PAYLOAD_SIZE,
@@ -111,9 +111,6 @@ const DEFAULT_EPOCH_DURATION: Duration =
 pub const GOSSIP_SLEEP_MILLIS: u64 = 100;
 /// Interval between pull requests (in gossip rounds)
 const PULL_REQUEST_PERIOD: usize = 5;
-const GOSSIP_SOCKET_CONSUME_CORE_OFFSET: usize = 0;
-const GOSSIP_LISTEN_LOOP_CORE_OFFSET: usize = 1;
-const GOSSIP_LISTEN_WORK_CORE_OFFSET: usize = 2;
 const GOSSIP_RUN_LOOP_CORE_OFFSET: usize = 3;
 const GOSSIP_RUN_WORK_CORE_OFFSET: usize = 0;
 
@@ -191,18 +188,6 @@ impl ProcessPacketsScratch {
 
 pub(crate) struct VerifiedPacketBatch {
     packets: Vec<(SocketAddr, Protocol)>,
-}
-
-struct SocketConsumeScratch {
-    verified_packets: Vec<(SocketAddr, Protocol)>,
-}
-
-impl SocketConsumeScratch {
-    fn new() -> Self {
-        Self {
-            verified_packets: Vec::with_capacity(1024),
-        }
-    }
 }
 
 fn allowed_gossip_core_ids() -> Vec<CoreId> {
@@ -636,7 +621,10 @@ impl ClusterInfo {
     }
 
     pub fn set_tpu(&self, tpu_addr: SocketAddr) -> Result<(), ContactInfoError> {
-        self.my_contact_info.write().unwrap().set_tpu(tpu_addr)?;
+        self.my_contact_info
+            .write()
+            .unwrap()
+            .set_tpu(contact_info::Protocol::QUIC, tpu_addr)?;
         self.refresh_my_gossip_contact_info();
         Ok(())
     }
@@ -645,9 +633,20 @@ impl ClusterInfo {
         self.my_contact_info
             .write()
             .unwrap()
-            .set_tpu_forwards(tpu_forwards_addr)?;
+            .set_tpu_forwards(contact_info::Protocol::QUIC, tpu_forwards_addr)?;
         self.refresh_my_gossip_contact_info();
         Ok(())
+    }
+
+    pub fn set_tpu_quic(&self, tpu_addr: SocketAddr) -> Result<(), ContactInfoError> {
+        self.set_tpu(tpu_addr)
+    }
+
+    pub fn set_tpu_forwards_quic(
+        &self,
+        tpu_forwards_addr: SocketAddr,
+    ) -> Result<(), ContactInfoError> {
+        self.set_tpu_forwards(tpu_forwards_addr)
     }
 
     pub fn set_tpu_vote(
@@ -1172,7 +1171,7 @@ impl ClusterInfo {
         (labels, txs)
     }
 
-    #[cfg(feature = "duplicate-shred-tools")]
+    #[cfg(feature = "duplicate-shred-rocksdb")]
     pub fn push_duplicate_shred(
         &self,
         shred: &Shred,
@@ -1250,7 +1249,7 @@ impl ClusterInfo {
     }
 
     /// Returns duplicate-shreds inserted since the given cursor.
-    #[cfg(feature = "duplicate-shred-tools")]
+    #[cfg(feature = "duplicate-shred-rocksdb")]
     pub(crate) fn get_duplicate_shreds(&self, cursor: &mut Cursor) -> Vec<DuplicateShred> {
         let gossip_crds = self.gossip.crds.read().unwrap();
         gossip_crds
@@ -2375,18 +2374,15 @@ impl ClusterInfo {
         Ok(())
     }
 
-    // Consumes packets received from the socket, deserializing, sanitizing and
-    // verifying them and then sending them down the channel for the actual
-    // handling of requests/messages.
-    fn run_socket_consume(
+    // Legacy gossip service path aligned with Agave. Keep the newer optimized
+    // path available in-tree, but use the stable one for production ingress.
+    fn run_socket_consume_legacy(
         &self,
-        thread_pool: Option<&ThreadPool>,
+        thread_pool: &ThreadPool,
         mut epoch_specs: Option<&mut EpochSpecs>,
         receiver: &PacketBatchReceiver,
-        sender: &impl ChannelSend<VerifiedPacketBatch>,
-        recycle_receiver: &Receiver<Vec<(/*from:*/ SocketAddr, Protocol)>>,
+        sender: &impl ChannelSend<Vec<(/*from:*/ SocketAddr, Protocol)>>,
         packet_buf: &mut Vec<PacketBatch>,
-        scratch: &mut SocketConsumeScratch,
     ) -> Result<(), GossipError> {
         let mut num_packets = 0;
         for packet_batch in receiver
@@ -2396,13 +2392,14 @@ impl ClusterInfo {
         {
             num_packets += packet_batch.len();
             packet_buf.push(packet_batch);
-            if packet_buf.len() == CHANNEL_CONSUME_CAPACITY {
+            if packet_buf.len() == gossip_channel_consume_capacity() {
                 break;
             }
         }
         self.stats
             .packets_received_count
             .add_relaxed(num_packets as u64);
+
         fn verify_packet(
             packet: PacketRef,
             stakes: &HashMap<Pubkey, u64>,
@@ -2426,6 +2423,7 @@ impl ClusterInfo {
                 (packet.meta().socket_addr(), protocol)
             })
         }
+
         let empty_stakes = HashMap::new();
         let stakes = if let Some(epoch_specs) = epoch_specs.as_deref_mut() {
             epoch_specs.current_epoch_staked_nodes().as_ref()
@@ -2434,67 +2432,23 @@ impl ClusterInfo {
         };
         let packets_verified: Vec<_> = {
             let _st = ScopedTimer::from(&self.stats.verify_gossip_packets_time);
-            if num_packets < gossip_socket_consume_parallel_packet_threshold()
-                || thread_pool.is_none()
-            {
-                scratch.verified_packets.clear();
-                while let Ok(mut recycled) = recycle_receiver.try_recv() {
-                    recycled.clear();
-                    if recycled.capacity() > scratch.verified_packets.capacity() {
-                        scratch.verified_packets = recycled;
-                    }
-                }
-                if scratch.verified_packets.capacity() < num_packets {
-                    scratch
-                        .verified_packets
-                        .reserve(num_packets - scratch.verified_packets.capacity());
-                }
-                if packet_buf.len() == 1 {
-                    for packet in packet_buf[0].iter() {
-                        if let Some(packet) = verify_packet(packet, stakes, &self.stats) {
-                            scratch.verified_packets.push(packet);
-                        }
-                    }
-                } else {
-                    for packet_batch in packet_buf.iter() {
-                        for packet in packet_batch.iter() {
-                            if let Some(packet) = verify_packet(packet, stakes, &self.stats) {
-                                scratch.verified_packets.push(packet);
-                            }
-                        }
-                    }
-                }
-                std::mem::take(&mut scratch.verified_packets)
+            if num_packets < gossip_socket_consume_parallel_packet_threshold() {
+                packet_buf
+                    .iter()
+                    .flat_map(|packet_batch| packet_batch.iter())
+                    .filter_map(|packet| verify_packet(packet, stakes, &self.stats))
+                    .collect()
             } else {
-                thread_pool.unwrap().install(|| {
-                    if packet_buf.len() == 1 {
-                        packet_buf[0]
-                            .par_iter()
-                            .filter_map(|packet| {
-                                verify_packet(packet, stakes, &self.stats)
-                            })
-                            .collect()
-                    } else {
-                        packet_buf
-                            .par_iter()
-                            .flatten()
-                            .filter_map(|packet| {
-                                verify_packet(packet, stakes, &self.stats)
-                            })
-                            .collect()
-                    }
+                thread_pool.install(|| {
+                    packet_buf
+                        .par_iter()
+                        .flatten()
+                        .filter_map(|packet| verify_packet(packet, stakes, &self.stats))
+                        .collect()
                 })
             }
         };
-        if packets_verified.is_empty() {
-            packet_buf.clear();
-            return Ok(());
-        }
-        if let Err(TrySendError::Full(batch)) = sender.try_send(VerifiedPacketBatch {
-            packets: packets_verified,
-        }) {
-            scratch.verified_packets = batch.packets;
-            scratch.verified_packets.clear();
+        if let Err(TrySendError::Full(_)) = sender.try_send(packets_verified) {
             self.stats.gossip_packets_dropped_count.add_relaxed(
                 packet_buf
                     .iter()
@@ -2505,13 +2459,11 @@ impl ClusterInfo {
         Ok(())
     }
 
-    /// Process messages from the network
-    fn run_listen(
+    fn run_listen_legacy(
         &self,
         recycler: &PacketBatchRecycler,
         mut epoch_specs: Option<&mut EpochSpecs>,
-        receiver: &Receiver<VerifiedPacketBatch>,
-        recycle_sender: &Sender<Vec<(/*from:*/ SocketAddr, Protocol)>>,
+        receiver: &Receiver<Vec<(/*from:*/ SocketAddr, Protocol)>>,
         response_sender: &impl ChannelSend<PacketBatch>,
         thread_pool: &ThreadPool,
         should_check_duplicate_instance: bool,
@@ -2524,34 +2476,30 @@ impl ClusterInfo {
             .map(std::iter::once)?
             .chain(receiver.try_iter())
         {
-            packet_buf.push(pkts);
-            if packet_buf.len() == CHANNEL_CONSUME_CAPACITY {
+            packet_buf.push(VerifiedPacketBatch { packets: pkts });
+            if packet_buf.len() == gossip_channel_consume_capacity() {
                 break;
             }
         }
+        let stakes = epoch_specs
+            .as_mut()
+            .map(|epoch_specs| epoch_specs.current_epoch_staked_nodes())
+            .cloned()
+            .unwrap_or_default();
         let epoch_duration = epoch_specs
-            .as_deref_mut()
             .map(EpochSpecs::epoch_duration)
             .unwrap_or(DEFAULT_EPOCH_DURATION);
-        let empty_stakes = HashMap::new();
-        let stakes = if let Some(epoch_specs) = epoch_specs.as_deref_mut() {
-            epoch_specs.current_epoch_staked_nodes().as_ref()
-        } else {
-            &empty_stakes
-        };
         self.process_packets(
             packet_buf,
             scratch,
             thread_pool,
             recycler,
             response_sender,
-            stakes,
+            &stakes,
             epoch_duration,
             should_check_duplicate_instance,
         )?;
-        for batch in packet_buf.drain(..) {
-            let _ = recycle_sender.try_send(batch.packets);
-        }
+        packet_buf.clear();
         self.stats
             .gossip_listen_loop_iterations_since_last_report
             .add_relaxed(1);
@@ -2562,53 +2510,24 @@ impl ClusterInfo {
         self: Arc<Self>,
         bank_forks: Option<Arc<RwLock<BankForks>>>,
         receiver: PacketBatchReceiver,
-        sender: impl ChannelSend<VerifiedPacketBatch>,
-        recycle_receiver: Receiver<Vec<(/*from:*/ SocketAddr, Protocol)>>,
+        sender: impl ChannelSend<Vec<(/*from:*/ SocketAddr, Protocol)>>,
         exit: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
-        let allowed_core_ids = allowed_gossip_core_ids();
-        let consume_threads = gossip_socket_consume_threads();
-        let thread_pool = if consume_threads > 1 {
-            Some(
-                ThreadPoolBuilder::new()
-                    .num_threads(consume_threads)
-                    .thread_name(|i| format!("solGossipCons{i:02}"))
-                    .start_handler({
-                        let allowed_core_ids = allowed_core_ids.clone();
-                        move |index| {
-                            maybe_pin_gossip_thread(
-                                "solGossipCons",
-                                index,
-                                GOSSIP_SOCKET_CONSUME_CORE_OFFSET,
-                                &allowed_core_ids,
-                            );
-                        }
-                    })
-                    .build()
-                    .unwrap(),
-            )
-        } else {
-            None
-        };
+        let thread_pool = ThreadPoolBuilder::new()
+            .num_threads(get_thread_count().min(8))
+            .thread_name(|i| format!("solGossipCons{i:02}"))
+            .build()
+            .unwrap();
         let mut epoch_specs = bank_forks.map(EpochSpecs::from);
         let mut packet_buf = Vec::with_capacity(gossip_channel_consume_capacity());
-        let mut scratch = SocketConsumeScratch::new();
         let run_consume = move || {
-            maybe_pin_gossip_thread(
-                "solGossipConsum",
-                0,
-                GOSSIP_SOCKET_CONSUME_CORE_OFFSET,
-                &allowed_core_ids,
-            );
             while !exit.load(Ordering::Relaxed) {
-                let result = self.run_socket_consume(
-                    thread_pool.as_ref(),
+                let result = self.run_socket_consume_legacy(
+                    &thread_pool,
                     epoch_specs.as_mut(),
                     &receiver,
                     &sender,
-                    &recycle_receiver,
                     &mut packet_buf,
-                    &mut scratch,
                 );
                 match result {
                     // A recv operation can only fail if the sending end of a
@@ -2629,28 +2548,15 @@ impl ClusterInfo {
     pub(crate) fn listen(
         self: Arc<Self>,
         bank_forks: Option<Arc<RwLock<BankForks>>>,
-        requests_receiver: Receiver<VerifiedPacketBatch>,
-        recycle_sender: Sender<Vec<(/*from:*/ SocketAddr, Protocol)>>,
+        requests_receiver: Receiver<Vec<(/*from:*/ SocketAddr, Protocol)>>,
         response_sender: impl ChannelSend<PacketBatch>,
         should_check_duplicate_instance: bool,
         exit: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
         let recycler = PacketBatchRecycler::default();
-        let allowed_core_ids = allowed_gossip_core_ids();
         let thread_pool = ThreadPoolBuilder::new()
-            .num_threads(gossip_listen_threads())
+            .num_threads(get_thread_count().min(8))
             .thread_name(|i| format!("solGossipWork{i:02}"))
-            .start_handler({
-                let allowed_core_ids = allowed_core_ids.clone();
-                move |index| {
-                    maybe_pin_gossip_thread(
-                        "solGossipWork",
-                        index,
-                        GOSSIP_LISTEN_WORK_CORE_OFFSET,
-                        &allowed_core_ids,
-                    );
-                }
-            })
             .build()
             .unwrap();
         let mut epoch_specs = bank_forks.map(EpochSpecs::from);
@@ -2659,18 +2565,11 @@ impl ClusterInfo {
         Builder::new()
             .name("solGossipListen".to_string())
             .spawn(move || {
-                maybe_pin_gossip_thread(
-                    "solGossipListen",
-                    0,
-                    GOSSIP_LISTEN_LOOP_CORE_OFFSET,
-                    &allowed_core_ids,
-                );
                 while !exit.load(Ordering::Relaxed) {
-                    let result = self.run_listen(
+                    let result = self.run_listen_legacy(
                         &recycler,
                         epoch_specs.as_mut(),
                         &requests_receiver,
-                        &recycle_sender,
                         &response_sender,
                         &thread_pool,
                         should_check_duplicate_instance,
@@ -2982,7 +2881,7 @@ mod tests {
         },
     };
 
-    #[cfg(feature = "duplicate-shred-tools")]
+    #[cfg(feature = "duplicate-shred-rocksdb")]
     use {
         crate::duplicate_shred::tests::new_rand_shred,
         solana_ledger::shred::Shredder,
@@ -3968,7 +3867,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "duplicate-shred-tools")]
+    #[cfg(feature = "duplicate-shred-rocksdb")]
     fn test_get_duplicate_shreds() {
         let host1_key = Arc::new(Keypair::new());
         let node = Node::new_localhost_with_pubkey(&host1_key.pubkey());

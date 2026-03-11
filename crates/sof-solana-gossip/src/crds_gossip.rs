@@ -32,7 +32,7 @@ use {
     },
 };
 
-#[cfg(feature = "duplicate-shred-tools")]
+#[cfg(feature = "duplicate-shred-rocksdb")]
 use {
     crate::{
         crds::GossipRoute,
@@ -93,7 +93,7 @@ impl CrdsGossip {
             .new_push_messages(pubkey, &self.crds, now, stakes, should_retain_crds_value)
     }
 
-    #[cfg(feature = "duplicate-shred-tools")]
+    #[cfg(feature = "duplicate-shred-rocksdb")]
     pub(crate) fn push_duplicate_shred<F>(
         &self,
         keypair: &Keypair,

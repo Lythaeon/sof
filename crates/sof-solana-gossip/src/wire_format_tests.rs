@@ -4,9 +4,11 @@
 mod tests {
 
     use {
+        crate::{contact_info::ContactInfo, crds_data::CrdsData},
         crate::protocol::Protocol,
         serde::Serialize,
         solana_net_utils::tooling_for_tests::{hexdump, validate_packet_format},
+        solana_pubkey::Pubkey,
         solana_sanitize::Sanitize,
         std::path::PathBuf,
     };
@@ -61,5 +63,16 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn test_crds_contact_info_variant_offset_is_stable() {
+        let value = CrdsData::from(ContactInfo::new_localhost(
+            &Pubkey::new_unique(),
+            123456789,
+        ));
+        let bytes = bincode::serialize(&value).unwrap();
+        assert!(bytes.len() >= 4);
+        assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 11);
     }
 }

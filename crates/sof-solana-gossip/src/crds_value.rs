@@ -18,7 +18,6 @@ use {
     std::borrow::{Borrow, Cow},
 };
 
-#[cfg(feature = "duplicate-shred-tools")]
 use crate::duplicate_shred::DuplicateShredIndex;
 
 /// CrdsValue that is replicated across the cluster
@@ -73,7 +72,6 @@ pub enum CrdsValueLabel {
     LegacyVersion(Pubkey),
     Version(Pubkey),
     NodeInstance(Pubkey),
-    #[cfg(feature = "duplicate-shred-tools")]
     DuplicateShred(DuplicateShredIndex, Pubkey),
     SnapshotHashes(Pubkey),
     ContactInfo(Pubkey),
@@ -93,7 +91,6 @@ impl CrdsValueLabel {
             CrdsValueLabel::LegacyVersion(p) => *p,
             CrdsValueLabel::Version(p) => *p,
             CrdsValueLabel::NodeInstance(p) => *p,
-            #[cfg(feature = "duplicate-shred-tools")]
             CrdsValueLabel::DuplicateShred(_, p) => *p,
             CrdsValueLabel::SnapshotHashes(p) => *p,
             CrdsValueLabel::ContactInfo(pubkey) => *pubkey,
@@ -180,7 +177,6 @@ impl CrdsValue {
             CrdsData::LegacyVersion(_) => CrdsValueLabel::LegacyVersion(pubkey),
             CrdsData::Version(_) => CrdsValueLabel::Version(pubkey),
             CrdsData::NodeInstance(_) => CrdsValueLabel::NodeInstance(pubkey),
-            #[cfg(feature = "duplicate-shred-tools")]
             CrdsData::DuplicateShred(ix, _) => CrdsValueLabel::DuplicateShred(ix, pubkey),
             CrdsData::SnapshotHashes(_) => CrdsValueLabel::SnapshotHashes(pubkey),
             CrdsData::ContactInfo(_) => CrdsValueLabel::ContactInfo(pubkey),

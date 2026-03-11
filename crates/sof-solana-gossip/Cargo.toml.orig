@@ -33,8 +33,9 @@ targets = ["x86_64-unknown-linux-gnu"]
 
 [features]
 agave-unstable-api = []
-duplicate-shred-tools = ["dep:solana-ledger"]
-solana-ledger = ["duplicate-shred-tools"]
+duplicate-shred-rocksdb = ["dep:solana-ledger"]
+duplicate-shred-tools = ["duplicate-shred-rocksdb"]
+solana-ledger = ["duplicate-shred-rocksdb"]
 
 [lib]
 name = "solana_gossip"

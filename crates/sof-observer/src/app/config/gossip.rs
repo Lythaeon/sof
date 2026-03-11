@@ -1,14 +1,13 @@
 #[cfg(feature = "gossip-bootstrap")]
+use solana_net_utils::PortRange;
+#[cfg(feature = "gossip-bootstrap")]
+use solana_pubkey::Pubkey;
+#[cfg(feature = "gossip-bootstrap")]
 use std::collections::HashSet;
 #[cfg(feature = "gossip-bootstrap")]
 use std::num::NonZeroUsize;
 #[cfg(feature = "gossip-bootstrap")]
 use std::num::ParseIntError;
-
-#[cfg(feature = "gossip-bootstrap")]
-use solana_net_utils::PortRange;
-#[cfg(feature = "gossip-bootstrap")]
-use solana_pubkey::Pubkey;
 #[cfg(feature = "gossip-bootstrap")]
 use thiserror::Error;
 

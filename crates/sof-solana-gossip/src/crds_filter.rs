@@ -41,7 +41,6 @@ pub(crate) fn should_retain_crds_value(
         CrdsData::ContactInfo(_) => true,
         // Unstaked nodes can still serve snapshots.
         CrdsData::SnapshotHashes(_) => true,
-        #[cfg(feature = "duplicate-shred-tools")]
         CrdsData::DuplicateShred(_, _) => retain_if_staked(),
         // Consensus related messages only allowed for staked nodes
         CrdsData::LowestSlot(0, _)
