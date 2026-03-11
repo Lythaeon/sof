@@ -4,6 +4,11 @@ use super::*;
 use thiserror::Error;
 
 #[cfg(feature = "gossip-bootstrap")]
+const GOSSIP_RECEIVER_STOP_TIMEOUT: Duration = Duration::from_millis(750);
+#[cfg(feature = "gossip-bootstrap")]
+const GOSSIP_RUNTIME_DROP_TIMEOUT: Duration = Duration::from_millis(2_000);
+
+#[cfg(feature = "gossip-bootstrap")]
 pub(super) fn is_bind_conflict_error(error: &impl std::fmt::Display) -> bool {
     let rendered = error.to_string();
     rendered.contains("Address already in use")
@@ -12,17 +17,45 @@ pub(super) fn is_bind_conflict_error(error: &impl std::fmt::Display) -> bool {
 }
 
 #[cfg(feature = "gossip-bootstrap")]
-pub(super) async fn stop_gossip_runtime_components(
+pub(crate) async fn stop_gossip_runtime_components(
     receiver_handles: Vec<JoinHandle<()>>,
     gossip_runtime: Option<GossipRuntime>,
 ) {
-    for handle in receiver_handles {
+    for handle in &receiver_handles {
         handle.abort();
-        if handle.await.is_err() {
-            // Receiver task was already aborted/cancelled.
+    }
+    for handle in receiver_handles {
+        match tokio::time::timeout(GOSSIP_RECEIVER_STOP_TIMEOUT, handle).await {
+            Ok(joined) => {
+                if joined.is_err() {
+                    // Receiver task was already aborted/cancelled.
+                }
+            }
+            Err(_) => {
+                tracing::warn!("timed out waiting for aborted gossip receiver task to stop");
+            }
         }
     }
-    drop(gossip_runtime);
+    if let Some(gossip_runtime) = gossip_runtime {
+        match tokio::time::timeout(
+            GOSSIP_RUNTIME_DROP_TIMEOUT,
+            tokio::task::spawn_blocking(move || drop(gossip_runtime)),
+        )
+        .await
+        {
+            Ok(joined) => {
+                if let Err(error) = joined {
+                    tracing::warn!(
+                        ?error,
+                        "failed to join blocking gossip runtime shutdown task"
+                    );
+                }
+            }
+            Err(_) => {
+                tracing::warn!("timed out waiting for gossip runtime control plane shutdown");
+            }
+        }
+    }
 }
 
 #[cfg(feature = "gossip-bootstrap")]
@@ -446,6 +479,9 @@ async fn start_gossip_bootstrapped_receiver(
         exit.clone(),
     );
 
+    // Bootstrap/runtime switching should only consider TVU ingress. Repair/control
+    // traffic can be present on otherwise dead runtimes and must not count as
+    // "healthy" packet flow.
     let ingest_telemetry = ingest::ReceiverTelemetry::default();
     let mut receiver_handles = Vec::with_capacity(node.sockets.tvu.len().saturating_add(1));
     for socket in &node.sockets.tvu {
@@ -474,7 +510,7 @@ async fn start_gossip_bootstrapped_receiver(
     receiver_handles.push(ingest::spawn_udp_receiver_from_std_with_telemetry(
         repair_receiver_socket,
         tx,
-        Some(ingest_telemetry.clone()),
+        None,
     ));
 
     let repair_client = if read_repair_enabled() {

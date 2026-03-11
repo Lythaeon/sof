@@ -4,8 +4,7 @@ use {
     crate::{
         cluster_info::{
             gossip_receiver_channel_capacity, gossip_response_channel_capacity,
-            gossip_socket_consume_channel_capacity, ClusterInfo, VerifiedPacketBatch,
-            GOSSIP_CHANNEL_CAPACITY,
+            gossip_socket_consume_channel_capacity, ClusterInfo,
         },
         cluster_info_metrics::submit_gossip_stats,
         contact_info::ContactInfo,
@@ -64,24 +63,14 @@ impl GossipService {
         stats_reporter_sender: Option<Sender<Box<dyn FnOnce() + Send>>>,
         exit: Arc<AtomicBool>,
     ) -> Self {
-        let receiver_channel_capacity = gossip_receiver_channel_capacity();
-        let socket_consume_channel_capacity = gossip_socket_consume_channel_capacity();
-        let response_channel_capacity = gossip_response_channel_capacity();
         let (request_sender, request_receiver) =
-            EvictingSender::new_bounded(receiver_channel_capacity);
+            EvictingSender::new_bounded(gossip_receiver_channel_capacity());
         trace!(
             "GossipService: id: {}, listening on primary interface: {:?}, all available \
              interfaces: {:?}",
             &cluster_info.id(),
             gossip_sockets[0].local_addr().unwrap(),
             gossip_sockets,
-        );
-        info!(
-            "gossip channel capacities: receiver={} socket_consume={} response={} legacy_default={}",
-            receiver_channel_capacity,
-            socket_consume_channel_capacity,
-            response_channel_capacity,
-            GOSSIP_CHANNEL_CAPACITY,
         );
         let socket_addr_space = *cluster_info.socket_addr_space();
         let gossip_receiver_stats = Arc::new(StreamerReceiveStats::new("gossip_receiver"));
@@ -99,22 +88,18 @@ impl GossipService {
             false,
         );
         let (consume_sender, listen_receiver) =
-            EvictingSender::<VerifiedPacketBatch>::new_bounded(socket_consume_channel_capacity);
-        let (consume_recycle_sender, consume_recycle_receiver) =
-            crossbeam_channel::bounded(socket_consume_channel_capacity.max(1));
+            EvictingSender::new_bounded(gossip_socket_consume_channel_capacity());
         let t_socket_consume = cluster_info.clone().start_socket_consume_thread(
             bank_forks.clone(),
             request_receiver,
             consume_sender,
-            consume_recycle_receiver,
             exit.clone(),
         );
         let (response_sender, response_receiver) =
-            EvictingSender::new_bounded(response_channel_capacity);
+            EvictingSender::new_bounded(gossip_response_channel_capacity());
         let t_listen = cluster_info.clone().listen(
             bank_forks.clone(),
             listen_receiver,
-            consume_recycle_sender,
             response_sender.clone(),
             should_check_duplicate_instance,
             exit.clone(),
@@ -127,44 +112,42 @@ impl GossipService {
         );
         let t_responder = streamer::responder_atomic(
             "Gossip",
-            gossip_sockets.clone(),
+            gossip_sockets,
             cluster_info.bind_ip_addrs(),
             response_receiver,
             socket_addr_space,
             stats_reporter_sender,
         );
-        let mut thread_hdls = vec![
+        let t_metrics = Builder::new()
+            .name("solGossipMetr".to_string())
+            .spawn({
+                let cluster_info = cluster_info.clone();
+                let mut epoch_specs = bank_forks.map(EpochSpecs::from);
+                let stats_interval =
+                    gossip_stats_interval().unwrap_or(DEFAULT_SUBMIT_GOSSIP_STATS_INTERVAL);
+                move || {
+                    while !exit.load(Ordering::Relaxed) {
+                        sleep(stats_interval);
+                        let stakes = epoch_specs
+                            .as_mut()
+                            .map(|epoch_specs| epoch_specs.current_epoch_staked_nodes())
+                            .cloned()
+                            .unwrap_or_default();
+
+                        submit_gossip_stats(&cluster_info.stats, &cluster_info.gossip, &stakes);
+                        gossip_receiver_stats.report();
+                    }
+                }
+            })
+            .unwrap();
+        let thread_hdls = vec![
             t_receiver,
             t_responder,
             t_socket_consume,
             t_listen,
             t_gossip,
+            t_metrics,
         ];
-        if let Some(stats_interval) = gossip_stats_interval() {
-            let t_metrics = Builder::new()
-                .name("solGossipMetr".to_string())
-                .spawn({
-                    let cluster_info = cluster_info.clone();
-                    let mut epoch_specs = bank_forks.map(EpochSpecs::from);
-                    move || {
-                        while !exit.load(Ordering::Relaxed) {
-                            sleep(stats_interval);
-                            let stakes = epoch_specs
-                                .as_mut()
-                                .map(|epoch_specs| epoch_specs.current_epoch_staked_nodes())
-                                .cloned()
-                                .unwrap_or_default();
-
-                            submit_gossip_stats(&cluster_info.stats, &cluster_info.gossip, &stakes);
-                            gossip_receiver_stats.report();
-                        }
-                    }
-                })
-                .unwrap();
-            thread_hdls.push(t_metrics);
-        } else {
-            info!("gossip metrics reporting disabled");
-        }
         Self { thread_hdls }
     }
 

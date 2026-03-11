@@ -1,14 +1,18 @@
 use {
-    crate::{contact_info, duplicate_shred},
+    crate::contact_info,
     crossbeam_channel::{RecvError, SendError},
     std::io,
     thiserror::Error,
 };
 
+#[cfg(feature = "duplicate-shred-rocksdb")]
+use crate::duplicate_shred;
+
 #[derive(Error, Debug)]
 pub enum GossipError {
     #[error("duplicate node instance")]
     DuplicateNodeInstance,
+    #[cfg(feature = "duplicate-shred-rocksdb")]
     #[error(transparent)]
     DuplicateShredError(#[from] duplicate_shred::Error),
     #[error(transparent)]

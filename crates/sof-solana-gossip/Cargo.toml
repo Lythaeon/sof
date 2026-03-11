@@ -33,6 +33,9 @@ targets = ["x86_64-unknown-linux-gnu"]
 
 [features]
 agave-unstable-api = []
+duplicate-shred-rocksdb = ["dep:solana-ledger"]
+duplicate-shred-tools = ["duplicate-shred-rocksdb"]
+solana-ledger = ["duplicate-shred-rocksdb"]
 
 [lib]
 name = "solana_gossip"
@@ -99,11 +102,11 @@ features = ["serde"]
 [dependencies.clap]
 version = "2.33.1"
 
-[dependencies.crossbeam-channel]
-version = "0.5.15"
-
 [dependencies.core_affinity]
 version = "0.8"
+
+[dependencies.crossbeam-channel]
+version = "0.5.15"
 
 [dependencies.flate2]
 version = "1.0.31"
@@ -183,6 +186,7 @@ version = "=3.0.1"
 
 [dependencies.solana-ledger]
 version = "=3.1.8"
+optional = true
 features = [
     "agave-unstable-api",
     "agave-unstable-api",

@@ -18,6 +18,7 @@ It is split into three user-facing crates:
 - Bundled gossip backend tuning for queue depths, worker counts, CPU pinning, and small-batch serial fallbacks
 - Local market-facing control-plane signals for leader, topology, blockhash, replay, and fork state
 - Local `processed` / `confirmed` / `finalized` transaction tagging
+- Semantic shred dedupe that suppresses duplicate or conflicting downstream event emission
 - Plugin hooks and runtime extensions for downstream logic
 - Lower-copy hot paths through shared dataset payload fragments and borrowed transaction classification
 - Replayable derived-state feed for restart-safe stateful services
@@ -78,6 +79,19 @@ Kernel-bypass integrations:
 
 - `sof` supports external ingress APIs through `--features kernel-bypass`
 - `sof-tx` supports custom direct transport adapters through `--features kernel-bypass`
+- `sof-solana-gossip` defaults to the lightweight in-memory duplicate/conflict path; pass `--features solana-ledger` only if you explicitly want the heavier ledger/RocksDB duplicate-shred tooling
+
+## Duplicate Shred Policy
+
+SOF is optimized by default for low-latency observer and execution workloads, not validator-style
+duplicate-shred durability.
+
+- Default behavior: SOF keeps duplicate/conflict suppression in memory and enforces a semantic
+  shred uniqueness contract before downstream dataset, transaction, and account-touch emission.
+- Opt-in durability: if you embed the vendored `sof-solana-gossip` crate directly and need the
+  heavier validator-style duplicate-shred tooling, build it with `--features solana-ledger`.
+- Tradeoff: the default path is lower latency and avoids RocksDB/native storage overhead; the
+  ledger-backed path is heavier but keeps the older durable duplicate-shred machinery available.
 
 ## Quick Start
 

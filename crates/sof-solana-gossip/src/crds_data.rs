@@ -2,7 +2,6 @@ use {
     crate::{
         contact_info::ContactInfo,
         deprecated,
-        duplicate_shred::{DuplicateShred, DuplicateShredIndex, MAX_DUPLICATE_SHREDS},
         epoch_slots::EpochSlots,
         legacy_contact_info::LegacyContactInfo,
         restart_crds_values::{RestartHeaviestFork, RestartLastVotedForkSlots},
@@ -18,6 +17,8 @@ use {
     solana_vote::vote_parser,
     std::collections::BTreeSet,
 };
+
+use crate::duplicate_shred::{DuplicateShred, DuplicateShredIndex, MAX_DUPLICATE_SHREDS};
 
 pub(crate) const MAX_WALLCLOCK: u64 = 1_000_000_000_000_000;
 pub(crate) const MAX_SLOT: u64 = 1_000_000_000_000_000;

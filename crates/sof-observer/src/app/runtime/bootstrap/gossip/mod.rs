@@ -4,6 +4,8 @@ mod receiver;
 #[cfg(feature = "gossip-bootstrap")]
 mod switch;
 
+#[cfg(feature = "gossip-bootstrap")]
+pub(crate) use handoff::stop_gossip_runtime_components;
 #[cfg(feature = "kernel-bypass")]
 pub(crate) use receiver::start_external_receiver;
 pub(crate) use receiver::{ReceiverBootstrapError, start_receiver};
@@ -20,6 +22,5 @@ use entrypoints::{
 #[cfg(feature = "gossip-bootstrap")]
 use handoff::{
     build_gossip_runtime_port_plan, format_port_range, is_bind_conflict_error,
-    start_gossip_bootstrapped_receiver_guarded, stop_gossip_runtime_components,
-    wait_for_runtime_stabilization,
+    start_gossip_bootstrapped_receiver_guarded, wait_for_runtime_stabilization,
 };

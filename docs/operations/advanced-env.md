@@ -40,6 +40,15 @@ Important scope note:
 
 - SOF's bundled `sof-solana-gossip` fork exposes queue-capacity knobs, Rayon worker-count knobs, CPU pinning for gossip threads, and small-batch serial fallbacks for gossip bootstrap.
 - `arb-bot` was the proving ground for those lower-level gossip tuning changes before they were carried into SOF.
+- The vendored gossip crate now defaults to SOF's lightweight in-memory duplicate/conflict path. The validator-style ledger/RocksDB duplicate-shred tooling is opt-in behind the `solana-ledger` crate feature when you explicitly need it.
+
+Duplicate-shred mode guidance:
+
+- Default SOF build: optimized for low-latency observer/runtime use, with in-memory semantic
+  duplicate/conflict suppression and no RocksDB dependency in the normal path.
+- Optional ledger mode: if you are building `sof-solana-gossip` directly and want the older
+  duplicate-shred persistence path, enable `--features solana-ledger`.
+- Do not enable the ledger path unless you explicitly want that heavier durability/tooling tradeoff.
 
 ## Runtime and dataset tuning
 
@@ -74,8 +83,29 @@ Important scope note:
 | `SOF_VERIFY_SIGNATURE_CACHE` | `65536` | Cache size directly impacts memory and miss behavior. |
 | `SOF_VERIFY_SLOT_WINDOW` | `4096` | Leader-window sizing trades memory for hit rate. |
 | `SOF_VERIFY_UNKNOWN_RETRY_MS` | `2000` | Retry cadence affects false unknowns vs CPU/network cost. |
-| `SOF_SHRED_DEDUP_CAPACITY` | `262144` | Too low increases duplicate processing; too high burns memory. |
-| `SOF_SHRED_DEDUP_TTL_MS` | `250` | TTL controls duplicate acceptance during jitter bursts. |
+| `SOF_SHRED_DEDUP_CAPACITY` | `262144` | Bounds the semantic shred dedupe cache that protects downstream event surfaces from duplicate or conflicting shred observations. Too low weakens that protection under heavy churn; too high burns memory. |
+| `SOF_SHRED_DEDUP_TTL_MS` | `250` | TTL is no longer the whole dedupe contract. SOF now keeps recent slot-window shred identities past the raw TTL so late repeats do not rebuild duplicate datasets or tx streams; TTL mainly governs when older slots become evictable. |
+
+Dedupe telemetry to watch while tuning:
+
+- `shred_dedupe_entries`
+- `shred_dedupe_max_entries`
+- `shred_dedupe_queue_depth`
+- `shred_dedupe_max_queue_depth`
+- `shred_dedupe_capacity_evictions_total`
+- `shred_dedupe_expired_evictions_total`
+- `shred_dedupe_ingress_duplicate_drops_total`
+- `shred_dedupe_ingress_conflict_drops_total`
+- `shred_dedupe_canonical_duplicate_drops_total`
+- `shred_dedupe_canonical_conflict_drops_total`
+
+Interpretation:
+
+- Capacity evictions increasing means the cache is too small for current churn.
+- Expiry evictions increasing without capacity pressure is normal bounded retention behavior.
+- Ingress drops tell you how much duplicate/conflicting traffic is being stopped before worker cost.
+- Canonical drops tell you how many repeats would still have reached downstream emission without the
+  final correctness boundary.
 
 ## Relay cache tuning
 

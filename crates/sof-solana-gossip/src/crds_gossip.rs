@@ -8,34 +8,41 @@ use {
     crate::{
         cluster_info_metrics::GossipStats,
         contact_info::ContactInfo,
-        crds::{Crds, GossipRoute},
-        crds_data::CrdsData,
+        crds::Crds,
         crds_gossip_error::CrdsGossipError,
         crds_gossip_pull::{
             CrdsFilter, CrdsGossipPull, CrdsTimeouts, ProcessPullStats, PullRequest,
         },
         crds_gossip_push::CrdsGossipPush,
         crds_value::CrdsValue,
-        duplicate_shred::{self, DuplicateShredIndex, MAX_DUPLICATE_SHREDS},
         protocol::{Ping, PingCache},
     },
     itertools::Itertools,
     rand::{CryptoRng, Rng},
     rayon::ThreadPool,
-    solana_clock::Slot,
     solana_hash::Hash,
     solana_keypair::Keypair,
-    solana_ledger::shred::Shred,
     solana_pubkey::Pubkey,
-    solana_signer::Signer,
     solana_streamer::socket::SocketAddrSpace,
-    solana_time_utils::timestamp,
     std::{
         collections::{HashMap, HashSet},
         net::SocketAddr,
         sync::{Mutex, RwLock},
         time::{Duration, Instant},
     },
+};
+
+#[cfg(feature = "duplicate-shred-rocksdb")]
+use {
+    crate::{
+        crds::GossipRoute,
+        crds_data::CrdsData,
+        duplicate_shred::{self, DuplicateShredIndex, MAX_DUPLICATE_SHREDS},
+    },
+    solana_clock::Slot,
+    solana_ledger::shred::Shred,
+    solana_signer::Signer,
+    solana_time_utils::timestamp,
 };
 
 #[derive(Default)]
@@ -86,6 +93,7 @@ impl CrdsGossip {
             .new_push_messages(pubkey, &self.crds, now, stakes, should_retain_crds_value)
     }
 
+    #[cfg(feature = "duplicate-shred-rocksdb")]
     pub(crate) fn push_duplicate_shred<F>(
         &self,
         keypair: &Keypair,

@@ -41,9 +41,9 @@ pub(crate) fn should_retain_crds_value(
         CrdsData::ContactInfo(_) => true,
         // Unstaked nodes can still serve snapshots.
         CrdsData::SnapshotHashes(_) => true,
+        CrdsData::DuplicateShred(_, _) => retain_if_staked(),
         // Consensus related messages only allowed for staked nodes
-        CrdsData::DuplicateShred(_, _)
-        | CrdsData::LowestSlot(0, _)
+        CrdsData::LowestSlot(0, _)
         | CrdsData::RestartHeaviestFork(_)
         | CrdsData::RestartLastVotedForkSlots(_) => retain_if_staked(),
         // Unstaked nodes can technically send EpochSlots, but we do not want them

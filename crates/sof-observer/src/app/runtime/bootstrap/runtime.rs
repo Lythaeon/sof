@@ -110,14 +110,12 @@ impl ReceiverRuntime {
     pub(in crate::app::runtime) async fn stop_gossip_runtime(&mut self) {
         let mut handles = Vec::new();
         handles.append(&mut self.gossip_receiver_handles);
-        for handle in handles {
-            handle.abort();
-            if handle.await.is_err() {
-                // Receiver task was already aborted/cancelled.
-            }
-        }
+        crate::app::runtime::bootstrap::gossip::stop_gossip_runtime_components(
+            handles,
+            self.gossip_runtime.take(),
+        )
+        .await;
         self.gossip_ingest_telemetry = None;
-        self.gossip_runtime = None;
         self.repair_client = None;
         self.active_gossip_entrypoint = None;
         self.gossip_runtime_active_port_range = None;

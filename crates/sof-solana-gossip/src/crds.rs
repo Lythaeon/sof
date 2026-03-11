@@ -234,7 +234,8 @@ impl Crds {
         let pubkey = value.pubkey();
         let value = VersionedCrdsValue::new(value, self.cursor, now, route);
         let mut stats = self.stats.lock().unwrap();
-        match self.table.entry(label) {
+        let entry = self.table.entry(label);
+        match entry {
             Entry::Vacant(entry) => {
                 stats.record_insert(&value, route);
                 let entry_index = entry.index();
@@ -378,6 +379,7 @@ impl Crds {
 
     /// Returns duplicate-shreds inserted since the given cursor.
     /// Updates the cursor as the values are consumed.
+    #[cfg(feature = "duplicate-shred-rocksdb")]
     pub(crate) fn get_duplicate_shreds<'a>(
         &'a self,
         cursor: &'a mut Cursor,
@@ -404,6 +406,7 @@ impl Crds {
     }
 
     /// Returns all records associated with a pubkey.
+    #[cfg(feature = "duplicate-shred-rocksdb")]
     pub(crate) fn get_records(&self, pubkey: &Pubkey) -> impl Iterator<Item = &VersionedCrdsValue> {
         self.records
             .get(pubkey)

@@ -379,8 +379,6 @@ async fn run_async_with_hosts_inner(
     let verify_unknown_retry = Duration::from_millis(read_verify_unknown_retry_ms());
     let dedupe_capacity = read_shred_dedupe_capacity();
     let dedupe_ttl_ms = read_shred_dedupe_ttl_ms();
-    let mut dedupe_cache = (dedupe_capacity > 0 && dedupe_ttl_ms > 0)
-        .then(|| RecentShredCache::new(dedupe_capacity, Duration::from_millis(dedupe_ttl_ms)));
     let verify_slot_leader_window = read_verify_slot_leader_window();
     tracing::info!(
         verify_shreds = verify_enabled,
@@ -556,6 +554,14 @@ async fn run_async_with_hosts_inner(
     let packet_workers = read_packet_workers();
     let packet_worker_queue_capacity = read_packet_worker_queue_capacity();
     let dataset_tail_min_shreds_without_anchor = read_dataset_tail_min_shreds_without_anchor();
+    let mut shred_dedupe_cache = (dedupe_capacity > 0 && dedupe_ttl_ms > 0).then(|| {
+        ShredDedupeCache::new(
+            dedupe_capacity,
+            Duration::from_millis(dedupe_ttl_ms),
+            dataset_retained_slot_lag,
+        )
+    });
+    sync_shred_dedupe_runtime_metrics(shred_dedupe_cache.as_ref());
     let mut packet_worker_pool = PacketWorkerPool::new(PacketWorkerPoolConfig {
         workers: packet_workers,
         queue_capacity: packet_worker_queue_capacity,
@@ -639,7 +645,10 @@ async fn run_async_with_hosts_inner(
     let mut udp_relay_backoff_drops: u64 = 0;
     #[cfg(not(feature = "gossip-bootstrap"))]
     let udp_relay_backoff_drops: u64 = 0;
-    let mut dedupe_drop_count: u64 = 0;
+    let mut dedupe_ingress_duplicate_drop_count: u64 = 0;
+    let mut dedupe_ingress_conflict_drop_count: u64 = 0;
+    let mut dedupe_canonical_duplicate_drop_count: u64 = 0;
+    let mut dedupe_canonical_conflict_drop_count: u64 = 0;
     let mut vote_only_count: u64 = 0;
     let mut mixed_count: u64 = 0;
     let mut non_vote_count: u64 = 0;
@@ -950,6 +959,9 @@ async fn run_async_with_hosts_inner(
                     missing_tracker: &mut missing_tracker,
                     outstanding_repairs: &mut outstanding_repairs,
                     repair_outstanding_cleared_on_receive: &mut repair_outstanding_cleared_on_receive,
+                    shred_dedupe_cache: &mut shred_dedupe_cache,
+                    dedupe_canonical_duplicate_drop_count: &mut dedupe_canonical_duplicate_drop_count,
+                    dedupe_canonical_conflict_drop_count: &mut dedupe_canonical_conflict_drop_count,
                     dataset_reassembler: &mut dataset_reassembler,
                     dataset_retained_slot_lag,
                     dataset_worker_queues: dataset_worker_pool.queues(),
@@ -1137,11 +1149,42 @@ async fn run_async_with_hosts_inner(
                             continue;
                         }
                     };
-                    if let Some(cache) = dedupe_cache.as_mut()
-                        && cache.is_recent_duplicate(packet_bytes.as_ref(), &parsed_shred, observed_at)
-                    {
-                        dedupe_drop_count = dedupe_drop_count.saturating_add(1);
-                        continue;
+                    if let Some(cache) = shred_dedupe_cache.as_mut() {
+                        match cache.observe_shred(packet_bytes.as_ref(), &parsed_shred, observed_at)
+                        {
+                            ShredDedupeObservation::Accepted => {}
+                            ShredDedupeObservation::Duplicate => {
+                                dedupe_ingress_duplicate_drop_count =
+                                    dedupe_ingress_duplicate_drop_count.saturating_add(1);
+                                crate::runtime_metrics::observe_shred_dedupe_drops(
+                                    ShredDedupeStage::Ingress,
+                                    1,
+                                    0,
+                                );
+                                continue;
+                            }
+                            ShredDedupeObservation::Conflict => {
+                                dedupe_ingress_conflict_drop_count =
+                                    dedupe_ingress_conflict_drop_count.saturating_add(1);
+                                crate::runtime_metrics::observe_shred_dedupe_drops(
+                                    ShredDedupeStage::Ingress,
+                                    0,
+                                    1,
+                                );
+                                if dedupe_ingress_conflict_drop_count
+                                    <= INITIAL_DEBUG_SAMPLE_LOG_LIMIT
+                                {
+                                    tracing::warn!(
+                                        source = %source_addr,
+                                        slot = parsed_shred_slot(&parsed_shred),
+                                        index = parsed_shred_index(&parsed_shred),
+                                        fec_set_index = parsed_shred_fec_set_index(&parsed_shred),
+                                        "dropping conflicting duplicate shred before dispatch"
+                                    );
+                                }
+                                continue;
+                            }
+                        }
                     }
                     if let Some(cache) = relay_cache.as_ref() {
                         let outcome = cache.insert(&packet_bytes, &parsed_shred, observed_at);
@@ -1666,9 +1709,10 @@ async fn run_async_with_hosts_inner(
                                         repair_driver_enabled =
                                             repair_command_tx.is_some();
                                     }
-                                    if let Some(cache) = dedupe_cache.as_mut() {
+                                    if let Some(cache) = shred_dedupe_cache.as_mut() {
                                         cache.clear();
                                     }
+                                    sync_shred_dedupe_runtime_metrics(shred_dedupe_cache.as_ref());
                                     outstanding_repairs = Some(OutstandingRepairRequests::new(
                                         Duration::from_millis(repair_outstanding_timeout_ms),
                                     ));
@@ -1998,6 +2042,7 @@ async fn run_async_with_hosts_inner(
                 let derived_state_consumer_telemetry = derived_state_host.consumer_telemetry();
                 let derived_state_replay_telemetry =
                     derived_state_host.replay_telemetry().unwrap_or_default();
+                sync_shred_dedupe_runtime_metrics(shred_dedupe_cache.as_ref());
                 let runtime_stage_metrics = crate::runtime_metrics::snapshot();
                 telemetry_tick_count = telemetry_tick_count.saturating_add(1);
                 let dataset_queue_pressure = dataset_queue_capacity_total > 0
@@ -2006,12 +2051,15 @@ async fn run_async_with_hosts_inner(
                     && runtime_stage_metrics.packet_worker_queue_depth
                         >= u64::try_from((packet_worker_queue_capacity / 2).max(1))
                             .unwrap_or(u64::MAX);
+                let dedupe_capacity_pressure =
+                    runtime_stage_metrics.shred_dedupe_capacity_evictions_total > 0;
                 let telemetry_requires_warning = ingest_dropped_packets > 0
                     || ingest_dropped_batches > 0
                     || ingest_rxq_ovfl_drops > 0
                     || dataset_queue_drops > 0
                     || dataset_queue_pressure
                     || packet_worker_queue_pressure
+                    || dedupe_capacity_pressure
                     || runtime_stage_metrics.packet_worker_dropped_batches_total > 0
                     || runtime_stage_metrics.packet_worker_dropped_packets_total > 0
                     || tx_event_drop_count.load(Ordering::Relaxed) > 0
@@ -2086,11 +2134,32 @@ async fn run_async_with_hosts_inner(
                         udp_relay_source_filtered_packets = udp_relay_source_filtered_packets,
                         udp_relay_backoff_events = udp_relay_backoff_events,
                         udp_relay_backoff_drops = udp_relay_backoff_drops,
-                        dedupe_enabled = dedupe_cache.is_some(),
+                        dedupe_enabled = shred_dedupe_cache.is_some(),
                         dedupe_capacity = dedupe_capacity,
                         dedupe_ttl_ms = dedupe_ttl_ms,
-                        dedupe_entries = dedupe_cache.as_ref().map_or(0, RecentShredCache::len),
-                        dedupe_drops = dedupe_drop_count,
+                        dedupe_entries = runtime_stage_metrics.shred_dedupe_entries,
+                        dedupe_max_entries =
+                            runtime_stage_metrics.shred_dedupe_max_entries,
+                        dedupe_queue_depth =
+                            runtime_stage_metrics.shred_dedupe_queue_depth,
+                        dedupe_max_queue_depth =
+                            runtime_stage_metrics.shred_dedupe_max_queue_depth,
+                        dedupe_capacity_evictions =
+                            runtime_stage_metrics.shred_dedupe_capacity_evictions_total,
+                        dedupe_expired_evictions =
+                            runtime_stage_metrics.shred_dedupe_expired_evictions_total,
+                        dedupe_ingress_duplicate_drops =
+                            dedupe_ingress_duplicate_drop_count,
+                        dedupe_ingress_conflict_drops =
+                            dedupe_ingress_conflict_drop_count,
+                        dedupe_canonical_duplicate_drops =
+                            dedupe_canonical_duplicate_drop_count,
+                        dedupe_canonical_conflict_drops =
+                            dedupe_canonical_conflict_drop_count,
+                        dedupe_duplicate_drops = dedupe_ingress_duplicate_drop_count
+                            .saturating_add(dedupe_canonical_duplicate_drop_count),
+                        dedupe_conflict_drops = dedupe_ingress_conflict_drop_count
+                            .saturating_add(dedupe_canonical_conflict_drop_count),
                         tx_event_drops = tx_event_drop_count.load(Ordering::Relaxed),
                         runtime_extension_active = extension_dispatch.active_extensions,
                         runtime_extension_dispatched = extension_dispatch.dispatched_events,
@@ -2331,11 +2400,32 @@ async fn run_async_with_hosts_inner(
                     udp_relay_source_filtered_packets = udp_relay_source_filtered_packets,
                     udp_relay_backoff_events = udp_relay_backoff_events,
                     udp_relay_backoff_drops = udp_relay_backoff_drops,
-                    dedupe_enabled = dedupe_cache.is_some(),
+                    dedupe_enabled = shred_dedupe_cache.is_some(),
                     dedupe_capacity = dedupe_capacity,
                     dedupe_ttl_ms = dedupe_ttl_ms,
-                    dedupe_entries = dedupe_cache.as_ref().map_or(0, RecentShredCache::len),
-                    dedupe_drops = dedupe_drop_count,
+                    dedupe_entries = runtime_stage_metrics.shred_dedupe_entries,
+                    dedupe_max_entries =
+                        runtime_stage_metrics.shred_dedupe_max_entries,
+                    dedupe_queue_depth =
+                        runtime_stage_metrics.shred_dedupe_queue_depth,
+                    dedupe_max_queue_depth =
+                        runtime_stage_metrics.shred_dedupe_max_queue_depth,
+                    dedupe_capacity_evictions =
+                        runtime_stage_metrics.shred_dedupe_capacity_evictions_total,
+                    dedupe_expired_evictions =
+                        runtime_stage_metrics.shred_dedupe_expired_evictions_total,
+                    dedupe_ingress_duplicate_drops =
+                        dedupe_ingress_duplicate_drop_count,
+                    dedupe_ingress_conflict_drops =
+                        dedupe_ingress_conflict_drop_count,
+                    dedupe_canonical_duplicate_drops =
+                        dedupe_canonical_duplicate_drop_count,
+                    dedupe_canonical_conflict_drops =
+                        dedupe_canonical_conflict_drop_count,
+                    dedupe_duplicate_drops = dedupe_ingress_duplicate_drop_count
+                        .saturating_add(dedupe_canonical_duplicate_drop_count),
+                    dedupe_conflict_drops = dedupe_ingress_conflict_drop_count
+                        .saturating_add(dedupe_canonical_conflict_drop_count),
                     tx_event_drops = tx_event_drop_count.load(Ordering::Relaxed),
                     runtime_extension_active = extension_dispatch.active_extensions,
                     runtime_extension_dispatched = extension_dispatch.dispatched_events,
@@ -2686,6 +2776,9 @@ struct PacketWorkerResultContext<'context> {
     missing_tracker: &'context mut Option<MissingShredTracker>,
     outstanding_repairs: &'context mut Option<OutstandingRepairRequests>,
     repair_outstanding_cleared_on_receive: &'context mut u64,
+    shred_dedupe_cache: &'context mut Option<ShredDedupeCache>,
+    dedupe_canonical_duplicate_drop_count: &'context mut u64,
+    dedupe_canonical_conflict_drop_count: &'context mut u64,
     dataset_reassembler: &'context mut DataSetReassembler,
     dataset_retained_slot_lag: u64,
     dataset_worker_queues: &'context [DatasetDispatchQueue],
@@ -2769,6 +2862,51 @@ impl PacketWorkerResultContext<'_> {
         observed_at: Instant,
         summary: &mut PacketWorkerResultSummary,
     ) {
+        if let Some(cache) = self.shred_dedupe_cache.as_mut() {
+            match cache.observe_signature(
+                ShredDedupeIdentity::new(
+                    shred.slot,
+                    shred.index,
+                    shred.fec_set_index,
+                    shred.version,
+                    shred.variant,
+                ),
+                shred.signature,
+                observed_at,
+                ShredDedupeStage::Canonical,
+            ) {
+                ShredDedupeObservation::Accepted => {}
+                ShredDedupeObservation::Duplicate => {
+                    *self.dedupe_canonical_duplicate_drop_count =
+                        self.dedupe_canonical_duplicate_drop_count.saturating_add(1);
+                    crate::runtime_metrics::observe_shred_dedupe_drops(
+                        ShredDedupeStage::Canonical,
+                        1,
+                        0,
+                    );
+                    return;
+                }
+                ShredDedupeObservation::Conflict => {
+                    *self.dedupe_canonical_conflict_drop_count =
+                        self.dedupe_canonical_conflict_drop_count.saturating_add(1);
+                    crate::runtime_metrics::observe_shred_dedupe_drops(
+                        ShredDedupeStage::Canonical,
+                        0,
+                        1,
+                    );
+                    if *self.dedupe_canonical_conflict_drop_count <= INITIAL_DEBUG_SAMPLE_LOG_LIMIT
+                    {
+                        tracing::warn!(
+                            slot = shred.slot,
+                            index = shred.index,
+                            fec_set_index = shred.fec_set_index,
+                            "dropping conflicting duplicate accepted shred"
+                        );
+                    }
+                    return;
+                }
+            }
+        }
         match shred.kind {
             WorkerAcceptedShredKind::Data {
                 parent_slot,
@@ -3080,6 +3218,13 @@ const fn parsed_shred_slot(parsed_shred: &ParsedShredHeader) -> u64 {
     }
 }
 
+const fn parsed_shred_index(parsed_shred: &ParsedShredHeader) -> u32 {
+    match parsed_shred {
+        ParsedShredHeader::Data(data) => data.common.index,
+        ParsedShredHeader::Code(code) => code.common.index,
+    }
+}
+
 const fn parsed_shred_fec_set_index(parsed_shred: &ParsedShredHeader) -> u32 {
     match parsed_shred {
         ParsedShredHeader::Data(data) => data.common.fec_set_index,
@@ -3265,6 +3410,23 @@ fn combine_packet_worker_pressure_into(
             .unwrap_or(0);
         out.push(queue_depth.saturating_add(fec_pressure));
     }
+}
+
+fn sync_shred_dedupe_runtime_metrics(cache: Option<&ShredDedupeCache>) {
+    let metrics = cache.map_or_else(
+        crate::app::state::ShredDedupeCacheMetrics::default,
+        ShredDedupeCache::metrics,
+    );
+    crate::runtime_metrics::set_shred_dedupe_metrics(
+        metrics.entries,
+        metrics.max_entries,
+        metrics.queue_depth,
+        metrics.max_queue_depth,
+    );
+    crate::runtime_metrics::set_shred_dedupe_evictions(
+        metrics.capacity_evictions_total,
+        metrics.expired_evictions_total,
+    );
 }
 
 fn source_addr_or_unspecified(source_addr: Option<SocketAddr>) -> SocketAddr {

@@ -2,7 +2,6 @@ use {
     crate::{
         contact_info::ContactInfo,
         crds_data::{CrdsData, EpochSlotsIndex, VoteIndex},
-        duplicate_shred::DuplicateShredIndex,
         epoch_slots::EpochSlots,
     },
     arrayvec::ArrayVec,
@@ -18,6 +17,8 @@ use {
     solana_signer::Signer,
     std::borrow::{Borrow, Cow},
 };
+
+use crate::duplicate_shred::DuplicateShredIndex;
 
 /// CrdsValue that is replicated across the cluster
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]

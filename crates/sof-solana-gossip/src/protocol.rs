@@ -29,6 +29,7 @@ pub(crate) const PUSH_MESSAGE_MAX_PAYLOAD_SIZE: usize = PACKET_DATA_SIZE - 44;
 /// is equal to PACKET_DATA_SIZE minus serialized size of an empty pull
 /// message: Protocol::PullResponse(Pubkey::default(), Vec::default())
 pub(crate) const PULL_RESPONSE_MAX_PAYLOAD_SIZE: usize = PUSH_MESSAGE_MAX_PAYLOAD_SIZE;
+#[cfg(feature = "duplicate-shred-rocksdb")]
 pub(crate) const DUPLICATE_SHRED_MAX_PAYLOAD_SIZE: usize = PACKET_DATA_SIZE - 115;
 /// Maximum number of incremental hashes in SnapshotHashes a node publishes
 /// such that the serialized size of the push/pull message stays below
@@ -262,13 +263,11 @@ pub(crate) mod tests {
             crds_data::{
                 self, AccountsHashes, CrdsData, LowestSlot, SnapshotHashes, Vote as CrdsVote,
             },
-            duplicate_shred::{self, tests::new_rand_shred, MAX_DUPLICATE_SHREDS},
         },
         rand::Rng,
         solana_clock::Slot,
         solana_hash::Hash,
         solana_keypair::Keypair,
-        solana_ledger::shred::Shredder,
         solana_perf::packet::Packet,
         solana_signer::Signer,
         solana_time_utils::timestamp,
@@ -279,6 +278,12 @@ pub(crate) mod tests {
             net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4},
             sync::Arc,
         },
+    };
+
+    #[cfg(feature = "duplicate-shred-rocksdb")]
+    use {
+        crate::duplicate_shred::{self, tests::new_rand_shred, MAX_DUPLICATE_SHREDS},
+        solana_ledger::shred::Shredder,
     };
 
     fn new_rand_socket_addr<R: Rng>(rng: &mut R) -> SocketAddr {
@@ -424,6 +429,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg(feature = "duplicate-shred-rocksdb")]
     fn test_duplicate_shred_max_payload_size() {
         let mut rng = rand::thread_rng();
         let leader = Arc::new(Keypair::new());
