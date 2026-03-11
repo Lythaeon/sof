@@ -3,6 +3,8 @@
 This folder is the documentation index for the SOF workspace.
 
 Use it as the entry point for architecture references, operations guides, and crate-level setup docs.
+The project is aimed at low-latency Solana infrastructure: ingest, replayable state, execution
+control planes, and deployment/tuning concerns that matter in real trading and market-data systems.
 
 ## Start Here
 

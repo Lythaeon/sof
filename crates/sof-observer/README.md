@@ -2,7 +2,9 @@
 
 `sof` is the SOF observer/runtime crate.
 
-It is built for low-latency Solana data ingest and local runtime-derived signals.
+It is built for low-latency Solana data ingest, local runtime-derived signals, and services that
+need infrastructure-style control over replay, control-plane freshness, and bounded multicore
+packet handling.
 
 Core responsibilities:
 
@@ -17,6 +19,7 @@ Core responsibilities:
 - Embed SOF directly inside a Tokio application
 - Attach `Plugin` or `RuntimeExtension` consumers
 - Run with built-in UDP ingress or external kernel-bypass ingress
+- Treat SOF as a local market-data and control-plane engine, not just a passive observer
 - Use packet-worker and dataset-worker fanout to keep multi-core hosts busy under sustained shred load
 - Consume local slot/reorg/transaction/account-touch signals
 - Use the replayable derived-state feed for restart-safe stateful consumers
