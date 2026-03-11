@@ -13,6 +13,9 @@ It provides:
   - `Hybrid` (direct first, RPC fallback)
 - routing policy and signature-level dedupe
 
+Together with `sof`, this is intended for low-latency execution services that want locally
+sourced control-plane state and predictable submit behavior, not just a generic wallet helper.
+
 ## At a Glance
 
 - Build `V0` or legacy Solana transactions

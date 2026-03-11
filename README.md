@@ -2,6 +2,10 @@
 
 SOF is a Solana-focused Rust workspace for low-latency data ingest and transaction execution.
 
+It is built more like financial systems infrastructure than a typical crypto framework:
+bounded pipelines, local control-plane state, restart-safe derived-state feeds, and execution
+paths designed for services that care about latency, replay, and operational discipline.
+
 It is split into three user-facing crates:
 
 - `sof`: observer/runtime crate for shred ingest, relay/cache, dataset reconstruction, plugin and runtime-extension events, fork/reorg tracking, and local commitment tagging without RPC dependency
@@ -12,6 +16,7 @@ It is split into three user-facing crates:
 
 - Multi-core packet ingest, FEC recovery, and dataset reconstruction
 - Bundled gossip backend tuning for queue depths, worker counts, CPU pinning, and small-batch serial fallbacks
+- Local market-facing control-plane signals for leader, topology, blockhash, replay, and fork state
 - Local `processed` / `confirmed` / `finalized` transaction tagging
 - Plugin hooks and runtime extensions for downstream logic
 - Lower-copy hot paths through shared dataset payload fragments and borrowed transaction classification
