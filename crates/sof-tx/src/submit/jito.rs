@@ -267,9 +267,8 @@ mod tests {
         let Some(parsed_url) = parsed_url_result.ok() else {
             return;
         };
-        let transport_result = JitoJsonRpcTransport::with_endpoint(
-            JitoBlockEngineEndpoint::custom(parsed_url),
-        );
+        let transport_result =
+            JitoJsonRpcTransport::with_endpoint(JitoBlockEngineEndpoint::custom(parsed_url));
         assert!(transport_result.is_ok());
         let Some(transport) = transport_result.ok() else {
             return;

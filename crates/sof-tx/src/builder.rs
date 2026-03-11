@@ -130,10 +130,24 @@ impl TxBuilder {
         self
     }
 
+    /// Removes any explicit compute unit limit instruction.
+    #[must_use]
+    pub const fn without_compute_unit_limit(mut self) -> Self {
+        self.compute_unit_limit = None;
+        self
+    }
+
     /// Sets priority fee in micro-lamports.
     #[must_use]
     pub const fn with_priority_fee_micro_lamports(mut self, micro_lamports: u64) -> Self {
         self.priority_fee_micro_lamports = Some(micro_lamports);
+        self
+    }
+
+    /// Removes any explicit priority-fee instruction.
+    #[must_use]
+    pub const fn without_priority_fee_micro_lamports(mut self) -> Self {
+        self.priority_fee_micro_lamports = None;
         self
     }
 
