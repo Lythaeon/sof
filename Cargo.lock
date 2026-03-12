@@ -2409,7 +2409,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.2",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -3695,7 +3695,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.1",
  "rustls",
- "socket2 0.6.2",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3734,7 +3734,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.2",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -4555,7 +4555,7 @@ dependencies = [
 
 [[package]]
 name = "sof"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "arcshift",
  "async-trait",
@@ -4594,11 +4594,11 @@ dependencies = [
 
 [[package]]
 name = "sof-gossip-tuning"
-version = "0.8.1"
+version = "0.9.0"
 
 [[package]]
 name = "sof-solana-gossip"
-version = "3.1.8-sof.2"
+version = "3.1.8-sof.3"
 dependencies = [
  "agave-feature-set",
  "agave-logger",
@@ -4663,7 +4663,7 @@ dependencies = [
 
 [[package]]
 name = "sof-tx"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "arcshift",
  "async-trait",
