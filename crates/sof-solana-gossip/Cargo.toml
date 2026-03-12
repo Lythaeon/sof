@@ -108,6 +108,12 @@ version = "0.8"
 [dependencies.crossbeam-channel]
 version = "0.5.15"
 
+[dependencies.dashmap]
+version = "5.5.3"
+
+[dependencies.ed25519-dalek]
+version = "2.2.0"
+
 [dependencies.flate2]
 version = "1.0.31"
 

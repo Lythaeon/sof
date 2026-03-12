@@ -26,7 +26,7 @@ use {
             get_max_bloom_filter_bytes, CrdsFilter, CrdsTimeouts, ProcessPullStats, PullRequest,
             CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS,
         },
-        crds_value::{CrdsValue, CrdsValueLabel},
+        crds_value::{CrdsValue, CrdsValueLabel, VerifyingKeyCache},
         epoch_slots::EpochSlots,
         epoch_specs::EpochSpecs,
         gossip_error::GossipError,
@@ -342,6 +342,14 @@ fn gossip_run_threads() -> usize {
     read_usize_env("SOF_GOSSIP_RUN_THREADS").unwrap_or(default)
 }
 
+fn gossip_verify_pubkey_cache_capacity() -> usize {
+    read_usize_env("SOF_GOSSIP_VERIFY_PUBKEY_CACHE_CAPACITY").unwrap_or(16_384)
+}
+
+fn gossip_verify_pubkey_cache_shards() -> usize {
+    read_usize_env("SOF_GOSSIP_VERIFY_PUBKEY_CACHE_SHARDS").unwrap_or(32)
+}
+
 #[derive(Debug, PartialEq, Eq, Error)]
 pub enum ClusterInfoError {
     #[error("NoPeers")]
@@ -374,6 +382,7 @@ pub struct ClusterInfo {
     contact_info_path: PathBuf,
     socket_addr_space: SocketAddrSpace,
     bind_ip_addrs: Arc<BindIpAddrs>,
+    verifying_key_cache: Option<VerifyingKeyCache>,
 }
 
 impl ClusterInfo {
@@ -404,6 +413,10 @@ impl ClusterInfo {
             contact_save_interval: 0, // disabled
             socket_addr_space,
             bind_ip_addrs: Arc::new(BindIpAddrs::default()),
+            verifying_key_cache: VerifyingKeyCache::new(
+                gossip_verify_pubkey_cache_capacity(),
+                gossip_verify_pubkey_cache_shards(),
+            ),
         };
         me.refresh_my_gossip_contact_info();
         me
@@ -415,6 +428,10 @@ impl ClusterInfo {
 
     pub fn socket_addr_space(&self) -> &SocketAddrSpace {
         &self.socket_addr_space
+    }
+
+    pub(crate) fn verifying_key_cache(&self) -> Option<&VerifyingKeyCache> {
+        self.verifying_key_cache.as_ref()
     }
 
     pub fn set_bind_ip_addrs(&mut self, ip_addrs: Arc<BindIpAddrs>) {
@@ -2404,46 +2421,102 @@ impl ClusterInfo {
             packet: PacketRef,
             stakes: &HashMap<Pubkey, u64>,
             stats: &GossipStats,
+            now: u64,
+            push_msg_timeout: u64,
+            crds: &Crds,
+            pull_response_timeouts: &CrdsTimeouts,
+            verifying_key_cache: Option<&VerifyingKeyCache>,
         ) -> Option<(SocketAddr, Protocol)> {
             let mut protocol: Protocol =
                 stats.record_received_packet(packet.deserialize_slice::<Protocol, _>(..))?;
             protocol.sanitize().ok()?;
-            if let Protocol::PullResponse(_, values) | Protocol::PushMessage(_, values) =
-                &mut protocol
-            {
-                values.retain(|value| {
-                    should_retain_crds_value(value, stakes, GossipFilterDirection::Ingress)
-                });
-                if values.is_empty() {
-                    return None;
+            match &mut protocol {
+                Protocol::PullResponse(_, values) => {
+                    values.retain(|value| {
+                        should_retain_crds_value(value, stakes, GossipFilterDirection::Ingress)
+                    });
+                    if !preverify_filter_pull_responses(
+                        values,
+                        crds,
+                        pull_response_timeouts,
+                        now,
+                        stats,
+                    ) {
+                        return None;
+                    }
                 }
+                Protocol::PushMessage(_, values) => {
+                    values.retain(|value| {
+                        should_retain_crds_value(value, stakes, GossipFilterDirection::Ingress)
+                    });
+                    if !preverify_filter_push_message_wallclock(
+                        values,
+                        now,
+                        push_msg_timeout,
+                        stats,
+                    ) {
+                        return None;
+                    }
+                }
+                _ => {}
             }
-            protocol.verify().then(|| {
+            protocol.verify_with_cache(verifying_key_cache).then(|| {
                 stats.packets_received_verified_count.add_relaxed(1);
                 (packet.meta().socket_addr(), protocol)
             })
         }
 
-        let empty_stakes = HashMap::new();
-        let stakes = if let Some(epoch_specs) = epoch_specs.as_deref_mut() {
-            epoch_specs.current_epoch_staked_nodes().as_ref()
+        let (stakes, epoch_duration) = if let Some(epoch_specs) = epoch_specs.as_deref_mut() {
+            (
+                epoch_specs.current_epoch_staked_nodes().clone(),
+                epoch_specs.epoch_duration(),
+            )
         } else {
-            &empty_stakes
+            (Arc::new(HashMap::new()), DEFAULT_EPOCH_DURATION)
         };
+        let self_pubkey = self.id();
+        let pull_response_timeouts =
+            self.gossip
+                .make_timeouts(self_pubkey, &stakes, epoch_duration);
+        let gossip_crds = self.gossip.crds.read().unwrap();
+        let now = timestamp();
+        let push_msg_timeout = self.gossip.push.msg_timeout;
         let packets_verified: Vec<_> = {
             let _st = ScopedTimer::from(&self.stats.verify_gossip_packets_time);
             if num_packets < gossip_socket_consume_parallel_packet_threshold() {
                 packet_buf
                     .iter()
                     .flat_map(|packet_batch| packet_batch.iter())
-                    .filter_map(|packet| verify_packet(packet, stakes, &self.stats))
+                    .filter_map(|packet| {
+                        verify_packet(
+                            packet,
+                            &stakes,
+                            &self.stats,
+                            now,
+                            push_msg_timeout,
+                            &gossip_crds,
+                            &pull_response_timeouts,
+                            self.verifying_key_cache.as_ref(),
+                        )
+                    })
                     .collect()
             } else {
                 thread_pool.install(|| {
                     packet_buf
                         .par_iter()
                         .flatten()
-                        .filter_map(|packet| verify_packet(packet, stakes, &self.stats))
+                        .filter_map(|packet| {
+                            verify_packet(
+                                packet,
+                                &stakes,
+                                &self.stats,
+                                now,
+                                push_msg_timeout,
+                                &gossip_crds,
+                                &pull_response_timeouts,
+                                self.verifying_key_cache.as_ref(),
+                            )
+                        })
                         .collect()
                 })
             }
@@ -2757,6 +2830,46 @@ fn discard_different_shred_version(
     if num_skipped != 0 {
         skip_shred_version_counter.add_relaxed(num_skipped as u64);
     }
+}
+
+fn preverify_filter_push_message_wallclock(
+    values: &mut Vec<CrdsValue>,
+    now: u64,
+    msg_timeout: u64,
+    stats: &GossipStats,
+) -> bool {
+    let num_values = values.len();
+    let wallclock_window = now.saturating_sub(msg_timeout)..=now.saturating_add(msg_timeout);
+    values.retain(|value| wallclock_window.contains(&value.wallclock()));
+    let num_dropped = num_values.saturating_sub(values.len());
+    if num_dropped != 0 {
+        stats.preverify_push_message_wallclock_dropped_values
+            .add_relaxed(num_dropped as u64);
+    }
+    !values.is_empty()
+}
+
+fn preverify_filter_pull_responses(
+    values: &mut Vec<CrdsValue>,
+    crds: &Crds,
+    timeouts: &CrdsTimeouts,
+    now: u64,
+    stats: &GossipStats,
+) -> bool {
+    let num_values = values.len();
+    values.retain(|value| {
+        let owner = value.label().pubkey();
+        let timeout = timeouts[&owner];
+        crds.upserts(value)
+            && (now <= value.wallclock().saturating_add(timeout)
+                || crds.get::<&ContactInfo>(owner).is_some())
+    });
+    let num_dropped = num_values.saturating_sub(values.len());
+    if num_dropped != 0 {
+        stats.preverify_pull_response_dropped_values
+            .add_relaxed(num_dropped as u64);
+    }
+    !values.is_empty()
 }
 
 #[inline]

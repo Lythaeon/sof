@@ -1,5 +1,9 @@
 use {
-    crate::{crds_gossip::CrdsGossip, crds_value::CrdsValue, protocol::Protocol},
+    crate::{
+        crds_gossip::CrdsGossip,
+        crds_value::{CrdsValue, VerifyingKeyCache},
+        protocol::Protocol,
+    },
     itertools::Itertools,
     solana_clock::Slot,
     solana_measure::measure::Measure,
@@ -132,6 +136,8 @@ pub struct GossipStats {
     packets_received_push_messages_count: Counter,
     packets_received_unknown_count: Counter,
     pub(crate) packets_received_verified_count: Counter,
+    pub(crate) preverify_pull_response_dropped_values: Counter,
+    pub(crate) preverify_push_message_wallclock_dropped_values: Counter,
     packets_sent_ping_messages_count: Counter,
     packets_sent_pong_messages_count: Counter,
     packets_sent_prune_messages_count: Counter,
@@ -210,6 +216,7 @@ impl GossipStats {
 pub(crate) fn submit_gossip_stats(
     stats: &GossipStats,
     gossip: &CrdsGossip,
+    verifying_key_cache: Option<&VerifyingKeyCache>,
     stakes: &HashMap<Pubkey, u64>,
 ) {
     let (crds_stats, table_size, num_nodes, num_pubkeys, purged_values_size, failed_inserts_size) = {
@@ -235,6 +242,18 @@ pub(crate) fn submit_gossip_stats(
     .iter()
     .map(|counter| counter.0.load(Ordering::Relaxed))
     .sum();
+    let verifying_key_cache_hits = verifying_key_cache
+        .map(VerifyingKeyCache::take_hit_count)
+        .unwrap_or_default();
+    let verifying_key_cache_misses = verifying_key_cache
+        .map(VerifyingKeyCache::take_miss_count)
+        .unwrap_or_default();
+    let verifying_key_cache_insert_failures = verifying_key_cache
+        .map(VerifyingKeyCache::take_insert_failure_count)
+        .unwrap_or_default();
+    let verifying_key_cache_evictions = verifying_key_cache
+        .map(VerifyingKeyCache::take_eviction_count)
+        .unwrap_or_default();
     datapoint_info!(
         "cluster_info_stats",
         ("entrypoint", stats.entrypoint.clear(), i64),
@@ -539,6 +558,30 @@ pub(crate) fn submit_gossip_stats(
         (
             "packets_received_verified_count",
             stats.packets_received_verified_count.clear(),
+            i64
+        ),
+        (
+            "preverify_pull_response_dropped_values",
+            stats.preverify_pull_response_dropped_values.clear(),
+            i64
+        ),
+        (
+            "preverify_push_message_wallclock_dropped_values",
+            stats
+                .preverify_push_message_wallclock_dropped_values
+                .clear(),
+            i64
+        ),
+        ("verifying_key_cache_hits", verifying_key_cache_hits, i64),
+        ("verifying_key_cache_misses", verifying_key_cache_misses, i64),
+        (
+            "verifying_key_cache_insert_failures",
+            verifying_key_cache_insert_failures,
+            i64
+        ),
+        (
+            "verifying_key_cache_evictions",
+            verifying_key_cache_evictions,
             i64
         ),
         (

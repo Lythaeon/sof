@@ -4610,6 +4610,8 @@ dependencies = [
  "clap",
  "core_affinity",
  "crossbeam-channel",
+ "dashmap",
+ "ed25519-dalek 2.2.0",
  "flate2",
  "indexmap",
  "itertools 0.12.1",

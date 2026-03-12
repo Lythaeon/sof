@@ -3,7 +3,7 @@ use {
     crate::{
         crds_data::{CrdsData, MAX_WALLCLOCK},
         crds_gossip_pull::CrdsFilter,
-        crds_value::CrdsValue,
+        crds_value::{CrdsValue, VerifyingKeyCache},
         ping_pong::{self, Pong},
     },
     bincode::serialize,
@@ -88,13 +88,12 @@ impl Protocol {
             .unwrap()
     }
 
-    // Returns true if all signatures verify.
     #[must_use]
-    pub(crate) fn verify(&self) -> bool {
+    pub(crate) fn verify_with_cache(&self, cache: Option<&VerifyingKeyCache>) -> bool {
         match self {
-            Self::PullRequest(_, caller) => caller.verify(),
-            Self::PullResponse(_, data) => data.iter().all(CrdsValue::verify),
-            Self::PushMessage(_, data) => data.iter().all(CrdsValue::verify),
+            Self::PullRequest(_, caller) => caller.verify_with_cache(cache),
+            Self::PullResponse(_, data) => CrdsValue::verify_many_with_cache(data, cache),
+            Self::PushMessage(_, data) => CrdsValue::verify_many_with_cache(data, cache),
             Self::PruneMessage(_, data) => data.verify(),
             Self::PingMessage(ping) => ping.verify(),
             Self::PongMessage(pong) => pong.verify(),
