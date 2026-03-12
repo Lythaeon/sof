@@ -134,7 +134,12 @@ impl GossipService {
                             .cloned()
                             .unwrap_or_default();
 
-                        submit_gossip_stats(&cluster_info.stats, &cluster_info.gossip, &stakes);
+                        submit_gossip_stats(
+                            &cluster_info.stats,
+                            &cluster_info.gossip,
+                            cluster_info.verifying_key_cache(),
+                            &stakes,
+                        );
                         gossip_receiver_stats.report();
                     }
                 }

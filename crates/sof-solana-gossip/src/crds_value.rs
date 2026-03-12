@@ -6,6 +6,8 @@ use {
     },
     arrayvec::ArrayVec,
     bincode::serialize,
+    dashmap::DashMap,
+    ed25519_dalek::VerifyingKey,
     rand::Rng,
     serde::{de::Deserializer, Deserialize, Serialize},
     solana_hash::Hash,
@@ -15,7 +17,12 @@ use {
     solana_sanitize::{Sanitize, SanitizeError},
     solana_signature::Signature,
     solana_signer::Signer,
-    std::borrow::{Borrow, Cow},
+    std::{
+        borrow::{Borrow, Cow},
+        collections::hash_map::RandomState,
+        hash::{BuildHasher, Hash as StdHash, Hasher},
+        sync::atomic::{AtomicU64, Ordering},
+    },
 };
 
 use crate::duplicate_shred::DuplicateShredIndex;
@@ -56,6 +63,112 @@ impl Signable for CrdsValue {
     fn verify(&self) -> bool {
         self.get_signature()
             .verify(self.pubkey().as_ref(), self.signable_data().borrow())
+    }
+}
+
+pub(crate) struct VerifyingKeyCache {
+    hasher: RandomState,
+    shards: Vec<DashMap<Pubkey, VerifyingKey>>,
+    shard_capacity: usize,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    insert_failures: AtomicU64,
+    evictions: AtomicU64,
+}
+
+impl VerifyingKeyCache {
+    pub(crate) fn new(capacity: usize, shards: usize) -> Option<Self> {
+        if capacity == 0 {
+            return None;
+        }
+        let shards = shards.max(1).min(capacity);
+        let shard_capacity = capacity.div_ceil(shards).max(1);
+        Some(Self {
+            hasher: RandomState::new(),
+            shards: (0..shards)
+                .map(|_| DashMap::with_capacity(shard_capacity))
+                .collect(),
+            shard_capacity,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            insert_failures: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+        })
+    }
+
+    fn shard_index(&self, pubkey: &Pubkey) -> usize {
+        let mut hasher = self.hasher.build_hasher();
+        pubkey.hash(&mut hasher);
+        hasher.finish() as usize % self.shards.len()
+    }
+
+    pub(crate) fn get_or_insert(&self, pubkey: Pubkey) -> Option<VerifyingKey> {
+        let shard_index = self.shard_index(&pubkey);
+        let shard = &self.shards[shard_index];
+        if let Some(verifying_key) = shard.get(&pubkey).map(|entry| entry.clone()) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Some(verifying_key);
+        }
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        let Ok(verifying_key) = VerifyingKey::from_bytes(&pubkey.to_bytes()) else {
+            self.insert_failures.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        if let Some(existing) = shard.get(&pubkey).map(|entry| entry.clone()) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Some(existing);
+        }
+        if shard.len() >= self.shard_capacity {
+            if let Some(evicted_key) = shard.iter().next().map(|entry| *entry.key()) {
+                let _ = shard.remove(&evicted_key);
+                self.evictions.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        shard.insert(pubkey, verifying_key.clone());
+        Some(verifying_key)
+    }
+
+    pub(crate) fn take_hit_count(&self) -> u64 {
+        self.hits.swap(0, Ordering::Relaxed)
+    }
+
+    pub(crate) fn take_miss_count(&self) -> u64 {
+        self.misses.swap(0, Ordering::Relaxed)
+    }
+
+    pub(crate) fn take_insert_failure_count(&self) -> u64 {
+        self.insert_failures.swap(0, Ordering::Relaxed)
+    }
+
+    pub(crate) fn take_eviction_count(&self) -> u64 {
+        self.evictions.swap(0, Ordering::Relaxed)
+    }
+}
+
+impl CrdsValue {
+    pub(crate) fn verify_with_cache(&self, cache: Option<&VerifyingKeyCache>) -> bool {
+        let Some(cache) = cache else {
+            return self.verify();
+        };
+        let Some(verifying_key) = cache.get_or_insert(self.pubkey()) else {
+            return false;
+        };
+        let signature = match ed25519_dalek::Signature::try_from(self.signature().as_ref()) {
+            Ok(signature) => signature,
+            Err(_) => return false,
+        };
+        let message = match serialize(self.data()) {
+            Ok(message) => message,
+            Err(_) => return false,
+        };
+        verifying_key.verify_strict(&message, &signature).is_ok()
+    }
+
+    pub(crate) fn verify_many_with_cache(
+        values: &[CrdsValue],
+        cache: Option<&VerifyingKeyCache>,
+    ) -> bool {
+        values.iter().all(|value| value.verify_with_cache(cache))
     }
 }
 
