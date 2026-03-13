@@ -30,8 +30,6 @@ pub use submit::{
     TxSubmitOutcome, TxSubmitOutcomeKind, TxSubmitOutcomeReporter, TxSubmitSuppressionKey,
     TxToxicFlowRejectionReason, TxToxicFlowTelemetry, TxToxicFlowTelemetrySnapshot,
 };
-pub use submit::{
-    JitoAuthToken, JitoBlockEngineEndpoint, JitoJsonRpcTransport, JitoTransportConfig,
-};
+pub use submit::{JitoBlockEngineEndpoint, JitoJsonRpcTransport, JitoTransportConfig};
 #[cfg(feature = "kernel-bypass")]
 pub use submit::{KernelBypassDatagramSocket, KernelBypassDirectTransport};

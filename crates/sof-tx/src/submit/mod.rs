@@ -19,7 +19,7 @@ mod types;
 
 pub use client::TxSubmitClient;
 pub use direct::UdpDirectTransport;
-pub use jito::{JitoAuthToken, JitoBlockEngineEndpoint, JitoJsonRpcTransport, JitoTransportConfig};
+pub use jito::{JitoBlockEngineEndpoint, JitoJsonRpcTransport, JitoTransportConfig};
 #[cfg(feature = "kernel-bypass")]
 pub use kernel_bypass::{KernelBypassDatagramSocket, KernelBypassDirectTransport};
 pub use rpc::JsonRpcTransport;

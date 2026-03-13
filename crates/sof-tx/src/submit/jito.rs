@@ -12,24 +12,6 @@ use super::{JitoSubmitConfig, JitoSubmitTransport, SubmitTransportError};
 /// Default Jito mainnet block-engine base URL.
 const DEFAULT_JITO_BLOCK_ENGINE_URL: &str = "https://mainnet.block-engine.jito.wtf";
 
-/// Typed Jito auth token sent as `x-jito-auth`.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct JitoAuthToken(String);
-
-impl JitoAuthToken {
-    /// Creates a validated auth token wrapper.
-    #[must_use]
-    pub fn new(token: impl Into<String>) -> Self {
-        Self(token.into())
-    }
-
-    /// Returns the raw token string.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 /// Typed Jito block-engine endpoint.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum JitoBlockEngineEndpoint {
@@ -75,8 +57,6 @@ pub struct JitoTransportConfig {
     pub endpoint: JitoBlockEngineEndpoint,
     /// HTTP timeout applied to block-engine requests.
     pub request_timeout: Duration,
-    /// Optional auth token sent as `x-jito-auth`.
-    pub auth_token: Option<JitoAuthToken>,
 }
 
 impl Default for JitoTransportConfig {
@@ -84,7 +64,6 @@ impl Default for JitoTransportConfig {
         Self {
             endpoint: JitoBlockEngineEndpoint::default(),
             request_timeout: Duration::from_secs(10),
-            auth_token: None,
         }
     }
 }
@@ -198,12 +177,10 @@ impl JitoSubmitTransport for JitoJsonRpcTransport {
             ]
         });
 
-        let mut request = self.client.post(self.request_url(config)).json(&payload);
-        if let Some(auth_token) = &self.transport_config.auth_token {
-            request = request.header("x-jito-auth", auth_token.as_str());
-        }
-
-        let response = request
+        let response = self
+            .client
+            .post(self.request_url(config))
+            .json(&payload)
             .send()
             .await
             .map_err(|error| SubmitTransportError::Failure {
@@ -288,6 +265,5 @@ mod tests {
 
         assert_eq!(config.endpoint, JitoBlockEngineEndpoint::mainnet());
         assert_eq!(config.request_timeout, Duration::from_secs(10));
-        assert_eq!(config.auth_token, None);
     }
 }
