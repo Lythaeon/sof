@@ -8,7 +8,8 @@ use libfuzzer_sys::fuzz_target;
 use solana_keypair::Keypair;
 use solana_signer::Signer;
 use sof_tx::{
-    JitoSubmitConfig, SignedTx, SubmitMode, SubmitTransportError, TxBuilder, TxSubmitClient,
+    JitoSubmitConfig, JitoSubmitResponse, SignedTx, SubmitMode, SubmitTransportError, TxBuilder,
+    TxSubmitClient,
     providers::{StaticLeaderProvider, StaticRecentBlockhashProvider},
     submit::JitoSubmitTransport,
 };
@@ -25,7 +26,7 @@ impl JitoSubmitTransport for FuzzJitoTransport {
         &self,
         tx_bytes: &[u8],
         config: &JitoSubmitConfig,
-    ) -> Result<String, SubmitTransportError> {
+    ) -> Result<JitoSubmitResponse, SubmitTransportError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         if self.should_fail {
             return Err(SubmitTransportError::Failure {
@@ -36,7 +37,14 @@ impl JitoSubmitTransport for FuzzJitoTransport {
                 ),
             });
         }
-        Ok(format!("sig-{}-{}", u8::from(config.bundle_only), tx_bytes.len()))
+        Ok(JitoSubmitResponse {
+            transaction_signature: Some(format!(
+                "sig-{}-{}",
+                u8::from(config.bundle_only),
+                tx_bytes.len()
+            )),
+            bundle_id: None,
+        })
     }
 }
 
@@ -109,6 +117,7 @@ fuzz_target!(|bytes: &[u8]| {
             assert_eq!(result.direct_target, None);
             assert!(!result.used_rpc_fallback);
             assert!(result.jito_signature.is_some());
+            assert_eq!(result.jito_bundle_id, None);
         }
         Err(error) => match error {
             sof_tx::SubmitError::DecodeSignedBytes { .. } => {

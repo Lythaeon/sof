@@ -23,6 +23,8 @@ pub use builder::{
 pub use providers::{LeaderProvider, LeaderTarget, RecentBlockhashProvider};
 pub use routing::{RoutingPolicy, SignatureDeduper};
 pub use signing::SignerRef;
+#[cfg(feature = "jito-grpc")]
+pub use submit::JitoGrpcTransport;
 pub use submit::{
     DirectSubmitConfig, JitoSubmitConfig, RpcSubmitConfig, SignedTx, SubmitError, SubmitMode,
     SubmitReliability, SubmitResult, SubmitTransportError, TxFlowSafetyIssue, TxFlowSafetyQuality,
@@ -30,6 +32,9 @@ pub use submit::{
     TxSubmitOutcome, TxSubmitOutcomeKind, TxSubmitOutcomeReporter, TxSubmitSuppressionKey,
     TxToxicFlowRejectionReason, TxToxicFlowTelemetry, TxToxicFlowTelemetrySnapshot,
 };
-pub use submit::{JitoBlockEngineEndpoint, JitoJsonRpcTransport, JitoTransportConfig};
+pub use submit::{
+    JitoBlockEngineEndpoint, JitoBlockEngineRegion, JitoJsonRpcTransport, JitoSubmitResponse,
+    JitoTransportConfig,
+};
 #[cfg(feature = "kernel-bypass")]
 pub use submit::{KernelBypassDatagramSocket, KernelBypassDirectTransport};

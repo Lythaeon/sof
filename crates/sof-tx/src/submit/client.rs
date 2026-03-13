@@ -506,6 +506,7 @@ impl TxSubmitClient {
             direct_target: None,
             rpc_signature: Some(rpc_signature),
             jito_signature: None,
+            jito_bundle_id: None,
             used_rpc_fallback: false,
             selected_target_count: 0,
             selected_identity_count: 0,
@@ -523,7 +524,7 @@ impl TxSubmitClient {
             .jito_transport
             .as_ref()
             .ok_or(SubmitError::MissingJitoTransport)?;
-        let jito_signature = jito
+        let jito_response = jito
             .submit_jito(&tx_bytes, &self.jito_config)
             .await
             .map_err(|source| SubmitError::Jito { source })?;
@@ -542,7 +543,8 @@ impl TxSubmitClient {
             mode,
             direct_target: None,
             rpc_signature: None,
-            jito_signature: Some(jito_signature),
+            jito_signature: jito_response.transaction_signature,
+            jito_bundle_id: jito_response.bundle_id,
             used_rpc_fallback: false,
             selected_target_count: 0,
             selected_identity_count: 0,
@@ -595,6 +597,7 @@ impl TxSubmitClient {
                         direct_target: Some(target),
                         rpc_signature: None,
                         jito_signature: None,
+                        jito_bundle_id: None,
                         used_rpc_fallback: false,
                         selected_target_count,
                         selected_identity_count,
@@ -675,6 +678,7 @@ impl TxSubmitClient {
                         direct_target: Some(target),
                         rpc_signature: Some(rpc_signature),
                         jito_signature: None,
+                        jito_bundle_id: None,
                         used_rpc_fallback: false,
                         selected_target_count,
                         selected_identity_count,
@@ -696,6 +700,7 @@ impl TxSubmitClient {
                     direct_target: Some(target),
                     rpc_signature: None,
                     jito_signature: None,
+                    jito_bundle_id: None,
                     used_rpc_fallback: false,
                     selected_target_count,
                     selected_identity_count,
@@ -726,6 +731,7 @@ impl TxSubmitClient {
             direct_target: None,
             rpc_signature: Some(rpc_signature),
             jito_signature: None,
+            jito_bundle_id: None,
             used_rpc_fallback: true,
             selected_target_count: 0,
             selected_identity_count: 0,

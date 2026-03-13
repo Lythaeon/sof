@@ -6,6 +6,9 @@ mod client;
 mod direct;
 /// Jito block-engine transport implementation.
 mod jito;
+#[cfg(feature = "jito-grpc")]
+/// Jito gRPC bundle transport implementation.
+mod jito_grpc;
 #[cfg(feature = "kernel-bypass")]
 /// Kernel-bypass direct transport hooks for `kernel-bypass` integrations.
 mod kernel_bypass;
@@ -19,14 +22,18 @@ mod types;
 
 pub use client::TxSubmitClient;
 pub use direct::UdpDirectTransport;
-pub use jito::{JitoBlockEngineEndpoint, JitoJsonRpcTransport, JitoTransportConfig};
+pub use jito::{
+    JitoBlockEngineEndpoint, JitoBlockEngineRegion, JitoJsonRpcTransport, JitoTransportConfig,
+};
+#[cfg(feature = "jito-grpc")]
+pub use jito_grpc::JitoGrpcTransport;
 #[cfg(feature = "kernel-bypass")]
 pub use kernel_bypass::{KernelBypassDatagramSocket, KernelBypassDirectTransport};
 pub use rpc::JsonRpcTransport;
 pub use types::{
-    DirectSubmitConfig, DirectSubmitTransport, JitoSubmitConfig, JitoSubmitTransport,
-    RpcSubmitConfig, RpcSubmitTransport, SignedTx, SubmitError, SubmitMode, SubmitReliability,
-    SubmitResult, SubmitTransportError, TxFlowSafetyIssue, TxFlowSafetyQuality,
+    DirectSubmitConfig, DirectSubmitTransport, JitoSubmitConfig, JitoSubmitResponse,
+    JitoSubmitTransport, RpcSubmitConfig, RpcSubmitTransport, SignedTx, SubmitError, SubmitMode,
+    SubmitReliability, SubmitResult, SubmitTransportError, TxFlowSafetyIssue, TxFlowSafetyQuality,
     TxFlowSafetySnapshot, TxFlowSafetySource, TxSubmitContext, TxSubmitGuardPolicy,
     TxSubmitOutcome, TxSubmitOutcomeKind, TxSubmitOutcomeReporter, TxSubmitSuppressionKey,
     TxToxicFlowRejectionReason, TxToxicFlowTelemetry, TxToxicFlowTelemetrySnapshot,

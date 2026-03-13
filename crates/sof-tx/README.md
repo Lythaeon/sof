@@ -367,6 +367,20 @@ let client = TxSubmitClient::new(blockhash_provider, leader_provider)
 Use `bundle_only = true` when you want Jito’s revert-protection behavior. Leave it `false` when
 you want the default `sendTransaction` path.
 
+Regional endpoint selection is available for the documented Jito mainnet regions:
+
+```rust
+use sof_tx::{JitoBlockEngineEndpoint, JitoBlockEngineRegion, submit::JitoJsonRpcTransport};
+
+let jito_transport = JitoJsonRpcTransport::with_endpoint(
+    JitoBlockEngineEndpoint::mainnet_region(JitoBlockEngineRegion::Frankfurt),
+)?;
+```
+
+With the `jito-grpc` feature enabled, `sof-tx` also exposes `JitoGrpcTransport`. That path sends
+transactions as single-transaction bundles over Jito searcher gRPC and returns a bundle UUID in
+`SubmitResult.jito_bundle_id`.
+
 ## Reliability Profiles
 
 Direct and hybrid modes include built-in reliability defaults through `SubmitReliability`.
