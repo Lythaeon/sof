@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "sof-solana-gossip"
-version = "3.1.8-sof.2"
+version = "3.1.8-sof.3"
 authors = ["Anza Maintainers <maintainers@anza.xyz>"]
 build = false
 exclude = ["Cargo.toml.orig"]
