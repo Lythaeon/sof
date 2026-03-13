@@ -34,7 +34,7 @@ struct MockRpcTransport {
 #[derive(Debug)]
 struct MockJitoTransport {
     /// Return value to use.
-    result: Result<String, SubmitTransportError>,
+    result: Result<JitoSubmitResponse, SubmitTransportError>,
     /// Number of submit calls.
     calls: AtomicU64,
 }
@@ -57,7 +57,7 @@ impl JitoSubmitTransport for MockJitoTransport {
         &self,
         _tx_bytes: &[u8],
         _config: &JitoSubmitConfig,
-    ) -> Result<String, SubmitTransportError> {
+    ) -> Result<JitoSubmitResponse, SubmitTransportError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         self.result.clone()
     }
@@ -194,7 +194,10 @@ async fn rpc_only_uses_rpc_transport() {
         calls: AtomicU64::new(0),
     });
     let jito = Arc::new(MockJitoTransport {
-        result: Ok("jito-signature".to_owned()),
+        result: Ok(JitoSubmitResponse {
+            transaction_signature: Some("jito-signature".to_owned()),
+            bundle_id: None,
+        }),
         calls: AtomicU64::new(0),
     });
     let mut client = TxSubmitClient::new(
@@ -218,6 +221,7 @@ async fn rpc_only_uses_rpc_transport() {
         assert_eq!(result.signature, Some(signature));
         assert_eq!(result.rpc_signature, Some("rpc-signature".to_owned()));
         assert_eq!(result.jito_signature, None);
+        assert_eq!(result.jito_bundle_id, None);
         assert_eq!(result.direct_target, None);
         assert!(!result.used_rpc_fallback);
     }
@@ -241,7 +245,10 @@ async fn jito_only_uses_jito_transport() {
         calls: AtomicU64::new(0),
     });
     let jito = Arc::new(MockJitoTransport {
-        result: Ok("jito-signature".to_owned()),
+        result: Ok(JitoSubmitResponse {
+            transaction_signature: Some("jito-signature".to_owned()),
+            bundle_id: None,
+        }),
         calls: AtomicU64::new(0),
     });
     let mut client = TxSubmitClient::new(
@@ -265,6 +272,7 @@ async fn jito_only_uses_jito_transport() {
         assert_eq!(result.signature, Some(signature));
         assert_eq!(result.rpc_signature, None);
         assert_eq!(result.jito_signature, Some("jito-signature".to_owned()));
+        assert_eq!(result.jito_bundle_id, None);
         assert_eq!(result.direct_target, None);
         assert!(!result.used_rpc_fallback);
     }
@@ -275,6 +283,42 @@ async fn jito_only_uses_jito_transport() {
     assert_eq!(rpc_calls, 0);
     assert_eq!(direct_calls, 0);
     assert_eq!(jito_calls, 1);
+}
+
+#[tokio::test]
+async fn jito_only_accepts_bundle_id_from_grpc_transport() {
+    let jito = Arc::new(MockJitoTransport {
+        result: Ok(JitoSubmitResponse {
+            transaction_signature: None,
+            bundle_id: Some("bundle-uuid".to_owned()),
+        }),
+        calls: AtomicU64::new(0),
+    });
+    let mut client = TxSubmitClient::new(
+        Arc::new(StaticRecentBlockhashProvider::new(Some([17_u8; 32]))),
+        Arc::new(StaticLeaderProvider::new(Some(target(9007)), Vec::new())),
+    )
+    .with_jito_transport(jito.clone());
+
+    let (bytes, signature) = signed_transfer_bytes();
+    let result = client
+        .submit_signed(
+            SignedTx::VersionedTransactionBytes(bytes),
+            SubmitMode::JitoOnly,
+        )
+        .await;
+
+    assert!(result.is_ok());
+    if let Ok(result) = result {
+        assert_eq!(result.signature, Some(signature));
+        assert_eq!(result.rpc_signature, None);
+        assert_eq!(result.jito_signature, None);
+        assert_eq!(result.jito_bundle_id, Some("bundle-uuid".to_owned()));
+        assert_eq!(result.direct_target, None);
+        assert!(!result.used_rpc_fallback);
+    }
+
+    assert_eq!(jito.calls.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test]
@@ -311,6 +355,7 @@ async fn direct_only_uses_direct_transport() {
         assert_eq!(result.direct_target, Some(direct_target));
         assert_eq!(result.rpc_signature, None);
         assert_eq!(result.jito_signature, None);
+        assert_eq!(result.jito_bundle_id, None);
         assert!(!result.used_rpc_fallback);
     }
 
@@ -355,6 +400,7 @@ async fn hybrid_falls_back_to_rpc_when_direct_fails() {
             Some("rpc-fallback-signature".to_owned())
         );
         assert_eq!(result.jito_signature, None);
+        assert_eq!(result.jito_bundle_id, None);
         assert!(result.used_rpc_fallback);
     }
 
@@ -406,6 +452,7 @@ async fn hybrid_uses_second_direct_attempt_before_rpc() {
             Some("rpc-fallback-signature".to_owned())
         );
         assert_eq!(result.jito_signature, None);
+        assert_eq!(result.jito_bundle_id, None);
         assert!(!result.used_rpc_fallback);
     }
 
@@ -451,6 +498,7 @@ async fn low_latency_reliability_uses_single_hybrid_attempt() {
             Some("rpc-fallback-signature".to_owned())
         );
         assert_eq!(result.jito_signature, None);
+        assert_eq!(result.jito_bundle_id, None);
         assert!(result.used_rpc_fallback);
     }
 
@@ -495,6 +543,7 @@ async fn low_latency_hybrid_direct_success_skips_rpc_broadcast() {
         assert_eq!(result.direct_target, Some(direct_target));
         assert_eq!(result.rpc_signature, None);
         assert_eq!(result.jito_signature, None);
+        assert_eq!(result.jito_bundle_id, None);
         assert!(!result.used_rpc_fallback);
     }
 

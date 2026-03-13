@@ -73,7 +73,19 @@ impl Default for RpcSubmitConfig {
 #[derive(Debug, Clone, Eq, PartialEq, Default)]
 pub struct JitoSubmitConfig {
     /// Enables revert protection by sending through bundle-only mode.
+    ///
+    /// This applies to the JSON-RPC transaction path. The gRPC transport is bundle-based and
+    /// therefore always behaves as a bundle submission.
     pub bundle_only: bool,
+}
+
+/// Successful Jito submission metadata.
+#[derive(Debug, Clone, Eq, PartialEq, Default)]
+pub struct JitoSubmitResponse {
+    /// Jito JSON-RPC returned transaction signature, when available.
+    pub transaction_signature: Option<String>,
+    /// Jito gRPC returned bundle UUID, when available.
+    pub bundle_id: Option<String>,
 }
 
 /// Direct submit tuning.
@@ -316,8 +328,10 @@ pub struct SubmitResult {
     pub direct_target: Option<LeaderTarget>,
     /// RPC-returned signature string when RPC path succeeded.
     pub rpc_signature: Option<String>,
-    /// Jito block-engine returned signature string when Jito path succeeded.
+    /// Jito block-engine returned transaction signature when the JSON-RPC path succeeded.
     pub jito_signature: Option<String>,
+    /// Jito block-engine returned bundle UUID when the gRPC bundle path succeeded.
+    pub jito_bundle_id: Option<String>,
     /// True when RPC fallback was used from hybrid mode.
     pub used_rpc_fallback: bool,
     /// Number of direct targets selected for submit attempt that succeeded.
@@ -749,12 +763,12 @@ pub trait RpcSubmitTransport: Send + Sync {
 /// Jito transport interface.
 #[async_trait]
 pub trait JitoSubmitTransport: Send + Sync {
-    /// Submits transaction bytes to Jito block engine and returns signature string.
+    /// Submits transaction bytes to Jito block engine and returns Jito-specific acceptance data.
     async fn submit_jito(
         &self,
         tx_bytes: &[u8],
         config: &JitoSubmitConfig,
-    ) -> Result<String, SubmitTransportError>;
+    ) -> Result<JitoSubmitResponse, SubmitTransportError>;
 }
 
 /// Direct transport interface.

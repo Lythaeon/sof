@@ -7,16 +7,39 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 
-use super::{JitoSubmitConfig, JitoSubmitTransport, SubmitTransportError};
+use super::{JitoSubmitConfig, JitoSubmitResponse, JitoSubmitTransport, SubmitTransportError};
 
 /// Default Jito mainnet block-engine base URL.
 const DEFAULT_JITO_BLOCK_ENGINE_URL: &str = "https://mainnet.block-engine.jito.wtf";
+
+/// Typed Jito mainnet region.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum JitoBlockEngineRegion {
+    /// Amsterdam region.
+    Amsterdam,
+    /// Dublin region.
+    Dublin,
+    /// Frankfurt region.
+    Frankfurt,
+    /// London region.
+    London,
+    /// New York region.
+    NewYork,
+    /// Salt Lake City region.
+    SaltLakeCity,
+    /// Singapore region.
+    Singapore,
+    /// Tokyo region.
+    Tokyo,
+}
 
 /// Typed Jito block-engine endpoint.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum JitoBlockEngineEndpoint {
     /// Default Jito mainnet block-engine endpoint.
     Mainnet,
+    /// Region-specific Jito mainnet block-engine endpoint.
+    MainnetRegion(JitoBlockEngineRegion),
     /// Custom parsed block-engine base URL.
     Custom(Url),
 }
@@ -26,6 +49,12 @@ impl JitoBlockEngineEndpoint {
     #[must_use]
     pub const fn mainnet() -> Self {
         Self::Mainnet
+    }
+
+    /// Returns one typed regional mainnet block-engine endpoint.
+    #[must_use]
+    pub const fn mainnet_region(region: JitoBlockEngineRegion) -> Self {
+        Self::MainnetRegion(region)
     }
 
     /// Creates a custom block-engine endpoint from a parsed URL.
@@ -39,6 +68,22 @@ impl JitoBlockEngineEndpoint {
     pub fn as_url(&self) -> &str {
         match self {
             Self::Mainnet => DEFAULT_JITO_BLOCK_ENGINE_URL,
+            Self::MainnetRegion(region) => match region {
+                JitoBlockEngineRegion::Amsterdam => {
+                    "https://amsterdam.mainnet.block-engine.jito.wtf"
+                }
+                JitoBlockEngineRegion::Dublin => "https://dublin.mainnet.block-engine.jito.wtf",
+                JitoBlockEngineRegion::Frankfurt => {
+                    "https://frankfurt.mainnet.block-engine.jito.wtf"
+                }
+                JitoBlockEngineRegion::London => "https://london.mainnet.block-engine.jito.wtf",
+                JitoBlockEngineRegion::NewYork => "https://ny.mainnet.block-engine.jito.wtf",
+                JitoBlockEngineRegion::SaltLakeCity => "https://slc.mainnet.block-engine.jito.wtf",
+                JitoBlockEngineRegion::Singapore => {
+                    "https://singapore.mainnet.block-engine.jito.wtf"
+                }
+                JitoBlockEngineRegion::Tokyo => "https://tokyo.mainnet.block-engine.jito.wtf",
+            },
             Self::Custom(url) => url.as_str(),
         }
     }
@@ -159,7 +204,7 @@ impl JitoSubmitTransport for JitoJsonRpcTransport {
         &self,
         tx_bytes: &[u8],
         config: &JitoSubmitConfig,
-    ) -> Result<String, SubmitTransportError> {
+    ) -> Result<JitoSubmitResponse, SubmitTransportError> {
         #[derive(Debug, Serialize)]
         struct JitoRpcConfig<'config> {
             /// Transaction encoding format.
@@ -203,7 +248,10 @@ impl JitoSubmitTransport for JitoJsonRpcTransport {
                 })?;
 
         if let Some(signature) = parsed.result {
-            return Ok(signature);
+            return Ok(JitoSubmitResponse {
+                transaction_signature: Some(signature),
+                bundle_id: None,
+            });
         }
         if let Some(error) = parsed.error {
             return Err(SubmitTransportError::Failure {
@@ -265,5 +313,15 @@ mod tests {
 
         assert_eq!(config.endpoint, JitoBlockEngineEndpoint::mainnet());
         assert_eq!(config.request_timeout, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn regional_endpoint_uses_documented_slug() {
+        let endpoint = JitoBlockEngineEndpoint::mainnet_region(JitoBlockEngineRegion::Frankfurt);
+
+        assert_eq!(
+            endpoint.as_url(),
+            "https://frankfurt.mainnet.block-engine.jito.wtf"
+        );
     }
 }
