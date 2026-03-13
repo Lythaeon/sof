@@ -325,7 +325,6 @@ Default transport settings:
 
 - endpoint: `JitoBlockEngineEndpoint::mainnet()` which resolves to `https://mainnet.block-engine.jito.wtf`
 - `request_timeout = 10s`
-- `auth_token = None`
 
 Default submit settings:
 
@@ -344,8 +343,8 @@ Example with explicit tuning:
 use std::{sync::Arc, time::Duration};
 
 use sof_tx::{
-    JitoAuthToken, JitoBlockEngineEndpoint, JitoSubmitConfig, JitoTransportConfig,
-    TxSubmitClient, submit::JitoJsonRpcTransport,
+    JitoBlockEngineEndpoint, JitoSubmitConfig, JitoTransportConfig, TxSubmitClient,
+    submit::JitoJsonRpcTransport,
 };
 use reqwest::Url;
 
@@ -355,7 +354,6 @@ let jito_transport = Arc::new(JitoJsonRpcTransport::with_config(
     JitoTransportConfig {
         endpoint: JitoBlockEngineEndpoint::custom(block_engine_url),
         request_timeout: Duration::from_secs(3),
-        auth_token: Some(JitoAuthToken::new("your-jito-auth-token")),
     },
 )?);
 
