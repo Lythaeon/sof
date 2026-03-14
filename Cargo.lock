@@ -4739,7 +4739,7 @@ dependencies = [
 
 [[package]]
 name = "sof"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "arcshift",
  "async-trait",
@@ -4778,11 +4778,11 @@ dependencies = [
 
 [[package]]
 name = "sof-gossip-tuning"
-version = "0.9.1"
+version = "0.9.2"
 
 [[package]]
 name = "sof-solana-gossip"
-version = "3.1.8-sof.3"
+version = "3.1.8-sof.4"
 dependencies = [
  "agave-feature-set",
  "agave-logger",
@@ -4847,7 +4847,7 @@ dependencies = [
 
 [[package]]
 name = "sof-tx"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "arcshift",
  "async-trait",
