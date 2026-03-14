@@ -135,6 +135,15 @@
                                 </div>
                             </aside>
                         </div>
+
+                        <footer class="site-footer" aria-label="Site footer">
+                            <div class="site-footer-inner">
+                                <p class="site-footer-copy">SOF <span data-current-year>2026</span></p>
+                                <a class="site-footer-link" href="https://github.com/Lythaeon/sof" aria-label="SOF on GitHub">
+                                    <i class="fa fa-github" aria-hidden="true"></i>
+                                </a>
+                            </div>
+                        </footer>
                     </div>
                 </div>
             </div>
@@ -195,6 +204,15 @@
                         link.removeAttribute("aria-current");
                     }
                 });
+            }
+
+            function syncFooterYear() {
+                var yearNode = document.querySelector("[data-current-year]");
+                if (!yearNode) {
+                    return;
+                }
+
+                yearNode.textContent = String(new Date().getFullYear());
             }
 
             function buildPageToc() {
@@ -320,6 +338,7 @@
 
             window.__sofDocsRenderChrome = function() {
                 syncTopNav();
+                syncFooterYear();
                 buildPageToc();
                 bindMobileChrome();
             };
