@@ -144,6 +144,7 @@ body {
   gap: 24px;
   flex: 1;
   min-width: 0;
+  position: relative;
 }
 
 .sof-brand {
@@ -178,7 +179,7 @@ body {
   gap: 2px;
   flex: 0 1 auto;
   min-width: 0;
-  margin-left: 8px;
+  margin-left: 0;
 }
 
 .book-top-nav a {
@@ -188,6 +189,7 @@ body {
   font-weight: 500;
   padding: 20px 12px 18px;
   text-decoration: none;
+  white-space: nowrap;
   transition:
     color 140ms ease,
     border-color 140ms ease;
@@ -588,7 +590,11 @@ body {
   }
 
   .book.with-summary .book-body {
-    left: 280px;
+    left: 0;
+  }
+
+  .book.with-summary .book-body .page-wrapper {
+    margin-left: 280px;
   }
 
   .book .book-header {
@@ -603,6 +609,17 @@ body {
 
   .navigation {
     display: none;
+  }
+}
+
+@media screen and (min-width: 1201px) {
+  .book-top-nav {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+    justify-content: center;
+    width: max-content;
+    max-width: min(52vw, 760px);
   }
 }
 
