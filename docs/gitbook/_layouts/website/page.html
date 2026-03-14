@@ -102,6 +102,12 @@
                             <a href="{{ "architecture/"|resolveFile }}" data-nav-match="architecture">Architecture</a>
                             <a href="{{ "maintainers/"|resolveFile }}" data-nav-match="maintain">Maintain SOF</a>
                         </nav>
+
+                        <button class="book-mobile-toggle" type="button" aria-label="Toggle navigation" aria-expanded="false">
+                            <span></span>
+                            <span></span>
+                            <span></span>
+                        </button>
                     </div>
 
                     <h1 class="book-header-page-title">
@@ -247,9 +253,75 @@
                 });
             }
 
+            function bindMobileChrome() {
+                if (window.__sofDocsMobileChromeBound) {
+                    return;
+                }
+
+                var book = document.querySelector(".book");
+                var toggle = document.querySelector(".book-mobile-toggle");
+                var summary = document.querySelector(".book-summary");
+
+                if (!book || !toggle || !summary) {
+                    return;
+                }
+
+                function syncToggleState() {
+                    var isOpen = book.classList.contains("with-summary");
+                    toggle.setAttribute("aria-expanded", isOpen ? "true" : "false");
+                }
+
+                function closeSummary() {
+                    if (!window.matchMedia("(max-width: 700px)").matches) {
+                        return;
+                    }
+                    book.classList.remove("with-summary");
+                    syncToggleState();
+                }
+
+                toggle.addEventListener("click", function() {
+                    if (!window.matchMedia("(max-width: 700px)").matches) {
+                        return;
+                    }
+                    book.classList.toggle("with-summary");
+                    syncToggleState();
+                });
+
+                summary.addEventListener("click", function(event) {
+                    var target = event.target;
+                    if (target && target.closest("a")) {
+                        closeSummary();
+                    }
+                });
+
+                document.addEventListener("click", function(event) {
+                    if (!window.matchMedia("(max-width: 700px)").matches) {
+                        return;
+                    }
+                    if (!book.classList.contains("with-summary")) {
+                        return;
+                    }
+                    if (summary.contains(event.target) || toggle.contains(event.target)) {
+                        return;
+                    }
+                    closeSummary();
+                });
+
+                window.addEventListener("resize", function() {
+                    if (!window.matchMedia("(max-width: 700px)").matches) {
+                        book.classList.remove("with-summary");
+                    }
+                    syncToggleState();
+                });
+
+                syncToggleState();
+                window.__sofDocsMobileChromeBound = true;
+            }
+
             window.__sofDocsRenderChrome = function() {
                 syncTopNav();
                 buildPageToc();
+                bindMobileChrome();
             };
 
             if (!window.__sofDocsChromeBound) {
