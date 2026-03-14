@@ -38,7 +38,7 @@
             }
         }
         function __init__restoreLastSidebarState() {
-            var isMobile = window.matchMedia("(max-width: 600px)").matches;
+            var isMobile = window.matchMedia("(max-width: 960px)").matches;
             if (isMobile) {
                 return;
             }
@@ -271,6 +271,56 @@
                 });
             }
 
+            function tagSpecialTables() {
+                var section = document.querySelector(".markdown-section");
+                var pageShell = document.querySelector(".page-shell");
+                if (!section) {
+                    return;
+                }
+
+                if (pageShell) {
+                    pageShell.classList.remove("has-knob-tables");
+                }
+
+                var tables = Array.prototype.slice.call(section.querySelectorAll("table"));
+                tables.forEach(function(table) {
+                    table.classList.remove("knob-table");
+
+                    var headings = Array.prototype.slice.call(table.querySelectorAll("thead th")).map(function(th) {
+                        return (th.textContent || "").trim().toLowerCase();
+                    });
+
+                    if (
+                        headings.length === 4 &&
+                        headings[0] === "knob" &&
+                        headings[1] === "default" &&
+                        headings[2] === "scope" &&
+                        headings[3] === "meaning"
+                    ) {
+                        var parent = table.parentNode;
+                        if (parent && !parent.classList.contains("knob-table-wrap")) {
+                            var wrapper = document.createElement("div");
+                            wrapper.className = "knob-table-wrap";
+                            parent.insertBefore(wrapper, table);
+                            wrapper.appendChild(table);
+                        }
+
+                        table.classList.add("knob-table");
+                        Array.prototype.forEach.call(table.querySelectorAll("tbody tr"), function(row) {
+                            Array.prototype.forEach.call(row.children, function(cell, index) {
+                                if (headings[index]) {
+                                    cell.setAttribute("data-label", headings[index]);
+                                }
+                            });
+                        });
+
+                        if (pageShell) {
+                            pageShell.classList.add("has-knob-tables");
+                        }
+                    }
+                });
+            }
+
             function bindMobileChrome() {
                 if (window.__sofDocsMobileChromeBound) {
                     return;
@@ -290,7 +340,7 @@
                 }
 
                 function closeSummary() {
-                    if (!window.matchMedia("(max-width: 700px)").matches) {
+                    if (!window.matchMedia("(max-width: 960px)").matches) {
                         return;
                     }
                     book.classList.remove("with-summary");
@@ -298,7 +348,7 @@
                 }
 
                 toggle.addEventListener("click", function() {
-                    if (!window.matchMedia("(max-width: 700px)").matches) {
+                    if (!window.matchMedia("(max-width: 960px)").matches) {
                         return;
                     }
                     book.classList.toggle("with-summary");
@@ -313,7 +363,7 @@
                 });
 
                 document.addEventListener("click", function(event) {
-                    if (!window.matchMedia("(max-width: 700px)").matches) {
+                    if (!window.matchMedia("(max-width: 960px)").matches) {
                         return;
                     }
                     if (!book.classList.contains("with-summary")) {
@@ -326,7 +376,7 @@
                 });
 
                 window.addEventListener("resize", function() {
-                    if (!window.matchMedia("(max-width: 700px)").matches) {
+                    if (!window.matchMedia("(max-width: 960px)").matches) {
                         book.classList.remove("with-summary");
                     }
                     syncToggleState();
@@ -340,6 +390,7 @@
                 syncTopNav();
                 syncFooterYear();
                 buildPageToc();
+                tagSpecialTables();
                 bindMobileChrome();
             };
 
