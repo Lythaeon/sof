@@ -1,6 +1,12 @@
 # Use SOF
 
-This track is for people who want to consume SOF as infrastructure, not maintain the repository.
+This track is for people who want to use SOF as a product, not maintain the repository.
+
+At the highest level:
+
+- `sof` is the observer/runtime product
+- `sof-tx` is the execution and submission product
+- `sof-gossip-tuning` is the typed tuning layer for embedded `sof` hosts
 
 Read this section if you are:
 

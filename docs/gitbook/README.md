@@ -1,7 +1,22 @@
 # SOF Documentation
 
-SOF is a Solana-focused Rust workspace for low-latency ingest, local control-plane state, and
-execution paths that are designed more like market infrastructure than wallet tooling.
+SOF is a Solana infrastructure toolkit.
+
+It is built for services that need one or both of these:
+
+- a local observer/runtime that ingests live Solana traffic and derives control-plane state
+- a transaction SDK that uses that control plane for predictable low-latency submission
+
+In practice, SOF is three public products with one internal backend:
+
+- `sof`: observer/runtime
+- `sof-tx`: transaction SDK
+- `sof-gossip-tuning`: typed host tuning
+- `sof-solana-gossip`: vendored bootstrap backend used internally by `sof`
+
+SOF is not a wallet framework and it is not a validator. The project is shaped more like market
+infrastructure software: bounded queues, explicit runtime posture, local control-plane state, and
+operationally visible tradeoffs.
 
 This book has two separate reading tracks because external users and repository maintainers need
 different documentation.

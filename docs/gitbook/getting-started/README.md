@@ -3,6 +3,12 @@
 This section is the shortest path for an external user to go from evaluation to first working
 integration.
 
+Before you start, keep the product model simple:
+
+- if you need ingest, local state, plugin events, or operations guidance, start with `sof`
+- if you need transaction building and submission, start with `sof-tx`
+- if you need both local observation and local submission decisions, use them together
+
 ## Who This Is For
 
 - Runtime embedders who need a local Solana ingest engine

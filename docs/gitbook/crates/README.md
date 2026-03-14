@@ -1,6 +1,12 @@
 # Crates
 
-SOF is intentionally split into focused crates instead of one wide public surface.
+SOF is not one wide crate with mixed concerns. It is a small product family split by job:
+
+- observe and derive local runtime state
+- build and submit transactions
+- apply typed host tuning
+
+That split is intentional because most users do not need the full surface at once.
 
 This section is consumer-facing. It explains which crate to adopt and why, without requiring
 repository-internal knowledge.
