@@ -1,0 +1,7 @@
+{
+  "title": "SOF Documentation",
+  "description": "Infrastructure-oriented documentation for the SOF Rust workspace",
+  "language": "en",
+  "plugins": [],
+  "root": "."
+}

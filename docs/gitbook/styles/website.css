@@ -1,0 +1,652 @@
+:root {
+  --bg: #0b1014;
+  --bg-subtle: #11171c;
+  --bg-panel: #141b21;
+  --bg-panel-2: #182128;
+  --bg-code: #10171d;
+  --border: #26333d;
+  --border-soft: #1d2831;
+  --text: #cad7df;
+  --text-muted: #93a5b1;
+  --text-dim: #70818c;
+  --heading: #f4fbff;
+  --accent: #57ddd1;
+  --accent-strong: #20cfc2;
+  --accent-soft: rgba(87, 221, 209, 0.1);
+  --shadow-soft: 0 18px 40px rgba(0, 0, 0, 0.24);
+  --radius-sm: 6px;
+  --radius-md: 10px;
+}
+
+html,
+body {
+  background: var(--bg);
+}
+
+body {
+  font-family: "IBM Plex Sans", "Avenir Next", "Segoe UI", sans-serif;
+  color: var(--text);
+  letter-spacing: 0.01em;
+}
+
+.book {
+  background:
+    radial-gradient(circle at top right, rgba(87, 221, 209, 0.08), transparent 26%),
+    linear-gradient(180deg, #0b1014 0%, #0d1217 100%);
+}
+
+.book.with-summary {
+  overflow: hidden;
+}
+
+.book .book-summary {
+  background: linear-gradient(180deg, #0f151a 0%, #11181d 100%);
+  border-right: 1px solid var(--border-soft);
+  box-shadow: inset -1px 0 0 rgba(255, 255, 255, 0.02);
+  overflow: hidden;
+}
+
+.book .book-summary nav {
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 18px 0 28px;
+}
+
+.book .book-summary nav::-webkit-scrollbar {
+  width: 8px;
+}
+
+.book .book-summary nav::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.book .book-summary nav::-webkit-scrollbar-thumb {
+  background: #23313a;
+  border-radius: 999px;
+}
+
+.book .book-summary ul.summary {
+  padding: 0 12px 30px;
+}
+
+.book .book-summary ul.summary li.divider {
+  display: none;
+}
+
+.book .book-summary ul.summary li a,
+.book .book-summary ul.summary li span {
+  color: var(--text-muted);
+  margin: 1px 0;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  transition:
+    color 140ms ease,
+    background-color 140ms ease;
+}
+
+.book .book-summary ul.summary li a:hover {
+  color: var(--heading);
+  text-decoration: none;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.book .book-summary ul.summary > li.chapter > a {
+  color: var(--heading);
+  font-size: 1.3rem;
+  font-weight: 700;
+  margin-top: 8px;
+}
+
+.book .book-summary ul.summary > li.chapter > ul > li.chapter > a {
+  color: var(--text);
+  font-size: 1.15rem;
+  font-weight: 600;
+  margin-top: 10px;
+}
+
+.book .book-summary ul.summary li.active > a {
+  color: var(--accent);
+  background: linear-gradient(90deg, rgba(87, 221, 209, 0.12), rgba(87, 221, 209, 0.04));
+}
+
+.book .book-summary ul.summary li ul {
+  padding-left: 14px;
+}
+
+.book .book-body {
+  background:
+    radial-gradient(circle at top left, rgba(87, 221, 209, 0.05), transparent 24%),
+    linear-gradient(180deg, #0c1216 0%, #0d1318 100%);
+  color: var(--text);
+}
+
+.book .book-body .body-inner,
+.book .book-body .page-wrapper {
+  background: transparent;
+}
+
+.book .book-header {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 64px;
+  padding: 0 28px;
+  background: rgba(15, 21, 26, 0.94);
+  border-bottom: 1px solid var(--border-soft);
+  backdrop-filter: blur(14px);
+  z-index: 6;
+}
+
+.book .book-header-inner {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  flex: 1;
+  min-width: 0;
+}
+
+.sof-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--heading);
+  font-size: 1.9rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  text-decoration: none;
+}
+
+.sof-brand:hover,
+.sof-brand:focus {
+  color: var(--heading);
+  text-decoration: none;
+}
+
+.sof-brand-mark {
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--accent);
+  border-radius: 4px;
+  box-shadow: inset 0 0 0 3px rgba(87, 221, 209, 0.12);
+  transform: rotate(45deg);
+}
+
+.book-top-nav {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: 0 1 auto;
+  min-width: 0;
+  margin-left: 8px;
+}
+
+.book-top-nav a {
+  color: var(--text-muted);
+  border-bottom: 2px solid transparent;
+  font-size: 1.4rem;
+  font-weight: 500;
+  padding: 20px 12px 18px;
+  text-decoration: none;
+  transition:
+    color 140ms ease,
+    border-color 140ms ease;
+}
+
+.book-top-nav a:hover {
+  color: var(--heading);
+}
+
+.book-top-nav a.is-active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+.book-header-search {
+  flex: 0 1 340px;
+  min-width: 220px;
+  max-width: 360px;
+}
+
+#book-search-input {
+  background: transparent;
+  border: none;
+  margin: 0;
+  padding: 0;
+}
+
+#book-search-input input,
+#book-search-input input:focus,
+#book-search-input input:hover {
+  width: 100%;
+  height: 42px;
+  background: linear-gradient(180deg, #151d23 0%, #131a20 100%);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02);
+  color: var(--text);
+  padding: 0 14px;
+}
+
+#book-search-input input::placeholder {
+  color: var(--text-dim);
+}
+
+.book .book-header > .btn {
+  order: 3;
+  min-width: 40px;
+  height: 40px;
+  line-height: 40px;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #131a20;
+  margin-left: 0;
+}
+
+.book .book-header > .btn:hover {
+  color: var(--accent);
+  background: #171f26;
+}
+
+.book-header-page-title {
+  display: none;
+}
+
+.book .book-body .page-wrapper .page-inner {
+  max-width: 1220px;
+  margin: 0 auto;
+  padding: 34px 48px 64px;
+}
+
+.page-shell {
+  position: relative;
+  min-height: 100%;
+}
+
+.page-content {
+  max-width: 760px;
+  margin: 0 auto;
+  min-width: 0;
+}
+
+.page-toc {
+  position: absolute;
+  left: calc(50% + 430px);
+  top: 94px;
+  width: 220px;
+}
+
+.page-toc.is-empty {
+  display: none;
+}
+
+.page-toc-inner {
+  padding-top: 16px;
+}
+
+.page-toc-label {
+  margin: 0 0 16px;
+  color: var(--accent);
+  font-size: 1.25rem;
+  font-weight: 600;
+}
+
+.page-toc-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.page-toc-nav a {
+  color: var(--text-muted);
+  border-left: 1px solid var(--border);
+  font-size: 1.35rem;
+  line-height: 1.5;
+  padding-left: 12px;
+  text-decoration: none;
+  transition:
+    color 140ms ease,
+    border-color 140ms ease;
+}
+
+.page-toc-nav a:hover {
+  color: var(--heading);
+}
+
+.page-toc-nav a.is-active {
+  color: var(--accent);
+  border-left-color: var(--accent);
+}
+
+.page-toc-nav a.toc-depth-3 {
+  margin-left: 12px;
+  font-size: 1.28rem;
+}
+
+.markdown-section {
+  color: var(--text);
+  font-size: 1.65rem;
+  line-height: 1.7;
+}
+
+.markdown-section h1,
+.markdown-section h2,
+.markdown-section h3,
+.markdown-section h4 {
+  color: var(--heading);
+  letter-spacing: -0.01em;
+}
+
+.markdown-section h1 {
+  font-size: 4.4rem;
+  font-weight: 700;
+  margin-bottom: 0.85em;
+  padding-bottom: 0.32em;
+  border-bottom: 1px solid rgba(87, 221, 209, 0.45);
+}
+
+.markdown-section h2 {
+  font-size: 3rem;
+  font-weight: 700;
+  margin-top: 1.9em;
+  margin-bottom: 0.55em;
+}
+
+.markdown-section h3 {
+  font-size: 2.2rem;
+  font-weight: 650;
+  margin-top: 1.5em;
+  margin-bottom: 0.45em;
+}
+
+.markdown-section p,
+.markdown-section li,
+.markdown-section blockquote,
+.markdown-section td,
+.markdown-section th {
+  color: var(--text);
+}
+
+.markdown-section a {
+  color: var(--accent);
+}
+
+.markdown-section a:hover {
+  color: #95fff7;
+}
+
+.markdown-section strong {
+  color: var(--heading);
+}
+
+.markdown-section ul li::marker,
+.markdown-section ol li::marker {
+  color: var(--accent);
+}
+
+.markdown-section hr {
+  background: rgba(87, 221, 209, 0.16);
+}
+
+.markdown-section code,
+.markdown-section pre {
+  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+}
+
+.markdown-section code {
+  color: #a9fff7;
+  background: rgba(87, 221, 209, 0.12);
+  border-radius: 4px;
+}
+
+.markdown-section pre {
+  background: linear-gradient(180deg, #11181e 0%, #10161b 100%);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-soft);
+  color: var(--text);
+}
+
+.markdown-section blockquote {
+  background: rgba(87, 221, 209, 0.05);
+  border-left: 3px solid var(--accent-strong);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  padding-top: 10px;
+  padding-bottom: 10px;
+}
+
+.markdown-section table {
+  width: 100%;
+  color: var(--text);
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+.markdown-section table th,
+.markdown-section table td {
+  background: #12191f;
+  border-color: #29414d;
+}
+
+.markdown-section table th {
+  background: #122029;
+  color: var(--heading);
+}
+
+.markdown-section table tr:nth-child(2n) td {
+  background: #141d24;
+}
+
+.markdown-section table thead tr:first-child th:first-child {
+  border-top-left-radius: var(--radius-md);
+}
+
+.markdown-section table thead tr:first-child th:last-child {
+  border-top-right-radius: var(--radius-md);
+}
+
+.markdown-section table tbody tr:last-child td:first-child {
+  border-bottom-left-radius: var(--radius-md);
+}
+
+.markdown-section table tbody tr:last-child td:last-child {
+  border-bottom-right-radius: var(--radius-md);
+}
+
+.page-inner .btn-group .btn,
+.button,
+.dropdown-menu {
+  background: #141b21;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.dropdown-menu {
+  box-shadow: var(--shadow-soft);
+}
+
+.dropdown-menu .buttons,
+.dropdown-menu .buttons:last-child {
+  border-bottom-color: var(--border);
+}
+
+.dropdown-menu .dropdown-caret .caret-outer {
+  border-bottom-color: rgba(38, 51, 61, 0.96);
+}
+
+.dropdown-menu .dropdown-caret .caret-inner {
+  border-bottom-color: #141b21;
+}
+
+.dropdown-menu .buttons .button {
+  color: var(--text-muted);
+  background: transparent;
+}
+
+.dropdown-menu .buttons .button:hover,
+.button:hover {
+  color: var(--accent);
+}
+
+.navigation {
+  color: rgba(202, 215, 223, 0.8);
+}
+
+.navigation:hover {
+  color: var(--accent);
+}
+
+.book .navigation.navigation-next,
+.book .navigation.navigation-prev {
+  text-shadow: none;
+}
+
+.book .navigation.navigation-next {
+  right: 10px;
+}
+
+.book .navigation.navigation-prev {
+  left: 10px;
+}
+
+#book-search-results .search-results .search-results-title,
+#book-search-results .search-results .has-results .search-results-item,
+#book-search-results .search-results .has-results .search-results-item a,
+#book-search-results .search-results .has-results .search-results-item p {
+  color: var(--text);
+}
+
+#book-search-results .search-results .has-results .search-results-item code,
+#book-search-results .search-results .has-results .search-results-item pre,
+#book-search-results .search-results .has-results .search-results-item table tr {
+  background: #141b21;
+  color: var(--text);
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0d1217;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #24333c;
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #2e4753;
+}
+
+@media screen and (min-width: 601px) {
+  .book .book-summary {
+    top: 64px;
+    left: -280px;
+    width: 280px;
+  }
+
+  .book.with-summary .book-summary {
+    left: 0;
+  }
+
+  .book .book-body {
+    left: 0;
+  }
+
+  .book.with-summary .book-body {
+    left: 280px;
+  }
+
+  .book .book-header {
+    left: 0;
+    right: 0;
+    height: 64px;
+  }
+
+  .book .book-header .btn.pull-left + .btn.pull-left {
+    display: inline-flex;
+  }
+
+  .navigation {
+    display: none;
+  }
+}
+
+@media screen and (max-width: 1180px) {
+  .page-toc {
+    display: none;
+  }
+}
+
+@media screen and (max-width: 960px) {
+  .book .book-header {
+    padding: 0 16px;
+  }
+
+  .book-top-nav {
+    display: none;
+  }
+
+  .book-header-search {
+    flex: 1 1 auto;
+    max-width: none;
+    min-width: 0;
+  }
+
+  .book .book-body .page-wrapper .page-inner {
+    padding: 28px 26px 48px;
+  }
+
+  .markdown-section h1 {
+    font-size: 3.6rem;
+  }
+}
+
+@media screen and (max-width: 700px) {
+  .sof-brand {
+    font-size: 1.7rem;
+  }
+
+  .book .book-header {
+    min-height: 56px;
+    padding: 8px 12px;
+    gap: 10px;
+  }
+
+  .book-header-search {
+    flex-basis: 100%;
+    order: 10;
+    max-width: none;
+  }
+
+  #book-search-input input,
+  #book-search-input input:focus,
+  #book-search-input input:hover {
+    height: 38px;
+  }
+
+  .book .book-body .page-wrapper .page-inner {
+    padding: 20px 16px 32px;
+  }
+
+  .markdown-section {
+    font-size: 1.55rem;
+  }
+
+  .markdown-section h1 {
+    font-size: 3rem;
+  }
+
+  .markdown-section h2 {
+    font-size: 2.5rem;
+  }
+
+  .markdown-section h3 {
+    font-size: 2rem;
+  }
+}

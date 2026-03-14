@@ -1,0 +1,27 @@
+{% extends "layout.html" %}
+
+{% block head %}
+    {{ super() }}
+    <meta name="HandheldFriendly" content="true"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black">
+    <link rel="icon" type="image/svg+xml" sizes="any" href="{{ "assets/sof-favicon.svg"|resolveFile }}">
+    <link rel="icon" type="image/x-icon" href="{{ "assets/favicon.ico"|resolveFile }}">
+    <link rel="shortcut icon" type="image/x-icon" href="{{ "assets/favicon.ico"|resolveFile }}">
+    <link rel="apple-touch-icon" href="{{ "assets/apple-touch-icon.png"|resolveFile }}">
+{% endblock %}
+
+{% block style %}
+    <link rel="stylesheet" href="{{ "style.css"|resolveAsset }}">
+
+    {{ super() }}
+
+    {% for type, style in config.styles %}
+        {% if fileExists(style) and type == "website" %}
+        <link rel="stylesheet" href="{{ style|resolveFile }}">
+        {% endif %}
+    {% endfor %}
+{% endblock %}
+
+{% block body %}{% endblock %}

@@ -144,6 +144,7 @@ To keep ingest/processing but reduce outward network activity:
 
 ## Documentation
 
+- GitBook-compatible docs site: `docs/gitbook/README.md`
 - Docs home: `docs/README.md`
 - Architecture index: `docs/architecture/README.md`
 - Operations index: `docs/operations/README.md`
