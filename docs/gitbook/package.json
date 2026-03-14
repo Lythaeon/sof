@@ -1,0 +1,17 @@
+{
+  "name": "sof-gitbook-docs",
+  "private": true,
+  "description": "Local GitBook-compatible documentation site for the SOF workspace",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "honkit build",
+    "serve": "honkit serve --port 4000",
+    "serve:open": "honkit serve --port 4000 --open",
+    "clean": "rm -rf _book"
+  },
+  "devDependencies": {
+    "honkit": "^6.1.6"
+  }
+}

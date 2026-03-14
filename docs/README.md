@@ -6,6 +6,14 @@ Use it as the entry point for architecture references, operations guides, and cr
 The project is aimed at low-latency Solana infrastructure: ingest, replayable state, execution
 control planes, and deployment/tuning concerns that matter in real trading and market-data systems.
 
+For a locally previewable documentation website, use `docs/gitbook/`:
+
+```bash
+cd docs/gitbook
+npm install
+npm run serve
+```
+
 ## Start Here
 
 Observer/runtime users:
@@ -22,6 +30,7 @@ Contributors:
 
 - `../CONTRIBUTING.md`
 - `architecture/README.md`
+- `gitbook/README.md`
 
 ## Architecture Docs
 
