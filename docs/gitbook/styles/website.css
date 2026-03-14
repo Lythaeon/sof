@@ -127,15 +127,18 @@ body {
 }
 
 .book .book-header {
+  position: sticky;
+  top: 0;
   display: flex;
   align-items: center;
   gap: 14px;
   min-height: 64px;
+  width: 100%;
   padding: 0 28px;
   background: rgba(15, 21, 26, 0.94);
   border-bottom: 1px solid var(--border-soft);
   backdrop-filter: blur(14px);
-  z-index: 6;
+  z-index: 12;
 }
 
 .book .book-header-inner {
@@ -294,6 +297,10 @@ body {
   min-height: 100%;
 }
 
+.page-shell.has-knob-tables .page-content {
+  max-width: 920px;
+}
+
 .page-content {
   max-width: 760px;
   margin: 0 auto;
@@ -349,6 +356,10 @@ body {
   left: calc(50% + 430px);
   top: 94px;
   width: 220px;
+}
+
+.page-shell.has-knob-tables .page-toc {
+  left: calc(50% + 510px);
 }
 
 .page-toc.is-empty {
@@ -533,6 +544,62 @@ body {
   border-bottom-right-radius: var(--radius-md);
 }
 
+.markdown-section table.knob-table {
+  display: table;
+  width: 1120px;
+  max-width: none;
+  table-layout: fixed;
+}
+
+.markdown-section .knob-table-wrap {
+  margin: 0 0 1.2em;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: visible;
+  width: 100%;
+  -webkit-overflow-scrolling: touch;
+}
+
+.markdown-section .knob-table-wrap table.knob-table {
+  margin-bottom: 0;
+}
+
+.markdown-section table.knob-table th,
+.markdown-section table.knob-table td {
+  hyphens: manual;
+  overflow-wrap: anywhere;
+  vertical-align: top;
+  word-break: normal;
+}
+
+.markdown-section table.knob-table th:nth-child(1),
+.markdown-section table.knob-table td:nth-child(1) {
+  width: 31%;
+}
+
+.markdown-section table.knob-table th:nth-child(2),
+.markdown-section table.knob-table td:nth-child(2) {
+  width: 16%;
+}
+
+.markdown-section table.knob-table th:nth-child(3),
+.markdown-section table.knob-table td:nth-child(3) {
+  width: 16%;
+}
+
+.markdown-section table.knob-table th:nth-child(4),
+.markdown-section table.knob-table td:nth-child(4) {
+  width: 37%;
+}
+
+.markdown-section table.knob-table td code {
+  display: inline-block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: normal;
+}
+
 .page-inner .btn-group .btn,
 .button,
 .dropdown-menu {
@@ -622,11 +689,13 @@ body {
   background: #2e4753;
 }
 
-@media screen and (min-width: 601px) {
+@media screen and (min-width: 961px) {
   .book .book-summary {
+    position: fixed;
     top: 64px;
     left: -280px;
     width: 280px;
+    bottom: 0;
   }
 
   .book.with-summary .book-summary {
@@ -698,30 +767,6 @@ body {
 }
 
 @media screen and (max-width: 960px) {
-  .book .book-header {
-    padding: 0 16px;
-  }
-
-  .book-top-nav {
-    display: none;
-  }
-
-  .book-header-search {
-    flex: 1 1 auto;
-    max-width: none;
-    min-width: 0;
-  }
-
-  .book .book-body .page-wrapper .page-inner {
-    padding: 28px 26px 48px;
-  }
-
-  .markdown-section h1 {
-    font-size: 3.6rem;
-  }
-}
-
-@media screen and (max-width: 700px) {
   .book {
     background: #0d1318;
   }
@@ -733,18 +778,18 @@ body {
   .book.with-summary::after {
     content: "";
     position: fixed;
-    inset: 0;
-    background: rgba(3, 6, 8, 0.82);
-    backdrop-filter: blur(4px);
+    inset: 64px 0 0;
+    background: rgba(3, 6, 8, 0.78);
+    backdrop-filter: blur(3px);
     z-index: 8;
   }
 
   .book .book-summary {
     position: fixed;
-    top: 0;
+    top: 64px;
     bottom: 0;
     left: 0;
-    width: min(86vw, 320px);
+    width: min(82vw, 320px);
     max-width: 320px;
     border-right: 1px solid var(--border);
     box-shadow: 24px 0 48px rgba(0, 0, 0, 0.34);
@@ -754,6 +799,7 @@ body {
   }
 
   .book.with-summary .book-summary {
+    left: 0;
     transform: translateX(0);
   }
 
@@ -778,6 +824,52 @@ body {
 
   .book.with-summary .book-body {
     overflow: hidden;
+  }
+
+  .book .book-header {
+    padding: 0 16px;
+  }
+
+  .book-top-nav {
+    display: none;
+  }
+
+  .book-header-search {
+    flex: 1 1 auto;
+    max-width: none;
+    min-width: 0;
+  }
+
+  .book-mobile-toggle {
+    display: inline-flex;
+    flex: 0 0 auto;
+    margin-left: 8px;
+  }
+
+  .book .book-header > .btn,
+  .book .book-header > .font-settings {
+    display: none;
+  }
+
+  .book .book-body .page-wrapper .page-inner {
+    padding: 28px 26px 48px;
+  }
+
+  .markdown-section h1 {
+    font-size: 3.6rem;
+  }
+}
+
+@media screen and (max-width: 700px) {
+  .book.with-summary::after {
+    inset: 0;
+    background: rgba(3, 6, 8, 0.82);
+    backdrop-filter: blur(4px);
+  }
+
+  .book .book-summary {
+    top: 0;
+    width: min(86vw, 320px);
   }
 
   .book.with-summary .body-inner {
@@ -816,17 +908,11 @@ body {
   }
 
   .book-mobile-toggle {
-    display: inline-flex;
     position: absolute;
     top: 6px;
     right: 0;
     margin-left: 0;
     z-index: 2;
-  }
-
-  .book .book-header > .btn,
-  .book .book-header > .font-settings {
-    display: none;
   }
 
   .book-header-search {
@@ -885,6 +971,69 @@ body {
 
   .navigation {
     display: none;
+  }
+}
+
+@media screen and (max-width: 900px) {
+  .markdown-section .knob-table-wrap {
+    overflow: visible;
+  }
+
+  .markdown-section table.knob-table {
+    display: block;
+    min-width: 0;
+    width: 100%;
+  }
+
+  .markdown-section table.knob-table thead {
+    display: none;
+  }
+
+  .markdown-section table.knob-table tbody {
+    display: block;
+  }
+
+  .markdown-section table.knob-table tr {
+    display: block;
+    margin-bottom: 14px;
+    border: 1px solid #29414d;
+    border-radius: var(--radius-md);
+    overflow: hidden;
+  }
+
+  .markdown-section table.knob-table td {
+    display: grid;
+    grid-template-columns: 92px minmax(0, 1fr);
+    gap: 12px;
+    width: 100%;
+    border: 0;
+    border-top: 1px solid #29414d;
+    padding: 12px 14px;
+  }
+
+  .markdown-section table.knob-table td:first-child {
+    border-top: 0;
+  }
+
+  .markdown-section table.knob-table td::before {
+    content: attr(data-label);
+    color: var(--text-dim);
+    font-size: 1.12rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+
+  .markdown-section table.knob-table td:nth-child(1),
+  .markdown-section table.knob-table td:nth-child(2),
+  .markdown-section table.knob-table td:nth-child(3),
+  .markdown-section table.knob-table td:nth-child(4) {
+    width: 100%;
+  }
+
+  .markdown-section table.knob-table td:nth-child(2),
+  .markdown-section table.knob-table td:nth-child(2) code {
+    white-space: normal;
   }
 }
 
