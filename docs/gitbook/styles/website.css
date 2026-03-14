@@ -275,6 +275,10 @@ body {
   background: #171f26;
 }
 
+.book .book-header > .font-settings {
+  display: none;
+}
+
 .book-header-page-title {
   display: none;
 }
@@ -294,6 +298,50 @@ body {
   max-width: 760px;
   margin: 0 auto;
   min-width: 0;
+}
+
+.site-footer {
+  margin-top: 40px;
+}
+
+.site-footer-inner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 18px 0 0;
+  border-top: 1px solid var(--border-soft);
+  text-align: center;
+}
+
+.site-footer-copy,
+.site-footer-link {
+  color: var(--text-dim);
+  font-size: 1.28rem;
+  line-height: 1.5;
+}
+
+.site-footer-copy {
+  margin: 0;
+}
+
+.site-footer-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+  transition: color 140ms ease;
+}
+
+.site-footer-link .fa {
+  font-size: 1.5rem;
+}
+
+.site-footer-link:hover,
+.site-footer-link:focus {
+  color: var(--accent);
 }
 
 .page-toc {
@@ -717,6 +765,7 @@ body {
   .book.with-summary .book-body {
     left: 0;
     width: 100%;
+    transform: none;
   }
 
   .sof-brand {
@@ -787,6 +836,16 @@ body {
     width: 100%;
   }
 
+  .site-footer {
+    margin-top: 28px;
+  }
+
+  .site-footer-inner {
+    max-width: none;
+    width: 100%;
+    padding-top: 14px;
+  }
+
   .markdown-section {
     font-size: 1.55rem;
   }
@@ -820,6 +879,12 @@ body {
 
   .book .book-body .page-wrapper .page-inner {
     padding: 18px 12px 28px;
+  }
+
+  .site-footer-inner {
+    align-items: center;
+    flex-direction: column;
+    gap: 8px;
   }
 
   .markdown-section {
