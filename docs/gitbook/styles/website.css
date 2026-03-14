@@ -765,7 +765,15 @@ body {
   .book.with-summary .book-body {
     left: 0;
     width: 100%;
+    -webkit-transform: none;
+    -moz-transform: none;
+    -ms-transform: none;
+    -o-transform: none;
     transform: none;
+  }
+
+  .book.with-summary .book-body .page-wrapper {
+    margin-left: 0;
   }
 
   .sof-brand {
