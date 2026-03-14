@@ -44,7 +44,7 @@ use {
     },
     arc_swap::ArcSwap,
     core_affinity::CoreId,
-    crossbeam_channel::{Receiver, TrySendError},
+    crossbeam_channel::{bounded, Receiver, Sender, TrySendError},
     itertools::{Either, Itertools},
     rand::{seq::SliceRandom, CryptoRng, Rng},
     rayon::{prelude::*, ThreadPool, ThreadPoolBuilder},
@@ -113,6 +113,10 @@ pub const GOSSIP_SLEEP_MILLIS: u64 = 100;
 const PULL_REQUEST_PERIOD: usize = 5;
 const GOSSIP_RUN_LOOP_CORE_OFFSET: usize = 3;
 const GOSSIP_RUN_WORK_CORE_OFFSET: usize = 0;
+const GOSSIP_CONSUME_LOOP_CORE_OFFSET: usize = 5;
+const GOSSIP_CONSUME_WORK_CORE_OFFSET: usize = 4;
+const GOSSIP_LISTEN_LOOP_CORE_OFFSET: usize = 7;
+const GOSSIP_LISTEN_WORK_CORE_OFFSET: usize = 6;
 
 /// Capacity for the [`ClusterInfo::run_socket_consume`] and [`ClusterInfo::run_listen`]
 /// intermediate packet batch buffers.
@@ -190,6 +194,298 @@ pub(crate) struct VerifiedPacketBatch {
     packets: Vec<(SocketAddr, Protocol)>,
 }
 
+type VerifiedProtocolBatch = Vec<(SocketAddr, Protocol)>;
+
+struct SocketConsumeVerifyJob {
+    packet_batches: Vec<PacketBatch>,
+    stakes: Arc<HashMap<Pubkey, /*stake:*/ u64>>,
+}
+
+struct SocketConsumeVerifierPool<S> {
+    worker_count: usize,
+    job_sender: Sender<SocketConsumeVerifyJob>,
+    worker_handles: Vec<JoinHandle<()>>,
+    _result_sender: std::marker::PhantomData<S>,
+}
+
+#[derive(Clone, Default)]
+struct GossipCpuLayout {
+    allowed_core_ids: Vec<CoreId>,
+    exact_non_overlapping: bool,
+    run_worker_cores: Vec<CoreId>,
+    run_loop_core: Option<CoreId>,
+    consume_worker_cores: Vec<CoreId>,
+    consume_loop_core: Option<CoreId>,
+    listen_worker_cores: Vec<CoreId>,
+    listen_loop_core: Option<CoreId>,
+}
+
+impl GossipCpuLayout {
+    fn run_worker_core(&self, index: usize) -> Option<CoreId> {
+        self.run_worker_cores.get(index).copied()
+    }
+
+    fn consume_worker_core(&self, index: usize) -> Option<CoreId> {
+        self.consume_worker_cores.get(index).copied()
+    }
+
+    fn listen_worker_core(&self, index: usize) -> Option<CoreId> {
+        self.listen_worker_cores.get(index).copied()
+    }
+}
+
+fn verify_gossip_packet(
+    packet: PacketRef,
+    stakes: &HashMap<Pubkey, u64>,
+    stats: &GossipStats,
+) -> Option<(SocketAddr, Protocol)> {
+    let mut protocol: Protocol = stats.record_received_packet(packet.deserialize_slice::<Protocol, _>(..))?;
+    protocol.sanitize().ok()?;
+    if let Protocol::PullResponse(_, values) | Protocol::PushMessage(_, values) = &mut protocol {
+        values.retain(|value| should_retain_crds_value(value, stakes, GossipFilterDirection::Ingress));
+        if values.is_empty() {
+            return None;
+        }
+    }
+    protocol.verify().then(|| {
+        stats.packets_received_verified_count.add_relaxed(1);
+        (packet.meta().socket_addr(), protocol)
+    })
+}
+
+fn verify_gossip_packet_batches(
+    packet_batches: &[PacketBatch],
+    stakes: &HashMap<Pubkey, u64>,
+    stats: &GossipStats,
+) -> VerifiedProtocolBatch {
+    packet_batches
+        .iter()
+        .flat_map(|packet_batch| packet_batch.iter())
+        .filter_map(|packet| verify_gossip_packet(packet, stakes, stats))
+        .collect()
+}
+
+fn gossip_cpu_layout() -> GossipCpuLayout {
+    static VALUE: OnceLock<GossipCpuLayout> = OnceLock::new();
+    VALUE
+        .get_or_init(|| {
+            let allowed_core_ids = allowed_gossip_core_ids();
+            if allowed_core_ids.is_empty() {
+                return GossipCpuLayout::default();
+            }
+            let run_worker_count = gossip_run_threads();
+            let consume_worker_count = gossip_socket_consume_threads().max(1);
+            let listen_worker_count = gossip_listen_threads();
+            let required_exact_cores = run_worker_count
+                .saturating_add(1)
+                .saturating_add(consume_worker_count)
+                .saturating_add(1)
+                .saturating_add(listen_worker_count)
+                .saturating_add(1);
+            if allowed_core_ids.len() < required_exact_cores {
+                info!(
+                    "using overlapping gossip CPU pinning because available cores are insufficient for exact placement: allowed_cores={} required_exact_cores={} run_threads={} consume_threads={} listen_threads={}",
+                    allowed_core_ids.len(),
+                    required_exact_cores,
+                    run_worker_count,
+                    consume_worker_count,
+                    listen_worker_count,
+                );
+                return GossipCpuLayout {
+                    allowed_core_ids,
+                    exact_non_overlapping: false,
+                    ..GossipCpuLayout::default()
+                };
+            }
+            let mut cursor = 0usize;
+            let run_worker_end = cursor.saturating_add(run_worker_count);
+            let run_worker_cores = allowed_core_ids[cursor..run_worker_end].to_vec();
+            cursor = run_worker_end;
+            let run_loop_core = allowed_core_ids.get(cursor).copied();
+            cursor = cursor.saturating_add(1);
+            let consume_worker_end = cursor.saturating_add(consume_worker_count);
+            let consume_worker_cores = allowed_core_ids[cursor..consume_worker_end].to_vec();
+            cursor = consume_worker_end;
+            let consume_loop_core = allowed_core_ids.get(cursor).copied();
+            cursor = cursor.saturating_add(1);
+            let listen_worker_end = cursor.saturating_add(listen_worker_count);
+            let listen_worker_cores = allowed_core_ids[cursor..listen_worker_end].to_vec();
+            cursor = listen_worker_end;
+            let listen_loop_core = allowed_core_ids.get(cursor).copied();
+            info!(
+                "using exact non-overlapping gossip CPU pinning: allowed_cores={} run_threads={} consume_threads={} listen_threads={}",
+                allowed_core_ids.len(),
+                run_worker_count,
+                consume_worker_count,
+                listen_worker_count,
+            );
+            GossipCpuLayout {
+                allowed_core_ids,
+                exact_non_overlapping: true,
+                run_worker_cores,
+                run_loop_core,
+                consume_worker_cores,
+                consume_loop_core,
+                listen_worker_cores,
+                listen_loop_core,
+            }
+        })
+        .clone()
+}
+
+fn maybe_pin_gossip_role_thread(
+    thread_name: &str,
+    thread_index: usize,
+    exact_core: Option<CoreId>,
+    fallback_core_offset: usize,
+    cpu_layout: &GossipCpuLayout,
+) {
+    if let Some(core_id) = exact_core {
+        maybe_pin_gossip_thread_to_core(thread_name, thread_index, core_id);
+        return;
+    }
+    if cpu_layout.allowed_core_ids.is_empty() {
+        return;
+    }
+    if cpu_layout.exact_non_overlapping {
+        info!(
+            "exact gossip CPU pinning selected but no dedicated core was assigned: name={thread_name} index={thread_index}"
+        );
+    }
+    maybe_pin_gossip_thread(
+        thread_name,
+        thread_index,
+        fallback_core_offset,
+        &cpu_layout.allowed_core_ids,
+    );
+}
+
+impl<S> SocketConsumeVerifierPool<S>
+where
+    S: ChannelSend<VerifiedProtocolBatch>,
+{
+    fn new(
+        cluster_info: Arc<ClusterInfo>,
+        result_sender: Arc<Mutex<S>>,
+        cpu_layout: &GossipCpuLayout,
+    ) -> Self {
+        let worker_count = gossip_socket_consume_threads().max(1);
+        // Keep the coordinator ahead of the crypto workers during bursty gossip
+        // traffic instead of stalling on a tiny handoff queue.
+        let queue_capacity = worker_count.saturating_mul(16).max(64);
+        let (job_sender, job_receiver) = bounded::<SocketConsumeVerifyJob>(queue_capacity);
+        let mut worker_handles = Vec::with_capacity(worker_count);
+
+        for index in 0..worker_count {
+            let thread_name = format!("solGossipConsW{index:02}");
+            let job_receiver = job_receiver.clone();
+            let result_sender = Arc::clone(&result_sender);
+            let cluster_info = cluster_info.clone();
+            let cpu_layout = cpu_layout.clone();
+            let handle = Builder::new()
+                .name(thread_name)
+                .spawn(move || {
+                    maybe_pin_gossip_role_thread(
+                        "solGossipConsW",
+                        index,
+                        cpu_layout.consume_worker_core(index),
+                        GOSSIP_CONSUME_WORK_CORE_OFFSET,
+                        &cpu_layout,
+                    );
+                    loop {
+                        let Ok(job) = job_receiver.recv() else {
+                            break;
+                        };
+                        let packet_count = job
+                            .packet_batches
+                            .iter()
+                            .fold(0usize, |count, packet_batch| count + packet_batch.len());
+                        let verified = verify_gossip_packet_batches(
+                            &job.packet_batches,
+                            job.stakes.as_ref(),
+                            &cluster_info.stats,
+                        );
+                        if verified.is_empty() {
+                            continue;
+                        }
+                        let result = {
+                            let sender = result_sender
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            sender.try_send(verified)
+                        };
+                        match result {
+                            Ok(()) => {}
+                            Err(TrySendError::Full(_)) => {
+                                cluster_info
+                                    .stats
+                                    .gossip_packets_dropped_count
+                                    .add_relaxed(packet_count as u64);
+                            }
+                            Err(TrySendError::Disconnected(_)) => {
+                                break;
+                            }
+                        }
+                    }
+                })
+                .unwrap();
+            worker_handles.push(handle);
+        }
+
+        Self {
+            worker_count,
+            job_sender,
+            worker_handles,
+            _result_sender: std::marker::PhantomData,
+        }
+    }
+
+    fn dispatch_batches(
+        &self,
+        packet_buf: &mut Vec<PacketBatch>,
+        stakes: Arc<HashMap<Pubkey, u64>>,
+    ) -> Result<u64, GossipError> {
+        let mut chunks = vec![Vec::new(); self.worker_count];
+        let mut chunk_loads = vec![0usize; self.worker_count];
+        for packet_batch in packet_buf.drain(..) {
+            let index = chunk_loads
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, load)| *load)
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+            chunk_loads[index] = chunk_loads[index].saturating_add(packet_batch.len());
+            chunks[index].push(packet_batch);
+        }
+
+        let mut dropped_packets = 0u64;
+        for packet_batches in chunks.into_iter().filter(|chunk| !chunk.is_empty()) {
+            let packet_count = packet_batches
+                .iter()
+                .fold(0usize, |count, packet_batch| count + packet_batch.len());
+            let job = SocketConsumeVerifyJob {
+                packet_batches,
+                stakes: stakes.clone(),
+            };
+            match self.job_sender.try_send(job) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    dropped_packets = dropped_packets.saturating_add(packet_count as u64);
+                }
+                Err(TrySendError::Disconnected(_)) => return Err(GossipError::SendError),
+            }
+        }
+        Ok(dropped_packets)
+    }
+
+    fn join(self) {
+        drop(self.job_sender);
+        for handle in self.worker_handles {
+            let _ = handle.join();
+        }
+    }
+}
+
 fn allowed_gossip_core_ids() -> Vec<CoreId> {
     let parsed_allowed_core_ids = std::fs::read_to_string("/proc/self/status")
         .ok()
@@ -205,24 +501,6 @@ fn allowed_gossip_core_ids() -> Vec<CoreId> {
     if allowed_core_ids.is_empty() {
         return allowed_core_ids;
     }
-
-    // Avoid forcing multiple hot gossip threads onto the same small core set.
-    // On compact hosts the scheduler usually does a better job than static
-    // pinning once the number of pinned roles exceeds the number of cores.
-    let required_pinned_threads = 1_usize // solGossipConsum loop
-        .saturating_add(gossip_socket_consume_threads().saturating_sub(1))
-        .saturating_add(1) // solGossipListen loop
-        .saturating_add(gossip_listen_threads())
-        .saturating_add(1) // solGossip loop
-        .saturating_add(gossip_run_threads());
-    if allowed_core_ids.len() < required_pinned_threads {
-        info!(
-            "skipping gossip CPU pinning because available cores are insufficient for dedicated placement: allowed_cores={} required_pinned_threads={}",
-            allowed_core_ids.len(),
-            required_pinned_threads,
-        );
-        return Vec::new();
-    }
     allowed_core_ids
 }
 
@@ -236,6 +514,10 @@ fn maybe_pin_gossip_thread(
         return;
     }
     let selected = allowed_core_ids[(core_offset + thread_index) % allowed_core_ids.len()];
+    maybe_pin_gossip_thread_to_core(thread_name, thread_index, selected);
+}
+
+fn maybe_pin_gossip_thread_to_core(thread_name: &str, thread_index: usize, selected: CoreId) {
     if core_affinity::set_for_current(selected) {
         info!(
             "pinned gossip thread to CPU core: name={thread_name} index={thread_index} core={}",
@@ -1700,18 +1982,19 @@ impl ClusterInfo {
         gossip_validators: Option<HashSet<Pubkey>>,
         exit: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
-        let allowed_core_ids = allowed_gossip_core_ids();
+        let cpu_layout = gossip_cpu_layout();
         let thread_pool = ThreadPoolBuilder::new()
             .num_threads(gossip_run_threads())
             .thread_name(|i| format!("solGossipRun{i:02}"))
             .start_handler({
-                let allowed_core_ids = allowed_core_ids.clone();
+                let cpu_layout = cpu_layout.clone();
                 move |index| {
-                    maybe_pin_gossip_thread(
+                    maybe_pin_gossip_role_thread(
                         "solGossipRun",
                         index,
+                        cpu_layout.run_worker_core(index),
                         GOSSIP_RUN_WORK_CORE_OFFSET,
-                        &allowed_core_ids,
+                        &cpu_layout,
                     );
                 }
             })
@@ -1721,11 +2004,12 @@ impl ClusterInfo {
         Builder::new()
             .name("solGossip".to_string())
             .spawn(move || {
-                maybe_pin_gossip_thread(
+                maybe_pin_gossip_role_thread(
                     "solGossip",
                     0,
+                    cpu_layout.run_loop_core,
                     GOSSIP_RUN_LOOP_CORE_OFFSET,
-                    &allowed_core_ids,
+                    &cpu_layout,
                 );
                 let mut last_push = 0;
                 let mut last_contact_info_trace = timestamp();
@@ -2376,14 +2660,17 @@ impl ClusterInfo {
 
     // Legacy gossip service path aligned with Agave. Keep the newer optimized
     // path available in-tree, but use the stable one for production ingress.
-    fn run_socket_consume_legacy(
+    fn run_socket_consume_legacy<S>(
         &self,
-        thread_pool: &ThreadPool,
-        mut epoch_specs: Option<&mut EpochSpecs>,
+        verifier_pool: &SocketConsumeVerifierPool<S>,
+        epoch_specs: Option<&mut EpochSpecs>,
         receiver: &PacketBatchReceiver,
-        sender: &impl ChannelSend<Vec<(/*from:*/ SocketAddr, Protocol)>>,
+        sender: &Mutex<S>,
         packet_buf: &mut Vec<PacketBatch>,
-    ) -> Result<(), GossipError> {
+    ) -> Result<(), GossipError>
+    where
+        S: ChannelSend<VerifiedProtocolBatch>,
+    {
         let mut num_packets = 0;
         for packet_batch in receiver
             .recv()
@@ -2399,61 +2686,39 @@ impl ClusterInfo {
         self.stats
             .packets_received_count
             .add_relaxed(num_packets as u64);
-
-        fn verify_packet(
-            packet: PacketRef,
-            stakes: &HashMap<Pubkey, u64>,
-            stats: &GossipStats,
-        ) -> Option<(SocketAddr, Protocol)> {
-            let mut protocol: Protocol =
-                stats.record_received_packet(packet.deserialize_slice::<Protocol, _>(..))?;
-            protocol.sanitize().ok()?;
-            if let Protocol::PullResponse(_, values) | Protocol::PushMessage(_, values) =
-                &mut protocol
-            {
-                values.retain(|value| {
-                    should_retain_crds_value(value, stakes, GossipFilterDirection::Ingress)
-                });
-                if values.is_empty() {
-                    return None;
-                }
-            }
-            protocol.verify().then(|| {
-                stats.packets_received_verified_count.add_relaxed(1);
-                (packet.meta().socket_addr(), protocol)
-            })
-        }
-
-        let empty_stakes = HashMap::new();
-        let stakes = if let Some(epoch_specs) = epoch_specs.as_deref_mut() {
-            epoch_specs.current_epoch_staked_nodes().as_ref()
+        let stakes = if let Some(epoch_specs) = epoch_specs {
+            epoch_specs.current_epoch_staked_nodes().clone()
         } else {
-            &empty_stakes
+            Arc::new(HashMap::new())
         };
-        let packets_verified: Vec<_> = {
+        let dropped_packets = {
             let _st = ScopedTimer::from(&self.stats.verify_gossip_packets_time);
-            if num_packets < gossip_socket_consume_parallel_packet_threshold() {
-                packet_buf
-                    .iter()
-                    .flat_map(|packet_batch| packet_batch.iter())
-                    .filter_map(|packet| verify_packet(packet, stakes, &self.stats))
-                    .collect()
+            if num_packets < gossip_socket_consume_parallel_packet_threshold()
+                || verifier_pool.worker_count <= 1
+            {
+                let packets_verified =
+                    verify_gossip_packet_batches(packet_buf, stakes.as_ref(), &self.stats);
+                if packets_verified.is_empty() {
+                    0
+                } else {
+                    let result = {
+                        let sender = sender.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        sender.try_send(packets_verified)
+                    };
+                    match result {
+                        Ok(()) => 0,
+                        Err(TrySendError::Full(_)) => num_packets as u64,
+                        Err(TrySendError::Disconnected(_)) => return Err(GossipError::SendError),
+                    }
+                }
             } else {
-                thread_pool.install(|| {
-                    packet_buf
-                        .par_iter()
-                        .flatten()
-                        .filter_map(|packet| verify_packet(packet, stakes, &self.stats))
-                        .collect()
-                })
+                verifier_pool.dispatch_batches(packet_buf, stakes)?
             }
         };
-        if let Err(TrySendError::Full(_)) = sender.try_send(packets_verified) {
-            self.stats.gossip_packets_dropped_count.add_relaxed(
-                packet_buf
-                    .iter()
-                    .fold(0, |acc, packet_batch| acc + packet_batch.len()) as u64,
-            );
+        if dropped_packets > 0 {
+            self.stats
+                .gossip_packets_dropped_count
+                .add_relaxed(dropped_packets);
         }
         packet_buf.clear();
         Ok(())
@@ -2510,23 +2775,29 @@ impl ClusterInfo {
         self: Arc<Self>,
         bank_forks: Option<Arc<RwLock<BankForks>>>,
         receiver: PacketBatchReceiver,
-        sender: impl ChannelSend<Vec<(/*from:*/ SocketAddr, Protocol)>>,
+        sender: impl ChannelSend<VerifiedProtocolBatch>,
         exit: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
-        let thread_pool = ThreadPoolBuilder::new()
-            .num_threads(get_thread_count().min(8))
-            .thread_name(|i| format!("solGossipCons{i:02}"))
-            .build()
-            .unwrap();
+        let cpu_layout = gossip_cpu_layout();
+        let sender = Arc::new(Mutex::new(sender));
+        let verifier_pool =
+            SocketConsumeVerifierPool::new(self.clone(), Arc::clone(&sender), &cpu_layout);
         let mut epoch_specs = bank_forks.map(EpochSpecs::from);
         let mut packet_buf = Vec::with_capacity(gossip_channel_consume_capacity());
         let run_consume = move || {
+            maybe_pin_gossip_role_thread(
+                "solGossipConsum",
+                0,
+                cpu_layout.consume_loop_core,
+                GOSSIP_CONSUME_LOOP_CORE_OFFSET,
+                &cpu_layout,
+            );
             while !exit.load(Ordering::Relaxed) {
                 let result = self.run_socket_consume_legacy(
-                    &thread_pool,
+                    &verifier_pool,
                     epoch_specs.as_mut(),
                     &receiver,
-                    &sender,
+                    sender.as_ref(),
                     &mut packet_buf,
                 );
                 match result {
@@ -2540,6 +2811,7 @@ impl ClusterInfo {
                     Ok(()) => (),
                 }
             }
+            verifier_pool.join();
         };
         let thread_name = String::from("solGossipConsum");
         Builder::new().name(thread_name).spawn(run_consume).unwrap()
@@ -2553,10 +2825,23 @@ impl ClusterInfo {
         should_check_duplicate_instance: bool,
         exit: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
+        let cpu_layout = gossip_cpu_layout();
         let recycler = PacketBatchRecycler::default();
         let thread_pool = ThreadPoolBuilder::new()
-            .num_threads(get_thread_count().min(8))
+            .num_threads(gossip_listen_threads())
             .thread_name(|i| format!("solGossipWork{i:02}"))
+            .start_handler({
+                let cpu_layout = cpu_layout.clone();
+                move |index| {
+                    maybe_pin_gossip_role_thread(
+                        "solGossipWork",
+                        index,
+                        cpu_layout.listen_worker_core(index),
+                        GOSSIP_LISTEN_WORK_CORE_OFFSET,
+                        &cpu_layout,
+                    );
+                }
+            })
             .build()
             .unwrap();
         let mut epoch_specs = bank_forks.map(EpochSpecs::from);
@@ -2565,6 +2850,13 @@ impl ClusterInfo {
         Builder::new()
             .name("solGossipListen".to_string())
             .spawn(move || {
+                maybe_pin_gossip_role_thread(
+                    "solGossipListen",
+                    0,
+                    cpu_layout.listen_loop_core,
+                    GOSSIP_LISTEN_LOOP_CORE_OFFSET,
+                    &cpu_layout,
+                );
                 while !exit.load(Ordering::Relaxed) {
                     let result = self.run_listen_legacy(
                         &recycler,
