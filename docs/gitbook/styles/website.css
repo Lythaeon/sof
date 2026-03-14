@@ -734,8 +734,8 @@ body {
     content: "";
     position: fixed;
     inset: 0;
-    background: rgba(3, 6, 8, 0.7);
-    backdrop-filter: blur(2px);
+    background: rgba(3, 6, 8, 0.82);
+    backdrop-filter: blur(4px);
     z-index: 8;
   }
 
@@ -774,6 +774,14 @@ body {
 
   .book.with-summary .book-body .page-wrapper {
     margin-left: 0;
+  }
+
+  .book.with-summary .book-body {
+    overflow: hidden;
+  }
+
+  .book.with-summary .body-inner {
+    filter: blur(1.2px) brightness(0.62);
   }
 
   .sof-brand {
