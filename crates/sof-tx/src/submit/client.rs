@@ -19,15 +19,18 @@ use tokio::{
 use super::{
     DirectSubmitConfig, DirectSubmitTransport, JitoSubmitConfig, JitoSubmitTransport,
     RpcSubmitConfig, RpcSubmitTransport, SignedTx, SubmitError, SubmitMode, SubmitReliability,
-    SubmitResult, TxFlowSafetyQuality, TxFlowSafetySource, TxSubmitContext, TxSubmitGuardPolicy,
-    TxSubmitOutcome, TxSubmitOutcomeKind, TxSubmitOutcomeReporter, TxToxicFlowRejectionReason,
-    TxToxicFlowTelemetry, TxToxicFlowTelemetrySnapshot,
+    SubmitResult, SubmitTransportError, TxFlowSafetyQuality, TxFlowSafetySource, TxSubmitContext,
+    TxSubmitGuardPolicy, TxSubmitOutcome, TxSubmitOutcomeKind, TxSubmitOutcomeReporter,
+    TxToxicFlowRejectionReason, TxToxicFlowTelemetry, TxToxicFlowTelemetrySnapshot,
 };
 use crate::{
     builder::TxBuilder,
-    providers::{LeaderProvider, LeaderTarget, RecentBlockhashProvider},
+    providers::{
+        LeaderProvider, LeaderTarget, RecentBlockhashProvider, RpcRecentBlockhashProvider,
+        StaticLeaderProvider,
+    },
     routing::{RoutingPolicy, SignatureDeduper, select_targets},
-    submit::types::TxSuppressionCache,
+    submit::{JsonRpcTransport, types::TxSuppressionCache},
 };
 
 /// Transaction submission client that orchestrates RPC and direct submit modes.
@@ -91,6 +94,28 @@ impl TxSubmitClient {
             telemetry: TxToxicFlowTelemetry::shared(),
             outcome_reporter: None,
         }
+    }
+
+    /// Creates a client with an empty leader source for blockhash-only submit paths.
+    #[must_use]
+    pub fn blockhash_only(blockhash_provider: Arc<dyn RecentBlockhashProvider>) -> Self {
+        Self::new(
+            blockhash_provider,
+            Arc::new(StaticLeaderProvider::default()),
+        )
+    }
+
+    /// Creates an RPC-only client from one RPC URL used for both blockhash and submission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubmitTransportError`] when the RPC transport or the initial blockhash fetch
+    /// cannot be initialized.
+    pub async fn rpc_only(rpc_url: impl Into<String>) -> Result<Self, SubmitTransportError> {
+        let rpc_url = rpc_url.into();
+        let blockhash_provider = Arc::new(RpcRecentBlockhashProvider::new(rpc_url.clone()).await?);
+        let rpc_transport = Arc::new(JsonRpcTransport::new(rpc_url)?);
+        Ok(Self::blockhash_only(blockhash_provider).with_rpc_transport(rpc_transport))
     }
 
     /// Sets optional backup validators.

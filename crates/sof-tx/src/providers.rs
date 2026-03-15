@@ -1,8 +1,16 @@
 //! Provider traits and basic in-memory adapters used by the transaction SDK.
 
-use std::net::SocketAddr;
+use std::{
+    net::SocketAddr,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
+use serde::{Deserialize, Serialize};
 use solana_pubkey::Pubkey;
+use tokio::time::sleep;
+
+use crate::submit::SubmitTransportError;
 
 /// One leader/validator target that can receive transactions directly.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -25,6 +33,108 @@ impl LeaderTarget {
 pub trait RecentBlockhashProvider: Send + Sync {
     /// Returns the newest blockhash bytes when available.
     fn latest_blockhash(&self) -> Option<[u8; 32]>;
+}
+
+/// RPC-backed blockhash provider settings.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RpcRecentBlockhashProviderConfig {
+    /// HTTP timeout applied to blockhash requests.
+    pub request_timeout: Duration,
+    /// Background refresh interval. Set to zero to disable polling after the initial fetch.
+    pub refresh_interval: Duration,
+}
+
+impl Default for RpcRecentBlockhashProviderConfig {
+    fn default() -> Self {
+        Self {
+            request_timeout: Duration::from_secs(10),
+            refresh_interval: Duration::from_secs(1),
+        }
+    }
+}
+
+/// Cached recent-blockhash provider sourced from a Solana JSON-RPC endpoint.
+#[derive(Debug, Clone)]
+pub struct RpcRecentBlockhashProvider {
+    /// Latest successfully fetched blockhash cached for synchronous readers.
+    latest: Arc<RwLock<Option<[u8; 32]>>>,
+}
+
+impl RpcRecentBlockhashProvider {
+    /// Creates a provider backed by one RPC endpoint using default polling settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubmitTransportError`] when the HTTP client cannot be built or the initial
+    /// `getLatestBlockhash` request fails.
+    pub async fn new(rpc_url: impl Into<String>) -> Result<Self, SubmitTransportError> {
+        Self::with_config(rpc_url, RpcRecentBlockhashProviderConfig::default()).await
+    }
+
+    /// Creates a provider with explicit request and refresh settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubmitTransportError`] when the HTTP client cannot be built or the initial
+    /// `getLatestBlockhash` request fails.
+    pub async fn with_config(
+        rpc_url: impl Into<String>,
+        config: RpcRecentBlockhashProviderConfig,
+    ) -> Result<Self, SubmitTransportError> {
+        let rpc_url = rpc_url.into();
+        let client = reqwest::Client::builder()
+            .timeout(config.request_timeout)
+            .build()
+            .map_err(|error| SubmitTransportError::Config {
+                message: error.to_string(),
+            })?;
+        let latest = Arc::new(RwLock::new(Some(
+            fetch_latest_blockhash(&client, &rpc_url).await?,
+        )));
+        if !config.refresh_interval.is_zero() {
+            spawn_blockhash_refresh_loop(
+                client.clone(),
+                rpc_url.clone(),
+                Arc::clone(&latest),
+                config.refresh_interval,
+            );
+        }
+        Ok(Self { latest })
+    }
+
+    /// Forces one refresh against the configured RPC endpoint and returns the cached value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubmitTransportError`] if the RPC request fails or the response is invalid.
+    pub async fn refresh(
+        &self,
+        rpc_url: impl AsRef<str>,
+        config: &RpcRecentBlockhashProviderConfig,
+    ) -> Result<[u8; 32], SubmitTransportError> {
+        let client = reqwest::Client::builder()
+            .timeout(config.request_timeout)
+            .build()
+            .map_err(|error| SubmitTransportError::Config {
+                message: error.to_string(),
+            })?;
+        let blockhash = fetch_latest_blockhash(&client, rpc_url.as_ref()).await?;
+        let mut latest = self
+            .latest
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *latest = Some(blockhash);
+        Ok(blockhash)
+    }
+}
+
+impl RecentBlockhashProvider for RpcRecentBlockhashProvider {
+    fn latest_blockhash(&self) -> Option<[u8; 32]> {
+        *self
+            .latest
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 /// Source of current/next leader targets.
@@ -81,5 +191,197 @@ impl LeaderProvider for StaticLeaderProvider {
 
     fn next_leaders(&self, n: usize) -> Vec<LeaderTarget> {
         self.next.iter().take(n).cloned().collect()
+    }
+}
+
+/// Minimal JSON-RPC response envelope for `getLatestBlockhash`.
+#[derive(Debug, Deserialize)]
+struct LatestBlockhashRpcResponse {
+    /// Successful RPC result payload.
+    result: Option<LatestBlockhashResult>,
+    /// Error payload returned by the RPC server.
+    error: Option<JsonRpcError>,
+}
+
+/// Parsed `getLatestBlockhash` result object.
+#[derive(Debug, Deserialize)]
+struct LatestBlockhashResult {
+    /// RPC value payload.
+    value: LatestBlockhashValue,
+}
+
+/// JSON payload that carries one base58-encoded recent blockhash.
+#[derive(Debug, Deserialize)]
+struct LatestBlockhashValue {
+    /// Base58-encoded recent blockhash string.
+    blockhash: String,
+}
+
+/// Minimal JSON-RPC error object.
+#[derive(Debug, Deserialize)]
+struct JsonRpcError {
+    /// Numeric JSON-RPC error code.
+    code: i64,
+    /// Human-readable error message.
+    message: String,
+}
+
+/// JSON-RPC request envelope for `getLatestBlockhash`.
+#[derive(Debug, Serialize)]
+struct LatestBlockhashRequest<'request> {
+    /// JSON-RPC protocol version.
+    jsonrpc: &'request str,
+    /// Caller-chosen request ID.
+    id: u64,
+    /// Requested RPC method.
+    method: &'request str,
+    /// Commitment config array.
+    params: [LatestBlockhashRequestConfig<'request>; 1],
+}
+
+/// Commitment config payload for `getLatestBlockhash`.
+#[derive(Debug, Serialize)]
+struct LatestBlockhashRequestConfig<'request> {
+    /// Commitment level requested from RPC.
+    commitment: &'request str,
+}
+
+/// Starts the best-effort background refresh loop for one RPC-backed blockhash provider.
+fn spawn_blockhash_refresh_loop(
+    client: reqwest::Client,
+    rpc_url: String,
+    latest: Arc<RwLock<Option<[u8; 32]>>>,
+    refresh_interval: Duration,
+) {
+    tokio::spawn(async move {
+        loop {
+            sleep(refresh_interval).await;
+            if let Ok(blockhash) = fetch_latest_blockhash(&client, &rpc_url).await {
+                let mut latest_guard = latest
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *latest_guard = Some(blockhash);
+            }
+        }
+    });
+}
+
+/// Fetches the latest recent blockhash from one Solana JSON-RPC endpoint.
+async fn fetch_latest_blockhash(
+    client: &reqwest::Client,
+    rpc_url: &str,
+) -> Result<[u8; 32], SubmitTransportError> {
+    let payload = LatestBlockhashRequest {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "getLatestBlockhash",
+        params: [LatestBlockhashRequestConfig {
+            commitment: "processed",
+        }],
+    };
+    let response = client
+        .post(rpc_url)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|error| SubmitTransportError::Failure {
+            message: error.to_string(),
+        })?;
+    let response = response
+        .error_for_status()
+        .map_err(|error| SubmitTransportError::Failure {
+            message: error.to_string(),
+        })?;
+    let parsed: LatestBlockhashRpcResponse =
+        response
+            .json()
+            .await
+            .map_err(|error| SubmitTransportError::Failure {
+                message: error.to_string(),
+            })?;
+    if let Some(result) = parsed.result {
+        return parse_blockhash(&result.value.blockhash);
+    }
+    if let Some(error) = parsed.error {
+        return Err(SubmitTransportError::Failure {
+            message: format!("rpc error {}: {}", error.code, error.message),
+        });
+    }
+    Err(SubmitTransportError::Failure {
+        message: "rpc returned neither result nor error".to_owned(),
+    })
+}
+
+/// Decodes one base58 blockhash string into the byte format used by `TxBuilder`.
+fn parse_blockhash(blockhash: &str) -> Result<[u8; 32], SubmitTransportError> {
+    let decoded =
+        bs58::decode(blockhash)
+            .into_vec()
+            .map_err(|error| SubmitTransportError::Failure {
+                message: format!("failed to decode recent blockhash: {error}"),
+            })?;
+    let bytes: [u8; 32] = decoded
+        .try_into()
+        .map_err(|_error| SubmitTransportError::Failure {
+            message: "rpc blockhash did not decode to 32 bytes".to_owned(),
+        })?;
+    Ok(bytes)
+}
+
+#[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::panic)]
+mod tests {
+    use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    #[tokio::test]
+    async fn rpc_recent_blockhash_provider_fetches_initial_value() {
+        let expected = [9_u8; 32];
+        let blockhash = bs58::encode(expected).into_string();
+        let listener = TcpListener::bind("127.0.0.1:0").await;
+        assert!(listener.is_ok());
+        let listener = listener.unwrap_or_else(|error| panic!("{error}"));
+        let addr = listener.local_addr();
+        assert!(addr.is_ok());
+        let addr = addr.unwrap_or_else(|error| panic!("{error}"));
+
+        let server = tokio::spawn(async move {
+            let accepted = listener.accept().await;
+            assert!(accepted.is_ok());
+            let (mut stream, _) = accepted.unwrap_or_else(|error| panic!("{error}"));
+            let mut buffer = [0_u8; 4096];
+            let read = stream.read(&mut buffer).await;
+            assert!(read.is_ok());
+            let request = String::from_utf8_lossy(&buffer[..read.unwrap_or(0)]);
+            assert!(request.contains("getLatestBlockhash"));
+            let body = format!(
+                "{{\"jsonrpc\":\"2.0\",\"result\":{{\"value\":{{\"blockhash\":\"{blockhash}\"}}}},\"id\":1}}"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let write = stream.write_all(response.as_bytes()).await;
+            assert!(write.is_ok());
+        });
+
+        let provider = RpcRecentBlockhashProvider::with_config(
+            format!("http://{addr}"),
+            RpcRecentBlockhashProviderConfig {
+                refresh_interval: Duration::ZERO,
+                ..RpcRecentBlockhashProviderConfig::default()
+            },
+        )
+        .await;
+        assert!(provider.is_ok());
+        let provider = provider.unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(provider.latest_blockhash(), Some(expected));
+
+        let joined = server.await;
+        assert!(joined.is_ok());
     }
 }

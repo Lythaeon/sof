@@ -4853,6 +4853,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bincode",
+ "bs58",
  "prost",
  "reqwest",
  "serde",

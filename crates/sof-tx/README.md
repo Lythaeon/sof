@@ -52,8 +52,8 @@ Basic client setup:
 use std::sync::Arc;
 
 use sof_tx::{
-    JitoTransportConfig, SubmitMode, SubmitReliability, TxBuilder, TxSubmitClient,
-    providers::{StaticLeaderProvider, StaticRecentBlockhashProvider},
+    SubmitMode, SubmitReliability, TxBuilder, TxSubmitClient,
+    providers::{RpcRecentBlockhashProvider, StaticLeaderProvider},
     submit::{JitoJsonRpcTransport, JsonRpcTransport, UdpDirectTransport},
 };
 use solana_keypair::Keypair;
@@ -65,14 +65,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let payer = Keypair::new();
     let recipient = Keypair::new();
 
-    let blockhash_provider = Arc::new(StaticRecentBlockhashProvider::new(Some([7_u8; 32])));
+    let blockhash_provider = Arc::new(
+        RpcRecentBlockhashProvider::new("https://api.mainnet-beta.solana.com").await?,
+    );
     let leader_provider = Arc::new(StaticLeaderProvider::new(None, Vec::new()));
 
-    let client = TxSubmitClient::new(blockhash_provider, leader_provider)
+    let mut client = TxSubmitClient::new(blockhash_provider, leader_provider)
         .with_reliability(SubmitReliability::Balanced)
         .with_rpc_transport(Arc::new(JsonRpcTransport::new("https://api.mainnet-beta.solana.com")?))
         .with_jito_transport(Arc::new(JitoJsonRpcTransport::new()?))
-        .with_direct_transport(Arc::new(UdpDirectTransport));
+        .with_direct_transport(Arc::new(UdpDirectTransport::new()));
 
     let builder = TxBuilder::new(payer.pubkey()).add_instruction(
         system_instruction::transfer(&payer.pubkey(), &recipient.pubkey(), 1),
@@ -85,6 +87,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+For `RpcOnly`, you can use one RPC URL for both recent blockhash sourcing and submission:
+
+```rust
+use std::sync::Arc;
+
+use sof_tx::{
+    TxSubmitClient,
+    providers::RpcRecentBlockhashProvider,
+    submit::JitoJsonRpcTransport,
+};
+
+let mut rpc_client = TxSubmitClient::rpc_only("https://api.mainnet-beta.solana.com").await?;
+
+let blockhash_provider = Arc::new(
+    RpcRecentBlockhashProvider::new("https://api.mainnet-beta.solana.com").await?,
+);
+let mut jito_client = TxSubmitClient::blockhash_only(blockhash_provider)
+    .with_jito_transport(Arc::new(JitoJsonRpcTransport::new()?));
+```
+
+One boundary is still intentional: `sof-tx` still treats blockhash as an explicit provider input.
+The RPC-backed provider just gives you a built-in way to source it from JSON-RPC for builder-based
+flows. If you already have signed transaction bytes, use `submit_signed(...)` instead.
 
 ## Core Types
 
@@ -139,11 +165,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // If SOF runtime was already running, optionally seed from host snapshots.
     adapter.prime_from_plugin_host(&host);
 
-    let client = TxSubmitClient::new(adapter.clone(), adapter.clone())
+    let mut client = TxSubmitClient::new(adapter.clone(), adapter.clone())
         .with_reliability(SubmitReliability::Balanced)
         .with_rpc_transport(Arc::new(JsonRpcTransport::new("https://api.mainnet-beta.solana.com")?))
         .with_jito_transport(Arc::new(JitoJsonRpcTransport::new()?))
-        .with_direct_transport(Arc::new(UdpDirectTransport));
+        .with_direct_transport(Arc::new(UdpDirectTransport::new()));
 
     let payer = Keypair::new();
     let recipient = Keypair::new();
@@ -197,7 +223,7 @@ use std::sync::Arc;
 
 use sof_tx::{
     SubmitMode, SubmitReliability, TxBuilder, TxSubmitClient,
-    providers::{LeaderProvider, LeaderTarget, RecentBlockhashProvider, StaticLeaderProvider, StaticRecentBlockhashProvider},
+    providers::{LeaderProvider, LeaderTarget, RecentBlockhashProvider, RpcRecentBlockhashProvider, StaticLeaderProvider},
     submit::{JitoJsonRpcTransport, JsonRpcTransport, UdpDirectTransport},
 };
 use solana_keypair::Keypair;
@@ -209,14 +235,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let payer = Keypair::new();
     let recipient = Keypair::new();
 
-    let blockhash_provider = Arc::new(StaticRecentBlockhashProvider::new(Some([7_u8; 32])));
+    let blockhash_provider = Arc::new(
+        RpcRecentBlockhashProvider::new("https://api.mainnet-beta.solana.com").await?,
+    );
     let leader_provider = Arc::new(StaticLeaderProvider::new(None, Vec::new()));
 
-    let client = TxSubmitClient::new(blockhash_provider, leader_provider)
+    let mut client = TxSubmitClient::new(blockhash_provider, leader_provider)
         .with_reliability(SubmitReliability::Balanced)
         .with_rpc_transport(Arc::new(JsonRpcTransport::new("https://api.mainnet-beta.solana.com")?))
         .with_jito_transport(Arc::new(JitoJsonRpcTransport::new()?))
-        .with_direct_transport(Arc::new(UdpDirectTransport));
+        .with_direct_transport(Arc::new(UdpDirectTransport::new()));
 
     let builder = TxBuilder::new(payer.pubkey())
         .with_compute_unit_limit(450_000)
@@ -257,7 +285,7 @@ fn build_cpmm_instructions(/* params */) -> Vec<Instruction> {
 }
 
 async fn submit_strategy_ixs(
-    client: &TxSubmitClient,
+    client: &mut TxSubmitClient,
     payer: &Keypair,
     ixs: Vec<Instruction>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -285,7 +313,7 @@ If your signer is external (wallet/HSM/offline), submit bytes directly:
 use sof_tx::{SignedTx, SubmitMode, TxSubmitClient};
 
 async fn send_presigned(
-    client: &TxSubmitClient,
+    client: &mut TxSubmitClient,
     tx_bytes: Vec<u8>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = client
@@ -357,7 +385,7 @@ let jito_transport = Arc::new(JitoJsonRpcTransport::with_config(
     },
 )?);
 
-let client = TxSubmitClient::new(blockhash_provider, leader_provider)
+let client = TxSubmitClient::blockhash_only(blockhash_provider)
     .with_jito_transport(jito_transport)
     .with_jito_config(JitoSubmitConfig {
         bundle_only: true,

@@ -20,7 +20,10 @@ pub use builder::{
     BuilderError, DEFAULT_DEVELOPER_TIP_LAMPORTS, MAX_TRANSACTION_ACCOUNT_LOCKS,
     MAX_TRANSACTION_WIRE_BYTES, TxBuilder, TxMessageVersion, UnsignedTx,
 };
-pub use providers::{LeaderProvider, LeaderTarget, RecentBlockhashProvider};
+pub use providers::{
+    LeaderProvider, LeaderTarget, RecentBlockhashProvider, RpcRecentBlockhashProvider,
+    RpcRecentBlockhashProviderConfig,
+};
 pub use routing::{RoutingPolicy, SignatureDeduper};
 pub use signing::SignerRef;
 #[cfg(feature = "jito-grpc")]

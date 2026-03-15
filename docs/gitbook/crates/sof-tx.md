@@ -45,6 +45,77 @@ Those responsibilities belong to `sof` or to your own external control plane.
 | `SignatureDeduper` | avoid duplicate sends at signature granularity |
 | `LeaderProvider` / `RecentBlockhashProvider` | abstract control-plane sources |
 
+## The First Two Code Paths You Will Usually Need
+
+### 1. Use `sof-tx` with RPC-sourced blockhash
+
+Start here when you want RPC submission and you want the client to source recent blockhashes from
+that same RPC endpoint.
+
+```rust
+use sof_tx::{SubmitMode, TxBuilder, TxSubmitClient};
+use solana_keypair::Keypair;
+use solana_signer::Signer;
+use solana_system_interface::instruction as system_instruction;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let payer = Keypair::new();
+    let recipient = Keypair::new();
+
+    let mut client = TxSubmitClient::rpc_only("https://api.mainnet-beta.solana.com").await?;
+
+    let builder = TxBuilder::new(payer.pubkey()).add_instruction(
+        system_instruction::transfer(&payer.pubkey(), &recipient.pubkey(), 1),
+    );
+
+    let _ = client
+        .submit_builder(builder, &[&payer], SubmitMode::RpcOnly)
+        .await?;
+
+    Ok(())
+}
+```
+
+Use this path when you want `sof-tx` for RPC submission without building a separate blockhash
+layer first.
+
+For `JitoOnly`, keep the same RPC-backed blockhash source and attach a Jito transport on top. The
+builder path still needs a recent blockhash even when the submit itself goes to Jito.
+
+### 2. Use `sof-tx` with live control-plane state from `sof`
+
+Start here when one process owns both observation and submission.
+
+```rust
+use std::sync::Arc;
+
+use sof::framework::{ObserverPlugin, PluginHost};
+use sof_tx::{
+    SubmitMode, TxBuilder, TxSubmitClient,
+    adapters::PluginHostTxProviderAdapter,
+};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let adapter = Arc::new(PluginHostTxProviderAdapter::default());
+    let host = PluginHost::builder()
+        .add_shared_plugin(adapter.clone() as Arc<dyn ObserverPlugin>)
+        .build();
+
+    adapter.prime_from_plugin_host(&host);
+    let _client = TxSubmitClient::new(adapter.clone(), adapter.clone());
+
+    // Start `sof` with the plugin host in the same process, then submit with `sof-tx`.
+    let _ = SubmitMode::Hybrid;
+    let _ = TxBuilder::new(solana_pubkey::Pubkey::new_unique());
+
+    Ok(())
+}
+```
+
+This is the shortest path to the “one process observes and sends” architecture.
+
 ## Submission Modes
 
 ### `RpcOnly`
@@ -64,6 +135,9 @@ starting point for latency-sensitive services because it balances speed with ope
 ### `JitoOnly`
 
 Use when your flow is built explicitly around block-engine submission.
+
+If you only want Jito submission, start with `RpcRecentBlockhashProvider` and then build the
+client with `TxSubmitClient::blockhash_only(...)` plus a Jito transport.
 
 ## Integration With `sof`
 
@@ -109,6 +183,15 @@ in implicit retries.
 2. wire in RPC transport first
 3. add direct transport and `Hybrid` mode
 4. attach `sof` adapters only after local runtime state is available and measured
+
+## What To Open In The Repository
+
+If the conceptual docs stop too early for what you need to build, open these next:
+
+- [`crates/sof-tx/README.md`](https://github.com/Lythaeon/sof/blob/main/crates/sof-tx/README.md): current end-to-end usage patterns
+- [`tpu_leader_logger.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/tpu_leader_logger.rs): how `sof` exposes leader information
+- [`observer_with_non_vote_plugin.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/observer_with_non_vote_plugin.rs): the plugin host shape that
+  adapters plug into
 
 ## Feature Flags
 
