@@ -364,7 +364,7 @@ async fn rpc_only_constructor_uses_rpc_for_blockhash_and_submit() {
         }
     });
 
-    let client = TxSubmitClient::rpc_only(format!("http://{addr}")).await;
+    let client = TxSubmitClient::rpc_only(format!("http://{addr}"));
     assert!(client.is_ok());
     let mut client = client.unwrap_or_else(|error| panic!("{error}"));
 

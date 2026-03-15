@@ -123,7 +123,7 @@ use sof_tx::TxSubmitClient;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let _client = TxSubmitClient::rpc_only("https://api.mainnet-beta.solana.com").await?;
+    let _client = TxSubmitClient::rpc_only("https://api.mainnet-beta.solana.com")?;
     Ok(())
 }
 ```
@@ -152,7 +152,7 @@ use sof_tx::TxSubmitClient;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let _client = TxSubmitClient::rpc_only("https://api.mainnet-beta.solana.com").await?;
+    let _client = TxSubmitClient::rpc_only("https://api.mainnet-beta.solana.com")?;
     Ok(())
 }
 ```

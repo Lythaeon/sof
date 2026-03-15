@@ -66,11 +66,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let recipient = Keypair::new();
 
     let blockhash_provider = Arc::new(
-        RpcRecentBlockhashProvider::new("https://api.mainnet-beta.solana.com").await?,
+        RpcRecentBlockhashProvider::new("https://api.mainnet-beta.solana.com")?,
     );
     let leader_provider = Arc::new(StaticLeaderProvider::new(None, Vec::new()));
 
-    let mut client = TxSubmitClient::new(blockhash_provider, leader_provider)
+    let mut client = TxSubmitClient::new(blockhash_provider.clone(), leader_provider)
+        .with_rpc_blockhash_provider(blockhash_provider.clone())
         .with_reliability(SubmitReliability::Balanced)
         .with_rpc_transport(Arc::new(JsonRpcTransport::new("https://api.mainnet-beta.solana.com")?))
         .with_jito_transport(Arc::new(JitoJsonRpcTransport::new()?))
@@ -95,22 +96,19 @@ use std::sync::Arc;
 
 use sof_tx::{
     TxSubmitClient,
-    providers::RpcRecentBlockhashProvider,
     submit::JitoJsonRpcTransport,
 };
 
-let mut rpc_client = TxSubmitClient::rpc_only("https://api.mainnet-beta.solana.com").await?;
+let mut rpc_client = TxSubmitClient::rpc_only("https://api.mainnet-beta.solana.com")?;
 
-let blockhash_provider = Arc::new(
-    RpcRecentBlockhashProvider::new("https://api.mainnet-beta.solana.com").await?,
-);
-let mut jito_client = TxSubmitClient::blockhash_only(blockhash_provider)
+let mut jito_client = TxSubmitClient::blockhash_via_rpc("https://api.mainnet-beta.solana.com")?
     .with_jito_transport(Arc::new(JitoJsonRpcTransport::new()?));
 ```
 
 One boundary is still intentional: `sof-tx` still treats blockhash as an explicit provider input.
-The RPC-backed provider just gives you a built-in way to source it from JSON-RPC for builder-based
-flows. If you already have signed transaction bytes, use `submit_signed(...)` instead.
+The RPC-backed provider now refreshes on demand when the builder path needs a blockhash, not in a
+background polling loop. If you already have signed transaction bytes, use `submit_signed(...)`
+instead.
 
 ## Core Types
 
@@ -236,11 +234,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let recipient = Keypair::new();
 
     let blockhash_provider = Arc::new(
-        RpcRecentBlockhashProvider::new("https://api.mainnet-beta.solana.com").await?,
+        RpcRecentBlockhashProvider::new("https://api.mainnet-beta.solana.com")?,
     );
     let leader_provider = Arc::new(StaticLeaderProvider::new(None, Vec::new()));
 
-    let mut client = TxSubmitClient::new(blockhash_provider, leader_provider)
+    let mut client = TxSubmitClient::new(blockhash_provider.clone(), leader_provider)
+        .with_rpc_blockhash_provider(blockhash_provider.clone())
         .with_reliability(SubmitReliability::Balanced)
         .with_rpc_transport(Arc::new(JsonRpcTransport::new("https://api.mainnet-beta.solana.com")?))
         .with_jito_transport(Arc::new(JitoJsonRpcTransport::new()?))

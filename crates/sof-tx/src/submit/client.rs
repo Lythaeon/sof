@@ -37,6 +37,8 @@ use crate::{
 pub struct TxSubmitClient {
     /// Blockhash source used by builder submit path.
     blockhash_provider: Arc<dyn RecentBlockhashProvider>,
+    /// Optional RPC-backed blockhash source refreshed on demand before builder submit.
+    on_demand_blockhash_provider: Option<Arc<RpcRecentBlockhashProvider>>,
     /// Leader source used by direct/hybrid paths.
     leader_provider: Arc<dyn LeaderProvider>,
     /// Optional backup validator targets.
@@ -78,6 +80,7 @@ impl TxSubmitClient {
     ) -> Self {
         Self {
             blockhash_provider,
+            on_demand_blockhash_provider: None,
             leader_provider,
             backups: Vec::new(),
             policy: RoutingPolicy::default(),
@@ -105,17 +108,28 @@ impl TxSubmitClient {
         )
     }
 
+    /// Creates a client with RPC-backed on-demand blockhash sourcing and no leader routing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubmitTransportError`] when the RPC-backed blockhash provider cannot be created.
+    pub fn blockhash_via_rpc(rpc_url: impl Into<String>) -> Result<Self, SubmitTransportError> {
+        let blockhash_provider = Arc::new(RpcRecentBlockhashProvider::new(rpc_url.into())?);
+        Ok(Self::blockhash_only(blockhash_provider.clone())
+            .with_rpc_blockhash_provider(blockhash_provider))
+    }
+
     /// Creates an RPC-only client from one RPC URL used for both blockhash and submission.
     ///
     /// # Errors
     ///
-    /// Returns [`SubmitTransportError`] when the RPC transport or the initial blockhash fetch
+    /// Returns [`SubmitTransportError`] when the RPC transport or blockhash provider
     /// cannot be initialized.
-    pub async fn rpc_only(rpc_url: impl Into<String>) -> Result<Self, SubmitTransportError> {
+    pub fn rpc_only(rpc_url: impl Into<String>) -> Result<Self, SubmitTransportError> {
         let rpc_url = rpc_url.into();
-        let blockhash_provider = Arc::new(RpcRecentBlockhashProvider::new(rpc_url.clone()).await?);
+        let client = Self::blockhash_via_rpc(rpc_url.clone())?;
         let rpc_transport = Arc::new(JsonRpcTransport::new(rpc_url)?);
-        Ok(Self::blockhash_only(blockhash_provider).with_rpc_transport(rpc_transport))
+        Ok(client.with_rpc_transport(rpc_transport))
     }
 
     /// Sets optional backup validators.
@@ -209,6 +223,16 @@ impl TxSubmitClient {
         self
     }
 
+    /// Registers an RPC-backed blockhash provider to refresh on demand for builder submit paths.
+    #[must_use]
+    pub fn with_rpc_blockhash_provider(
+        mut self,
+        provider: Arc<RpcRecentBlockhashProvider>,
+    ) -> Self {
+        self.on_demand_blockhash_provider = Some(provider);
+        self
+    }
+
     /// Returns the current built-in toxic-flow telemetry snapshot.
     #[must_use]
     pub fn toxic_flow_telemetry(&self) -> TxToxicFlowTelemetrySnapshot {
@@ -238,6 +262,12 @@ impl TxSubmitClient {
     where
         T: Signers + ?Sized,
     {
+        if let Some(provider) = &self.on_demand_blockhash_provider {
+            provider
+                .refresh()
+                .await
+                .map_err(|source| SubmitError::Rpc { source })?;
+        }
         let blockhash = self
             .blockhash_provider
             .latest_blockhash()
@@ -265,6 +295,12 @@ impl TxSubmitClient {
     where
         T: Signers + ?Sized,
     {
+        if let Some(provider) = &self.on_demand_blockhash_provider {
+            provider
+                .refresh()
+                .await
+                .map_err(|source| SubmitError::Rpc { source })?;
+        }
         let blockhash = self
             .blockhash_provider
             .latest_blockhash()

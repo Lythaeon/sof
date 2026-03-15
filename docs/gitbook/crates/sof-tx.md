@@ -63,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let payer = Keypair::new();
     let recipient = Keypair::new();
 
-    let mut client = TxSubmitClient::rpc_only("https://api.mainnet-beta.solana.com").await?;
+    let mut client = TxSubmitClient::rpc_only("https://api.mainnet-beta.solana.com")?;
 
     let builder = TxBuilder::new(payer.pubkey()).add_instruction(
         system_instruction::transfer(&payer.pubkey(), &recipient.pubkey(), 1),
@@ -79,6 +79,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Use this path when you want `sof-tx` for RPC submission without building a separate blockhash
 layer first.
+
+This path does not poll in the background. The client refreshes the recent blockhash only when the
+builder path is about to use it.
 
 For `JitoOnly`, keep the same RPC-backed blockhash source and attach a Jito transport on top. The
 builder path still needs a recent blockhash even when the submit itself goes to Jito.
@@ -136,8 +139,8 @@ starting point for latency-sensitive services because it balances speed with ope
 
 Use when your flow is built explicitly around block-engine submission.
 
-If you only want Jito submission, start with `RpcRecentBlockhashProvider` and then build the
-client with `TxSubmitClient::blockhash_only(...)` plus a Jito transport.
+If you only want Jito submission, start with `TxSubmitClient::blockhash_via_rpc(...)` and then
+attach a Jito transport.
 
 ## Integration With `sof`
 

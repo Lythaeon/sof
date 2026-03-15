@@ -8,7 +8,6 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use solana_pubkey::Pubkey;
-use tokio::time::sleep;
 
 use crate::submit::SubmitTransportError;
 
@@ -40,15 +39,12 @@ pub trait RecentBlockhashProvider: Send + Sync {
 pub struct RpcRecentBlockhashProviderConfig {
     /// HTTP timeout applied to blockhash requests.
     pub request_timeout: Duration,
-    /// Background refresh interval. Set to zero to disable polling after the initial fetch.
-    pub refresh_interval: Duration,
 }
 
 impl Default for RpcRecentBlockhashProviderConfig {
     fn default() -> Self {
         Self {
             request_timeout: Duration::from_secs(10),
-            refresh_interval: Duration::from_secs(1),
         }
     }
 }
@@ -58,28 +54,31 @@ impl Default for RpcRecentBlockhashProviderConfig {
 pub struct RpcRecentBlockhashProvider {
     /// Latest successfully fetched blockhash cached for synchronous readers.
     latest: Arc<RwLock<Option<[u8; 32]>>>,
+    /// HTTP client reused across on-demand refreshes.
+    client: reqwest::Client,
+    /// Target JSON-RPC endpoint URL.
+    rpc_url: String,
 }
 
 impl RpcRecentBlockhashProvider {
-    /// Creates a provider backed by one RPC endpoint using default polling settings.
+    /// Creates a provider backed by one RPC endpoint using on-demand refresh.
     ///
     /// # Errors
     ///
-    /// Returns [`SubmitTransportError`] when the HTTP client cannot be built or the initial
-    /// `getLatestBlockhash` request fails.
-    pub async fn new(rpc_url: impl Into<String>) -> Result<Self, SubmitTransportError> {
-        Self::with_config(rpc_url, RpcRecentBlockhashProviderConfig::default()).await
+    /// Returns [`SubmitTransportError`] when the HTTP client cannot be built.
+    pub fn new(rpc_url: impl Into<String>) -> Result<Self, SubmitTransportError> {
+        let config = RpcRecentBlockhashProviderConfig::default();
+        Self::with_config(rpc_url, &config)
     }
 
-    /// Creates a provider with explicit request and refresh settings.
+    /// Creates a provider with explicit request settings.
     ///
     /// # Errors
     ///
-    /// Returns [`SubmitTransportError`] when the HTTP client cannot be built or the initial
-    /// `getLatestBlockhash` request fails.
-    pub async fn with_config(
+    /// Returns [`SubmitTransportError`] when the HTTP client cannot be built.
+    pub fn with_config(
         rpc_url: impl Into<String>,
-        config: RpcRecentBlockhashProviderConfig,
+        config: &RpcRecentBlockhashProviderConfig,
     ) -> Result<Self, SubmitTransportError> {
         let rpc_url = rpc_url.into();
         let client = reqwest::Client::builder()
@@ -88,18 +87,12 @@ impl RpcRecentBlockhashProvider {
             .map_err(|error| SubmitTransportError::Config {
                 message: error.to_string(),
             })?;
-        let latest = Arc::new(RwLock::new(Some(
-            fetch_latest_blockhash(&client, &rpc_url).await?,
-        )));
-        if !config.refresh_interval.is_zero() {
-            spawn_blockhash_refresh_loop(
-                client.clone(),
-                rpc_url.clone(),
-                Arc::clone(&latest),
-                config.refresh_interval,
-            );
-        }
-        Ok(Self { latest })
+        let latest = Arc::new(RwLock::new(None));
+        Ok(Self {
+            latest,
+            client,
+            rpc_url,
+        })
     }
 
     /// Forces one refresh against the configured RPC endpoint and returns the cached value.
@@ -107,18 +100,8 @@ impl RpcRecentBlockhashProvider {
     /// # Errors
     ///
     /// Returns [`SubmitTransportError`] if the RPC request fails or the response is invalid.
-    pub async fn refresh(
-        &self,
-        rpc_url: impl AsRef<str>,
-        config: &RpcRecentBlockhashProviderConfig,
-    ) -> Result<[u8; 32], SubmitTransportError> {
-        let client = reqwest::Client::builder()
-            .timeout(config.request_timeout)
-            .build()
-            .map_err(|error| SubmitTransportError::Config {
-                message: error.to_string(),
-            })?;
-        let blockhash = fetch_latest_blockhash(&client, rpc_url.as_ref()).await?;
+    pub async fn refresh(&self) -> Result<[u8; 32], SubmitTransportError> {
+        let blockhash = fetch_latest_blockhash(&self.client, &self.rpc_url).await?;
         let mut latest = self
             .latest
             .write()
@@ -246,26 +229,6 @@ struct LatestBlockhashRequestConfig<'request> {
     commitment: &'request str,
 }
 
-/// Starts the best-effort background refresh loop for one RPC-backed blockhash provider.
-fn spawn_blockhash_refresh_loop(
-    client: reqwest::Client,
-    rpc_url: String,
-    latest: Arc<RwLock<Option<[u8; 32]>>>,
-    refresh_interval: Duration,
-) {
-    tokio::spawn(async move {
-        loop {
-            sleep(refresh_interval).await;
-            if let Ok(blockhash) = fetch_latest_blockhash(&client, &rpc_url).await {
-                let mut latest_guard = latest
-                    .write()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                *latest_guard = Some(blockhash);
-            }
-        }
-    });
-}
-
 /// Fetches the latest recent blockhash from one Solana JSON-RPC endpoint.
 async fn fetch_latest_blockhash(
     client: &reqwest::Client,
@@ -371,14 +334,14 @@ mod tests {
 
         let provider = RpcRecentBlockhashProvider::with_config(
             format!("http://{addr}"),
-            RpcRecentBlockhashProviderConfig {
-                refresh_interval: Duration::ZERO,
-                ..RpcRecentBlockhashProviderConfig::default()
-            },
-        )
-        .await;
+            &RpcRecentBlockhashProviderConfig::default(),
+        );
         assert!(provider.is_ok());
         let provider = provider.unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(provider.latest_blockhash(), None);
+        let refreshed = provider.refresh().await;
+        assert!(refreshed.is_ok());
+        assert_eq!(refreshed.unwrap_or([0_u8; 32]), expected);
         assert_eq!(provider.latest_blockhash(), Some(expected));
 
         let joined = server.await;
