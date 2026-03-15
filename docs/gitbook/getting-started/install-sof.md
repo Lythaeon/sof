@@ -1,14 +1,14 @@
 # Install SOF
 
-This page is for consumers adding SOF crates to their own project.
+Use this page when adding SOF crates to an existing Rust project.
 
 If Solana traffic internals are still unfamiliar, read these first:
 
 - [Before You Start](before-you-start.md)
 - [Common Questions](common-questions.md)
 
-If you are evaluating the repository examples instead, use the commands shown in
-[First Runtime Bring-Up](first-runtime.md) from a repository checkout.
+If the goal is to try the packaged repository examples first, use the commands in
+[First Runtime Bring-Up](first-runtime.md).
 
 ## Add The Crates To Your Project
 
@@ -210,5 +210,4 @@ Or:
 cargo test -p sof-tx
 ```
 
-If you are developing the repository itself rather than consuming the crates, switch to the
-[Maintain SOF](../maintainers/README.md) track.
+Repository and contributor material lives under [Maintain SOF](../maintainers/README.md).

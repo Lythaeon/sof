@@ -1,6 +1,6 @@
 # Common Questions
 
-This page is for the questions people usually have before they trust themselves to integrate SOF.
+These are the questions that usually come up before an integration feels concrete.
 
 ## Do I Need To Understand Shreds To Use SOF?
 

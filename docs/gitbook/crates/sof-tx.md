@@ -273,7 +273,7 @@ sof-tx = { version = "0.10.0", features = ["jito-grpc"] }
 
 ## Good Fit
 
-`sof-tx` is a good fit when you are building:
+`sof-tx` fits services that are building:
 
 - arbitrage or execution services
 - strategy engines that own their own routing policy

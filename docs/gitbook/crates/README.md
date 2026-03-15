@@ -6,10 +6,7 @@ SOF is not one wide crate with mixed concerns. It is a small product family spli
 - build and submit transactions
 - apply typed host tuning
 
-That split is intentional because most users do not need the full surface at once.
-
-This section is consumer-facing. It explains which crate to adopt and why, without requiring
-repository-internal knowledge.
+That split is intentional because most services do not need the full surface at once.
 
 ## Why The Split Exists
 
@@ -28,7 +25,7 @@ Start with [`sof`](sof.md).
 
 Start with [`sof-tx`](sof-tx.md).
 
-Use this when:
+This is the right fit when:
 
 - you already have a blockhash source
 - you already have a leader or TPU routing source
@@ -38,7 +35,7 @@ Use this when:
 
 Use [`sof`](sof.md) together with [`sof-tx`](sof-tx.md).
 
-Use this when:
+This is the right fit when:
 
 - `sof` is your local source of recent blockhash, leader schedule, and cluster topology state
 - `sof-tx` is your submit path

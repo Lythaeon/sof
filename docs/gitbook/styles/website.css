@@ -77,6 +77,8 @@ body {
 .book .book-summary ul.summary li a,
 .book .book-summary ul.summary li span {
   color: var(--text-muted);
+  font-size: 1.24rem;
+  line-height: 1.55;
   margin: 1px 0;
   padding: 8px 12px;
   border-radius: var(--radius-sm);
@@ -93,14 +95,14 @@ body {
 
 .book .book-summary ul.summary > li.chapter > a {
   color: var(--heading);
-  font-size: 1.3rem;
+  font-size: 1.42rem;
   font-weight: 700;
   margin-top: 8px;
 }
 
 .book .book-summary ul.summary > li.chapter > ul > li.chapter > a {
   color: var(--text);
-  font-size: 1.15rem;
+  font-size: 1.26rem;
   font-weight: 600;
   margin-top: 10px;
 }
@@ -493,6 +495,26 @@ body {
   box-shadow: var(--shadow-soft);
   color: var(--text);
   overflow-x: auto;
+}
+
+.markdown-section .mermaid-shell {
+  margin: 1.4em 0 1.6em;
+  padding: 18px 18px 12px;
+  background: linear-gradient(180deg, #11181e 0%, #10161b 100%);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-soft);
+  overflow-x: auto;
+}
+
+.markdown-section .mermaid {
+  min-width: 620px;
+}
+
+.markdown-section .mermaid svg {
+  display: block;
+  width: 100%;
+  height: auto;
 }
 
 .markdown-section blockquote {
@@ -967,6 +989,14 @@ body {
   .markdown-section pre,
   .markdown-section table {
     max-width: 100%;
+  }
+
+  .markdown-section .mermaid-shell {
+    padding: 12px 12px 8px;
+  }
+
+  .markdown-section .mermaid {
+    min-width: 500px;
   }
 
   .navigation {

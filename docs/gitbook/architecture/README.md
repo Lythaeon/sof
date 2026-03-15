@@ -3,8 +3,8 @@
 The architecture documents explain why SOF is shaped like infrastructure software rather than a
 generic crypto SDK.
 
-This section is primarily maintainer-facing. External users should read it only when they need to
-understand internal design tradeoffs or debug integration behavior at a deeper level.
+These pages are mainly for maintainers and for users who need a deeper view of runtime design or
+integration behavior.
 
 ## Core Themes
 
@@ -16,7 +16,11 @@ understand internal design tradeoffs or debug integration behavior at a deeper l
 
 ## Read This Section For
 
+- a one-screen architecture picture before deeper pipeline details
 - runtime data flow and stage ownership
 - the distinction between plugins, runtime extensions, and derived-state consumers
 - how `sof` and `sof-tx` share local control-plane information
 - where the ADRs and ARDs fit into day-to-day engineering decisions
+
+Start with [System Overview](system-overview.md) if you want the shortest possible diagram-first
+view of how the pieces fit together.

@@ -1,12 +1,8 @@
 # Operations
 
-The operations material is written for people who have to keep SOF useful under real traffic rather
-than just make examples compile.
+These pages are about keeping SOF useful under real traffic, not just making examples compile.
 
-This section is part of the external user track. It focuses on deployment posture, traffic
-behavior, and safe tuning order rather than repository contribution rules.
-
-If you are new to SOF, do not start here first. Read:
+If SOF is still new, start with:
 
 1. [Before You Start](../getting-started/before-you-start.md)
 2. [Common Questions](../getting-started/common-questions.md)

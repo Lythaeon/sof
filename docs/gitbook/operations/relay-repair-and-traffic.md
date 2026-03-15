@@ -3,8 +3,8 @@
 Operators often miss one key point: in gossip mode, SOF is not observer-only by default.
 
 If that sentence is surprising, go back to [Before You Start](../getting-started/before-you-start.md)
-first. This page assumes you already understand the difference between direct UDP mode and
-gossip-bootstrap mode.
+first. The rest of this guide assumes the difference between direct UDP mode and gossip-bootstrap
+mode is already clear.
 
 ## Default Network Posture
 

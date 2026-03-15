@@ -1,6 +1,6 @@
 # Use SOF
 
-This track is for people who want to use SOF as a product, not maintain the repository.
+Use these pages when the goal is to run SOF, embed it, or evaluate it as part of a service.
 
 At the highest level:
 
@@ -15,26 +15,30 @@ Read this section if you are:
 - operating SOF on a host and tuning deployment behavior
 - evaluating whether SOF fits your architecture
 
-If you are still trying to understand the network model itself, start with the onboarding pages
-before you go deeper into crate and operations material:
+If the network model still feels unfamiliar, start with the onboarding pages before going deeper
+into crate and operations material:
 
+- [Why SOF Exists](why-sof-exists.md)
+- [SOF Compared To The Usual Alternatives](sof-compared.md)
 - [Before You Start](../getting-started/before-you-start.md)
 - [Common Questions](../getting-started/common-questions.md)
 
 ## Start Here
 
-1. [Choose the Right SOF Path](adoption-paths.md)
-2. [Before You Start](../getting-started/before-you-start.md)
-3. [Common Questions](../getting-started/common-questions.md)
-4. [Choose Your Control Plane Source](control-plane-sourcing.md)
-5. [Common Recipes](common-recipes.md)
-6. [Build An Observer Service](observer-service.md)
-7. [Build One Process That Observes And Submits](observe-and-submit-service.md)
-8. [Build A Live-Only Stream Service](live-only-stream-service.md)
-9. [Getting Started](../getting-started/README.md)
-10. [First Runtime Bring-Up](../getting-started/first-runtime.md)
-11. [Crates](../crates/README.md)
-12. [Operations](../operations/README.md)
+1. [Why SOF Exists](why-sof-exists.md)
+2. [SOF Compared To The Usual Alternatives](sof-compared.md)
+3. [Choose the Right SOF Path](adoption-paths.md)
+4. [Before You Start](../getting-started/before-you-start.md)
+5. [Common Questions](../getting-started/common-questions.md)
+6. [Choose Your Control Plane Source](control-plane-sourcing.md)
+7. [Common Recipes](common-recipes.md)
+8. [Build An Observer Service](observer-service.md)
+9. [Build One Process That Observes And Submits](observe-and-submit-service.md)
+10. [Build A Live-Only Stream Service](live-only-stream-service.md)
+11. [Getting Started](../getting-started/README.md)
+12. [First Runtime Bring-Up](../getting-started/first-runtime.md)
+13. [Crates](../crates/README.md)
+14. [Operations](../operations/README.md)
 
 ## What This Track Optimizes For
 
@@ -43,4 +47,4 @@ before you go deeper into crate and operations material:
 - understanding the operational posture before production use
 - avoiding repository-internal detail unless it is needed for integration decisions
 
-If you are changing SOF itself, move to [Maintain SOF](../maintainers/README.md).
+Repository and contributor material lives under [Maintain SOF](../maintainers/README.md).

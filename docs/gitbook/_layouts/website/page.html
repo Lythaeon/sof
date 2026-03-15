@@ -22,6 +22,7 @@
             }
         </style>
     </noscript>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
     <script>
         function __init__getSidebarState(defaultValue){
             var baseKey = "";
@@ -321,6 +322,77 @@
                 });
             }
 
+            function renderMermaidDiagrams() {
+                var section = document.querySelector(".markdown-section");
+                if (!section || !window.mermaid) {
+                    return;
+                }
+
+                Array.prototype.forEach.call(
+                    section.querySelectorAll("pre code.lang-mermaid, pre code.language-mermaid"),
+                    function(codeBlock) {
+                        var pre = codeBlock.parentNode;
+                        if (!pre || pre.getAttribute("data-mermaid-processed") === "true") {
+                            return;
+                        }
+
+                        var shell = document.createElement("div");
+                        shell.className = "mermaid-shell";
+
+                        var diagram = document.createElement("div");
+                        diagram.className = "mermaid";
+                        diagram.textContent = codeBlock.textContent || "";
+
+                        shell.appendChild(diagram);
+                        pre.parentNode.replaceChild(shell, pre);
+                    }
+                );
+
+                window.mermaid.initialize({
+                    startOnLoad: false,
+                    securityLevel: "loose",
+                    theme: "base",
+                    themeVariables: {
+                        background: "#11181e",
+                        primaryColor: "#122029",
+                        primaryBorderColor: "#29414d",
+                        primaryTextColor: "#f4fbff",
+                        secondaryColor: "#141b21",
+                        secondaryBorderColor: "#26333d",
+                        secondaryTextColor: "#cad7df",
+                        tertiaryColor: "#10171d",
+                        tertiaryBorderColor: "#26333d",
+                        tertiaryTextColor: "#cad7df",
+                        lineColor: "#57ddd1",
+                        mainBkg: "#141b21",
+                        textColor: "#cad7df",
+                        edgeLabelBackground: "#11181e",
+                        clusterBkg: "#10161b",
+                        clusterBorder: "#29414d",
+                        titleColor: "#f4fbff",
+                        noteBkgColor: "#141b21",
+                        noteBorderColor: "#29414d",
+                        noteTextColor: "#cad7df",
+                        actorBkg: "#122029",
+                        actorBorder: "#29414d",
+                        actorTextColor: "#f4fbff",
+                        labelBoxBkgColor: "#11181e",
+                        labelBoxBorderColor: "#29414d",
+                        labelTextColor: "#cad7df",
+                        fontFamily: "IBM Plex Sans, Avenir Next, Segoe UI, sans-serif"
+                    },
+                    flowchart: {
+                        curve: "basis",
+                        useMaxWidth: true,
+                        htmlLabels: false
+                    }
+                });
+
+                window.mermaid.run({
+                    querySelector: ".mermaid"
+                });
+            }
+
             function bindMobileChrome() {
                 if (window.__sofDocsMobileChromeBound) {
                     return;
@@ -391,6 +463,7 @@
                 syncFooterYear();
                 buildPageToc();
                 tagSpecialTables();
+                renderMermaidDiagrams();
                 bindMobileChrome();
             };
 

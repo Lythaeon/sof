@@ -1,6 +1,6 @@
 # Getting Started
 
-This section is the shortest path from evaluation to a first working integration.
+Start here to get from evaluation to a first working integration.
 
 If Solana traffic internals still feel unfamiliar, do not skip the onboarding pages:
 
@@ -29,8 +29,7 @@ Before you start, keep the product model simple:
 6. [Crates](../crates/README.md)
 7. [Operations](../operations/README.md)
 
-If you are maintaining the repository rather than consuming SOF, use the
-[Maintain SOF](../maintainers/README.md) track instead.
+Repository and contributor material lives under [Maintain SOF](../maintainers/README.md).
 
 ## What You Should Know Before Deploying
 

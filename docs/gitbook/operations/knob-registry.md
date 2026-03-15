@@ -1,6 +1,6 @@
 # Knob Registry
 
-This page is the reference registry for SOF runtime knobs.
+Use this page as the reference registry for SOF runtime knobs.
 
 Scope:
 
@@ -8,7 +8,7 @@ Scope:
 - the bundled gossip backend knobs exposed through `crates/sof-solana-gossip`
 - feature-gated knobs are marked where relevant
 
-This page is intentionally different from the tuning guide:
+This registry is intentionally different from the tuning guide:
 
 - use this page when you need to look up one knob quickly
 - use [Tuning and Environment Controls](tuning-and-env.md) when you need advice on what to change
@@ -18,7 +18,7 @@ Snapshot date:
 
 - `2026-03-14`
 
-## How To Read This Page
+## How To Read The Registry
 
 - `Default` is the runtime default when the knob is unset
 - `Scope` tells you whether the knob is always available, feature-gated, or implementation-specific

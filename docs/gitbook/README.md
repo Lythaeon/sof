@@ -18,14 +18,17 @@ SOF is not a wallet framework and it is not a validator. The project is shaped m
 infrastructure software: bounded queues, explicit runtime posture, local control-plane state, and
 operationally visible tradeoffs.
 
-This book has two separate reading tracks because external users and repository maintainers need
-different documentation.
+The docs are split into two reading tracks because product users and repository maintainers need
+different levels of detail.
 
 If Solana network internals are still new to you, do not jump straight into crate pages. Start
 with:
 
+- [Why SOF Exists](use-sof/why-sof-exists.md)
+- [SOF Compared To The Usual Alternatives](use-sof/sof-compared.md)
 - [Before You Start](getting-started/before-you-start.md)
 - [Common Questions](getting-started/common-questions.md)
+- [System Overview](architecture/system-overview.md)
 
 ## Choose Your Track
 
@@ -41,6 +44,8 @@ Start here: [Use SOF](use-sof/README.md)
 
 Recommended next decisions:
 
+- [Why SOF Exists](use-sof/why-sof-exists.md)
+- [SOF Compared To The Usual Alternatives](use-sof/sof-compared.md)
 - [Before You Start](getting-started/before-you-start.md)
 - [Common Questions](getting-started/common-questions.md)
 - [Choose Your Control Plane Source](use-sof/control-plane-sourcing.md)

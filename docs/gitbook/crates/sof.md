@@ -200,8 +200,7 @@ RPC.
 | `tpu_leader_logger` | local leader and TPU endpoint observation |
 | `kernel_bypass_ingress_metrics` | external ingress handoff |
 
-If you are new to the crate, do not stop at this page. Open the example that matches what you need
-to build:
+The quickest way forward is to open the example that matches the service being built:
 
 - [`observer_runtime.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/observer_runtime.rs)
 - [`observer_with_non_vote_plugin.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/observer_with_non_vote_plugin.rs)
@@ -210,15 +209,14 @@ to build:
 
 ## A Good Mental Model For Implementation
 
-If you are integrating `sof` into your own app, this is the implementation loop you will usually
-follow:
+The implementation loop is usually:
 
 1. choose a runtime mode
 2. choose whether your app logic is a plugin, runtime extension, or derived-state consumer
 3. build the matching host
 4. pass that host into the runtime entrypoint
 
-In practice, your integration usually comes down to one concrete pattern: choose the host type
+In practice, the integration usually comes down to one concrete pattern: choose the host type
 that matches your service, then pass that host into the matching runtime entrypoint.
 
 ## Operational Baseline
