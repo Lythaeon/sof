@@ -2,6 +2,11 @@
 
 This page is for consumers adding SOF crates to their own project.
 
+If Solana traffic internals are still unfamiliar, read these first:
+
+- [Before You Start](before-you-start.md)
+- [Common Questions](common-questions.md)
+
 If you are evaluating the repository examples instead, use the commands shown in
 [First Runtime Bring-Up](first-runtime.md) from a repository checkout.
 

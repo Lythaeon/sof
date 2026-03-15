@@ -2,6 +2,10 @@
 
 This page is the shortest path to running `sof` locally and understanding which mode you are in.
 
+If terms like shreds, relay, repair, or leader schedule still feel fuzzy, read
+[Before You Start](before-you-start.md) first. This page assumes you already know the basic shape
+of what SOF is doing on the network.
+
 ## Try It From This Repository
 
 If you are evaluating SOF from a repository checkout, start with the packaged examples.
@@ -124,6 +128,21 @@ If you need less outbound activity while keeping ingest active:
 
 Do not start with the advanced queue, repair, or gossip thread knobs unless you are already
 measuring a concrete problem.
+
+## What Success Looks Like
+
+For a first bring-up, success is usually one of these:
+
+- the runtime starts and stays healthy for a few minutes
+- your plugin logs the event type you expected
+- you can clearly tell whether you are in direct UDP mode or gossip mode
+
+What is not required on day one:
+
+- perfect packet coverage
+- final tuning values
+- understanding every environment variable
+- jumping immediately into relay/repair tuning
 
 ## Examples Worth Trying
 

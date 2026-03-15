@@ -21,6 +21,12 @@ operationally visible tradeoffs.
 This book has two separate reading tracks because external users and repository maintainers need
 different documentation.
 
+If Solana network internals are still new to you, do not jump straight into crate pages. Start
+with:
+
+- [Before You Start](getting-started/before-you-start.md)
+- [Common Questions](getting-started/common-questions.md)
+
 ## Choose Your Track
 
 ### Use SOF
@@ -35,6 +41,8 @@ Start here: [Use SOF](use-sof/README.md)
 
 Recommended next decisions:
 
+- [Before You Start](getting-started/before-you-start.md)
+- [Common Questions](getting-started/common-questions.md)
 - [Choose Your Control Plane Source](use-sof/control-plane-sourcing.md)
 - [Common Recipes](use-sof/common-recipes.md)
 
