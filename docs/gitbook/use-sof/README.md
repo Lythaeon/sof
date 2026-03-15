@@ -15,15 +15,26 @@ Read this section if you are:
 - operating SOF on a host and tuning deployment behavior
 - evaluating whether SOF fits your architecture
 
+If you are still trying to understand the network model itself, start with the onboarding pages
+before you go deeper into crate and operations material:
+
+- [Before You Start](../getting-started/before-you-start.md)
+- [Common Questions](../getting-started/common-questions.md)
+
 ## Start Here
 
 1. [Choose the Right SOF Path](adoption-paths.md)
-2. [Choose Your Control Plane Source](control-plane-sourcing.md)
-3. [Common Recipes](common-recipes.md)
-4. [Getting Started](../getting-started/README.md)
-5. [First Runtime Bring-Up](../getting-started/first-runtime.md)
-6. [Crates](../crates/README.md)
-7. [Operations](../operations/README.md)
+2. [Before You Start](../getting-started/before-you-start.md)
+3. [Common Questions](../getting-started/common-questions.md)
+4. [Choose Your Control Plane Source](control-plane-sourcing.md)
+5. [Common Recipes](common-recipes.md)
+6. [Build An Observer Service](observer-service.md)
+7. [Build One Process That Observes And Submits](observe-and-submit-service.md)
+8. [Build A Live-Only Stream Service](live-only-stream-service.md)
+9. [Getting Started](../getting-started/README.md)
+10. [First Runtime Bring-Up](../getting-started/first-runtime.md)
+11. [Crates](../crates/README.md)
+12. [Operations](../operations/README.md)
 
 ## What This Track Optimizes For
 

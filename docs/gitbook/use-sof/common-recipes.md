@@ -2,6 +2,12 @@
 
 These are the product shapes you will usually end up choosing between when you deploy SOF.
 
+If you want the pages with fuller service-level walkthroughs, open these too:
+
+- [Build An Observer Service](observer-service.md)
+- [Build One Process That Observes And Submits](observe-and-submit-service.md)
+- [Build A Live-Only Stream Service](live-only-stream-service.md)
+
 ## Observer Host Only
 
 Use:
@@ -23,6 +29,10 @@ Implementation shape:
 
 - `sof::runtime::run_async()` for first bring-up
 - `PluginHost` once your service starts consuming transactions, slots, or topology
+
+Build this next:
+
+- [Build An Observer Service](observer-service.md)
 
 ## Submitter With External Control Plane
 
@@ -68,6 +78,10 @@ Implementation shape:
 - `PluginHost::builder().add_shared_plugin(...)`
 - `TxSubmitClient::new(adapter.clone(), adapter.clone())`
 
+Build this next:
+
+- [Build One Process That Observes And Submits](observe-and-submit-service.md)
+
 ## Restart-Safe Stateful Execution Service
 
 Use:
@@ -98,3 +112,19 @@ Use this when:
 - the built-in UDP ingress is not the final network shape you need
 
 Do not start here unless you have already measured why the standard ingress path is insufficient.
+
+## Live-Only Stream Product
+
+Use:
+
+- `sof`
+- your own fanout/auth/filtering service layer
+
+Use this when:
+
+- you want to expose live events to external users or internal services
+- you do not want replay or catch-up yet
+
+Build this next:
+
+- [Build A Live-Only Stream Service](live-only-stream-service.md)

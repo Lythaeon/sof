@@ -6,6 +6,12 @@ than just make examples compile.
 This section is part of the external user track. It focuses on deployment posture, traffic
 behavior, and safe tuning order rather than repository contribution rules.
 
+If you are new to SOF, do not start here first. Read:
+
+1. [Before You Start](../getting-started/before-you-start.md)
+2. [Common Questions](../getting-started/common-questions.md)
+3. [First Runtime Bring-Up](../getting-started/first-runtime.md)
+
 ## Operating Principles
 
 - start from safe defaults

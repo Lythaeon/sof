@@ -3,6 +3,10 @@
 `sof` is the packaged observer/runtime crate for low-latency shred ingestion and local
 control-plane signals.
 
+If the words “shred”, “relay”, or “repair” still feel too low-level right now, read
+[Before You Start](../getting-started/before-you-start.md) before treating this page as your first
+stop.
+
 ## Core Responsibilities
 
 - packet ingress from direct UDP, gossip bootstrap, or external kernel-bypass receivers
@@ -11,6 +15,9 @@ control-plane signals.
 - runtime extension hosting for filtered packet/resource consumers
 - bounded relay and repair behavior
 - local canonical and commitment tracking without requiring an RPC dependency
+
+You do not need to understand the raw shred format to use the crate well. What matters is that
+`sof` starts from live packet traffic and turns it into higher-level local signals and events.
 
 ## Where It Fits
 
