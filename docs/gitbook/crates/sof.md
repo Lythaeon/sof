@@ -44,6 +44,70 @@ If your only goal is to build and submit transactions, start with `sof-tx` inste
 | Derived-state consumers | `sof::framework::DerivedStateConsumer` and `DerivedStateHost` |
 | Event payloads | `sof::event` |
 
+## The First Three Code Paths You Will Usually Need
+
+### 1. Start the runtime
+
+```rust
+#[tokio::main]
+async fn main() -> Result<(), sof::runtime::RuntimeError> {
+    sof::runtime::run_async().await
+}
+```
+
+Use this when you only need to prove the runtime starts on your host.
+
+### 2. Start the runtime with explicit setup
+
+```rust
+use sof::runtime::RuntimeSetup;
+
+#[tokio::main]
+async fn main() -> Result<(), sof::runtime::RuntimeError> {
+    let setup = RuntimeSetup::new()
+        .with_startup_step_logs(true);
+    sof::runtime::run_async_with_setup(&setup).await
+}
+```
+
+Use this once you want bind address, gossip entrypoints, worker counts, or derived-state behavior
+to be explicit in code.
+
+### 3. Start the runtime and consume one event stream
+
+```rust
+use async_trait::async_trait;
+use sof::{
+    event::TxKind,
+    framework::{Plugin, PluginHost, TransactionEvent},
+};
+
+#[derive(Clone, Copy, Debug, Default)]
+struct NonVoteLogger;
+
+#[async_trait]
+impl Plugin for NonVoteLogger {
+    fn wants_transaction(&self) -> bool {
+        true
+    }
+
+    async fn on_transaction(&self, event: &TransactionEvent) {
+        if event.kind == TxKind::VoteOnly {
+            return;
+        }
+        tracing::info!(slot = event.slot, kind = ?event.kind, "transaction observed");
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), sof::runtime::RuntimeError> {
+    let host = PluginHost::builder().add_plugin(NonVoteLogger).build();
+    sof::runtime::run_async_with_plugin_host(host).await
+}
+```
+
+Use this when you are building a real service rather than only proving SOF can boot.
+
 ## Runtime Modes
 
 ### Direct UDP listener
@@ -128,6 +192,27 @@ RPC.
 | `derived_state_slot_mirror` | replayable stateful-consumer pattern; requires `SOF_RUN_EXAMPLE=1` |
 | `tpu_leader_logger` | local leader and TPU endpoint observation |
 | `kernel_bypass_ingress_metrics` | external ingress handoff |
+
+If you are new to the crate, do not stop at this page. Open the example that matches what you need
+to build:
+
+- [`observer_runtime.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/observer_runtime.rs)
+- [`observer_with_non_vote_plugin.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/observer_with_non_vote_plugin.rs)
+- [`observer_with_multiple_plugins.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/observer_with_multiple_plugins.rs)
+- [`tpu_leader_logger.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/tpu_leader_logger.rs)
+
+## A Good Mental Model For Implementation
+
+If you are integrating `sof` into your own app, this is the implementation loop you will usually
+follow:
+
+1. choose a runtime mode
+2. choose whether your app logic is a plugin, runtime extension, or derived-state consumer
+3. build the matching host
+4. pass that host into the runtime entrypoint
+
+In practice, your integration usually comes down to one concrete pattern: choose the host type
+that matches your service, then pass that host into the matching runtime entrypoint.
 
 ## Operational Baseline
 

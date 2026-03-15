@@ -1,5 +1,7 @@
 //! Submission module unit tests.
 
+#![allow(clippy::indexing_slicing, clippy::panic)]
+
 use std::{
     net::SocketAddr,
     sync::{
@@ -13,6 +15,10 @@ use async_trait::async_trait;
 use solana_keypair::Keypair;
 use solana_signature::Signature;
 use solana_signer::Signer;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
 
 use super::*;
 use crate::{
@@ -235,6 +241,32 @@ async fn rpc_only_uses_rpc_transport() {
 }
 
 #[tokio::test]
+async fn builder_allows_signed_rpc_submit_without_blockhash_provider() {
+    let rpc = Arc::new(MockRpcTransport {
+        result: Ok("rpc-signature".to_owned()),
+        calls: AtomicU64::new(0),
+    });
+    let mut client = TxSubmitClient::builder()
+        .with_rpc_transport(rpc.clone())
+        .build();
+
+    let (bytes, signature) = signed_transfer_bytes();
+    let result = client
+        .submit_signed(
+            SignedTx::VersionedTransactionBytes(bytes),
+            SubmitMode::RpcOnly,
+        )
+        .await;
+
+    assert!(result.is_ok());
+    if let Ok(result) = result {
+        assert_eq!(result.signature, Some(signature));
+        assert_eq!(result.rpc_signature, Some("rpc-signature".to_owned()));
+    }
+    assert_eq!(rpc.calls.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
 async fn jito_only_uses_jito_transport() {
     let rpc = Arc::new(MockRpcTransport {
         result: Ok("rpc-signature".to_owned()),
@@ -319,6 +351,126 @@ async fn jito_only_accepts_bundle_id_from_grpc_transport() {
     }
 
     assert_eq!(jito.calls.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn rpc_only_constructor_uses_rpc_for_blockhash_and_submit() {
+    let blockhash = bs58::encode([31_u8; 32]).into_string();
+    let listener = TcpListener::bind("127.0.0.1:0").await;
+    assert!(listener.is_ok());
+    let listener = listener.unwrap_or_else(|error| panic!("{error}"));
+    let addr = listener.local_addr();
+    assert!(addr.is_ok());
+    let addr = addr.unwrap_or_else(|error| panic!("{error}"));
+
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let accepted = listener.accept().await;
+            assert!(accepted.is_ok());
+            let (mut stream, _) = accepted.unwrap_or_else(|error| panic!("{error}"));
+            let mut buffer = [0_u8; 8192];
+            let read = stream.read(&mut buffer).await;
+            assert!(read.is_ok());
+            let request = String::from_utf8_lossy(&buffer[..read.unwrap_or(0)]);
+            let body = if request.contains("getLatestBlockhash") {
+                format!(
+                    "{{\"jsonrpc\":\"2.0\",\"result\":{{\"value\":{{\"blockhash\":\"{blockhash}\"}}}},\"id\":1}}"
+                )
+            } else {
+                assert!(request.contains("sendTransaction"));
+                "{\"jsonrpc\":\"2.0\",\"result\":\"rpc-signature\",\"id\":1}".to_owned()
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let write = stream.write_all(response.as_bytes()).await;
+            assert!(write.is_ok());
+        }
+    });
+
+    let client = TxSubmitClient::rpc_only(format!("http://{addr}"));
+    assert!(client.is_ok());
+    let mut client = client.unwrap_or_else(|error| panic!("{error}"));
+
+    let payer = Keypair::new();
+    let recipient = Keypair::new();
+    let builder = TxBuilder::new(payer.pubkey()).add_instruction(
+        solana_system_interface::instruction::transfer(&payer.pubkey(), &recipient.pubkey(), 1),
+    );
+    let result = client
+        .submit_builder(builder, &[&payer], SubmitMode::RpcOnly)
+        .await;
+
+    assert!(result.is_ok());
+    if let Ok(result) = result {
+        assert_eq!(result.rpc_signature, Some("rpc-signature".to_owned()));
+        assert_eq!(result.direct_target, None);
+    }
+
+    let joined = server.await;
+    assert!(joined.is_ok());
+}
+
+#[tokio::test]
+async fn builder_rpc_defaults_uses_rpc_for_blockhash_and_submit() {
+    let blockhash = bs58::encode([41_u8; 32]).into_string();
+    let listener = TcpListener::bind("127.0.0.1:0").await;
+    assert!(listener.is_ok());
+    let listener = listener.unwrap_or_else(|error| panic!("{error}"));
+    let addr = listener.local_addr();
+    assert!(addr.is_ok());
+    let addr = addr.unwrap_or_else(|error| panic!("{error}"));
+
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let accepted = listener.accept().await;
+            assert!(accepted.is_ok());
+            let (mut stream, _) = accepted.unwrap_or_else(|error| panic!("{error}"));
+            let mut buffer = [0_u8; 8192];
+            let read = stream.read(&mut buffer).await;
+            assert!(read.is_ok());
+            let request = String::from_utf8_lossy(&buffer[..read.unwrap_or(0)]);
+            let body = if request.contains("getLatestBlockhash") {
+                format!(
+                    "{{\"jsonrpc\":\"2.0\",\"result\":{{\"value\":{{\"blockhash\":\"{blockhash}\"}}}},\"id\":1}}"
+                )
+            } else {
+                assert!(request.contains("sendTransaction"));
+                "{\"jsonrpc\":\"2.0\",\"result\":\"rpc-signature\",\"id\":1}".to_owned()
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let write = stream.write_all(response.as_bytes()).await;
+            assert!(write.is_ok());
+        }
+    });
+
+    let built = TxSubmitClient::builder().with_rpc_defaults(format!("http://{addr}"));
+    assert!(built.is_ok());
+    let mut client = built.unwrap_or_else(|error| panic!("{error}")).build();
+
+    let payer = Keypair::new();
+    let recipient = Keypair::new();
+    let builder = TxBuilder::new(payer.pubkey()).add_instruction(
+        solana_system_interface::instruction::transfer(&payer.pubkey(), &recipient.pubkey(), 1),
+    );
+    let result = client
+        .submit_builder(builder, &[&payer], SubmitMode::RpcOnly)
+        .await;
+
+    assert!(result.is_ok());
+    if let Ok(result) = result {
+        assert_eq!(result.rpc_signature, Some("rpc-signature".to_owned()));
+        assert_eq!(result.direct_target, None);
+    }
+
+    let joined = server.await;
+    assert!(joined.is_ok());
 }
 
 #[tokio::test]

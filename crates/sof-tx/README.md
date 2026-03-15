@@ -46,16 +46,10 @@ sof-tx = { version = "0.9.2", features = ["kernel-bypass"] }
 
 ## Quick Start
 
-Basic client setup:
+Start with the simplest builder-based path:
 
 ```rust
-use std::sync::Arc;
-
-use sof_tx::{
-    JitoTransportConfig, SubmitMode, SubmitReliability, TxBuilder, TxSubmitClient,
-    providers::{StaticLeaderProvider, StaticRecentBlockhashProvider},
-    submit::{JitoJsonRpcTransport, JsonRpcTransport, UdpDirectTransport},
-};
+use sof_tx::{SubmitMode, TxBuilder, TxSubmitClient};
 use solana_keypair::Keypair;
 use solana_signer::Signer;
 use solana_system_interface::instruction as system_instruction;
@@ -65,29 +59,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let payer = Keypair::new();
     let recipient = Keypair::new();
 
-    let blockhash_provider = Arc::new(StaticRecentBlockhashProvider::new(Some([7_u8; 32])));
-    let leader_provider = Arc::new(StaticLeaderProvider::new(None, Vec::new()));
-
-    let client = TxSubmitClient::new(blockhash_provider, leader_provider)
-        .with_reliability(SubmitReliability::Balanced)
-        .with_rpc_transport(Arc::new(JsonRpcTransport::new("https://api.mainnet-beta.solana.com")?))
-        .with_jito_transport(Arc::new(JitoJsonRpcTransport::new()?))
-        .with_direct_transport(Arc::new(UdpDirectTransport));
+    let mut client = TxSubmitClient::builder()
+        .with_rpc_defaults("https://api.mainnet-beta.solana.com")?
+        .build();
 
     let builder = TxBuilder::new(payer.pubkey()).add_instruction(
         system_instruction::transfer(&payer.pubkey(), &recipient.pubkey(), 1),
     );
 
     let _ = client
-        .submit_builder(builder, &[&payer], SubmitMode::Hybrid)
+        .submit_builder(builder, &[&payer], SubmitMode::RpcOnly)
         .await?;
 
     Ok(())
 }
 ```
 
+Pick the setup that matches what you need:
+
+```rust
+use std::sync::Arc;
+
+use sof_tx::{
+    TxSubmitClient,
+    submit::JsonRpcTransport,
+};
+
+let mut rpc_client = TxSubmitClient::builder()
+    .with_rpc_defaults("https://api.mainnet-beta.solana.com")?
+    .build();
+
+let mut jito_client = TxSubmitClient::builder()
+    .with_jito_defaults("https://api.mainnet-beta.solana.com")?
+    .build();
+
+let mut signed_only_client = TxSubmitClient::builder()
+    .with_rpc_transport(Arc::new(JsonRpcTransport::new(
+        "https://api.mainnet-beta.solana.com",
+    )?))
+    .build();
+```
+
+- `with_rpc_defaults(...)`: use one RPC URL for builder-based `RpcOnly` submission.
+- `with_jito_defaults(...)`: use one RPC URL for blockhash plus Jito for `JitoOnly` submission.
+- `with_rpc_transport(...)`: enough for `submit_signed(...)` because that path does not build the
+  transaction inside the client and does not need a blockhash provider.
+
+The builder gives you the product-level paths first. Drop down to the provider APIs only when you
+need custom control-plane wiring.
+
 ## Core Types
 
+- `TxSubmitClientBuilder`: configure common RPC, Jito, direct, and control-plane paths without
+  wiring providers by hand first.
 - `TxBuilder`: compose transaction instructions and signing inputs.
 - `TxSubmitClient`: submit through RPC/Jito/direct/hybrid.
 - `SubmitMode`: runtime mode switch.
@@ -139,11 +163,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // If SOF runtime was already running, optionally seed from host snapshots.
     adapter.prime_from_plugin_host(&host);
 
-    let client = TxSubmitClient::new(adapter.clone(), adapter.clone())
+    let mut client = TxSubmitClient::new(adapter.clone(), adapter.clone())
         .with_reliability(SubmitReliability::Balanced)
         .with_rpc_transport(Arc::new(JsonRpcTransport::new("https://api.mainnet-beta.solana.com")?))
         .with_jito_transport(Arc::new(JitoJsonRpcTransport::new()?))
-        .with_direct_transport(Arc::new(UdpDirectTransport));
+        .with_direct_transport(Arc::new(UdpDirectTransport::new()));
 
     let payer = Keypair::new();
     let recipient = Keypair::new();
@@ -196,9 +220,8 @@ driving direct or hybrid sends. Typical checks include:
 use std::sync::Arc;
 
 use sof_tx::{
-    SubmitMode, SubmitReliability, TxBuilder, TxSubmitClient,
-    providers::{LeaderProvider, LeaderTarget, RecentBlockhashProvider, StaticLeaderProvider, StaticRecentBlockhashProvider},
-    submit::{JitoJsonRpcTransport, JsonRpcTransport, UdpDirectTransport},
+    SubmitMode, TxBuilder, TxSubmitClient,
+    submit::JitoJsonRpcTransport,
 };
 use solana_keypair::Keypair;
 use solana_signer::Signer;
@@ -209,14 +232,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let payer = Keypair::new();
     let recipient = Keypair::new();
 
-    let blockhash_provider = Arc::new(StaticRecentBlockhashProvider::new(Some([7_u8; 32])));
-    let leader_provider = Arc::new(StaticLeaderProvider::new(None, Vec::new()));
-
-    let client = TxSubmitClient::new(blockhash_provider, leader_provider)
-        .with_reliability(SubmitReliability::Balanced)
-        .with_rpc_transport(Arc::new(JsonRpcTransport::new("https://api.mainnet-beta.solana.com")?))
+    let mut client = TxSubmitClient::builder()
+        .with_rpc_defaults("https://api.mainnet-beta.solana.com")?
         .with_jito_transport(Arc::new(JitoJsonRpcTransport::new()?))
-        .with_direct_transport(Arc::new(UdpDirectTransport));
+        .build();
 
     let builder = TxBuilder::new(payer.pubkey())
         .with_compute_unit_limit(450_000)
@@ -229,7 +248,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
 
     let _result = client
-        .submit_builder(builder, &[&payer], SubmitMode::Hybrid)
+        .submit_builder(builder, &[&payer], SubmitMode::JitoOnly)
         .await?;
 
     Ok(())
@@ -257,7 +276,7 @@ fn build_cpmm_instructions(/* params */) -> Vec<Instruction> {
 }
 
 async fn submit_strategy_ixs(
-    client: &TxSubmitClient,
+    client: &mut TxSubmitClient,
     payer: &Keypair,
     ixs: Vec<Instruction>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -279,13 +298,14 @@ This gives one consistent path for signing, dedupe, routing, and fallback behavi
 
 ## Submitting Pre-Signed Transactions
 
-If your signer is external (wallet/HSM/offline), submit bytes directly:
+If your signer is external (wallet/HSM/offline), submit bytes directly. This path does not need a
+blockhash provider inside `TxSubmitClient` because the transaction is already signed before submit:
 
 ```rust
 use sof_tx::{SignedTx, SubmitMode, TxSubmitClient};
 
 async fn send_presigned(
-    client: &TxSubmitClient,
+    client: &mut TxSubmitClient,
     tx_bytes: Vec<u8>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = client
@@ -357,7 +377,7 @@ let jito_transport = Arc::new(JitoJsonRpcTransport::with_config(
     },
 )?);
 
-let client = TxSubmitClient::new(blockhash_provider, leader_provider)
+let client = TxSubmitClient::blockhash_only(blockhash_provider)
     .with_jito_transport(jito_transport)
     .with_jito_config(JitoSubmitConfig {
         bundle_only: true,
