@@ -49,9 +49,45 @@
                 book.classList.add("without-animation", "with-summary");
             }
         }
+        function __init__restoreSidebarScroll() {
+            var nav = document.querySelector(".book-summary nav");
+            if (!nav) {
+                return;
+            }
 
+            try {
+                var raw = sessionStorage.getItem("sof:sidebar:scrollTop");
+                if (raw == null) {
+                    return;
+                }
+
+                if (document.activeElement && nav.contains(document.activeElement)) {
+                    document.activeElement.blur();
+                }
+
+                var scrollTop = parseInt(raw, 10);
+                if (!Number.isNaN(scrollTop)) {
+                    nav.scrollTop = scrollTop;
+                }
+            } catch (e) {
+                return;
+            }
+        }
+        function __init__saveSidebarScroll() {
+            var nav = document.querySelector(".book-summary nav");
+            if (!nav) {
+                return;
+            }
+
+            try {
+                sessionStorage.setItem("sof:sidebar:scrollTop", String(nav.scrollTop));
+            } catch (e) {
+                return;
+            }
+        }
         try {
             __init__restoreLastSidebarState();
+            __init__restoreSidebarScroll();
         } finally {
             var book = document.querySelector(".book");
             book.classList.remove("honkit-cloak");
@@ -145,6 +181,19 @@
                                 </a>
                             </div>
                         </footer>
+
+                        <div class="diagram-lightbox" data-diagram-lightbox hidden aria-hidden="true">
+                            <div class="diagram-lightbox-backdrop" data-diagram-close></div>
+                            <div class="diagram-lightbox-dialog" role="dialog" aria-modal="true" aria-label="Diagram viewer">
+                                <div class="diagram-lightbox-header">
+                                    <p class="diagram-lightbox-title" data-diagram-lightbox-title></p>
+                                </div>
+                                <button class="diagram-lightbox-close" type="button" aria-label="Close diagram viewer" data-diagram-close>
+                                    <i class="fa fa-times" aria-hidden="true"></i>
+                                </button>
+                                <div class="diagram-lightbox-stage" data-diagram-stage></div>
+                            </div>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -328,6 +377,46 @@
                     return;
                 }
 
+                function findDiagramTitle(diagramNode) {
+                    var node = diagramNode;
+                    while (node && node !== section) {
+                        var sibling = node.previousElementSibling;
+                        while (sibling) {
+                            if (/^H[1-4]$/.test(sibling.tagName)) {
+                                return sibling.textContent.trim();
+                            }
+                            sibling = sibling.previousElementSibling;
+                        }
+                        node = node.parentElement;
+                    }
+
+                    var pageHeading = section.querySelector("h1");
+                    return pageHeading ? pageHeading.textContent.trim() : "Diagram";
+                }
+
+                Array.prototype.forEach.call(
+                    section.querySelectorAll(".mermaid"),
+                    function(diagram) {
+                        if (diagram.parentNode && diagram.parentNode.classList.contains("mermaid-shell")) {
+                            return;
+                        }
+
+                        var shell = document.createElement("div");
+                        shell.className = "mermaid-shell";
+
+                        var button = document.createElement("button");
+                        button.className = "mermaid-zoom-button";
+                        button.type = "button";
+                        button.setAttribute("aria-label", "Expand diagram");
+                        button.innerHTML = '<i class="fa fa-search-plus" aria-hidden="true"></i>';
+
+                        shell.setAttribute("data-diagram-title", findDiagramTitle(diagram));
+                        diagram.parentNode.insertBefore(shell, diagram);
+                        shell.appendChild(button);
+                        shell.appendChild(diagram);
+                    }
+                );
+
                 Array.prototype.forEach.call(
                     section.querySelectorAll("pre code.lang-mermaid, pre code.language-mermaid"),
                     function(codeBlock) {
@@ -339,10 +428,18 @@
                         var shell = document.createElement("div");
                         shell.className = "mermaid-shell";
 
+                        var button = document.createElement("button");
+                        button.className = "mermaid-zoom-button";
+                        button.type = "button";
+                        button.setAttribute("aria-label", "Expand diagram");
+                        button.innerHTML = '<i class="fa fa-search-plus" aria-hidden="true"></i>';
+
                         var diagram = document.createElement("div");
                         diagram.className = "mermaid";
                         diagram.textContent = codeBlock.textContent || "";
 
+                        shell.setAttribute("data-diagram-title", findDiagramTitle(pre));
+                        shell.appendChild(button);
                         shell.appendChild(diagram);
                         pre.parentNode.replaceChild(shell, pre);
                     }
@@ -391,6 +488,79 @@
                 window.mermaid.run({
                     querySelector: ".mermaid"
                 });
+            }
+
+            function bindDiagramLightbox() {
+                var lightbox = document.querySelector("[data-diagram-lightbox]");
+                var stage = document.querySelector("[data-diagram-stage]");
+                var title = document.querySelector("[data-diagram-lightbox-title]");
+                if (!lightbox || !stage || !title) {
+                    return;
+                }
+
+                function closeLightbox() {
+                    lightbox.hidden = true;
+                    lightbox.setAttribute("aria-hidden", "true");
+                    stage.innerHTML = "";
+                    title.textContent = "";
+                    document.documentElement.classList.remove("diagram-lightbox-open");
+                    document.body.classList.remove("diagram-lightbox-open");
+                }
+
+                Array.prototype.forEach.call(
+                    document.querySelectorAll(".mermaid-zoom-button"),
+                    function(button) {
+                        if (button.__sofDocsZoomBound) {
+                            return;
+                        }
+
+                        button.addEventListener("click", function(event) {
+                            event.preventDefault();
+                            event.stopPropagation();
+
+                            var shell = button.closest(".mermaid-shell");
+                            var svg = shell ? shell.querySelector(".mermaid svg") : null;
+                            if (!svg) {
+                                return;
+                            }
+
+                            title.textContent = shell.getAttribute("data-diagram-title") || "Diagram";
+                            stage.innerHTML = svg.outerHTML;
+                            lightbox.hidden = false;
+                            lightbox.setAttribute("aria-hidden", "false");
+                            document.documentElement.classList.add("diagram-lightbox-open");
+                            document.body.classList.add("diagram-lightbox-open");
+                        });
+
+                        button.__sofDocsZoomBound = true;
+                    }
+                );
+
+                Array.prototype.forEach.call(
+                    document.querySelectorAll("[data-diagram-close]"),
+                    function(node) {
+                        if (node.__sofDocsDiagramCloseBound) {
+                            return;
+                        }
+
+                        node.addEventListener("click", function(event) {
+                            event.preventDefault();
+                            closeLightbox();
+                        });
+
+                        node.__sofDocsDiagramCloseBound = true;
+                    }
+                );
+
+                if (!window.__sofDocsDiagramKeyBound) {
+                    document.addEventListener("keydown", function(event) {
+                        if (event.key === "Escape" && !lightbox.hidden) {
+                            closeLightbox();
+                        }
+                    });
+
+                    window.__sofDocsDiagramKeyBound = true;
+                }
             }
 
             function bindMobileChrome() {
@@ -458,13 +628,45 @@
                 window.__sofDocsMobileChromeBound = true;
             }
 
+            function bindSidebarScrollMemory() {
+                var nav = document.querySelector(".book-summary nav");
+                if (!nav || nav.__sofDocsSidebarMemoryBound) {
+                    return;
+                }
+
+                nav.addEventListener("scroll", function() {
+                    __init__saveSidebarScroll();
+                }, { passive: true });
+
+                nav.addEventListener("click", function(event) {
+                    if (event.target && event.target.closest("a")) {
+                        __init__saveSidebarScroll();
+                        var active = document.activeElement;
+                        if (active && nav.contains(active)) {
+                            active.blur();
+                        }
+                    }
+                });
+
+                nav.addEventListener("mousedown", function(event) {
+                    if (event.target && event.target.closest("a")) {
+                        __init__saveSidebarScroll();
+                    }
+                });
+
+                nav.__sofDocsSidebarMemoryBound = true;
+            }
+
             window.__sofDocsRenderChrome = function() {
                 syncTopNav();
                 syncFooterYear();
                 buildPageToc();
                 tagSpecialTables();
                 renderMermaidDiagrams();
+                bindDiagramLightbox();
+                bindSidebarScrollMemory();
                 bindMobileChrome();
+                __init__restoreSidebarScroll();
             };
 
             if (!window.__sofDocsChromeBound) {
