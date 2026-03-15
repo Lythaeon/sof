@@ -2,6 +2,8 @@
 
 /// Submission client implementation and mode orchestration.
 mod client;
+/// High-level client builder for common submit configurations.
+mod client_builder;
 /// UDP direct transport implementation.
 mod direct;
 /// Jito block-engine transport implementation.
@@ -21,6 +23,7 @@ mod tests;
 mod types;
 
 pub use client::TxSubmitClient;
+pub use client_builder::TxSubmitClientBuilder;
 pub use direct::UdpDirectTransport;
 pub use jito::{
     JitoBlockEngineEndpoint, JitoBlockEngineRegion, JitoJsonRpcTransport, JitoTransportConfig,

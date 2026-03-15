@@ -19,9 +19,10 @@ use tokio::{
 use super::{
     DirectSubmitConfig, DirectSubmitTransport, JitoSubmitConfig, JitoSubmitTransport,
     RpcSubmitConfig, RpcSubmitTransport, SignedTx, SubmitError, SubmitMode, SubmitReliability,
-    SubmitResult, SubmitTransportError, TxFlowSafetyQuality, TxFlowSafetySource, TxSubmitContext,
-    TxSubmitGuardPolicy, TxSubmitOutcome, TxSubmitOutcomeKind, TxSubmitOutcomeReporter,
-    TxToxicFlowRejectionReason, TxToxicFlowTelemetry, TxToxicFlowTelemetrySnapshot,
+    SubmitResult, SubmitTransportError, TxFlowSafetyQuality, TxFlowSafetySource,
+    TxSubmitClientBuilder, TxSubmitContext, TxSubmitGuardPolicy, TxSubmitOutcome,
+    TxSubmitOutcomeKind, TxSubmitOutcomeReporter, TxToxicFlowRejectionReason, TxToxicFlowTelemetry,
+    TxToxicFlowTelemetrySnapshot,
 };
 use crate::{
     builder::TxBuilder,
@@ -72,6 +73,12 @@ pub struct TxSubmitClient {
 }
 
 impl TxSubmitClient {
+    /// Creates a high-level builder for common submit configurations.
+    #[must_use]
+    pub fn builder() -> TxSubmitClientBuilder {
+        TxSubmitClientBuilder::new()
+    }
+
     /// Creates a submission client with no transports preconfigured.
     #[must_use]
     pub fn new(

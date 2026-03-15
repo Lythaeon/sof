@@ -31,9 +31,10 @@ pub use submit::JitoGrpcTransport;
 pub use submit::{
     DirectSubmitConfig, JitoSubmitConfig, RpcSubmitConfig, SignedTx, SubmitError, SubmitMode,
     SubmitReliability, SubmitResult, SubmitTransportError, TxFlowSafetyIssue, TxFlowSafetyQuality,
-    TxFlowSafetySnapshot, TxFlowSafetySource, TxSubmitClient, TxSubmitContext, TxSubmitGuardPolicy,
-    TxSubmitOutcome, TxSubmitOutcomeKind, TxSubmitOutcomeReporter, TxSubmitSuppressionKey,
-    TxToxicFlowRejectionReason, TxToxicFlowTelemetry, TxToxicFlowTelemetrySnapshot,
+    TxFlowSafetySnapshot, TxFlowSafetySource, TxSubmitClient, TxSubmitClientBuilder,
+    TxSubmitContext, TxSubmitGuardPolicy, TxSubmitOutcome, TxSubmitOutcomeKind,
+    TxSubmitOutcomeReporter, TxSubmitSuppressionKey, TxToxicFlowRejectionReason,
+    TxToxicFlowTelemetry, TxToxicFlowTelemetrySnapshot,
 };
 pub use submit::{
     JitoBlockEngineEndpoint, JitoBlockEngineRegion, JitoJsonRpcTransport, JitoSubmitResponse,

@@ -45,7 +45,7 @@ Those responsibilities belong to `sof` or to your own external control plane.
 | `SignatureDeduper` | avoid duplicate sends at signature granularity |
 | `LeaderProvider` / `RecentBlockhashProvider` | abstract control-plane sources |
 
-## The First Two Code Paths You Will Usually Need
+## The First Three Code Paths You Will Usually Need
 
 ### 1. Use `sof-tx` with RPC-sourced blockhash
 
@@ -63,7 +63,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let payer = Keypair::new();
     let recipient = Keypair::new();
 
-    let mut client = TxSubmitClient::rpc_only("https://api.mainnet-beta.solana.com")?;
+    let mut client = TxSubmitClient::builder()
+        .with_rpc_defaults("https://api.mainnet-beta.solana.com")?
+        .build();
 
     let builder = TxBuilder::new(payer.pubkey()).add_instruction(
         system_instruction::transfer(&payer.pubkey(), &recipient.pubkey(), 1),
@@ -86,7 +88,39 @@ builder path is about to use it.
 For `JitoOnly`, keep the same RPC-backed blockhash source and attach a Jito transport on top. The
 builder path still needs a recent blockhash even when the submit itself goes to Jito.
 
-### 2. Use `sof-tx` with live control-plane state from `sof`
+### 2. Submit signed bytes without blockhash setup in the client
+
+Start here when your signer already lives elsewhere and you only need the submit pipeline.
+
+```rust
+use std::sync::Arc;
+
+use sof_tx::{
+    SignedTx, SubmitMode, TxSubmitClient,
+    submit::JsonRpcTransport,
+};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = TxSubmitClient::builder()
+        .with_rpc_transport(Arc::new(JsonRpcTransport::new(
+            "https://api.mainnet-beta.solana.com",
+        )?))
+        .build();
+
+    let tx_bytes = Vec::new();
+    let _ = client
+        .submit_signed(SignedTx::WireTransactionBytes(tx_bytes), SubmitMode::RpcOnly)
+        .await?;
+
+    Ok(())
+}
+```
+
+Use this path when you already have signed transaction bytes. `submit_signed(...)` does not build
+the transaction inside the client, so there is no blockhash lookup step here.
+
+### 3. Use `sof-tx` with live control-plane state from `sof`
 
 Start here when one process owns both observation and submission.
 
@@ -139,8 +173,8 @@ starting point for latency-sensitive services because it balances speed with ope
 
 Use when your flow is built explicitly around block-engine submission.
 
-If you only want Jito submission, start with `TxSubmitClient::blockhash_via_rpc(...)` and then
-attach a Jito transport.
+If you only want Jito submission, start with `TxSubmitClient::builder()` and
+`.with_jito_defaults(...)`.
 
 ## Integration With `sof`
 

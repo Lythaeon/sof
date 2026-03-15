@@ -46,16 +46,10 @@ sof-tx = { version = "0.9.2", features = ["kernel-bypass"] }
 
 ## Quick Start
 
-Basic client setup:
+Start with the simplest builder-based path:
 
 ```rust
-use std::sync::Arc;
-
-use sof_tx::{
-    SubmitMode, SubmitReliability, TxBuilder, TxSubmitClient,
-    providers::{RpcRecentBlockhashProvider, StaticLeaderProvider},
-    submit::{JitoJsonRpcTransport, JsonRpcTransport, UdpDirectTransport},
-};
+use sof_tx::{SubmitMode, TxBuilder, TxSubmitClient};
 use solana_keypair::Keypair;
 use solana_signer::Signer;
 use solana_system_interface::instruction as system_instruction;
@@ -65,53 +59,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let payer = Keypair::new();
     let recipient = Keypair::new();
 
-    let blockhash_provider = Arc::new(
-        RpcRecentBlockhashProvider::new("https://api.mainnet-beta.solana.com")?,
-    );
-    let leader_provider = Arc::new(StaticLeaderProvider::new(None, Vec::new()));
-
-    let mut client = TxSubmitClient::new(blockhash_provider.clone(), leader_provider)
-        .with_rpc_blockhash_provider(blockhash_provider.clone())
-        .with_reliability(SubmitReliability::Balanced)
-        .with_rpc_transport(Arc::new(JsonRpcTransport::new("https://api.mainnet-beta.solana.com")?))
-        .with_jito_transport(Arc::new(JitoJsonRpcTransport::new()?))
-        .with_direct_transport(Arc::new(UdpDirectTransport::new()));
+    let mut client = TxSubmitClient::builder()
+        .with_rpc_defaults("https://api.mainnet-beta.solana.com")?
+        .build();
 
     let builder = TxBuilder::new(payer.pubkey()).add_instruction(
         system_instruction::transfer(&payer.pubkey(), &recipient.pubkey(), 1),
     );
 
     let _ = client
-        .submit_builder(builder, &[&payer], SubmitMode::Hybrid)
+        .submit_builder(builder, &[&payer], SubmitMode::RpcOnly)
         .await?;
 
     Ok(())
 }
 ```
 
-For `RpcOnly`, you can use one RPC URL for both recent blockhash sourcing and submission:
+Pick the setup that matches what you need:
 
 ```rust
 use std::sync::Arc;
 
 use sof_tx::{
     TxSubmitClient,
-    submit::JitoJsonRpcTransport,
+    submit::JsonRpcTransport,
 };
 
-let mut rpc_client = TxSubmitClient::rpc_only("https://api.mainnet-beta.solana.com")?;
+let mut rpc_client = TxSubmitClient::builder()
+    .with_rpc_defaults("https://api.mainnet-beta.solana.com")?
+    .build();
 
-let mut jito_client = TxSubmitClient::blockhash_via_rpc("https://api.mainnet-beta.solana.com")?
-    .with_jito_transport(Arc::new(JitoJsonRpcTransport::new()?));
+let mut jito_client = TxSubmitClient::builder()
+    .with_jito_defaults("https://api.mainnet-beta.solana.com")?
+    .build();
+
+let mut signed_only_client = TxSubmitClient::builder()
+    .with_rpc_transport(Arc::new(JsonRpcTransport::new(
+        "https://api.mainnet-beta.solana.com",
+    )?))
+    .build();
 ```
 
-One boundary is still intentional: `sof-tx` still treats blockhash as an explicit provider input.
-The RPC-backed provider now refreshes on demand when the builder path needs a blockhash, not in a
-background polling loop. If you already have signed transaction bytes, use `submit_signed(...)`
-instead.
+- `with_rpc_defaults(...)`: use one RPC URL for builder-based `RpcOnly` submission.
+- `with_jito_defaults(...)`: use one RPC URL for blockhash plus Jito for `JitoOnly` submission.
+- `with_rpc_transport(...)`: enough for `submit_signed(...)` because that path does not build the
+  transaction inside the client and does not need a blockhash provider.
+
+The builder gives you the product-level paths first. Drop down to the provider APIs only when you
+need custom control-plane wiring.
 
 ## Core Types
 
+- `TxSubmitClientBuilder`: configure common RPC, Jito, direct, and control-plane paths without
+  wiring providers by hand first.
 - `TxBuilder`: compose transaction instructions and signing inputs.
 - `TxSubmitClient`: submit through RPC/Jito/direct/hybrid.
 - `SubmitMode`: runtime mode switch.
@@ -220,9 +220,8 @@ driving direct or hybrid sends. Typical checks include:
 use std::sync::Arc;
 
 use sof_tx::{
-    SubmitMode, SubmitReliability, TxBuilder, TxSubmitClient,
-    providers::{LeaderProvider, LeaderTarget, RecentBlockhashProvider, RpcRecentBlockhashProvider, StaticLeaderProvider},
-    submit::{JitoJsonRpcTransport, JsonRpcTransport, UdpDirectTransport},
+    SubmitMode, TxBuilder, TxSubmitClient,
+    submit::JitoJsonRpcTransport,
 };
 use solana_keypair::Keypair;
 use solana_signer::Signer;
@@ -233,17 +232,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let payer = Keypair::new();
     let recipient = Keypair::new();
 
-    let blockhash_provider = Arc::new(
-        RpcRecentBlockhashProvider::new("https://api.mainnet-beta.solana.com")?,
-    );
-    let leader_provider = Arc::new(StaticLeaderProvider::new(None, Vec::new()));
-
-    let mut client = TxSubmitClient::new(blockhash_provider.clone(), leader_provider)
-        .with_rpc_blockhash_provider(blockhash_provider.clone())
-        .with_reliability(SubmitReliability::Balanced)
-        .with_rpc_transport(Arc::new(JsonRpcTransport::new("https://api.mainnet-beta.solana.com")?))
+    let mut client = TxSubmitClient::builder()
+        .with_rpc_defaults("https://api.mainnet-beta.solana.com")?
         .with_jito_transport(Arc::new(JitoJsonRpcTransport::new()?))
-        .with_direct_transport(Arc::new(UdpDirectTransport::new()));
+        .build();
 
     let builder = TxBuilder::new(payer.pubkey())
         .with_compute_unit_limit(450_000)
@@ -256,7 +248,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
 
     let _result = client
-        .submit_builder(builder, &[&payer], SubmitMode::Hybrid)
+        .submit_builder(builder, &[&payer], SubmitMode::JitoOnly)
         .await?;
 
     Ok(())
@@ -306,7 +298,8 @@ This gives one consistent path for signing, dedupe, routing, and fallback behavi
 
 ## Submitting Pre-Signed Transactions
 
-If your signer is external (wallet/HSM/offline), submit bytes directly:
+If your signer is external (wallet/HSM/offline), submit bytes directly. This path does not need a
+blockhash provider inside `TxSubmitClient` because the transaction is already signed before submit:
 
 ```rust
 use sof_tx::{SignedTx, SubmitMode, TxSubmitClient};

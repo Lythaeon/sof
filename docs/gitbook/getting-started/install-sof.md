@@ -123,13 +123,18 @@ use sof_tx::TxSubmitClient;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let _client = TxSubmitClient::rpc_only("https://api.mainnet-beta.solana.com")?;
+    let _client = TxSubmitClient::builder()
+        .with_rpc_defaults("https://api.mainnet-beta.solana.com")?
+        .build();
     Ok(())
 }
 ```
 
 Use this when you only need the send pipeline and want `sof-tx` to source recent blockhashes from
 the same RPC endpoint you submit to.
+
+If your signer already lives elsewhere and you only call `submit_signed(...)`, you can stop at
+transport setup instead of wiring blockhash sourcing too.
 
 ## Minimal App-Level Validation
 
@@ -152,7 +157,27 @@ use sof_tx::TxSubmitClient;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let _client = TxSubmitClient::rpc_only("https://api.mainnet-beta.solana.com")?;
+    let _client = TxSubmitClient::builder()
+        .with_rpc_defaults("https://api.mainnet-beta.solana.com")?
+        .build();
+    Ok(())
+}
+```
+
+Example `sof-tx` signed-bytes skeleton:
+
+```rust
+use std::sync::Arc;
+
+use sof_tx::{TxSubmitClient, submit::JsonRpcTransport};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let _client = TxSubmitClient::builder()
+        .with_rpc_transport(Arc::new(JsonRpcTransport::new(
+            "https://api.mainnet-beta.solana.com",
+        )?))
+        .build();
     Ok(())
 }
 ```
