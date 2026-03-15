@@ -353,6 +353,105 @@ body {
   color: var(--accent);
 }
 
+.diagram-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+}
+
+.diagram-lightbox[hidden] {
+  display: none;
+}
+
+.diagram-lightbox-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(4, 8, 11, 0.84);
+  backdrop-filter: blur(6px);
+}
+
+.diagram-lightbox-dialog {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  width: min(92vw, 1380px);
+  height: min(88vh, 980px);
+  margin: min(6vh, 54px) auto 0;
+  padding: 28px;
+  background: linear-gradient(180deg, #10171d 0%, #0f151a 100%);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 28px 80px rgba(0, 0, 0, 0.46);
+}
+
+.diagram-lightbox-header {
+  width: 100%;
+  padding: 0 64px 20px;
+  text-align: center;
+}
+
+.diagram-lightbox-title {
+  margin: 0;
+  color: var(--heading);
+  font-size: 2rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  line-height: 1.35;
+}
+
+.diagram-lightbox-close {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #141b21;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition:
+    color 140ms ease,
+    border-color 140ms ease,
+    background-color 140ms ease;
+}
+
+.diagram-lightbox-close:hover,
+.diagram-lightbox-close:focus {
+  color: var(--accent);
+  border-color: #31515d;
+  background: #182128;
+}
+
+.diagram-lightbox-stage {
+  display: flex;
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: 0;
+  overflow: auto;
+}
+
+.diagram-lightbox-stage svg {
+  flex: 0 0 auto;
+  display: block;
+  min-width: 920px;
+  width: 100%;
+  height: auto;
+  margin: 0 auto;
+}
+
+.diagram-lightbox-open {
+  overflow: hidden;
+}
+
 .page-toc {
   position: absolute;
   left: calc(50% + 430px);
@@ -498,6 +597,7 @@ body {
 }
 
 .markdown-section .mermaid-shell {
+  position: relative;
   margin: 1.4em 0 1.6em;
   padding: 18px 18px 12px;
   background: linear-gradient(180deg, #11181e 0%, #10161b 100%);
@@ -505,6 +605,35 @@ body {
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-soft);
   overflow-x: auto;
+}
+
+.markdown-section .mermaid-zoom-button {
+  position: sticky;
+  top: 0;
+  left: calc(100% - 42px);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  margin-bottom: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: rgba(20, 27, 33, 0.92);
+  color: var(--text-muted);
+  cursor: pointer;
+  z-index: 1;
+  transition:
+    color 140ms ease,
+    border-color 140ms ease,
+    background-color 140ms ease;
+}
+
+.markdown-section .mermaid-zoom-button:hover,
+.markdown-section .mermaid-zoom-button:focus {
+  color: var(--accent);
+  border-color: #31515d;
+  background: rgba(18, 32, 41, 0.96);
 }
 
 .markdown-section .mermaid {
@@ -997,6 +1126,25 @@ body {
 
   .markdown-section .mermaid {
     min-width: 500px;
+  }
+
+  .diagram-lightbox-dialog {
+    width: calc(100vw - 24px);
+    height: calc(100vh - 24px);
+    margin: 12px auto 0;
+    padding: 18px 14px 14px;
+  }
+
+  .diagram-lightbox-header {
+    padding: 0 52px 14px;
+  }
+
+  .diagram-lightbox-title {
+    font-size: 1.7rem;
+  }
+
+  .diagram-lightbox-stage svg {
+    min-width: 680px;
   }
 
   .navigation {
