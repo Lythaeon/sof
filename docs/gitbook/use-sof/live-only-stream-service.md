@@ -3,7 +3,7 @@
 Start here if you want to build a service on top of SOF that streams live events to external
 clients.
 
-This page is intentionally about the first version:
+The focus here is the first version:
 
 - live only
 - no replay

@@ -1,14 +1,12 @@
 # Choose the Right SOF Path
 
-External users usually do not need the whole workspace. Start from the smallest useful slice.
+Most services do not need the whole workspace on day one. Start from the smallest useful slice.
 
 ## Common Adoption Patterns
 
 ### I need a local Solana ingest and event runtime
 
-Start with [`sof`](../crates/sof.md).
-
-Good fit when you need:
+Start with [`sof`](../crates/sof.md) when the service needs:
 
 - shred ingest
 - local slot and blockhash signals
@@ -18,9 +16,7 @@ Good fit when you need:
 
 ### I need transaction construction and submission
 
-Start with [`sof-tx`](../crates/sof-tx.md).
-
-Good fit when you need:
+Start with [`sof-tx`](../crates/sof-tx.md) when the service needs:
 
 - a transaction builder
 - direct leader routing
@@ -68,9 +64,9 @@ instead of environment-variable sprawl.
 | typed runtime tuning profiles | `sof-gossip-tuning` |
 | gossip backend internals | only then look at `sof-solana-gossip` |
 
-## What Most Consumers Can Ignore At First
+## What Can Wait Until Later
 
-You usually do not need to read these on day one:
+These usually do not need attention on day one:
 
 - repository layout
 - ADR and ARD process

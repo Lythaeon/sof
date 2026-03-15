@@ -2,6 +2,8 @@
 
 - [SOF Documentation](README.md)
 - [Use SOF](use-sof/README.md)
+  - [Why SOF Exists](use-sof/why-sof-exists.md)
+  - [SOF Compared To The Usual Alternatives](use-sof/sof-compared.md)
   - [Choose the Right SOF Path](use-sof/adoption-paths.md)
   - [Choose Your Control Plane Source](use-sof/control-plane-sourcing.md)
   - [Common Recipes](use-sof/common-recipes.md)
@@ -27,6 +29,7 @@
   - [Repository Layout](getting-started/workspace-layout.md)
   - [`sof-solana-gossip`](crates/sof-solana-gossip.md)
   - [Architecture](architecture/README.md)
+    - [System Overview](architecture/system-overview.md)
     - [Runtime Pipeline](architecture/runtime-pipeline.md)
     - [Integration Model](architecture/integration-model.md)
     - [Derived State and Control Plane](architecture/derived-state-and-control-plane.md)

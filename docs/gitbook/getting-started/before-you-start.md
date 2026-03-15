@@ -35,8 +35,8 @@ What matters for you:
   larger dataset they belong to
 - only after that do higher-level transaction and slot events become available
 
-If you are building with plugins, this is why SOF can emit transaction and dataset events without
-asking RPC for them first.
+For plugin-based services, this is why SOF can emit transaction and dataset events without asking
+RPC for them first.
 
 ## What A Dataset Is
 
@@ -141,7 +141,7 @@ You do need to know:
 
 ## The Safe Learning Order
 
-If you are new, this is the order that usually prevents confusion:
+This order usually prevents confusion:
 
 1. read [Choose the Right SOF Path](../use-sof/adoption-paths.md)
 2. read [Common Questions](common-questions.md)

@@ -1,14 +1,14 @@
 # First Runtime Bring-Up
 
-This page is the shortest path to running `sof` locally and understanding which mode you are in.
+Use this page to get `sof` running locally and to understand which runtime mode is active.
 
 If terms like shreds, relay, repair, or leader schedule still feel fuzzy, read
-[Before You Start](before-you-start.md) first. This page assumes you already know the basic shape
+[Before You Start](before-you-start.md) first. The rest of this page assumes the basic shape
 of what SOF is doing on the network.
 
 ## Try It From This Repository
 
-If you are evaluating SOF from a repository checkout, start with the packaged examples.
+From a repository checkout, the packaged examples are the fastest starting point.
 
 ### Simplest Runtime Start
 
@@ -36,12 +36,12 @@ Important runtime effect:
 
 ## Embed It In Your Own App
 
-If you are consuming `sof` as a crate, start with `RuntimeSetup` or the plain runtime entrypoints.
+For crate consumers, start with `RuntimeSetup` or the plain runtime entrypoints.
 
 ### Programmatic Setup
 
-If you are embedding `sof` in your own app, you will usually want `RuntimeSetup` instead of
-stuffing startup behavior into environment strings.
+Embedded services usually want `RuntimeSetup` instead of pushing startup behavior into environment
+strings.
 
 ```rust
 #[tokio::main]
@@ -64,7 +64,7 @@ Useful setup helpers include:
 
 ### The First Useful Progression
 
-If you are new to the crate, this is the progression you will usually want:
+For a first real integration, this progression usually works well:
 
 1. make `run_async()` compile and start
 2. switch to `RuntimeSetup` so startup is explicit in code
@@ -111,7 +111,7 @@ async fn main() -> Result<(), sof::runtime::RuntimeError> {
 }
 ```
 
-If this works, you have crossed the line from “you can launch SOF” to “you can integrate SOF”.
+If this works, the runtime is no longer just launching; it is already feeding service logic.
 
 ## First Operational Knobs
 
@@ -154,9 +154,9 @@ What is not required on day one:
   `SOF_RUN_EXAMPLE=1` because it is intentionally guarded
 - `kernel_bypass_ingress_metrics`: external ingress path
 
-If you are unsure where to look next, open the example source before reading deeper operations
-pages:
+If the next step is still unclear, open the example source before reading deeper operations pages:
 
 - [`observer_runtime.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/observer_runtime.rs)
 - [`observer_with_non_vote_plugin.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/observer_with_non_vote_plugin.rs)
+- [`observer_with_multiple_plugins.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/observer_with_multiple_plugins.rs)
 - [`tpu_leader_logger.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/tpu_leader_logger.rs)
