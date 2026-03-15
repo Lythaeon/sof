@@ -400,7 +400,7 @@ async fn rpc_only_constructor_uses_rpc_for_blockhash_and_submit() {
         solana_system_interface::instruction::transfer(&payer.pubkey(), &recipient.pubkey(), 1),
     );
     let result = client
-        .submit_builder(builder, &[&payer], SubmitMode::RpcOnly)
+        .submit_unsigned(builder, &[&payer], SubmitMode::RpcOnly)
         .await;
 
     assert!(result.is_ok());
@@ -460,7 +460,7 @@ async fn builder_rpc_defaults_uses_rpc_for_blockhash_and_submit() {
         solana_system_interface::instruction::transfer(&payer.pubkey(), &recipient.pubkey(), 1),
     );
     let result = client
-        .submit_builder(builder, &[&payer], SubmitMode::RpcOnly)
+        .submit_unsigned(builder, &[&payer], SubmitMode::RpcOnly)
         .await;
 
     assert!(result.is_ok());

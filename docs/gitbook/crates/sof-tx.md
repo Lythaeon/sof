@@ -72,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let _ = client
-        .submit_builder(builder, &[&payer], SubmitMode::RpcOnly)
+        .submit_unsigned(builder, &[&payer], SubmitMode::RpcOnly)
         .await?;
 
     Ok(())
@@ -83,10 +83,43 @@ Use this path when you want `sof-tx` for RPC submission without building a separ
 layer first.
 
 This path does not poll in the background. The client refreshes the recent blockhash only when the
-builder path is about to use it.
+unsigned submit path is about to use it.
 
 For `JitoOnly`, keep the same RPC-backed blockhash source and attach a Jito transport on top. The
-builder path still needs a recent blockhash even when the submit itself goes to Jito.
+unsigned submit path still needs a recent blockhash even when the submit itself goes to Jito.
+
+```rust
+use std::sync::Arc;
+
+use sof_tx::{
+    SubmitMode, TxBuilder, TxSubmitClient,
+    submit::JitoJsonRpcTransport,
+};
+use solana_keypair::Keypair;
+use solana_signer::Signer;
+use solana_system_interface::instruction as system_instruction;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let payer = Keypair::new();
+    let recipient = Keypair::new();
+
+    let mut client = TxSubmitClient::builder()
+        .with_jito_defaults("https://api.mainnet-beta.solana.com")?
+        .with_jito_transport(Arc::new(JitoJsonRpcTransport::new()?))
+        .build();
+
+    let builder = TxBuilder::new(payer.pubkey()).add_instruction(
+        system_instruction::transfer(&payer.pubkey(), &recipient.pubkey(), 1),
+    );
+
+    let _ = client
+        .submit_unsigned(builder, &[&payer], SubmitMode::JitoOnly)
+        .await?;
+
+    Ok(())
+}
+```
 
 ### 2. Submit signed bytes without blockhash setup in the client
 
@@ -233,9 +266,9 @@ If the conceptual docs stop too early for what you need to build, open these nex
 ## Feature Flags
 
 ```toml
-sof-tx = { version = "0.9.2", features = ["sof-adapters"] }
-sof-tx = { version = "0.9.2", features = ["kernel-bypass"] }
-sof-tx = { version = "0.9.2", features = ["jito-grpc"] }
+sof-tx = { version = "0.10.0", features = ["sof-adapters"] }
+sof-tx = { version = "0.10.0", features = ["kernel-bypass"] }
+sof-tx = { version = "0.10.0", features = ["jito-grpc"] }
 ```
 
 ## Good Fit

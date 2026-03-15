@@ -18,7 +18,7 @@ use crate::{
 
 /// High-level builder for common `TxSubmitClient` configurations.
 pub struct TxSubmitClientBuilder {
-    /// Source used by builder submit paths.
+    /// Source used by unsigned submit paths.
     blockhash_provider: Arc<dyn RecentBlockhashProvider>,
     /// Optional RPC-backed blockhash source refreshed on demand.
     on_demand_blockhash_provider: Option<Arc<RpcRecentBlockhashProvider>>,
@@ -87,7 +87,7 @@ impl TxSubmitClientBuilder {
         self
     }
 
-    /// Uses one RPC endpoint as an on-demand blockhash source for builder submits.
+    /// Uses one RPC endpoint as an on-demand blockhash source for unsigned submits.
     ///
     /// # Errors
     ///
