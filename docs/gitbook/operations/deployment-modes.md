@@ -42,7 +42,7 @@ Important behavior:
 Build flag:
 
 ```toml
-sof = { version = "0.9.2", features = ["gossip-bootstrap"] }
+sof = { version = "0.10.0", features = ["gossip-bootstrap"] }
 ```
 
 ## External Kernel-Bypass Ingress
@@ -61,7 +61,7 @@ Important behavior:
 Build flag:
 
 ```toml
-sof = { version = "0.9.2", features = ["kernel-bypass"] }
+sof = { version = "0.10.0", features = ["kernel-bypass"] }
 ```
 
 ## Recommended Starting Point

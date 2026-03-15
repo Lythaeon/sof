@@ -255,13 +255,13 @@ pub enum SubmitTransportError {
 /// Submission-level errors.
 #[derive(Debug, Error)]
 pub enum SubmitError {
-    /// Could not build/sign transaction for builder submit path.
+    /// Could not build/sign transaction for unsigned submit path.
     #[error("failed to build/sign transaction: {source}")]
     Build {
         /// Builder-layer failure.
         source: BuilderError,
     },
-    /// No blockhash available for builder submit path.
+    /// No blockhash available for unsigned submit path.
     #[error("blockhash provider returned no recent blockhash")]
     MissingRecentBlockhash,
     /// Signed bytes could not be decoded into a transaction.

@@ -36,9 +36,9 @@ use crate::{
 
 /// Transaction submission client that orchestrates RPC and direct submit modes.
 pub struct TxSubmitClient {
-    /// Blockhash source used by builder submit path.
+    /// Blockhash source used by unsigned submit path.
     blockhash_provider: Arc<dyn RecentBlockhashProvider>,
-    /// Optional RPC-backed blockhash source refreshed on demand before builder submit.
+    /// Optional RPC-backed blockhash source refreshed on demand before unsigned submit.
     on_demand_blockhash_provider: Option<Arc<RpcRecentBlockhashProvider>>,
     /// Leader source used by direct/hybrid paths.
     leader_provider: Arc<dyn LeaderProvider>,
@@ -230,7 +230,7 @@ impl TxSubmitClient {
         self
     }
 
-    /// Registers an RPC-backed blockhash provider to refresh on demand for builder submit paths.
+    /// Registers an RPC-backed blockhash provider to refresh on demand for unsigned submit paths.
     #[must_use]
     pub fn with_rpc_blockhash_provider(
         mut self,
@@ -260,7 +260,7 @@ impl TxSubmitClient {
     ///
     /// Returns [`SubmitError`] when blockhash lookup, signing, dedupe, routing, or submission
     /// fails.
-    pub async fn submit_builder<T>(
+    pub async fn submit_unsigned<T>(
         &mut self,
         builder: TxBuilder,
         signers: &T,
@@ -292,7 +292,7 @@ impl TxSubmitClient {
     ///
     /// Returns [`SubmitError`] when blockhash lookup, signing, dedupe, toxic-flow guards,
     /// routing, or submission fails.
-    pub async fn submit_builder_with_context<T>(
+    pub async fn submit_unsigned_with_context<T>(
         &mut self,
         builder: TxBuilder,
         signers: &T,

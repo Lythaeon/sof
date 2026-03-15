@@ -35,18 +35,18 @@ cargo add sof-tx
 Enable SOF runtime adapters when you want provider values from live `sof` plugin events:
 
 ```toml
-sof-tx = { version = "0.9.2", features = ["sof-adapters"] }
+sof-tx = { version = "0.10.0", features = ["sof-adapters"] }
 ```
 
 Enable `kernel-bypass` transport hooks for kernel-bypass direct submit integrations:
 
 ```toml
-sof-tx = { version = "0.9.2", features = ["kernel-bypass"] }
+sof-tx = { version = "0.10.0", features = ["kernel-bypass"] }
 ```
 
 ## Quick Start
 
-Start with the simplest builder-based path:
+Start with the simplest unsigned-submit path:
 
 ```rust
 use sof_tx::{SubmitMode, TxBuilder, TxSubmitClient};
@@ -68,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let _ = client
-        .submit_builder(builder, &[&payer], SubmitMode::RpcOnly)
+        .submit_unsigned(builder, &[&payer], SubmitMode::RpcOnly)
         .await?;
 
     Ok(())
@@ -100,7 +100,7 @@ let mut signed_only_client = TxSubmitClient::builder()
     .build();
 ```
 
-- `with_rpc_defaults(...)`: use one RPC URL for builder-based `RpcOnly` submission.
+- `with_rpc_defaults(...)`: use one RPC URL for unsigned `RpcOnly` submission.
 - `with_jito_defaults(...)`: use one RPC URL for blockhash plus Jito for `JitoOnly` submission.
 - `with_rpc_transport(...)`: enough for `submit_signed(...)` because that path does not build the
   transaction inside the client and does not need a blockhash provider.
@@ -181,7 +181,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
 
     let _ = client
-        .submit_builder(builder, &[&payer], SubmitMode::Hybrid)
+        .submit_unsigned(builder, &[&payer], SubmitMode::Hybrid)
         .await?;
 
     Ok(())
@@ -248,7 +248,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
 
     let _result = client
-        .submit_builder(builder, &[&payer], SubmitMode::JitoOnly)
+        .submit_unsigned(builder, &[&payer], SubmitMode::JitoOnly)
         .await?;
 
     Ok(())
@@ -287,7 +287,7 @@ async fn submit_strategy_ixs(
         .add_instructions(ixs);
 
     let _ = client
-        .submit_builder(builder, &[payer], SubmitMode::Hybrid)
+        .submit_unsigned(builder, &[payer], SubmitMode::Hybrid)
         .await?;
 
     Ok(())
