@@ -564,15 +564,9 @@
             }
 
             function bindMobileChrome() {
-                if (window.__sofDocsMobileChromeBound) {
-                    return;
-                }
-
                 var book = document.querySelector(".book");
                 var toggle = document.querySelector(".book-mobile-toggle");
-                var summary = document.querySelector(".book-summary");
-
-                if (!book || !toggle || !summary) {
+                if (!book || !toggle) {
                     return;
                 }
 
@@ -581,50 +575,78 @@
                     toggle.setAttribute("aria-expanded", isOpen ? "true" : "false");
                 }
 
-                function closeSummary() {
-                    if (!window.matchMedia("(max-width: 960px)").matches) {
-                        return;
-                    }
-                    book.classList.remove("with-summary");
-                    syncToggleState();
+                syncToggleState();
+
+                if (window.__sofDocsMobileChromeBound) {
+                    return;
                 }
 
-                toggle.addEventListener("click", function() {
+                function closeSummary(bookNode, toggleNode) {
                     if (!window.matchMedia("(max-width: 960px)").matches) {
                         return;
                     }
-                    book.classList.toggle("with-summary");
-                    syncToggleState();
-                });
-
-                summary.addEventListener("click", function(event) {
-                    var target = event.target;
-                    if (target && target.closest("a")) {
-                        closeSummary();
+                    if (!bookNode || !toggleNode) {
+                        return;
                     }
-                });
+                    bookNode.classList.remove("with-summary");
+                    toggleNode.setAttribute("aria-expanded", "false");
+                }
 
                 document.addEventListener("click", function(event) {
+                    var currentBook = document.querySelector(".book");
+                    var currentToggle = document.querySelector(".book-mobile-toggle");
+                    var currentSummary = document.querySelector(".book-summary");
+                    if (!currentBook || !currentToggle || !currentSummary) {
+                        return;
+                    }
+
+                    var toggleHit = event.target && event.target.closest(".book-mobile-toggle");
+                    if (toggleHit) {
+                        if (!window.matchMedia("(max-width: 960px)").matches) {
+                            return;
+                        }
+                        currentBook.classList.toggle("with-summary");
+                        currentToggle.setAttribute(
+                            "aria-expanded",
+                            currentBook.classList.contains("with-summary") ? "true" : "false"
+                        );
+                        return;
+                    }
+
                     if (!window.matchMedia("(max-width: 960px)").matches) {
                         return;
                     }
-                    if (!book.classList.contains("with-summary")) {
+                    if (!currentBook.classList.contains("with-summary")) {
                         return;
                     }
-                    if (summary.contains(event.target) || toggle.contains(event.target)) {
+
+                    var summaryLink = event.target && event.target.closest(".book-summary a");
+                    if (summaryLink) {
+                        closeSummary(currentBook, currentToggle);
                         return;
                     }
-                    closeSummary();
+
+                    if (currentSummary.contains(event.target) || currentToggle.contains(event.target)) {
+                        return;
+                    }
+                    closeSummary(currentBook, currentToggle);
                 });
 
                 window.addEventListener("resize", function() {
-                    if (!window.matchMedia("(max-width: 960px)").matches) {
-                        book.classList.remove("with-summary");
+                    var currentBook = document.querySelector(".book");
+                    var currentToggle = document.querySelector(".book-mobile-toggle");
+                    if (!currentBook || !currentToggle) {
+                        return;
                     }
-                    syncToggleState();
+                    if (!window.matchMedia("(max-width: 960px)").matches) {
+                        currentBook.classList.remove("with-summary");
+                    }
+                    currentToggle.setAttribute(
+                        "aria-expanded",
+                        currentBook.classList.contains("with-summary") ? "true" : "false"
+                    );
                 });
 
-                syncToggleState();
                 window.__sofDocsMobileChromeBound = true;
             }
 
