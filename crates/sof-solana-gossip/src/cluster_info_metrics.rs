@@ -9,7 +9,7 @@ use {
         cmp::Reverse,
         collections::HashMap,
         ops::{Deref, DerefMut},
-        sync::atomic::{AtomicU64, Ordering},
+        sync::atomic::{AtomicU64, AtomicUsize, Ordering},
         time::Instant,
     },
 };
@@ -87,6 +87,91 @@ impl<T> DerefMut for TimedGuard<'_, T> {
 impl<T> Drop for TimedGuard<'_, T> {
     fn drop(&mut self) {
         self.counter.add_measure(&mut self.timer);
+    }
+}
+
+pub(crate) struct QueueDepthStats {
+    capacity: usize,
+    current_len: AtomicUsize,
+    max_len: AtomicUsize,
+    dropped_messages: Counter,
+    dropped_packets: Counter,
+}
+
+impl QueueDepthStats {
+    pub(crate) const fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            current_len: AtomicUsize::new(0),
+            max_len: AtomicUsize::new(0),
+            dropped_messages: Counter(AtomicU64::new(0)),
+            dropped_packets: Counter(AtomicU64::new(0)),
+        }
+    }
+
+    pub(crate) fn observe_len(&self, len: usize) {
+        self.current_len.store(len, Ordering::Relaxed);
+        self.max_len.fetch_max(len, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_drop(&self, dropped_messages: u64, dropped_packets: u64) {
+        self.dropped_messages.add_relaxed(dropped_messages);
+        self.dropped_packets.add_relaxed(dropped_packets);
+    }
+
+    fn report(&self, datapoint: &'static str) {
+        datapoint_info!(
+            datapoint,
+            (
+                "capacity",
+                i64::try_from(self.capacity).unwrap_or(i64::MAX),
+                i64
+            ),
+            (
+                "current_len",
+                i64::try_from(self.current_len.load(Ordering::Relaxed)).unwrap_or(i64::MAX),
+                i64
+            ),
+            (
+                "max_len",
+                i64::try_from(self.max_len.swap(0, Ordering::Relaxed)).unwrap_or(i64::MAX),
+                i64
+            ),
+            (
+                "dropped_messages",
+                i64::try_from(self.dropped_messages.clear()).unwrap_or(i64::MAX),
+                i64
+            ),
+            (
+                "dropped_packets",
+                i64::try_from(self.dropped_packets.clear()).unwrap_or(i64::MAX),
+                i64
+            ),
+        );
+    }
+}
+
+pub(crate) struct GossipQueueStats {
+    pub(crate) socket_consume_verify_queue: QueueDepthStats,
+    pub(crate) socket_consume_output_queue: QueueDepthStats,
+}
+
+impl GossipQueueStats {
+    pub(crate) const fn new(
+        socket_consume_verify_capacity: usize,
+        socket_consume_output_capacity: usize,
+    ) -> Self {
+        Self {
+            socket_consume_verify_queue: QueueDepthStats::new(socket_consume_verify_capacity),
+            socket_consume_output_queue: QueueDepthStats::new(socket_consume_output_capacity),
+        }
+    }
+
+    pub(crate) fn report(&self) {
+        self.socket_consume_verify_queue
+            .report("gossip_socket_consume_verify_queue");
+        self.socket_consume_output_queue
+            .report("gossip_socket_consume_output_queue");
     }
 }
 
@@ -744,4 +829,24 @@ pub(crate) fn log_gossip_crds_sample_egress(value: &CrdsValue, peer: &Pubkey) {
             Option<String>
         ),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queue_depth_stats_tracks_peak_and_drops() {
+        let stats = QueueDepthStats::new(64);
+
+        stats.observe_len(7);
+        stats.observe_len(3);
+        stats.record_drop(2, 11);
+
+        assert_eq!(stats.capacity, 64);
+        assert_eq!(stats.current_len.load(Ordering::Relaxed), 3);
+        assert_eq!(stats.max_len.load(Ordering::Relaxed), 7);
+        assert_eq!(stats.dropped_messages.0.load(Ordering::Relaxed), 2);
+        assert_eq!(stats.dropped_packets.0.load(Ordering::Relaxed), 11);
+    }
 }

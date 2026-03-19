@@ -4,9 +4,10 @@ use {
     crate::{
         cluster_info::{
             gossip_receiver_channel_capacity, gossip_response_channel_capacity,
-            gossip_socket_consume_channel_capacity, ClusterInfo,
+            gossip_socket_consume_channel_capacity, gossip_socket_consume_verify_queue_capacity,
+            ClusterInfo,
         },
-        cluster_info_metrics::submit_gossip_stats,
+        cluster_info_metrics::{submit_gossip_stats, GossipQueueStats},
         contact_info::ContactInfo,
         epoch_specs::EpochSpecs,
     },
@@ -65,6 +66,10 @@ impl GossipService {
     ) -> Self {
         let (request_sender, request_receiver) =
             EvictingSender::new_bounded(gossip_receiver_channel_capacity());
+        let gossip_queue_stats = Arc::new(GossipQueueStats::new(
+            gossip_socket_consume_verify_queue_capacity(),
+            gossip_socket_consume_channel_capacity(),
+        ));
         trace!(
             "GossipService: id: {}, listening on primary interface: {:?}, all available \
              interfaces: {:?}",
@@ -93,6 +98,7 @@ impl GossipService {
             bank_forks.clone(),
             request_receiver,
             consume_sender,
+            gossip_queue_stats.clone(),
             exit.clone(),
         );
         let (response_sender, response_receiver) =
@@ -135,6 +141,7 @@ impl GossipService {
                             .unwrap_or_default();
 
                         submit_gossip_stats(&cluster_info.stats, &cluster_info.gossip, &stakes);
+                        gossip_queue_stats.report();
                         gossip_receiver_stats.report();
                     }
                 }

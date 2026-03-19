@@ -35,8 +35,8 @@ Only add `sof-gossip-tuning` if you are embedding `sof` and want typed host/runt
 Common feature combinations:
 
 ```toml
-sof = { version = "0.10.0", features = ["gossip-bootstrap"] }
-sof-tx = { version = "0.10.0", features = ["sof-adapters"] }
+sof = { version = "0.10.1", features = ["gossip-bootstrap"] }
+sof-tx = { version = "0.10.1", features = ["sof-adapters"] }
 ```
 
 ## Choose Your Starting Point
@@ -50,7 +50,7 @@ Start with the app shape that matches what you need to build right now.
 ```toml
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-sof = "0.10.0"
+sof = "0.10.1"
 ```
 
 `src/main.rs`:
@@ -72,7 +72,7 @@ Use this when you need ingest, plugin events, datasets, or local control-plane s
 [dependencies]
 async-trait = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-sof = "0.10.0"
+sof = "0.10.1"
 tracing = "0.1"
 ```
 
@@ -117,7 +117,7 @@ Use this when you already know you want to consume SOF events in your own code.
 
 ```toml
 [dependencies]
-sof-tx = "0.10.0"
+sof-tx = "0.10.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 

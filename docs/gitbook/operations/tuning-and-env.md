@@ -45,6 +45,13 @@ more network noise without improving useful ingest.
 These affect bootstrap worker counts, queue budgets, and control-plane behavior inside the bundled
 backend. They are operationally sensitive and should be changed with measurement.
 
+Useful bundled gossip telemetry while tuning:
+
+- `gossip_receiver channel_len` and `num_packets_dropped`
+- `gossip_socket_consume_verify_queue current_len`, `max_len`, and `dropped_packets`
+- `gossip_socket_consume_output_queue current_len`, `max_len`, and `dropped_packets`
+- `cluster_info_stats2 gossip_packets_dropped_count`
+
 ## Signs You Are Overtuning
 
 - queue capacities keep rising but latency keeps getting worse
