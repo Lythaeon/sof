@@ -167,6 +167,14 @@ Interpretation:
 | `SOF_GOSSIP_RUNTIME_SWITCH_STABILIZE_MAX_WAIT_MS` | `8000` | Max wait impacts startup/switch latency. |
 | `SOF_GOSSIP_RUNTIME_SWITCH_PEER_CANDIDATES` | `64` | Too low misses good peers; too high adds overhead. |
 
+Bundled gossip telemetry to watch while tuning:
+
+- `gossip_receiver channel_len` and `num_packets_dropped` show the UDP receiver backlog and whether socket ingress is starting to evict packet batches.
+- `gossip_socket_consume_verify_queue current_len` and `max_len` show how much work is queued for the socket-consume verifier workers before signature/shred-version processing.
+- `gossip_socket_consume_output_queue current_len` and `max_len` show the backlog after verification and before the listen/process stage.
+- `gossip_socket_consume_verify_queue dropped_packets` or `gossip_socket_consume_output_queue dropped_packets` rising means the threaded gossip handoff is overloaded even if the top-level receiver is still clean.
+- `cluster_info_stats2 gossip_packets_dropped_count` remains the high-level "control-plane packets were dropped somewhere in the consume/listen path" signal.
+
 ## Repair pipeline controls
 
 Repairs are stream-first by default: SOF keeps repair request budgets at `0` while fresh shred flow is healthy, and only opens repair request budgets once tip/dataset stall thresholds are observed.

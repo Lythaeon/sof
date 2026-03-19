@@ -15,7 +15,7 @@
 
 use {
     crate::{
-        cluster_info_metrics::{Counter, GossipStats, ScopedTimer, TimedGuard},
+        cluster_info_metrics::{Counter, GossipQueueStats, GossipStats, ScopedTimer, TimedGuard},
         contact_info::{self, ContactInfo, ContactInfoQuery, Error as ContactInfoError},
         crds::{Crds, Cursor, GossipRoute},
         crds_data::{self, CrdsData, EpochSlotsIndex, LowestSlot, SnapshotHashes, Vote, MAX_VOTES},
@@ -204,6 +204,7 @@ struct SocketConsumeVerifyJob {
 struct SocketConsumeVerifierPool<S> {
     worker_count: usize,
     job_sender: Sender<SocketConsumeVerifyJob>,
+    queue_stats: Arc<GossipQueueStats>,
     worker_handles: Vec<JoinHandle<()>>,
     _result_sender: std::marker::PhantomData<S>,
 }
@@ -367,12 +368,11 @@ where
     fn new(
         cluster_info: Arc<ClusterInfo>,
         result_sender: Arc<Mutex<S>>,
+        queue_stats: Arc<GossipQueueStats>,
         cpu_layout: &GossipCpuLayout,
     ) -> Self {
         let worker_count = gossip_socket_consume_threads().max(1);
-        // Keep the coordinator ahead of the crypto workers during bursty gossip
-        // traffic instead of stalling on a tiny handoff queue.
-        let queue_capacity = worker_count.saturating_mul(16).max(64);
+        let queue_capacity = gossip_socket_consume_verify_queue_capacity();
         let (job_sender, job_receiver) = bounded::<SocketConsumeVerifyJob>(queue_capacity);
         let mut worker_handles = Vec::with_capacity(worker_count);
 
@@ -381,6 +381,7 @@ where
             let job_receiver = job_receiver.clone();
             let result_sender = Arc::clone(&result_sender);
             let cluster_info = cluster_info.clone();
+            let queue_stats = queue_stats.clone();
             let cpu_layout = cpu_layout.clone();
             let handle = Builder::new()
                 .name(thread_name)
@@ -396,6 +397,9 @@ where
                         let Ok(job) = job_receiver.recv() else {
                             break;
                         };
+                        queue_stats
+                            .socket_consume_verify_queue
+                            .observe_len(job_receiver.len());
                         let packet_count = job
                             .packet_batches
                             .iter()
@@ -408,15 +412,24 @@ where
                         if verified.is_empty() {
                             continue;
                         }
-                        let result = {
+                        let (result, sender_len) = {
                             let sender = result_sender
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            sender.try_send(verified)
+                            let result = sender.try_send(verified);
+                            let sender_len = sender.len();
+                            (result, sender_len)
                         };
                         match result {
-                            Ok(()) => {}
+                            Ok(()) => {
+                                queue_stats
+                                    .socket_consume_output_queue
+                                    .observe_len(sender_len);
+                            }
                             Err(TrySendError::Full(_)) => {
+                                queue_stats
+                                    .socket_consume_output_queue
+                                    .record_drop(1, packet_count as u64);
                                 cluster_info
                                     .stats
                                     .gossip_packets_dropped_count
@@ -435,6 +448,7 @@ where
         Self {
             worker_count,
             job_sender,
+            queue_stats,
             worker_handles,
             _result_sender: std::marker::PhantomData,
         }
@@ -468,8 +482,15 @@ where
                 stakes: stakes.clone(),
             };
             match self.job_sender.try_send(job) {
-                Ok(()) => {}
+                Ok(()) => {
+                    self.queue_stats
+                        .socket_consume_verify_queue
+                        .observe_len(self.job_sender.len());
+                }
                 Err(TrySendError::Full(_)) => {
+                    self.queue_stats
+                        .socket_consume_verify_queue
+                        .record_drop(1, packet_count as u64);
                     dropped_packets = dropped_packets.saturating_add(packet_count as u64);
                 }
                 Err(TrySendError::Disconnected(_)) => return Err(GossipError::SendError),
@@ -585,6 +606,12 @@ fn gossip_channel_consume_capacity() -> usize {
 fn gossip_socket_consume_parallel_packet_threshold() -> usize {
     read_usize_env("SOF_GOSSIP_SOCKET_CONSUME_PARALLEL_PACKET_THRESHOLD")
         .unwrap_or(DEFAULT_GOSSIP_SOCKET_CONSUME_PARALLEL_PACKET_THRESHOLD)
+}
+
+pub(crate) fn gossip_socket_consume_verify_queue_capacity() -> usize {
+    // Keep the coordinator ahead of the crypto workers during bursty gossip
+    // traffic instead of stalling on a tiny handoff queue.
+    gossip_socket_consume_threads().max(1).saturating_mul(16).max(64)
 }
 
 fn gossip_listen_parallel_batch_threshold() -> usize {
@@ -2663,6 +2690,7 @@ impl ClusterInfo {
     fn run_socket_consume_legacy<S>(
         &self,
         verifier_pool: &SocketConsumeVerifierPool<S>,
+        queue_stats: &GossipQueueStats,
         epoch_specs: Option<&mut EpochSpecs>,
         receiver: &PacketBatchReceiver,
         sender: &Mutex<S>,
@@ -2701,13 +2729,25 @@ impl ClusterInfo {
                 if packets_verified.is_empty() {
                     0
                 } else {
-                    let result = {
+                    let (result, sender_len) = {
                         let sender = sender.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                        sender.try_send(packets_verified)
+                        let result = sender.try_send(packets_verified);
+                        let sender_len = sender.len();
+                        (result, sender_len)
                     };
                     match result {
-                        Ok(()) => 0,
-                        Err(TrySendError::Full(_)) => num_packets as u64,
+                        Ok(()) => {
+                            queue_stats
+                                .socket_consume_output_queue
+                                .observe_len(sender_len);
+                            0
+                        }
+                        Err(TrySendError::Full(_)) => {
+                            queue_stats
+                                .socket_consume_output_queue
+                                .record_drop(1, num_packets as u64);
+                            num_packets as u64
+                        }
                         Err(TrySendError::Disconnected(_)) => return Err(GossipError::SendError),
                     }
                 }
@@ -2776,12 +2816,17 @@ impl ClusterInfo {
         bank_forks: Option<Arc<RwLock<BankForks>>>,
         receiver: PacketBatchReceiver,
         sender: impl ChannelSend<VerifiedProtocolBatch>,
+        queue_stats: Arc<GossipQueueStats>,
         exit: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
         let cpu_layout = gossip_cpu_layout();
         let sender = Arc::new(Mutex::new(sender));
-        let verifier_pool =
-            SocketConsumeVerifierPool::new(self.clone(), Arc::clone(&sender), &cpu_layout);
+        let verifier_pool = SocketConsumeVerifierPool::new(
+            self.clone(),
+            Arc::clone(&sender),
+            queue_stats.clone(),
+            &cpu_layout,
+        );
         let mut epoch_specs = bank_forks.map(EpochSpecs::from);
         let mut packet_buf = Vec::with_capacity(gossip_channel_consume_capacity());
         let run_consume = move || {
@@ -2795,6 +2840,7 @@ impl ClusterInfo {
             while !exit.load(Ordering::Relaxed) {
                 let result = self.run_socket_consume_legacy(
                     &verifier_pool,
+                    queue_stats.as_ref(),
                     epoch_specs.as_mut(),
                     &receiver,
                     sender.as_ref(),

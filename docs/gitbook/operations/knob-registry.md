@@ -153,6 +153,13 @@ Snapshot date:
 | `SOF_GOSSIP_STATS_INTERVAL_SECS` | `10` | bundled gossip backend | Gossip metrics reporting interval. |
 | `SOF_GOSSIP_SAMPLE_LOGS_ENABLED` | `true` | bundled gossip backend | Enable sampled gossip and ping datapoint logging. |
 
+Bundled gossip telemetry to watch:
+
+- `gossip_receiver channel_len` and `num_packets_dropped` cover UDP receiver backlog and evictions.
+- `gossip_socket_consume_verify_queue current_len`, `max_len`, and `dropped_packets` cover backlog before socket-consume verification completes.
+- `gossip_socket_consume_output_queue current_len`, `max_len`, and `dropped_packets` cover backlog after verification and before listen/process.
+- `cluster_info_stats2 gossip_packets_dropped_count` is the aggregate "packets were dropped somewhere in the bundled gossip consume/listen path" signal.
+
 ## Gossip Runtime Switching
 
 | Knob | Default | Scope | Meaning |
