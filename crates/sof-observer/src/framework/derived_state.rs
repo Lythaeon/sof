@@ -1405,6 +1405,8 @@ impl DiskDerivedStateReplaySource {
         new_path: &Path,
         envelopes: &[DerivedStateFeedEnvelope],
     ) -> io::Result<()> {
+        Self::evict_cached_appender(old_path);
+        Self::evict_cached_appender(new_path);
         let temp_path = new_path.with_extension("segment.tmp");
         {
             let mut file = File::create(&temp_path)?;
@@ -1535,6 +1537,22 @@ impl DiskDerivedStateReplaySource {
         }
     }
 
+    /// Closes one cached append handle before the underlying segment path is rewritten or removed.
+    fn evict_cached_appender(path: &Path) {
+        DISK_REPLAY_APPENDERS.with(|appenders| {
+            appenders.borrow_mut().remove(path);
+        });
+    }
+
+    /// Closes cached append handles rooted under one directory before compacting it away.
+    fn evict_cached_appenders_in_dir(dir: &Path) {
+        DISK_REPLAY_APPENDERS.with(|appenders| {
+            appenders
+                .borrow_mut()
+                .retain(|path, _file| !path.starts_with(dir));
+        });
+    }
+
     /// Reconstructs lightweight retained-session metadata by scanning the session directory.
     fn scan_session_metadata(
         &self,
@@ -1618,6 +1636,7 @@ impl DiskDerivedStateReplaySource {
                 break;
             };
             if oldest_segment.retained_envelopes <= envelopes_to_remove {
+                Self::evict_cached_appender(&oldest_segment.path);
                 fs::remove_file(&oldest_segment.path)?;
                 metadata.segments.remove(0);
                 metadata.retained_envelopes = metadata
@@ -1686,6 +1705,7 @@ impl DiskDerivedStateReplaySource {
             if session_id == current_session_id {
                 break;
             }
+            Self::evict_cached_appenders_in_dir(&path);
             fs::remove_dir_all(&path)?;
             self.update_session_metadata(session_id, DiskDerivedStateSessionMetadata::default());
             retained_sessions.remove(0);
@@ -5330,6 +5350,58 @@ mod tests {
             })
         ));
 
+        drop(fs::remove_dir_all(replay_dir));
+    }
+
+    #[test]
+    fn disk_replay_source_evicts_stale_appenders_during_truncation() {
+        let replay_dir = unique_test_replay_dir("truncate-appender-eviction");
+        let session_id = FeedSessionId(2026);
+        let replay_source = DiskDerivedStateReplaySource::new(&replay_dir, 2)
+            .expect("disk replay source should create its root directory");
+
+        for sequence in 0..2048_u64 {
+            replay_source
+                .append_batch_inline(&[DerivedStateFeedEnvelope {
+                    session_id,
+                    sequence: FeedSequence(sequence),
+                    emitted_at: SystemTime::UNIX_EPOCH,
+                    watermarks: FeedWatermarks {
+                        canonical_tip_slot: Some(500 + sequence),
+                        processed_slot: Some(500 + sequence),
+                        confirmed_slot: Some(499 + sequence),
+                        finalized_slot: Some(498 + sequence),
+                    },
+                    event: DerivedStateFeedEvent::SlotStatusChanged(SlotStatusChangedEvent {
+                        slot: 500 + sequence,
+                        parent_slot: Some(499 + sequence),
+                        previous_status: None,
+                        status: ForkSlotStatus::Processed,
+                    }),
+                }])
+                .expect("inline append should not fail while truncating retained segments");
+        }
+
+        assert_eq!(replay_source.append_failures(), 0);
+        let replayed = replay_source
+            .replay_from(session_id, FeedSequence(2046))
+            .expect("replay should return the retained tail after repeated truncation");
+        assert_eq!(
+            replayed
+                .iter()
+                .map(|envelope| envelope.sequence)
+                .collect::<Vec<_>>(),
+            vec![FeedSequence(2046), FeedSequence(2047)]
+        );
+
+        let cached_appenders = DISK_REPLAY_APPENDERS.with(|appenders| appenders.borrow().len());
+        assert!(
+            cached_appenders <= 2,
+            "expected truncation to keep cached appenders bounded, got {cached_appenders}"
+        );
+
+        drop(replay_source);
+        DISK_REPLAY_APPENDERS.with(|appenders| appenders.borrow_mut().clear());
         drop(fs::remove_dir_all(replay_dir));
     }
 
