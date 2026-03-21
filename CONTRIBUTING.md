@@ -161,6 +161,12 @@ Reference docs:
 - Keep tests deterministic and fast.
 - If you touch parser/reassembly invariants, expand edge-case coverage (including fuzz-oriented cases where applicable).
 
+Runtime hardening workflow for public-host changes:
+
+- Use `cargo make vps-observer-restart-loop` when changing shutdown, restart, gossip handoff, or queue/backpressure behavior.
+- Use `cargo make vps-derived-state-restart-check` when changing derived-state checkpoint, replay, or shutdown behavior.
+- Include the VPS host class and the observed drop/replay results in the PR notes when these scripts are part of validation.
+
 Fuzzing workflow:
 
 - Fuzz targets and corpora are in `crates/sof-observer/fuzz/`.
