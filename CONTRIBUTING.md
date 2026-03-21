@@ -161,6 +161,13 @@ Reference docs:
 - Keep tests deterministic and fast.
 - If you touch parser/reassembly invariants, expand edge-case coverage (including fuzz-oriented cases where applicable).
 
+Benchmark workflow for hot-path changes:
+
+- Use `cargo bench -p sof --bench hot_paths --no-run` as the fast compile-only smoke check for the Criterion harness.
+- Run `cargo bench -p sof --bench hot_paths` when changing relay, reassembly, or derived-state dispatch hot paths.
+- When local host noise is too high, validate the same bench binary on the reference VPS and include the command and host class in the PR notes.
+- Treat benchmark deltas as evidence, not proof by themselves: explain the workload shape and any limits of the measurement.
+
 Fuzzing workflow:
 
 - Fuzz targets and corpora are in `crates/sof-observer/fuzz/`.
