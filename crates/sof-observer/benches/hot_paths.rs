@@ -1,9 +1,9 @@
-#![allow(missing_docs)]
 //! Criterion benches for public SOF hot paths.
 
+use std::ops::Range;
 use std::time::{Duration, Instant};
 
-use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, Throughput, black_box};
 use sof::{
     event::ForkSlotStatus,
     framework::{
@@ -18,15 +18,24 @@ use sof::{
     shred::wire::{SIZE_OF_DATA_SHRED_HEADERS, SIZE_OF_DATA_SHRED_PAYLOAD, parse_shred_header},
 };
 
+/// Relay-cache insert workload size.
 const RELAY_BENCH_SHREDS: usize = 512;
+/// Relay-cache lookup fixture size.
 const RELAY_QUERY_SHREDS: usize = 1024;
+/// Relay range query start index.
 const RELAY_QUERY_START_INDEX: u32 = 320;
+/// Relay range query end index.
 const RELAY_QUERY_END_INDEX: u32 = 383;
+/// Dataset reassembly contiguous-shred workload size.
 const DATASET_BENCH_SHREDS: usize = 32;
+/// Derived-state dispatch batch size.
 const DERIVED_STATE_BATCH_EVENTS: usize = 64;
 
+/// Bench relay-cache insert throughput on a bounded shared cache.
 fn bench_shared_relay_cache_insert(c: &mut Criterion) {
-    let packets = relay_packets(RELAY_BENCH_SHREDS);
+    let Some(packets) = relay_packets(RELAY_BENCH_SHREDS) else {
+        return;
+    };
     let mut group = c.benchmark_group("relay_cache_insert");
     group.throughput(Throughput::Elements(RELAY_BENCH_SHREDS as u64));
     group.bench_function("shared_cache_insert_512", |b| {
@@ -35,8 +44,7 @@ fn bench_shared_relay_cache_insert(c: &mut Criterion) {
             |cache| {
                 let now = Instant::now();
                 for (offset, (packet, parsed)) in packets.iter().enumerate() {
-                    let observed_at =
-                        now + Duration::from_micros(u64::try_from(offset).unwrap_or(u64::MAX));
+                    let observed_at = observed_at(now, offset);
                     let outcome = cache.insert(packet, parsed, observed_at);
                     black_box(outcome);
                 }
@@ -48,8 +56,11 @@ fn bench_shared_relay_cache_insert(c: &mut Criterion) {
     group.finish();
 }
 
+/// Bench bounded relay-cache range-query throughput.
 fn bench_shared_relay_cache_query_range(c: &mut Criterion) {
-    let cache = populated_shared_relay_cache(RELAY_QUERY_SHREDS);
+    let Some(cache) = populated_shared_relay_cache(RELAY_QUERY_SHREDS) else {
+        return;
+    };
     let request = RelayRangeRequest {
         slot: 42,
         start_index: RELAY_QUERY_START_INDEX,
@@ -68,15 +79,16 @@ fn bench_shared_relay_cache_query_range(c: &mut Criterion) {
     )));
     group.bench_function("shared_cache_query_range_64", |b| {
         b.iter(|| {
-            let response = cache
+            let response_len = cache
                 .query_range(request, limits, Instant::now())
-                .expect("relay range query should succeed");
-            black_box(response.len());
+                .map_or(0, |response| response.len());
+            black_box(response_len);
         });
     });
     group.finish();
 }
 
+/// Bench contiguous dataset reassembly with bounded in-slot fragments.
 fn bench_dataset_reassembly(c: &mut Criterion) {
     let fragments = dataset_fragments(DATASET_BENCH_SHREDS);
     let mut group = c.benchmark_group("dataset_reassembly");
@@ -87,11 +99,12 @@ fn bench_dataset_reassembly(c: &mut Criterion) {
             |mut reassembler| {
                 let mut completed = 0usize;
                 for (index, fragment) in fragments.iter().cloned().enumerate() {
+                    let is_last = index.saturating_add(1) == DATASET_BENCH_SHREDS;
                     let datasets = reassembler.ingest_data_shred_meta(
                         11_000,
                         u32::try_from(index).unwrap_or(u32::MAX),
-                        index + 1 == DATASET_BENCH_SHREDS,
-                        index + 1 == DATASET_BENCH_SHREDS,
+                        is_last,
+                        is_last,
                         fragment,
                     );
                     completed = completed.saturating_add(datasets.len());
@@ -104,6 +117,7 @@ fn bench_dataset_reassembly(c: &mut Criterion) {
     group.finish();
 }
 
+/// Bench the full derived-state host dispatch path for one control-plane batch.
 fn bench_derived_state_dispatch(c: &mut Criterion) {
     let host = DerivedStateHost::builder()
         .add_consumer(NoopDerivedStateConsumer)
@@ -131,29 +145,32 @@ fn bench_derived_state_dispatch(c: &mut Criterion) {
     group.finish();
 }
 
-fn relay_packets(count: usize) -> Vec<(Vec<u8>, sof::shred::wire::ParsedShredHeader)> {
+/// Build parsed benchmark shred packets for relay-cache benches.
+fn relay_packets(count: usize) -> Option<Vec<(Vec<u8>, sof::shred::wire::ParsedShredHeader)>> {
     (0..count)
         .map(|index| {
             let index_u32 = u32::try_from(index).unwrap_or(u32::MAX);
-            let packet = build_data_shred_packet(42, index_u32, index_u32 / 8, 1, &[7_u8; 96]);
-            let header = parse_shred_header(&packet).expect("benchmark packet must parse");
-            (packet, header)
+            let packet = build_data_shred_packet(42, index_u32, index_u32 / 8, 1, &[7_u8; 96])?;
+            let header = parse_shred_header(&packet).ok()?;
+            Some((packet, header))
         })
         .collect()
 }
 
-fn populated_shared_relay_cache(count: usize) -> SharedRelayCache {
+/// Build and prefill a bounded relay cache for lookup benches.
+fn populated_shared_relay_cache(count: usize) -> Option<SharedRelayCache> {
     let cache = SharedRelayCache::new(RecentShredRingBuffer::new(16_384, Duration::from_secs(30)));
-    let packets = relay_packets(count);
+    let packets = relay_packets(count)?;
     let now = Instant::now();
     for (offset, (packet, parsed)) in packets.iter().enumerate() {
-        let observed_at = now + Duration::from_micros(u64::try_from(offset).unwrap_or(u64::MAX));
+        let observed_at = observed_at(now, offset);
         let outcome = cache.insert(packet, parsed, observed_at);
         debug_assert!(outcome.inserted || outcome.replaced);
     }
-    cache
+    Some(cache)
 }
 
+/// Build owned payload fragments for dataset-reassembly benches.
 fn dataset_fragments(count: usize) -> Vec<SharedPayloadFragment> {
     (0..count)
         .map(|index| {
@@ -162,12 +179,13 @@ fn dataset_fragments(count: usize) -> Vec<SharedPayloadFragment> {
         .collect()
 }
 
+/// Build slot-status events for derived-state dispatch benches.
 fn derived_state_events(count: usize) -> Vec<DerivedStateFeedEvent> {
     (0..count)
         .map(|index| {
             DerivedStateFeedEvent::SlotStatusChanged(SlotStatusChangedEvent {
-                slot: 22_000 + u64::try_from(index).unwrap_or(u64::MAX),
-                parent_slot: Some(21_999 + u64::try_from(index).unwrap_or(u64::MAX)),
+                slot: bench_slot(22_000, index),
+                parent_slot: Some(bench_slot(21_999, index)),
                 previous_status: Some(ForkSlotStatus::Processed),
                 status: ForkSlotStatus::Confirmed,
             })
@@ -175,33 +193,61 @@ fn derived_state_events(count: usize) -> Vec<DerivedStateFeedEvent> {
         .collect()
 }
 
+/// Build one minimal parseable data shred packet for relay-cache benches.
 fn build_data_shred_packet(
     slot: u64,
     index: u32,
     fec_set_index: u32,
     parent_offset: u16,
     payload: &[u8],
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
     let total = SIZE_OF_DATA_SHRED_HEADERS.saturating_add(payload.len());
-    let size = u16::try_from(total).expect("benchmark packet too large");
+    let size = u16::try_from(total).ok()?;
     let mut packet = vec![0_u8; SIZE_OF_DATA_SHRED_PAYLOAD];
 
-    packet[0..8].copy_from_slice(&slot.to_le_bytes());
-    packet[8..12].copy_from_slice(&index.to_le_bytes());
-    packet[12..16].copy_from_slice(&fec_set_index.to_le_bytes());
-    packet[64] = VARIANT_MERKLE_DATA;
-    packet[65..73].copy_from_slice(&slot.to_le_bytes());
-    packet[73..77].copy_from_slice(&index.to_le_bytes());
-    packet[77..79].copy_from_slice(&1_u16.to_le_bytes());
-    packet[79..83].copy_from_slice(&fec_set_index.to_le_bytes());
-    packet[83..85].copy_from_slice(&parent_offset.to_le_bytes());
-    packet[85] = 0b0100_0000;
-    packet[86..88].copy_from_slice(&size.to_le_bytes());
+    copy_into(&mut packet, 0..8, &slot.to_le_bytes())?;
+    copy_into(&mut packet, 8..12, &index.to_le_bytes())?;
+    copy_into(&mut packet, 12..16, &fec_set_index.to_le_bytes())?;
+    set_byte(&mut packet, 64, VARIANT_MERKLE_DATA)?;
+    copy_into(&mut packet, 65..73, &slot.to_le_bytes())?;
+    copy_into(&mut packet, 73..77, &index.to_le_bytes())?;
+    copy_into(&mut packet, 77..79, &1_u16.to_le_bytes())?;
+    copy_into(&mut packet, 79..83, &fec_set_index.to_le_bytes())?;
+    copy_into(&mut packet, 83..85, &parent_offset.to_le_bytes())?;
+    set_byte(&mut packet, 85, 0b0100_0000)?;
+    copy_into(&mut packet, 86..88, &size.to_le_bytes())?;
     let end = 88usize.saturating_add(payload.len());
-    packet[88..end].copy_from_slice(payload);
-    packet
+    copy_into(&mut packet, 88..end, payload)?;
+    Some(packet)
 }
 
+/// Convert an event index into a saturating benchmark slot.
+fn bench_slot(base: u64, index: usize) -> u64 {
+    base.saturating_add(u64::try_from(index).unwrap_or(u64::MAX))
+}
+
+/// Convert an offset into a saturating observed-at timestamp.
+fn observed_at(now: Instant, offset: usize) -> Instant {
+    let micros = u64::try_from(offset).unwrap_or(u64::MAX);
+    now.checked_add(Duration::from_micros(micros))
+        .unwrap_or(now)
+}
+
+/// Copy bytes into a checked range inside the packet fixture.
+fn copy_into(packet: &mut [u8], range: Range<usize>, bytes: &[u8]) -> Option<()> {
+    packet.get_mut(range).map(|dst| {
+        dst.copy_from_slice(bytes);
+    })
+}
+
+/// Set one checked byte inside the packet fixture.
+fn set_byte(packet: &mut [u8], index: usize, value: u8) -> Option<()> {
+    packet.get_mut(index).map(|slot| {
+        *slot = value;
+    })
+}
+
+/// No-op derived-state consumer used to benchmark host dispatch overhead.
 #[derive(Debug, Default)]
 struct NoopDerivedStateConsumer;
 
@@ -252,11 +298,12 @@ impl DerivedStateConsumer for NoopDerivedStateConsumer {
     }
 }
 
-criterion_group!(
-    hot_paths,
-    bench_shared_relay_cache_insert,
-    bench_shared_relay_cache_query_range,
-    bench_dataset_reassembly,
-    bench_derived_state_dispatch
-);
-criterion_main!(hot_paths);
+/// Run the SOF hot-path Criterion benchmark suite.
+fn main() {
+    let mut criterion = Criterion::default().configure_from_args();
+    bench_shared_relay_cache_insert(&mut criterion);
+    bench_shared_relay_cache_query_range(&mut criterion);
+    bench_dataset_reassembly(&mut criterion);
+    bench_derived_state_dispatch(&mut criterion);
+    criterion.final_summary();
+}
