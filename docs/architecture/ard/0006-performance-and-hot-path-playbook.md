@@ -37,6 +37,8 @@
 ## Verification
 
 - Changes to hot paths include benchmark/profiling evidence.
+- Host-side receive experiments such as UDP busy polling require live VPS or dedicated-host
+  validation, not just local synthetic benches.
 - Regressions in throughput/latency block merge until resolved or accepted via ADR.
 
 ## Exit criteria

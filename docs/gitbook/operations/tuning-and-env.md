@@ -18,6 +18,7 @@ The typed `Vps` preset now reflects the validated public-host profile:
 - `SOF_UDP_BATCH_SIZE=96`
 - `SOF_TVU_SOCKETS=2`
 - `SOF_UDP_RECEIVER_PIN_BY_PORT=true`
+- `SOF_UDP_BUSY_POLL_US` / `SOF_UDP_BUSY_POLL_BUDGET` / `SOF_UDP_PREFER_BUSY_POLL` (Linux-only, off by default; use only when you want lower interrupt jitter and accept higher CPU burn)
 - `SOF_GOSSIP_RECEIVER_CHANNEL_CAPACITY=131072`
 - `SOF_GOSSIP_SOCKET_CONSUME_CHANNEL_CAPACITY=65536`
 - `SOF_GOSSIP_RESPONSE_CHANNEL_CAPACITY=65536`
