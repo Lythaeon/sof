@@ -203,3 +203,15 @@ args = [
     "-lc",
     "set -euo pipefail; cd crates/sof-gossip-tuning; target_name=\"$(printenv SOF_GOSSIP_TUNING_FUZZ_TARGET || true)\"; target_args=(); if [[ -n \"${target_name}\" ]]; then target_args=(--target \"${target_name}\"); fi; for target in profile_runtime_port; do echo \"== fuzz smoke: ${target} ==\"; cargo +nightly fuzz run \"${target_args[@]}\" \"${target}\" -- -runs=32; done",
 ]
+
+[tasks.vps-observer-restart-loop]
+description = "Run repeated observer_runtime restart/shutdown validation against the reference VPS"
+workspace = false
+command = "bash"
+args = ["scripts/soak/vps-observer-restart-loop.sh"]
+
+[tasks.vps-derived-state-restart-check]
+description = "Run derived-state replay/restart validation against the reference VPS"
+workspace = false
+command = "bash"
+args = ["scripts/soak/vps-derived-state-restart-check.sh"]
