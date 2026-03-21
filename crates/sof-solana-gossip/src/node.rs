@@ -21,10 +21,12 @@ use {
     solana_streamer::quic::DEFAULT_QUIC_ENDPOINTS,
     solana_time_utils::timestamp,
     std::{
+        env,
         io,
         iter::once,
         net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
         num::NonZero,
+        os::fd::AsRawFd,
         sync::Arc,
     },
 };
@@ -374,6 +376,7 @@ impl Node {
             rpc_sts_client,
             vortexor_receivers,
         };
+        configure_observer_busy_poll_sockets(&sockets);
         info!("Bound all network sockets as follows: {:#?}", &sockets);
         Node {
             info,
@@ -422,6 +425,241 @@ impl Node {
         }
         Ok(sockets)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn configure_observer_busy_poll_sockets(sockets: &Sockets) {
+    const SO_BUSY_POLL: libc::c_int = 46;
+    const SO_PREFER_BUSY_POLL: libc::c_int = 69;
+    const SO_BUSY_POLL_BUDGET: libc::c_int = 70;
+
+    let busy_poll_us = read_udp_busy_poll_us();
+    let prefer_busy_poll = read_udp_prefer_busy_poll();
+    let busy_poll_budget = read_udp_busy_poll_budget();
+    if busy_poll_us.is_none() && !prefer_busy_poll && busy_poll_budget.is_none() {
+        return;
+    }
+
+    for socket in sockets.gossip.iter() {
+        configure_udp_busy_poll_socket(
+            socket,
+            "gossip",
+            busy_poll_us,
+            prefer_busy_poll,
+            busy_poll_budget,
+            SO_BUSY_POLL,
+            SO_PREFER_BUSY_POLL,
+            SO_BUSY_POLL_BUDGET,
+        );
+    }
+    for socket in &sockets.tvu {
+        configure_udp_busy_poll_socket(
+            socket,
+            "tvu",
+            busy_poll_us,
+            prefer_busy_poll,
+            busy_poll_budget,
+            SO_BUSY_POLL,
+            SO_PREFER_BUSY_POLL,
+            SO_BUSY_POLL_BUDGET,
+        );
+    }
+    configure_udp_busy_poll_socket(
+        &sockets.tvu_quic,
+        "tvu_quic",
+        busy_poll_us,
+        prefer_busy_poll,
+        busy_poll_budget,
+        SO_BUSY_POLL,
+        SO_PREFER_BUSY_POLL,
+        SO_BUSY_POLL_BUDGET,
+    );
+    configure_udp_busy_poll_socket(
+        &sockets.repair,
+        "repair",
+        busy_poll_us,
+        prefer_busy_poll,
+        busy_poll_budget,
+        SO_BUSY_POLL,
+        SO_PREFER_BUSY_POLL,
+        SO_BUSY_POLL_BUDGET,
+    );
+    configure_udp_busy_poll_socket(
+        &sockets.repair_quic,
+        "repair_quic",
+        busy_poll_us,
+        prefer_busy_poll,
+        busy_poll_budget,
+        SO_BUSY_POLL,
+        SO_PREFER_BUSY_POLL,
+        SO_BUSY_POLL_BUDGET,
+    );
+    configure_udp_busy_poll_socket(
+        &sockets.serve_repair,
+        "serve_repair",
+        busy_poll_us,
+        prefer_busy_poll,
+        busy_poll_budget,
+        SO_BUSY_POLL,
+        SO_PREFER_BUSY_POLL,
+        SO_BUSY_POLL_BUDGET,
+    );
+    configure_udp_busy_poll_socket(
+        &sockets.serve_repair_quic,
+        "serve_repair_quic",
+        busy_poll_us,
+        prefer_busy_poll,
+        busy_poll_budget,
+        SO_BUSY_POLL,
+        SO_PREFER_BUSY_POLL,
+        SO_BUSY_POLL_BUDGET,
+    );
+    configure_udp_busy_poll_socket(
+        &sockets.ancestor_hashes_requests,
+        "ancestor_hashes_requests",
+        busy_poll_us,
+        prefer_busy_poll,
+        busy_poll_budget,
+        SO_BUSY_POLL,
+        SO_PREFER_BUSY_POLL,
+        SO_BUSY_POLL_BUDGET,
+    );
+    configure_udp_busy_poll_socket(
+        &sockets.ancestor_hashes_requests_quic,
+        "ancestor_hashes_requests_quic",
+        busy_poll_us,
+        prefer_busy_poll,
+        busy_poll_budget,
+        SO_BUSY_POLL,
+        SO_PREFER_BUSY_POLL,
+        SO_BUSY_POLL_BUDGET,
+    );
+    if let Some(socket) = &sockets.alpenglow {
+        configure_udp_busy_poll_socket(
+            socket,
+            "alpenglow",
+            busy_poll_us,
+            prefer_busy_poll,
+            busy_poll_budget,
+            SO_BUSY_POLL,
+            SO_PREFER_BUSY_POLL,
+            SO_BUSY_POLL_BUDGET,
+        );
+    }
+    if let Some(vortexor_receivers) = &sockets.vortexor_receivers {
+        for socket in vortexor_receivers {
+            configure_udp_busy_poll_socket(
+                socket,
+                "vortexor_receiver",
+                busy_poll_us,
+                prefer_busy_poll,
+                busy_poll_budget,
+                SO_BUSY_POLL,
+                SO_PREFER_BUSY_POLL,
+                SO_BUSY_POLL_BUDGET,
+            );
+        }
+    }
+
+    info!(
+        "configured Linux UDP busy-poll socket options for observer-facing gossip sockets: \
+         busy_poll_us={} prefer_busy_poll={} busy_poll_budget={}",
+        busy_poll_us.unwrap_or_default(),
+        prefer_busy_poll,
+        busy_poll_budget.unwrap_or_default(),
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_observer_busy_poll_sockets(_sockets: &Sockets) {}
+
+#[cfg(target_os = "linux")]
+fn configure_udp_busy_poll_socket(
+    socket: &UdpSocket,
+    socket_group: &str,
+    busy_poll_us: Option<u32>,
+    prefer_busy_poll: bool,
+    busy_poll_budget: Option<u32>,
+    so_busy_poll: libc::c_int,
+    so_prefer_busy_poll: libc::c_int,
+    so_busy_poll_budget: libc::c_int,
+) {
+    if let Some(timeout_us) = busy_poll_us {
+        set_udp_socket_int_sockopt(socket, socket_group, "SO_BUSY_POLL", so_busy_poll, timeout_us as libc::c_int);
+    }
+    if prefer_busy_poll {
+        set_udp_socket_int_sockopt(
+            socket,
+            socket_group,
+            "SO_PREFER_BUSY_POLL",
+            so_prefer_busy_poll,
+            1,
+        );
+    }
+    if let Some(packet_budget) = busy_poll_budget {
+        set_udp_socket_int_sockopt(
+            socket,
+            socket_group,
+            "SO_BUSY_POLL_BUDGET",
+            so_busy_poll_budget,
+            packet_budget as libc::c_int,
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_udp_socket_int_sockopt(
+    socket: &UdpSocket,
+    socket_group: &str,
+    option_label: &str,
+    option_name: libc::c_int,
+    option_value: libc::c_int,
+) {
+    // SAFETY: `socket.as_raw_fd()` is a live UDP socket, `option_value` points to a valid
+    // `c_int`, and the provided length matches that value's size.
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            option_name,
+            &option_value as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        return;
+    }
+    let error = io::Error::last_os_error();
+    warn!(
+        "failed to configure {option_label} for {socket_group} socket {:?}: {error}",
+        socket.local_addr().ok()
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn read_udp_busy_poll_us() -> Option<u32> {
+    env::var("SOF_UDP_BUSY_POLL_US")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+}
+
+#[cfg(target_os = "linux")]
+fn read_udp_busy_poll_budget() -> Option<u32> {
+    env::var("SOF_UDP_BUSY_POLL_BUDGET")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+}
+
+#[cfg(target_os = "linux")]
+fn read_udp_prefer_busy_poll() -> bool {
+    env::var("SOF_UDP_PREFER_BUSY_POLL")
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
 }
 
 mod multihoming {

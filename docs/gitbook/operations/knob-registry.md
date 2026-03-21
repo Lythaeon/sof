@@ -58,6 +58,9 @@ Snapshot date:
 | `SOF_UDP_BATCH_SIZE` | `64` | all builds | Maximum packet batch size per UDP receive pass. |
 | `SOF_UDP_BATCH_MAX_WAIT_MS` | `1` | all builds | Coalesce wait before flushing a partially filled UDP batch. |
 | `SOF_UDP_IDLE_WAIT_MS` | `100` | all builds | Idle wait interval when traffic is sparse. |
+| `SOF_UDP_BUSY_POLL_US` | unset (`off`) | Linux-only | Socket busy-poll timeout in microseconds for SOF UDP ingest and observer-facing bundled gossip sockets. |
+| `SOF_UDP_BUSY_POLL_BUDGET` | unset | Linux-only | Packet budget used by Linux busy polling on supported UDP sockets. |
+| `SOF_UDP_PREFER_BUSY_POLL` | `false` | Linux-only | Ask the kernel to prefer busy polling for supported UDP sockets. |
 | `SOF_UDP_RECEIVER_CORE` | unset | all builds | Fixed CPU core index for UDP receiver pinning. |
 | `SOF_UDP_RECEIVER_PIN_BY_PORT` | `false` | all builds | Derive receiver pinning from local port number instead of a fixed core. |
 | `SOF_UDP_DROP_ON_CHANNEL_FULL` | `true` | built-in UDP path only | Drop new UDP batches instead of blocking when the ingest queue is full. |

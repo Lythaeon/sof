@@ -1,4 +1,7 @@
 use super::*;
+use crate::ingest::config::{
+    read_udp_busy_poll_budget, read_udp_busy_poll_us, read_udp_prefer_busy_poll,
+};
 
 pub(super) struct UdpReceive {
     pub(super) len: usize,
@@ -105,6 +108,7 @@ pub(super) fn current_unix_ms() -> u64 {
 
 pub(super) fn tune_udp_socket(socket: &std::net::UdpSocket) {
     let Some(rcvbuf_bytes) = read_udp_rcvbuf_bytes() else {
+        tune_udp_busy_poll(socket);
         return;
     };
     let sockref = SockRef::from(socket);
@@ -123,6 +127,83 @@ pub(super) fn tune_udp_socket(socket: &std::net::UdpSocket) {
             "configured UDP receive buffer size"
         );
     }
+    tune_udp_busy_poll(socket);
+}
+
+#[cfg(target_os = "linux")]
+fn tune_udp_busy_poll(socket: &std::net::UdpSocket) {
+    const SO_BUSY_POLL: libc::c_int = 46;
+    const SO_PREFER_BUSY_POLL: libc::c_int = 69;
+    const SO_BUSY_POLL_BUDGET: libc::c_int = 70;
+
+    let busy_poll_us = read_udp_busy_poll_us();
+    let prefer_busy_poll = read_udp_prefer_busy_poll();
+    let busy_poll_budget = read_udp_busy_poll_budget();
+    if busy_poll_us.is_none() && !prefer_busy_poll && busy_poll_budget.is_none() {
+        return;
+    }
+
+    if let Some(timeout_us) = busy_poll_us {
+        set_udp_socket_int_sockopt(
+            socket,
+            SO_BUSY_POLL,
+            timeout_us as libc::c_int,
+            "SO_BUSY_POLL",
+        );
+    }
+    if prefer_busy_poll {
+        set_udp_socket_int_sockopt(socket, SO_PREFER_BUSY_POLL, 1, "SO_PREFER_BUSY_POLL");
+    }
+    if let Some(packet_budget) = busy_poll_budget {
+        set_udp_socket_int_sockopt(
+            socket,
+            SO_BUSY_POLL_BUDGET,
+            packet_budget as libc::c_int,
+            "SO_BUSY_POLL_BUDGET",
+        );
+    }
+
+    tracing::info!(
+        local_addr = ?socket.local_addr().ok(),
+        busy_poll_us,
+        prefer_busy_poll,
+        busy_poll_budget,
+        "configured UDP busy-poll socket options"
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+fn tune_udp_busy_poll(_socket: &std::net::UdpSocket) {}
+
+#[cfg(target_os = "linux")]
+fn set_udp_socket_int_sockopt(
+    socket: &std::net::UdpSocket,
+    option_name: libc::c_int,
+    option_value: libc::c_int,
+    option_label: &str,
+) {
+    // SAFETY: `socket.as_raw_fd()` is a live UDP socket, `option_value` points to a valid
+    // `c_int`, and the provided length matches that value's size.
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            option_name,
+            &option_value as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        return;
+    }
+    let error = std::io::Error::last_os_error();
+    tracing::warn!(
+        option = option_label,
+        value = option_value,
+        error = %error,
+        local_addr = ?socket.local_addr().ok(),
+        "failed to configure UDP socket option"
+    );
 }
 
 pub(super) fn maybe_pin_receiver_thread(socket: &std::net::UdpSocket) {

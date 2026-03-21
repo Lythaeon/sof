@@ -203,3 +203,9 @@ args = [
     "-lc",
     "set -euo pipefail; cd crates/sof-gossip-tuning; target_name=\"$(printenv SOF_GOSSIP_TUNING_FUZZ_TARGET || true)\"; target_args=(); if [[ -n \"${target_name}\" ]]; then target_args=(--target \"${target_name}\"); fi; for target in profile_runtime_port; do echo \"== fuzz smoke: ${target} ==\"; cargo +nightly fuzz run \"${target_args[@]}\" \"${target}\" -- -runs=32; done",
 ]
+
+[tasks.vps-busy-poll-compare]
+description = "Compare baseline vs Linux UDP busy-poll behavior on the VPS observer_runtime profile"
+workspace = false
+command = "bash"
+args = ["scripts/soak/vps-busy-poll-compare.sh"]
