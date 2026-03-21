@@ -3724,6 +3724,13 @@ mod tests {
             Ok(None)
         }
 
+        fn config(&self) -> crate::framework::DerivedStateConsumerConfig {
+            crate::framework::DerivedStateConsumerConfig::new()
+                .with_transaction_applied()
+                .with_account_touch_key_partitions()
+                .with_control_plane_observed()
+        }
+
         fn apply(
             &mut self,
             envelope: &DerivedStateFeedEnvelope,

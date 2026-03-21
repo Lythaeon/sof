@@ -38,6 +38,93 @@ use crate::{
     },
 };
 
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+/// Static feed subscriptions requested by one derived-state consumer during host construction.
+pub struct DerivedStateConsumerConfig {
+    /// Enables `TransactionApplied` feed delivery.
+    pub transaction_applied: bool,
+    /// Enables `AccountTouchObserved` feed delivery.
+    pub account_touch_observed: bool,
+    /// Requests writable/read-only key partitions on account-touch events.
+    pub account_touch_key_partitions: bool,
+    /// Enables control-plane derived-state events beyond slot/reorg/barrier.
+    pub control_plane_observed: bool,
+}
+
+impl DerivedStateConsumerConfig {
+    /// Creates an empty consumer config with all optional feeds disabled.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            transaction_applied: false,
+            account_touch_observed: false,
+            account_touch_key_partitions: false,
+            control_plane_observed: false,
+        }
+    }
+
+    /// Enables `TransactionApplied`.
+    #[must_use]
+    pub const fn with_transaction_applied(mut self) -> Self {
+        self.transaction_applied = true;
+        self
+    }
+
+    /// Enables `AccountTouchObserved`.
+    #[must_use]
+    pub const fn with_account_touch_observed(mut self) -> Self {
+        self.account_touch_observed = true;
+        self
+    }
+
+    /// Enables account-touch key partitions.
+    #[must_use]
+    pub const fn with_account_touch_key_partitions(mut self) -> Self {
+        self.account_touch_observed = true;
+        self.account_touch_key_partitions = true;
+        self
+    }
+
+    /// Enables control-plane derived-state events.
+    #[must_use]
+    pub const fn with_control_plane_observed(mut self) -> Self {
+        self.control_plane_observed = true;
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+/// Context passed to [`DerivedStateConsumer::on_startup`].
+pub struct DerivedStateConsumerStartupContext {
+    /// Consumer identifier.
+    pub consumer_name: &'static str,
+}
+
+#[derive(Debug, Clone)]
+/// Context passed to [`DerivedStateConsumer::on_shutdown`].
+pub struct DerivedStateConsumerShutdownContext {
+    /// Consumer identifier.
+    pub consumer_name: &'static str,
+}
+
+#[derive(Debug, Clone, Error, Eq, PartialEq)]
+#[error("{reason}")]
+/// Startup failure reported by one derived-state consumer implementation.
+pub struct DerivedStateConsumerStartupError {
+    /// Human-readable startup failure reason.
+    reason: String,
+}
+
+impl DerivedStateConsumerStartupError {
+    /// Creates a startup error with a human-readable reason.
+    #[must_use]
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
 /// One runtime feed session identity.
 ///
 /// A new session id is expected whenever feed continuity cannot be assumed across process
@@ -1947,25 +2034,24 @@ pub trait DerivedStateConsumer: Send + Sync + 'static {
         &mut self,
     ) -> Result<Option<DerivedStateCheckpoint>, DerivedStateConsumerFault>;
 
-    /// Returns true when this consumer wants transaction-applied feed events.
-    fn wants_transaction_applied(&self) -> bool {
-        true
+    /// Returns static feed subscriptions requested by this consumer.
+    fn config(&self) -> DerivedStateConsumerConfig {
+        DerivedStateConsumerConfig::default()
     }
 
-    /// Returns true when this consumer wants account-touch feed events.
-    fn wants_account_touch_observed(&self) -> bool {
-        true
+    /// Called once after the worker thread is created and before any replay or live apply.
+    ///
+    /// # Errors
+    /// Returns a startup error when the consumer cannot initialize its runtime-owned resources.
+    fn on_startup(
+        &mut self,
+        _ctx: DerivedStateConsumerStartupContext,
+    ) -> Result<(), DerivedStateConsumerStartupError> {
+        Ok(())
     }
 
-    /// Returns true when account-touch events for this consumer need writable/read-only splits.
-    fn wants_account_touch_key_partitions(&self) -> bool {
-        self.wants_account_touch_observed()
-    }
-
-    /// Returns true when this consumer wants observer-side control-plane events.
-    fn wants_control_plane_observed(&self) -> bool {
-        true
-    }
+    /// Called once before the worker thread exits.
+    fn on_shutdown(&mut self, _ctx: DerivedStateConsumerShutdownContext) {}
 
     /// Applies one feed envelope in canonical sequence order.
     ///
@@ -1991,6 +2077,11 @@ const DERIVED_STATE_CONSUMER_QUEUE_CAPACITY: usize = 1024;
 
 /// Commands sent from the host thread into one consumer-owned worker thread.
 enum DerivedStateConsumerCommand {
+    /// Ensures the consumer startup hook has completed successfully.
+    EnsureStarted {
+        /// One-shot reply channel for the startup outcome.
+        response: mpsc::SyncSender<Result<(), DerivedStateConsumerFault>>,
+    },
     /// Loads the latest durable checkpoint from the consumer.
     LoadCheckpoint {
         /// One-shot reply channel for the checkpoint result.
@@ -2046,6 +2137,8 @@ struct DerivedStateConsumerWorker {
     shutdown: Arc<AtomicBool>,
     /// Structured startup fault captured when the worker could not be spawned.
     startup_fault: Option<DerivedStateConsumerFault>,
+    /// Cached startup outcome so the lifecycle runs exactly once.
+    startup_state: OnceLock<Result<(), DerivedStateConsumerFault>>,
     /// Join handle for the worker thread when startup succeeded.
     worker_handle: Option<JoinHandle<()>>,
 }
@@ -2063,12 +2156,41 @@ impl DerivedStateConsumerWorker {
             .name(format!("derived-state-{name}"))
             .spawn(move || {
                 drop(worker_thread_ref.set(std::thread::current()));
+                let mut started = false;
                 while !worker_shutdown.load(Ordering::Relaxed) {
                     let Some(command) = worker_queue.pop() else {
                         std::thread::park();
                         continue;
                     };
                     match command {
+                        DerivedStateConsumerCommand::EnsureStarted { response } => {
+                            if started {
+                                drop(response.send(Ok(())));
+                                continue;
+                            }
+                            let startup_result = consumer
+                                .on_startup(DerivedStateConsumerStartupContext {
+                                    consumer_name: name,
+                                })
+                                .map_err(|error| {
+                                    DerivedStateConsumerFault::new(
+                                        DerivedStateConsumerFaultKind::ConsumerApplyFailed,
+                                        None,
+                                        format!("derived-state consumer startup failed: {error}"),
+                                    )
+                                });
+                            if let Err(fault) = startup_result.as_ref() {
+                                tracing::error!(
+                                    consumer = name,
+                                    reason = %fault,
+                                    "derived-state consumer startup failed"
+                                );
+                                drop(response.send(Err(fault.clone())));
+                                return;
+                            }
+                            started = true;
+                            drop(response.send(Ok(())));
+                        }
                         DerivedStateConsumerCommand::LoadCheckpoint { response } => {
                             drop(response.send(consumer.load_checkpoint()));
                         }
@@ -2145,6 +2267,11 @@ impl DerivedStateConsumerWorker {
                         DerivedStateConsumerCommand::Shutdown => break,
                     }
                 }
+                if started {
+                    consumer.on_shutdown(DerivedStateConsumerShutdownContext {
+                        consumer_name: name,
+                    });
+                }
             });
         let (startup_fault, worker_handle) = match worker_handle {
             Ok(handle) => (None, Some(handle)),
@@ -2162,6 +2289,7 @@ impl DerivedStateConsumerWorker {
             worker_thread,
             shutdown,
             startup_fault,
+            startup_state: OnceLock::new(),
             worker_handle,
         }
     }
@@ -2187,11 +2315,31 @@ impl DerivedStateConsumerWorker {
         }
     }
 
+    /// Ensures the consumer startup hook has completed successfully once.
+    fn startup(&self) -> Result<(), DerivedStateConsumerFault> {
+        self.startup_state
+            .get_or_init(|| {
+                if let Some(fault) = self.startup_fault.as_ref() {
+                    return Err(fault.clone());
+                }
+                let (response_tx, response_rx) = mpsc::sync_channel(1);
+                self.push_blocking(DerivedStateConsumerCommand::EnsureStarted {
+                    response: response_tx,
+                });
+                response_rx.recv().unwrap_or_else(|_| {
+                    Err(DerivedStateConsumerFault::new(
+                        DerivedStateConsumerFaultKind::ConsumerApplyFailed,
+                        None,
+                        "derived-state consumer worker exited during startup",
+                    ))
+                })
+            })
+            .clone()
+    }
+
     /// Loads the most recent checkpoint through the consumer worker.
     fn load_checkpoint(&self) -> Result<Option<DerivedStateCheckpoint>, DerivedStateConsumerFault> {
-        if let Some(fault) = self.startup_fault.as_ref() {
-            return Err(fault.clone());
-        }
+        self.startup()?;
         let (response_tx, response_rx) = mpsc::sync_channel(1);
         self.push_blocking(DerivedStateConsumerCommand::LoadCheckpoint {
             response: response_tx,
@@ -2211,11 +2359,11 @@ impl DerivedStateConsumerWorker {
         envelopes: Vec<DerivedStateFeedEnvelope>,
     ) -> DerivedStateConsumerBatchApplyReply {
         let last_sequence = envelopes.last().map(|envelope| envelope.sequence);
-        if let Some(fault) = self.startup_fault.as_ref() {
+        if let Err(fault) = self.startup() {
             return DerivedStateConsumerBatchApplyReply {
                 applied_events: 0,
                 last_sequence,
-                fault: Some(fault.clone()),
+                fault: Some(fault),
             };
         }
         let (response_tx, response_rx) = mpsc::sync_channel(1);
@@ -2242,11 +2390,11 @@ impl DerivedStateConsumerWorker {
         envelopes: Vec<Arc<DerivedStateFeedEnvelope>>,
     ) -> DerivedStateConsumerBatchApplyReply {
         let last_sequence = envelopes.last().map(|envelope| envelope.sequence);
-        if let Some(fault) = self.startup_fault.as_ref() {
+        if let Err(fault) = self.startup() {
             return DerivedStateConsumerBatchApplyReply {
                 applied_events: 0,
                 last_sequence,
-                fault: Some(fault.clone()),
+                fault: Some(fault),
             };
         }
         let (response_tx, response_rx) = mpsc::sync_channel(1);
@@ -2274,9 +2422,7 @@ impl DerivedStateConsumerWorker {
         session_id: FeedSessionId,
         watermarks: FeedWatermarks,
     ) -> Result<(), DerivedStateConsumerFault> {
-        if let Some(fault) = self.startup_fault.as_ref() {
-            return Err(fault.clone());
-        }
+        self.startup()?;
         let sequence = envelope.sequence;
         let (response_tx, response_rx) = mpsc::sync_channel(1);
         self.push_blocking(DerivedStateConsumerCommand::FlushCheckpoint {
@@ -2346,11 +2492,12 @@ impl DerivedStateHostBuilder {
         C: DerivedStateConsumer,
     {
         let name = consumer.name();
+        let config = consumer.config();
         let subscriptions = DerivedStateConsumerSubscriptions {
-            transaction_applied: consumer.wants_transaction_applied(),
-            account_touch_observed: consumer.wants_account_touch_observed(),
-            account_touch_key_partitions: consumer.wants_account_touch_key_partitions(),
-            control_plane_observed: consumer.wants_control_plane_observed(),
+            transaction_applied: config.transaction_applied,
+            account_touch_observed: config.account_touch_observed,
+            account_touch_key_partitions: config.account_touch_key_partitions,
+            control_plane_observed: config.control_plane_observed,
         };
         self.consumers.push(RegisteredDerivedStateConsumer {
             name,
@@ -4224,6 +4371,13 @@ mod tests {
             Ok(None)
         }
 
+        fn config(&self) -> DerivedStateConsumerConfig {
+            DerivedStateConsumerConfig::new()
+                .with_transaction_applied()
+                .with_account_touch_key_partitions()
+                .with_control_plane_observed()
+        }
+
         fn apply(
             &mut self,
             envelope: &DerivedStateFeedEnvelope,
@@ -4259,6 +4413,84 @@ mod tests {
                 .push(checkpoint);
             Ok(())
         }
+    }
+
+    struct LifecycleConsumer {
+        starts: Arc<AtomicUsize>,
+        stops: Arc<AtomicUsize>,
+    }
+
+    impl DerivedStateConsumer for LifecycleConsumer {
+        fn name(&self) -> &'static str {
+            "lifecycle-consumer"
+        }
+
+        fn state_version(&self) -> u32 {
+            1
+        }
+
+        fn extension_version(&self) -> &'static str {
+            "lifecycle-test"
+        }
+
+        fn load_checkpoint(
+            &mut self,
+        ) -> Result<Option<DerivedStateCheckpoint>, DerivedStateConsumerFault> {
+            Ok(None)
+        }
+
+        fn config(&self) -> DerivedStateConsumerConfig {
+            DerivedStateConsumerConfig::new().with_control_plane_observed()
+        }
+
+        fn on_startup(
+            &mut self,
+            _ctx: DerivedStateConsumerStartupContext,
+        ) -> Result<(), DerivedStateConsumerStartupError> {
+            let _ = self.starts.fetch_add(1, AtomicOrdering::Relaxed);
+            Ok(())
+        }
+
+        fn on_shutdown(&mut self, _ctx: DerivedStateConsumerShutdownContext) {
+            let _ = self.stops.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+
+        fn apply(
+            &mut self,
+            _envelope: &DerivedStateFeedEnvelope,
+        ) -> Result<(), DerivedStateConsumerFault> {
+            Ok(())
+        }
+
+        fn flush_checkpoint(
+            &mut self,
+            _checkpoint: DerivedStateCheckpoint,
+        ) -> Result<(), DerivedStateConsumerFault> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn consumer_lifecycle_hooks_run_once() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let stops = Arc::new(AtomicUsize::new(0));
+        {
+            let host = DerivedStateHost::builder()
+                .add_consumer(LifecycleConsumer {
+                    starts: Arc::clone(&starts),
+                    stops: Arc::clone(&stops),
+                })
+                .build();
+            assert_eq!(host.consumer_names(), vec!["lifecycle-consumer"]);
+            assert_eq!(starts.load(AtomicOrdering::Relaxed), 0);
+            assert_eq!(stops.load(AtomicOrdering::Relaxed), 0);
+            host.initialize();
+            host.initialize();
+            assert_eq!(starts.load(AtomicOrdering::Relaxed), 1);
+            assert_eq!(stops.load(AtomicOrdering::Relaxed), 0);
+        }
+        assert_eq!(starts.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(stops.load(AtomicOrdering::Relaxed), 1);
     }
 
     #[test]
@@ -4546,6 +4778,13 @@ mod tests {
             Ok(None)
         }
 
+        fn config(&self) -> DerivedStateConsumerConfig {
+            DerivedStateConsumerConfig::new()
+                .with_transaction_applied()
+                .with_account_touch_key_partitions()
+                .with_control_plane_observed()
+        }
+
         fn apply(
             &mut self,
             envelope: &DerivedStateFeedEnvelope,
@@ -4641,6 +4880,13 @@ mod tests {
             &mut self,
         ) -> Result<Option<DerivedStateCheckpoint>, DerivedStateConsumerFault> {
             Ok(None)
+        }
+
+        fn config(&self) -> DerivedStateConsumerConfig {
+            DerivedStateConsumerConfig::new()
+                .with_transaction_applied()
+                .with_account_touch_key_partitions()
+                .with_control_plane_observed()
         }
 
         fn apply(
@@ -4751,6 +4997,13 @@ mod tests {
             Ok(self.checkpoint.take())
         }
 
+        fn config(&self) -> DerivedStateConsumerConfig {
+            DerivedStateConsumerConfig::new()
+                .with_transaction_applied()
+                .with_account_touch_key_partitions()
+                .with_control_plane_observed()
+        }
+
         fn apply(
             &mut self,
             envelope: &DerivedStateFeedEnvelope,
@@ -4822,6 +5075,13 @@ mod tests {
                 )
             })?;
             Ok(state.checkpoint.clone())
+        }
+
+        fn config(&self) -> DerivedStateConsumerConfig {
+            DerivedStateConsumerConfig::new()
+                .with_transaction_applied()
+                .with_account_touch_key_partitions()
+                .with_control_plane_observed()
         }
 
         fn apply(

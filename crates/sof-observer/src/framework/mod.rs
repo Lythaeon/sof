@@ -17,7 +17,9 @@ pub use crate::event::{ForkSlotStatus, TxCommitmentStatus};
 pub use derived_state::{
     AccountTouchObservedEvent, BranchReorgedEvent, CheckpointBarrierEvent, CheckpointBarrierReason,
     DerivedStateCheckpoint, DerivedStateCheckpointStore, DerivedStateConsumer,
-    DerivedStateConsumerFault, DerivedStateConsumerFaultKind, DerivedStateConsumerRecoveryState,
+    DerivedStateConsumerConfig, DerivedStateConsumerFault, DerivedStateConsumerFaultKind,
+    DerivedStateConsumerRecoveryState, DerivedStateConsumerShutdownContext,
+    DerivedStateConsumerStartupContext, DerivedStateConsumerStartupError,
     DerivedStateConsumerTelemetry, DerivedStateControlPlaneQuality,
     DerivedStateControlPlaneStateEvent, DerivedStateFeedEnvelope, DerivedStateFeedEvent,
     DerivedStateFreshnessState, DerivedStateHost, DerivedStateHostBuilder,

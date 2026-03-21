@@ -102,14 +102,17 @@ The consumer model should support:
 4. rollback/reorg handling,
 5. graceful shutdown with checkpoint persistence.
 
-Likely shape:
+Current implemented shape:
 
-1. `on_startup` or `load_checkpoint`
-2. `apply_event`
-3. `flush_checkpoint`
-4. `on_shutdown`
+1. static `config() -> DerivedStateConsumerConfig`
+2. optional `on_startup`
+3. `load_checkpoint`
+4. `apply`
+5. `flush_checkpoint`
+6. optional `on_shutdown`
 
-The exact API surface is deferred, but it should be purpose-built for state materialization.
+The durability boundary remains `load_checkpoint` / `flush_checkpoint`, while startup and
+shutdown hooks are consumer-local lifecycle helpers.
 
 ## Relationship to Existing Systems
 

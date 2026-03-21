@@ -50,3 +50,14 @@ Use when:
 
 Use live state when freshness dominates. Use replayed state when correctness across restarts
 dominates. Many serious services need both: fresh live updates on top of a replayable baseline.
+
+## Consumer Shape
+
+Derived-state consumers now follow the same broad discipline as plugins:
+
+- static interest is declared once with `DerivedStateConsumerConfig`
+- optional `on_startup` / `on_shutdown` hooks handle consumer-local lifecycle work
+- `load_checkpoint` / `flush_checkpoint` remain the actual durability boundary
+
+That split matters because startup hooks are operational, while checkpoint methods define replay
+continuity.

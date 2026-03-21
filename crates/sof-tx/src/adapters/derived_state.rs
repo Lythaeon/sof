@@ -305,6 +305,10 @@ impl DerivedStateConsumer for DerivedStateTxProviderAdapter {
         Ok(Some(checkpoint))
     }
 
+    fn config(&self) -> sof::framework::DerivedStateConsumerConfig {
+        sof::framework::DerivedStateConsumerConfig::new().with_control_plane_observed()
+    }
+
     fn apply(
         &mut self,
         envelope: &DerivedStateFeedEnvelope,
