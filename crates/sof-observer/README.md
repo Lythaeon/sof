@@ -123,6 +123,7 @@ use sof::runtime::{ObserverRuntime, RuntimeSetup};
 async fn main() -> Result<(), sof::runtime::RuntimeError> {
     let setup = RuntimeSetup::new()
         .with_bind_addr(SocketAddr::from(([0, 0, 0, 0], 8001)))
+        .with_observability_bind_addr(SocketAddr::from(([127, 0, 0, 1], 9108)))
         .with_startup_step_logs(true);
 
     ObserverRuntime::new()
@@ -131,6 +132,13 @@ async fn main() -> Result<(), sof::runtime::RuntimeError> {
         .await
 }
 ```
+
+When `SOF_OBSERVABILITY_BIND` (or `RuntimeSetup::with_observability_bind_addr`) is set, the
+packaged runtime also serves:
+
+- `/metrics`
+- `/healthz`
+- `/readyz`
 
 Or apply one typed gossip/ingest profile instead of stringly env overrides:
 

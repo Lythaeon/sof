@@ -35,6 +35,7 @@ User-facing crate docs:
 - ADR-0009: `adr/0009-derived-state-extensions-and-replay-contracts.md` (Implemented)
 - ADR-0010: `adr/0010-dedicated-derived-state-feed.md` (Implemented)
 - ADR-0011: `adr/0011-plugin-config-and-lifecycle-hooks.md` (Implemented)
+- ADR-0012: `adr/0012-runtime-owned-observability-endpoints.md` (Implemented)
 - Framework Hooks: `framework-plugin-hooks.md`
 - Derived-State Extension Contract: `derived-state-extension-contract.md`
 - Derived-State Feed Contract: `derived-state-feed-contract.md`

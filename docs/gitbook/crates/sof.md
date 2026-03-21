@@ -85,6 +85,30 @@ async fn main() -> Result<(), sof::runtime::RuntimeError> {
 Use this once you want bind address, gossip entrypoints, worker counts, or derived-state behavior
 to be explicit in code.
 
+You can also enable SOF's runtime-owned metrics and probe endpoint the same way:
+
+```rust
+use std::net::SocketAddr;
+use sof::runtime::{ObserverRuntime, RuntimeSetup};
+
+#[tokio::main]
+async fn main() -> Result<(), sof::runtime::RuntimeError> {
+    let setup = RuntimeSetup::new()
+        .with_observability_bind_addr(SocketAddr::from(([127, 0, 0, 1], 9108)));
+
+    ObserverRuntime::new()
+        .with_setup(setup)
+        .run_until_termination_signal()
+        .await
+}
+```
+
+That endpoint exposes:
+
+- `/metrics`
+- `/healthz`
+- `/readyz`
+
 ### 3. Start the runtime and consume one event stream
 
 ```rust
