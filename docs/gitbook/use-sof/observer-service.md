@@ -32,6 +32,7 @@ use async_trait::async_trait;
 use sof::{
     event::TxKind,
     framework::{Plugin, PluginConfig, PluginHost, TransactionEvent},
+    runtime::ObserverRuntime,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -54,7 +55,11 @@ impl Plugin for NonVoteLogger {
 #[tokio::main]
 async fn main() -> Result<(), sof::runtime::RuntimeError> {
     let host = PluginHost::builder().add_plugin(NonVoteLogger).build();
-    sof::runtime::run_async_with_plugin_host(host).await
+
+    ObserverRuntime::new()
+        .with_plugin_host(host)
+        .run_until_termination_signal()
+        .await
 }
 ```
 
