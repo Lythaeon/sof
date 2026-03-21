@@ -6,8 +6,8 @@ use sof::{
     event::TxKind,
     framework::{
         ExtensionCapability, ExtensionManifest, ExtensionStartupContext, PacketSubscription,
-        Plugin, PluginHost, RuntimeExtension, RuntimeExtensionHost, RuntimePacketEvent,
-        RuntimePacketSourceKind, TransactionEvent,
+        Plugin, PluginConfig, PluginHost, RuntimeExtension, RuntimeExtensionHost,
+        RuntimePacketEvent, RuntimePacketSourceKind, TransactionEvent,
     },
 };
 use thiserror::Error;
@@ -21,8 +21,8 @@ impl Plugin for NonVoteTxPlugin {
         "coexistence-non-vote-plugin"
     }
 
-    fn wants_transaction(&self) -> bool {
-        true
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_transaction()
     }
 
     async fn on_transaction(&self, event: &TransactionEvent) {

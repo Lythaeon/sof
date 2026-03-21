@@ -188,7 +188,7 @@ Notes for high-ingest runs:
 use async_trait::async_trait;
 use sof::{
     event::TxKind,
-    framework::{Plugin, PluginHost, TransactionEvent},
+    framework::{Plugin, PluginConfig, PluginHost, TransactionEvent},
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -196,11 +196,11 @@ struct NonVoteLogger;
 
 #[async_trait]
 impl Plugin for NonVoteLogger {
-    fn wants_transaction(&self) -> bool {
-        true
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_transaction()
     }
 
-    async fn on_transaction(&self, event: TransactionEvent) {
+    async fn on_transaction(&self, event: &TransactionEvent) {
         if event.kind == TxKind::VoteOnly {
             return;
         }
@@ -214,6 +214,10 @@ async fn main() -> Result<(), sof::runtime::RuntimeError> {
     sof::runtime::run_async_with_plugin_host(host).await
 }
 ```
+
+For sparse plugin subscriptions, prefer `PluginConfig::new().with_*()` so the enabled hooks stand
+out clearly. Use a raw `PluginConfig { .. }` literal only when many flags are enabled and the full
+shape is easier to scan.
 
 ## RuntimeExtension Quickstart
 

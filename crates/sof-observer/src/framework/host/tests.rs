@@ -2,12 +2,15 @@ use super::*;
 use async_trait::async_trait;
 use solana_transaction::Transaction;
 use std::{
-    sync::atomic::AtomicUsize,
+    sync::atomic::{AtomicBool, AtomicUsize},
     time::{Duration, Instant},
 };
 
 use crate::event::TxKind;
-use crate::framework::{TransactionEventRef, TransactionInterest, TxCommitmentStatus};
+use crate::framework::{
+    PluginConfig, PluginShutdownContext, PluginStartupContext, PluginStartupError,
+    TransactionEventRef, TransactionInterest, TxCommitmentStatus,
+};
 
 #[derive(Clone, Copy)]
 struct PluginA;
@@ -56,8 +59,8 @@ impl ObserverPlugin for PanicPlugin {
         "panic-plugin"
     }
 
-    fn wants_dataset(&self) -> bool {
-        true
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_dataset()
     }
 
     async fn on_dataset(&self, _event: DatasetEvent) {
@@ -76,8 +79,8 @@ impl ObserverPlugin for CounterPlugin {
         "counter-plugin"
     }
 
-    fn wants_dataset(&self) -> bool {
-        true
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_dataset()
     }
 
     async fn on_dataset(&self, _event: DatasetEvent) {
@@ -96,8 +99,8 @@ impl ObserverPlugin for RecentBlockhashCounterPlugin {
         "recent-blockhash-counter-plugin"
     }
 
-    fn wants_recent_blockhash(&self) -> bool {
-        true
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_recent_blockhash()
     }
 
     async fn on_recent_blockhash(&self, _event: ObservedRecentBlockhashEvent) {
@@ -117,12 +120,8 @@ impl ObserverPlugin for ForkHookCounterPlugin {
         "fork-hook-counter-plugin"
     }
 
-    fn wants_slot_status(&self) -> bool {
-        true
-    }
-
-    fn wants_reorg(&self) -> bool {
-        true
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_slot_status().with_reorg()
     }
 
     async fn on_slot_status(&self, _event: SlotStatusEvent) {
@@ -147,8 +146,8 @@ impl ObserverPlugin for FilteringTransactionPlugin {
         "filtering-transaction-plugin"
     }
 
-    fn wants_transaction(&self) -> bool {
-        true
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_transaction()
     }
 
     fn accepts_transaction_ref(&self, event: TransactionEventRef<'_>) -> bool {
@@ -187,8 +186,8 @@ impl ObserverPlugin for PriorityTransactionPlugin {
         "priority-transaction-plugin"
     }
 
-    fn wants_transaction(&self) -> bool {
-        true
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_transaction()
     }
 
     fn transaction_interest_ref(&self, event: TransactionEventRef<'_>) -> TransactionInterest {
@@ -595,6 +594,90 @@ fn critical_transaction_lane_stays_isolated_from_background_pressure() {
     assert_eq!(host.general_dropped_event_count(), 0);
     assert!(host.background_transaction_dropped_event_count() > 0);
     assert!(background_handled.load(Ordering::Relaxed) < 60);
+}
+
+#[derive(Clone)]
+struct LifecyclePlugin {
+    startup_count: Arc<AtomicUsize>,
+    shutdown_count: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ObserverPlugin for LifecyclePlugin {
+    fn name(&self) -> &'static str {
+        "lifecycle-plugin"
+    }
+
+    async fn on_startup(&self, _ctx: PluginStartupContext) -> Result<(), PluginStartupError> {
+        self.startup_count.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn on_shutdown(&self, _ctx: PluginShutdownContext) {
+        self.shutdown_count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone)]
+struct FailingStartupPlugin {
+    startup_attempted: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl ObserverPlugin for FailingStartupPlugin {
+    fn name(&self) -> &'static str {
+        "failing-startup-plugin"
+    }
+
+    async fn on_startup(&self, _ctx: PluginStartupContext) -> Result<(), PluginStartupError> {
+        self.startup_attempted.store(true, Ordering::Relaxed);
+        Err(PluginStartupError::new("boom"))
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn startup_and_shutdown_hooks_run_once() {
+    let startup_count = Arc::new(AtomicUsize::new(0));
+    let shutdown_count = Arc::new(AtomicUsize::new(0));
+    let host = PluginHostBuilder::new()
+        .add_plugin(LifecyclePlugin {
+            startup_count: Arc::clone(&startup_count),
+            shutdown_count: Arc::clone(&shutdown_count),
+        })
+        .build();
+
+    assert!(host.startup().await.is_ok());
+    assert!(host.startup().await.is_ok());
+    host.shutdown().await;
+    host.shutdown().await;
+
+    assert_eq!(startup_count.load(Ordering::Relaxed), 1);
+    assert_eq!(shutdown_count.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn startup_failure_shuts_down_started_plugins() {
+    let startup_count = Arc::new(AtomicUsize::new(0));
+    let shutdown_count = Arc::new(AtomicUsize::new(0));
+    let failed_startup = Arc::new(AtomicBool::new(false));
+    let host = PluginHostBuilder::new()
+        .add_plugin(LifecyclePlugin {
+            startup_count: Arc::clone(&startup_count),
+            shutdown_count: Arc::clone(&shutdown_count),
+        })
+        .add_plugin(FailingStartupPlugin {
+            startup_attempted: Arc::clone(&failed_startup),
+        })
+        .build();
+
+    let error = host
+        .startup()
+        .await
+        .expect_err("second plugin should fail startup");
+    assert_eq!(error.plugin, "failing-startup-plugin");
+    assert!(failed_startup.load(Ordering::Relaxed));
+    assert_eq!(startup_count.load(Ordering::Relaxed), 1);
+    assert_eq!(shutdown_count.load(Ordering::Relaxed), 1);
 }
 
 fn wait_until_counter(counter: &AtomicUsize, expected: usize, timeout: Duration) -> bool {

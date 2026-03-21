@@ -4,7 +4,10 @@
 use async_trait::async_trait;
 use sof::{
     event::TxKind,
-    framework::{DatasetEvent, Plugin, PluginHost, TransactionEvent},
+    framework::{
+        DatasetEvent, Plugin, PluginConfig, PluginHost, PluginShutdownContext,
+        PluginStartupContext, PluginStartupError, TransactionEvent,
+    },
 };
 use thiserror::Error;
 
@@ -17,8 +20,13 @@ impl Plugin for NonVoteTxLoggerPlugin {
         "non-vote-tx-logger"
     }
 
-    fn wants_transaction(&self) -> bool {
-        true
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_transaction()
+    }
+
+    async fn on_startup(&self, ctx: PluginStartupContext) -> Result<(), PluginStartupError> {
+        tracing::info!(plugin = ctx.plugin_name, "plugin startup completed");
+        Ok(())
     }
 
     async fn on_transaction(&self, event: &TransactionEvent) {
@@ -38,6 +46,10 @@ impl Plugin for NonVoteTxLoggerPlugin {
             "non-vote transaction observed"
         );
     }
+
+    async fn on_shutdown(&self, ctx: PluginShutdownContext) {
+        tracing::info!(plugin = ctx.plugin_name, "plugin shutdown completed");
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -49,8 +61,8 @@ impl Plugin for DatasetLoggerPlugin {
         "dataset-logger"
     }
 
-    fn wants_dataset(&self) -> bool {
-        true
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_dataset()
     }
 
     async fn on_dataset(&self, event: DatasetEvent) {

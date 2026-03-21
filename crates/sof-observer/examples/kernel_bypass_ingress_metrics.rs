@@ -20,7 +20,10 @@ use async_trait::async_trait;
 use sof::runtime::RuntimeSetup;
 use sof::{
     event::TxKind,
-    framework::{ObserverPlugin, PluginDispatchMode, PluginHost, RawPacketEvent, ShredEvent},
+    framework::{
+        ObserverPlugin, PluginConfig, PluginDispatchMode, PluginHost, PluginShutdownContext,
+        PluginStartupContext, PluginStartupError, RawPacketEvent, ShredEvent,
+    },
 };
 #[cfg(feature = "kernel-bypass")]
 use sof::{
@@ -132,16 +135,20 @@ impl ObserverPlugin for RawIngressMetricsPlugin {
         "kernel-bypass-ingress-metrics-plugin"
     }
 
-    fn wants_raw_packet(&self) -> bool {
-        true
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new()
+            .with_raw_packet()
+            .with_shred()
+            .with_transaction()
     }
 
-    fn wants_shred(&self) -> bool {
-        true
+    async fn on_startup(&self, ctx: PluginStartupContext) -> Result<(), PluginStartupError> {
+        tracing::info!(plugin = ctx.plugin_name, "plugin startup completed");
+        Ok(())
     }
 
-    fn wants_transaction(&self) -> bool {
-        true
+    async fn on_shutdown(&self, ctx: PluginShutdownContext) {
+        tracing::info!(plugin = ctx.plugin_name, "plugin shutdown completed");
     }
 
     async fn on_raw_packet(&self, event: RawPacketEvent) {

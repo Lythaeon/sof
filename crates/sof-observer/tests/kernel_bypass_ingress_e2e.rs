@@ -13,7 +13,7 @@ use std::{
 
 use async_trait::async_trait;
 use sof::{
-    framework::{ObserverPlugin, PluginHost, RawPacketEvent, ShredEvent},
+    framework::{ObserverPlugin, PluginConfig, PluginHost, RawPacketEvent, ShredEvent},
     ingest::{RawPacket, RawPacketBatch, RawPacketIngress},
     protocol::shred_wire::{SIZE_OF_DATA_SHRED_PAYLOAD, VARIANT_MERKLE_DATA},
     runtime,
@@ -71,12 +71,8 @@ impl ObserverPlugin for RawIngressCounterPlugin {
         "kernel-bypass-ingress-counter-plugin"
     }
 
-    fn wants_raw_packet(&self) -> bool {
-        true
-    }
-
-    fn wants_shred(&self) -> bool {
-        true
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_raw_packet().with_shred()
     }
 
     async fn on_raw_packet(&self, event: RawPacketEvent) {

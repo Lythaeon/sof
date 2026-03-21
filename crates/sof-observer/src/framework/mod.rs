@@ -45,6 +45,9 @@ pub use extension_host::{
     RuntimeExtensionCapabilityPolicy, RuntimeExtensionDispatchMetrics, RuntimeExtensionHost,
     RuntimeExtensionHostBuilder, RuntimeExtensionStartupFailure, RuntimeExtensionStartupReport,
 };
-pub use host::{PluginDispatchMode, PluginHost, PluginHostBuilder};
+pub use host::{PluginDispatchMode, PluginHost, PluginHostBuilder, PluginHostStartupError};
 pub use plugin::ObserverPlugin as Plugin;
-pub use plugin::{ObserverPlugin, TransactionInterest};
+pub use plugin::{
+    ObserverPlugin, PluginConfig, PluginShutdownContext, PluginStartupContext, PluginStartupError,
+    TransactionInterest,
+};

@@ -4,7 +4,7 @@
 use async_trait::async_trait;
 use sof::{
     event::TxKind,
-    framework::{Plugin, PluginHost, TransactionEvent},
+    framework::{Plugin, PluginConfig, PluginHost, TransactionEvent},
 };
 use thiserror::Error;
 
@@ -17,8 +17,8 @@ impl Plugin for NonVoteTxLoggerPlugin {
         "non-vote-tx-logger"
     }
 
-    fn wants_transaction(&self) -> bool {
-        true
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_transaction()
     }
 
     async fn on_transaction(&self, event: &TransactionEvent) {

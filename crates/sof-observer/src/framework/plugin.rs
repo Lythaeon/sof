@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use thiserror::Error;
 
 use crate::framework::events::{
     AccountTouchEvent, AccountTouchEventRef, ClusterTopologyEvent, DatasetEvent,
@@ -17,6 +18,152 @@ pub enum TransactionInterest {
     Critical,
 }
 
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+/// Static hook subscriptions requested by one plugin during host construction.
+pub struct PluginConfig {
+    /// Enables `on_raw_packet`.
+    pub raw_packet: bool,
+    /// Enables `on_shred`.
+    pub shred: bool,
+    /// Enables `on_dataset`.
+    pub dataset: bool,
+    /// Enables `on_transaction`.
+    pub transaction: bool,
+    /// Enables `on_account_touch`.
+    pub account_touch: bool,
+    /// Enables `on_slot_status`.
+    pub slot_status: bool,
+    /// Enables `on_reorg`.
+    pub reorg: bool,
+    /// Enables `on_recent_blockhash`.
+    pub recent_blockhash: bool,
+    /// Enables `on_cluster_topology`.
+    pub cluster_topology: bool,
+    /// Enables `on_leader_schedule`.
+    pub leader_schedule: bool,
+}
+
+impl PluginConfig {
+    /// Creates an empty plugin config with all hooks disabled.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            raw_packet: false,
+            shred: false,
+            dataset: false,
+            transaction: false,
+            account_touch: false,
+            slot_status: false,
+            reorg: false,
+            recent_blockhash: false,
+            cluster_topology: false,
+            leader_schedule: false,
+        }
+    }
+
+    /// Enables `on_raw_packet`.
+    #[must_use]
+    pub const fn with_raw_packet(mut self) -> Self {
+        self.raw_packet = true;
+        self
+    }
+
+    /// Enables `on_shred`.
+    #[must_use]
+    pub const fn with_shred(mut self) -> Self {
+        self.shred = true;
+        self
+    }
+
+    /// Enables `on_dataset`.
+    #[must_use]
+    pub const fn with_dataset(mut self) -> Self {
+        self.dataset = true;
+        self
+    }
+
+    /// Enables `on_transaction`.
+    #[must_use]
+    pub const fn with_transaction(mut self) -> Self {
+        self.transaction = true;
+        self
+    }
+
+    /// Enables `on_account_touch`.
+    #[must_use]
+    pub const fn with_account_touch(mut self) -> Self {
+        self.account_touch = true;
+        self
+    }
+
+    /// Enables `on_slot_status`.
+    #[must_use]
+    pub const fn with_slot_status(mut self) -> Self {
+        self.slot_status = true;
+        self
+    }
+
+    /// Enables `on_reorg`.
+    #[must_use]
+    pub const fn with_reorg(mut self) -> Self {
+        self.reorg = true;
+        self
+    }
+
+    /// Enables `on_recent_blockhash`.
+    #[must_use]
+    pub const fn with_recent_blockhash(mut self) -> Self {
+        self.recent_blockhash = true;
+        self
+    }
+
+    /// Enables `on_cluster_topology`.
+    #[must_use]
+    pub const fn with_cluster_topology(mut self) -> Self {
+        self.cluster_topology = true;
+        self
+    }
+
+    /// Enables `on_leader_schedule`.
+    #[must_use]
+    pub const fn with_leader_schedule(mut self) -> Self {
+        self.leader_schedule = true;
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+/// Context passed to [`ObserverPlugin::on_startup`].
+pub struct PluginStartupContext {
+    /// Plugin identifier.
+    pub plugin_name: &'static str,
+}
+
+#[derive(Debug, Clone)]
+/// Context passed to [`ObserverPlugin::on_shutdown`].
+pub struct PluginShutdownContext {
+    /// Plugin identifier.
+    pub plugin_name: &'static str,
+}
+
+#[derive(Debug, Clone, Error, Eq, PartialEq)]
+#[error("{reason}")]
+/// Plugin startup failure reported by one plugin implementation.
+pub struct PluginStartupError {
+    /// Human-readable startup failure reason.
+    reason: String,
+}
+
+impl PluginStartupError {
+    /// Creates a startup error with a human-readable reason.
+    #[must_use]
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
 /// Extension point for SOF runtime event hooks.
 ///
 /// Plugins are executed asynchronously by the plugin host worker, decoupled from ingest hot paths.
@@ -30,34 +177,27 @@ pub trait ObserverPlugin: Send + Sync + 'static {
         core::any::type_name::<Self>()
     }
 
-    /// Returns true when this plugin wants raw-packet callbacks.
-    fn wants_raw_packet(&self) -> bool {
-        false
+    /// Returns static hook subscriptions requested by this plugin.
+    ///
+    /// The host evaluates this once during construction and precomputes dispatch
+    /// targets so the runtime does not need per-hook subscription lookups later.
+    fn config(&self) -> PluginConfig {
+        PluginConfig::default()
+    }
+
+    /// Called once before the runtime enters its main event loop.
+    async fn on_startup(&self, _ctx: PluginStartupContext) -> Result<(), PluginStartupError> {
+        Ok(())
     }
 
     /// Called for every UDP packet before shred parsing.
     async fn on_raw_packet(&self, _event: RawPacketEvent) {}
 
-    /// Returns true when this plugin wants parsed shred callbacks.
-    fn wants_shred(&self) -> bool {
-        false
-    }
-
     /// Called for every packet that produced a valid parsed shred header.
     async fn on_shred(&self, _event: ShredEvent) {}
 
-    /// Returns true when this plugin wants reconstructed dataset callbacks.
-    fn wants_dataset(&self) -> bool {
-        false
-    }
-
     /// Called when a contiguous shred dataset is reconstructed.
     async fn on_dataset(&self, _event: DatasetEvent) {}
-
-    /// Returns true when this plugin wants decoded transaction callbacks.
-    fn wants_transaction(&self) -> bool {
-        false
-    }
 
     /// Returns true when this plugin wants a specific decoded transaction callback.
     ///
@@ -116,11 +256,6 @@ pub trait ObserverPlugin: Send + Sync + 'static {
         self.on_transaction(event).await;
     }
 
-    /// Returns true when this plugin wants account-touch callbacks.
-    fn wants_account_touch(&self) -> bool {
-        false
-    }
-
     /// Borrowed account-touch prefilter used on the dataset hot path.
     ///
     /// Override this to reject irrelevant account-touch callbacks before the
@@ -132,43 +267,21 @@ pub trait ObserverPlugin: Send + Sync + 'static {
     /// Called for each decoded transaction's static touched-account set.
     async fn on_account_touch(&self, _event: &AccountTouchEvent) {}
 
-    /// Returns true when this plugin wants slot-status callbacks.
-    fn wants_slot_status(&self) -> bool {
-        false
-    }
-
     /// Called when local slot status transitions (processed/confirmed/finalized/orphaned).
     async fn on_slot_status(&self, _event: SlotStatusEvent) {}
-
-    /// Returns true when this plugin wants reorg callbacks.
-    fn wants_reorg(&self) -> bool {
-        false
-    }
 
     /// Called when local canonical tip switches to a different branch.
     async fn on_reorg(&self, _event: ReorgEvent) {}
 
-    /// Returns true when this plugin wants recent-blockhash callbacks.
-    fn wants_recent_blockhash(&self) -> bool {
-        false
-    }
-
     /// Called when a newer observed recent blockhash is detected.
     async fn on_recent_blockhash(&self, _event: ObservedRecentBlockhashEvent) {}
-
-    /// Returns true when this plugin wants cluster-topology callbacks.
-    fn wants_cluster_topology(&self) -> bool {
-        false
-    }
 
     /// Called on low-frequency cluster topology diffs/snapshots (gossip-bootstrap mode).
     async fn on_cluster_topology(&self, _event: ClusterTopologyEvent) {}
 
-    /// Returns true when this plugin wants leader-schedule callbacks.
-    fn wants_leader_schedule(&self) -> bool {
-        false
-    }
-
     /// Called on event-driven leader-schedule diffs/snapshots.
     async fn on_leader_schedule(&self, _event: LeaderScheduleEvent) {}
+
+    /// Called during runtime shutdown after ingest has stopped.
+    async fn on_shutdown(&self, _ctx: PluginShutdownContext) {}
 }

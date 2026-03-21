@@ -32,8 +32,9 @@ User-facing crate docs:
 - ADR-0006: `adr/0006-transaction-sdk-and-dual-submit-routing.md` (Implemented)
 - ADR-0007: `adr/0007-always-on-relay-and-shred-cache-mesh.md` (Implemented)
 - ADR-0008: `adr/0008-runtime-extension-capability-and-filtered-ingress.md` (Implemented)
-- ADR-0009: `adr/0009-derived-state-extensions-and-replay-contracts.md` (Proposed)
-- ADR-0010: `adr/0010-dedicated-derived-state-feed.md` (Proposed)
+- ADR-0009: `adr/0009-derived-state-extensions-and-replay-contracts.md` (Implemented)
+- ADR-0010: `adr/0010-dedicated-derived-state-feed.md` (Implemented)
+- ADR-0011: `adr/0011-plugin-config-and-lifecycle-hooks.md` (Implemented)
 - Framework Hooks: `framework-plugin-hooks.md`
 - Derived-State Extension Contract: `derived-state-extension-contract.md`
 - Derived-State Feed Contract: `derived-state-feed-contract.md`

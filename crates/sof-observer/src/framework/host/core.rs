@@ -7,6 +7,7 @@ use super::*;
 use crate::framework::AccountTouchEvent;
 use crate::framework::events::AccountTouchEventRef;
 use crate::framework::events::TransactionEventRef;
+use crate::framework::{PluginShutdownContext, PluginStartupContext};
 
 /// Immutable plugin registry and async event dispatcher.
 #[derive(Clone)]
@@ -27,6 +28,8 @@ pub struct PluginHost {
     pub(super) latest_observed_recent_blockhash: ArcShift<Option<ObservedRecentBlockhashState>>,
     /// Latest observed TPU leader snapshot.
     pub(super) latest_observed_tpu_leader: ArcShift<Option<ObservedTpuLeaderState>>,
+    /// Shared lifecycle guard for startup/shutdown hooks.
+    pub(super) lifecycle: Arc<PluginHostLifecycleState>,
 }
 
 impl Default for PluginHost {
@@ -40,6 +43,7 @@ impl Default for PluginHost {
             subscriptions: PluginHookSubscriptions::default(),
             latest_observed_recent_blockhash: ArcShift::new(None),
             latest_observed_tpu_leader: ArcShift::new(None),
+            lifecycle: Arc::new(PluginHostLifecycleState::default()),
         }
     }
 }
@@ -123,6 +127,67 @@ impl PluginHost {
     #[must_use]
     pub fn plugin_names(&self) -> Vec<&'static str> {
         self.plugins.iter().map(|plugin| plugin.name()).collect()
+    }
+
+    /// Runs plugin startup hooks once before the runtime main loop begins.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PluginHostStartupError`] when any registered plugin fails its
+    /// `on_startup` hook. Plugins started earlier in the same startup pass are
+    /// shut down best-effort before the error is returned.
+    pub async fn startup(&self) -> Result<(), PluginHostStartupError> {
+        if self
+            .lifecycle
+            .started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+
+        let mut started_plugins: Vec<Arc<dyn ObserverPlugin>> =
+            Vec::with_capacity(self.plugins.len());
+        for plugin in self.plugins.iter() {
+            let plugin_name = plugin.name();
+            let startup_context = PluginStartupContext { plugin_name };
+            if let Err(error) = plugin.on_startup(startup_context).await {
+                for started_plugin in started_plugins.iter().rev() {
+                    started_plugin
+                        .on_shutdown(PluginShutdownContext {
+                            plugin_name: started_plugin.name(),
+                        })
+                        .await;
+                }
+                self.lifecycle.started.store(false, Ordering::Release);
+                return Err(PluginHostStartupError {
+                    plugin: plugin_name,
+                    reason: error.to_string(),
+                });
+            }
+            started_plugins.push(Arc::clone(plugin));
+        }
+        Ok(())
+    }
+
+    /// Runs plugin shutdown hooks once after runtime ingest has stopped.
+    pub async fn shutdown(&self) {
+        if self
+            .lifecycle
+            .started
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        for plugin in self.plugins.iter().rev() {
+            plugin
+                .on_shutdown(PluginShutdownContext {
+                    plugin_name: plugin.name(),
+                })
+                .await;
+        }
     }
 
     /// Returns latest observed recent blockhash snapshot from live runtime data.

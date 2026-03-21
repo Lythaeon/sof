@@ -31,7 +31,7 @@ That means your service shape is:
 use async_trait::async_trait;
 use sof::{
     event::TxKind,
-    framework::{Plugin, PluginHost, TransactionEvent},
+    framework::{Plugin, PluginConfig, PluginHost, TransactionEvent},
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -39,8 +39,8 @@ struct NonVoteLogger;
 
 #[async_trait]
 impl Plugin for NonVoteLogger {
-    fn wants_transaction(&self) -> bool {
-        true
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_transaction()
     }
 
     async fn on_transaction(&self, event: &TransactionEvent) {
@@ -63,6 +63,9 @@ This is the right first service because it proves all of the important boundarie
 - SOF can start on your host
 - your service can receive decoded events
 - your application logic can stay outside the runtime core
+
+If the plugin needs initialization or cleanup, add `on_startup(ctx)` and `on_shutdown(ctx)`.
+The packaged runtime invokes both automatically when the host is attached.
 
 ## What You Usually Add Next
 

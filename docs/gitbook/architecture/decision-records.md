@@ -15,6 +15,7 @@ Key ADR themes in this repository:
 - transaction SDK routing model
 - always-on relay and shred-cache mesh
 - runtime extension capability model
+- plugin config and lifecycle hooks
 - derived-state replay contracts
 
 Use ADRs when you need to understand why a decision exists and what tradeoff was accepted.

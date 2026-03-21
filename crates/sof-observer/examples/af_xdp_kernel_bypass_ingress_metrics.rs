@@ -26,7 +26,9 @@ use async_trait::async_trait;
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
 use sof::{
     event::TxKind,
-    framework::{ObserverPlugin, PluginDispatchMode, PluginHost, RawPacketEvent, ShredEvent},
+    framework::{
+        ObserverPlugin, PluginConfig, PluginDispatchMode, PluginHost, RawPacketEvent, ShredEvent,
+    },
     ingest::{RawPacket, RawPacketIngress},
     runtime::KernelBypassIngressSender,
 };
@@ -152,16 +154,11 @@ impl ObserverPlugin for RawIngressMetricsPlugin {
         "af-xdp-kernel-bypass-ingress-metrics-plugin"
     }
 
-    fn wants_raw_packet(&self) -> bool {
-        true
-    }
-
-    fn wants_shred(&self) -> bool {
-        true
-    }
-
-    fn wants_transaction(&self) -> bool {
-        true
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new()
+            .with_raw_packet()
+            .with_shred()
+            .with_transaction()
     }
 
     async fn on_raw_packet(&self, event: RawPacketEvent) {
