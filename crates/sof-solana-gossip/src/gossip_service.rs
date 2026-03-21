@@ -40,6 +40,7 @@ use {
 };
 
 const DEFAULT_SUBMIT_GOSSIP_STATS_INTERVAL: Duration = Duration::from_secs(10);
+const GOSSIP_STATS_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 fn gossip_stats_interval() -> Option<Duration> {
     crate::read_runtime_env_override("SOF_GOSSIP_STATS_INTERVAL_SECS")
@@ -132,8 +133,16 @@ impl GossipService {
                 let stats_interval =
                     gossip_stats_interval().unwrap_or(DEFAULT_SUBMIT_GOSSIP_STATS_INTERVAL);
                 move || {
+                    let mut next_report_at = Instant::now() + stats_interval;
                     while !exit.load(Ordering::Relaxed) {
-                        sleep(stats_interval);
+                        let now = Instant::now();
+                        if now < next_report_at {
+                            let wait = next_report_at
+                                .saturating_duration_since(now)
+                                .min(GOSSIP_STATS_EXIT_POLL_INTERVAL);
+                            sleep(wait);
+                            continue;
+                        }
                         let stakes = epoch_specs
                             .as_mut()
                             .map(|epoch_specs| epoch_specs.current_epoch_staked_nodes())
@@ -143,6 +152,7 @@ impl GossipService {
                         submit_gossip_stats(&cluster_info.stats, &cluster_info.gossip, &stakes);
                         gossip_queue_stats.report();
                         gossip_receiver_stats.report();
+                        next_report_at = Instant::now() + stats_interval;
                     }
                 }
             })
