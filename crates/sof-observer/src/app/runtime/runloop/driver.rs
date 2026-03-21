@@ -2116,6 +2116,56 @@ async fn run_async_with_hosts_inner(
                     gossip_runtime_stall_age_ms,
                     repair_dynamic_stream_healthy,
                 );
+                crate::runtime_metrics::set_network_operability_metrics(
+                    relay_cache
+                        .as_ref()
+                        .map_or(0_u64, |cache| u64::try_from(cache.len()).unwrap_or(u64::MAX)),
+                    relay_cache_inserts,
+                    relay_cache_replacements,
+                    relay_cache_evictions,
+                    udp_relay_candidates,
+                    udp_relay_peers_telemetry,
+                    udp_relay_refreshes,
+                    udp_relay_forwarded_packets,
+                    udp_relay_send_attempts,
+                    udp_relay_send_errors,
+                    udp_relay_rate_limited_packets,
+                    udp_relay_source_filtered_packets,
+                    udp_relay_backoff_events,
+                    udp_relay_backoff_drops,
+                    repair_requests_total,
+                    repair_requests_enqueued,
+                    repair_requests_sent,
+                    repair_requests_no_peer,
+                    repair_request_errors,
+                    repair_request_queue_drops,
+                    repair_requests_skipped_outstanding,
+                    outstanding_repairs.as_ref().map_or(0_u64, |repairs| {
+                        u64::try_from(repairs.len()).unwrap_or(u64::MAX)
+                    }),
+                    repair_outstanding_purged,
+                    repair_outstanding_cleared_on_receive,
+                    repair_response_pings,
+                    repair_response_ping_errors,
+                    repair_ping_queue_drops,
+                    repair_serve_requests_enqueued,
+                    repair_serve_requests_handled,
+                    repair_serve_responses_sent,
+                    repair_serve_cache_misses,
+                    repair_serve_rate_limited,
+                    repair_serve_rate_limited_peer,
+                    repair_serve_rate_limited_bytes,
+                    repair_serve_errors,
+                    repair_serve_queue_drops,
+                    repair_source_hint_enqueued,
+                    repair_source_hint_drops,
+                    repair_source_hint_buffer_drops,
+                    repair_peer_total,
+                    repair_peer_active,
+                    gossip_switch_attempts,
+                    gossip_switch_successes,
+                    gossip_switch_fails,
+                );
                 let runtime_stage_metrics = crate::runtime_metrics::snapshot();
                 telemetry_tick_count = telemetry_tick_count.saturating_add(1);
                 let dataset_queue_pressure = dataset_queue_capacity_total > 0

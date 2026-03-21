@@ -213,7 +213,7 @@ fn render_metrics(
     extension_host: &RuntimeExtensionHost,
     derived_state_host: &DerivedStateHost,
 ) -> String {
-    let mut buffer = String::with_capacity(8 * 1024);
+    let mut buffer = String::with_capacity(16 * 1024);
     let state = handle.snapshot();
     append_metric_family(
         &mut buffer,
@@ -678,6 +678,534 @@ fn render_metrics(
         &mut buffer,
         "sof_repair_dynamic_stream_healthy",
         u8::from(snapshot.repair_dynamic_stream_healthy),
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_relay_cache_entries",
+        "Current relay cache entry count.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_relay_cache_entries",
+        snapshot.relay_cache_entries,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_relay_cache_inserts_total",
+        "Relay cache inserts since startup.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_relay_cache_inserts_total",
+        snapshot.relay_cache_inserts_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_relay_cache_replacements_total",
+        "Relay cache replacements since startup.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_relay_cache_replacements_total",
+        snapshot.relay_cache_replacements_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_relay_cache_evictions_total",
+        "Relay cache evictions since startup.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_relay_cache_evictions_total",
+        snapshot.relay_cache_evictions_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_udp_relay_candidates",
+        "Current UDP relay candidate peer count after filtering.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_udp_relay_candidates",
+        snapshot.udp_relay_candidates,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_udp_relay_peers",
+        "Current UDP relay peer count selected for forwarding.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_udp_relay_peers",
+        snapshot.udp_relay_peers,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_udp_relay_refreshes_total",
+        "UDP relay peer refresh cycles since startup.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_udp_relay_refreshes_total",
+        snapshot.udp_relay_refreshes_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_udp_relay_forwarded_packets_total",
+        "Packets forwarded by the UDP relay.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_udp_relay_forwarded_packets_total",
+        snapshot.udp_relay_forwarded_packets_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_udp_relay_send_attempts_total",
+        "UDP relay send attempts.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_udp_relay_send_attempts_total",
+        snapshot.udp_relay_send_attempts_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_udp_relay_send_errors_total",
+        "UDP relay send errors.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_udp_relay_send_errors_total",
+        snapshot.udp_relay_send_errors_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_udp_relay_rate_limited_packets_total",
+        "UDP relay packets dropped by rate limiting.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_udp_relay_rate_limited_packets_total",
+        snapshot.udp_relay_rate_limited_packets_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_udp_relay_source_filtered_packets_total",
+        "Packets filtered out before UDP relay forwarding.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_udp_relay_source_filtered_packets_total",
+        snapshot.udp_relay_source_filtered_packets_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_udp_relay_backoff_events_total",
+        "UDP relay backoff activations.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_udp_relay_backoff_events_total",
+        snapshot.udp_relay_backoff_events_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_udp_relay_backoff_drops_total",
+        "Packets dropped due to UDP relay backoff.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_udp_relay_backoff_drops_total",
+        snapshot.udp_relay_backoff_drops_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_repair_requests_total",
+        "Repair requests considered by the runtime.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_repair_requests_total",
+        snapshot.repair_requests_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_repair_requests_enqueued_total",
+        "Repair requests enqueued for the repair driver.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_repair_requests_enqueued_total",
+        snapshot.repair_requests_enqueued_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_repair_requests_sent_total",
+        "Repair requests successfully sent.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_repair_requests_sent_total",
+        snapshot.repair_requests_sent_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_repair_requests_no_peer_total",
+        "Repair requests skipped because no peer was available.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_repair_requests_no_peer_total",
+        snapshot.repair_requests_no_peer_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_repair_request_errors_total",
+        "Repair request send errors.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_repair_request_errors_total",
+        snapshot.repair_request_errors_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_repair_request_queue_drops_total",
+        "Repair requests dropped before enqueue due to queue pressure.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_repair_request_queue_drops_total",
+        snapshot.repair_request_queue_drops_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_repair_requests_skipped_outstanding_total",
+        "Repair requests skipped because one was already outstanding.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_repair_requests_skipped_outstanding_total",
+        snapshot.repair_requests_skipped_outstanding_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_repair_outstanding_entries",
+        "Current outstanding repair request count.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_repair_outstanding_entries",
+        snapshot.repair_outstanding_entries,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_repair_outstanding_purged_total",
+        "Outstanding repair requests purged by timeout.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_repair_outstanding_purged_total",
+        snapshot.repair_outstanding_purged_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_repair_outstanding_cleared_on_receive_total",
+        "Outstanding repair requests cleared when data arrived.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_repair_outstanding_cleared_on_receive_total",
+        snapshot.repair_outstanding_cleared_on_receive_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_repair_response_pings_total",
+        "Repair response pings sent.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_repair_response_pings_total",
+        snapshot.repair_response_pings_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_repair_response_ping_errors_total",
+        "Repair response ping send errors.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_repair_response_ping_errors_total",
+        snapshot.repair_response_ping_errors_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_repair_ping_queue_drops_total",
+        "Repair pings dropped due to queue pressure.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_repair_ping_queue_drops_total",
+        snapshot.repair_ping_queue_drops_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_repair_serve_requests_enqueued_total",
+        "Incoming repair serve requests enqueued.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_repair_serve_requests_enqueued_total",
+        snapshot.repair_serve_requests_enqueued_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_repair_serve_requests_handled_total",
+        "Incoming repair serve requests handled.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_repair_serve_requests_handled_total",
+        snapshot.repair_serve_requests_handled_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_repair_serve_responses_sent_total",
+        "Repair serve responses sent.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_repair_serve_responses_sent_total",
+        snapshot.repair_serve_responses_sent_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_repair_serve_cache_misses_total",
+        "Repair serve cache misses.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_repair_serve_cache_misses_total",
+        snapshot.repair_serve_cache_misses_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_repair_serve_rate_limited_total",
+        "Repair serve drops due to aggregate rate limiting.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_repair_serve_rate_limited_total",
+        snapshot.repair_serve_rate_limited_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_repair_serve_rate_limited_peer_total",
+        "Repair serve drops due to per-peer rate limiting.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_repair_serve_rate_limited_peer_total",
+        snapshot.repair_serve_rate_limited_peer_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_repair_serve_rate_limited_bytes_total",
+        "Repair serve bytes dropped by byte budgeting.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_repair_serve_rate_limited_bytes_total",
+        snapshot.repair_serve_rate_limited_bytes_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_repair_serve_errors_total",
+        "Repair serve response errors.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_repair_serve_errors_total",
+        snapshot.repair_serve_errors_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_repair_serve_queue_drops_total",
+        "Repair serve queue drops.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_repair_serve_queue_drops_total",
+        snapshot.repair_serve_queue_drops_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_repair_source_hint_enqueued_total",
+        "Repair source hints enqueued.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_repair_source_hint_enqueued_total",
+        snapshot.repair_source_hint_enqueued_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_repair_source_hint_drops_total",
+        "Repair source hints dropped during enqueue.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_repair_source_hint_drops_total",
+        snapshot.repair_source_hint_drops_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_repair_source_hint_buffer_drops_total",
+        "Repair source hints dropped by the hint buffer.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_repair_source_hint_buffer_drops_total",
+        snapshot.repair_source_hint_buffer_drops_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_repair_peer_total",
+        "Current repair peer count known to the runtime.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_repair_peer_total",
+        snapshot.repair_peer_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_repair_peer_active",
+        "Current active repair peer count after runtime filtering.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_repair_peer_active",
+        snapshot.repair_peer_active,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_gossip_runtime_switch_attempts_total",
+        "Gossip-runtime switch attempts.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_gossip_runtime_switch_attempts_total",
+        snapshot.gossip_runtime_switch_attempts_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_gossip_runtime_switch_successes_total",
+        "Successful gossip-runtime switches.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_gossip_runtime_switch_successes_total",
+        snapshot.gossip_runtime_switch_successes_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_gossip_runtime_switch_failures_total",
+        "Failed gossip-runtime switches.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_gossip_runtime_switch_failures_total",
+        snapshot.gossip_runtime_switch_failures_total,
         None,
     );
 
@@ -1161,6 +1689,8 @@ mod tests {
         assert!(metrics.contains("sof_ingest_packets_seen_total "));
         assert!(metrics.contains("sof_packet_worker_queue_depth "));
         assert!(metrics.contains("sof_latest_shred_age_ms "));
+        assert!(metrics.contains("sof_udp_relay_forwarded_packets_total "));
+        assert!(metrics.contains("sof_repair_requests_total "));
     }
 
     #[tokio::test(flavor = "current_thread")]
