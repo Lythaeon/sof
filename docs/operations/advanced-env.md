@@ -103,6 +103,9 @@ Metrics now available from the runtime-owned endpoint include:
 - ingest totals and ingest drop counters
 - dataset backlog and packet-worker queue depth
 - dedupe occupancy and dedupe drop counters
+- relay cache occupancy and UDP relay counters
+- repair request, serve, hint, and peer-health counters
+- gossip runtime switch attempt counters
 - derived-state consumer and replay health
 - runtime-extension queue/drop/dispatch telemetry
 - freshness gauges like `latest_shred_age_ms` and `gossip_runtime_stall_age_ms`

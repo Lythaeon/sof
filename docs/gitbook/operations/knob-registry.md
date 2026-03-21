@@ -105,6 +105,9 @@ SOF's runtime-owned observability endpoint exposes low-cardinality operational m
 - ingest totals and ingest drops
 - dataset and packet-worker backlog
 - dedupe occupancy and drop counters
+- relay cache occupancy and bounded UDP relay behavior
+- repair request / serve / peer-health behavior
+- gossip runtime switch attempt counters
 - derived-state health
 - runtime-extension dispatch health
 - freshness/readiness gauges

@@ -83,6 +83,11 @@ Useful runtime-owned endpoint metrics while tuning:
 - `sof_dataset_queue_depth`
 - `sof_packet_worker_queue_depth`
 - `sof_shred_dedupe_capacity_evictions_total`
+- `sof_udp_relay_forwarded_packets_total`
+- `sof_udp_relay_source_filtered_packets_total`
+- `sof_repair_requests_sent_total`
+- `sof_repair_outstanding_entries`
+- `sof_repair_peer_active`
 - `sof_latest_shred_age_ms`
 - `sof_gossip_runtime_stall_age_ms`
 
