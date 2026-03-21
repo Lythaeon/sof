@@ -17,6 +17,7 @@ Key ADR themes in this repository:
 - runtime extension capability model
 - plugin config and lifecycle hooks
 - derived-state replay contracts
+- runtime-owned observability endpoints
 
 Use ADRs when you need to understand why a decision exists and what tradeoff was accepted.
 

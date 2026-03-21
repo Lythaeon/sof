@@ -167,6 +167,13 @@ Runtime hardening workflow for public-host changes:
 - Use `cargo make vps-derived-state-restart-check` when changing derived-state checkpoint, replay, or shutdown behavior.
 - Include the VPS host class and the observed drop/replay results in the PR notes when these scripts are part of validation.
 
+Benchmark workflow for hot-path changes:
+
+- Use `cargo bench -p sof --bench hot_paths --no-run` as the fast compile-only smoke check for the Criterion harness.
+- Run `cargo bench -p sof --bench hot_paths` when changing relay, reassembly, or derived-state dispatch hot paths.
+- When local host noise is too high, validate the same bench binary on the reference VPS and include the command and host class in the PR notes.
+- Treat benchmark deltas as evidence, not proof by themselves: explain the workload shape and any limits of the measurement.
+
 Fuzzing workflow:
 
 - Fuzz targets and corpora are in `crates/sof-observer/fuzz/`.

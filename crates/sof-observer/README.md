@@ -87,11 +87,16 @@ cargo run --release -p sof --example observer_runtime --features gossip-bootstra
 Basic programmatic setup:
 
 ```rust
+use sof::runtime::{ObserverRuntime, RuntimeSetup};
+
 #[tokio::main]
 async fn main() -> Result<(), sof::runtime::RuntimeError> {
-    let setup = sof::runtime::RuntimeSetup::new()
-        .with_startup_step_logs(true);
-    sof::runtime::run_async_with_setup(&setup).await
+    let setup = RuntimeSetup::new().with_startup_step_logs(true);
+
+    ObserverRuntime::new()
+        .with_setup(setup)
+        .run_until_termination_signal()
+        .await
 }
 ```
 
@@ -100,9 +105,11 @@ async fn main() -> Result<(), sof::runtime::RuntimeError> {
 Embed directly in Tokio:
 
 ```rust
+use sof::runtime::ObserverRuntime;
+
 #[tokio::main]
 async fn main() -> Result<(), sof::runtime::RuntimeError> {
-    sof::runtime::run_async().await
+    ObserverRuntime::new().run_until_termination_signal().await
 }
 ```
 
@@ -110,26 +117,44 @@ Or use programmatic setup:
 
 ```rust
 use std::net::SocketAddr;
+use sof::runtime::{ObserverRuntime, RuntimeSetup};
 
 #[tokio::main]
 async fn main() -> Result<(), sof::runtime::RuntimeError> {
-    let setup = sof::runtime::RuntimeSetup::new()
+    let setup = RuntimeSetup::new()
         .with_bind_addr(SocketAddr::from(([0, 0, 0, 0], 8001)))
+        .with_observability_bind_addr(SocketAddr::from(([127, 0, 0, 1], 9108)))
         .with_startup_step_logs(true);
-    sof::runtime::run_async_with_setup(&setup).await
+
+    ObserverRuntime::new()
+        .with_setup(setup)
+        .run_until_termination_signal()
+        .await
 }
 ```
+
+When `SOF_OBSERVABILITY_BIND` (or `RuntimeSetup::with_observability_bind_addr`) is set, the
+packaged runtime also serves:
+
+- `/metrics`
+- `/healthz`
+- `/readyz`
 
 Or apply one typed gossip/ingest profile instead of stringly env overrides:
 
 ```rust
+use sof::runtime::{ObserverRuntime, RuntimeSetup};
 use sof_gossip_tuning::{GossipTuningProfile, HostProfilePreset};
 
 #[tokio::main]
 async fn main() -> Result<(), sof::runtime::RuntimeError> {
-    let setup = sof::runtime::RuntimeSetup::new()
+    let setup = RuntimeSetup::new()
         .with_gossip_tuning_profile(GossipTuningProfile::preset(HostProfilePreset::Vps));
-    sof::runtime::run_async_with_setup(&setup).await
+
+    ObserverRuntime::new()
+        .with_setup(setup)
+        .run_until_termination_signal()
+        .await
 }
 ```
 
@@ -189,6 +214,7 @@ use async_trait::async_trait;
 use sof::{
     event::TxKind,
     framework::{Plugin, PluginConfig, PluginHost, TransactionEvent},
+    runtime::ObserverRuntime,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -211,7 +237,11 @@ impl Plugin for NonVoteLogger {
 #[tokio::main]
 async fn main() -> Result<(), sof::runtime::RuntimeError> {
     let host = PluginHost::builder().add_plugin(NonVoteLogger).build();
-    sof::runtime::run_async_with_plugin_host(host).await
+
+    ObserverRuntime::new()
+        .with_plugin_host(host)
+        .run_until_termination_signal()
+        .await
 }
 ```
 
@@ -227,6 +257,7 @@ use sof::framework::{
     ExtensionCapability, ExtensionContext, ExtensionManifest, PacketSubscription,
     RuntimeExtension, RuntimeExtensionHost, RuntimePacketSourceKind,
 };
+use sof::runtime::ObserverRuntime;
 
 #[derive(Debug, Clone, Copy)]
 struct IngressExtension;
@@ -253,7 +284,11 @@ async fn main() -> Result<(), sof::runtime::RuntimeError> {
     let host = RuntimeExtensionHost::builder()
         .add_extension(IngressExtension)
         .build();
-    sof::runtime::run_async_with_extension_host(host).await
+
+    ObserverRuntime::new()
+        .with_extension_host(host)
+        .run_until_termination_signal()
+        .await
 }
 ```
 

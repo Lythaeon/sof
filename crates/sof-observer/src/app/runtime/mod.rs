@@ -2,6 +2,7 @@ mod bootstrap;
 mod dataset;
 mod entrypoints;
 mod logging;
+mod observability;
 mod prelude;
 mod runloop;
 #[cfg(test)]
@@ -20,6 +21,7 @@ pub(crate) use entrypoints::{
     run_async_with_plugin_host_and_kernel_bypass_ingress,
 };
 use logging::init_tracing;
+use observability::{RuntimeObservabilityHandle, RuntimeObservabilityService};
 use prelude::*;
 
 #[cfg(feature = "gossip-bootstrap")]

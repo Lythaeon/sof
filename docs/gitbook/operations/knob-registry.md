@@ -43,6 +43,7 @@ Snapshot date:
 | Knob | Default | Scope | Meaning |
 | --- | --- | --- | --- |
 | `SOF_BIND` | `0.0.0.0:8001` | all builds | Direct UDP bind address for the packaged runtime. |
+| `SOF_OBSERVABILITY_BIND` | unset | all builds | TCP bind address for SOF's runtime-owned `/metrics`, `/healthz`, and `/readyz` endpoint. |
 | `SOF_GOSSIP_ENTRYPOINT` | mainnet bootstrap set with `gossip-bootstrap`, otherwise unset | `gossip-bootstrap` affects behavior | Comma-separated gossip entrypoints used for bootstrap discovery. |
 | `SOF_GOSSIP_BOOTSTRAP_ONLY` | `false` | `gossip-bootstrap` | Bootstrap gossip control-plane state, then detach it and keep direct receivers active. |
 | `SOF_LIVE_SHREDS_ENABLED` | `true` | all builds | Enables live shred processing paths required by parts of the control plane. |
@@ -98,6 +99,18 @@ Snapshot date:
 | `SOF_LOG_DATASET_RECONSTRUCTION` | `false` | all builds | Emit dataset reconstruction logs. |
 | `SOF_LOG_REPAIR_PEER_TRAFFIC` | `false` | `gossip-bootstrap` | Emit repair peer traffic logs. |
 | `SOF_LOG_REPAIR_PEER_TRAFFIC_EVERY` | `256` | `gossip-bootstrap` | Sampling interval for repair peer traffic logs. |
+
+SOF's runtime-owned observability endpoint exposes low-cardinality operational metrics for:
+
+- ingest totals and ingest drops
+- dataset and packet-worker backlog
+- dedupe occupancy and drop counters
+- relay cache occupancy and bounded UDP relay behavior
+- repair request / serve / peer-health behavior
+- gossip runtime switch attempt counters
+- derived-state health
+- runtime-extension dispatch health
+- freshness/readiness gauges
 
 ## Verification And Dedupe
 

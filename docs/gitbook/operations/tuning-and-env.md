@@ -10,6 +10,16 @@ For first deployments, keep to:
 - `SOF_BIND`
 - `SOF_GOSSIP_ENTRYPOINT` when using gossip bootstrap
 
+Enable SOF's runtime-owned probe/scrape listener only when you actually need it:
+
+- `SOF_OBSERVABILITY_BIND`
+
+When enabled, SOF exposes:
+
+- `/metrics`
+- `/healthz`
+- `/readyz`
+
 If you configure the runtime in code, prefer `RuntimeSetup` and `sof-gossip-tuning` instead of raw
 string overrides.
 
@@ -65,6 +75,21 @@ Useful bundled gossip telemetry while tuning:
 - `gossip_socket_consume_verify_queue current_len`, `max_len`, and `dropped_packets`
 - `gossip_socket_consume_output_queue current_len`, `max_len`, and `dropped_packets`
 - `cluster_info_stats2 gossip_packets_dropped_count`
+
+Useful runtime-owned endpoint metrics while tuning:
+
+- `sof_ingest_packets_seen_total`
+- `sof_ingest_dropped_packets_total`
+- `sof_dataset_queue_depth`
+- `sof_packet_worker_queue_depth`
+- `sof_shred_dedupe_capacity_evictions_total`
+- `sof_udp_relay_forwarded_packets_total`
+- `sof_udp_relay_source_filtered_packets_total`
+- `sof_repair_requests_sent_total`
+- `sof_repair_outstanding_entries`
+- `sof_repair_peer_active`
+- `sof_latest_shred_age_ms`
+- `sof_gossip_runtime_stall_age_ms`
 
 ## Signs You Are Overtuning
 
