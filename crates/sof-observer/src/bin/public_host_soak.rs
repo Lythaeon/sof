@@ -827,7 +827,7 @@ fn start_observer_profile_with_retries(
     extra_env: &[(String, String)],
 ) -> Result<StartedProcess, DynError> {
     for attempt in 1..=config.startup_retries {
-        cleanup_stale_processes("observer_runtime")?;
+        cleanup_stale_processes(binary_path)?;
         wait_for_port_range_release(config.port_range, config.shutdown_timeout)?;
         remove_if_exists(log_path)?;
 
@@ -889,7 +889,7 @@ fn start_derived_state_with_retries(
     observability_bind: Option<&str>,
 ) -> Result<StartedProcess, DynError> {
     for attempt in 1..=config.startup_retries {
-        cleanup_stale_processes("derived_state_slot_mirror")?;
+        cleanup_stale_processes(binary_path)?;
         wait_for_port_range_release(config.port_range, config.shutdown_timeout)?;
         remove_if_exists(log_path)?;
 
@@ -1140,12 +1140,19 @@ fn remove_if_exists(path: &Path) -> Result<(), DynError> {
 /// # Errors
 ///
 /// Returns an error when `pkill` fails unexpectedly.
-fn cleanup_stale_processes(binary_name: &str) -> Result<(), DynError> {
-    let status = Command::new("pkill").args(["-x", binary_name]).status()?;
+fn cleanup_stale_processes(binary_path: &Path) -> Result<(), DynError> {
+    let status = Command::new("pkill")
+        .args(["-f", "--"])
+        .arg(binary_path)
+        .status()?;
     if status.success() || status.code() == Some(1) {
         return Ok(());
     }
-    Err(io::Error::other(format!("pkill failed for {binary_name}: {status}")).into())
+    Err(io::Error::other(format!(
+        "pkill failed for {}: {status}",
+        binary_path.display()
+    ))
+    .into())
 }
 
 /// Allocates an ephemeral loopback TCP port for the observability endpoint.
