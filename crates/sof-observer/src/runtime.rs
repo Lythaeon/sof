@@ -558,6 +558,30 @@ impl RuntimeSetup {
         self.with_env("SOF_UDP_IDLE_WAIT_MS", idle_wait_ms.to_string())
     }
 
+    /// Sets `SOF_UDP_BUSY_POLL_US`.
+    ///
+    /// Linux only. Use `0` or leave unset to disable socket busy polling.
+    #[must_use]
+    pub fn with_udp_busy_poll_us(self, busy_poll_us: u32) -> Self {
+        self.with_env("SOF_UDP_BUSY_POLL_US", busy_poll_us.to_string())
+    }
+
+    /// Sets `SOF_UDP_BUSY_POLL_BUDGET`.
+    ///
+    /// Linux only. This controls how many packets one busy-poll pass will try to drain.
+    #[must_use]
+    pub fn with_udp_busy_poll_budget(self, busy_poll_budget: u32) -> Self {
+        self.with_env("SOF_UDP_BUSY_POLL_BUDGET", busy_poll_budget.to_string())
+    }
+
+    /// Sets `SOF_UDP_PREFER_BUSY_POLL`.
+    ///
+    /// Linux only. This asks the kernel to prefer busy polling for supported UDP sockets.
+    #[must_use]
+    pub fn with_udp_prefer_busy_poll(self, enabled: bool) -> Self {
+        self.with_env("SOF_UDP_PREFER_BUSY_POLL", enabled.to_string())
+    }
+
     /// Sets `SOF_INGEST_QUEUE_MODE`.
     ///
     /// Accepted values:
@@ -1642,6 +1666,28 @@ mod tests {
                 String::from("SOF_INGEST_QUEUE_MODE"),
                 String::from("bounded")
             ))
+        );
+    }
+
+    #[test]
+    fn udp_busy_poll_overrides_serialize_into_env_overrides() {
+        let setup = RuntimeSetup::new()
+            .with_udp_busy_poll_us(50)
+            .with_udp_busy_poll_budget(64)
+            .with_udp_prefer_busy_poll(true);
+        let overrides = setup.env_overrides.into_iter().collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            overrides.get("SOF_UDP_BUSY_POLL_US"),
+            Some(&"50".to_owned())
+        );
+        assert_eq!(
+            overrides.get("SOF_UDP_BUSY_POLL_BUDGET"),
+            Some(&"64".to_owned())
+        );
+        assert_eq!(
+            overrides.get("SOF_UDP_PREFER_BUSY_POLL"),
+            Some(&"true".to_owned())
         );
     }
 }
