@@ -56,9 +56,11 @@ sof = "0.11.0"
 `src/main.rs`:
 
 ```rust
+use sof::runtime::ObserverRuntime;
+
 #[tokio::main]
 async fn main() -> Result<(), sof::runtime::RuntimeError> {
-    sof::runtime::run_async().await
+    ObserverRuntime::new().run_until_termination_signal().await
 }
 ```
 
@@ -83,6 +85,7 @@ use async_trait::async_trait;
 use sof::{
     event::TxKind,
     framework::{Plugin, PluginConfig, PluginHost, TransactionEvent},
+    runtime::ObserverRuntime,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -105,7 +108,11 @@ impl Plugin for NonVoteLogger {
 #[tokio::main]
 async fn main() -> Result<(), sof::runtime::RuntimeError> {
     let host = PluginHost::builder().add_plugin(NonVoteLogger).build();
-    sof::runtime::run_async_with_plugin_host(host).await
+
+    ObserverRuntime::new()
+        .with_plugin_host(host)
+        .run_until_termination_signal()
+        .await
 }
 ```
 
@@ -149,9 +156,11 @@ minimal runtime bring-up.
 Example `sof` runtime skeleton:
 
 ```rust
+use sof::runtime::ObserverRuntime;
+
 #[tokio::main]
 async fn main() -> Result<(), sof::runtime::RuntimeError> {
-    sof::runtime::run_async().await
+    ObserverRuntime::new().run_until_termination_signal().await
 }
 ```
 

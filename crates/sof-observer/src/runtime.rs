@@ -45,6 +45,13 @@ pub struct RuntimeSetup {
     env_overrides: Vec<(String, String)>,
 }
 
+/// Typed runtime observability endpoint configuration.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeObservabilityConfig {
+    /// Bind address for the runtime-owned observability endpoint.
+    pub bind_addr: Option<SocketAddr>,
+}
+
 /// Typed replay retention configuration for derived-state consumers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DerivedStateReplayConfig {
@@ -122,6 +129,28 @@ impl DerivedStateRuntimeConfig {
     }
 }
 
+impl RuntimeObservabilityConfig {
+    /// Returns a disabled observability configuration.
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self::default()
+    }
+
+    /// Returns an enabled observability configuration bound to one socket address.
+    #[must_use]
+    pub const fn with_bind_addr(bind_addr: SocketAddr) -> Self {
+        Self {
+            bind_addr: Some(bind_addr),
+        }
+    }
+
+    /// Returns whether the runtime-owned observability endpoint is enabled.
+    #[must_use]
+    pub const fn is_enabled(&self) -> bool {
+        self.bind_addr.is_some()
+    }
+}
+
 impl RuntimeSetup {
     /// Creates an empty setup that preserves standard env/default behavior.
     #[must_use]
@@ -148,6 +177,21 @@ impl RuntimeSetup {
     #[must_use]
     pub fn with_bind_addr(self, bind_addr: SocketAddr) -> Self {
         self.with_env("SOF_BIND", bind_addr.to_string())
+    }
+
+    /// Sets `SOF_OBSERVABILITY_BIND`.
+    #[must_use]
+    pub fn with_observability_bind_addr(self, bind_addr: SocketAddr) -> Self {
+        self.with_env("SOF_OBSERVABILITY_BIND", bind_addr.to_string())
+    }
+
+    /// Applies one typed runtime observability configuration bundle.
+    #[must_use]
+    pub fn with_observability_config(self, config: RuntimeObservabilityConfig) -> Self {
+        match config.bind_addr {
+            Some(bind_addr) => self.with_observability_bind_addr(bind_addr),
+            None => self,
+        }
     }
 
     /// Sets `SOF_GOSSIP_ENTRYPOINT` from a list of entrypoints.
@@ -1666,6 +1710,32 @@ mod tests {
                 String::from("SOF_INGEST_QUEUE_MODE"),
                 String::from("bounded")
             ))
+        );
+    }
+
+    #[test]
+    fn typed_observability_config_serializes_into_env_overrides() {
+        let bind_addr: SocketAddr = "127.0.0.1:9108".parse().expect("valid bind addr");
+        let setup = RuntimeSetup::new()
+            .with_observability_config(RuntimeObservabilityConfig::with_bind_addr(bind_addr));
+        let overrides = setup.env_overrides.into_iter().collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            overrides.get("SOF_OBSERVABILITY_BIND"),
+            Some(&"127.0.0.1:9108".to_owned())
+        );
+    }
+
+    #[test]
+    fn disabled_observability_config_is_not_serialized() {
+        let setup =
+            RuntimeSetup::new().with_observability_config(RuntimeObservabilityConfig::disabled());
+
+        assert!(
+            !setup
+                .env_overrides
+                .iter()
+                .any(|(key, _)| key == "SOF_OBSERVABILITY_BIND")
         );
     }
 

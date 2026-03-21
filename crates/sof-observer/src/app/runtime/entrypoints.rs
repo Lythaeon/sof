@@ -178,14 +178,40 @@ async fn run_async_with_hosts_and_optional_shutdown(
     derived_state_host: DerivedStateHost,
     shutdown_signal: Option<ShutdownSignal>,
 ) -> Result<(), RuntimeEntrypointError> {
-    runloop::run_async_with_hosts(
+    let observability = if let Some(bind_addr) = read_observability_bind_addr() {
+        let service = RuntimeObservabilityService::start(
+            bind_addr,
+            extension_host.clone(),
+            derived_state_host.clone(),
+        )
+        .await
+        .map_err(|source| RuntimeEntrypointError::Runloop {
+            reason: format!("failed to start observability endpoint on {bind_addr}: {source}"),
+        })?;
+        tracing::info!(
+            bind_addr = %service.local_addr(),
+            "runtime observability endpoint enabled"
+        );
+        Some(service)
+    } else {
+        None
+    };
+    let observability_handle = observability
+        .as_ref()
+        .map(RuntimeObservabilityService::handle)
+        .cloned();
+    let result = runloop::run_async_with_hosts(
         plugin_host,
         extension_host,
         derived_state_host,
         shutdown_signal,
+        observability_handle,
     )
-    .await
-    .map_err(|source| RuntimeEntrypointError::Runloop {
+    .await;
+    if let Some(service) = observability {
+        service.shutdown().await;
+    }
+    result.map_err(|source| RuntimeEntrypointError::Runloop {
         reason: source.to_string(),
     })
 }
@@ -257,15 +283,41 @@ pub(crate) async fn run_async_with_hosts_and_kernel_bypass_ingress(
     shutdown_signal: Option<ShutdownSignal>,
     packet_ingest_rx: ingest::RawPacketBatchReceiver,
 ) -> Result<(), RuntimeEntrypointError> {
-    runloop::run_async_with_hosts_and_kernel_bypass_ingress(
+    let observability = if let Some(bind_addr) = read_observability_bind_addr() {
+        let service = RuntimeObservabilityService::start(
+            bind_addr,
+            extension_host.clone(),
+            derived_state_host.clone(),
+        )
+        .await
+        .map_err(|source| RuntimeEntrypointError::Runloop {
+            reason: format!("failed to start observability endpoint on {bind_addr}: {source}"),
+        })?;
+        tracing::info!(
+            bind_addr = %service.local_addr(),
+            "runtime observability endpoint enabled"
+        );
+        Some(service)
+    } else {
+        None
+    };
+    let observability_handle = observability
+        .as_ref()
+        .map(RuntimeObservabilityService::handle)
+        .cloned();
+    let result = runloop::run_async_with_hosts_and_kernel_bypass_ingress(
         plugin_host,
         extension_host,
         derived_state_host,
         shutdown_signal,
+        observability_handle,
         packet_ingest_rx,
     )
-    .await
-    .map_err(|source| RuntimeEntrypointError::Runloop {
+    .await;
+    if let Some(service) = observability {
+        service.shutdown().await;
+    }
+    result.map_err(|source| RuntimeEntrypointError::Runloop {
         reason: source.to_string(),
     })
 }

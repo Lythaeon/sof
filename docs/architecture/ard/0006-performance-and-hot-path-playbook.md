@@ -40,6 +40,9 @@
 - Host-side receive experiments such as UDP busy polling require live VPS or dedicated-host
   validation, not just local synthetic benches.
 - Regressions in throughput/latency block merge until resolved or accepted via ADR.
+- Use the `crates/sof-observer/benches/hot_paths.rs` Criterion harness for SOF-owned relay, dataset-reassembly, and derived-state dispatch checks before inventing one-off microbenches.
+- Keep hot-path benches workload-shaped and bounded: prefer representative batch sizes and queue/cache sizes over synthetic "infinite loop" measurements that hide coordination costs.
+- When comparing hosts, record the host class explicitly (for example laptop vs VPS) because scheduler and networking topology materially affect multicore runtime behavior.
 
 ## Exit criteria
 

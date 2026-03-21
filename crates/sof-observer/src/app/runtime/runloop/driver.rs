@@ -67,6 +67,7 @@ pub(in crate::app::runtime) async fn run_async_with_hosts(
     extension_host: RuntimeExtensionHost,
     derived_state_host: DerivedStateHost,
     shutdown_signal: Option<ShutdownSignal>,
+    observability_handle: Option<RuntimeObservabilityHandle>,
 ) -> Result<(), RuntimeRunloopError> {
     let plugin_host_cleanup = plugin_host.clone();
     let result = run_async_with_hosts_inner(
@@ -74,6 +75,7 @@ pub(in crate::app::runtime) async fn run_async_with_hosts(
         extension_host,
         derived_state_host,
         shutdown_signal,
+        observability_handle,
         #[cfg(feature = "kernel-bypass")]
         None,
     )
@@ -88,6 +90,7 @@ pub(in crate::app::runtime) async fn run_async_with_hosts_and_kernel_bypass_ingr
     extension_host: RuntimeExtensionHost,
     derived_state_host: DerivedStateHost,
     shutdown_signal: Option<ShutdownSignal>,
+    observability_handle: Option<RuntimeObservabilityHandle>,
     packet_ingest_rx: ingest::RawPacketBatchReceiver,
 ) -> Result<(), RuntimeRunloopError> {
     let plugin_host_cleanup = plugin_host.clone();
@@ -96,6 +99,7 @@ pub(in crate::app::runtime) async fn run_async_with_hosts_and_kernel_bypass_ingr
         extension_host,
         derived_state_host,
         shutdown_signal,
+        observability_handle,
         Some(packet_ingest_rx),
     )
     .await;
@@ -108,6 +112,7 @@ async fn run_async_with_hosts_inner(
     extension_host: RuntimeExtensionHost,
     derived_state_host: DerivedStateHost,
     mut shutdown_signal: Option<ShutdownSignal>,
+    observability_handle: Option<RuntimeObservabilityHandle>,
     #[cfg(feature = "kernel-bypass")] mut kernel_bypass_packet_ingest_rx: Option<
         ingest::RawPacketBatchReceiver,
     >,
@@ -395,6 +400,9 @@ async fn run_async_with_hosts_inner(
             gossip_receivers = runtime.gossip_receiver_handles.len(),
             "receiver bootstrap completed"
         );
+    }
+    if let Some(observability_handle) = observability_handle.as_ref() {
+        observability_handle.mark_ready();
     }
     let verify_enabled = read_verify_shreds();
     let live_shreds_enabled = read_live_shreds_enabled();
@@ -956,6 +964,9 @@ async fn run_async_with_hosts_inner(
                 }
             }, if shutdown_signal.is_some() => {
                 tracing::info!("observer runtime shutdown signal received");
+                if let Some(observability_handle) = observability_handle.as_ref() {
+                    observability_handle.mark_not_ready();
+                }
                 break 'event_loop;
             }
             maybe_worker_result = packet_worker_pool.recv(), if !packet_workers_closed => {
@@ -2052,6 +2063,12 @@ async fn run_async_with_hosts_inner(
                 } else {
                     current_unix_ms().saturating_sub(ingest_last_packet_unix_ms)
                 };
+                let latest_shred_age_ms = duration_to_ms_u64(
+                    Instant::now().saturating_duration_since(latest_shred_updated_at),
+                );
+                let latest_dataset_age_ms = duration_to_ms_u64(
+                    Instant::now().saturating_duration_since(last_dataset_reconstructed_at),
+                );
                 let extension_dispatch = if extension_hooks_enabled {
                     collect_extension_dispatch_telemetry(
                         extension_host.dispatch_metrics_by_extension(),
@@ -2080,6 +2097,75 @@ async fn run_async_with_hosts_inner(
                 let derived_state_replay_telemetry =
                     derived_state_host.replay_telemetry().unwrap_or_default();
                 sync_shred_dedupe_runtime_metrics(shred_dedupe_cache.as_ref());
+                crate::runtime_metrics::set_ingest_metrics(
+                    ingest_packets_seen,
+                    ingest_sent_packets,
+                    ingest_sent_batches,
+                    ingest_dropped_packets,
+                    ingest_dropped_batches,
+                    ingest_rxq_ovfl_drops,
+                    ingest_last_packet_age_ms,
+                );
+                crate::runtime_metrics::set_dataset_dispatch_metrics(
+                    u64::try_from(dataset_queue_depth).unwrap_or(u64::MAX),
+                    dataset_jobs_pending,
+                );
+                crate::runtime_metrics::set_runtime_health_metrics(
+                    latest_shred_age_ms,
+                    latest_dataset_age_ms,
+                    gossip_runtime_stall_age_ms,
+                    repair_dynamic_stream_healthy,
+                );
+                crate::runtime_metrics::set_network_operability_metrics(
+                    relay_cache
+                        .as_ref()
+                        .map_or(0_u64, |cache| u64::try_from(cache.len()).unwrap_or(u64::MAX)),
+                    relay_cache_inserts,
+                    relay_cache_replacements,
+                    relay_cache_evictions,
+                    udp_relay_candidates,
+                    udp_relay_peers_telemetry,
+                    udp_relay_refreshes,
+                    udp_relay_forwarded_packets,
+                    udp_relay_send_attempts,
+                    udp_relay_send_errors,
+                    udp_relay_rate_limited_packets,
+                    udp_relay_source_filtered_packets,
+                    udp_relay_backoff_events,
+                    udp_relay_backoff_drops,
+                    repair_requests_total,
+                    repair_requests_enqueued,
+                    repair_requests_sent,
+                    repair_requests_no_peer,
+                    repair_request_errors,
+                    repair_request_queue_drops,
+                    repair_requests_skipped_outstanding,
+                    outstanding_repairs.as_ref().map_or(0_u64, |repairs| {
+                        u64::try_from(repairs.len()).unwrap_or(u64::MAX)
+                    }),
+                    repair_outstanding_purged,
+                    repair_outstanding_cleared_on_receive,
+                    repair_response_pings,
+                    repair_response_ping_errors,
+                    repair_ping_queue_drops,
+                    repair_serve_requests_enqueued,
+                    repair_serve_requests_handled,
+                    repair_serve_responses_sent,
+                    repair_serve_cache_misses,
+                    repair_serve_rate_limited,
+                    repair_serve_rate_limited_peer,
+                    repair_serve_rate_limited_bytes,
+                    repair_serve_errors,
+                    repair_serve_queue_drops,
+                    repair_source_hint_enqueued,
+                    repair_source_hint_drops,
+                    repair_source_hint_buffer_drops,
+                    repair_peer_total,
+                    repair_peer_active,
+                    gossip_switch_attempts,
+                    gossip_switch_successes,
+                    gossip_switch_fails,
+                );
                 let runtime_stage_metrics = crate::runtime_metrics::snapshot();
                 telemetry_tick_count = telemetry_tick_count.saturating_add(1);
                 let dataset_queue_pressure = dataset_queue_capacity_total > 0
@@ -2752,6 +2838,9 @@ async fn run_async_with_hosts_inner(
     }
     #[cfg(feature = "gossip-bootstrap")]
     runtime.stop_gossip_runtime().await;
+    if let Some(observability_handle) = observability_handle.as_ref() {
+        observability_handle.mark_not_ready();
+    }
     drop(runtime);
     #[cfg(feature = "kernel-bypass")]
     if let Some(drain_task) = kernel_bypass_internal_ingest_drain_task.take()

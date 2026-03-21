@@ -59,6 +59,9 @@ tokio-tungstenite = { version = "0.28", default-features = false, features = ["c
 signal-hook = "0.3"
 xdp = { version = "0.7.3", optional = true }
 
+[dev-dependencies]
+criterion = "0.5.1"
+
 [[example]]
 name = "non_vote_tx_logger"
 path = "examples/non_vote_tx_logger.rs"
@@ -110,3 +113,7 @@ path = "examples/kernel_bypass_ingress_metrics.rs"
 [[example]]
 name = "af_xdp_kernel_bypass_ingress_metrics"
 path = "examples/af_xdp_kernel_bypass_ingress_metrics.rs"
+
+[[bench]]
+name = "hot_paths"
+harness = false

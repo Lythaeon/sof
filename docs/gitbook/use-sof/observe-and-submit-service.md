@@ -28,6 +28,7 @@ the provider traits that `sof-tx` already understands.
 use std::sync::Arc;
 
 use sof::framework::{ObserverPlugin, PluginHost};
+use sof::runtime::ObserverRuntime;
 use sof_tx::{
     SubmitMode, TxBuilder, TxSubmitClient,
     adapters::PluginHostTxProviderAdapter,
@@ -61,7 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = (builder, &mut client, SubmitMode::Hybrid);
 
     // Run `sof` with this plugin host, then use the client from your strategy task.
-    let _ = sof::runtime::run_async_with_plugin_host(host).await;
+    let _ = ObserverRuntime::new().with_plugin_host(host).run().await;
 
     Ok(())
 }

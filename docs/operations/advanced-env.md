@@ -15,6 +15,16 @@ For most deployments, keep defaults and set only:
 - `SOF_GOSSIP_ENTRYPOINT` (gossip mode)
 - `SOF_BIND` (plain UDP listener mode)
 
+Enable the runtime-owned metrics/health endpoint only when you have a real scrape or probe target:
+
+- `SOF_OBSERVABILITY_BIND`
+
+When enabled, SOF serves:
+
+- `/metrics`
+- `/healthz`
+- `/readyz`
+
 If outbound control-plane traffic is high without measurable shred ingest benefit,
 prefer these Agave-aligned reductions before disabling relay/repair:
 
@@ -82,10 +92,23 @@ Duplicate-shred mode guidance:
 | `SOF_RUNTIME_EXTENSION_QUEUE_DEPTH_WARN` | `4096` | Warn threshold for aggregate runtime-extension queue depth; tune to your expected extension fanout and burst profile. Set `0` to disable queue-depth pressure warnings. |
 | `SOF_RUNTIME_EXTENSION_DISPATCH_LAG_WARN_US` | `50000` | Warn threshold for maximum runtime-extension dispatch lag in microseconds; lower values increase sensitivity to extension callback stalls. Set `0` to disable lag warnings. |
 | `SOF_RUNTIME_EXTENSION_DROP_WARN_DELTA` | `100` | Warn threshold for dropped runtime-extension events per telemetry interval; useful for catching sustained extension overload before ingest impact. Set `0` to disable drop-delta warnings. |
+| `SOF_OBSERVABILITY_BIND` | unset | Enables SOF's runtime-owned observability listener on one TCP bind address. Keep unset unless you explicitly want Prometheus scraping and liveness/readiness probing. |
 | `SOF_COVERAGE_WINDOW_SLOTS` | `256` | Impacts coverage stats memory/cadence. |
 | `SOF_FORK_WINDOW_SLOTS` | `2048` | Bounded in-memory slot graph used for local canonical/reorg tracking; lower values reduce memory but can shorten reorg context. |
 | `SOF_TX_CONFIRMED_DEPTH_SLOTS` | `32` | Local slot-depth threshold used to tag tx events as `confirmed`; lower values are faster but less conservative. |
 | `SOF_TX_FINALIZED_DEPTH_SLOTS` | `150` | Local slot-depth threshold used to tag tx events as `finalized`; must be >= confirmed depth for consistent semantics. |
+
+Metrics now available from the runtime-owned endpoint include:
+
+- ingest totals and ingest drop counters
+- dataset backlog and packet-worker queue depth
+- dedupe occupancy and dedupe drop counters
+- relay cache occupancy and UDP relay counters
+- repair request, serve, hint, and peer-health counters
+- gossip runtime switch attempt counters
+- derived-state consumer and replay health
+- runtime-extension queue/drop/dispatch telemetry
+- freshness gauges like `latest_shred_age_ms` and `gossip_runtime_stall_age_ms`
 
 ## Verification and dedupe tuning
 
