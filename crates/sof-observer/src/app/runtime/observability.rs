@@ -101,13 +101,16 @@ impl RuntimeObservabilityService {
                         let request_extension_host = extension_host.clone();
                         let request_derived_state_host = derived_state_host.clone();
                         tokio::spawn(async move {
-                            let _ = handle_connection(
+                            if let Err(error) = handle_connection(
                                 stream,
                                 request_handle,
                                 request_extension_host,
                                 request_derived_state_host,
                             )
-                            .await;
+                            .await
+                            {
+                                tracing::debug!(%error, "observability endpoint request failed");
+                            }
                         });
                     }
                 }
@@ -131,9 +134,9 @@ impl RuntimeObservabilityService {
 
     pub(crate) async fn shutdown(mut self) {
         self.handle.mark_stopped();
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
-        }
+        if let Some(shutdown_tx) = self.shutdown_tx.take()
+            && shutdown_tx.send(()).is_err()
+        {}
         if self.task.await.is_err() {
             tracing::warn!("observability endpoint task panicked during shutdown");
         }
@@ -180,7 +183,10 @@ async fn read_request_path(stream: &mut TcpStream) -> io::Result<Option<&'static
     if read == 0 {
         return Ok(None);
     }
-    let request = match std::str::from_utf8(&buffer[..read]) {
+    let Some(bytes) = buffer.get(..read) else {
+        return Ok(None);
+    };
+    let request = match std::str::from_utf8(bytes) {
         Ok(request) => request,
         Err(_) => return Ok(None),
     };
@@ -1041,13 +1047,13 @@ fn append_metric_value<T>(
         && !labels.is_empty()
     {
         buffer.push('{');
-        for (index, (key, value)) in labels.iter().enumerate() {
+        for (index, (key, label_value)) in labels.iter().enumerate() {
             if index > 0 {
                 buffer.push(',');
             }
             buffer.push_str(key);
             buffer.push_str("=\"");
-            append_escaped_label_value(buffer, value);
+            append_escaped_label_value(buffer, label_value);
             buffer.push('"');
         }
         buffer.push('}');
@@ -1076,7 +1082,7 @@ struct HttpResponse {
 }
 
 impl HttpResponse {
-    fn ok(content_type: &'static str, body: String) -> Self {
+    const fn ok(content_type: &'static str, body: String) -> Self {
         Self {
             status_line: "HTTP/1.1 200 OK",
             content_type,
@@ -1084,7 +1090,7 @@ impl HttpResponse {
         }
     }
 
-    fn service_unavailable(content_type: &'static str, body: String) -> Self {
+    const fn service_unavailable(content_type: &'static str, body: String) -> Self {
         Self {
             status_line: "HTTP/1.1 503 Service Unavailable",
             content_type,

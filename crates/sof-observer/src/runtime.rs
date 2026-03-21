@@ -46,7 +46,7 @@ pub struct RuntimeSetup {
 }
 
 /// Typed runtime observability endpoint configuration.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeObservabilityConfig {
     /// Bind address for the runtime-owned observability endpoint.
     pub bind_addr: Option<SocketAddr>,
@@ -138,7 +138,7 @@ impl RuntimeObservabilityConfig {
 
     /// Returns an enabled observability configuration bound to one socket address.
     #[must_use]
-    pub fn with_bind_addr(bind_addr: SocketAddr) -> Self {
+    pub const fn with_bind_addr(bind_addr: SocketAddr) -> Self {
         Self {
             bind_addr: Some(bind_addr),
         }
