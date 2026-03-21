@@ -3360,12 +3360,13 @@ impl DerivedStateHost {
     where
         I: IntoIterator<Item = (FeedSequence, DerivedStateFeedEvent)>,
     {
+        let emitted_at = SystemTime::now();
         let mut envelopes = Vec::new();
         for (sequence, event) in events {
             let envelope = DerivedStateFeedEnvelope {
                 session_id: self.inner.session_id,
                 sequence,
-                emitted_at: SystemTime::now(),
+                emitted_at,
                 watermarks,
                 event,
             };
