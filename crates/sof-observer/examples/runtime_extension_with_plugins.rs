@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use sof::{
     event::TxKind,
     framework::{
-        ExtensionCapability, ExtensionManifest, ExtensionStartupContext, PacketSubscription,
-        Plugin, PluginHost, RuntimeExtension, RuntimeExtensionHost, RuntimePacketEvent,
+        ExtensionCapability, ExtensionContext, ExtensionManifest, PacketSubscription, Plugin,
+        PluginConfig, PluginHost, RuntimeExtension, RuntimeExtensionHost, RuntimePacketEvent,
         RuntimePacketSourceKind, TransactionEvent,
     },
 };
@@ -21,8 +21,8 @@ impl Plugin for NonVoteTxPlugin {
         "coexistence-non-vote-plugin"
     }
 
-    fn wants_transaction(&self) -> bool {
-        true
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_transaction()
     }
 
     async fn on_transaction(&self, event: &TransactionEvent) {
@@ -46,10 +46,10 @@ impl RuntimeExtension for ObserverIngressExtension {
         "coexistence-observer-ingress-extension"
     }
 
-    async fn on_startup(
+    async fn setup(
         &self,
-        _ctx: ExtensionStartupContext,
-    ) -> Result<ExtensionManifest, sof::framework::extension::ExtensionStartupError> {
+        _ctx: ExtensionContext,
+    ) -> Result<ExtensionManifest, sof::framework::extension::ExtensionSetupError> {
         Ok(ExtensionManifest {
             capabilities: vec![ExtensionCapability::ObserveObserverIngress],
             resources: Vec::new(),

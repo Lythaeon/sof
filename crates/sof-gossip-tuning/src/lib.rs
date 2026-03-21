@@ -26,7 +26,7 @@ pub use application::{ports::RuntimeTuningPort, service::GossipTuningService};
 pub use domain::{
     constants::{
         DEFAULT_INGEST_QUEUE_CAPACITY, DEFAULT_RECEIVER_COALESCE_WAIT_MS, DEFAULT_UDP_BATCH_SIZE,
-        LEGACY_GOSSIP_CHANNEL_CAPACITY, VPS_GOSSIP_CHANNEL_CAPACITY,
+        LEGACY_GOSSIP_CHANNEL_CAPACITY, VPS_GOSSIP_RECEIVER_CHANNEL_CAPACITY,
     },
     error::TuningValueError,
     model::{

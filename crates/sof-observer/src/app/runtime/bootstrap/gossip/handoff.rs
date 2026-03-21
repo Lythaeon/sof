@@ -19,8 +19,11 @@ pub(super) fn is_bind_conflict_error(error: &impl std::fmt::Display) -> bool {
 #[cfg(feature = "gossip-bootstrap")]
 pub(crate) async fn stop_gossip_runtime_components(
     receiver_handles: Vec<JoinHandle<()>>,
-    gossip_runtime: Option<GossipRuntime>,
+    mut gossip_runtime: Option<GossipRuntime>,
 ) {
+    if let Some(runtime) = gossip_runtime.as_ref() {
+        runtime.exit.store(true, Ordering::Relaxed);
+    }
     for handle in &receiver_handles {
         handle.abort();
     }
@@ -36,7 +39,7 @@ pub(crate) async fn stop_gossip_runtime_components(
             }
         }
     }
-    if let Some(gossip_runtime) = gossip_runtime {
+    if let Some(gossip_runtime) = gossip_runtime.take() {
         match tokio::time::timeout(
             GOSSIP_RUNTIME_DROP_TIMEOUT,
             tokio::task::spawn_blocking(move || drop(gossip_runtime)),
@@ -491,11 +494,14 @@ async fn start_gossip_bootstrapped_receiver(
         std_socket
             .set_nonblocking(true)
             .map_err(|source| GossipBootstrapStartError::SetTvuSocketNonblocking { source })?;
-        receiver_handles.push(ingest::spawn_udp_receiver_from_std_with_telemetry(
-            std_socket,
-            tx.clone(),
-            Some(ingest_telemetry.clone()),
-        ));
+        receiver_handles.push(
+            ingest::spawn_udp_receiver_from_std_with_telemetry_and_shutdown(
+                std_socket,
+                tx.clone(),
+                Some(ingest_telemetry.clone()),
+                Some(exit.clone()),
+            ),
+        );
     }
     let repair_receiver_socket = node
         .sockets
@@ -507,11 +513,14 @@ async fn start_gossip_bootstrapped_receiver(
         .map_err(
             |source| GossipBootstrapStartError::SetRepairReceiverSocketNonblocking { source },
         )?;
-    receiver_handles.push(ingest::spawn_udp_receiver_from_std_with_telemetry(
-        repair_receiver_socket,
-        tx,
-        None,
-    ));
+    receiver_handles.push(
+        ingest::spawn_udp_receiver_from_std_with_telemetry_and_shutdown(
+            repair_receiver_socket,
+            tx,
+            None,
+            Some(exit.clone()),
+        ),
+    );
 
     let repair_client = if read_repair_enabled() {
         let repair_sender_socket = node

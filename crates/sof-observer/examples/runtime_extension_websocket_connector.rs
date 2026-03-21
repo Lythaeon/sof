@@ -4,7 +4,7 @@
 use async_trait::async_trait;
 use futures_util::SinkExt;
 use sof::framework::{
-    ExtensionCapability, ExtensionManifest, ExtensionResourceSpec, ExtensionStartupContext,
+    ExtensionCapability, ExtensionContext, ExtensionManifest, ExtensionResourceSpec,
     ExtensionStreamVisibility, PacketSubscription, RuntimeExtension, RuntimeExtensionHost,
     RuntimePacketEvent, RuntimePacketEventClass, RuntimePacketSourceKind, WsConnectorSpec,
 };
@@ -25,10 +25,10 @@ impl RuntimeExtension for WebSocketConsumerExtension {
         "websocket-consumer-extension"
     }
 
-    async fn on_startup(
+    async fn setup(
         &self,
-        _ctx: ExtensionStartupContext,
-    ) -> Result<ExtensionManifest, sof::framework::extension::ExtensionStartupError> {
+        _ctx: ExtensionContext,
+    ) -> Result<ExtensionManifest, sof::framework::extension::ExtensionSetupError> {
         Ok(ExtensionManifest {
             capabilities: vec![ExtensionCapability::ConnectWebSocket],
             resources: vec![ExtensionResourceSpec::WsConnector(WsConnectorSpec {

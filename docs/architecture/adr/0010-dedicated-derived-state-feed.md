@@ -1,6 +1,6 @@
 # ADR-0010: Dedicated Derived-State Feed for Official Stateful Extensions
 
-- Status: Proposed
+- Status: Implemented
 - Date: 2026-03-06
 - Decision makers: `sof-observer` maintainers
 - Related: `docs/architecture/adr/0009-derived-state-extensions-and-replay-contracts.md`, `docs/architecture/derived-state-extension-contract.md`, `docs/architecture/derived-state-feed-contract.md`, `docs/architecture/framework-plugin-hooks.md`, `docs/architecture/runtime-extension-hooks.md`
@@ -102,14 +102,23 @@ The consumer model should support:
 4. rollback/reorg handling,
 5. graceful shutdown with checkpoint persistence.
 
-Likely shape:
+Current implemented shape:
 
-1. `on_startup` or `load_checkpoint`
-2. `apply_event`
-3. `flush_checkpoint`
-4. `on_shutdown`
+1. static `config() -> DerivedStateConsumerConfig`
+2. optional `setup`
+3. `load_checkpoint`
+4. `apply`
+5. `flush_checkpoint`
+6. optional `shutdown`
 
-The exact API surface is deferred, but it should be purpose-built for state materialization.
+The durability boundary remains `load_checkpoint` / `flush_checkpoint`, while startup and
+shutdown hooks are consumer-local lifecycle helpers.
+
+Current lifecycle timing:
+
+1. host construction captures static subscriptions only,
+2. `setup` runs when the host is initialized or first used for checkpoint/load/apply work,
+3. `shutdown` runs during cooperative runtime teardown or worker drop after successful setup.
 
 ## Relationship to Existing Systems
 

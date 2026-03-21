@@ -152,16 +152,11 @@ impl ObserverPlugin for PluginHostTxProviderAdapter {
         "sof-tx-provider-adapter"
     }
 
-    fn wants_recent_blockhash(&self) -> bool {
-        true
-    }
-
-    fn wants_cluster_topology(&self) -> bool {
-        true
-    }
-
-    fn wants_leader_schedule(&self) -> bool {
-        true
+    fn config(&self) -> sof::framework::PluginConfig {
+        sof::framework::PluginConfig::new()
+            .with_recent_blockhash()
+            .with_cluster_topology()
+            .with_leader_schedule()
     }
 
     async fn on_recent_blockhash(&self, event: ObservedRecentBlockhashEvent) {
@@ -256,9 +251,10 @@ mod tests {
     #[tokio::test]
     async fn adapter_opt_in_flags_are_enabled() {
         let adapter = PluginHostTxProviderAdapter::default();
-        assert!(adapter.wants_recent_blockhash());
-        assert!(adapter.wants_cluster_topology());
-        assert!(adapter.wants_leader_schedule());
+        let config = adapter.config();
+        assert!(config.recent_blockhash);
+        assert!(config.cluster_topology);
+        assert!(config.leader_schedule);
     }
 
     #[tokio::test]

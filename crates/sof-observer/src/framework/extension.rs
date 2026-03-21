@@ -102,7 +102,7 @@ pub struct WsConnectorSpec {
     pub read_buffer_bytes: usize,
 }
 
-/// Resource declarations accepted from [`RuntimeExtension::on_startup`].
+/// Resource declarations accepted from [`RuntimeExtension::setup`].
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ExtensionResourceSpec {
     /// UDP listener resource.
@@ -281,7 +281,7 @@ impl PacketSubscription {
     }
 }
 
-/// Startup manifest returned by [`RuntimeExtension::on_startup`].
+/// Setup manifest returned by [`RuntimeExtension::setup`].
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct ExtensionManifest {
     /// Declared capabilities required by this extension.
@@ -292,29 +292,22 @@ pub struct ExtensionManifest {
     pub subscriptions: Vec<PacketSubscription>,
 }
 
-/// Startup context passed to [`RuntimeExtension::on_startup`].
+/// Context passed to runtime extension lifecycle hooks.
 #[derive(Debug, Clone)]
-pub struct ExtensionStartupContext {
+pub struct ExtensionContext {
     /// Extension identifier.
     pub extension_name: &'static str,
 }
 
-/// Shutdown context passed to [`RuntimeExtension::on_shutdown`].
-#[derive(Debug, Clone)]
-pub struct ExtensionShutdownContext {
-    /// Extension identifier.
-    pub extension_name: &'static str,
-}
-
-/// Extension startup failure.
+/// Extension setup failure.
 #[derive(Debug, Clone, Error, Eq, PartialEq)]
 #[error("{reason}")]
-pub struct ExtensionStartupError {
+pub struct ExtensionSetupError {
     /// Human-readable startup failure reason.
     reason: String,
 }
 
-impl ExtensionStartupError {
+impl ExtensionSetupError {
     /// Creates a startup error with a human-readable reason.
     #[must_use]
     pub fn new(reason: impl Into<String>) -> Self {
@@ -343,10 +336,10 @@ pub trait RuntimeExtension: Send + Sync + 'static {
     }
 
     /// Called once during runtime startup to request capabilities, resources, and subscriptions.
-    async fn on_startup(
+    async fn setup(
         &self,
-        _ctx: ExtensionStartupContext,
-    ) -> Result<ExtensionManifest, ExtensionStartupError> {
+        _ctx: ExtensionContext,
+    ) -> Result<ExtensionManifest, ExtensionSetupError> {
         Ok(ExtensionManifest::default())
     }
 
@@ -354,5 +347,5 @@ pub trait RuntimeExtension: Send + Sync + 'static {
     async fn on_packet_received(&self, _event: RuntimePacketEvent) {}
 
     /// Called during runtime shutdown before force-cancel logic runs.
-    async fn on_shutdown(&self, _ctx: ExtensionShutdownContext) {}
+    async fn shutdown(&self, _ctx: ExtensionContext) {}
 }

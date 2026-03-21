@@ -34,7 +34,7 @@ This surface is independent from `ObserverPlugin`:
 
 Current hook count: `3` (must stay in sync with `sof::framework::RuntimeExtension`).
 
-1. `on_startup`:
+1. `setup`:
    - Called once during runtime bootstrap.
    - Returns an `ExtensionManifest` declaring:
      - capabilities,
@@ -43,7 +43,7 @@ Current hook count: `3` (must stay in sync with `sof::framework::RuntimeExtensio
 2. `on_packet_received`:
    - Called only for packets matching startup-declared subscriptions.
    - Includes source metadata + packet bytes.
-3. `on_shutdown`:
+3. `shutdown`:
    - Called during runtime shutdown with bounded timeout.
    - Long-running callbacks are force-cancelled after shutdown deadline.
 

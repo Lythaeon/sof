@@ -86,7 +86,7 @@ to be explicit in code.
 use async_trait::async_trait;
 use sof::{
     event::TxKind,
-    framework::{Plugin, PluginHost, TransactionEvent},
+    framework::{Plugin, PluginConfig, PluginHost, TransactionEvent},
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -94,8 +94,8 @@ struct NonVoteLogger;
 
 #[async_trait]
 impl Plugin for NonVoteLogger {
-    fn wants_transaction(&self) -> bool {
-        true
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_transaction()
     }
 
     async fn on_transaction(&self, event: &TransactionEvent) {
@@ -136,7 +136,7 @@ Best for:
 Build flag:
 
 ```toml
-sof = { version = "0.10.1", features = ["gossip-bootstrap"] }
+sof = { version = "0.11.0", features = ["gossip-bootstrap"] }
 ```
 
 ### External kernel-bypass ingress
@@ -149,7 +149,7 @@ Best for:
 Build flag:
 
 ```toml
-sof = { version = "0.10.1", features = ["kernel-bypass"] }
+sof = { version = "0.11.0", features = ["kernel-bypass"] }
 ```
 
 ## When To Use Plugins vs Runtime Extensions

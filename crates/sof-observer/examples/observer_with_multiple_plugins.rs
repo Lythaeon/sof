@@ -4,7 +4,10 @@
 use async_trait::async_trait;
 use sof::{
     event::TxKind,
-    framework::{DatasetEvent, Plugin, PluginHost, TransactionEvent},
+    framework::{
+        DatasetEvent, Plugin, PluginConfig, PluginContext, PluginHost, PluginSetupError,
+        TransactionEvent,
+    },
 };
 use thiserror::Error;
 
@@ -17,8 +20,13 @@ impl Plugin for NonVoteTxLoggerPlugin {
         "non-vote-tx-logger"
     }
 
-    fn wants_transaction(&self) -> bool {
-        true
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_transaction()
+    }
+
+    async fn setup(&self, ctx: PluginContext) -> Result<(), PluginSetupError> {
+        tracing::info!(plugin = ctx.plugin_name, "plugin startup completed");
+        Ok(())
     }
 
     async fn on_transaction(&self, event: &TransactionEvent) {
@@ -38,6 +46,10 @@ impl Plugin for NonVoteTxLoggerPlugin {
             "non-vote transaction observed"
         );
     }
+
+    async fn shutdown(&self, ctx: PluginContext) {
+        tracing::info!(plugin = ctx.plugin_name, "plugin shutdown completed");
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -49,8 +61,8 @@ impl Plugin for DatasetLoggerPlugin {
         "dataset-logger"
     }
 
-    fn wants_dataset(&self) -> bool {
-        true
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_dataset()
     }
 
     async fn on_dataset(&self, event: DatasetEvent) {
@@ -69,6 +81,8 @@ impl Plugin for DatasetLoggerPlugin {
 enum ObserverWithMultiplePluginsError {
     #[error("examples are release-only; run with `{command}`")]
     ReleaseModeRequired { command: &'static str },
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
     #[error(transparent)]
     Runtime(#[from] sof::runtime::RuntimeError),
 }
@@ -92,5 +106,8 @@ async fn main() -> Result<(), ObserverWithMultiplePluginsError> {
         .build();
 
     tracing::info!(plugins = ?host.plugin_names(), "starting SOF runtime with plugin host");
-    Ok(sof::runtime::run_async_with_plugin_host(host).await?)
+    Ok(sof::runtime::ObserverRuntime::new()
+        .with_plugin_host(host)
+        .run_until_termination_signal()
+        .await?)
 }

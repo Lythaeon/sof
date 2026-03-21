@@ -16,7 +16,7 @@ This registry is intentionally different from the tuning guide:
 
 Snapshot date:
 
-- `2026-03-14`
+- `2026-03-21`
 
 ## How To Read The Registry
 

@@ -32,6 +32,7 @@
     - [System Overview](architecture/system-overview.md)
     - [Runtime Pipeline](architecture/runtime-pipeline.md)
     - [Integration Model](architecture/integration-model.md)
+    - [Plugin Config and Lifecycle](architecture/plugin-config-and-lifecycle.md)
     - [Derived State and Control Plane](architecture/derived-state-and-control-plane.md)
     - [Decision Records Map](architecture/decision-records.md)
   - [Development](development/README.md)

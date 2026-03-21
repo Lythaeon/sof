@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{future::Future, net::SocketAddr, path::PathBuf};
 
 use crate::framework::{
     DerivedStateHost, DerivedStateReplayBackend, DerivedStateReplayDurability, PluginHost,
@@ -593,7 +593,8 @@ impl RuntimeSetup {
 
     /// Applies one typed gossip host profile.
     ///
-    /// This applies both the SOF runtime subset and the bundled gossip backend queue capacities.
+    /// This applies the SOF runtime subset plus bundled gossip queue/worker tuning and
+    /// semantic shred dedupe capacity.
     #[must_use]
     pub fn with_gossip_tuning_profile(self, profile: GossipTuningProfile) -> Self {
         let mut adapter = RuntimeSetupTuningAdapter::new(self);
@@ -783,6 +784,31 @@ impl RuntimeTuningPort for RuntimeSetupTuningAdapter {
         self.setup = self.setup.clone().with_tvu_receive_sockets(sockets.get());
     }
 
+    fn set_gossip_channel_consume_capacity(&mut self, capacity: QueueCapacity) {
+        self.setup = self.setup.clone().with_gossip_channel_consume_capacity(
+            usize::try_from(capacity.get()).unwrap_or(usize::MAX),
+        );
+    }
+
+    fn set_gossip_consume_threads(&mut self, thread_count: usize) {
+        self.setup = self.setup.clone().with_gossip_consume_threads(thread_count);
+    }
+
+    fn set_gossip_listen_threads(&mut self, thread_count: usize) {
+        self.setup = self.setup.clone().with_gossip_listen_threads(thread_count);
+    }
+
+    fn set_gossip_run_threads(&mut self, thread_count: usize) {
+        self.setup = self.setup.clone().with_gossip_run_threads(thread_count);
+    }
+
+    fn set_shred_dedup_capacity(&mut self, dedupe_capacity: usize) {
+        self.setup = self
+            .setup
+            .clone()
+            .with_shred_dedupe_capacity(dedupe_capacity);
+    }
+
     fn set_gossip_channel_tuning(&mut self, tuning: GossipChannelTuning) {
         self.setup = self
             .setup
@@ -960,13 +986,154 @@ pub fn run_with_hosts_and_setup(
     )?)
 }
 
+/// Programmatic observer runtime composition with an optional cooperative shutdown future.
+#[derive(Clone, Default)]
+pub struct ObserverRuntime {
+    /// Plugin host invoked by the packaged observer runtime.
+    plugin_host: PluginHost,
+    /// Runtime extension host invoked by the packaged observer runtime.
+    extension_host: RuntimeExtensionHost,
+    /// Derived-state host invoked by the packaged observer runtime.
+    derived_state_host: DerivedStateHost,
+    /// Programmatic setup overrides applied before startup.
+    setup: RuntimeSetup,
+}
+
+impl ObserverRuntime {
+    /// Creates a runtime composition using SOF defaults.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replaces the plugin host used by this runtime instance.
+    #[must_use]
+    pub fn with_plugin_host(mut self, plugin_host: PluginHost) -> Self {
+        self.plugin_host = plugin_host;
+        self
+    }
+
+    /// Replaces the runtime extension host used by this runtime instance.
+    #[must_use]
+    pub fn with_extension_host(mut self, extension_host: RuntimeExtensionHost) -> Self {
+        self.extension_host = extension_host;
+        self
+    }
+
+    /// Replaces the derived-state host used by this runtime instance.
+    #[must_use]
+    pub fn with_derived_state_host(mut self, derived_state_host: DerivedStateHost) -> Self {
+        self.derived_state_host = derived_state_host;
+        self
+    }
+
+    /// Applies programmatic setup overrides before the runtime boots.
+    #[must_use]
+    pub fn with_setup(mut self, setup: RuntimeSetup) -> Self {
+        self.setup = setup;
+        self
+    }
+
+    /// Runs the configured runtime until it exits on its own.
+    ///
+    /// # Errors
+    /// Returns any runtime initialization or shutdown error from the underlying observer runtime.
+    pub async fn run(self) -> Result<(), RuntimeError> {
+        crate::runtime_env::clear_runtime_env_overrides();
+        self.setup.apply();
+        Ok(crate::app::runtime::run_async_with_hosts(
+            self.plugin_host,
+            self.extension_host,
+            self.derived_state_host,
+            None,
+        )
+        .await?)
+    }
+
+    /// Runs the configured runtime until one shutdown future resolves.
+    ///
+    /// # Errors
+    /// Returns any runtime initialization or shutdown error from the underlying observer runtime.
+    pub async fn run_until<F>(self, shutdown_signal: F) -> Result<(), RuntimeError>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        crate::runtime_env::clear_runtime_env_overrides();
+        self.setup.apply();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            shutdown_signal.await;
+            if shutdown_tx.send(()).is_err() {}
+        });
+        Ok(crate::app::runtime::run_async_with_hosts(
+            self.plugin_host,
+            self.extension_host,
+            self.derived_state_host,
+            Some(Box::pin(async move {
+                if shutdown_rx.await.is_err() {
+                    tracing::warn!(
+                        "runtime shutdown trigger task dropped before notifying runloop"
+                    );
+                }
+            })),
+        )
+        .await?)
+    }
+
+    /// Runs the configured runtime until the process receives a termination signal.
+    ///
+    /// On Unix this listens for `SIGTERM` and `SIGINT`. On other platforms it
+    /// listens for the standard Ctrl-C shutdown event.
+    ///
+    /// # Errors
+    /// Returns any runtime initialization or shutdown error from the underlying observer runtime.
+    pub async fn run_until_termination_signal(self) -> Result<(), RuntimeError> {
+        self.run_until(async {
+            wait_for_termination_signal().await;
+        })
+        .await
+    }
+}
+
+/// Waits for a process-level termination signal used by demo/example runtimes.
+async fn wait_for_termination_signal() {
+    #[cfg(unix)]
+    {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let mut signals = match signal_hook::iterator::Signals::new([
+                signal_hook::consts::signal::SIGTERM,
+                signal_hook::consts::signal::SIGINT,
+            ]) {
+                Ok(signals) => signals,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to register process signal listeners");
+                    let _send_result = shutdown_tx.send(());
+                    return;
+                }
+            };
+            let _ = signals.forever().next();
+            let _send_result = shutdown_tx.send(());
+        });
+        if shutdown_rx.await.is_err() {
+            tracing::warn!("process signal listener dropped before notifying shutdown");
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::warn!(%error, "failed to wait for Ctrl-C shutdown signal");
+        }
+    }
+}
+
 /// Async variant of [`run`], for callers that already own a Tokio runtime.
 ///
 /// # Errors
 /// Returns any runtime initialization or shutdown error from the underlying observer runtime.
 pub async fn run_async() -> Result<(), RuntimeError> {
-    crate::runtime_env::clear_runtime_env_overrides();
-    Ok(crate::app::runtime::run_async().await?)
+    ObserverRuntime::new().run().await
 }
 
 /// Async variant of [`run_with_plugin_host`].
@@ -974,8 +1141,10 @@ pub async fn run_async() -> Result<(), RuntimeError> {
 /// # Errors
 /// Returns any runtime initialization or shutdown error from the underlying observer runtime.
 pub async fn run_async_with_plugin_host(plugin_host: PluginHost) -> Result<(), RuntimeError> {
-    crate::runtime_env::clear_runtime_env_overrides();
-    Ok(crate::app::runtime::run_async_with_plugin_host(plugin_host).await?)
+    ObserverRuntime::new()
+        .with_plugin_host(plugin_host)
+        .run()
+        .await
 }
 
 /// Async variant of [`run_with_extension_host`].
@@ -985,8 +1154,10 @@ pub async fn run_async_with_plugin_host(plugin_host: PluginHost) -> Result<(), R
 pub async fn run_async_with_extension_host(
     extension_host: RuntimeExtensionHost,
 ) -> Result<(), RuntimeError> {
-    crate::runtime_env::clear_runtime_env_overrides();
-    Ok(crate::app::runtime::run_async_with_extension_host(extension_host).await?)
+    ObserverRuntime::new()
+        .with_extension_host(extension_host)
+        .run()
+        .await
 }
 
 /// Async variant of [`run_with_derived_state_host`].
@@ -996,8 +1167,10 @@ pub async fn run_async_with_extension_host(
 pub async fn run_async_with_derived_state_host(
     derived_state_host: DerivedStateHost,
 ) -> Result<(), RuntimeError> {
-    crate::runtime_env::clear_runtime_env_overrides();
-    Ok(crate::app::runtime::run_async_with_derived_state_host(derived_state_host).await?)
+    ObserverRuntime::new()
+        .with_derived_state_host(derived_state_host)
+        .run()
+        .await
 }
 
 /// Async variant of [`run_with_hosts`].
@@ -1013,6 +1186,7 @@ pub async fn run_async_with_hosts(
         plugin_host,
         extension_host,
         DerivedStateHost::builder().build(),
+        None,
     )
     .await?)
 }
@@ -1027,10 +1201,13 @@ pub async fn run_async_with_hosts_and_derived_state_host(
     derived_state_host: DerivedStateHost,
 ) -> Result<(), RuntimeError> {
     crate::runtime_env::clear_runtime_env_overrides();
-    Ok(
-        crate::app::runtime::run_async_with_hosts(plugin_host, extension_host, derived_state_host)
-            .await?,
+    Ok(crate::app::runtime::run_async_with_hosts(
+        plugin_host,
+        extension_host,
+        derived_state_host,
+        None,
     )
+    .await?)
 }
 
 /// Async variant of [`run_with_derived_state_host_and_setup`].
@@ -1056,10 +1233,13 @@ pub async fn run_async_with_hosts_and_derived_state_host_and_setup(
     setup: &RuntimeSetup,
 ) -> Result<(), RuntimeError> {
     setup.apply();
-    Ok(
-        crate::app::runtime::run_async_with_hosts(plugin_host, extension_host, derived_state_host)
-            .await?,
+    Ok(crate::app::runtime::run_async_with_hosts(
+        plugin_host,
+        extension_host,
+        derived_state_host,
+        None,
     )
+    .await?)
 }
 
 #[cfg(feature = "kernel-bypass")]
@@ -1149,6 +1329,7 @@ pub async fn run_async_with_hosts_and_kernel_bypass_ingress(
             plugin_host,
             extension_host,
             DerivedStateHost::builder().build(),
+            None,
             packet_ingest_rx.into(),
         )
         .await?,
@@ -1211,6 +1392,7 @@ pub async fn run_async_with_hosts_and_derived_state_host_and_kernel_bypass_ingre
             plugin_host,
             extension_host,
             derived_state_host,
+            None,
             packet_ingest_rx.into(),
         )
         .await?,
@@ -1235,6 +1417,7 @@ pub async fn run_async_with_hosts_and_derived_state_host_and_kernel_bypass_ingre
             plugin_host,
             extension_host,
             derived_state_host,
+            None,
             packet_ingest_rx.into(),
         )
         .await?,
@@ -1288,6 +1471,7 @@ pub async fn run_async_with_hosts_and_setup(
         plugin_host,
         extension_host,
         DerivedStateHost::builder().build(),
+        None,
     )
     .await?)
 }
@@ -1383,7 +1567,37 @@ mod tests {
         );
         assert!(setup.env_overrides.contains(&(
             String::from("SOF_GOSSIP_RECEIVER_CHANNEL_CAPACITY"),
-            String::from("8192")
+            String::from("131072")
+        )));
+        assert!(setup.env_overrides.contains(&(
+            String::from("SOF_GOSSIP_SOCKET_CONSUME_CHANNEL_CAPACITY"),
+            String::from("65536")
+        )));
+        assert!(setup.env_overrides.contains(&(
+            String::from("SOF_GOSSIP_RESPONSE_CHANNEL_CAPACITY"),
+            String::from("65536")
+        )));
+        assert!(setup.env_overrides.contains(&(
+            String::from("SOF_GOSSIP_CHANNEL_CONSUME_CAPACITY"),
+            String::from("4096")
+        )));
+        assert!(setup.env_overrides.contains(&(
+            String::from("SOF_GOSSIP_CONSUME_THREADS"),
+            String::from("4")
+        )));
+        assert!(
+            setup
+                .env_overrides
+                .contains(&(String::from("SOF_GOSSIP_LISTEN_THREADS"), String::from("4")))
+        );
+        assert!(
+            setup
+                .env_overrides
+                .contains(&(String::from("SOF_GOSSIP_RUN_THREADS"), String::from("4")))
+        );
+        assert!(setup.env_overrides.contains(&(
+            String::from("SOF_SHRED_DEDUP_CAPACITY"),
+            String::from("524288")
         )));
         assert!(setup.env_overrides.contains(&(
             String::from("SOF_UDP_RECEIVER_PIN_BY_PORT"),

@@ -8,7 +8,11 @@ use super::packet_workers::{
 };
 use super::*;
 use crate::reassembly::dataset::CompletedDataSet;
-use std::net::{IpAddr, Ipv4Addr};
+use std::{
+    future::Future,
+    net::{IpAddr, Ipv4Addr},
+    pin::Pin,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -17,6 +21,8 @@ pub(in crate::app::runtime) enum RuntimeRunloopError {
     ReceiverBootstrap {
         source: bootstrap::gossip::ReceiverBootstrapError,
     },
+    #[error("runtime startup failed: {reason}")]
+    RunloopStartup { reason: String },
 }
 
 // Runtime coordination defaults kept local to the runloop for operational clarity.
@@ -54,19 +60,26 @@ fn emit_shutdown_checkpoint_barrier(
         .emit_shutdown_checkpoint_barrier(feed_watermarks_from_fork_snapshot(fork_snapshot));
 }
 
+pub(super) type ShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
 pub(in crate::app::runtime) async fn run_async_with_hosts(
     plugin_host: PluginHost,
     extension_host: RuntimeExtensionHost,
     derived_state_host: DerivedStateHost,
+    shutdown_signal: Option<ShutdownSignal>,
 ) -> Result<(), RuntimeRunloopError> {
-    run_async_with_hosts_inner(
+    let plugin_host_cleanup = plugin_host.clone();
+    let result = run_async_with_hosts_inner(
         plugin_host,
         extension_host,
         derived_state_host,
+        shutdown_signal,
         #[cfg(feature = "kernel-bypass")]
         None,
     )
-    .await
+    .await;
+    plugin_host_cleanup.shutdown().await;
+    result
 }
 
 #[cfg(feature = "kernel-bypass")]
@@ -74,21 +87,27 @@ pub(in crate::app::runtime) async fn run_async_with_hosts_and_kernel_bypass_ingr
     plugin_host: PluginHost,
     extension_host: RuntimeExtensionHost,
     derived_state_host: DerivedStateHost,
+    shutdown_signal: Option<ShutdownSignal>,
     packet_ingest_rx: ingest::RawPacketBatchReceiver,
 ) -> Result<(), RuntimeRunloopError> {
-    run_async_with_hosts_inner(
+    let plugin_host_cleanup = plugin_host.clone();
+    let result = run_async_with_hosts_inner(
         plugin_host,
         extension_host,
         derived_state_host,
+        shutdown_signal,
         Some(packet_ingest_rx),
     )
-    .await
+    .await;
+    plugin_host_cleanup.shutdown().await;
+    result
 }
 
 async fn run_async_with_hosts_inner(
     plugin_host: PluginHost,
     extension_host: RuntimeExtensionHost,
     derived_state_host: DerivedStateHost,
+    mut shutdown_signal: Option<ShutdownSignal>,
     #[cfg(feature = "kernel-bypass")] mut kernel_bypass_packet_ingest_rx: Option<
         ingest::RawPacketBatchReceiver,
     >,
@@ -183,6 +202,16 @@ async fn run_async_with_hosts_inner(
     let plugin_hooks_enabled = !plugin_host.is_empty();
     if plugin_hooks_enabled {
         tracing::info!(plugins = ?plugin_host.plugin_names(), "observer plugins enabled");
+        plugin_host.startup().await.map_err(|error| {
+            tracing::error!(
+                plugin = error.plugin,
+                reason = %error.reason,
+                "observer plugin startup failed"
+            );
+            RuntimeRunloopError::RunloopStartup {
+                reason: error.to_string(),
+            }
+        })?;
     }
     let derived_state_hooks_enabled = !derived_state_host.is_empty();
     let derived_state_config = read_derived_state_runtime_config();
@@ -921,6 +950,14 @@ async fn run_async_with_hosts_inner(
     'event_loop: loop {
         tokio::select! {
             biased;
+            () = async {
+                if let Some(signal) = shutdown_signal.as_mut() {
+                    signal.as_mut().await;
+                }
+            }, if shutdown_signal.is_some() => {
+                tracing::info!("observer runtime shutdown signal received");
+                break 'event_loop;
+            }
             maybe_worker_result = packet_worker_pool.recv(), if !packet_workers_closed => {
                 let Some(worker_result) = maybe_worker_result else {
                     packet_workers_closed = true;
@@ -2710,6 +2747,11 @@ async fn run_async_with_hosts_inner(
     if extension_hooks_enabled {
         extension_host.shutdown().await;
     }
+    if plugin_hooks_enabled {
+        plugin_host.shutdown().await;
+    }
+    #[cfg(feature = "gossip-bootstrap")]
+    runtime.stop_gossip_runtime().await;
     drop(runtime);
     #[cfg(feature = "kernel-bypass")]
     if let Some(drain_task) = kernel_bypass_internal_ingest_drain_task.take()
@@ -3701,6 +3743,13 @@ mod tests {
             &mut self,
         ) -> Result<Option<DerivedStateCheckpoint>, DerivedStateConsumerFault> {
             Ok(None)
+        }
+
+        fn config(&self) -> crate::framework::DerivedStateConsumerConfig {
+            crate::framework::DerivedStateConsumerConfig::new()
+                .with_transaction_applied()
+                .with_account_touch_key_partitions()
+                .with_control_plane_observed()
         }
 
         fn apply(

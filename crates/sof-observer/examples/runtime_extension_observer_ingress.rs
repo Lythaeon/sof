@@ -8,9 +8,8 @@ use std::sync::{
 
 use async_trait::async_trait;
 use sof::framework::{
-    ExtensionCapability, ExtensionManifest, ExtensionShutdownContext, ExtensionStartupContext,
-    PacketSubscription, RuntimeExtension, RuntimeExtensionHost, RuntimePacketEvent,
-    RuntimePacketSourceKind, RuntimePacketTransport,
+    ExtensionCapability, ExtensionContext, ExtensionManifest, PacketSubscription, RuntimeExtension,
+    RuntimeExtensionHost, RuntimePacketEvent, RuntimePacketSourceKind, RuntimePacketTransport,
 };
 use thiserror::Error;
 
@@ -26,10 +25,10 @@ impl RuntimeExtension for ObserverIngressExtension {
         "observer-ingress-extension"
     }
 
-    async fn on_startup(
+    async fn setup(
         &self,
-        _ctx: ExtensionStartupContext,
-    ) -> Result<ExtensionManifest, sof::framework::extension::ExtensionStartupError> {
+        _ctx: ExtensionContext,
+    ) -> Result<ExtensionManifest, sof::framework::extension::ExtensionSetupError> {
         Ok(ExtensionManifest {
             capabilities: vec![ExtensionCapability::ObserveObserverIngress],
             resources: Vec::new(),
@@ -60,7 +59,7 @@ impl RuntimeExtension for ObserverIngressExtension {
         }
     }
 
-    async fn on_shutdown(&self, _ctx: ExtensionShutdownContext) {
+    async fn shutdown(&self, _ctx: ExtensionContext) {
         tracing::info!(
             packets = self.packets.load(Ordering::Relaxed),
             bytes = self.bytes.load(Ordering::Relaxed),

@@ -4,13 +4,15 @@ use super::*;
 /// Collects plugins that subscribed to one hook family while preserving registration order.
 fn collect_hook_plugins(
     plugins: &Arc<[Arc<dyn ObserverPlugin>]>,
-    wants_hook: impl Fn(&Arc<dyn ObserverPlugin>) -> bool,
+    plugin_subscriptions: &[PluginHookSubscriptions],
+    wants_hook: impl Fn(&PluginHookSubscriptions) -> bool,
 ) -> Arc<[Arc<dyn ObserverPlugin>]> {
     Arc::from(
         plugins
             .iter()
-            .filter(|plugin| wants_hook(plugin))
-            .cloned()
+            .zip(plugin_subscriptions.iter())
+            .filter(|(_, subscription)| wants_hook(subscription))
+            .map(|(plugin, _)| Arc::clone(plugin))
             .collect::<Vec<_>>(),
     )
 }
@@ -150,22 +152,48 @@ impl PluginHostBuilder {
     #[must_use]
     pub fn build(self) -> PluginHost {
         let plugins: Arc<[Arc<dyn ObserverPlugin>]> = Arc::from(self.plugins);
-        let raw_packet_plugins = collect_hook_plugins(&plugins, |plugin| plugin.wants_raw_packet());
-        let shred_plugins = collect_hook_plugins(&plugins, |plugin| plugin.wants_shred());
-        let dataset_plugins = collect_hook_plugins(&plugins, |plugin| plugin.wants_dataset());
+        let plugin_subscriptions: Vec<PluginHookSubscriptions> = plugins
+            .iter()
+            .map(|plugin| PluginHookSubscriptions::from(&plugin.config()))
+            .collect();
+        let raw_packet_plugins =
+            collect_hook_plugins(&plugins, &plugin_subscriptions, |subscription| {
+                subscription.raw_packet
+            });
+        let shred_plugins = collect_hook_plugins(&plugins, &plugin_subscriptions, |subscription| {
+            subscription.shred
+        });
+        let dataset_plugins =
+            collect_hook_plugins(&plugins, &plugin_subscriptions, |subscription| {
+                subscription.dataset
+            });
         let transaction_plugins =
-            collect_hook_plugins(&plugins, |plugin| plugin.wants_transaction());
+            collect_hook_plugins(&plugins, &plugin_subscriptions, |subscription| {
+                subscription.transaction
+            });
         let account_touch_plugins =
-            collect_hook_plugins(&plugins, |plugin| plugin.wants_account_touch());
+            collect_hook_plugins(&plugins, &plugin_subscriptions, |subscription| {
+                subscription.account_touch
+            });
         let slot_status_plugins =
-            collect_hook_plugins(&plugins, |plugin| plugin.wants_slot_status());
-        let reorg_plugins = collect_hook_plugins(&plugins, |plugin| plugin.wants_reorg());
+            collect_hook_plugins(&plugins, &plugin_subscriptions, |subscription| {
+                subscription.slot_status
+            });
+        let reorg_plugins = collect_hook_plugins(&plugins, &plugin_subscriptions, |subscription| {
+            subscription.reorg
+        });
         let recent_blockhash_plugins =
-            collect_hook_plugins(&plugins, |plugin| plugin.wants_recent_blockhash());
+            collect_hook_plugins(&plugins, &plugin_subscriptions, |subscription| {
+                subscription.recent_blockhash
+            });
         let cluster_topology_plugins =
-            collect_hook_plugins(&plugins, |plugin| plugin.wants_cluster_topology());
+            collect_hook_plugins(&plugins, &plugin_subscriptions, |subscription| {
+                subscription.cluster_topology
+            });
         let leader_schedule_plugins =
-            collect_hook_plugins(&plugins, |plugin| plugin.wants_leader_schedule());
+            collect_hook_plugins(&plugins, &plugin_subscriptions, |subscription| {
+                subscription.leader_schedule
+            });
         let subscriptions = PluginHookSubscriptions {
             raw_packet: !raw_packet_plugins.is_empty(),
             shred: !shred_plugins.is_empty(),
@@ -209,6 +237,7 @@ impl PluginHostBuilder {
             subscriptions,
             latest_observed_recent_blockhash: ArcShift::new(None),
             latest_observed_tpu_leader: ArcShift::new(None),
+            lifecycle: Arc::new(PluginHostLifecycleState::default()),
         }
     }
 }

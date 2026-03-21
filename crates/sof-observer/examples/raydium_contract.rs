@@ -7,7 +7,7 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
-use sof::framework::{Plugin, PluginHost, TransactionEvent};
+use sof::framework::{Plugin, PluginConfig, PluginHost, TransactionEvent};
 use solana_pubkey::Pubkey;
 use thiserror::Error;
 
@@ -67,8 +67,8 @@ impl Plugin for RaydiumTxFilterLoggerPlugin {
         "raydium-tx-filter-logger"
     }
 
-    fn wants_transaction(&self) -> bool {
-        true
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_transaction()
     }
 
     async fn on_transaction(&self, event: &TransactionEvent) {

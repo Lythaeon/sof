@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // Linux-only ancillary control messages are used for RX queue overflow telemetry.
@@ -125,8 +125,17 @@ impl ReceiverTelemetry {
 
 #[must_use]
 pub fn spawn_udp_receiver(bind_addr: SocketAddr, tx: RawPacketBatchSender) -> JoinHandle<()> {
+    spawn_udp_receiver_with_shutdown(bind_addr, tx, None)
+}
+
+#[must_use]
+pub fn spawn_udp_receiver_with_shutdown(
+    bind_addr: SocketAddr,
+    tx: RawPacketBatchSender,
+    shutdown: Option<Arc<AtomicBool>>,
+) -> JoinHandle<()> {
     task::spawn_blocking(move || {
-        if let Err(err) = run_udp_receiver(bind_addr, &tx, None) {
+        if let Err(err) = run_udp_receiver(bind_addr, &tx, None, shutdown.as_ref()) {
             tracing::error!(%bind_addr, error = %err, "udp receiver terminated");
         }
     })
@@ -137,7 +146,7 @@ pub fn spawn_udp_receiver_from_std(
     std_socket: std::net::UdpSocket,
     tx: RawPacketBatchSender,
 ) -> JoinHandle<()> {
-    spawn_udp_receiver_from_std_with_telemetry(std_socket, tx, None)
+    spawn_udp_receiver_from_std_with_telemetry_and_shutdown(std_socket, tx, None, None)
 }
 
 #[must_use]
@@ -146,8 +155,20 @@ pub fn spawn_udp_receiver_from_std_with_telemetry(
     tx: RawPacketBatchSender,
     telemetry: Option<ReceiverTelemetry>,
 ) -> JoinHandle<()> {
+    spawn_udp_receiver_from_std_with_telemetry_and_shutdown(std_socket, tx, telemetry, None)
+}
+
+#[must_use]
+pub fn spawn_udp_receiver_from_std_with_telemetry_and_shutdown(
+    std_socket: std::net::UdpSocket,
+    tx: RawPacketBatchSender,
+    telemetry: Option<ReceiverTelemetry>,
+    shutdown: Option<Arc<AtomicBool>>,
+) -> JoinHandle<()> {
     task::spawn_blocking(move || {
-        if let Err(err) = run_udp_receiver_with_socket(&std_socket, &tx, telemetry.as_ref()) {
+        if let Err(err) =
+            run_udp_receiver_with_socket(&std_socket, &tx, telemetry.as_ref(), shutdown.as_ref())
+        {
             tracing::error!(error = %err, "udp receiver terminated");
         }
     })
@@ -157,17 +178,19 @@ fn run_udp_receiver(
     bind_addr: SocketAddr,
     tx: &RawPacketBatchSender,
     telemetry: Option<&ReceiverTelemetry>,
+    shutdown: Option<&Arc<AtomicBool>>,
 ) -> Result<(), UdpReceiverError> {
     let std_socket = std::net::UdpSocket::bind(bind_addr)
         .map_err(|source| UdpReceiverError::BindSocket { bind_addr, source })?;
     tracing::info!(%bind_addr, "listening for udp packets");
-    run_udp_receiver_with_socket(&std_socket, tx, telemetry)
+    run_udp_receiver_with_socket(&std_socket, tx, telemetry, shutdown)
 }
 
 fn run_udp_receiver_with_socket(
     std_socket: &std::net::UdpSocket,
     tx: &RawPacketBatchSender,
     telemetry: Option<&ReceiverTelemetry>,
+    shutdown: Option<&Arc<AtomicBool>>,
 ) -> Result<(), UdpReceiverError> {
     std_socket
         .set_nonblocking(false)
@@ -189,6 +212,10 @@ fn run_udp_receiver_with_socket(
     let mut batch_started_at: Option<Instant> = None;
     let mut last_rxq_ovfl_counter: Option<u64> = None;
     loop {
+        if should_shutdown(shutdown) {
+            flush_batch(tx, &mut batch, telemetry);
+            return Ok(());
+        }
         match recv_udp_packet(std_socket, &mut buffer, track_rxq_ovfl) {
             Ok(packet) => {
                 if let (Some(telemetry), Some(drop_counter)) = (telemetry, packet.rxq_ovfl_counter)
@@ -250,12 +277,19 @@ fn run_udp_receiver_with_socket(
                         .map_err(|source| UdpReceiverError::SetReadTimeout { source })?;
                     current_wait = idle_wait;
                 }
+                if should_shutdown(shutdown) {
+                    return Ok(());
+                }
             }
             Err(error) => {
                 return Err(UdpReceiverError::Receive { source: error });
             }
         }
     }
+}
+
+fn should_shutdown(shutdown: Option<&Arc<AtomicBool>>) -> bool {
+    shutdown.is_some_and(|flag| flag.load(Ordering::Relaxed))
 }
 
 #[path = "io.rs"]

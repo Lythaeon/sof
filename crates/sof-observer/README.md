@@ -36,13 +36,13 @@ cargo add sof
 Optional gossip bootstrap support at compile time:
 
 ```toml
-sof = { version = "0.10.1", features = ["gossip-bootstrap"] }
+sof = { version = "0.11.0", features = ["gossip-bootstrap"] }
 ```
 
 Optional external `kernel-bypass` ingress support:
 
 ```toml
-sof = { version = "0.10.1", features = ["kernel-bypass"] }
+sof = { version = "0.11.0", features = ["kernel-bypass"] }
 ```
 
 The bundled `sof-solana-gossip` backend defaults to SOF's lightweight in-memory duplicate/conflict
@@ -188,7 +188,7 @@ Notes for high-ingest runs:
 use async_trait::async_trait;
 use sof::{
     event::TxKind,
-    framework::{Plugin, PluginHost, TransactionEvent},
+    framework::{Plugin, PluginConfig, PluginHost, TransactionEvent},
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -196,11 +196,11 @@ struct NonVoteLogger;
 
 #[async_trait]
 impl Plugin for NonVoteLogger {
-    fn wants_transaction(&self) -> bool {
-        true
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_transaction()
     }
 
-    async fn on_transaction(&self, event: TransactionEvent) {
+    async fn on_transaction(&self, event: &TransactionEvent) {
         if event.kind == TxKind::VoteOnly {
             return;
         }
@@ -215,12 +215,16 @@ async fn main() -> Result<(), sof::runtime::RuntimeError> {
 }
 ```
 
+For sparse plugin subscriptions, prefer `PluginConfig::new().with_*()` so the enabled hooks stand
+out clearly. Use a raw `PluginConfig { .. }` literal only when many flags are enabled and the full
+shape is easier to scan.
+
 ## RuntimeExtension Quickstart
 
 ```rust
 use async_trait::async_trait;
 use sof::framework::{
-    ExtensionCapability, ExtensionManifest, ExtensionStartupContext, PacketSubscription,
+    ExtensionCapability, ExtensionContext, ExtensionManifest, PacketSubscription,
     RuntimeExtension, RuntimeExtensionHost, RuntimePacketSourceKind,
 };
 
@@ -229,10 +233,10 @@ struct IngressExtension;
 
 #[async_trait]
 impl RuntimeExtension for IngressExtension {
-    async fn on_startup(
+    async fn setup(
         &self,
-        _ctx: ExtensionStartupContext,
-    ) -> Result<ExtensionManifest, sof::framework::extension::ExtensionStartupError> {
+        _ctx: ExtensionContext,
+    ) -> Result<ExtensionManifest, sof::framework::extension::ExtensionSetupError> {
         Ok(ExtensionManifest {
             capabilities: vec![ExtensionCapability::ObserveObserverIngress],
             resources: Vec::new(),

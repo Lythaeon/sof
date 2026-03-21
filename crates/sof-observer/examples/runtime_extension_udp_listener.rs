@@ -5,9 +5,9 @@ use std::{net::SocketAddr, str::FromStr};
 
 use async_trait::async_trait;
 use sof::framework::{
-    ExtensionCapability, ExtensionManifest, ExtensionResourceSpec, ExtensionShutdownContext,
-    ExtensionStartupContext, ExtensionStreamVisibility, PacketSubscription, RuntimeExtension,
-    RuntimeExtensionHost, RuntimePacketEvent, RuntimePacketSourceKind, UdpListenerSpec,
+    ExtensionCapability, ExtensionContext, ExtensionManifest, ExtensionResourceSpec,
+    ExtensionStreamVisibility, PacketSubscription, RuntimeExtension, RuntimeExtensionHost,
+    RuntimePacketEvent, RuntimePacketSourceKind, UdpListenerSpec,
 };
 use thiserror::Error;
 use tokio::net::UdpSocket;
@@ -26,10 +26,10 @@ impl RuntimeExtension for LocalUdpListenerExtension {
         "local-udp-listener-extension"
     }
 
-    async fn on_startup(
+    async fn setup(
         &self,
-        _ctx: ExtensionStartupContext,
-    ) -> Result<ExtensionManifest, sof::framework::extension::ExtensionStartupError> {
+        _ctx: ExtensionContext,
+    ) -> Result<ExtensionManifest, sof::framework::extension::ExtensionSetupError> {
         Ok(ExtensionManifest {
             capabilities: vec![ExtensionCapability::BindUdp],
             resources: vec![ExtensionResourceSpec::UdpListener(UdpListenerSpec {
@@ -56,7 +56,7 @@ impl RuntimeExtension for LocalUdpListenerExtension {
         );
     }
 
-    async fn on_shutdown(&self, _ctx: ExtensionShutdownContext) {
+    async fn shutdown(&self, _ctx: ExtensionContext) {
         tracing::info!("local udp listener runtime extension shutting down");
     }
 }

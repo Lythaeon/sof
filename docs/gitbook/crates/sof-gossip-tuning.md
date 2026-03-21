@@ -12,6 +12,8 @@ their applications.
 - receiver fanout and pinning
 - TVU socket count
 - bundled gossip queue capacities used by the optional bootstrap path
+- bundled gossip drain budget and worker counts
+- shred dedupe capacity
 
 ## Why It Matters
 
@@ -27,8 +29,22 @@ This crate keeps those values explicit, validated, and reusable.
 | Preset | Intended Host Profile |
 | --- | --- |
 | `Home` | small self-hosted machine, conservative fanout |
-| `Vps` | constrained public host with moderate queue budgets |
+| `Vps` | validated public host profile with deeper gossip queues and dual-socket fanout |
 | `Dedicated` | dedicated ingest machine with more aggressive fanout |
+
+The `Vps` preset now mirrors the live public-host profile validated against mainnet traffic:
+
+- `SOF_UDP_BATCH_SIZE=96`
+- `SOF_TVU_SOCKETS=2`
+- `SOF_UDP_RECEIVER_PIN_BY_PORT=true`
+- `SOF_GOSSIP_RECEIVER_CHANNEL_CAPACITY=131072`
+- `SOF_GOSSIP_SOCKET_CONSUME_CHANNEL_CAPACITY=65536`
+- `SOF_GOSSIP_RESPONSE_CHANNEL_CAPACITY=65536`
+- `SOF_GOSSIP_CHANNEL_CONSUME_CAPACITY=4096`
+- `SOF_GOSSIP_CONSUME_THREADS=4`
+- `SOF_GOSSIP_LISTEN_THREADS=4`
+- `SOF_GOSSIP_RUN_THREADS=4`
+- `SOF_SHRED_DEDUP_CAPACITY=524288`
 
 ## Typical Usage
 

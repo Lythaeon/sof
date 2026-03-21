@@ -1,6 +1,6 @@
 [package]
 name = "sof"
-version = "0.10.1"
+version = "0.11.0"
 edition.workspace = true
 description = "Solana Observer Framework for low-latency shred ingestion and plugin-driven transaction observation"
 license = "Apache-2.0 OR MIT"
@@ -23,7 +23,7 @@ gossip-bootstrap = ["dep:solana-gossip"]
 kernel-bypass = ["dep:xdp"]
 
 [dependencies]
-sof-gossip-tuning = { version = "0.10.1", path = "../sof-gossip-tuning" }
+sof-gossip-tuning = { version = "0.11.0", path = "../sof-gossip-tuning" }
 solana-gossip = { package = "sof-solana-gossip", version = "3.1.8-sof.4", optional = true, features = ["agave-unstable-api"] }
 solana-entry = { version = "3.1.8", features = ["agave-unstable-api"] }
 solana-keypair = "3.0.1"
@@ -55,6 +55,7 @@ crossbeam-skiplist = "0.1"
 async-trait = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+signal-hook = "0.3"
 xdp = { version = "0.7.3", optional = true }
 
 [[example]]

@@ -3,13 +3,14 @@ use std::{
     future::Future,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
 };
 
 use arcshift::ArcShift;
 use solana_pubkey::Pubkey;
+use thiserror::Error;
 use tokio::sync::{Semaphore, mpsc};
 
 use crate::framework::{
@@ -18,7 +19,7 @@ use crate::framework::{
         ObservedRecentBlockhashEvent, RawPacketEvent, ReorgEvent, ShredEvent, SlotStatusEvent,
         TransactionEvent,
     },
-    plugin::ObserverPlugin,
+    plugin::{ObserverPlugin, PluginConfig},
 };
 
 /// Builder surface for assembling immutable plugin hosts.
@@ -43,6 +44,23 @@ const DEFAULT_TRANSACTION_DISPATCH_WORKERS_CAP: usize = 8;
 const INITIAL_DROP_LOG_LIMIT: u64 = 5;
 /// Warning sample cadence after the initial dropped-event warning burst.
 const DROP_LOG_SAMPLE_EVERY: u64 = 1_000;
+
+#[derive(Debug, Default)]
+/// Shared lifecycle state so cloned plugin hosts run startup/shutdown hooks once.
+struct PluginHostLifecycleState {
+    /// Tracks whether plugin startup completed and shutdown is still pending.
+    started: AtomicBool,
+}
+
+#[derive(Debug, Clone, Error, Eq, PartialEq)]
+#[error("plugin `{plugin}` startup failed: {reason}")]
+/// Startup failure returned by [`PluginHost::startup`].
+pub struct PluginHostStartupError {
+    /// Plugin identifier.
+    pub plugin: &'static str,
+    /// Human-readable failure reason.
+    pub reason: String,
+}
 
 /// Chooses a bounded default worker count for accepted-transaction dispatch.
 fn default_transaction_dispatch_workers() -> usize {
@@ -111,4 +129,21 @@ struct PluginHookSubscriptions {
     cluster_topology: bool,
     /// At least one plugin wants leader-schedule callbacks.
     leader_schedule: bool,
+}
+
+impl From<&PluginConfig> for PluginHookSubscriptions {
+    fn from(config: &PluginConfig) -> Self {
+        Self {
+            raw_packet: config.raw_packet,
+            shred: config.shred,
+            dataset: config.dataset,
+            transaction: config.transaction,
+            account_touch: config.account_touch,
+            slot_status: config.slot_status,
+            reorg: config.reorg,
+            recent_blockhash: config.recent_blockhash,
+            cluster_topology: config.cluster_topology,
+            leader_schedule: config.leader_schedule,
+        }
+    }
 }

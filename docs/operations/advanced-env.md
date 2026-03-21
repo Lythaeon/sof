@@ -5,7 +5,7 @@ These variables are intentionally undocumented in the quick-start path because t
 Use these only when you are measuring changes and can roll back quickly.
 
 - Source of truth: `crates/sof-observer/src/app/config/*`, `crates/sof-observer/src/app/runtime/*`, `crates/sof-observer/src/ingest/core.rs`
-- Snapshot date: 2026-03-09
+- Snapshot date: 2026-03-21
 
 ## Safe baseline
 
@@ -32,9 +32,23 @@ If you configure SOF programmatically, prefer the typed control surface from
 - `sof_gossip_tuning::GossipTuningProfile`
 - `sof::runtime::RuntimeSetup::with_gossip_tuning_profile(...)`
 
-That path now applies both SOF runtime knobs and the bundled patched gossip queue capacities used by
-SOF's bootstrap path. Downstream users do not need a separate workspace-root
+That path now applies SOF runtime knobs, semantic shred dedupe capacity, and the bundled patched
+gossip queue/worker capacities used by SOF's bootstrap path. Downstream users do not need a separate workspace-root
 `[patch.crates-io]` override for those queue controls.
+
+Current validated public-host preset (`HostProfilePreset::Vps`):
+
+- `SOF_UDP_BATCH_SIZE=96`
+- `SOF_TVU_SOCKETS=2`
+- `SOF_UDP_RECEIVER_PIN_BY_PORT=true`
+- `SOF_GOSSIP_RECEIVER_CHANNEL_CAPACITY=131072`
+- `SOF_GOSSIP_SOCKET_CONSUME_CHANNEL_CAPACITY=65536`
+- `SOF_GOSSIP_RESPONSE_CHANNEL_CAPACITY=65536`
+- `SOF_GOSSIP_CHANNEL_CONSUME_CAPACITY=4096`
+- `SOF_GOSSIP_CONSUME_THREADS=4`
+- `SOF_GOSSIP_LISTEN_THREADS=4`
+- `SOF_GOSSIP_RUN_THREADS=4`
+- `SOF_SHRED_DEDUP_CAPACITY=524288`
 
 Important scope note:
 

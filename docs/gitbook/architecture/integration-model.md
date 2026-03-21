@@ -18,6 +18,8 @@ Use plugins when you want callbacks for:
 - leader schedule changes
 
 Plugins are the right fit for downstream logic that consumes decoded runtime events.
+They declare static hook interest with `PluginConfig` and may use startup/shutdown lifecycle hooks
+for plugin-local initialization and cleanup.
 
 ## 2. Runtime Extensions
 

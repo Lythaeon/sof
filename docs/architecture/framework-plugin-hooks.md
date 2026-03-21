@@ -13,6 +13,9 @@ custom logic without forking the runtime.
 
 - Trait:
   - `ObserverPlugin` (also re-exported as `Plugin`)
+- Static config and lifecycle:
+  - `PluginConfig`
+  - `PluginContext`
 - Event payloads:
   - `ClusterTopologyEvent`
   - `RawPacketEvent`
@@ -34,13 +37,70 @@ custom logic without forking the runtime.
 
 Hooks are opt-in.
 
-Implementing `on_*` is not enough by itself. Plugins must also return `true` from the
-matching `wants_*` method or the host will skip queueing that hook entirely.
+Implementing `on_*` is not enough by itself. Plugins must opt in through
+`Plugin::config() -> PluginConfig`, otherwise the host will skip queueing that hook entirely.
 
 `on_transaction` has an additional synchronous prefilter:
 
-- `wants_transaction()` enables transaction hook delivery at all
+- `config().transaction` enables transaction hook delivery at all
 - `accepts_transaction(&event)` allows cheap hot-path rejection before queueing
+
+Defaults:
+
+- `PluginConfig::default()` / `PluginConfig::new()` enable no hooks
+- the host reads plugin configs once during construction
+- dispatch target lists are precomputed at startup and remain static for the lifetime of the host
+
+Preferred style for sparse plugin configs:
+
+```rust
+fn config(&self) -> PluginConfig {
+    PluginConfig::new().with_transaction().with_dataset()
+}
+```
+
+Raw struct construction is still valid when a dense config is more readable:
+
+```rust
+fn config(&self) -> PluginConfig {
+    PluginConfig {
+        transaction: true,
+        dataset: true,
+        ..PluginConfig::default()
+    }
+}
+```
+
+## Plugin Lifecycle
+
+Plugins now have explicit lifecycle hooks:
+
+1. `setup`
+2. steady-state `on_*` callbacks
+3. `shutdown`
+
+Semantics:
+
+- `setup` runs once before the runtime enters its main loop
+- `shutdown` runs once after ingest stops
+- the packaged runtime invokes both automatically when a `PluginHost` is attached
+- startup is sequential in registration order
+- shutdown is sequential in reverse registration order
+- if one plugin startup fails, SOF aborts runtime startup and best-effort shuts down any plugins
+  that already started successfully
+
+Typical lifecycle shape:
+
+```rust
+async fn setup(&self, ctx: PluginContext) -> Result<(), PluginSetupError> {
+    tracing::info!(plugin = ctx.plugin_name, "plugin startup completed");
+    Ok(())
+}
+
+async fn shutdown(&self, ctx: PluginContext) {
+    tracing::info!(plugin = ctx.plugin_name, "plugin shutdown completed");
+}
+```
 
 ## Hook Semantics
 
@@ -165,6 +225,8 @@ The packaged runtime dispatches hooks asynchronously using a bounded queue:
 - dispatch mode defaults to `Sequential` and can be set to `BoundedConcurrent(N)`
 - plugin panics are isolated per hook dispatch; SOF logs the panic and continues
 - when the queue is full, hook events are dropped to protect ingest latency
+- plugin startup failure aborts runtime startup before ingest begins
+- plugin shutdown hooks run after runtime ingest stops
 
 To run the packaged runtime entrypoint:
 

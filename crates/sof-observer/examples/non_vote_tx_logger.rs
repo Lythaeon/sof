@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_trait::async_trait;
 use sof::{
     event::TxKind,
-    framework::{DatasetEvent, Plugin, PluginHost, ShredEvent, TransactionEvent},
+    framework::{DatasetEvent, Plugin, PluginConfig, PluginHost, ShredEvent, TransactionEvent},
 };
 use thiserror::Error;
 
@@ -29,16 +29,11 @@ impl Plugin for NonVoteTxLoggerPlugin {
         "non-vote-tx-logger"
     }
 
-    fn wants_dataset(&self) -> bool {
-        true
-    }
-
-    fn wants_shred(&self) -> bool {
-        true
-    }
-
-    fn wants_transaction(&self) -> bool {
-        true
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new()
+            .with_dataset()
+            .with_shred()
+            .with_transaction()
     }
 
     async fn on_dataset(&self, event: DatasetEvent) {

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use sof::framework::{
-    ClusterNodeInfo, ClusterTopologyEvent, LeaderScheduleEvent, Plugin, PluginHost,
+    ClusterNodeInfo, ClusterTopologyEvent, LeaderScheduleEvent, Plugin, PluginConfig, PluginHost,
 };
 use sof::runtime::RuntimeSetup;
 use solana_pubkey::Pubkey;
@@ -31,12 +31,10 @@ impl Plugin for TpuLeaderLoggerPlugin {
         "tpu-leader-logger"
     }
 
-    fn wants_cluster_topology(&self) -> bool {
-        true
-    }
-
-    fn wants_leader_schedule(&self) -> bool {
-        true
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new()
+            .with_cluster_topology()
+            .with_leader_schedule()
     }
 
     async fn on_cluster_topology(&self, event: ClusterTopologyEvent) {

@@ -9,8 +9,9 @@ use std::{
 
 use sof::{
     framework::{
-        DerivedStateCheckpoint, DerivedStateConsumer, DerivedStateConsumerFault,
-        DerivedStateConsumerFaultKind, DerivedStateFeedEnvelope, DerivedStateFeedEvent,
+        DerivedStateCheckpoint, DerivedStateConsumer, DerivedStateConsumerConfig,
+        DerivedStateConsumerContext, DerivedStateConsumerFault, DerivedStateConsumerFaultKind,
+        DerivedStateConsumerSetupError, DerivedStateFeedEnvelope, DerivedStateFeedEvent,
         DerivedStateHost, DerivedStateReplayBackend, DerivedStateReplayDurability,
     },
     runtime::{self, DerivedStateReplayConfig, DerivedStateRuntimeConfig, RuntimeSetup},
@@ -56,6 +57,28 @@ impl DerivedStateConsumer for SlotMirrorConsumer {
         &mut self,
     ) -> Result<Option<DerivedStateCheckpoint>, DerivedStateConsumerFault> {
         Ok(self.persisted_checkpoint())
+    }
+
+    fn config(&self) -> DerivedStateConsumerConfig {
+        DerivedStateConsumerConfig::new().with_control_plane_observed()
+    }
+
+    fn setup(
+        &mut self,
+        ctx: DerivedStateConsumerContext,
+    ) -> Result<(), DerivedStateConsumerSetupError> {
+        tracing::info!(
+            consumer = ctx.consumer_name,
+            "derived-state consumer startup completed"
+        );
+        Ok(())
+    }
+
+    fn shutdown(&mut self, ctx: DerivedStateConsumerContext) {
+        tracing::info!(
+            consumer = ctx.consumer_name,
+            "derived-state consumer shutdown completed"
+        );
     }
 
     fn apply(
@@ -140,6 +163,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     });
 
-    runtime::run_async_with_derived_state_host_and_setup(derived_state_host, &setup).await?;
+    runtime::ObserverRuntime::new()
+        .with_derived_state_host(derived_state_host)
+        .with_setup(setup)
+        .run_until_termination_signal()
+        .await?;
     Ok(())
 }

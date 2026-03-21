@@ -1,6 +1,6 @@
 # ADR-0009: External Derived-State Extensions and Replay Contracts
 
-- Status: Proposed
+- Status: Implemented
 - Date: 2026-03-06
 - Decision makers: `sof-observer` maintainers
 - Related: `docs/architecture/framework-plugin-hooks.md`, `docs/architecture/runtime-extension-hooks.md`, `docs/architecture/derived-state-extension-contract.md`, `docs/architecture/derived-state-feed-contract.md`, `docs/architecture/adr/0008-runtime-extension-capability-and-filtered-ingress.md`, `docs/architecture/ard/0007-infrastructure-composition-and-runtime-model.md`
