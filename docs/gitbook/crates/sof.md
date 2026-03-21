@@ -56,9 +56,11 @@ If your only goal is to build and submit transactions, start with `sof-tx` inste
 ### 1. Start the runtime
 
 ```rust
+use sof::runtime::ObserverRuntime;
+
 #[tokio::main]
 async fn main() -> Result<(), sof::runtime::RuntimeError> {
-    sof::runtime::run_async().await
+    ObserverRuntime::new().run_until_termination_signal().await
 }
 ```
 
@@ -67,13 +69,16 @@ Use this when you only need to prove the runtime starts on your host.
 ### 2. Start the runtime with explicit setup
 
 ```rust
-use sof::runtime::RuntimeSetup;
+use sof::runtime::{ObserverRuntime, RuntimeSetup};
 
 #[tokio::main]
 async fn main() -> Result<(), sof::runtime::RuntimeError> {
-    let setup = RuntimeSetup::new()
-        .with_startup_step_logs(true);
-    sof::runtime::run_async_with_setup(&setup).await
+    let setup = RuntimeSetup::new().with_startup_step_logs(true);
+
+    ObserverRuntime::new()
+        .with_setup(setup)
+        .run_until_termination_signal()
+        .await
 }
 ```
 
@@ -87,6 +92,7 @@ use async_trait::async_trait;
 use sof::{
     event::TxKind,
     framework::{Plugin, PluginConfig, PluginHost, TransactionEvent},
+    runtime::ObserverRuntime,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -109,7 +115,11 @@ impl Plugin for NonVoteLogger {
 #[tokio::main]
 async fn main() -> Result<(), sof::runtime::RuntimeError> {
     let host = PluginHost::builder().add_plugin(NonVoteLogger).build();
-    sof::runtime::run_async_with_plugin_host(host).await
+
+    ObserverRuntime::new()
+        .with_plugin_host(host)
+        .run_until_termination_signal()
+        .await
 }
 ```
 
@@ -217,7 +227,7 @@ The implementation loop is usually:
 4. pass that host into the runtime entrypoint
 
 In practice, the integration usually comes down to one concrete pattern: choose the host type
-that matches your service, then pass that host into the matching runtime entrypoint.
+that matches your service, attach it to `ObserverRuntime::new()`, then run the composed runtime.
 
 ## Operational Baseline
 

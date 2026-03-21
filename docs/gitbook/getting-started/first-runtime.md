@@ -36,7 +36,8 @@ Important runtime effect:
 
 ## Embed It In Your Own App
 
-For crate consumers, start with `RuntimeSetup` or the plain runtime entrypoints.
+For crate consumers, start with `ObserverRuntime` plus `RuntimeSetup` when startup should be
+explicit in code.
 
 ### Programmatic Setup
 
@@ -44,11 +45,16 @@ Embedded services usually want `RuntimeSetup` instead of pushing startup behavio
 strings.
 
 ```rust
+use sof::runtime::{ObserverRuntime, RuntimeSetup};
+
 #[tokio::main]
 async fn main() -> Result<(), sof::runtime::RuntimeError> {
-    let setup = sof::runtime::RuntimeSetup::new()
-        .with_startup_step_logs(true);
-    sof::runtime::run_async_with_setup(&setup).await
+    let setup = RuntimeSetup::new().with_startup_step_logs(true);
+
+    ObserverRuntime::new()
+        .with_setup(setup)
+        .run_until_termination_signal()
+        .await
 }
 ```
 
@@ -66,7 +72,7 @@ Useful setup helpers include:
 
 For a first real integration, this progression usually works well:
 
-1. make `run_async()` compile and start
+1. make `ObserverRuntime::new()` compile and start
 2. switch to `RuntimeSetup` so startup is explicit in code
 3. attach one plugin and prove you can consume events
 4. only then move into gossip mode, runtime extensions, or derived-state consumers
@@ -83,7 +89,7 @@ use async_trait::async_trait;
 use sof::{
     event::TxKind,
     framework::{Plugin, PluginConfig, PluginHost, TransactionEvent},
-    runtime::RuntimeSetup,
+    runtime::{ObserverRuntime, RuntimeSetup},
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -107,7 +113,12 @@ impl Plugin for NonVoteLogger {
 async fn main() -> Result<(), sof::runtime::RuntimeError> {
     let setup = RuntimeSetup::new().with_startup_step_logs(true);
     let host = PluginHost::builder().add_plugin(NonVoteLogger).build();
-    sof::runtime::run_async_with_plugin_host_and_setup(host, &setup).await
+
+    ObserverRuntime::new()
+        .with_setup(setup)
+        .with_plugin_host(host)
+        .run_until_termination_signal()
+        .await
 }
 ```
 
