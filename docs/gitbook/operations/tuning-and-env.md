@@ -13,6 +13,20 @@ For first deployments, keep to:
 If you configure the runtime in code, prefer `RuntimeSetup` and `sof-gossip-tuning` instead of raw
 string overrides.
 
+The typed `Vps` preset now reflects the validated public-host profile:
+
+- `SOF_UDP_BATCH_SIZE=96`
+- `SOF_TVU_SOCKETS=2`
+- `SOF_UDP_RECEIVER_PIN_BY_PORT=true`
+- `SOF_GOSSIP_RECEIVER_CHANNEL_CAPACITY=131072`
+- `SOF_GOSSIP_SOCKET_CONSUME_CHANNEL_CAPACITY=65536`
+- `SOF_GOSSIP_RESPONSE_CHANNEL_CAPACITY=65536`
+- `SOF_GOSSIP_CHANNEL_CONSUME_CAPACITY=4096`
+- `SOF_GOSSIP_CONSUME_THREADS=4`
+- `SOF_GOSSIP_LISTEN_THREADS=4`
+- `SOF_GOSSIP_RUN_THREADS=4`
+- `SOF_SHRED_DEDUP_CAPACITY=524288`
+
 ## Preferred Tuning Order
 
 1. keep defaults

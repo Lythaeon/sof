@@ -32,9 +32,9 @@ Adopted `RuntimeExtension` as a separate runtime system from `ObserverPlugin`, w
 
 Added trait:
 
-1. `on_startup(ctx) -> Result<ExtensionManifest, ExtensionStartupError>`
+1. `setup(ctx) -> Result<ExtensionManifest, ExtensionSetupError>`
 2. `on_packet_received(event)`
-3. `on_shutdown(ctx)`
+3. `shutdown(ctx)`
 
 `ObserverPlugin` remains unchanged and separate.
 
@@ -89,7 +89,7 @@ Payload-DSL filtering remains out of scope in v1.
 
 ### Startup
 
-1. host calls each extension `on_startup` with timeout,
+1. host calls each extension `setup` with timeout,
 2. validates manifest against capability policy,
 3. validates resource/capability consistency,
 4. provisions requested resources for successful extensions, and
@@ -117,7 +117,7 @@ Payload-DSL filtering remains out of scope in v1.
 ### Shutdown
 
 1. abort resource tasks first,
-2. call extension `on_shutdown` with timeout,
+2. call extension `shutdown` with timeout,
 3. force-cancel lingering extension worker tasks after deadline.
 
 ### WebSocket connectors

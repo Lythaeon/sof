@@ -56,7 +56,7 @@ dominates. Many serious services need both: fresh live updates on top of a repla
 Derived-state consumers now follow the same broad discipline as plugins:
 
 - static interest is declared once with `DerivedStateConsumerConfig`
-- optional `on_startup` / `on_shutdown` hooks handle consumer-local lifecycle work
+- optional `setup` / `shutdown` hooks handle consumer-local lifecycle work
 - `load_checkpoint` / `flush_checkpoint` remain the actual durability boundary
 
 That split matters because startup hooks are operational, while checkpoint methods define replay

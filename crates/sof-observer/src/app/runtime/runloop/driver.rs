@@ -8,7 +8,11 @@ use super::packet_workers::{
 };
 use super::*;
 use crate::reassembly::dataset::CompletedDataSet;
-use std::net::{IpAddr, Ipv4Addr};
+use std::{
+    future::Future,
+    net::{IpAddr, Ipv4Addr},
+    pin::Pin,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -56,16 +60,20 @@ fn emit_shutdown_checkpoint_barrier(
         .emit_shutdown_checkpoint_barrier(feed_watermarks_from_fork_snapshot(fork_snapshot));
 }
 
+pub(super) type ShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
 pub(in crate::app::runtime) async fn run_async_with_hosts(
     plugin_host: PluginHost,
     extension_host: RuntimeExtensionHost,
     derived_state_host: DerivedStateHost,
+    shutdown_signal: Option<ShutdownSignal>,
 ) -> Result<(), RuntimeRunloopError> {
     let plugin_host_cleanup = plugin_host.clone();
     let result = run_async_with_hosts_inner(
         plugin_host,
         extension_host,
         derived_state_host,
+        shutdown_signal,
         #[cfg(feature = "kernel-bypass")]
         None,
     )
@@ -79,6 +87,7 @@ pub(in crate::app::runtime) async fn run_async_with_hosts_and_kernel_bypass_ingr
     plugin_host: PluginHost,
     extension_host: RuntimeExtensionHost,
     derived_state_host: DerivedStateHost,
+    shutdown_signal: Option<ShutdownSignal>,
     packet_ingest_rx: ingest::RawPacketBatchReceiver,
 ) -> Result<(), RuntimeRunloopError> {
     let plugin_host_cleanup = plugin_host.clone();
@@ -86,6 +95,7 @@ pub(in crate::app::runtime) async fn run_async_with_hosts_and_kernel_bypass_ingr
         plugin_host,
         extension_host,
         derived_state_host,
+        shutdown_signal,
         Some(packet_ingest_rx),
     )
     .await;
@@ -97,6 +107,7 @@ async fn run_async_with_hosts_inner(
     plugin_host: PluginHost,
     extension_host: RuntimeExtensionHost,
     derived_state_host: DerivedStateHost,
+    mut shutdown_signal: Option<ShutdownSignal>,
     #[cfg(feature = "kernel-bypass")] mut kernel_bypass_packet_ingest_rx: Option<
         ingest::RawPacketBatchReceiver,
     >,
@@ -939,6 +950,14 @@ async fn run_async_with_hosts_inner(
     'event_loop: loop {
         tokio::select! {
             biased;
+            () = async {
+                if let Some(signal) = shutdown_signal.as_mut() {
+                    signal.as_mut().await;
+                }
+            }, if shutdown_signal.is_some() => {
+                tracing::info!("observer runtime shutdown signal received");
+                break 'event_loop;
+            }
             maybe_worker_result = packet_worker_pool.recv(), if !packet_workers_closed => {
                 let Some(worker_result) = maybe_worker_result else {
                     packet_workers_closed = true;
@@ -2731,6 +2750,8 @@ async fn run_async_with_hosts_inner(
     if plugin_hooks_enabled {
         plugin_host.shutdown().await;
     }
+    #[cfg(feature = "gossip-bootstrap")]
+    runtime.stop_gossip_runtime().await;
     drop(runtime);
     #[cfg(feature = "kernel-bypass")]
     if let Some(drain_task) = kernel_bypass_internal_ingest_drain_task.take()

@@ -17,10 +17,9 @@ pub use crate::event::{ForkSlotStatus, TxCommitmentStatus};
 pub use derived_state::{
     AccountTouchObservedEvent, BranchReorgedEvent, CheckpointBarrierEvent, CheckpointBarrierReason,
     DerivedStateCheckpoint, DerivedStateCheckpointStore, DerivedStateConsumer,
-    DerivedStateConsumerConfig, DerivedStateConsumerFault, DerivedStateConsumerFaultKind,
-    DerivedStateConsumerRecoveryState, DerivedStateConsumerShutdownContext,
-    DerivedStateConsumerStartupContext, DerivedStateConsumerStartupError,
-    DerivedStateConsumerTelemetry, DerivedStateControlPlaneQuality,
+    DerivedStateConsumerConfig, DerivedStateConsumerContext, DerivedStateConsumerFault,
+    DerivedStateConsumerFaultKind, DerivedStateConsumerRecoveryState,
+    DerivedStateConsumerSetupError, DerivedStateConsumerTelemetry, DerivedStateControlPlaneQuality,
     DerivedStateControlPlaneStateEvent, DerivedStateFeedEnvelope, DerivedStateFeedEvent,
     DerivedStateFreshnessState, DerivedStateHost, DerivedStateHostBuilder,
     DerivedStateInputFreshness, DerivedStateInvalidationEvent, DerivedStateInvalidationReason,
@@ -37,8 +36,8 @@ pub use events::{
     TransactionEvent, TransactionEventRef,
 };
 pub use extension::{
-    ExtensionCapability, ExtensionManifest, ExtensionResourceSpec, ExtensionShutdownContext,
-    ExtensionStartupContext, ExtensionStreamVisibility, PacketSubscription, RuntimeExtension,
+    ExtensionCapability, ExtensionContext, ExtensionManifest, ExtensionResourceSpec,
+    ExtensionSetupError, ExtensionStreamVisibility, PacketSubscription, RuntimeExtension,
     RuntimePacketEvent, RuntimePacketEventClass, RuntimePacketSource, RuntimePacketSourceKind,
     RuntimePacketTransport, RuntimeWebSocketFrameType, TcpConnectorSpec, TcpListenerSpec,
     UdpListenerSpec, WsConnectorSpec,
@@ -50,6 +49,5 @@ pub use extension_host::{
 pub use host::{PluginDispatchMode, PluginHost, PluginHostBuilder, PluginHostStartupError};
 pub use plugin::ObserverPlugin as Plugin;
 pub use plugin::{
-    ObserverPlugin, PluginConfig, PluginShutdownContext, PluginStartupContext, PluginStartupError,
-    TransactionInterest,
+    ObserverPlugin, PluginConfig, PluginContext, PluginSetupError, TransactionInterest,
 };

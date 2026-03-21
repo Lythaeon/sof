@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use sof::{
     event::TxKind,
     framework::{
-        DatasetEvent, Plugin, PluginConfig, PluginHost, PluginShutdownContext,
-        PluginStartupContext, PluginStartupError, TransactionEvent,
+        DatasetEvent, Plugin, PluginConfig, PluginContext, PluginHost, PluginSetupError,
+        TransactionEvent,
     },
 };
 use thiserror::Error;
@@ -24,7 +24,7 @@ impl Plugin for NonVoteTxLoggerPlugin {
         PluginConfig::new().with_transaction()
     }
 
-    async fn on_startup(&self, ctx: PluginStartupContext) -> Result<(), PluginStartupError> {
+    async fn setup(&self, ctx: PluginContext) -> Result<(), PluginSetupError> {
         tracing::info!(plugin = ctx.plugin_name, "plugin startup completed");
         Ok(())
     }
@@ -47,7 +47,7 @@ impl Plugin for NonVoteTxLoggerPlugin {
         );
     }
 
-    async fn on_shutdown(&self, ctx: PluginShutdownContext) {
+    async fn shutdown(&self, ctx: PluginContext) {
         tracing::info!(plugin = ctx.plugin_name, "plugin shutdown completed");
     }
 }
@@ -82,6 +82,8 @@ enum ObserverWithMultiplePluginsError {
     #[error("examples are release-only; run with `{command}`")]
     ReleaseModeRequired { command: &'static str },
     #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
     Runtime(#[from] sof::runtime::RuntimeError),
 }
 
@@ -104,5 +106,8 @@ async fn main() -> Result<(), ObserverWithMultiplePluginsError> {
         .build();
 
     tracing::info!(plugins = ?host.plugin_names(), "starting SOF runtime with plugin host");
-    Ok(sof::runtime::run_async_with_plugin_host(host).await?)
+    Ok(sof::runtime::ObserverRuntime::new()
+        .with_plugin_host(host)
+        .run_until_termination_signal()
+        .await?)
 }

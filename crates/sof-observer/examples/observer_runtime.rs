@@ -8,6 +8,8 @@ enum ObserverRuntimeExampleError {
     #[error("examples are release-only; run with `{command}`")]
     ReleaseModeRequired { command: &'static str },
     #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
     Runtime(#[from] sof::runtime::RuntimeError),
 }
 
@@ -23,5 +25,7 @@ const fn require_release_mode() -> Result<(), ObserverRuntimeExampleError> {
 #[tokio::main]
 async fn main() -> Result<(), ObserverRuntimeExampleError> {
     require_release_mode()?;
-    Ok(sof::runtime::run_async().await?)
+    Ok(sof::runtime::ObserverRuntime::new()
+        .run_until_termination_signal()
+        .await?)
 }

@@ -36,13 +36,13 @@ cargo add sof
 Optional gossip bootstrap support at compile time:
 
 ```toml
-sof = { version = "0.10.1", features = ["gossip-bootstrap"] }
+sof = { version = "0.11.0", features = ["gossip-bootstrap"] }
 ```
 
 Optional external `kernel-bypass` ingress support:
 
 ```toml
-sof = { version = "0.10.1", features = ["kernel-bypass"] }
+sof = { version = "0.11.0", features = ["kernel-bypass"] }
 ```
 
 The bundled `sof-solana-gossip` backend defaults to SOF's lightweight in-memory duplicate/conflict
@@ -224,7 +224,7 @@ shape is easier to scan.
 ```rust
 use async_trait::async_trait;
 use sof::framework::{
-    ExtensionCapability, ExtensionManifest, ExtensionStartupContext, PacketSubscription,
+    ExtensionCapability, ExtensionContext, ExtensionManifest, PacketSubscription,
     RuntimeExtension, RuntimeExtensionHost, RuntimePacketSourceKind,
 };
 
@@ -233,10 +233,10 @@ struct IngressExtension;
 
 #[async_trait]
 impl RuntimeExtension for IngressExtension {
-    async fn on_startup(
+    async fn setup(
         &self,
-        _ctx: ExtensionStartupContext,
-    ) -> Result<ExtensionManifest, sof::framework::extension::ExtensionStartupError> {
+        _ctx: ExtensionContext,
+    ) -> Result<ExtensionManifest, sof::framework::extension::ExtensionSetupError> {
         Ok(ExtensionManifest {
             capabilities: vec![ExtensionCapability::ObserveObserverIngress],
             resources: Vec::new(),

@@ -77,6 +77,16 @@ pub struct SofRuntimeTuning {
     pub udp_receiver_pin_by_port: bool,
     /// TVU receive socket count used by gossip bootstrap.
     pub tvu_receive_sockets: TvuReceiveSocketCount,
+    /// Bounded drain budget for one gossip worker pass.
+    pub gossip_channel_consume_capacity: QueueCapacity,
+    /// Gossip socket-consume worker count.
+    pub gossip_consume_threads: usize,
+    /// Gossip listen worker count.
+    pub gossip_listen_threads: usize,
+    /// Gossip run/push-pull worker count.
+    pub gossip_run_threads: usize,
+    /// Semantic shred dedupe capacity.
+    pub shred_dedup_capacity: usize,
 }
 
 /// Gossip queue budget exposed as a compact planning view.

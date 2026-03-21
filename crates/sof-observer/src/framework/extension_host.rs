@@ -24,9 +24,9 @@ use tokio::{
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 use crate::framework::extension::{
-    ExtensionCapability, ExtensionManifest, ExtensionResourceSpec, ExtensionShutdownContext,
-    ExtensionStartupContext, PacketSubscription, RuntimeExtension, RuntimePacketEvent,
-    RuntimePacketEventClass, RuntimePacketSource, RuntimePacketSourceKind, RuntimePacketTransport,
+    ExtensionCapability, ExtensionContext, ExtensionManifest, ExtensionResourceSpec,
+    PacketSubscription, RuntimeExtension, RuntimePacketEvent, RuntimePacketEventClass,
+    RuntimePacketSource, RuntimePacketSourceKind, RuntimePacketTransport,
     RuntimeWebSocketFrameType, WsConnectorSpec,
 };
 
@@ -216,14 +216,14 @@ impl RuntimeExtensionHostBuilder {
         self
     }
 
-    /// Sets startup timeout for `RuntimeExtension::on_startup`.
+    /// Sets startup timeout for `RuntimeExtension::setup`.
     #[must_use]
     pub const fn with_startup_timeout(mut self, timeout: Duration) -> Self {
         self.startup_timeout = timeout;
         self
     }
 
-    /// Sets shutdown timeout for `RuntimeExtension::on_shutdown`.
+    /// Sets shutdown timeout for `RuntimeExtension::shutdown`.
     #[must_use]
     pub const fn with_shutdown_timeout(mut self, timeout: Duration) -> Self {
         self.shutdown_timeout = timeout;
@@ -692,12 +692,9 @@ impl RuntimeExtensionHost {
                 continue;
             }
 
-            let startup_context = ExtensionStartupContext { extension_name };
-            let manifest_result = timeout(
-                self.inner.startup_timeout,
-                extension.on_startup(startup_context),
-            )
-            .await;
+            let startup_context = ExtensionContext { extension_name };
+            let manifest_result =
+                timeout(self.inner.startup_timeout, extension.setup(startup_context)).await;
             let manifest = match manifest_result {
                 Ok(Ok(manifest)) => manifest,
                 Ok(Err(error)) => {
@@ -831,12 +828,12 @@ impl RuntimeExtensionHost {
         }
 
         for extension in state.active_extensions.iter() {
-            let shutdown_context = ExtensionShutdownContext {
+            let shutdown_context = ExtensionContext {
                 extension_name: extension.name,
             };
             let shutdown_result = timeout(
                 self.inner.shutdown_timeout,
-                extension.extension.on_shutdown(shutdown_context),
+                extension.extension.shutdown(shutdown_context),
             )
             .await;
             if shutdown_result.is_err() {
@@ -1443,10 +1440,10 @@ mod tests {
             self.name
         }
 
-        async fn on_startup(
+        async fn setup(
             &self,
-            _ctx: ExtensionStartupContext,
-        ) -> Result<ExtensionManifest, crate::framework::extension::ExtensionStartupError> {
+            _ctx: ExtensionContext,
+        ) -> Result<ExtensionManifest, crate::framework::extension::ExtensionSetupError> {
             Ok(self.startup_manifest.clone())
         }
 
@@ -1454,7 +1451,7 @@ mod tests {
             self.packet_count.fetch_add(1, Ordering::Relaxed);
         }
 
-        async fn on_shutdown(&self, _ctx: ExtensionShutdownContext) {
+        async fn shutdown(&self, _ctx: ExtensionContext) {
             self.shutdown_called.store(true, Ordering::Relaxed);
             if !self.shutdown_wait.is_zero() {
                 tokio::time::sleep(self.shutdown_wait).await;
@@ -1470,11 +1467,11 @@ mod tests {
             "startup-fail"
         }
 
-        async fn on_startup(
+        async fn setup(
             &self,
-            _ctx: ExtensionStartupContext,
-        ) -> Result<ExtensionManifest, crate::framework::extension::ExtensionStartupError> {
-            Err(crate::framework::extension::ExtensionStartupError::new(
+            _ctx: ExtensionContext,
+        ) -> Result<ExtensionManifest, crate::framework::extension::ExtensionSetupError> {
+            Err(crate::framework::extension::ExtensionSetupError::new(
                 "intentional startup fail",
             ))
         }
@@ -1484,10 +1481,10 @@ mod tests {
 
     #[async_trait]
     impl RuntimeExtension for ImplicitNameExtension {
-        async fn on_startup(
+        async fn setup(
             &self,
-            _ctx: ExtensionStartupContext,
-        ) -> Result<ExtensionManifest, crate::framework::extension::ExtensionStartupError> {
+            _ctx: ExtensionContext,
+        ) -> Result<ExtensionManifest, crate::framework::extension::ExtensionSetupError> {
             Ok(ExtensionManifest {
                 capabilities: vec![ExtensionCapability::ObserveObserverIngress],
                 resources: Vec::new(),
@@ -1814,10 +1811,10 @@ mod tests {
             "slow-extension"
         }
 
-        async fn on_startup(
+        async fn setup(
             &self,
-            _ctx: ExtensionStartupContext,
-        ) -> Result<ExtensionManifest, crate::framework::extension::ExtensionStartupError> {
+            _ctx: ExtensionContext,
+        ) -> Result<ExtensionManifest, crate::framework::extension::ExtensionSetupError> {
             Ok(ExtensionManifest {
                 capabilities: vec![ExtensionCapability::ObserveObserverIngress],
                 resources: Vec::new(),

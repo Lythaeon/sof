@@ -46,19 +46,8 @@ pub struct PluginConfig {
 impl PluginConfig {
     /// Creates an empty plugin config with all hooks disabled.
     #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            raw_packet: false,
-            shred: false,
-            dataset: false,
-            transaction: false,
-            account_touch: false,
-            slot_status: false,
-            reorg: false,
-            recent_blockhash: false,
-            cluster_topology: false,
-            leader_schedule: false,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Enables `on_raw_packet`.
@@ -133,29 +122,22 @@ impl PluginConfig {
 }
 
 #[derive(Debug, Clone)]
-/// Context passed to [`ObserverPlugin::on_startup`].
-pub struct PluginStartupContext {
-    /// Plugin identifier.
-    pub plugin_name: &'static str,
-}
-
-#[derive(Debug, Clone)]
-/// Context passed to [`ObserverPlugin::on_shutdown`].
-pub struct PluginShutdownContext {
+/// Context passed to plugin lifecycle hooks.
+pub struct PluginContext {
     /// Plugin identifier.
     pub plugin_name: &'static str,
 }
 
 #[derive(Debug, Clone, Error, Eq, PartialEq)]
 #[error("{reason}")]
-/// Plugin startup failure reported by one plugin implementation.
-pub struct PluginStartupError {
-    /// Human-readable startup failure reason.
+/// Plugin setup failure reported by one plugin implementation.
+pub struct PluginSetupError {
+    /// Human-readable setup failure reason.
     reason: String,
 }
 
-impl PluginStartupError {
-    /// Creates a startup error with a human-readable reason.
+impl PluginSetupError {
+    /// Creates a setup error with a human-readable reason.
     #[must_use]
     pub fn new(reason: impl Into<String>) -> Self {
         Self {
@@ -186,7 +168,7 @@ pub trait ObserverPlugin: Send + Sync + 'static {
     }
 
     /// Called once before the runtime enters its main event loop.
-    async fn on_startup(&self, _ctx: PluginStartupContext) -> Result<(), PluginStartupError> {
+    async fn setup(&self, _ctx: PluginContext) -> Result<(), PluginSetupError> {
         Ok(())
     }
 
@@ -283,5 +265,5 @@ pub trait ObserverPlugin: Send + Sync + 'static {
     async fn on_leader_schedule(&self, _event: LeaderScheduleEvent) {}
 
     /// Called during runtime shutdown after ingest has stopped.
-    async fn on_shutdown(&self, _ctx: PluginShutdownContext) {}
+    async fn shutdown(&self, _ctx: PluginContext) {}
 }

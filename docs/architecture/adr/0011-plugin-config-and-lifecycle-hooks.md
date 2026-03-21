@@ -34,8 +34,8 @@ Adopt an explicit plugin config and lifecycle model.
 
 1. Replace per-hook `wants_*` methods with one `config() -> PluginConfig`.
 2. Keep `PluginConfig` static and host-owned.
-3. Add `on_startup(ctx)` for plugin initialization.
-4. Add `on_shutdown(ctx)` for plugin cleanup.
+3. Add `setup(ctx)` for plugin initialization.
+4. Add `shutdown(ctx)` for plugin cleanup.
 5. Keep transaction/account-touch acceptance and routing classifiers separate because they remain
    event-dependent hot-path decisions rather than static subscriptions.
 
@@ -55,7 +55,7 @@ That means one returned config object is the natural abstraction boundary.
 
 Plugins should be self-contained units of runtime behavior.
 
-Adding `on_startup` and `on_shutdown` gives plugins a clear place to:
+Adding `setup` and `shutdown` gives plugins a clear place to:
 
 1. allocate or validate plugin-local state,
 2. log initialization facts,
@@ -96,9 +96,9 @@ The packaged runtime applies the following lifecycle order:
 
 1. plugins are registered into `PluginHost`,
 2. the host evaluates `PluginConfig` once and precomputes dispatch targets,
-3. `on_startup` runs sequentially in registration order,
+3. `setup` runs sequentially in registration order,
 4. ingest/runtime main loop runs,
-5. `on_shutdown` runs sequentially in reverse registration order.
+5. `shutdown` runs sequentially in reverse registration order.
 
 If one plugin fails during startup, runtime startup aborts and SOF attempts to run shutdown hooks
 for any plugins that already started successfully.

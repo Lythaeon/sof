@@ -35,13 +35,13 @@ cargo add sof-tx
 Enable SOF runtime adapters when you want provider values from live `sof` plugin events:
 
 ```toml
-sof-tx = { version = "0.10.1", features = ["sof-adapters"] }
+sof-tx = { version = "0.11.0", features = ["sof-adapters"] }
 ```
 
 Enable `kernel-bypass` transport hooks for kernel-bypass direct submit integrations:
 
 ```toml
-sof-tx = { version = "0.10.1", features = ["kernel-bypass"] }
+sof-tx = { version = "0.11.0", features = ["kernel-bypass"] }
 ```
 
 ## Quick Start

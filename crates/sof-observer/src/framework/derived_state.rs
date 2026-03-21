@@ -54,13 +54,8 @@ pub struct DerivedStateConsumerConfig {
 impl DerivedStateConsumerConfig {
     /// Creates an empty consumer config with all optional feeds disabled.
     #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            transaction_applied: false,
-            account_touch_observed: false,
-            account_touch_key_partitions: false,
-            control_plane_observed: false,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Enables `TransactionApplied`.
@@ -94,29 +89,22 @@ impl DerivedStateConsumerConfig {
 }
 
 #[derive(Debug, Clone)]
-/// Context passed to [`DerivedStateConsumer::on_startup`].
-pub struct DerivedStateConsumerStartupContext {
-    /// Consumer identifier.
-    pub consumer_name: &'static str,
-}
-
-#[derive(Debug, Clone)]
-/// Context passed to [`DerivedStateConsumer::on_shutdown`].
-pub struct DerivedStateConsumerShutdownContext {
+/// Context passed to derived-state consumer lifecycle hooks.
+pub struct DerivedStateConsumerContext {
     /// Consumer identifier.
     pub consumer_name: &'static str,
 }
 
 #[derive(Debug, Clone, Error, Eq, PartialEq)]
 #[error("{reason}")]
-/// Startup failure reported by one derived-state consumer implementation.
-pub struct DerivedStateConsumerStartupError {
+/// Setup failure reported by one derived-state consumer implementation.
+pub struct DerivedStateConsumerSetupError {
     /// Human-readable startup failure reason.
     reason: String,
 }
 
-impl DerivedStateConsumerStartupError {
-    /// Creates a startup error with a human-readable reason.
+impl DerivedStateConsumerSetupError {
+    /// Creates a setup error with a human-readable reason.
     #[must_use]
     pub fn new(reason: impl Into<String>) -> Self {
         Self {
@@ -2043,15 +2031,15 @@ pub trait DerivedStateConsumer: Send + Sync + 'static {
     ///
     /// # Errors
     /// Returns a startup error when the consumer cannot initialize its runtime-owned resources.
-    fn on_startup(
+    fn setup(
         &mut self,
-        _ctx: DerivedStateConsumerStartupContext,
-    ) -> Result<(), DerivedStateConsumerStartupError> {
+        _ctx: DerivedStateConsumerContext,
+    ) -> Result<(), DerivedStateConsumerSetupError> {
         Ok(())
     }
 
     /// Called once before the worker thread exits.
-    fn on_shutdown(&mut self, _ctx: DerivedStateConsumerShutdownContext) {}
+    fn shutdown(&mut self, _ctx: DerivedStateConsumerContext) {}
 
     /// Applies one feed envelope in canonical sequence order.
     ///
@@ -2169,7 +2157,7 @@ impl DerivedStateConsumerWorker {
                                 continue;
                             }
                             let startup_result = consumer
-                                .on_startup(DerivedStateConsumerStartupContext {
+                                .setup(DerivedStateConsumerContext {
                                     consumer_name: name,
                                 })
                                 .map_err(|error| {
@@ -2268,7 +2256,7 @@ impl DerivedStateConsumerWorker {
                     }
                 }
                 if started {
-                    consumer.on_shutdown(DerivedStateConsumerShutdownContext {
+                    consumer.shutdown(DerivedStateConsumerContext {
                         consumer_name: name,
                     });
                 }
@@ -4443,15 +4431,15 @@ mod tests {
             DerivedStateConsumerConfig::new().with_control_plane_observed()
         }
 
-        fn on_startup(
+        fn setup(
             &mut self,
-            _ctx: DerivedStateConsumerStartupContext,
-        ) -> Result<(), DerivedStateConsumerStartupError> {
+            _ctx: DerivedStateConsumerContext,
+        ) -> Result<(), DerivedStateConsumerSetupError> {
             let _ = self.starts.fetch_add(1, AtomicOrdering::Relaxed);
             Ok(())
         }
 
-        fn on_shutdown(&mut self, _ctx: DerivedStateConsumerShutdownContext) {
+        fn shutdown(&mut self, _ctx: DerivedStateConsumerContext) {
             let _ = self.stops.fetch_add(1, AtomicOrdering::Relaxed);
         }
 

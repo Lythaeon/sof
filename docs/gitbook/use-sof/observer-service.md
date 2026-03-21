@@ -64,7 +64,7 @@ This is the right first service because it proves all of the important boundarie
 - your service can receive decoded events
 - your application logic can stay outside the runtime core
 
-If the plugin needs initialization or cleanup, add `on_startup(ctx)` and `on_shutdown(ctx)`.
+If the plugin needs initialization or cleanup, add `setup(ctx)` and `shutdown(ctx)`.
 The packaged runtime invokes both automatically when the host is attached.
 
 ## What You Usually Add Next

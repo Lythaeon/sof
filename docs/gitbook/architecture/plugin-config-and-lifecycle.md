@@ -55,8 +55,8 @@ So one returned config object matches the actual runtime model better than many 
 
 Plugins may also implement:
 
-- `on_startup(ctx)`
-- `on_shutdown(ctx)`
+- `setup(ctx)`
+- `shutdown(ctx)`
 
 Use them when a plugin needs to:
 
@@ -69,12 +69,12 @@ Use them when a plugin needs to:
 Typical lifecycle shape:
 
 ```rust
-async fn on_startup(&self, ctx: PluginStartupContext) -> Result<(), PluginStartupError> {
+async fn setup(&self, ctx: PluginContext) -> Result<(), PluginSetupError> {
     tracing::info!(plugin = ctx.plugin_name, "plugin startup completed");
     Ok(())
 }
 
-async fn on_shutdown(&self, ctx: PluginShutdownContext) {
+async fn shutdown(&self, ctx: PluginContext) {
     tracing::info!(plugin = ctx.plugin_name, "plugin shutdown completed");
 }
 ```
@@ -84,9 +84,9 @@ async fn on_shutdown(&self, ctx: PluginShutdownContext) {
 When a `PluginHost` is passed into the packaged SOF runtime:
 
 1. plugin configs are read and dispatch targets are built
-2. `on_startup` runs once in registration order
+2. `setup` runs once in registration order
 3. normal event hooks run during the main loop
-4. `on_shutdown` runs once in reverse registration order
+4. `shutdown` runs once in reverse registration order
 
 If one plugin fails during startup, SOF aborts runtime startup and shuts down any plugins that had
 already started.

@@ -136,7 +136,7 @@ Best for:
 Build flag:
 
 ```toml
-sof = { version = "0.10.1", features = ["gossip-bootstrap"] }
+sof = { version = "0.11.0", features = ["gossip-bootstrap"] }
 ```
 
 ### External kernel-bypass ingress
@@ -149,7 +149,7 @@ Best for:
 Build flag:
 
 ```toml
-sof = { version = "0.10.1", features = ["kernel-bypass"] }
+sof = { version = "0.11.0", features = ["kernel-bypass"] }
 ```
 
 ## When To Use Plugins vs Runtime Extensions

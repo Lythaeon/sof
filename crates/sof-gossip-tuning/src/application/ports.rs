@@ -21,6 +21,16 @@ pub trait RuntimeTuningPort {
     fn set_udp_receiver_pin_by_port(&mut self, enabled: bool);
     /// Applies the TVU receive socket count.
     fn set_tvu_receive_sockets(&mut self, sockets: TvuReceiveSocketCount);
+    /// Applies the gossip worker drain budget.
+    fn set_gossip_channel_consume_capacity(&mut self, capacity: QueueCapacity);
+    /// Applies the gossip socket-consume worker count.
+    fn set_gossip_consume_threads(&mut self, thread_count: usize);
+    /// Applies the gossip listen worker count.
+    fn set_gossip_listen_threads(&mut self, thread_count: usize);
+    /// Applies the gossip run/push-pull worker count.
+    fn set_gossip_run_threads(&mut self, thread_count: usize);
+    /// Applies the semantic shred dedupe capacity.
+    fn set_shred_dedup_capacity(&mut self, dedupe_capacity: usize);
     /// Applies gossip backend queue capacities.
     fn set_gossip_channel_tuning(&mut self, tuning: GossipChannelTuning);
 }

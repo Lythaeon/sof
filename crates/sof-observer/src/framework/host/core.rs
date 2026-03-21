@@ -5,9 +5,9 @@ use super::dispatch::{
 use super::state::{ObservedRecentBlockhashState, ObservedTpuLeaderState};
 use super::*;
 use crate::framework::AccountTouchEvent;
+use crate::framework::PluginContext;
 use crate::framework::events::AccountTouchEventRef;
 use crate::framework::events::TransactionEventRef;
-use crate::framework::{PluginShutdownContext, PluginStartupContext};
 
 /// Immutable plugin registry and async event dispatcher.
 #[derive(Clone)]
@@ -129,12 +129,12 @@ impl PluginHost {
         self.plugins.iter().map(|plugin| plugin.name()).collect()
     }
 
-    /// Runs plugin startup hooks once before the runtime main loop begins.
+    /// Runs plugin setup hooks once before the runtime main loop begins.
     ///
     /// # Errors
     ///
     /// Returns [`PluginHostStartupError`] when any registered plugin fails its
-    /// `on_startup` hook. Plugins started earlier in the same startup pass are
+    /// `setup` hook. Plugins started earlier in the same setup pass are
     /// shut down best-effort before the error is returned.
     pub async fn startup(&self) -> Result<(), PluginHostStartupError> {
         if self
@@ -150,11 +150,11 @@ impl PluginHost {
             Vec::with_capacity(self.plugins.len());
         for plugin in self.plugins.iter() {
             let plugin_name = plugin.name();
-            let startup_context = PluginStartupContext { plugin_name };
-            if let Err(error) = plugin.on_startup(startup_context).await {
+            let context = PluginContext { plugin_name };
+            if let Err(error) = plugin.setup(context.clone()).await {
                 for started_plugin in started_plugins.iter().rev() {
                     started_plugin
-                        .on_shutdown(PluginShutdownContext {
+                        .shutdown(PluginContext {
                             plugin_name: started_plugin.name(),
                         })
                         .await;
@@ -183,7 +183,7 @@ impl PluginHost {
 
         for plugin in self.plugins.iter().rev() {
             plugin
-                .on_shutdown(PluginShutdownContext {
+                .shutdown(PluginContext {
                     plugin_name: plugin.name(),
                 })
                 .await;

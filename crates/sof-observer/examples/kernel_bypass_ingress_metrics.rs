@@ -21,8 +21,8 @@ use sof::runtime::RuntimeSetup;
 use sof::{
     event::TxKind,
     framework::{
-        ObserverPlugin, PluginConfig, PluginDispatchMode, PluginHost, PluginShutdownContext,
-        PluginStartupContext, PluginStartupError, RawPacketEvent, ShredEvent,
+        ObserverPlugin, PluginConfig, PluginContext, PluginDispatchMode, PluginHost,
+        PluginSetupError, RawPacketEvent, ShredEvent,
     },
 };
 #[cfg(feature = "kernel-bypass")]
@@ -142,12 +142,12 @@ impl ObserverPlugin for RawIngressMetricsPlugin {
             .with_transaction()
     }
 
-    async fn on_startup(&self, ctx: PluginStartupContext) -> Result<(), PluginStartupError> {
+    async fn setup(&self, ctx: PluginContext) -> Result<(), PluginSetupError> {
         tracing::info!(plugin = ctx.plugin_name, "plugin startup completed");
         Ok(())
     }
 
-    async fn on_shutdown(&self, ctx: PluginShutdownContext) {
+    async fn shutdown(&self, ctx: PluginContext) {
         tracing::info!(plugin = ctx.plugin_name, "plugin shutdown completed");
     }
 

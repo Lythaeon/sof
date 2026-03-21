@@ -8,8 +8,8 @@ use std::{
 
 use crate::event::TxKind;
 use crate::framework::{
-    PluginConfig, PluginShutdownContext, PluginStartupContext, PluginStartupError,
-    TransactionEventRef, TransactionInterest, TxCommitmentStatus,
+    PluginConfig, PluginContext, PluginSetupError, TransactionEventRef, TransactionInterest,
+    TxCommitmentStatus,
 };
 
 #[derive(Clone, Copy)]
@@ -608,12 +608,12 @@ impl ObserverPlugin for LifecyclePlugin {
         "lifecycle-plugin"
     }
 
-    async fn on_startup(&self, _ctx: PluginStartupContext) -> Result<(), PluginStartupError> {
+    async fn setup(&self, _ctx: PluginContext) -> Result<(), PluginSetupError> {
         self.startup_count.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
-    async fn on_shutdown(&self, _ctx: PluginShutdownContext) {
+    async fn shutdown(&self, _ctx: PluginContext) {
         self.shutdown_count.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -629,9 +629,9 @@ impl ObserverPlugin for FailingStartupPlugin {
         "failing-startup-plugin"
     }
 
-    async fn on_startup(&self, _ctx: PluginStartupContext) -> Result<(), PluginStartupError> {
+    async fn setup(&self, _ctx: PluginContext) -> Result<(), PluginSetupError> {
         self.startup_attempted.store(true, Ordering::Relaxed);
-        Err(PluginStartupError::new("boom"))
+        Err(PluginSetupError::new("boom"))
     }
 }
 

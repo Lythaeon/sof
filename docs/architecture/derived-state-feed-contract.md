@@ -325,15 +325,15 @@ The current SOF consumer surface supports this lifecycle:
 ```rust
 trait DerivedStateConsumer {
     fn config(&self) -> DerivedStateConsumerConfig;
-    fn on_startup(&mut self, ctx: DerivedStateConsumerStartupContext)
-        -> Result<(), DerivedStateConsumerStartupError>;
+    fn setup(&mut self, ctx: DerivedStateConsumerContext)
+        -> Result<(), DerivedStateConsumerSetupError>;
     fn load_checkpoint(&mut self) -> Result<Option<DerivedStateCheckpoint>, ConsumerError>;
     fn apply(&mut self, event: &DerivedStateFeedEnvelope) -> Result<(), ConsumerError>;
     fn flush_checkpoint(
         &mut self,
         checkpoint: DerivedStateCheckpoint,
     ) -> Result<(), ConsumerError>;
-    fn on_shutdown(&mut self, ctx: DerivedStateConsumerShutdownContext);
+    fn shutdown(&mut self, ctx: DerivedStateConsumerContext);
 }
 ```
 
@@ -341,8 +341,9 @@ Important details:
 
 1. `config()` is static host-construction metadata for optional feed families,
 2. `load_checkpoint()` and `flush_checkpoint()` remain the durability boundary,
-3. `on_startup()` and `on_shutdown()` are optional lifecycle hooks,
-4. slot status, reorg, and checkpoint barrier events remain part of the authoritative core feed.
+3. `setup()` and `shutdown()` are optional lifecycle hooks,
+4. `setup()` is deferred until host initialization / first use rather than builder time,
+5. slot status, reorg, and checkpoint barrier events remain part of the authoritative core feed.
 
 The lifecycle should remain:
 

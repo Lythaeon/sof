@@ -15,8 +15,7 @@ custom logic without forking the runtime.
   - `ObserverPlugin` (also re-exported as `Plugin`)
 - Static config and lifecycle:
   - `PluginConfig`
-  - `PluginStartupContext`
-  - `PluginShutdownContext`
+  - `PluginContext`
 - Event payloads:
   - `ClusterTopologyEvent`
   - `RawPacketEvent`
@@ -76,14 +75,14 @@ fn config(&self) -> PluginConfig {
 
 Plugins now have explicit lifecycle hooks:
 
-1. `on_startup`
+1. `setup`
 2. steady-state `on_*` callbacks
-3. `on_shutdown`
+3. `shutdown`
 
 Semantics:
 
-- `on_startup` runs once before the runtime enters its main loop
-- `on_shutdown` runs once after ingest stops
+- `setup` runs once before the runtime enters its main loop
+- `shutdown` runs once after ingest stops
 - the packaged runtime invokes both automatically when a `PluginHost` is attached
 - startup is sequential in registration order
 - shutdown is sequential in reverse registration order
@@ -93,12 +92,12 @@ Semantics:
 Typical lifecycle shape:
 
 ```rust
-async fn on_startup(&self, ctx: PluginStartupContext) -> Result<(), PluginStartupError> {
+async fn setup(&self, ctx: PluginContext) -> Result<(), PluginSetupError> {
     tracing::info!(plugin = ctx.plugin_name, "plugin startup completed");
     Ok(())
 }
 
-async fn on_shutdown(&self, ctx: PluginShutdownContext) {
+async fn shutdown(&self, ctx: PluginContext) {
     tracing::info!(plugin = ctx.plugin_name, "plugin shutdown completed");
 }
 ```

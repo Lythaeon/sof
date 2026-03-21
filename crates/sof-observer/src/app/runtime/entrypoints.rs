@@ -1,5 +1,9 @@
+use std::{future::Future, pin::Pin};
+
 use super::*;
 use thiserror::Error;
+
+type ShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 #[derive(Debug, Error)]
 pub(crate) enum RuntimeEntrypointError {
@@ -57,6 +61,7 @@ pub(crate) fn run_with_hosts(
                     plugin_host,
                     extension_host,
                     derived_state_host,
+                    None,
                 ))
             }),
             tokio::runtime::RuntimeFlavor::CurrentThread => {
@@ -85,6 +90,7 @@ pub(crate) fn run_with_hosts(
                     plugin_host,
                     extension_host,
                     derived_state_host,
+                    None,
                 ))
             }),
         };
@@ -101,6 +107,7 @@ pub(crate) fn run_with_hosts(
             plugin_host,
             extension_host,
             derived_state_host,
+            None,
         ))
 }
 
@@ -109,6 +116,7 @@ pub(crate) async fn run_async() -> Result<(), RuntimeEntrypointError> {
         PluginHostBuilder::new().build(),
         RuntimeExtensionHostBuilder::new().build(),
         DerivedStateHost::builder().build(),
+        None,
     )
     .await
 }
@@ -120,6 +128,7 @@ pub(crate) async fn run_async_with_plugin_host(
         plugin_host,
         RuntimeExtensionHostBuilder::new().build(),
         DerivedStateHost::builder().build(),
+        None,
     )
     .await
 }
@@ -131,6 +140,7 @@ pub(crate) async fn run_async_with_extension_host(
         PluginHostBuilder::new().build(),
         extension_host,
         DerivedStateHost::builder().build(),
+        None,
     )
     .await
 }
@@ -142,6 +152,7 @@ pub(crate) async fn run_async_with_derived_state_host(
         PluginHostBuilder::new().build(),
         RuntimeExtensionHostBuilder::new().build(),
         derived_state_host,
+        None,
     )
     .await
 }
@@ -150,12 +161,33 @@ pub(crate) async fn run_async_with_hosts(
     plugin_host: PluginHost,
     extension_host: RuntimeExtensionHost,
     derived_state_host: DerivedStateHost,
+    shutdown_signal: Option<ShutdownSignal>,
 ) -> Result<(), RuntimeEntrypointError> {
-    runloop::run_async_with_hosts(plugin_host, extension_host, derived_state_host)
-        .await
-        .map_err(|source| RuntimeEntrypointError::Runloop {
-            reason: source.to_string(),
-        })
+    run_async_with_hosts_and_optional_shutdown(
+        plugin_host,
+        extension_host,
+        derived_state_host,
+        shutdown_signal,
+    )
+    .await
+}
+
+async fn run_async_with_hosts_and_optional_shutdown(
+    plugin_host: PluginHost,
+    extension_host: RuntimeExtensionHost,
+    derived_state_host: DerivedStateHost,
+    shutdown_signal: Option<ShutdownSignal>,
+) -> Result<(), RuntimeEntrypointError> {
+    runloop::run_async_with_hosts(
+        plugin_host,
+        extension_host,
+        derived_state_host,
+        shutdown_signal,
+    )
+    .await
+    .map_err(|source| RuntimeEntrypointError::Runloop {
+        reason: source.to_string(),
+    })
 }
 
 #[cfg(feature = "kernel-bypass")]
@@ -166,6 +198,7 @@ pub(crate) async fn run_async_with_kernel_bypass_ingress(
         PluginHostBuilder::new().build(),
         RuntimeExtensionHostBuilder::new().build(),
         DerivedStateHost::builder().build(),
+        None,
         packet_ingest_rx,
     )
     .await
@@ -180,6 +213,7 @@ pub(crate) async fn run_async_with_plugin_host_and_kernel_bypass_ingress(
         plugin_host,
         RuntimeExtensionHostBuilder::new().build(),
         DerivedStateHost::builder().build(),
+        None,
         packet_ingest_rx,
     )
     .await
@@ -194,6 +228,7 @@ pub(crate) async fn run_async_with_extension_host_and_kernel_bypass_ingress(
         PluginHostBuilder::new().build(),
         extension_host,
         DerivedStateHost::builder().build(),
+        None,
         packet_ingest_rx,
     )
     .await
@@ -208,6 +243,7 @@ pub(crate) async fn run_async_with_derived_state_host_and_kernel_bypass_ingress(
         PluginHostBuilder::new().build(),
         RuntimeExtensionHostBuilder::new().build(),
         derived_state_host,
+        None,
         packet_ingest_rx,
     )
     .await
@@ -218,12 +254,14 @@ pub(crate) async fn run_async_with_hosts_and_kernel_bypass_ingress(
     plugin_host: PluginHost,
     extension_host: RuntimeExtensionHost,
     derived_state_host: DerivedStateHost,
+    shutdown_signal: Option<ShutdownSignal>,
     packet_ingest_rx: ingest::RawPacketBatchReceiver,
 ) -> Result<(), RuntimeEntrypointError> {
     runloop::run_async_with_hosts_and_kernel_bypass_ingress(
         plugin_host,
         extension_host,
         derived_state_host,
+        shutdown_signal,
         packet_ingest_rx,
     )
     .await
