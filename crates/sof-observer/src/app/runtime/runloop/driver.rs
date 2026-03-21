@@ -67,6 +67,7 @@ pub(in crate::app::runtime) async fn run_async_with_hosts(
     extension_host: RuntimeExtensionHost,
     derived_state_host: DerivedStateHost,
     shutdown_signal: Option<ShutdownSignal>,
+    observability_handle: Option<RuntimeObservabilityHandle>,
 ) -> Result<(), RuntimeRunloopError> {
     let plugin_host_cleanup = plugin_host.clone();
     let result = run_async_with_hosts_inner(
@@ -74,6 +75,7 @@ pub(in crate::app::runtime) async fn run_async_with_hosts(
         extension_host,
         derived_state_host,
         shutdown_signal,
+        observability_handle,
         #[cfg(feature = "kernel-bypass")]
         None,
     )
@@ -88,6 +90,7 @@ pub(in crate::app::runtime) async fn run_async_with_hosts_and_kernel_bypass_ingr
     extension_host: RuntimeExtensionHost,
     derived_state_host: DerivedStateHost,
     shutdown_signal: Option<ShutdownSignal>,
+    observability_handle: Option<RuntimeObservabilityHandle>,
     packet_ingest_rx: ingest::RawPacketBatchReceiver,
 ) -> Result<(), RuntimeRunloopError> {
     let plugin_host_cleanup = plugin_host.clone();
@@ -96,6 +99,7 @@ pub(in crate::app::runtime) async fn run_async_with_hosts_and_kernel_bypass_ingr
         extension_host,
         derived_state_host,
         shutdown_signal,
+        observability_handle,
         Some(packet_ingest_rx),
     )
     .await;
@@ -108,6 +112,7 @@ async fn run_async_with_hosts_inner(
     extension_host: RuntimeExtensionHost,
     derived_state_host: DerivedStateHost,
     mut shutdown_signal: Option<ShutdownSignal>,
+    observability_handle: Option<RuntimeObservabilityHandle>,
     #[cfg(feature = "kernel-bypass")] mut kernel_bypass_packet_ingest_rx: Option<
         ingest::RawPacketBatchReceiver,
     >,
@@ -395,6 +400,9 @@ async fn run_async_with_hosts_inner(
             gossip_receivers = runtime.gossip_receiver_handles.len(),
             "receiver bootstrap completed"
         );
+    }
+    if let Some(observability_handle) = observability_handle.as_ref() {
+        observability_handle.mark_ready();
     }
     let verify_enabled = read_verify_shreds();
     let live_shreds_enabled = read_live_shreds_enabled();
@@ -956,6 +964,9 @@ async fn run_async_with_hosts_inner(
                 }
             }, if shutdown_signal.is_some() => {
                 tracing::info!("observer runtime shutdown signal received");
+                if let Some(observability_handle) = observability_handle.as_ref() {
+                    observability_handle.mark_not_ready();
+                }
                 break 'event_loop;
             }
             maybe_worker_result = packet_worker_pool.recv(), if !packet_workers_closed => {
@@ -2752,6 +2763,9 @@ async fn run_async_with_hosts_inner(
     }
     #[cfg(feature = "gossip-bootstrap")]
     runtime.stop_gossip_runtime().await;
+    if let Some(observability_handle) = observability_handle.as_ref() {
+        observability_handle.mark_not_ready();
+    }
     drop(runtime);
     #[cfg(feature = "kernel-bypass")]
     if let Some(drain_task) = kernel_bypass_internal_ingest_drain_task.take()
