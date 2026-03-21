@@ -221,3 +221,9 @@ description = "Run derived-state crash/replay recovery validation against the co
 workspace = false
 command = "bash"
 args = ["scripts/soak/vps-derived-state-crash-recovery-check.sh"]
+
+[tasks.vps-busy-poll-compare]
+description = "Compare baseline vs Linux UDP busy-poll behavior on the VPS observer_runtime profile"
+workspace = false
+command = "bash"
+args = ["scripts/soak/vps-busy-poll-compare.sh"]

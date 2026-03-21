@@ -265,6 +265,9 @@ Additional implemented behavior (not env-tunable in current release):
 | `SOF_UDP_BATCH_SIZE` | `64` | Larger batches reduce syscalls but increase per-batch latency. |
 | `SOF_UDP_BATCH_MAX_WAIT_MS` | `1` | Higher values can add avoidable tail latency. |
 | `SOF_UDP_IDLE_WAIT_MS` | `100` | Impacts poll cadence when traffic is sparse. |
+| `SOF_UDP_BUSY_POLL_US` | unset (`off`) | Linux-only socket busy-poll timeout in microseconds. Reduces interrupt jitter at the cost of steady CPU burn. |
+| `SOF_UDP_BUSY_POLL_BUDGET` | unset | Linux-only packet budget for one busy-poll drain pass. Higher values favor throughput over fairness. |
+| `SOF_UDP_PREFER_BUSY_POLL` | `false` | Linux-only request to prefer busy polling on supported UDP sockets. Keep explicit because it changes host scheduling behavior. |
 | `SOF_UDP_RECEIVER_CORE` | unset | Wrong pinning can hurt NUMA/locality and starve other work. |
 | `SOF_UDP_RECEIVER_PIN_BY_PORT` | `false` | Deterministic pinning may conflict with scheduler strategy. |
 | `SOF_UDP_TRACK_RXQ_OVFL` | `false` | Linux-only telemetry path adds socket option behavior. |
@@ -274,6 +277,9 @@ Programmatic equivalent for the currently supported subset:
 - `RuntimeSetup::with_tvu_receive_sockets(...)`
 - `RuntimeSetup::with_udp_batch_size(...)`
 - `RuntimeSetup::with_udp_batch_max_wait_ms(...)`
+- `RuntimeSetup::with_udp_busy_poll_us(...)`
+- `RuntimeSetup::with_udp_busy_poll_budget(...)`
+- `RuntimeSetup::with_udp_prefer_busy_poll(...)`
 - `RuntimeSetup::with_udp_receiver_core(...)`
 - `RuntimeSetup::with_udp_receiver_pin_by_port(...)`
 - `RuntimeSetup::with_gossip_receiver_channel_capacity(...)`
@@ -287,6 +293,10 @@ Programmatic equivalent for the currently supported subset:
 - `RuntimeSetup::with_gossip_stats_interval_secs(...)`
 - `RuntimeSetup::with_gossip_sample_logs_enabled(...)`
 - `RuntimeSetup::with_ingest_queue_mode_typed(...)`
+
+Busy-poll knobs are explicit and disabled by default. When enabled they apply to both SOF's direct
+UDP ingest sockets and the observer-facing UDP sockets in the bundled gossip bootstrap path.
+Treat them as host-class experiments, not universal defaults.
 - `RuntimeSetup::with_sof_gossip_runtime_tuning(...)`
 - `RuntimeSetup::with_gossip_tuning_profile(...)`
 

@@ -158,6 +158,28 @@ async fn main() -> Result<(), sof::runtime::RuntimeError> {
 }
 ```
 
+Linux busy-poll is available as an explicit host-side experiment when you want to trade CPU
+efficiency for steadier UDP receive behavior:
+
+```rust
+use sof::runtime::ObserverRuntime;
+use sof_gossip_tuning::{GossipTuningProfile, HostProfilePreset};
+
+#[tokio::main]
+async fn main() -> Result<(), sof::runtime::RuntimeError> {
+    let setup = sof::runtime::RuntimeSetup::new()
+        .with_gossip_tuning_profile(GossipTuningProfile::preset(HostProfilePreset::Vps))
+        .with_udp_busy_poll_us(50)
+        .with_udp_busy_poll_budget(64)
+        .with_udp_prefer_busy_poll(true);
+
+    ObserverRuntime::new()
+        .with_setup(setup)
+        .run_until_termination_signal()
+        .await
+}
+```
+
 With external `kernel-bypass` ingress, feed `RawPacketBatch` values through SOF's ingress queue:
 
 ```rust

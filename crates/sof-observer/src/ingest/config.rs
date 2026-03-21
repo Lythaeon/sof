@@ -70,6 +70,22 @@ pub(super) fn read_udp_idle_wait_ms() -> u64 {
         .unwrap_or(100)
 }
 
+pub(super) fn read_udp_busy_poll_us() -> Option<u32> {
+    read_env_var("SOF_UDP_BUSY_POLL_US")
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+}
+
+pub(super) fn read_udp_busy_poll_budget() -> Option<u32> {
+    read_env_var("SOF_UDP_BUSY_POLL_BUDGET")
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+}
+
+pub(super) fn read_udp_prefer_busy_poll() -> bool {
+    read_bool_env("SOF_UDP_PREFER_BUSY_POLL", false)
+}
+
 pub(super) fn read_udp_drop_on_channel_full() -> bool {
     read_bool_env("SOF_UDP_DROP_ON_CHANNEL_FULL", true)
 }

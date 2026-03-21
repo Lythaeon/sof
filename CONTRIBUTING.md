@@ -184,6 +184,8 @@ Fuzzing workflow:
 - When fuzz finds a crash, reproduce it from `artifacts/<target>/crash-*`, then add:
   - a deterministic regression test in the owning module, and
   - a minimized corpus seed in `crates/sof-observer/fuzz/corpus/<target>/`.
+- For UDP receive-strategy changes, run `cargo make vps-busy-poll-compare` and include the 5-minute
+  VPS queue/freshness deltas in the PR.
 
 Reference:
 
