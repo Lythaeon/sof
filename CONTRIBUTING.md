@@ -166,7 +166,8 @@ Runtime hardening workflow for public-host changes:
 - Use `cargo make vps-observer-restart-loop` when changing shutdown, restart, gossip handoff, or queue/backpressure behavior.
 - Use `cargo make vps-derived-state-restart-check` when changing derived-state checkpoint, replay, or shutdown behavior.
 - Use `cargo make vps-derived-state-crash-recovery-check` when changing derived-state crash semantics, replay recovery, or checkpoint durability expectations.
-- The soak scripts are host-agnostic. Use `SOF_SOAK_TRANSPORT=ssh` with `SOF_SOAK_HOST`, `SOF_SOAK_USER`, `SOF_SOAK_KEY`, and `SOF_SOAK_BASE_DIR`, or `SOF_SOAK_TRANSPORT=local` when the repo already exists on the target host and the scripts should run in place.
+- These commands now run through the Rust `public_host_soak` harness and are intended to be executed directly on the target host from a cloned SOF repo.
+- The harness builds the required release examples locally on that host, stores logs under `logs/soak-validation/`, stores derived-state working data under `demo-state/`, and serializes runs with `.soak-lock/`.
 - Include the validated host class and the observed drop/replay results in the PR notes when these scripts are part of validation.
 
 Benchmark workflow for hot-path changes:
