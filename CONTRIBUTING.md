@@ -161,6 +161,15 @@ Reference docs:
 - Keep tests deterministic and fast.
 - If you touch parser/reassembly invariants, expand edge-case coverage (including fuzz-oriented cases where applicable).
 
+Runtime hardening workflow for public-host changes:
+
+- Use `cargo make vps-observer-restart-loop` when changing shutdown, restart, gossip handoff, or queue/backpressure behavior.
+- Use `cargo make vps-derived-state-restart-check` when changing derived-state checkpoint, replay, or shutdown behavior.
+- Use `cargo make vps-derived-state-crash-recovery-check` when changing derived-state crash semantics, replay recovery, or checkpoint durability expectations.
+- These commands now run through the Rust `public_host_soak` harness and are intended to be executed directly on the target host from a cloned SOF repo.
+- The harness builds the required release examples locally on that host, stores logs under `logs/soak-validation/`, stores derived-state working data under `demo-state/`, and serializes runs with `.soak-lock/`.
+- Include the validated host class and the observed drop/replay results in the PR notes when these scripts are part of validation.
+
 Benchmark workflow for hot-path changes:
 
 - Use `cargo bench -p sof --bench hot_paths --no-run` as the fast compile-only smoke check for the Criterion harness.
