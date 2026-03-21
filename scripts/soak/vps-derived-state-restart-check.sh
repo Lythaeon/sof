@@ -7,11 +7,15 @@ source "$SCRIPT_DIR/vps-common.sh"
 SOF_DERIVED_STATE_RUN_SECS="${SOF_DERIVED_STATE_RUN_SECS:-45}"
 SOF_DERIVED_STATE_STARTUP_TIMEOUT_SECS="${SOF_DERIVED_STATE_STARTUP_TIMEOUT_SECS:-90}"
 SOF_DERIVED_STATE_SHUTDOWN_TIMEOUT_SECS="${SOF_DERIVED_STATE_SHUTDOWN_TIMEOUT_SECS:-30}"
+SOF_DERIVED_STATE_PROGRESS_TIMEOUT_SECS="${SOF_DERIVED_STATE_PROGRESS_TIMEOUT_SECS:-60}"
+SOF_DERIVED_STATE_STARTUP_RETRIES="${SOF_DERIVED_STATE_STARTUP_RETRIES:-3}"
 
+acquire_remote_soak_lock
 ensure_remote_dirs
+build_and_sync_example "derived_state_slot_mirror"
 
-pidfile_path="${SOF_VPS_LOG_DIR}/derived_state_restart_check.pid"
-workdir_path="${SOF_VPS_DEMO_STATE_DIR}/derived_state_slot_mirror"
+pidfile_path="${SOF_SOAK_LOG_DIR}/derived_state_restart_check.pid"
+workdir_path="${SOF_SOAK_DEMO_STATE_DIR}/derived_state_slot_mirror"
 checkpoint_path="${workdir_path}/.sof-example/slot-mirror-checkpoint.json"
 
 read_checkpoint_sequence() {
@@ -23,11 +27,37 @@ read_checkpoint_sequence() {
   "
 }
 
+wait_for_checkpoint_advance() {
+  local baseline_sequence="$1"
+  local timeout_secs="$2"
+  local elapsed=0
+
+  while (( elapsed < timeout_secs )); do
+    local observed_sequence
+    observed_sequence="$(read_checkpoint_sequence 2>/dev/null || true)"
+    if [[ -n "$observed_sequence" ]] && (( observed_sequence > baseline_sequence )); then
+      printf '%s\n' "$observed_sequence"
+      return 0
+    fi
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+
+  return 1
+}
+
 start_consumer() {
   local log_path="$1"
   ssh_script <<EOF
 set -euo pipefail
-pkill -f $(quote "$SOF_VPS_BASE_DIR/derived_state_slot_mirror") 2>/dev/null || true
+pkill -f $(quote "$SOF_SOAK_BASE_DIR/derived_state_slot_mirror") 2>/dev/null || true
+rm -f $(quote "$pidfile_path")
+EOF
+
+  wait_for_remote_port_range_release "$SOF_PORT_RANGE" "$SOF_DERIVED_STATE_SHUTDOWN_TIMEOUT_SECS"
+
+  ssh_script <<EOF
+set -euo pipefail
 rm -f $(quote "$pidfile_path")
 mkdir -p $(quote "$workdir_path")
 cd $(quote "$workdir_path")
@@ -37,10 +67,57 @@ nohup env \
   SOF_GOSSIP_ENTRYPOINT=$(quote "$SOF_GOSSIP_ENTRYPOINT") \
   SOF_PORT_RANGE=$(quote "$SOF_PORT_RANGE") \
   SOF_SHRED_DEDUP_CAPACITY=$(quote "$SOF_SHRED_DEDUP_CAPACITY") \
-  $(quote "$SOF_VPS_BASE_DIR/derived_state_slot_mirror") \
+  $(quote "$SOF_SOAK_BASE_DIR/derived_state_slot_mirror") \
   >> $(quote "$log_path") 2>&1 &
 echo \$! > $(quote "$pidfile_path")
 EOF
+}
+
+wait_for_consumer_startup() {
+  local log_path="$1"
+  local attempt=1
+
+  while (( attempt <= SOF_DERIVED_STATE_STARTUP_RETRIES )); do
+    ssh_run "rm -f $(quote "$log_path")"
+    start_consumer "$log_path"
+
+    local elapsed=0
+    while (( elapsed < SOF_DERIVED_STATE_STARTUP_TIMEOUT_SECS )); do
+      if ssh_run "
+        test -f $(quote "$log_path") \
+          && grep -qF 'receiver bootstrap completed' $(quote "$log_path") \
+          && grep -qF 'derived-state consumer startup completed' $(quote "$log_path")
+      "; then
+        return 0
+      fi
+
+      if ssh_run "
+        test -f $(quote "$log_path") \
+          && grep -qF 'receiver runtime bootstrap failed' $(quote "$log_path")
+      "; then
+        break
+      fi
+
+      if ! remote_pid_is_running "$pidfile_path"; then
+        break
+      fi
+
+      sleep 1
+      elapsed=$((elapsed + 1))
+    done
+
+    if (( attempt == SOF_DERIVED_STATE_STARTUP_RETRIES )); then
+      printf 'derived-state consumer failed to start after %s attempts; last log: %s\n' \
+        "$SOF_DERIVED_STATE_STARTUP_RETRIES" "$log_path" >&2
+      return 1
+    fi
+
+    printf 'startup attempt %s/%s failed; retrying\n' \
+      "$attempt" "$SOF_DERIVED_STATE_STARTUP_RETRIES"
+    wait_for_remote_pid_exit "$pidfile_path" "$SOF_DERIVED_STATE_SHUTDOWN_TIMEOUT_SECS" || true
+    wait_for_remote_port_range_release "$SOF_PORT_RANGE" "$SOF_DERIVED_STATE_SHUTDOWN_TIMEOUT_SECS" || true
+    attempt=$((attempt + 1))
+  done
 }
 
 stop_consumer() {
@@ -52,12 +129,13 @@ stop_consumer() {
   wait_for_remote_log_line "$log_path" "observer runtime shutdown signal received" "$SOF_DERIVED_STATE_SHUTDOWN_TIMEOUT_SECS"
   wait_for_remote_log_line "$log_path" "derived-state consumer shutdown completed" "$SOF_DERIVED_STATE_SHUTDOWN_TIMEOUT_SECS"
   wait_for_remote_pid_exit "$pidfile_path" "$SOF_DERIVED_STATE_SHUTDOWN_TIMEOUT_SECS"
+  wait_for_remote_port_range_release "$SOF_PORT_RANGE" "$SOF_DERIVED_STATE_SHUTDOWN_TIMEOUT_SECS"
 }
 
-printf 'Running derived-state restart check on %s\n' "$SOF_VPS_HOST"
+printf 'Running derived-state restart check on %s\n' "$SOF_SOAK_HOST"
 
-first_log_path="${SOF_VPS_LOG_DIR}/derived_state_restart_check_first.log"
-second_log_path="${SOF_VPS_LOG_DIR}/derived_state_restart_check_second.log"
+first_log_path="${SOF_SOAK_LOG_DIR}/derived_state_restart_check_first.log"
+second_log_path="${SOF_SOAK_LOG_DIR}/derived_state_restart_check_second.log"
 
 ssh_script <<EOF
 set -euo pipefail
@@ -66,9 +144,7 @@ rm -f $(quote "$first_log_path") $(quote "$second_log_path") $(quote "$pidfile_p
 mkdir -p $(quote "$workdir_path")
 EOF
 
-start_consumer "$first_log_path"
-wait_for_remote_log_line "$first_log_path" "receiver bootstrap completed" "$SOF_DERIVED_STATE_STARTUP_TIMEOUT_SECS"
-wait_for_remote_log_line "$first_log_path" "derived-state consumer startup completed" "$SOF_DERIVED_STATE_STARTUP_TIMEOUT_SECS"
+wait_for_consumer_startup "$first_log_path"
 sleep "$SOF_DERIVED_STATE_RUN_SECS"
 
 first_sequence="$(read_checkpoint_sequence)"
@@ -78,16 +154,11 @@ printf 'first checkpoint sequence: %s\n' "$first_sequence"
 stop_consumer "$first_log_path"
 printf 'first shutdown completed\n'
 
-start_consumer "$second_log_path"
-wait_for_remote_log_line "$second_log_path" "receiver bootstrap completed" "$SOF_DERIVED_STATE_STARTUP_TIMEOUT_SECS"
-wait_for_remote_log_line "$second_log_path" "derived-state consumer startup completed" "$SOF_DERIVED_STATE_STARTUP_TIMEOUT_SECS"
-sleep "$SOF_DERIVED_STATE_RUN_SECS"
-
-second_sequence="$(read_checkpoint_sequence)"
-[[ -n "$second_sequence" ]]
-if (( second_sequence <= first_sequence )); then
-  printf 'expected checkpoint sequence to advance across restart: first=%s second=%s\n' \
-    "$first_sequence" "$second_sequence" >&2
+wait_for_consumer_startup "$second_log_path"
+second_sequence="$(wait_for_checkpoint_advance "$first_sequence" "$SOF_DERIVED_STATE_PROGRESS_TIMEOUT_SECS" || true)"
+if [[ -z "$second_sequence" ]]; then
+  printf 'checkpoint did not advance across restart within %ss (baseline=%s)\n' \
+    "$SOF_DERIVED_STATE_PROGRESS_TIMEOUT_SECS" "$first_sequence" >&2
   exit 1
 fi
 
