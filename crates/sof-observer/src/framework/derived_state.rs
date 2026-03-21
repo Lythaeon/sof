@@ -2079,7 +2079,7 @@ enum DerivedStateConsumerCommand {
     /// Applies a preordered live batch of shared envelopes.
     ApplySharedBatch {
         /// Live batch to apply in sequence order.
-        envelopes: Vec<Arc<DerivedStateFeedEnvelope>>,
+        envelopes: SharedDerivedStateEnvelopeBatch,
         /// One-shot reply channel for batch progress and any fault.
         response: mpsc::SyncSender<DerivedStateConsumerBatchApplyReply>,
     },
@@ -2113,6 +2113,33 @@ struct DerivedStateConsumerBatchApplyReply {
     last_sequence: Option<FeedSequence>,
     /// First consumer fault encountered during the batch, when any.
     fault: Option<DerivedStateConsumerFault>,
+}
+
+/// Shared live-batch representation reused across derived-state consumers.
+enum SharedDerivedStateEnvelopeBatch {
+    /// Full emitted batch accepted by the consumer without filtering.
+    Full(Arc<[Arc<DerivedStateFeedEnvelope>]>),
+    /// Filtered subset accepted by the consumer.
+    Filtered(Vec<Arc<DerivedStateFeedEnvelope>>),
+}
+
+impl SharedDerivedStateEnvelopeBatch {
+    /// Returns the highest sequence in the batch when one exists.
+    #[must_use]
+    fn last_sequence(&self) -> Option<FeedSequence> {
+        match self {
+            Self::Full(envelopes) => envelopes.last().map(|envelope| envelope.sequence),
+            Self::Filtered(envelopes) => envelopes.last().map(|envelope| envelope.sequence),
+        }
+    }
+
+    /// Iterates over envelopes in canonical sequence order.
+    fn iter(&self) -> impl Iterator<Item = &Arc<DerivedStateFeedEnvelope>> {
+        match self {
+            Self::Full(envelopes) => envelopes.iter(),
+            Self::Filtered(envelopes) => envelopes.iter(),
+        }
+    }
 }
 
 /// Dedicated worker state for one derived-state consumer instance.
@@ -2189,7 +2216,7 @@ impl DerivedStateConsumerWorker {
                             let mut applied_events = 0_u64;
                             let mut last_sequence = None;
                             let mut fault = None;
-                            for envelope in envelopes {
+                            for envelope in envelopes.iter() {
                                 match consumer.apply(envelope.as_ref()) {
                                     Ok(()) => {
                                         applied_events = applied_events.saturating_add(1);
@@ -2375,9 +2402,9 @@ impl DerivedStateConsumerWorker {
     /// Applies one live shared batch through the consumer worker.
     fn apply_shared_batch(
         &self,
-        envelopes: Vec<Arc<DerivedStateFeedEnvelope>>,
+        envelopes: SharedDerivedStateEnvelopeBatch,
     ) -> DerivedStateConsumerBatchApplyReply {
-        let last_sequence = envelopes.last().map(|envelope| envelope.sequence);
+        let last_sequence = envelopes.last_sequence();
         if let Err(fault) = self.startup() {
             return DerivedStateConsumerBatchApplyReply {
                 applied_events: 0,
@@ -3356,7 +3383,7 @@ impl DerivedStateHost {
         &self,
         watermarks: FeedWatermarks,
         events: I,
-    ) -> Vec<Arc<DerivedStateFeedEnvelope>>
+    ) -> Arc<[Arc<DerivedStateFeedEnvelope>]>
     where
         I: IntoIterator<Item = (FeedSequence, DerivedStateFeedEvent)>,
     {
@@ -3372,28 +3399,34 @@ impl DerivedStateHost {
             };
             envelopes.push(envelope);
         }
-        let shared = envelopes.into_iter().map(Arc::new).collect::<Vec<_>>();
+        let shared: Arc<[Arc<DerivedStateFeedEnvelope>]> =
+            envelopes.into_iter().map(Arc::new).collect();
         if let Some(replay_source) = self.replay_source() {
-            replay_source.append_shared_batch(shared.as_slice());
+            replay_source.append_shared_batch(&shared);
         }
         shared
     }
 
     /// Dispatches one shared publish batch to every registered consumer.
-    fn dispatch_shared_envelopes(&self, envelopes: &[Arc<DerivedStateFeedEnvelope>]) {
+    fn dispatch_shared_envelopes(&self, envelopes: &Arc<[Arc<DerivedStateFeedEnvelope>]>) {
         for registered in self.inner.consumers.iter() {
             if registered.is_unhealthy() {
                 continue;
             }
-            let filtered: Vec<_> = envelopes
-                .iter()
-                .filter(|envelope| registered.accepts_event(&envelope.event))
-                .cloned()
-                .collect();
-            if filtered.is_empty() {
-                continue;
-            }
-            let reply = registered.worker.apply_shared_batch(filtered);
+            let batch = if registered.accepts_all_events() {
+                SharedDerivedStateEnvelopeBatch::Full(Arc::clone(envelopes))
+            } else {
+                let filtered: Vec<_> = envelopes
+                    .iter()
+                    .filter(|envelope| registered.accepts_event(&envelope.event))
+                    .cloned()
+                    .collect();
+                if filtered.is_empty() {
+                    continue;
+                }
+                SharedDerivedStateEnvelopeBatch::Filtered(filtered)
+            };
+            let reply = registered.worker.apply_shared_batch(batch);
             registered.note_applied_batch(reply.applied_events, reply.last_sequence);
             if let Some(fault) = reply.fault.as_ref() {
                 self.record_consumer_fault(registered, fault);
@@ -3978,6 +4011,14 @@ struct DerivedStateConsumerSubscriptions {
 }
 
 impl RegisteredDerivedStateConsumer {
+    /// Returns whether the consumer accepts every derived-state event kind.
+    #[must_use]
+    const fn accepts_all_events(&self) -> bool {
+        self.subscriptions.transaction_applied
+            && self.subscriptions.account_touch_observed
+            && self.subscriptions.control_plane_observed
+    }
+
     /// Returns whether this consumer has lost live continuity.
     #[must_use]
     fn is_unhealthy(&self) -> bool {
