@@ -2063,6 +2063,12 @@ async fn run_async_with_hosts_inner(
                 } else {
                     current_unix_ms().saturating_sub(ingest_last_packet_unix_ms)
                 };
+                let latest_shred_age_ms = duration_to_ms_u64(
+                    Instant::now().saturating_duration_since(latest_shred_updated_at),
+                );
+                let latest_dataset_age_ms = duration_to_ms_u64(
+                    Instant::now().saturating_duration_since(last_dataset_reconstructed_at),
+                );
                 let extension_dispatch = if extension_hooks_enabled {
                     collect_extension_dispatch_telemetry(
                         extension_host.dispatch_metrics_by_extension(),
@@ -2091,6 +2097,25 @@ async fn run_async_with_hosts_inner(
                 let derived_state_replay_telemetry =
                     derived_state_host.replay_telemetry().unwrap_or_default();
                 sync_shred_dedupe_runtime_metrics(shred_dedupe_cache.as_ref());
+                crate::runtime_metrics::set_ingest_metrics(
+                    ingest_packets_seen,
+                    ingest_sent_packets,
+                    ingest_sent_batches,
+                    ingest_dropped_packets,
+                    ingest_dropped_batches,
+                    ingest_rxq_ovfl_drops,
+                    ingest_last_packet_age_ms,
+                );
+                crate::runtime_metrics::set_dataset_dispatch_metrics(
+                    u64::try_from(dataset_queue_depth).unwrap_or(u64::MAX),
+                    dataset_jobs_pending,
+                );
+                crate::runtime_metrics::set_runtime_health_metrics(
+                    latest_shred_age_ms,
+                    latest_dataset_age_ms,
+                    gossip_runtime_stall_age_ms,
+                    repair_dynamic_stream_healthy,
+                );
                 let runtime_stage_metrics = crate::runtime_metrics::snapshot();
                 telemetry_tick_count = telemetry_tick_count.saturating_add(1);
                 let dataset_queue_pressure = dataset_queue_capacity_total > 0

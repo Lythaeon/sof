@@ -232,6 +232,90 @@ fn render_metrics(
     let snapshot = runtime_metrics::snapshot();
     append_metric_family(
         &mut buffer,
+        "sof_ingest_packets_seen_total",
+        "Packets observed by the active ingest source.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_ingest_packets_seen_total",
+        snapshot.ingest_packets_seen_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_ingest_sent_packets_total",
+        "Packets forwarded from ingest into runtime processing.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_ingest_sent_packets_total",
+        snapshot.ingest_sent_packets_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_ingest_sent_batches_total",
+        "Packet batches forwarded from ingest into runtime processing.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_ingest_sent_batches_total",
+        snapshot.ingest_sent_batches_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_ingest_dropped_packets_total",
+        "Packets dropped by ingest due to downstream backpressure.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_ingest_dropped_packets_total",
+        snapshot.ingest_dropped_packets_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_ingest_dropped_batches_total",
+        "Packet batches dropped by ingest due to downstream backpressure.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_ingest_dropped_batches_total",
+        snapshot.ingest_dropped_batches_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_ingest_rxq_ovfl_drops_total",
+        "Kernel receive queue overflow drops observed by ingest.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_ingest_rxq_ovfl_drops_total",
+        snapshot.ingest_rxq_ovfl_drops_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_ingest_last_packet_age_ms",
+        "Age in milliseconds of the latest packet observed by ingest.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_ingest_last_packet_age_ms",
+        snapshot.ingest_last_packet_age_ms,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
         "sof_recovered_data_packets_total",
         "Recovered data shreds accepted after FEC repair.",
         PrometheusMetricType::Counter,
@@ -240,6 +324,30 @@ fn render_metrics(
         &mut buffer,
         "sof_recovered_data_packets_total",
         snapshot.recovered_data_packets_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_dataset_queue_depth",
+        "Current aggregate dataset dispatch queue depth across dataset workers.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_dataset_queue_depth",
+        snapshot.dataset_queue_depth,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_dataset_jobs_pending",
+        "Current number of dataset jobs pending across dataset workers.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_dataset_jobs_pending",
+        snapshot.dataset_jobs_pending,
         None,
     );
     append_metric_family(
@@ -516,6 +624,54 @@ fn render_metrics(
         &mut buffer,
         "sof_tx_event_dropped_total",
         snapshot.tx_event_dropped_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_latest_shred_age_ms",
+        "Age in milliseconds of the most recent canonical shred observed by the runtime.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_latest_shred_age_ms",
+        snapshot.latest_shred_age_ms,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_latest_dataset_age_ms",
+        "Age in milliseconds of the most recent reconstructed dataset observed by the runtime.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_latest_dataset_age_ms",
+        snapshot.latest_dataset_age_ms,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_gossip_runtime_stall_age_ms",
+        "Age in milliseconds since the gossip runtime last made progress.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_gossip_runtime_stall_age_ms",
+        snapshot.gossip_runtime_stall_age_ms,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_repair_dynamic_stream_healthy",
+        "Whether the dynamic repair stream is currently healthy.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_repair_dynamic_stream_healthy",
+        u8::from(snapshot.repair_dynamic_stream_healthy),
         None,
     );
 
@@ -996,7 +1152,9 @@ mod tests {
 
         assert!(metrics.contains("sof_runtime_live 1"));
         assert!(metrics.contains("sof_runtime_ready 1"));
+        assert!(metrics.contains("sof_ingest_packets_seen_total "));
         assert!(metrics.contains("sof_packet_worker_queue_depth "));
+        assert!(metrics.contains("sof_latest_shred_age_ms "));
     }
 
     #[tokio::test(flavor = "current_thread")]
