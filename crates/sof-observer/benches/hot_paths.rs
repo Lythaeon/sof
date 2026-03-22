@@ -1,22 +1,25 @@
 //! Criterion benches for public SOF hot paths.
 
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use criterion::{BatchSize, Criterion, Throughput, black_box};
 use sof::{
-    event::ForkSlotStatus,
+    event::{ForkSlotStatus, TxCommitmentStatus, TxKind},
     framework::{
         DerivedStateCheckpoint, DerivedStateConsumer, DerivedStateConsumerConfig,
         DerivedStateConsumerContext, DerivedStateConsumerFault, DerivedStateConsumerSetupError,
         DerivedStateFeedEnvelope, DerivedStateFeedEvent, DerivedStateHost, FeedWatermarks,
-        SlotStatusChangedEvent,
+        SlotStatusChangedEvent, TransactionAppliedEvent,
     },
     protocol::shred_wire::VARIANT_MERKLE_DATA,
     reassembly::dataset::{DataSetReassembler, SharedPayloadFragment},
     relay::{RecentShredRingBuffer, RelayRangeLimits, RelayRangeRequest, SharedRelayCache},
     shred::wire::{SIZE_OF_DATA_SHRED_HEADERS, SIZE_OF_DATA_SHRED_PAYLOAD, parse_shred_header},
 };
+use solana_transaction::Transaction;
+use solana_transaction::versioned::VersionedTransaction;
 
 /// Relay-cache insert workload size.
 const RELAY_BENCH_SHREDS: usize = 512;
@@ -122,6 +125,7 @@ fn bench_dataset_reassembly(c: &mut Criterion) {
 /// Bench the full derived-state host dispatch path for one control-plane batch.
 fn bench_derived_state_dispatch(c: &mut Criterion) {
     let event_template = derived_state_events(DERIVED_STATE_BATCH_EVENTS);
+    let mixed_event_template = mixed_derived_state_events(DERIVED_STATE_BATCH_EVENTS);
     let watermarks = FeedWatermarks {
         canonical_tip_slot: Some(22_000),
         processed_slot: Some(22_000),
@@ -168,6 +172,20 @@ fn bench_derived_state_dispatch(c: &mut Criterion) {
             |events| {
                 full_feed_host.on_events(watermarks, events);
                 black_box(full_feed_host.last_emitted_sequence());
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    let filtered_host = derived_state_host(
+        DERIVED_STATE_MULTI_CONSUMER_COUNT,
+        BenchConsumerMode::ControlPlaneOnly,
+    );
+    group.bench_function("mixed_batch_64_four_filtered_consumers", |b| {
+        b.iter_batched(
+            || mixed_event_template.clone(),
+            |events| {
+                filtered_host.on_events(watermarks, events);
+                black_box(filtered_host.last_emitted_sequence());
             },
             BatchSize::SmallInput,
         );
@@ -239,6 +257,35 @@ fn derived_state_events(count: usize) -> Vec<DerivedStateFeedEvent> {
                 previous_status: Some(ForkSlotStatus::Processed),
                 status: ForkSlotStatus::Confirmed,
             })
+        })
+        .collect()
+}
+
+/// Build mixed transaction/control-plane events to exercise filtered dispatch.
+fn mixed_derived_state_events(count: usize) -> Vec<DerivedStateFeedEvent> {
+    let tx = Arc::new(VersionedTransaction::from(Transaction::new_with_payer(
+        &[],
+        None,
+    )));
+    (0..count)
+        .map(|index| {
+            if index % 2 == 0 {
+                DerivedStateFeedEvent::SlotStatusChanged(SlotStatusChangedEvent {
+                    slot: bench_slot(22_000, index),
+                    parent_slot: Some(bench_slot(21_999, index)),
+                    previous_status: Some(ForkSlotStatus::Processed),
+                    status: ForkSlotStatus::Confirmed,
+                })
+            } else {
+                DerivedStateFeedEvent::TransactionApplied(TransactionAppliedEvent {
+                    slot: bench_slot(22_000, index),
+                    tx_index: u32::try_from(index).unwrap_or(u32::MAX),
+                    signature: None,
+                    kind: TxKind::NonVote,
+                    transaction: Arc::clone(&tx),
+                    commitment_status: TxCommitmentStatus::Processed,
+                })
+            }
         })
         .collect()
 }
