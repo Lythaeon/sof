@@ -1009,12 +1009,8 @@ pub trait DerivedStateReplaySource: Send + Sync + 'static {
     }
 
     /// Records a shared batch of emitted envelopes into the replay source.
-    fn append_shared_batch(&self, envelopes: &[Arc<DerivedStateFeedEnvelope>]) {
-        let owned = envelopes
-            .iter()
-            .map(|envelope| envelope.as_ref().clone())
-            .collect::<Vec<_>>();
-        self.append_batch(owned.as_slice());
+    fn append_shared_batch(&self, envelopes: &[DerivedStateFeedEnvelope]) {
+        self.append_batch(envelopes);
     }
 
     /// Returns retained envelopes starting at the requested sequence boundary.
@@ -1158,7 +1154,7 @@ pub struct DiskDerivedStateReplaySource {
     /// Total number of disk compaction runs.
     compactions: Arc<AtomicU64>,
     /// Dedicated writer path for replay appends so dataset workers do not block on disk IO.
-    writer_tx: mpsc::Sender<Vec<Arc<DerivedStateFeedEnvelope>>>,
+    writer_tx: mpsc::Sender<Vec<DerivedStateFeedEnvelope>>,
     /// Join handle for the dedicated replay writer thread.
     writer_handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -1263,7 +1259,7 @@ impl DiskDerivedStateReplaySource {
         let append_failures = Arc::new(AtomicU64::new(0));
         let load_failures = Arc::new(AtomicU64::new(0));
         let compactions = Arc::new(AtomicU64::new(0));
-        let (writer_tx, writer_rx) = mpsc::channel::<Vec<Arc<DerivedStateFeedEnvelope>>>();
+        let (writer_tx, writer_rx) = mpsc::channel::<Vec<DerivedStateFeedEnvelope>>();
         let writer_root_dir = root_dir.clone();
         let writer_session_metadata = Arc::clone(&session_metadata);
         let writer_truncated_envelopes = Arc::clone(&truncated_envelopes);
@@ -1273,7 +1269,7 @@ impl DiskDerivedStateReplaySource {
         let writer_handle = std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
-                let (dummy_tx, _dummy_rx) = mpsc::channel::<Vec<Arc<DerivedStateFeedEnvelope>>>();
+                let (dummy_tx, _dummy_rx) = mpsc::channel::<Vec<DerivedStateFeedEnvelope>>();
                 let writer_backend = Self {
                     root_dir: writer_root_dir,
                     max_envelopes_per_session,
@@ -1292,11 +1288,7 @@ impl DiskDerivedStateReplaySource {
                         continue;
                     };
                     let session_id = first_envelope.session_id;
-                    let owned = envelopes
-                        .iter()
-                        .map(|envelope| envelope.as_ref().clone())
-                        .collect::<Vec<_>>();
-                    if let Err(error) = writer_backend.append_batch_inline(owned.as_slice()) {
+                    if let Err(error) = writer_backend.append_batch_inline(envelopes.as_slice()) {
                         let _ = writer_append_failures.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(
                             session_id = ?session_id,
@@ -1807,7 +1799,7 @@ impl DiskDerivedStateReplaySource {
 
 impl Drop for DiskDerivedStateReplaySource {
     fn drop(&mut self) {
-        let (dummy_tx, _dummy_rx) = mpsc::channel::<Vec<Arc<DerivedStateFeedEnvelope>>>();
+        let (dummy_tx, _dummy_rx) = mpsc::channel::<Vec<DerivedStateFeedEnvelope>>();
         let writer_tx = std::mem::replace(&mut self.writer_tx, dummy_tx);
         drop(writer_tx);
         if let Some(writer_handle) = self.writer_handle.take()
@@ -1821,7 +1813,7 @@ impl Drop for DiskDerivedStateReplaySource {
 impl DerivedStateReplaySource for DiskDerivedStateReplaySource {
     fn append(&self, envelope: DerivedStateFeedEnvelope) {
         let session_id = envelope.session_id;
-        if let Err(error) = self.writer_tx.send(vec![Arc::new(envelope)]) {
+        if let Err(error) = self.writer_tx.send(vec![envelope]) {
             let _ = self.append_failures.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 session_id = ?session_id,
@@ -1836,8 +1828,7 @@ impl DerivedStateReplaySource for DiskDerivedStateReplaySource {
             return;
         };
         let session_id = first_envelope.session_id;
-        let shared = envelopes.iter().cloned().map(Arc::new).collect::<Vec<_>>();
-        if let Err(error) = self.writer_tx.send(shared) {
+        if let Err(error) = self.writer_tx.send(envelopes.to_vec()) {
             let _ = self.append_failures.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 session_id = ?session_id,
@@ -1847,7 +1838,7 @@ impl DerivedStateReplaySource for DiskDerivedStateReplaySource {
         }
     }
 
-    fn append_shared_batch(&self, envelopes: &[Arc<DerivedStateFeedEnvelope>]) {
+    fn append_shared_batch(&self, envelopes: &[DerivedStateFeedEnvelope]) {
         let Some(first_envelope) = envelopes.first() else {
             return;
         };
@@ -2092,8 +2083,6 @@ enum DerivedStateConsumerCommand {
     ApplySharedBatch {
         /// Live batch to apply in sequence order.
         envelopes: SharedDerivedStateEnvelopeBatch,
-        /// One-shot reply channel for batch progress and any fault.
-        response: channel::Sender<DerivedStateConsumerBatchApplyReply>,
     },
     /// Applies a preordered replay batch.
     ApplyBatch {
@@ -2130,11 +2119,11 @@ struct DerivedStateConsumerBatchApplyReply {
 /// Shared live-batch representation reused across derived-state consumers.
 enum SharedDerivedStateEnvelopeBatch {
     /// Full emitted batch accepted by the consumer without filtering.
-    Full(Arc<[Arc<DerivedStateFeedEnvelope>]>),
+    Full(Arc<Vec<DerivedStateFeedEnvelope>>),
     /// Filtered subset accepted by the consumer, referenced by index into one shared batch.
     Indexed {
         /// Shared emitted batch.
-        envelopes: Arc<[Arc<DerivedStateFeedEnvelope>]>,
+        envelopes: Arc<Vec<DerivedStateFeedEnvelope>>,
         /// Accepted envelope indexes in canonical order.
         indexes: Vec<usize>,
     },
@@ -2168,6 +2157,8 @@ struct DerivedStateConsumerWorker {
     startup_state: OnceLock<Result<(), DerivedStateConsumerFault>>,
     /// Join handle for the worker thread when startup succeeded.
     worker_handle: Option<JoinHandle<()>>,
+    /// Reused reply receiver for the live shared-batch path.
+    apply_shared_batch_reply_rx: channel::Receiver<DerivedStateConsumerBatchApplyReply>,
 }
 
 impl DerivedStateConsumerWorker {
@@ -2176,6 +2167,7 @@ impl DerivedStateConsumerWorker {
         let queue = Arc::new(ArrayQueue::new(DERIVED_STATE_CONSUMER_QUEUE_CAPACITY));
         let worker_thread = Arc::new(OnceLock::new());
         let shutdown = Arc::new(AtomicBool::new(false));
+        let (apply_shared_batch_reply_tx, apply_shared_batch_reply_rx) = channel::bounded(1);
         let worker_queue = queue.clone();
         let worker_thread_ref = worker_thread.clone();
         let worker_shutdown = shutdown.clone();
@@ -2221,17 +2213,14 @@ impl DerivedStateConsumerWorker {
                         DerivedStateConsumerCommand::LoadCheckpoint { response } => {
                             drop(response.send(consumer.load_checkpoint()));
                         }
-                        DerivedStateConsumerCommand::ApplySharedBatch {
-                            envelopes,
-                            response,
-                        } => {
+                        DerivedStateConsumerCommand::ApplySharedBatch { envelopes } => {
                             let mut applied_events = 0_u64;
                             let mut last_sequence = None;
                             let mut fault = None;
                             match envelopes {
                                 SharedDerivedStateEnvelopeBatch::Full(envelopes) => {
                                     for envelope in envelopes.iter() {
-                                        match consumer.apply(envelope.as_ref()) {
+                                        match consumer.apply(envelope) {
                                             Ok(()) => {
                                                 applied_events = applied_events.saturating_add(1);
                                                 last_sequence = Some(envelope.sequence);
@@ -2248,7 +2237,7 @@ impl DerivedStateConsumerWorker {
                                         let Some(envelope) = envelopes.get(index) else {
                                             continue;
                                         };
-                                        match consumer.apply(envelope.as_ref()) {
+                                        match consumer.apply(envelope) {
                                             Ok(()) => {
                                                 applied_events = applied_events.saturating_add(1);
                                                 last_sequence = Some(envelope.sequence);
@@ -2261,11 +2250,13 @@ impl DerivedStateConsumerWorker {
                                     }
                                 }
                             }
-                            drop(response.send(DerivedStateConsumerBatchApplyReply {
-                                applied_events,
-                                last_sequence,
-                                fault,
-                            }));
+                            drop(apply_shared_batch_reply_tx.send(
+                                DerivedStateConsumerBatchApplyReply {
+                                    applied_events,
+                                    last_sequence,
+                                    fault,
+                                },
+                            ));
                         }
                         DerivedStateConsumerCommand::ApplyBatch {
                             envelopes,
@@ -2339,6 +2330,7 @@ impl DerivedStateConsumerWorker {
             startup_fault,
             startup_state: OnceLock::new(),
             worker_handle,
+            apply_shared_batch_reply_rx,
         }
     }
 
@@ -2436,13 +2428,7 @@ impl DerivedStateConsumerWorker {
     fn begin_apply_shared_batch(
         &self,
         envelopes: SharedDerivedStateEnvelopeBatch,
-    ) -> Result<
-        (
-            channel::Receiver<DerivedStateConsumerBatchApplyReply>,
-            Option<FeedSequence>,
-        ),
-        DerivedStateConsumerBatchApplyReply,
-    > {
+    ) -> Result<Option<FeedSequence>, DerivedStateConsumerBatchApplyReply> {
         let last_sequence = envelopes.last_sequence();
         if let Err(fault) = self.startup() {
             return Err(DerivedStateConsumerBatchApplyReply {
@@ -2451,12 +2437,26 @@ impl DerivedStateConsumerWorker {
                 fault: Some(fault),
             });
         }
-        let (response_tx, response_rx) = channel::bounded(1);
-        self.push_blocking(DerivedStateConsumerCommand::ApplySharedBatch {
-            envelopes,
-            response: response_tx,
-        });
-        Ok((response_rx, last_sequence))
+        self.push_blocking(DerivedStateConsumerCommand::ApplySharedBatch { envelopes });
+        Ok(last_sequence)
+    }
+
+    /// Waits for one live shared-batch reply from the consumer worker.
+    fn recv_apply_shared_batch_reply(
+        &self,
+        last_sequence: Option<FeedSequence>,
+    ) -> DerivedStateConsumerBatchApplyReply {
+        self.apply_shared_batch_reply_rx.recv().unwrap_or_else(|_| {
+            DerivedStateConsumerBatchApplyReply {
+                applied_events: 0,
+                last_sequence,
+                fault: Some(DerivedStateConsumerFault::new(
+                    DerivedStateConsumerFaultKind::ConsumerApplyFailed,
+                    last_sequence,
+                    "derived-state consumer worker exited during shared batch apply",
+                )),
+            }
+        })
     }
 
     /// Flushes one checkpoint barrier through the consumer worker.
@@ -3412,7 +3412,7 @@ impl DerivedStateHost {
         &self,
         watermarks: FeedWatermarks,
         events: I,
-    ) -> Arc<[Arc<DerivedStateFeedEnvelope>]>
+    ) -> Arc<Vec<DerivedStateFeedEnvelope>>
     where
         I: IntoIterator<Item = (FeedSequence, DerivedStateFeedEvent)>,
     {
@@ -3428,16 +3428,15 @@ impl DerivedStateHost {
             };
             envelopes.push(envelope);
         }
-        let shared: Arc<[Arc<DerivedStateFeedEnvelope>]> =
-            envelopes.into_iter().map(Arc::new).collect();
+        let shared = Arc::new(envelopes);
         if let Some(replay_source) = self.replay_source() {
-            replay_source.append_shared_batch(&shared);
+            replay_source.append_shared_batch(shared.as_slice());
         }
         shared
     }
 
     /// Dispatches one shared publish batch to every registered consumer.
-    fn dispatch_shared_envelopes(&self, envelopes: &Arc<[Arc<DerivedStateFeedEnvelope>]>) {
+    fn dispatch_shared_envelopes(&self, envelopes: &Arc<Vec<DerivedStateFeedEnvelope>>) {
         let universally_delivered = envelopes
             .iter()
             .all(|envelope| envelope.event.is_universally_delivered());
@@ -3465,8 +3464,8 @@ impl DerivedStateHost {
                 }
             };
             let reply = match registered.worker.begin_apply_shared_batch(batch) {
-                Ok((response_rx, last_sequence)) => {
-                    pending.push((registered, response_rx, last_sequence));
+                Ok(last_sequence) => {
+                    pending.push((registered, last_sequence));
                     continue;
                 }
                 Err(reply) => reply,
@@ -3476,19 +3475,10 @@ impl DerivedStateHost {
                 self.record_consumer_fault(registered, fault);
             }
         }
-        for (registered, response_rx, last_sequence) in pending {
-            let reply =
-                response_rx
-                    .recv()
-                    .unwrap_or_else(|_| DerivedStateConsumerBatchApplyReply {
-                        applied_events: 0,
-                        last_sequence,
-                        fault: Some(DerivedStateConsumerFault::new(
-                            DerivedStateConsumerFaultKind::ConsumerApplyFailed,
-                            last_sequence,
-                            "derived-state consumer worker exited during shared batch apply",
-                        )),
-                    });
+        for (registered, last_sequence) in pending {
+            let reply = registered
+                .worker
+                .recv_apply_shared_batch_reply(last_sequence);
             registered.note_applied_batch(reply.applied_events, reply.last_sequence);
             if let Some(fault) = reply.fault.as_ref() {
                 self.record_consumer_fault(registered, fault);
