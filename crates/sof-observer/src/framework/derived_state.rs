@@ -22,6 +22,7 @@ use std::{
 };
 
 use arcshift::ArcShift;
+use crossbeam_channel as channel;
 use crossbeam_queue::ArrayQueue;
 use crossbeam_skiplist::SkipMap;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -2068,27 +2069,27 @@ enum DerivedStateConsumerCommand {
     /// Ensures the consumer startup hook has completed successfully.
     EnsureStarted {
         /// One-shot reply channel for the startup outcome.
-        response: mpsc::SyncSender<Result<(), DerivedStateConsumerFault>>,
+        response: channel::Sender<Result<(), DerivedStateConsumerFault>>,
     },
     /// Loads the latest durable checkpoint from the consumer.
     LoadCheckpoint {
         /// One-shot reply channel for the checkpoint result.
         response:
-            mpsc::SyncSender<Result<Option<DerivedStateCheckpoint>, DerivedStateConsumerFault>>,
+            channel::Sender<Result<Option<DerivedStateCheckpoint>, DerivedStateConsumerFault>>,
     },
     /// Applies a preordered live batch of shared envelopes.
     ApplySharedBatch {
         /// Live batch to apply in sequence order.
         envelopes: SharedDerivedStateEnvelopeBatch,
         /// One-shot reply channel for batch progress and any fault.
-        response: mpsc::SyncSender<DerivedStateConsumerBatchApplyReply>,
+        response: channel::Sender<DerivedStateConsumerBatchApplyReply>,
     },
     /// Applies a preordered replay batch.
     ApplyBatch {
         /// Replay batch to apply in sequence order.
         envelopes: Vec<DerivedStateFeedEnvelope>,
         /// One-shot reply channel for batch progress and any fault.
-        response: mpsc::SyncSender<DerivedStateConsumerBatchApplyReply>,
+        response: channel::Sender<DerivedStateConsumerBatchApplyReply>,
     },
     /// Applies one final envelope and then persists a checkpoint.
     FlushCheckpoint {
@@ -2099,7 +2100,7 @@ enum DerivedStateConsumerCommand {
         /// Watermarks paired with the checkpoint barrier.
         watermarks: FeedWatermarks,
         /// One-shot reply channel for the checkpoint flush outcome.
-        response: mpsc::SyncSender<Option<DerivedStateConsumerFault>>,
+        response: channel::Sender<Option<DerivedStateConsumerFault>>,
     },
     /// Requests cooperative worker shutdown.
     Shutdown,
@@ -2337,7 +2338,7 @@ impl DerivedStateConsumerWorker {
                 if let Some(fault) = self.startup_fault.as_ref() {
                     return Err(fault.clone());
                 }
-                let (response_tx, response_rx) = mpsc::sync_channel(1);
+                let (response_tx, response_rx) = channel::bounded(1);
                 self.push_blocking(DerivedStateConsumerCommand::EnsureStarted {
                     response: response_tx,
                 });
@@ -2355,7 +2356,7 @@ impl DerivedStateConsumerWorker {
     /// Loads the most recent checkpoint through the consumer worker.
     fn load_checkpoint(&self) -> Result<Option<DerivedStateCheckpoint>, DerivedStateConsumerFault> {
         self.startup()?;
-        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        let (response_tx, response_rx) = channel::bounded(1);
         self.push_blocking(DerivedStateConsumerCommand::LoadCheckpoint {
             response: response_tx,
         });
@@ -2381,7 +2382,7 @@ impl DerivedStateConsumerWorker {
                 fault: Some(fault),
             };
         }
-        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        let (response_tx, response_rx) = channel::bounded(1);
         self.push_blocking(DerivedStateConsumerCommand::ApplyBatch {
             envelopes,
             response: response_tx,
@@ -2412,7 +2413,7 @@ impl DerivedStateConsumerWorker {
                 fault: Some(fault),
             };
         }
-        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        let (response_tx, response_rx) = channel::bounded(1);
         self.push_blocking(DerivedStateConsumerCommand::ApplySharedBatch {
             envelopes,
             response: response_tx,
@@ -2439,7 +2440,7 @@ impl DerivedStateConsumerWorker {
     ) -> Result<(), DerivedStateConsumerFault> {
         self.startup()?;
         let sequence = envelope.sequence;
-        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        let (response_tx, response_rx) = channel::bounded(1);
         self.push_blocking(DerivedStateConsumerCommand::FlushCheckpoint {
             envelope,
             session_id,

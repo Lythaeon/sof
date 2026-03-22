@@ -4902,6 +4902,7 @@ dependencies = [
  "bincode",
  "core_affinity",
  "criterion",
+ "crossbeam-channel",
  "crossbeam-queue",
  "crossbeam-skiplist",
  "ed25519-dalek 2.2.0",
