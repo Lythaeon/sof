@@ -1,22 +1,25 @@
 //! Criterion benches for public SOF hot paths.
 
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use criterion::{BatchSize, Criterion, Throughput, black_box};
 use sof::{
-    event::ForkSlotStatus,
+    event::{ForkSlotStatus, TxCommitmentStatus, TxKind},
     framework::{
         DerivedStateCheckpoint, DerivedStateConsumer, DerivedStateConsumerConfig,
         DerivedStateConsumerContext, DerivedStateConsumerFault, DerivedStateConsumerSetupError,
         DerivedStateFeedEnvelope, DerivedStateFeedEvent, DerivedStateHost, FeedWatermarks,
-        SlotStatusChangedEvent,
+        SlotStatusChangedEvent, TransactionAppliedEvent,
     },
     protocol::shred_wire::VARIANT_MERKLE_DATA,
     reassembly::dataset::{DataSetReassembler, SharedPayloadFragment},
     relay::{RecentShredRingBuffer, RelayRangeLimits, RelayRangeRequest, SharedRelayCache},
     shred::wire::{SIZE_OF_DATA_SHRED_HEADERS, SIZE_OF_DATA_SHRED_PAYLOAD, parse_shred_header},
 };
+use solana_transaction::Transaction;
+use solana_transaction::versioned::VersionedTransaction;
 
 /// Relay-cache insert workload size.
 const RELAY_BENCH_SHREDS: usize = 512;
@@ -30,6 +33,8 @@ const RELAY_QUERY_END_INDEX: u32 = 383;
 const DATASET_BENCH_SHREDS: usize = 32;
 /// Derived-state dispatch batch size.
 const DERIVED_STATE_BATCH_EVENTS: usize = 64;
+/// Derived-state multi-consumer fanout width.
+const DERIVED_STATE_MULTI_CONSUMER_COUNT: usize = 4;
 
 /// Bench relay-cache insert throughput on a bounded shared cache.
 fn bench_shared_relay_cache_insert(c: &mut Criterion) {
@@ -119,11 +124,8 @@ fn bench_dataset_reassembly(c: &mut Criterion) {
 
 /// Bench the full derived-state host dispatch path for one control-plane batch.
 fn bench_derived_state_dispatch(c: &mut Criterion) {
-    let host = DerivedStateHost::builder()
-        .add_consumer(NoopDerivedStateConsumer)
-        .build();
-    host.initialize();
     let event_template = derived_state_events(DERIVED_STATE_BATCH_EVENTS);
+    let mixed_event_template = mixed_derived_state_events(DERIVED_STATE_BATCH_EVENTS);
     let watermarks = FeedWatermarks {
         canonical_tip_slot: Some(22_000),
         processed_slot: Some(22_000),
@@ -132,17 +134,83 @@ fn bench_derived_state_dispatch(c: &mut Criterion) {
     };
     let mut group = c.benchmark_group("derived_state_dispatch");
     group.throughput(Throughput::Elements(DERIVED_STATE_BATCH_EVENTS as u64));
-    group.bench_function("slot_status_batch_64", |b| {
+    let control_plane_host = derived_state_host(
+        DERIVED_STATE_MULTI_CONSUMER_COUNT.min(1),
+        BenchConsumerMode::ControlPlaneOnly,
+    );
+    group.bench_function("slot_status_batch_64_single_consumer", |b| {
         b.iter_batched(
             || event_template.clone(),
             |events| {
-                host.on_events(watermarks, events);
-                black_box(host.last_emitted_sequence());
+                control_plane_host.on_events(watermarks, events);
+                black_box(control_plane_host.last_emitted_sequence());
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    let multi_consumer_host = derived_state_host(
+        DERIVED_STATE_MULTI_CONSUMER_COUNT,
+        BenchConsumerMode::ControlPlaneOnly,
+    );
+    group.bench_function("slot_status_batch_64_four_consumers", |b| {
+        b.iter_batched(
+            || event_template.clone(),
+            |events| {
+                multi_consumer_host.on_events(watermarks, events);
+                black_box(multi_consumer_host.last_emitted_sequence());
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    let full_feed_host = derived_state_host(
+        DERIVED_STATE_MULTI_CONSUMER_COUNT,
+        BenchConsumerMode::FullFeed,
+    );
+    group.bench_function("slot_status_batch_64_four_full_feed_consumers", |b| {
+        b.iter_batched(
+            || event_template.clone(),
+            |events| {
+                full_feed_host.on_events(watermarks, events);
+                black_box(full_feed_host.last_emitted_sequence());
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    let filtered_host = derived_state_host(
+        DERIVED_STATE_MULTI_CONSUMER_COUNT,
+        BenchConsumerMode::ControlPlaneOnly,
+    );
+    group.bench_function("mixed_batch_64_four_filtered_consumers", |b| {
+        b.iter_batched(
+            || mixed_event_template.clone(),
+            |events| {
+                filtered_host.on_events(watermarks, events);
+                black_box(filtered_host.last_emitted_sequence());
             },
             BatchSize::SmallInput,
         );
     });
     group.finish();
+}
+
+/// Subscription profile used by the derived-state dispatch benches.
+#[derive(Clone, Copy, Debug)]
+enum BenchConsumerMode {
+    /// Subscribes only to control-plane derived-state events.
+    ControlPlaneOnly,
+    /// Subscribes to the full derived-state feed surface.
+    FullFeed,
+}
+
+/// Builds one initialized derived-state host for the requested consumer fanout.
+fn derived_state_host(consumer_count: usize, mode: BenchConsumerMode) -> DerivedStateHost {
+    let mut builder = DerivedStateHost::builder();
+    for _ in 0..consumer_count {
+        builder = builder.add_consumer(NoopDerivedStateConsumer { mode });
+    }
+    let host = builder.build();
+    host.initialize();
+    host
 }
 
 /// Build parsed benchmark shred packets for relay-cache benches.
@@ -189,6 +257,35 @@ fn derived_state_events(count: usize) -> Vec<DerivedStateFeedEvent> {
                 previous_status: Some(ForkSlotStatus::Processed),
                 status: ForkSlotStatus::Confirmed,
             })
+        })
+        .collect()
+}
+
+/// Build mixed transaction/control-plane events to exercise filtered dispatch.
+fn mixed_derived_state_events(count: usize) -> Vec<DerivedStateFeedEvent> {
+    let tx = Arc::new(VersionedTransaction::from(Transaction::new_with_payer(
+        &[],
+        None,
+    )));
+    (0..count)
+        .map(|index| {
+            if index % 2 == 0 {
+                DerivedStateFeedEvent::SlotStatusChanged(SlotStatusChangedEvent {
+                    slot: bench_slot(22_000, index),
+                    parent_slot: Some(bench_slot(21_999, index)),
+                    previous_status: Some(ForkSlotStatus::Processed),
+                    status: ForkSlotStatus::Confirmed,
+                })
+            } else {
+                DerivedStateFeedEvent::TransactionApplied(TransactionAppliedEvent {
+                    slot: bench_slot(22_000, index),
+                    tx_index: u32::try_from(index).unwrap_or(u32::MAX),
+                    signature: None,
+                    kind: TxKind::NonVote,
+                    transaction: Arc::clone(&tx),
+                    commitment_status: TxCommitmentStatus::Processed,
+                })
+            }
         })
         .collect()
 }
@@ -248,8 +345,11 @@ fn set_byte(packet: &mut [u8], index: usize, value: u8) -> Option<()> {
 }
 
 /// No-op derived-state consumer used to benchmark host dispatch overhead.
-#[derive(Debug, Default)]
-struct NoopDerivedStateConsumer;
+#[derive(Debug, Clone, Copy)]
+struct NoopDerivedStateConsumer {
+    /// Subscription shape exercised by this bench consumer.
+    mode: BenchConsumerMode,
+}
 
 impl DerivedStateConsumer for NoopDerivedStateConsumer {
     fn name(&self) -> &'static str {
@@ -271,7 +371,15 @@ impl DerivedStateConsumer for NoopDerivedStateConsumer {
     }
 
     fn config(&self) -> DerivedStateConsumerConfig {
-        DerivedStateConsumerConfig::new().with_control_plane_observed()
+        match self.mode {
+            BenchConsumerMode::ControlPlaneOnly => {
+                DerivedStateConsumerConfig::new().with_control_plane_observed()
+            }
+            BenchConsumerMode::FullFeed => DerivedStateConsumerConfig::new()
+                .with_transaction_applied()
+                .with_account_touch_observed()
+                .with_control_plane_observed(),
+        }
     }
 
     fn setup(
