@@ -235,6 +235,17 @@ pub enum DerivedStateFeedEvent {
     CheckpointBarrier(CheckpointBarrierEvent),
 }
 
+impl DerivedStateFeedEvent {
+    /// Returns whether this event kind is always delivered to every consumer.
+    #[must_use]
+    const fn is_universally_delivered(&self) -> bool {
+        matches!(
+            self,
+            Self::SlotStatusChanged(_) | Self::BranchReorged(_) | Self::CheckpointBarrier(_)
+        )
+    }
+}
+
 /// Freshness classification for one control-plane input.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub enum DerivedStateFreshnessState {
@@ -2400,35 +2411,31 @@ impl DerivedStateConsumerWorker {
             })
     }
 
-    /// Applies one live shared batch through the consumer worker.
-    fn apply_shared_batch(
+    /// Enqueues one live shared batch and returns the reply receiver when startup succeeded.
+    fn begin_apply_shared_batch(
         &self,
         envelopes: SharedDerivedStateEnvelopeBatch,
-    ) -> DerivedStateConsumerBatchApplyReply {
+    ) -> Result<
+        (
+            channel::Receiver<DerivedStateConsumerBatchApplyReply>,
+            Option<FeedSequence>,
+        ),
+        DerivedStateConsumerBatchApplyReply,
+    > {
         let last_sequence = envelopes.last_sequence();
         if let Err(fault) = self.startup() {
-            return DerivedStateConsumerBatchApplyReply {
+            return Err(DerivedStateConsumerBatchApplyReply {
                 applied_events: 0,
                 last_sequence,
                 fault: Some(fault),
-            };
+            });
         }
         let (response_tx, response_rx) = channel::bounded(1);
         self.push_blocking(DerivedStateConsumerCommand::ApplySharedBatch {
             envelopes,
             response: response_tx,
         });
-        response_rx
-            .recv()
-            .unwrap_or_else(|_| DerivedStateConsumerBatchApplyReply {
-                applied_events: 0,
-                last_sequence,
-                fault: Some(DerivedStateConsumerFault::new(
-                    DerivedStateConsumerFaultKind::ConsumerApplyFailed,
-                    last_sequence,
-                    "derived-state consumer worker exited during shared batch apply",
-                )),
-            })
+        Ok((response_rx, last_sequence))
     }
 
     /// Flushes one checkpoint barrier through the consumer worker.
@@ -3410,11 +3417,15 @@ impl DerivedStateHost {
 
     /// Dispatches one shared publish batch to every registered consumer.
     fn dispatch_shared_envelopes(&self, envelopes: &Arc<[Arc<DerivedStateFeedEnvelope>]>) {
+        let universally_delivered = envelopes
+            .iter()
+            .all(|envelope| envelope.event.is_universally_delivered());
+        let mut pending = Vec::with_capacity(self.inner.consumers.len());
         for registered in self.inner.consumers.iter() {
             if registered.is_unhealthy() {
                 continue;
             }
-            let batch = if registered.accepts_all_events() {
+            let batch = if universally_delivered || registered.accepts_all_events() {
                 SharedDerivedStateEnvelopeBatch::Full(Arc::clone(envelopes))
             } else {
                 let filtered: Vec<_> = envelopes
@@ -3427,7 +3438,31 @@ impl DerivedStateHost {
                 }
                 SharedDerivedStateEnvelopeBatch::Filtered(filtered)
             };
-            let reply = registered.worker.apply_shared_batch(batch);
+            let reply = match registered.worker.begin_apply_shared_batch(batch) {
+                Ok((response_rx, last_sequence)) => {
+                    pending.push((registered, response_rx, last_sequence));
+                    continue;
+                }
+                Err(reply) => reply,
+            };
+            registered.note_applied_batch(reply.applied_events, reply.last_sequence);
+            if let Some(fault) = reply.fault.as_ref() {
+                self.record_consumer_fault(registered, fault);
+            }
+        }
+        for (registered, response_rx, last_sequence) in pending {
+            let reply =
+                response_rx
+                    .recv()
+                    .unwrap_or_else(|_| DerivedStateConsumerBatchApplyReply {
+                        applied_events: 0,
+                        last_sequence,
+                        fault: Some(DerivedStateConsumerFault::new(
+                            DerivedStateConsumerFaultKind::ConsumerApplyFailed,
+                            last_sequence,
+                            "derived-state consumer worker exited during shared batch apply",
+                        )),
+                    });
             registered.note_applied_batch(reply.applied_events, reply.last_sequence);
             if let Some(fault) = reply.fault.as_ref() {
                 self.record_consumer_fault(registered, fault);
