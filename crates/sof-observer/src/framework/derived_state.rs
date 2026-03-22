@@ -2131,8 +2131,13 @@ struct DerivedStateConsumerBatchApplyReply {
 enum SharedDerivedStateEnvelopeBatch {
     /// Full emitted batch accepted by the consumer without filtering.
     Full(Arc<[Arc<DerivedStateFeedEnvelope>]>),
-    /// Filtered subset accepted by the consumer.
-    Filtered(Vec<Arc<DerivedStateFeedEnvelope>>),
+    /// Filtered subset accepted by the consumer, referenced by index into one shared batch.
+    Indexed {
+        /// Shared emitted batch.
+        envelopes: Arc<[Arc<DerivedStateFeedEnvelope>]>,
+        /// Accepted envelope indexes in canonical order.
+        indexes: Vec<usize>,
+    },
 }
 
 impl SharedDerivedStateEnvelopeBatch {
@@ -2141,15 +2146,10 @@ impl SharedDerivedStateEnvelopeBatch {
     fn last_sequence(&self) -> Option<FeedSequence> {
         match self {
             Self::Full(envelopes) => envelopes.last().map(|envelope| envelope.sequence),
-            Self::Filtered(envelopes) => envelopes.last().map(|envelope| envelope.sequence),
-        }
-    }
-
-    /// Iterates over envelopes in canonical sequence order.
-    fn iter(&self) -> impl Iterator<Item = &Arc<DerivedStateFeedEnvelope>> {
-        match self {
-            Self::Full(envelopes) => envelopes.iter(),
-            Self::Filtered(envelopes) => envelopes.iter(),
+            Self::Indexed { envelopes, indexes } => indexes
+                .last()
+                .and_then(|index| envelopes.get(*index))
+                .map(|envelope| envelope.sequence),
         }
     }
 }
@@ -2228,15 +2228,36 @@ impl DerivedStateConsumerWorker {
                             let mut applied_events = 0_u64;
                             let mut last_sequence = None;
                             let mut fault = None;
-                            for envelope in envelopes.iter() {
-                                match consumer.apply(envelope.as_ref()) {
-                                    Ok(()) => {
-                                        applied_events = applied_events.saturating_add(1);
-                                        last_sequence = Some(envelope.sequence);
+                            match envelopes {
+                                SharedDerivedStateEnvelopeBatch::Full(envelopes) => {
+                                    for envelope in envelopes.iter() {
+                                        match consumer.apply(envelope.as_ref()) {
+                                            Ok(()) => {
+                                                applied_events = applied_events.saturating_add(1);
+                                                last_sequence = Some(envelope.sequence);
+                                            }
+                                            Err(error) => {
+                                                fault = Some(error);
+                                                break;
+                                            }
+                                        }
                                     }
-                                    Err(error) => {
-                                        fault = Some(error);
-                                        break;
+                                }
+                                SharedDerivedStateEnvelopeBatch::Indexed { envelopes, indexes } => {
+                                    for index in indexes {
+                                        let Some(envelope) = envelopes.get(index) else {
+                                            continue;
+                                        };
+                                        match consumer.apply(envelope.as_ref()) {
+                                            Ok(()) => {
+                                                applied_events = applied_events.saturating_add(1);
+                                                last_sequence = Some(envelope.sequence);
+                                            }
+                                            Err(error) => {
+                                                fault = Some(error);
+                                                break;
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -3428,15 +3449,20 @@ impl DerivedStateHost {
             let batch = if universally_delivered || registered.accepts_all_events() {
                 SharedDerivedStateEnvelopeBatch::Full(Arc::clone(envelopes))
             } else {
-                let filtered: Vec<_> = envelopes
+                let indexes: Vec<_> = envelopes
                     .iter()
-                    .filter(|envelope| registered.accepts_event(&envelope.event))
-                    .cloned()
+                    .enumerate()
+                    .filter_map(|(index, envelope)| {
+                        registered.accepts_event(&envelope.event).then_some(index)
+                    })
                     .collect();
-                if filtered.is_empty() {
+                if indexes.is_empty() {
                     continue;
                 }
-                SharedDerivedStateEnvelopeBatch::Filtered(filtered)
+                SharedDerivedStateEnvelopeBatch::Indexed {
+                    envelopes: Arc::clone(envelopes),
+                    indexes,
+                }
             };
             let reply = match registered.worker.begin_apply_shared_batch(batch) {
                 Ok((response_rx, last_sequence)) => {
