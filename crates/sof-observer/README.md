@@ -271,6 +271,73 @@ For sparse plugin subscriptions, prefer `PluginConfig::new().with_*()` so the en
 out clearly. Use a raw `PluginConfig { .. }` literal only when many flags are enabled and the full
 shape is easier to scan.
 
+For low-latency transaction consumers, prefer the explicit inline path:
+
+```rust
+use async_trait::async_trait;
+use sof::{
+    event::TxKind,
+    framework::{Plugin, PluginConfig, PluginHost, TransactionDispatchMode, TransactionEvent},
+    runtime::ObserverRuntime,
+};
+
+#[derive(Clone, Copy, Debug, Default)]
+struct InlineTxLogger;
+
+#[async_trait]
+impl Plugin for InlineTxLogger {
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_transaction_mode(TransactionDispatchMode::Inline)
+    }
+
+    async fn on_transaction(&self, event: &TransactionEvent) {
+        if event.kind == TxKind::VoteOnly {
+            return;
+        }
+        tracing::info!(slot = event.slot, kind = ?event.kind, "inline transaction observed");
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), sof::runtime::RuntimeError> {
+    let host = PluginHost::builder().add_plugin(InlineTxLogger).build();
+
+    ObserverRuntime::new()
+        .with_plugin_host(host)
+        .run_until_termination_signal()
+        .await
+}
+```
+
+`TransactionDispatchMode::Inline` is an explicit delivery contract for `on_transaction`.
+SOF now tries to dispatch that hook as soon as an anchored contiguous dataset prefix
+contains one full serialized transaction for the plugin that asked for it, instead of
+waiting for the whole dataset by default. If the runtime still cannot anchor the dataset
+prefix early, inline dispatch falls back to the completed-dataset point for that tx.
+If other plugins or subsystems still need deferred dataset processing, SOF can deliver
+the inline transaction hook first and then continue the same dataset through the
+standard dataset-worker path for those remaining consumers.
+
+When observability is enabled, SOF exports exact inline latency counters:
+
+- `sof_inline_transaction_plugin_first_shred_lag_us_total`
+- `sof_latest_inline_transaction_plugin_first_shred_lag_us`
+- `sof_max_inline_transaction_plugin_first_shred_lag_us`
+- `sof_inline_transaction_plugin_last_shred_lag_us_total`
+- `sof_latest_inline_transaction_plugin_last_shred_lag_us`
+- `sof_max_inline_transaction_plugin_last_shred_lag_us`
+- `sof_inline_transaction_plugin_completed_dataset_lag_us_total`
+- `sof_latest_inline_transaction_plugin_completed_dataset_lag_us`
+- `sof_max_inline_transaction_plugin_completed_dataset_lag_us`
+
+Those track, respectively:
+
+- first observed shred that contributes to the inline tx path -> inline `on_transaction`
+  callback start
+- last observed shred required to dispatch the inline tx -> inline `on_transaction`
+  callback start
+- inline dispatch-ready timestamp -> inline `on_transaction` callback start
+
 ## RuntimeExtension Quickstart
 
 ```rust

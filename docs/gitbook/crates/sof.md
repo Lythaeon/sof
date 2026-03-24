@@ -149,6 +149,49 @@ async fn main() -> Result<(), sof::runtime::RuntimeError> {
 
 Use this when you are building a real service rather than only proving SOF can boot.
 
+For low-latency transaction consumers, make that preference explicit on the plugin and
+enable the runtime fast path:
+
+```rust
+use async_trait::async_trait;
+use sof::{
+    event::TxKind,
+    framework::{Plugin, PluginConfig, PluginHost, TransactionDispatchMode, TransactionEvent},
+    runtime::ObserverRuntime,
+};
+
+#[derive(Clone, Copy, Debug, Default)]
+struct InlineTxLogger;
+
+#[async_trait]
+impl Plugin for InlineTxLogger {
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_transaction_mode(TransactionDispatchMode::Inline)
+    }
+
+    async fn on_transaction(&self, event: &TransactionEvent) {
+        if event.kind == TxKind::VoteOnly {
+            return;
+        }
+        tracing::info!(slot = event.slot, kind = ?event.kind, "inline transaction observed");
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), sof::runtime::RuntimeError> {
+    let host = PluginHost::builder().add_plugin(InlineTxLogger).build();
+
+    ObserverRuntime::new()
+        .with_plugin_host(host)
+        .run_until_termination_signal()
+        .await
+}
+```
+
+`TransactionDispatchMode::Inline` makes inline transaction delivery explicit. SOF
+keeps that hook on the inline path while other dataset-oriented subscribers can
+continue on the dataset-worker path.
+
 ## Runtime Modes
 
 ### Direct UDP listener

@@ -38,6 +38,16 @@ The typed `Vps` preset now reflects the validated public-host profile:
 - `SOF_GOSSIP_RUN_THREADS=4`
 - `SOF_SHRED_DEDUP_CAPACITY=524288`
 
+Two latency-oriented knobs are intentionally left out of the typed preset because
+they are too host-specific to recommend as defaults:
+
+- `SOF_RUNTIME_CURRENT_THREAD=true` with `SOF_RUNTIME_CORE=<n>` isolates the main
+  SOF runtime thread onto one core. This can improve `ready -> plugin` latency on
+  some one-box deployments and hurt throughput on others.
+- `SOF_PACKET_WORKER_BATCH_MAX_PACKETS` changes how much accepted-shred work one
+  packet-worker burst can hand back at once. Smaller values reduce burst
+  head-of-line delay but add more queue churn.
+
 ## Preferred Tuning Order
 
 1. keep defaults
@@ -54,6 +64,12 @@ another.
 
 These affect thread counts, queue capacities, and reconstruction fanout. Oversizing them can add
 contention and memory pressure instead of throughput.
+
+Special-case controls in this family:
+
+- `SOF_RUNTIME_CURRENT_THREAD`
+- `SOF_RUNTIME_CORE`
+- `SOF_PACKET_WORKER_BATCH_MAX_PACKETS`
 
 ### Verification and dedupe controls
 

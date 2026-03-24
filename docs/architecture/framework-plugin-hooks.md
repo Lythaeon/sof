@@ -16,6 +16,7 @@ custom logic without forking the runtime.
 - Static config and lifecycle:
   - `PluginConfig`
   - `PluginContext`
+  - `TransactionDispatchMode`
 - Event payloads:
   - `ClusterTopologyEvent`
   - `RawPacketEvent`
@@ -43,6 +44,8 @@ Implementing `on_*` is not enough by itself. Plugins must opt in through
 `on_transaction` has an additional synchronous prefilter:
 
 - `config().transaction` enables transaction hook delivery at all
+- `config().transaction_dispatch_mode` expresses whether the plugin uses the standard
+  dataset-worker path or the inline completed-dataset path
 - `accepts_transaction(&event)` allows cheap hot-path rejection before queueing
 
 Defaults:
@@ -58,6 +61,56 @@ fn config(&self) -> PluginConfig {
     PluginConfig::new().with_transaction().with_dataset()
 }
 ```
+
+For a low-latency transaction plugin, make the preference explicit:
+
+```rust
+fn config(&self) -> PluginConfig {
+    PluginConfig::new().with_transaction_mode(TransactionDispatchMode::Inline)
+}
+```
+
+Inline transaction plugins now stay inline even when dataset or derived-state
+consumers also exist. SOF keeps the transaction hook on the inline path while
+the dataset worker path continues for other subscribers.
+
+## Inline Delivery
+
+`TransactionDispatchMode::Inline` is an explicit delivery contract for
+`on_transaction`.
+
+What it means:
+
+- the plugin's `on_transaction` callback runs from the anchored contiguous
+  inline prefix as soon as SOF can reconstruct one full serialized transaction
+- if the early inline path is not yet reconstructable, SOF falls back to the
+  completed-dataset point for that transaction instead of dropping the callback
+- the inline callback still sees the same transaction payload and commitment
+  metadata as the standard path
+- if another plugin or subsystem still needs dataset-worker processing, SOF can
+  dispatch the inline transaction hook first and then continue the same dataset
+  through the worker path for deferred consumers
+- inline applies to the transaction hook for the plugin that requested it; it
+  does not silently move unrelated hooks onto the inline path
+
+Why it exists:
+
+- it removes dataset-worker scheduling jitter from latency-sensitive transaction
+  consumers
+- it keeps delivery explicit: a plugin that asks for inline gets the inline
+  path first, while still retaining a correct fallback when the tx cannot be
+  reconstructed early yet
+- it preserves the current data surface while letting SOF use two internal
+  delivery paths when low-latency transaction plugins and dataset-oriented
+  consumers must coexist
+
+Tradeoff:
+
+- mixed inline plus worker mode can decode and classify transactions on the hot
+  path before the dataset continues to deferred consumers, so it should be used
+  for plugins that actually benefit from lower tx visibility latency
+- the tx is still constrained by the earliest reconstructable contiguous entry
+  stream prefix; inline does not bypass missing earlier bytes in the wire format
 
 Raw struct construction is still valid when a dense config is more readable:
 
