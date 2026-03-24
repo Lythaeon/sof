@@ -145,10 +145,10 @@ pub struct AccountTouchObserved {
     pub slot: u64,
     pub tx_index: u32,
     pub signature: Option<solana_signature::Signature>,
-    pub account_keys: Arc<Vec<solana_pubkey::Pubkey>>,
-    pub writable_account_keys: Arc<Vec<solana_pubkey::Pubkey>>,
-    pub readonly_account_keys: Arc<Vec<solana_pubkey::Pubkey>>,
-    pub lookup_table_account_keys: Arc<Vec<solana_pubkey::Pubkey>>,
+    pub account_keys: Arc<[solana_pubkey::Pubkey]>,
+    pub writable_account_keys: Arc<[solana_pubkey::Pubkey]>,
+    pub readonly_account_keys: Arc<[solana_pubkey::Pubkey]>,
+    pub lookup_table_account_keys: Arc<[solana_pubkey::Pubkey]>,
 }
 ```
 

@@ -299,13 +299,13 @@ pub struct AccountTouchEvent {
     /// Transaction signature if present.
     pub signature: Option<Signature>,
     /// All static message account keys present on the transaction.
-    pub account_keys: Arc<Vec<Pubkey>>,
+    pub account_keys: Arc<[Pubkey]>,
     /// Writable static message account keys inferred from the versioned message header.
-    pub writable_account_keys: Arc<Vec<Pubkey>>,
+    pub writable_account_keys: Arc<[Pubkey]>,
     /// Read-only static message account keys inferred from the versioned message header.
-    pub readonly_account_keys: Arc<Vec<Pubkey>>,
+    pub readonly_account_keys: Arc<[Pubkey]>,
     /// Lookup table account pubkeys referenced by the message itself.
-    pub lookup_table_account_keys: Arc<Vec<Pubkey>>,
+    pub lookup_table_account_keys: Arc<[Pubkey]>,
 }
 
 #[derive(Debug, Clone, Copy)]

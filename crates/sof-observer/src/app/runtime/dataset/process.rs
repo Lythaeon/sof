@@ -876,7 +876,7 @@ fn process_decoded_transaction(
             .as_ref()
             .is_some_and(|dispatch| !dispatch.is_empty()))
     .then(|| {
-        let static_account_keys = Arc::new(static_account_keys.to_vec());
+        let static_account_keys = Arc::from(static_account_keys.to_vec());
         let (writable_account_keys, readonly_account_keys) =
             if config.account_touch_needs_key_partitions {
                 partition_static_account_keys(tx_ref)
@@ -1058,9 +1058,7 @@ struct ViewOnlyDatasetProcessInput {
     emit_detailed_tx_events: bool,
 }
 
-fn partition_static_account_keys(
-    tx: &VersionedTransaction,
-) -> (Arc<Vec<Pubkey>>, Arc<Vec<Pubkey>>) {
+fn partition_static_account_keys(tx: &VersionedTransaction) -> (Arc<[Pubkey]>, Arc<[Pubkey]>) {
     let static_account_keys = tx.message.static_account_keys();
     let mut writable_account_keys = Vec::with_capacity(static_account_keys.len());
     let mut readonly_account_keys = Vec::with_capacity(static_account_keys.len());
@@ -1072,14 +1070,14 @@ fn partition_static_account_keys(
         }
     }
     (
-        Arc::new(writable_account_keys),
-        Arc::new(readonly_account_keys),
+        Arc::from(writable_account_keys),
+        Arc::from(readonly_account_keys),
     )
 }
 
-fn empty_pubkey_vec() -> Arc<Vec<Pubkey>> {
-    static EMPTY: std::sync::OnceLock<Arc<Vec<Pubkey>>> = std::sync::OnceLock::new();
-    EMPTY.get_or_init(|| Arc::new(Vec::new())).clone()
+fn empty_pubkey_vec() -> Arc<[Pubkey]> {
+    static EMPTY: std::sync::OnceLock<Arc<[Pubkey]>> = std::sync::OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| Arc::from([])))
 }
 
 fn lookup_table_account_key_count(tx: &VersionedTransaction) -> usize {
@@ -1088,14 +1086,19 @@ fn lookup_table_account_key_count(tx: &VersionedTransaction) -> usize {
         .map_or(0, |lookups| lookups.len())
 }
 
-fn lookup_table_account_keys(tx: &VersionedTransaction) -> Arc<Vec<Pubkey>> {
+fn lookup_table_account_keys(tx: &VersionedTransaction) -> Arc<[Pubkey]> {
     let Some(lookups) = tx.message.address_table_lookups() else {
         return empty_pubkey_vec();
     };
     if lookups.is_empty() {
         return empty_pubkey_vec();
     }
-    Arc::new(lookups.iter().map(|lookup| lookup.account_key).collect())
+    Arc::from(
+        lookups
+            .iter()
+            .map(|lookup| lookup.account_key)
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn decode_entries_from_payload_fragments(
