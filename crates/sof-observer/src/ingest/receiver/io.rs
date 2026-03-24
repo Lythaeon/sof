@@ -2,6 +2,10 @@ use super::*;
 use crate::ingest::config::{
     read_udp_busy_poll_budget, read_udp_busy_poll_us, read_udp_prefer_busy_poll,
 };
+#[cfg(target_os = "linux")]
+use nix::poll::{PollFd, PollFlags, ppoll};
+#[cfg(target_os = "linux")]
+use nix::sys::time::TimeSpec;
 
 pub(super) struct UdpReceive {
     pub(super) len: usize,
@@ -93,7 +97,78 @@ pub(super) fn recv_udp_batch(
     scratch: &mut UdpBatchScratch,
     batch: &mut RawPacketBatch,
 ) -> std::io::Result<usize> {
+    batch.clear();
+    recv_udp_batch_append(socket, scratch, batch, scratch.buffers.len())
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn recv_udp_batch_coalesced(
+    socket: &std::net::UdpSocket,
+    scratch: &mut UdpBatchScratch,
+    batch: &mut RawPacketBatch,
+    idle_wait: Duration,
+    batch_max_wait: Duration,
+    poll_fd: &mut [PollFd<'_>],
+) -> std::io::Result<usize> {
+    batch.clear();
+    let mut total_received = 0_usize;
+    let deadline = Instant::now() + batch_max_wait;
+
+    loop {
+        let remaining_capacity = scratch.buffers.len().saturating_sub(batch.len());
+        if remaining_capacity == 0 {
+            break;
+        }
+        match recv_udp_batch_append(socket, scratch, batch, remaining_capacity) {
+            Ok(received) => {
+                total_received = total_received.saturating_add(received);
+                if batch.len() >= scratch.buffers.len() {
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                if !wait_udp_readable(poll_fd, remaining)? {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                let wait = if total_received == 0 {
+                    idle_wait
+                } else {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    remaining
+                };
+                if !wait_udp_readable(poll_fd, wait)? {
+                    if total_received == 0 {
+                        return Err(std::io::Error::from(ErrorKind::WouldBlock));
+                    }
+                    break;
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(total_received)
+}
+
+#[cfg(target_os = "linux")]
+fn recv_udp_batch_append(
+    socket: &std::net::UdpSocket,
+    scratch: &mut UdpBatchScratch,
+    batch: &mut RawPacketBatch,
+    max_packets: usize,
+) -> std::io::Result<usize> {
     let capacity = scratch.buffers.len();
+    let count = capacity.min(max_packets);
+    if count == 0 {
+        return Ok(0);
+    }
     for index in 0..capacity {
         scratch.io_vectors[index] = libc::iovec {
             iov_base: scratch.buffers[index].as_mut_ptr().cast(),
@@ -120,7 +195,7 @@ pub(super) fn recv_udp_batch(
         libc::recvmmsg(
             socket.as_raw_fd(),
             scratch.headers.as_mut_ptr(),
-            capacity.min(u32::MAX as usize) as u32,
+            count.min(u32::MAX as usize) as u32,
             libc::MSG_WAITFORONE,
             std::ptr::null_mut(),
         )
@@ -133,7 +208,6 @@ pub(super) fn recv_udp_batch(
         return Ok(0);
     }
 
-    batch.clear();
     batch.reserve(received);
     for index in 0..received {
         let len = usize::try_from(scratch.headers[index].msg_len).unwrap_or(0);
@@ -150,13 +224,31 @@ pub(super) fn recv_udp_batch(
                 "udp recvmmsg returned packet larger than receive buffer",
             )
         })?;
-        batch.push(RawPacket {
-            source,
-            ingress: RawPacketIngress::Udp,
-            bytes: Arc::from(bytes),
-        });
+        batch
+            .push_packet(source, RawPacketIngress::Udp, bytes)
+            .map_err(|error| match error {
+                UdpReceiverError::InvalidPacketLength { len, capacity } => std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "udp recvmmsg returned packet length {len} beyond buffer capacity {capacity}"
+                    ),
+                ),
+                UdpReceiverError::Receive { source } => source,
+                _ => std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "udp recvmmsg packet push failed",
+                ),
+            })?;
     }
     Ok(received)
+}
+
+#[cfg(target_os = "linux")]
+fn wait_udp_readable(poll_fd: &mut [PollFd<'_>], timeout: Duration) -> std::io::Result<bool> {
+    if timeout.is_zero() {
+        return Ok(false);
+    }
+    Ok(ppoll(poll_fd, Some(TimeSpec::from_duration(timeout)), None)? > 0)
 }
 
 #[cfg(target_os = "linux")]
@@ -378,6 +470,15 @@ pub(super) fn maybe_pin_receiver_thread(socket: &std::net::UdpSocket) {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use std::thread;
+
+    #[derive(Debug)]
+    struct LegacyRawPacket {
+        #[allow(dead_code)]
+        source: SocketAddr,
+        #[allow(dead_code)]
+        bytes: Arc<[u8]>,
+    }
 
     fn send_burst(
         sender: &std::net::UdpSocket,
@@ -389,6 +490,30 @@ mod tests {
             sender.send_to(&payload, destination)?;
         }
         Ok(())
+    }
+
+    fn send_staggered_burst(
+        sender: std::net::UdpSocket,
+        destination: SocketAddr,
+        packet_count: usize,
+        packets_per_chunk: usize,
+        gap: Duration,
+    ) -> std::thread::JoinHandle<std::io::Result<()>> {
+        thread::spawn(move || {
+            let payload = [9_u8; 256];
+            let mut sent = 0_usize;
+            while sent < packet_count {
+                let chunk = packets_per_chunk.min(packet_count.saturating_sub(sent));
+                for _ in 0..chunk {
+                    sender.send_to(&payload, destination)?;
+                }
+                sent = sent.saturating_add(chunk);
+                if sent < packet_count {
+                    thread::sleep(gap);
+                }
+            }
+            Ok(())
+        })
     }
 
     fn receive_legacy_burst(
@@ -416,7 +541,7 @@ mod tests {
 
         send_burst(&sender, destination, packet_count).expect("send burst");
         let mut scratch = UdpBatchScratch::new(packet_count);
-        let mut batch = Vec::with_capacity(packet_count);
+        let mut batch = RawPacketBatch::with_capacity(packet_count);
         let batch_received =
             recv_udp_batch(&receiver, &mut scratch, &mut batch).expect("recvmmsg batch");
         assert_eq!(batch_received, packet_count);
@@ -448,7 +573,7 @@ mod tests {
             .expect("set read timeout");
         let destination = receiver.local_addr().expect("receiver addr");
         let mut scratch = UdpBatchScratch::new(packet_count);
-        let mut batch = Vec::with_capacity(packet_count);
+        let mut batch = RawPacketBatch::with_capacity(packet_count);
 
         let legacy_started_at = Instant::now();
         for _ in 0..iterations {
@@ -474,6 +599,168 @@ mod tests {
             packet_count,
             legacy_elapsed.as_micros(),
             batch_elapsed.as_micros()
+        );
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for UDP receiver coalesced ingress"]
+    fn udp_receiver_recvmmsg_coalesced_profile_fixture() {
+        use std::os::fd::AsFd;
+
+        let iterations = std::env::var("SOF_UDP_RECEIVER_PROFILE_ITERS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1_000);
+        let packet_count = std::env::var("SOF_UDP_RECEIVER_PROFILE_BURST")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(64);
+        let chunk_size = std::env::var("SOF_UDP_RECEIVER_PROFILE_CHUNK")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(8);
+        let gap_us = std::env::var("SOF_UDP_RECEIVER_PROFILE_GAP_US")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(100);
+        let gap = Duration::from_micros(gap_us);
+        let idle_wait = Duration::from_millis(200);
+        let batch_max_wait = Duration::from_millis(2);
+
+        let blocking_receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind sender");
+        blocking_receiver
+            .set_read_timeout(Some(idle_wait))
+            .expect("set read timeout");
+        let destination = blocking_receiver.local_addr().expect("receiver addr");
+
+        let mut scratch = UdpBatchScratch::new(packet_count);
+        let mut batch = RawPacketBatch::with_capacity(packet_count);
+        let blocking_started_at = Instant::now();
+        for _ in 0..iterations {
+            let sender_thread = send_staggered_burst(
+                sender.try_clone().expect("clone sender"),
+                destination,
+                packet_count,
+                chunk_size,
+                gap,
+            );
+            let mut received = 0_usize;
+            while received < packet_count {
+                received = received.saturating_add(
+                    recv_udp_batch(&blocking_receiver, &mut scratch, &mut batch)
+                        .expect("receive blocking batch"),
+                );
+            }
+            sender_thread
+                .join()
+                .expect("join sender")
+                .expect("send staggered burst");
+        }
+        let blocking_elapsed = blocking_started_at.elapsed();
+
+        let coalesced_receiver =
+            std::net::UdpSocket::bind("127.0.0.1:0").expect("bind coalesced receiver");
+        let destination = coalesced_receiver
+            .local_addr()
+            .expect("coalesced receiver addr");
+        coalesced_receiver
+            .set_nonblocking(true)
+            .expect("set nonblocking");
+        let mut scratch = UdpBatchScratch::new(packet_count);
+        let mut batch = RawPacketBatch::with_capacity(packet_count);
+        let mut poll_fd = [PollFd::new(coalesced_receiver.as_fd(), PollFlags::POLLIN)];
+        let coalesced_started_at = Instant::now();
+        for _ in 0..iterations {
+            let sender_thread = send_staggered_burst(
+                sender.try_clone().expect("clone sender"),
+                destination,
+                packet_count,
+                chunk_size,
+                gap,
+            );
+            let received = recv_udp_batch_coalesced(
+                &coalesced_receiver,
+                &mut scratch,
+                &mut batch,
+                idle_wait,
+                batch_max_wait,
+                &mut poll_fd,
+            )
+            .expect("receive coalesced batch");
+            assert_eq!(received, packet_count);
+            assert_eq!(batch.len(), packet_count);
+            sender_thread
+                .join()
+                .expect("join sender")
+                .expect("send staggered burst");
+        }
+        let coalesced_elapsed = coalesced_started_at.elapsed();
+
+        println!(
+            "udp_receiver_recvmmsg_coalesced_profile_fixture iterations={} burst={} chunk={} gap_us={} immediate_us={} coalesced_us={}",
+            iterations,
+            packet_count,
+            chunk_size,
+            gap_us,
+            blocking_elapsed.as_micros(),
+            coalesced_elapsed.as_micros()
+        );
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for contiguous raw packet batch materialization"]
+    fn udp_receiver_batch_materialization_profile_fixture() {
+        let iterations = std::env::var("SOF_UDP_RECEIVER_PROFILE_ITERS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(20_000);
+        let packet_count = std::env::var("SOF_UDP_RECEIVER_PROFILE_BURST")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(64);
+        let source: SocketAddr = "127.0.0.1:8899".parse().expect("source addr");
+        let payloads: Vec<Vec<u8>> = (0..packet_count)
+            .map(|index| vec![u8::try_from(index % 251).unwrap_or(0); 256])
+            .collect();
+
+        let legacy_started_at = Instant::now();
+        for _ in 0..iterations {
+            let mut batch = Vec::with_capacity(packet_count);
+            for payload in &payloads {
+                batch.push(LegacyRawPacket {
+                    source,
+                    bytes: Arc::from(payload.as_slice()),
+                });
+            }
+            assert_eq!(batch.len(), packet_count);
+        }
+        let legacy_elapsed = legacy_started_at.elapsed();
+
+        let contiguous_started_at = Instant::now();
+        for _ in 0..iterations {
+            let mut batch = RawPacketBatch::with_capacity(packet_count);
+            for payload in &payloads {
+                batch
+                    .push_packet(source, RawPacketIngress::Udp, payload)
+                    .expect("push packet");
+            }
+            assert_eq!(batch.len(), packet_count);
+        }
+        let contiguous_elapsed = contiguous_started_at.elapsed();
+
+        println!(
+            "udp_receiver_batch_materialization_profile_fixture iterations={} burst={} legacy_arc_us={} contiguous_us={}",
+            iterations,
+            packet_count,
+            legacy_elapsed.as_micros(),
+            contiguous_elapsed.as_micros()
         );
     }
 }

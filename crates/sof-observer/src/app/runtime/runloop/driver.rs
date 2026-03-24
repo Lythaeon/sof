@@ -1311,13 +1311,13 @@ async fn run_async_with_hosts_inner(
                 packet_batch_dispatch_scratch.refresh(&packet_worker_pool);
                 let mut deferred_parsed_shred_side_effects =
                     Vec::with_capacity(packet_batch.len());
-                for packet in packet_batch {
+                for packet in packet_batch.packets().iter().copied() {
                     let observed_at = Instant::now();
                     let source_addr = packet.source;
-                    let packet_bytes = packet.bytes;
+                    let packet_bytes = packet_batch.packet_bytes(packet);
                     let shared_observer_packet =
                         (plugin_raw_packet_enabled || extension_hooks_enabled)
-                        .then(|| Arc::clone(&packet_bytes));
+                        .then(|| Arc::<[u8]>::from(packet_bytes));
                     if plugin_raw_packet_enabled
                         && let Some(shared_packet) = shared_observer_packet.as_ref()
                     {
@@ -1346,16 +1346,16 @@ async fn run_async_with_hosts_inner(
                     if !live_shreds_enabled {
                         continue;
                     }
-                    let parsed_shred = match parse_shred_header(packet_bytes.as_ref()) {
+                    let parsed_shred = match parse_shred_header(packet_bytes) {
                         Ok(parsed) => parsed,
                         Err(error) => {
                             #[cfg(feature = "gossip-bootstrap")]
                             if repair_driver_enabled
-                                && crate::repair::is_repair_response_ping_packet(packet_bytes.as_ref())
+                                && crate::repair::is_repair_response_ping_packet(packet_bytes)
                                 && let Some(command_tx) = repair_command_tx.as_ref()
                             {
                                 match command_tx.try_send(RepairCommand::HandleResponsePing {
-                                    packet: Arc::clone(&packet_bytes),
+                                    packet: Arc::<[u8]>::from(packet_bytes),
                                     from_addr: source_addr,
                                 }) {
                                     Ok(()) => {
@@ -1372,11 +1372,11 @@ async fn run_async_with_hosts_inner(
                             }
                             #[cfg(feature = "gossip-bootstrap")]
                             if repair_driver_enabled
-                                && crate::repair::is_supported_repair_request_packet(packet_bytes.as_ref())
+                                && crate::repair::is_supported_repair_request_packet(packet_bytes)
                                 && let Some(command_tx) = repair_command_tx.as_ref()
                             {
                                 match command_tx.try_send(RepairCommand::HandleServeRequest {
-                                    packet: Arc::clone(&packet_bytes),
+                                    packet: Arc::<[u8]>::from(packet_bytes),
                                     from_addr: source_addr,
                                 }) {
                                     Ok(()) => {
@@ -1434,7 +1434,7 @@ async fn run_async_with_hosts_inner(
                         }
                     }
                     if let Some(cache) = shred_dedupe_cache.as_mut() {
-                        match cache.observe_shred(packet_bytes.as_ref(), &parsed_shred, observed_at)
+                        match cache.observe_shred(packet_bytes, &parsed_shred, observed_at)
                         {
                             ShredDedupeObservation::Accepted => {}
                             ShredDedupeObservation::Duplicate => {
@@ -1473,9 +1473,10 @@ async fn run_async_with_hosts_inner(
                     let defer_parsed_shred_side_effects =
                         relay_cache.is_some() || plugin_shred_enabled || udp_relay_enabled;
                     let deferred_packet_bytes =
-                        defer_parsed_shred_side_effects.then(|| Arc::clone(&packet_bytes));
+                        defer_parsed_shred_side_effects.then(|| Arc::<[u8]>::from(packet_bytes));
                     let deferred_parsed_shred =
                         defer_parsed_shred_side_effects.then(|| parsed_shred.clone());
+                    let worker_packet_bytes = Arc::<[u8]>::from(packet_bytes);
                     let worker_index = packet_worker_assignments.worker_for(
                         parsed_shred_slot(&parsed_shred),
                         parsed_shred_fec_set_index(&parsed_shred),
@@ -1486,7 +1487,7 @@ async fn run_async_with_hosts_inner(
                     {
                         batch.push(PacketWorkerInput {
                             source: source_addr,
-                            packet_bytes,
+                            packet_bytes: worker_packet_bytes,
                             parsed_header: parsed_shred,
                             observed_at,
                         });

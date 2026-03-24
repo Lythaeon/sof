@@ -25,17 +25,92 @@ pub enum RawPacketIngress {
     Udp,
 }
 
-#[derive(Debug)]
+pub const UDP_PACKET_BUFFER_BYTES: usize = 2048;
+
+#[derive(Debug, Clone, Copy)]
 pub struct RawPacket {
     pub source: SocketAddr,
     pub ingress: RawPacketIngress,
-    pub bytes: Arc<[u8]>,
+    pub buffer_index: usize,
+    pub len: usize,
 }
 
-pub type RawPacketBatch = Vec<RawPacket>;
+#[derive(Debug, Default)]
+pub struct RawPacketBatch {
+    buffers: Vec<[u8; UDP_PACKET_BUFFER_BYTES]>,
+    packets: Vec<RawPacket>,
+}
+
+impl RawPacketBatch {
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            buffers: vec![[0_u8; UDP_PACKET_BUFFER_BYTES]; capacity],
+            packets: Vec::with_capacity(capacity),
+        }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.packets.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.packets.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.packets.clear();
+    }
+
+    pub fn reserve(&mut self, additional: usize) {
+        let needed = self.packets.len().saturating_add(additional);
+        if needed > self.buffers.len() {
+            self.buffers.resize(needed, [0_u8; UDP_PACKET_BUFFER_BYTES]);
+        }
+        self.packets.reserve(additional);
+    }
+
+    pub(super) fn push_packet(
+        &mut self,
+        source: SocketAddr,
+        ingress: RawPacketIngress,
+        bytes: &[u8],
+    ) -> Result<(), UdpReceiverError> {
+        if bytes.len() > UDP_PACKET_BUFFER_BYTES {
+            return Err(UdpReceiverError::InvalidPacketLength {
+                len: bytes.len(),
+                capacity: UDP_PACKET_BUFFER_BYTES,
+            });
+        }
+        let buffer_index = self.packets.len();
+        if buffer_index == self.buffers.len() {
+            self.buffers.push([0_u8; UDP_PACKET_BUFFER_BYTES]);
+        }
+        self.buffers[buffer_index][..bytes.len()].copy_from_slice(bytes);
+        self.packets.push(RawPacket {
+            source,
+            ingress,
+            buffer_index,
+            len: bytes.len(),
+        });
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn packets(&self) -> &[RawPacket] {
+        &self.packets
+    }
+
+    #[must_use]
+    pub fn packet_bytes(&self, packet: RawPacket) -> &[u8] {
+        &self.buffers[packet.buffer_index][..packet.len]
+    }
+}
 
 #[derive(Debug, Error)]
-enum UdpReceiverError {
+pub(super) enum UdpReceiverError {
     #[error("failed to bind udp receiver socket on {bind_addr}: {source}")]
     BindSocket {
         bind_addr: SocketAddr,
@@ -218,8 +293,8 @@ fn run_udp_receiver_with_socket(
     let batch_size = read_udp_batch_size();
     #[cfg(target_os = "linux")]
     let mut batch_scratch = (!track_rxq_ovfl).then(|| io::UdpBatchScratch::new(batch_size));
-    let mut buffer = vec![0_u8; 2048];
-    let mut batch = Vec::with_capacity(batch_size);
+    let mut buffer = vec![0_u8; UDP_PACKET_BUFFER_BYTES];
+    let mut batch = RawPacketBatch::with_capacity(batch_size);
     let mut batch_started_at: Option<Instant> = None;
     let mut last_rxq_ovfl_counter: Option<u64> = None;
     loop {
@@ -285,11 +360,7 @@ fn run_udp_receiver_with_socket(
                 if let Some(telemetry) = telemetry {
                     telemetry.record_packet();
                 }
-                batch.push(RawPacket {
-                    source: packet.source,
-                    ingress: RawPacketIngress::Udp,
-                    bytes: Arc::from(bytes),
-                });
+                batch.push_packet(packet.source, RawPacketIngress::Udp, bytes)?;
                 let batch_elapsed = batch_started_at
                     .map(|started_at| started_at.elapsed())
                     .unwrap_or_default();
