@@ -35,6 +35,30 @@ impl TransactionDispatchScope {
 }
 
 /// Immutable plugin registry and async event dispatcher.
+///
+/// Build this through [`PluginHost::builder`] and pass it into
+/// [`crate::ObserverRuntime::with_plugin_host`] when embedding SOF.
+///
+/// # Examples
+///
+/// ```rust
+/// use async_trait::async_trait;
+/// use sof::framework::{ObserverPlugin, PluginConfig, PluginHost};
+///
+/// struct BlockhashPlugin;
+///
+/// #[async_trait]
+/// impl ObserverPlugin for BlockhashPlugin {
+///     fn config(&self) -> PluginConfig {
+///         PluginConfig::new().with_recent_blockhash()
+///     }
+/// }
+///
+/// let host = PluginHost::builder().add_plugin(BlockhashPlugin).build();
+///
+/// assert_eq!(host.len(), 1);
+/// assert!(host.wants_recent_blockhash());
+/// ```
 #[derive(Clone)]
 pub struct PluginHost {
     /// Immutable plugin collection in registration order.

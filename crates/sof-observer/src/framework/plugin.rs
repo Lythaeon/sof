@@ -21,16 +21,46 @@ pub enum TransactionInterest {
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 /// Delivery path for transaction callbacks.
+///
+/// # Examples
+///
+/// ```rust
+/// use sof::framework::{PluginConfig, TransactionDispatchMode};
+///
+/// let config = PluginConfig::new().with_transaction_mode(TransactionDispatchMode::Inline);
+///
+/// assert!(config.transaction);
+/// assert_eq!(config.transaction_dispatch_mode, TransactionDispatchMode::Inline);
+/// ```
 pub enum TransactionDispatchMode {
     /// Use the standard dataset-worker transaction path.
     #[default]
     Standard,
-    /// Dispatch inline from the completed-dataset boundary.
+    /// Dispatch inline from the earliest reconstructable contiguous transaction path.
+    ///
+    /// SOF emits `on_transaction` as soon as one full serialized transaction is
+    /// reconstructable on the inline path and falls back to the completed-dataset
+    /// boundary only when early reconstruction is not yet possible.
     Inline,
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 /// Static hook subscriptions requested by one plugin during host construction.
+///
+/// # Examples
+///
+/// ```rust
+/// use sof::framework::{PluginConfig, TransactionDispatchMode};
+///
+/// let config = PluginConfig::new()
+///     .with_transaction_mode(TransactionDispatchMode::Inline)
+///     .with_recent_blockhash()
+///     .with_leader_schedule();
+///
+/// assert!(config.transaction);
+/// assert!(config.recent_blockhash);
+/// assert!(config.leader_schedule);
+/// ```
 pub struct PluginConfig {
     /// Enables `on_raw_packet`.
     pub raw_packet: bool,
@@ -66,6 +96,16 @@ pub struct PluginConfig {
 
 impl PluginConfig {
     /// Creates an empty plugin config with all hooks disabled.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use sof::framework::PluginConfig;
+    ///
+    /// let config = PluginConfig::new();
+    /// assert!(!config.transaction);
+    /// assert!(!config.dataset);
+    /// ```
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -100,6 +140,17 @@ impl PluginConfig {
     }
 
     /// Enables `on_transaction` and requests inline low-jitter transaction delivery.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use sof::framework::{PluginConfig, TransactionDispatchMode};
+    ///
+    /// let config = PluginConfig::new().with_inline_transaction();
+    ///
+    /// assert!(config.transaction);
+    /// assert_eq!(config.transaction_dispatch_mode, TransactionDispatchMode::Inline);
+    /// ```
     #[must_use]
     pub const fn with_inline_transaction(mut self) -> Self {
         self.transaction = true;
@@ -233,6 +284,26 @@ impl PluginSetupError {
 ///
 /// Plugins are executed asynchronously by the plugin host worker, decoupled from ingest hot paths.
 /// Keep callbacks lightweight and use bounded work queues for any expensive downstream processing.
+///
+/// # Examples
+///
+/// ```rust
+/// use async_trait::async_trait;
+/// use sof::framework::{ObserverPlugin, PluginConfig, TransactionEvent};
+///
+/// struct CriticalFlowPlugin;
+///
+/// #[async_trait]
+/// impl ObserverPlugin for CriticalFlowPlugin {
+///     fn config(&self) -> PluginConfig {
+///         PluginConfig::new().with_inline_transaction()
+///     }
+///
+///     async fn on_transaction(&self, event: &TransactionEvent) {
+///         let _signature = event.signature;
+///     }
+/// }
+/// ```
 #[async_trait]
 pub trait ObserverPlugin: Send + Sync + 'static {
     /// Stable plugin identifier used in startup logs and diagnostics.

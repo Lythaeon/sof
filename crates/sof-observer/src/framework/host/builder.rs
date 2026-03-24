@@ -18,6 +18,30 @@ fn collect_hook_plugins(
 }
 
 /// Builder for constructing an immutable [`PluginHost`].
+///
+/// # Examples
+///
+/// ```rust
+/// use async_trait::async_trait;
+/// use sof::framework::{ObserverPlugin, PluginConfig, PluginHost};
+///
+/// struct TransactionsOnly;
+///
+/// #[async_trait]
+/// impl ObserverPlugin for TransactionsOnly {
+///     fn config(&self) -> PluginConfig {
+///         PluginConfig::new().with_transaction()
+///     }
+/// }
+///
+/// let host = PluginHost::builder()
+///     .with_event_queue_capacity(4096)
+///     .add_plugin(TransactionsOnly)
+///     .build();
+///
+/// assert_eq!(host.len(), 1);
+/// assert!(host.wants_transaction());
+/// ```
 pub struct PluginHostBuilder {
     /// Plugins accumulated in registration order.
     plugins: Vec<Arc<dyn ObserverPlugin>>,
@@ -42,6 +66,14 @@ impl Default for PluginHostBuilder {
 
 impl PluginHostBuilder {
     /// Creates an empty builder.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use sof::framework::PluginHostBuilder;
+    ///
+    /// let _builder = PluginHostBuilder::new();
+    /// ```
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -69,6 +101,25 @@ impl PluginHostBuilder {
     }
 
     /// Adds one plugin value by storing it behind `Arc`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use async_trait::async_trait;
+    /// use sof::framework::{ObserverPlugin, PluginConfig, PluginHost};
+    ///
+    /// struct DatasetPlugin;
+    ///
+    /// #[async_trait]
+    /// impl ObserverPlugin for DatasetPlugin {
+    ///     fn config(&self) -> PluginConfig {
+    ///         PluginConfig::new().with_dataset()
+    ///     }
+    /// }
+    ///
+    /// let host = PluginHost::builder().add_plugin(DatasetPlugin).build();
+    /// assert!(host.wants_dataset());
+    /// ```
     #[must_use]
     pub fn add_plugin<P>(mut self, plugin: P) -> Self
     where
@@ -149,6 +200,15 @@ impl PluginHostBuilder {
     }
 
     /// Finalizes the builder into an immutable host.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use sof::framework::PluginHostBuilder;
+    ///
+    /// let host = PluginHostBuilder::new().build();
+    /// assert!(host.is_empty());
+    /// ```
     #[must_use]
     pub fn build(self) -> PluginHost {
         let plugins: Arc<[Arc<dyn ObserverPlugin>]> = Arc::from(self.plugins);

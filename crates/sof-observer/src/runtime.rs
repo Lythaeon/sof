@@ -1076,6 +1076,38 @@ pub fn run_with_hosts_and_setup(
 }
 
 /// Programmatic observer runtime composition with an optional cooperative shutdown future.
+///
+/// This is the main entry point when embedding SOF into an application instead of
+/// calling the crate-level convenience helpers.
+///
+/// # Examples
+///
+/// ```no_run
+/// use async_trait::async_trait;
+/// use sof::framework::{ObserverPlugin, PluginConfig, PluginHost};
+/// use sof::runtime::{ObserverRuntime, RuntimeError};
+///
+/// struct TransactionLogger;
+///
+/// #[async_trait]
+/// impl ObserverPlugin for TransactionLogger {
+///     fn config(&self) -> PluginConfig {
+///         PluginConfig::new().with_transaction()
+///     }
+/// }
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), RuntimeError> {
+/// let host = PluginHost::builder().add_plugin(TransactionLogger).build();
+///
+/// ObserverRuntime::new()
+///     .with_plugin_host(host)
+///     .run_until(async {
+///         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+///     })
+///     .await
+/// }
+/// ```
 #[derive(Clone, Default)]
 pub struct ObserverRuntime {
     /// Plugin host invoked by the packaged observer runtime.
@@ -1090,12 +1122,30 @@ pub struct ObserverRuntime {
 
 impl ObserverRuntime {
     /// Creates a runtime composition using SOF defaults.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use sof::runtime::ObserverRuntime;
+    ///
+    /// let _runtime = ObserverRuntime::new();
+    /// ```
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Replaces the plugin host used by this runtime instance.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use sof::framework::PluginHost;
+    /// use sof::runtime::ObserverRuntime;
+    ///
+    /// let host = PluginHost::builder().build();
+    /// let _runtime = ObserverRuntime::new().with_plugin_host(host);
+    /// ```
     #[must_use]
     pub fn with_plugin_host(mut self, plugin_host: PluginHost) -> Self {
         self.plugin_host = plugin_host;
@@ -1140,6 +1190,21 @@ impl ObserverRuntime {
     }
 
     /// Runs the configured runtime until one shutdown future resolves.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use sof::runtime::{ObserverRuntime, RuntimeError};
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), RuntimeError> {
+    /// ObserverRuntime::new()
+    ///     .run_until(async {
+    ///         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    ///     })
+    ///     .await
+    /// }
+    /// ```
     ///
     /// # Errors
     /// Returns any runtime initialization or shutdown error from the underlying observer runtime.

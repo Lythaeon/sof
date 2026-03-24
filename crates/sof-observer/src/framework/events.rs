@@ -52,6 +52,16 @@ pub struct DatasetEvent {
 
 #[derive(Debug, Clone)]
 /// Runtime event emitted for each decoded transaction.
+///
+/// # Examples
+///
+/// ```rust
+/// use sof::framework::TransactionEvent;
+///
+/// fn signature_present(event: &TransactionEvent) -> bool {
+///     event.signature.is_some()
+/// }
+/// ```
 pub struct TransactionEvent {
     /// Slot containing this transaction.
     pub slot: u64,
@@ -71,6 +81,16 @@ pub struct TransactionEvent {
 
 #[derive(Debug, Clone)]
 /// Runtime event emitted once per completed dataset with all decoded transactions.
+///
+/// # Examples
+///
+/// ```rust
+/// use sof::framework::TransactionBatchEvent;
+///
+/// fn transaction_count(event: &TransactionBatchEvent) -> usize {
+///     event.transactions.len()
+/// }
+/// ```
 pub struct TransactionBatchEvent {
     /// Slot containing this dataset.
     pub slot: u64,
@@ -137,6 +157,16 @@ impl SerializedTransactionRange {
 
 #[derive(Debug, Clone)]
 /// Runtime event emitted once per completed dataset with authoritative serialized transaction views.
+///
+/// # Examples
+///
+/// ```rust
+/// use sof::framework::TransactionViewBatchEvent;
+///
+/// fn first_transaction_len(event: &TransactionViewBatchEvent) -> Option<usize> {
+///     event.transaction_bytes(0).map(|bytes| bytes.len())
+/// }
+/// ```
 pub struct TransactionViewBatchEvent {
     /// Slot containing this dataset.
     pub slot: u64,
@@ -176,6 +206,16 @@ impl TransactionViewBatchEvent {
     }
 
     /// Returns the serialized transaction bytes at one dataset position.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use sof::framework::TransactionViewBatchEvent;
+    ///
+    /// fn first_transaction_bytes(event: &TransactionViewBatchEvent) -> Option<&[u8]> {
+    ///     event.transaction_bytes(0)
+    /// }
+    /// ```
     #[must_use]
     pub fn transaction_bytes(&self, index: usize) -> Option<&[u8]> {
         let range = *self.transactions.get(index)?;
@@ -185,6 +225,16 @@ impl TransactionViewBatchEvent {
     }
 
     /// Returns one iterator over sanitized authoritative transaction views in dataset order.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use sof::framework::TransactionViewBatchEvent;
+    ///
+    /// fn count_valid_views(event: &TransactionViewBatchEvent) -> usize {
+    ///     event.transaction_views().filter(|view| view.is_ok()).count()
+    /// }
+    /// ```
     pub fn transaction_views(
         &self,
     ) -> impl Iterator<Item = agave_transaction_view::result::Result<SanitizedTransactionView<&[u8]>>> + '_
