@@ -1,8 +1,5 @@
 use super::*;
-use crate::shred::wire::{
-    ParsedShred, SIZE_OF_CODING_SHRED_HEADERS, SIZE_OF_CODING_SHRED_PAYLOAD,
-    SIZE_OF_DATA_SHRED_PAYLOAD, parse_shred,
-};
+use crate::shred::wire::{ParsedShred, SIZE_OF_DATA_SHRED_PAYLOAD, parse_shred};
 
 pub(super) fn recover_missing_data(
     set: &mut ErasureSet,
@@ -15,13 +12,13 @@ pub(super) fn recover_missing_data(
         return None;
     }
 
-    let shard_len = coding_erasure_shard_len(variant)?;
+    let _ = coding_erasure_shard_len(variant)?;
     let total = config.num_data.checked_add(config.num_coding)?;
     let mut shards: Vec<Option<Vec<u8>>> = vec![None; total];
     let mut present = 0_usize;
     let mut data_present = vec![false; config.num_data];
 
-    for (&index, packet) in &set.data_shreds {
+    for (&index, shard) in &set.data_shards {
         let Some(position) = index.checked_sub(fec_set_index) else {
             continue;
         };
@@ -31,9 +28,6 @@ pub(super) fn recover_missing_data(
         if position >= config.num_data {
             continue;
         }
-        let Some(shard) = extract_data_erasure_shard(packet, shard_len) else {
-            continue;
-        };
         if shards.get(position).is_some_and(Option::is_none) {
             present = present.saturating_add(1);
         }
@@ -43,20 +37,17 @@ pub(super) fn recover_missing_data(
             continue;
         }
         if let Some(shard_slot) = shards.get_mut(position) {
-            *shard_slot = Some(shard);
+            *shard_slot = Some(shard.clone());
         } else {
             continue;
         }
     }
 
-    for (&position, packet) in &set.coding_shreds {
+    for (&position, shard) in &set.coding_shards {
         let position = usize::from(position);
         if position >= config.num_coding {
             continue;
         }
-        let Some(shard) = extract_coding_erasure_shard(packet, shard_len) else {
-            continue;
-        };
         let Some(slot) = config.num_data.checked_add(position) else {
             continue;
         };
@@ -64,7 +55,7 @@ pub(super) fn recover_missing_data(
             present = present.saturating_add(1);
         }
         if let Some(shard_slot) = shards.get_mut(slot) {
-            *shard_slot = Some(shard);
+            *shard_slot = Some(shard.clone());
         } else {
             continue;
         }
@@ -103,24 +94,12 @@ pub(super) fn recover_missing_data(
         };
         let recovered =
             build_recovered_data_shred(&shard, &set.leader_signature, SIZE_OF_DATA_SHRED_PAYLOAD)?;
-        if set.insert_recovered_data_shred(fec_set_index, index, recovered.clone()) {
+        if set.insert_recovered_data_shred(fec_set_index, index, shard) {
             recovered_payloads.push(recovered);
         }
     }
 
     Some(recovered_payloads)
-}
-
-fn extract_data_erasure_shard(packet: &[u8], shard_len: usize) -> Option<Vec<u8>> {
-    let start = SIZE_OF_SIGNATURE;
-    let end = start.checked_add(shard_len)?;
-    packet.get(start..end).map(ToOwned::to_owned)
-}
-
-fn extract_coding_erasure_shard(packet: &[u8], shard_len: usize) -> Option<Vec<u8>> {
-    let start = SIZE_OF_CODING_SHRED_HEADERS;
-    let end = start.checked_add(shard_len)?;
-    packet.get(start..end).map(ToOwned::to_owned)
 }
 
 fn build_recovered_data_shred(
@@ -141,20 +120,6 @@ fn build_recovered_data_shred(
         Ok(ParsedShred::Data(_)) => Some(recovered),
         Ok(ParsedShred::Code(_)) | Err(_) => None,
     }
-}
-
-fn coding_erasure_shard_len(variant: SetVariant) -> Option<usize> {
-    let proof = usize::from(variant.proof_size);
-    let proof_bytes = proof.checked_mul(SIZE_OF_MERKLE_PROOF_ENTRY)?;
-    let trailer =
-        SIZE_OF_MERKLE_ROOT
-            .checked_add(proof_bytes)?
-            .checked_add(if variant.resigned {
-                SIZE_OF_SIGNATURE
-            } else {
-                0
-            })?;
-    SIZE_OF_CODING_SHRED_PAYLOAD.checked_sub(SIZE_OF_CODING_SHRED_HEADERS.checked_add(trailer)?)
 }
 
 pub(super) fn parse_packet_signature(packet: &[u8]) -> Option<[u8; SIZE_OF_SIGNATURE]> {

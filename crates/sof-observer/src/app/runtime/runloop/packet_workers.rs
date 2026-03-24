@@ -746,9 +746,13 @@ const fn derive_parent_slot(slot: u64, parent_offset: u16) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::{
-        protocol::shred_wire::{SIZE_OF_DATA_SHRED_PAYLOAD, VARIANT_MERKLE_DATA},
+        protocol::shred_wire::{
+            SIZE_OF_CODING_SHRED_HEADERS, SIZE_OF_CODING_SHRED_PAYLOAD, SIZE_OF_DATA_SHRED_PAYLOAD,
+            SIZE_OF_SIGNATURE, VARIANT_MERKLE_CODE, VARIANT_MERKLE_DATA,
+        },
         shred::wire::{SIZE_OF_DATA_SHRED_HEADERS, parse_shred_header},
     };
+    use reed_solomon_erasure::galois_8::ReedSolomon;
 
     fn build_data_shred_packet(
         slot: u64,
@@ -775,6 +779,63 @@ mod tests {
         let end = 88usize.saturating_add(payload.len());
         packet[88..end].copy_from_slice(payload);
         packet
+    }
+
+    fn build_coding_shard_packet(
+        slot: u64,
+        index: u32,
+        fec_set_index: u32,
+        num_data_shreds: u16,
+        num_coding_shreds: u16,
+        position: u16,
+        parity_shard: &[u8],
+    ) -> Vec<u8> {
+        let mut packet = vec![0_u8; SIZE_OF_CODING_SHRED_PAYLOAD];
+        packet[64] = VARIANT_MERKLE_CODE;
+        packet[65..73].copy_from_slice(&slot.to_le_bytes());
+        packet[73..77].copy_from_slice(&index.to_le_bytes());
+        packet[77..79].copy_from_slice(&1_u16.to_le_bytes());
+        packet[79..83].copy_from_slice(&fec_set_index.to_le_bytes());
+        packet[83..85].copy_from_slice(&num_data_shreds.to_le_bytes());
+        packet[85..87].copy_from_slice(&num_coding_shreds.to_le_bytes());
+        packet[87..89].copy_from_slice(&position.to_le_bytes());
+        let shard_end = SIZE_OF_CODING_SHRED_HEADERS.saturating_add(parity_shard.len());
+        packet[SIZE_OF_CODING_SHRED_HEADERS..shard_end].copy_from_slice(parity_shard);
+        packet
+    }
+
+    fn erasure_shard_len_for_test() -> usize {
+        SIZE_OF_CODING_SHRED_PAYLOAD.saturating_sub(SIZE_OF_CODING_SHRED_HEADERS + 32)
+    }
+
+    fn data_erasure_shard_for_test(packet: &[u8]) -> Vec<u8> {
+        let shard_len = erasure_shard_len_for_test();
+        packet[SIZE_OF_SIGNATURE..SIZE_OF_SIGNATURE + shard_len].to_vec()
+    }
+
+    fn build_recoverable_fec_pair(slot: u64) -> [(Arc<[u8]>, ParsedShredHeader); 2] {
+        let data0 = build_data_shred_packet(slot, 0, 0, 1, &[1, 2, 3, 4]);
+        let data1 = build_data_shred_packet(slot, 1, 0, 1, &[5, 6, 7, 8]);
+        let mut shards = vec![
+            data_erasure_shard_for_test(&data0),
+            data_erasure_shard_for_test(&data1),
+            vec![0_u8; erasure_shard_len_for_test()],
+        ];
+        ReedSolomon::new(2, 1)
+            .expect("reed solomon config")
+            .encode(&mut shards)
+            .expect("encode parity shard");
+        let code0 = build_coding_shard_packet(slot, 2, 0, 2, 1, 0, &shards[2]);
+        [
+            (
+                Arc::<[u8]>::from(data0.clone()),
+                parse_shred_header(&data0).expect("valid data shred"),
+            ),
+            (
+                Arc::<[u8]>::from(code0.clone()),
+                parse_shred_header(&code0).expect("valid coding shred"),
+            ),
+        ]
     }
 
     #[test]
@@ -831,6 +892,73 @@ mod tests {
             "packet_worker_primary_fec_profile_fixture iterations={} emitted={} elapsed_ms={}",
             iterations,
             emitted,
+            started_at.elapsed().as_millis()
+        );
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for packet worker FEC recovery"]
+    fn packet_worker_recovery_fec_profile_fixture() {
+        let iterations = std::env::var("SOF_PACKET_WORKER_FEC_RECOVERY_PROFILE_ITERS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(20_000);
+        let batches = (0..iterations)
+            .map(|iteration| {
+                let slot =
+                    10_000_000_u64.saturating_add(u64::try_from(iteration).unwrap_or(u64::MAX));
+                build_recoverable_fec_pair(slot)
+            })
+            .collect::<Vec<_>>();
+        let mut fec_recoverer = FecRecoverer::new(128, 1);
+        let started_at = Instant::now();
+        let mut emitted = 0_u64;
+        let mut recovered = 0_u64;
+        for [data_packet, code_packet] in batches {
+            let forwarded = process_packet_batch_streaming(
+                PacketWorkerBatch {
+                    worker_index: 0,
+                    packets: vec![
+                        PacketWorkerInput {
+                            source: SocketAddr::from(([127, 0, 0, 1], 8_899)),
+                            packet_bytes: data_packet.0,
+                            parsed_header: data_packet.1,
+                            observed_at: Instant::now(),
+                        },
+                        PacketWorkerInput {
+                            source: SocketAddr::from(([127, 0, 0, 1], 8_900)),
+                            packet_bytes: code_packet.0,
+                            parsed_header: code_packet.1,
+                            observed_at: Instant::now(),
+                        },
+                    ],
+                },
+                None,
+                false,
+                false,
+                &mut fec_recoverer,
+                |result| {
+                    emitted = emitted.saturating_add(1);
+                    recovered = recovered.saturating_add(
+                        result
+                            .accepted_shreds
+                            .iter()
+                            .filter(|shred| {
+                                matches!(shred.kind, WorkerAcceptedShredKind::RecoveredData { .. })
+                            })
+                            .count() as u64,
+                    );
+                    true
+                },
+            );
+            assert!(forwarded);
+        }
+        println!(
+            "packet_worker_recovery_fec_profile_fixture iterations={} emitted={} recovered={} elapsed_ms={}",
+            iterations,
+            emitted,
+            recovered,
             started_at.elapsed().as_millis()
         );
     }
