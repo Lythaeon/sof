@@ -1,16 +1,22 @@
 //! Criterion benches for public SOF hot paths.
 
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use criterion::{BatchSize, Criterion, Throughput, black_box};
 use sof::{
     event::{ForkSlotStatus, TxCommitmentStatus, TxKind},
+    framework::events::DatasetEvent,
     framework::{
         DerivedStateCheckpoint, DerivedStateConsumer, DerivedStateConsumerConfig,
         DerivedStateConsumerContext, DerivedStateConsumerFault, DerivedStateConsumerSetupError,
         DerivedStateFeedEnvelope, DerivedStateFeedEvent, DerivedStateHost, FeedWatermarks,
+        ObserverPlugin, PluginConfig, PluginDispatchMode, PluginHostBuilder,
         SlotStatusChangedEvent, TransactionAppliedEvent,
     },
     protocol::shred_wire::VARIANT_MERKLE_DATA,
@@ -35,6 +41,8 @@ const DATASET_BENCH_SHREDS: usize = 32;
 const DERIVED_STATE_BATCH_EVENTS: usize = 64;
 /// Derived-state multi-consumer fanout width.
 const DERIVED_STATE_MULTI_CONSUMER_COUNT: usize = 4;
+/// Dataset-plugin dispatch fixture slot.
+const PLUGIN_DATASET_BENCH_SLOT: u64 = 91_000;
 
 /// Bench relay-cache insert throughput on a bounded shared cache.
 fn bench_shared_relay_cache_insert(c: &mut Criterion) {
@@ -213,6 +221,50 @@ fn derived_state_host(consumer_count: usize, mode: BenchConsumerMode) -> Derived
     host
 }
 
+/// Bench end-to-end dataset plugin dispatch latency through the generic dispatcher.
+fn bench_plugin_dataset_dispatch(c: &mut Criterion) {
+    let dataset_event = DatasetEvent {
+        slot: PLUGIN_DATASET_BENCH_SLOT,
+        start_index: 0,
+        end_index: 31,
+        last_in_slot: false,
+        shreds: 32,
+        payload_len: 4096,
+        tx_count: 64,
+    };
+
+    let mut group = c.benchmark_group("plugin_dataset_dispatch");
+    group.throughput(Throughput::Elements(1));
+
+    let sequential_counter = Arc::new(AtomicUsize::new(0));
+    let sequential_host = PluginHostBuilder::new()
+        .with_dispatch_mode(PluginDispatchMode::Sequential)
+        .add_plugin(DatasetCounterBenchPlugin {
+            counter: Arc::clone(&sequential_counter),
+        })
+        .build();
+    group.bench_function("single_plugin_sequential", |b| {
+        b.iter(|| {
+            dispatch_dataset_and_wait(&sequential_host, &sequential_counter, 1, dataset_event);
+        });
+    });
+
+    let bounded_counter = Arc::new(AtomicUsize::new(0));
+    let bounded_host = PluginHostBuilder::new()
+        .with_dispatch_mode(PluginDispatchMode::BoundedConcurrent(4))
+        .add_plugins((0..4).map(|_| DatasetCounterBenchPlugin {
+            counter: Arc::clone(&bounded_counter),
+        }))
+        .build();
+    group.bench_function("four_plugins_bounded_concurrent", |b| {
+        b.iter(|| {
+            dispatch_dataset_and_wait(&bounded_host, &bounded_counter, 4, dataset_event);
+        });
+    });
+
+    group.finish();
+}
+
 /// Build parsed benchmark shred packets for relay-cache benches.
 fn relay_packets(count: usize) -> Option<Vec<(Vec<u8>, sof::shred::wire::ParsedShredHeader)>> {
     (0..count)
@@ -344,6 +396,22 @@ fn set_byte(packet: &mut [u8], index: usize, value: u8) -> Option<()> {
     })
 }
 
+/// Dispatch one dataset event and wait until the async worker fanout finishes.
+fn dispatch_dataset_and_wait(
+    host: &sof::framework::PluginHost,
+    counter: &AtomicUsize,
+    expected_increments: usize,
+    event: DatasetEvent,
+) {
+    let expected = counter
+        .load(Ordering::Relaxed)
+        .saturating_add(expected_increments);
+    host.on_dataset(event);
+    while counter.load(Ordering::Relaxed) < expected {
+        std::hint::spin_loop();
+    }
+}
+
 /// No-op derived-state consumer used to benchmark host dispatch overhead.
 #[derive(Debug, Clone, Copy)]
 struct NoopDerivedStateConsumer {
@@ -406,6 +474,24 @@ impl DerivedStateConsumer for NoopDerivedStateConsumer {
     }
 }
 
+/// No-op dataset plugin used to benchmark generic plugin dispatch overhead.
+#[derive(Clone)]
+struct DatasetCounterBenchPlugin {
+    /// Shared callback completion counter for one bench host.
+    counter: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ObserverPlugin for DatasetCounterBenchPlugin {
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_dataset()
+    }
+
+    async fn on_dataset(&self, _event: DatasetEvent) {
+        self.counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Run the SOF hot-path Criterion benchmark suite.
 fn main() {
     let mut criterion = Criterion::default().configure_from_args();
@@ -413,5 +499,6 @@ fn main() {
     bench_shared_relay_cache_query_range(&mut criterion);
     bench_dataset_reassembly(&mut criterion);
     bench_derived_state_dispatch(&mut criterion);
+    bench_plugin_dataset_dispatch(&mut criterion);
     criterion.final_summary();
 }

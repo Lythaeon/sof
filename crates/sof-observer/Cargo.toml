@@ -23,17 +23,24 @@ gossip-bootstrap = ["dep:solana-gossip"]
 kernel-bypass = ["dep:xdp"]
 
 [dependencies]
+agave-transaction-view = { version = "3.1.8", features = ["agave-unstable-api"] }
 sof-gossip-tuning = { version = "0.11.0", path = "../sof-gossip-tuning" }
 solana-gossip = { package = "sof-solana-gossip", version = "3.1.8-sof.4", optional = true, features = ["agave-unstable-api"] }
 solana-entry = { version = "3.1.8", features = ["agave-unstable-api"] }
+solana-hash = "3.1.0"
 solana-keypair = "3.0.1"
 solana-net-utils = "3.1.8"
+solana-perf = { version = "3.1.8", features = ["dev-context-only-utils"] }
 solana-pubkey = { version = "3.0.0", features = ["serde"] }
+solana-sanitize = "3.0.1"
 solana-sdk-ids = "3.1.0"
 solana-signature = { version = "3.1.0", features = ["serde"] }
 solana-signer = "3.0.0"
 solana-streamer = "3.1.8"
 solana-transaction = { version = "3.0.2", features = ["serde"] }
+solana-packet = "3.0.0"
+solana-vote = "3.1.8"
+solana-vote-program = { version = "3.1.8", features = ["agave-unstable-api"] }
 reed-solomon-erasure = { version = "6.0.0", features = ["simd-accel"] }
 thiserror = "2.0"
 tokio = { version = "1.48", features = ["io-util", "macros", "rt-multi-thread", "net", "sync", "time"] }
@@ -45,6 +52,7 @@ bincode = "1.3.3"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 libc = "0.2"
+rand = "0.8.5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 sha2 = "0.10"
 ed25519-dalek = "2.1"
@@ -52,12 +60,13 @@ arcshift = "0.4.2"
 core_affinity = "0.8"
 nix = { version = "0.30", features = ["net", "uio"] }
 crossbeam-queue = "0.3"
-crossbeam-channel = "0.5"
+crossbeam-channel = "0.5.15"
 crossbeam-skiplist = "0.1"
 async-trait = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 signal-hook = "0.3"
+smallvec = "1.15"
 xdp = { version = "0.7.3", optional = true }
 
 [dev-dependencies]
@@ -114,6 +123,11 @@ path = "examples/kernel_bypass_ingress_metrics.rs"
 [[example]]
 name = "af_xdp_kernel_bypass_ingress_metrics"
 path = "examples/af_xdp_kernel_bypass_ingress_metrics.rs"
+
+[[bin]]
+name = "gossip_protocol_profile"
+path = "src/bin/gossip_protocol_profile.rs"
+required-features = ["gossip-bootstrap"]
 
 [[bench]]
 name = "hot_paths"

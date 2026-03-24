@@ -5,7 +5,7 @@ These variables are intentionally undocumented in the quick-start path because t
 Use these only when you are measuring changes and can roll back quickly.
 
 - Source of truth: `crates/sof-observer/src/app/config/*`, `crates/sof-observer/src/app/runtime/*`, `crates/sof-observer/src/ingest/core.rs`
-- Snapshot date: 2026-03-21
+- Snapshot date: 2026-03-24
 
 ## Safe baseline
 
@@ -79,9 +79,12 @@ Duplicate-shred mode guidance:
 | Variable | Default | Why this is advanced |
 |---|---:|---|
 | `SOF_WORKER_THREADS` | host parallelism | Oversizing can add contention and context-switch overhead. |
+| `SOF_RUNTIME_CURRENT_THREAD` | `false` | Runs SOF on a dedicated current-thread Tokio runtime instead of the default multithreaded runtime. Useful only when you are explicitly isolating one observer thread and measuring the result. |
+| `SOF_RUNTIME_CORE` | unset | Optional CPU core pin for the dedicated runtime thread when `SOF_RUNTIME_CURRENT_THREAD=true`. Incorrect pinning can hurt overall throughput on small hosts. |
 | `SOF_DATASET_WORKERS` | `SOF_WORKER_THREADS` | Dataset reconstruction runs on Tokio's blocking pool; too high can still cause queue churn, extra memory pressure, and CPU contention without higher throughput. |
 | `SOF_PACKET_WORKERS` | `SOF_WORKER_THREADS` | Packet verification/FEC/reassembly fanout; too low underuses multi-core hosts, too high adds scheduling and cache overhead. |
 | `SOF_PACKET_WORKER_QUEUE_CAPACITY` | `256` | Queue depth per packet worker. Current full-queue policy is `drop_newest`, so raising this mostly trades packet loss for extra latency/memory unless workers also get faster. |
+| `SOF_PACKET_WORKER_BATCH_MAX_PACKETS` | `8` | Maximum packets emitted per packet-worker burst node. Lower values can reduce burst head-of-line delay but add more queue churn; higher values do the opposite. |
 | `SOF_DATASET_MAX_TRACKED_SLOTS` | `2048` | Higher values increase memory and stale-state retention. |
 | `SOF_FEC_MAX_TRACKED_SETS` | `8192` | Direct memory/CPU pressure control in recovery paths. |
 | `SOF_DATASET_QUEUE_CAPACITY` | `8192` | Larger queue can hide backpressure and increase latency. |

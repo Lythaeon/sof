@@ -24,9 +24,11 @@ pub struct FecRecoverer {
 struct ErasureSet {
     variant: Option<SetVariant>,
     config: Option<ErasureConfig>,
+    config_fec_set_index: Option<u32>,
     leader_signature: [u8; SIZE_OF_SIGNATURE],
     data_shreds: HashMap<u32, Vec<u8>>,
     coding_shreds: HashMap<u16, Vec<u8>>,
+    present_data_shreds_in_config: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,9 +48,11 @@ impl ErasureSet {
         Self {
             variant: None,
             config: None,
+            config_fec_set_index: None,
             leader_signature,
             data_shreds: HashMap::new(),
             coding_shreds: HashMap::new(),
+            present_data_shreds_in_config: 0,
         }
     }
 }
@@ -98,14 +102,14 @@ impl FecRecoverer {
             if !set.accepts_variant(variant) {
                 return Vec::new();
             }
-            set.ingest_packet(&parsed, packet.to_vec());
+            set.ingest_packet(&parsed, packet);
             recovered = recover_missing_data(set, fec_set_index, &mut self.reed_solomon_cache)
                 .unwrap_or_default();
             should_remove = set.is_data_complete_for_config(fec_set_index);
         } else {
-            let mut set = ErasureSet::new(signature);
-            set.ingest_packet(&parsed, packet.to_vec());
-            let _ = self.sets.insert(set_id, set);
+            let mut new_set = ErasureSet::new(signature);
+            new_set.ingest_packet(&parsed, packet);
+            let _ = self.sets.insert(set_id, new_set);
         }
 
         if should_remove {
@@ -150,7 +154,7 @@ impl ErasureSet {
         self.variant.is_none_or(|existing| existing == incoming)
     }
 
-    fn ingest_packet(&mut self, parsed: &ParsedShred, packet: Vec<u8>) {
+    fn ingest_packet(&mut self, parsed: &ParsedShred, packet: &[u8]) {
         let common_variant = match parsed {
             ParsedShred::Data(data) => data.common.shred_variant,
             ParsedShred::Code(code) => code.common.shred_variant,
@@ -161,7 +165,13 @@ impl ErasureSet {
 
         match parsed {
             ParsedShred::Data(data) => {
-                let _ = self.data_shreds.entry(data.common.index).or_insert(packet);
+                if let Entry::Vacant(vacant) = self.data_shreds.entry(data.common.index) {
+                    let _ = vacant.insert(packet.to_vec());
+                    if self.index_within_config(data.common.index, self.config_fec_set_index) {
+                        self.present_data_shreds_in_config =
+                            self.present_data_shreds_in_config.saturating_add(1);
+                    }
+                }
             }
             ParsedShred::Code(code) => {
                 let incoming_config = ErasureConfig {
@@ -173,11 +183,18 @@ impl ErasureSet {
                 {
                     return;
                 }
-                let _ = self
-                    .coding_shreds
-                    .entry(code.coding_header.position)
-                    .or_insert(packet);
-                self.config = Some(incoming_config);
+                if let Entry::Vacant(vacant) = self.coding_shreds.entry(code.coding_header.position)
+                {
+                    let _ = vacant.insert(packet.to_vec());
+                }
+                if self.config != Some(incoming_config)
+                    || self.config_fec_set_index != Some(code.common.fec_set_index)
+                {
+                    self.config = Some(incoming_config);
+                    self.config_fec_set_index = Some(code.common.fec_set_index);
+                    self.present_data_shreds_in_config =
+                        self.count_present_data_shreds_in_config(code.common.fec_set_index);
+                }
             }
         }
     }
@@ -186,19 +203,52 @@ impl ErasureSet {
         let Some(config) = self.config else {
             return false;
         };
-        let mut count = 0_usize;
-        for position in 0..config.num_data {
-            let Ok(position_u32) = u32::try_from(position) else {
-                return false;
-            };
-            let Some(index) = fec_set_index.checked_add(position_u32) else {
-                return false;
-            };
-            if self.data_shreds.contains_key(&index) {
-                count = count.saturating_add(1);
+        self.present_data_shreds_in_config >= config.num_data
+            && self.config_fec_set_index == Some(fec_set_index)
+    }
+
+    fn index_within_config(&self, index: u32, fec_set_index: Option<u32>) -> bool {
+        let (Some(config), Some(fec_set_index)) = (self.config, fec_set_index) else {
+            return false;
+        };
+        let Some(delta) = index.checked_sub(fec_set_index) else {
+            return false;
+        };
+        let Ok(offset) = usize::try_from(delta) else {
+            return false;
+        };
+        offset < config.num_data
+    }
+
+    fn count_present_data_shreds_in_config(&self, fec_set_index: u32) -> usize {
+        let Some(config) = self.config else {
+            return 0;
+        };
+        self.data_shreds
+            .keys()
+            .filter(|&&index| {
+                usize::try_from(index.saturating_sub(fec_set_index))
+                    .ok()
+                    .is_some_and(|offset| offset < config.num_data)
+            })
+            .count()
+    }
+
+    fn insert_recovered_data_shred(
+        &mut self,
+        fec_set_index: u32,
+        index: u32,
+        recovered: Vec<u8>,
+    ) -> bool {
+        if let Entry::Vacant(vacant) = self.data_shreds.entry(index) {
+            let _ = vacant.insert(recovered);
+            if self.index_within_config(index, Some(fec_set_index)) {
+                self.present_data_shreds_in_config =
+                    self.present_data_shreds_in_config.saturating_add(1);
             }
+            return true;
         }
-        count >= config.num_data
+        false
     }
 }
 
@@ -233,5 +283,34 @@ mod tests {
         assert_eq!(purged, 2);
         assert_eq!(recoverer.tracked_sets(), 1);
         assert!(recoverer.sets.contains_key(&(140, 0)));
+    }
+
+    #[test]
+    fn data_completeness_tracks_in_range_count_once_config_is_known() {
+        let mut set = ErasureSet::new([0; SIZE_OF_SIGNATURE]);
+        let _ = set.data_shreds.insert(10, vec![1]);
+        let _ = set.data_shreds.insert(11, vec![2]);
+
+        set.config = Some(ErasureConfig {
+            num_data: 2,
+            num_coding: 1,
+        });
+        set.config_fec_set_index = Some(10);
+        set.present_data_shreds_in_config = set.count_present_data_shreds_in_config(10);
+
+        assert!(set.is_data_complete_for_config(10));
+
+        let mut incomplete_set = ErasureSet::new([0; SIZE_OF_SIGNATURE]);
+        let _ = incomplete_set.data_shreds.insert(10, vec![1]);
+        let _ = incomplete_set.data_shreds.insert(12, vec![2]);
+        incomplete_set.config = Some(ErasureConfig {
+            num_data: 2,
+            num_coding: 1,
+        });
+        incomplete_set.config_fec_set_index = Some(10);
+        incomplete_set.present_data_shreds_in_config =
+            incomplete_set.count_present_data_shreds_in_config(10);
+
+        assert!(!incomplete_set.is_data_complete_for_config(10));
     }
 }

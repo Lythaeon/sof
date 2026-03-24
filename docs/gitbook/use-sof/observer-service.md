@@ -72,6 +72,47 @@ This is the right first service because it proves all of the important boundarie
 If the plugin needs initialization or cleanup, add `setup(ctx)` and `shutdown(ctx)`.
 The packaged runtime invokes both automatically when the host is attached.
 
+For HFT-style transaction services, prefer the explicit inline transaction mode:
+
+```rust
+use async_trait::async_trait;
+use sof::{
+    event::TxKind,
+    framework::{Plugin, PluginConfig, PluginHost, TransactionDispatchMode, TransactionEvent},
+    runtime::ObserverRuntime,
+};
+
+#[derive(Clone, Copy, Debug, Default)]
+struct InlineTxLogger;
+
+#[async_trait]
+impl Plugin for InlineTxLogger {
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_transaction_mode(TransactionDispatchMode::Inline)
+    }
+
+    async fn on_transaction(&self, event: &TransactionEvent) {
+        if event.kind == TxKind::VoteOnly {
+            return;
+        }
+        tracing::info!(slot = event.slot, kind = ?event.kind, "inline transaction observed");
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), sof::runtime::RuntimeError> {
+    let host = PluginHost::builder().add_plugin(InlineTxLogger).build();
+
+    ObserverRuntime::new()
+        .with_plugin_host(host)
+        .run_until_termination_signal()
+        .await
+}
+```
+
+That keeps `on_transaction` on the low-latency inline path. Other dataset
+consumers can still continue on the dataset-worker path in parallel.
+
 ## What You Usually Add Next
 
 Once this works, the normal next step is one of these:

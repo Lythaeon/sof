@@ -4,7 +4,8 @@ use thiserror::Error;
 use crate::framework::events::{
     AccountTouchEvent, AccountTouchEventRef, ClusterTopologyEvent, DatasetEvent,
     LeaderScheduleEvent, ObservedRecentBlockhashEvent, RawPacketEvent, ReorgEvent, ShredEvent,
-    SlotStatusEvent, TransactionEvent, TransactionEventRef,
+    SlotStatusEvent, TransactionBatchEvent, TransactionEvent, TransactionEventRef,
+    TransactionViewBatchEvent,
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -19,7 +20,47 @@ pub enum TransactionInterest {
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+/// Delivery path for transaction callbacks.
+///
+/// # Examples
+///
+/// ```rust
+/// use sof::framework::{PluginConfig, TransactionDispatchMode};
+///
+/// let config = PluginConfig::new().with_transaction_mode(TransactionDispatchMode::Inline);
+///
+/// assert!(config.transaction);
+/// assert_eq!(config.transaction_dispatch_mode, TransactionDispatchMode::Inline);
+/// ```
+pub enum TransactionDispatchMode {
+    /// Use the standard dataset-worker transaction path.
+    #[default]
+    Standard,
+    /// Dispatch inline from the earliest reconstructable contiguous transaction path.
+    ///
+    /// SOF emits `on_transaction` as soon as one full serialized transaction is
+    /// reconstructable on the inline path and falls back to the completed-dataset
+    /// boundary only when early reconstruction is not yet possible.
+    Inline,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 /// Static hook subscriptions requested by one plugin during host construction.
+///
+/// # Examples
+///
+/// ```rust
+/// use sof::framework::{PluginConfig, TransactionDispatchMode};
+///
+/// let config = PluginConfig::new()
+///     .with_transaction_mode(TransactionDispatchMode::Inline)
+///     .with_recent_blockhash()
+///     .with_leader_schedule();
+///
+/// assert!(config.transaction);
+/// assert!(config.recent_blockhash);
+/// assert!(config.leader_schedule);
+/// ```
 pub struct PluginConfig {
     /// Enables `on_raw_packet`.
     pub raw_packet: bool,
@@ -29,6 +70,16 @@ pub struct PluginConfig {
     pub dataset: bool,
     /// Enables `on_transaction`.
     pub transaction: bool,
+    /// Requested delivery path for `on_transaction`.
+    pub transaction_dispatch_mode: TransactionDispatchMode,
+    /// Enables `on_transaction_batch`.
+    pub transaction_batch: bool,
+    /// Requested delivery path for `on_transaction_batch`.
+    pub transaction_batch_dispatch_mode: TransactionDispatchMode,
+    /// Enables `on_transaction_view_batch`.
+    pub transaction_view_batch: bool,
+    /// Requested delivery path for `on_transaction_view_batch`.
+    pub transaction_view_batch_dispatch_mode: TransactionDispatchMode,
     /// Enables `on_account_touch`.
     pub account_touch: bool,
     /// Enables `on_slot_status`.
@@ -45,6 +96,16 @@ pub struct PluginConfig {
 
 impl PluginConfig {
     /// Creates an empty plugin config with all hooks disabled.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use sof::framework::PluginConfig;
+    ///
+    /// let config = PluginConfig::new();
+    /// assert!(!config.transaction);
+    /// assert!(!config.dataset);
+    /// ```
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -75,6 +136,79 @@ impl PluginConfig {
     #[must_use]
     pub const fn with_transaction(mut self) -> Self {
         self.transaction = true;
+        self
+    }
+
+    /// Enables `on_transaction` and requests inline low-jitter transaction delivery.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use sof::framework::{PluginConfig, TransactionDispatchMode};
+    ///
+    /// let config = PluginConfig::new().with_inline_transaction();
+    ///
+    /// assert!(config.transaction);
+    /// assert_eq!(config.transaction_dispatch_mode, TransactionDispatchMode::Inline);
+    /// ```
+    #[must_use]
+    pub const fn with_inline_transaction(mut self) -> Self {
+        self.transaction = true;
+        self.transaction_dispatch_mode = TransactionDispatchMode::Inline;
+        self
+    }
+
+    /// Enables `on_transaction` and chooses one explicit transaction delivery mode.
+    #[must_use]
+    pub const fn with_transaction_mode(mut self, mode: TransactionDispatchMode) -> Self {
+        self.transaction = true;
+        self.transaction_dispatch_mode = mode;
+        self
+    }
+
+    /// Enables `on_transaction_batch`.
+    #[must_use]
+    pub const fn with_transaction_batch(mut self) -> Self {
+        self.transaction_batch = true;
+        self
+    }
+
+    /// Enables `on_transaction_batch` and requests inline completed-dataset delivery.
+    #[must_use]
+    pub const fn with_inline_transaction_batch(mut self) -> Self {
+        self.transaction_batch = true;
+        self.transaction_batch_dispatch_mode = TransactionDispatchMode::Inline;
+        self
+    }
+
+    /// Enables `on_transaction_batch` and chooses one explicit batch delivery mode.
+    #[must_use]
+    pub const fn with_transaction_batch_mode(mut self, mode: TransactionDispatchMode) -> Self {
+        self.transaction_batch = true;
+        self.transaction_batch_dispatch_mode = mode;
+        self
+    }
+
+    /// Enables `on_transaction_view_batch`.
+    #[must_use]
+    pub const fn with_transaction_view_batch(mut self) -> Self {
+        self.transaction_view_batch = true;
+        self
+    }
+
+    /// Enables `on_transaction_view_batch` and requests inline completed-dataset delivery.
+    #[must_use]
+    pub const fn with_inline_transaction_view_batch(mut self) -> Self {
+        self.transaction_view_batch = true;
+        self.transaction_view_batch_dispatch_mode = TransactionDispatchMode::Inline;
+        self
+    }
+
+    /// Enables `on_transaction_view_batch` and chooses one explicit view-batch delivery mode.
+    #[must_use]
+    pub const fn with_transaction_view_batch_mode(mut self, mode: TransactionDispatchMode) -> Self {
+        self.transaction_view_batch = true;
+        self.transaction_view_batch_dispatch_mode = mode;
         self
     }
 
@@ -150,6 +284,26 @@ impl PluginSetupError {
 ///
 /// Plugins are executed asynchronously by the plugin host worker, decoupled from ingest hot paths.
 /// Keep callbacks lightweight and use bounded work queues for any expensive downstream processing.
+///
+/// # Examples
+///
+/// ```rust
+/// use async_trait::async_trait;
+/// use sof::framework::{ObserverPlugin, PluginConfig, TransactionEvent};
+///
+/// struct CriticalFlowPlugin;
+///
+/// #[async_trait]
+/// impl ObserverPlugin for CriticalFlowPlugin {
+///     fn config(&self) -> PluginConfig {
+///         PluginConfig::new().with_inline_transaction()
+///     }
+///
+///     async fn on_transaction(&self, event: &TransactionEvent) {
+///         let _signature = event.signature;
+///     }
+/// }
+/// ```
 #[async_trait]
 pub trait ObserverPlugin: Send + Sync + 'static {
     /// Stable plugin identifier used in startup logs and diagnostics.
@@ -223,8 +377,27 @@ pub trait ObserverPlugin: Send + Sync + 'static {
         self.transaction_interest(&event.to_owned())
     }
 
-    /// Called for each decoded transaction emitted from a dataset.
+    /// Called for each decoded transaction emitted from a completed contiguous data range.
+    ///
+    /// By default this happens on the dataset-worker path. Plugins that request inline
+    /// transaction delivery receive this hook from the completed-dataset boundary even when
+    /// other dataset consumers still continue on the dataset-worker path.
     async fn on_transaction(&self, _event: &TransactionEvent) {}
+
+    /// Called once per completed dataset with all decoded transactions in dataset order.
+    ///
+    /// This hook is non-speculative. SOF invokes it only after a contiguous dataset is fully
+    /// reconstructed and decoded, and before the runtime walks each transaction through the
+    /// per-transaction plugin path.
+    async fn on_transaction_batch(&self, _event: &TransactionBatchEvent) {}
+
+    /// Called once per completed dataset with authoritative serialized transaction views.
+    ///
+    /// This hook is non-speculative. SOF invokes it after the completed dataset payload is
+    /// assembled and the transaction byte ranges are validated, but before full owned
+    /// `VersionedTransaction` materialization. It is intended for low-latency completed-dataset
+    /// consumers that can work directly on sanitized transaction views.
+    async fn on_transaction_view_batch(&self, _event: &TransactionViewBatchEvent) {}
 
     /// Called for each accepted decoded transaction with the already-computed routing lane.
     ///

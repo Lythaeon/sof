@@ -1,5 +1,6 @@
 use std::{net::SocketAddr, sync::Arc};
 
+use agave_transaction_view::transaction_view::SanitizedTransactionView;
 use serde::{Deserialize, Serialize};
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
@@ -51,6 +52,16 @@ pub struct DatasetEvent {
 
 #[derive(Debug, Clone)]
 /// Runtime event emitted for each decoded transaction.
+///
+/// # Examples
+///
+/// ```rust
+/// use sof::framework::TransactionEvent;
+///
+/// fn signature_present(event: &TransactionEvent) -> bool {
+///     event.signature.is_some()
+/// }
+/// ```
 pub struct TransactionEvent {
     /// Slot containing this transaction.
     pub slot: u64,
@@ -66,6 +77,177 @@ pub struct TransactionEvent {
     pub tx: Arc<VersionedTransaction>,
     /// SOF transaction kind classification.
     pub kind: TxKind,
+}
+
+#[derive(Debug, Clone)]
+/// Runtime event emitted once per completed dataset with all decoded transactions.
+///
+/// # Examples
+///
+/// ```rust
+/// use sof::framework::TransactionBatchEvent;
+///
+/// fn transaction_count(event: &TransactionBatchEvent) -> usize {
+///     event.transactions.len()
+/// }
+/// ```
+pub struct TransactionBatchEvent {
+    /// Slot containing this dataset.
+    pub slot: u64,
+    /// Start shred index (inclusive) in this dataset.
+    pub start_index: u32,
+    /// End shred index (inclusive) in this dataset.
+    pub end_index: u32,
+    /// True when this dataset carries the `LAST_SHRED_IN_SLOT` signal.
+    pub last_in_slot: bool,
+    /// Number of shreds included in this dataset.
+    pub shreds: usize,
+    /// Total payload bytes across shreds in this dataset.
+    pub payload_len: usize,
+    /// Commitment status for this dataset slot when event was emitted.
+    pub commitment_status: TxCommitmentStatus,
+    /// Latest observed confirmed slot watermark when event was emitted.
+    pub confirmed_slot: Option<u64>,
+    /// Latest observed finalized slot watermark when event was emitted.
+    pub finalized_slot: Option<u64>,
+    /// All decoded transactions in dataset order.
+    pub transactions: Arc<[VersionedTransaction]>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+/// One authoritative serialized transaction byte range inside a completed dataset payload.
+pub struct SerializedTransactionRange {
+    /// Start offset of the serialized transaction inside the contiguous dataset payload.
+    start: u32,
+    /// Exclusive end offset of the serialized transaction inside the contiguous dataset payload.
+    end: u32,
+}
+
+impl SerializedTransactionRange {
+    /// Creates one byte range with an exclusive end offset.
+    #[must_use]
+    pub const fn new(start: u32, end: u32) -> Self {
+        Self { start, end }
+    }
+
+    /// Returns the start offset of the serialized transaction.
+    #[must_use]
+    pub const fn start(self) -> u32 {
+        self.start
+    }
+
+    /// Returns the exclusive end offset of the serialized transaction.
+    #[must_use]
+    pub const fn end(self) -> u32 {
+        self.end
+    }
+
+    /// Returns the serialized transaction length in bytes.
+    #[must_use]
+    pub const fn len(self) -> u32 {
+        self.end.saturating_sub(self.start)
+    }
+
+    /// Returns true when the serialized transaction range is empty.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.start == self.end
+    }
+}
+
+#[derive(Debug, Clone)]
+/// Runtime event emitted once per completed dataset with authoritative serialized transaction views.
+///
+/// # Examples
+///
+/// ```rust
+/// use sof::framework::TransactionViewBatchEvent;
+///
+/// fn first_transaction_len(event: &TransactionViewBatchEvent) -> Option<usize> {
+///     event.transaction_bytes(0).map(|bytes| bytes.len())
+/// }
+/// ```
+pub struct TransactionViewBatchEvent {
+    /// Slot containing this dataset.
+    pub slot: u64,
+    /// Start shred index (inclusive) in this dataset.
+    pub start_index: u32,
+    /// End shred index (inclusive) in this dataset.
+    pub end_index: u32,
+    /// True when this dataset carries the `LAST_SHRED_IN_SLOT` signal.
+    pub last_in_slot: bool,
+    /// Number of shreds included in this dataset.
+    pub shreds: usize,
+    /// Total payload bytes across shreds in this dataset.
+    pub payload_len: usize,
+    /// Commitment status for this dataset slot when event was emitted.
+    pub commitment_status: TxCommitmentStatus,
+    /// Latest observed confirmed slot watermark when event was emitted.
+    pub confirmed_slot: Option<u64>,
+    /// Latest observed finalized slot watermark when event was emitted.
+    pub finalized_slot: Option<u64>,
+    /// Shared contiguous completed-dataset payload bytes.
+    pub payload: Arc<[u8]>,
+    /// Serialized transaction byte ranges in dataset order.
+    pub transactions: Arc<[SerializedTransactionRange]>,
+}
+
+impl TransactionViewBatchEvent {
+    /// Returns the number of serialized transactions in this completed dataset.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.transactions.len()
+    }
+
+    /// Returns true when the completed dataset contained no transactions.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.transactions.is_empty()
+    }
+
+    /// Returns the serialized transaction bytes at one dataset position.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use sof::framework::TransactionViewBatchEvent;
+    ///
+    /// fn first_transaction_bytes(event: &TransactionViewBatchEvent) -> Option<&[u8]> {
+    ///     event.transaction_bytes(0)
+    /// }
+    /// ```
+    #[must_use]
+    pub fn transaction_bytes(&self, index: usize) -> Option<&[u8]> {
+        let range = *self.transactions.get(index)?;
+        let start = usize::try_from(range.start()).ok()?;
+        let end = usize::try_from(range.end()).ok()?;
+        self.payload.get(start..end)
+    }
+
+    /// Returns one iterator over sanitized authoritative transaction views in dataset order.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use sof::framework::TransactionViewBatchEvent;
+    ///
+    /// fn count_valid_views(event: &TransactionViewBatchEvent) -> usize {
+    ///     event.transaction_views().filter(|view| view.is_ok()).count()
+    /// }
+    /// ```
+    pub fn transaction_views(
+        &self,
+    ) -> impl Iterator<Item = agave_transaction_view::result::Result<SanitizedTransactionView<&[u8]>>> + '_
+    {
+        self.transactions
+            .iter()
+            .filter_map(|range| {
+                let start = usize::try_from(range.start()).ok()?;
+                let end = usize::try_from(range.end()).ok()?;
+                self.payload.get(start..end)
+            })
+            .map(|bytes| SanitizedTransactionView::try_new_sanitized(bytes, true))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

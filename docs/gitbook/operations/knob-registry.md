@@ -16,7 +16,7 @@ This registry is intentionally different from the tuning guide:
 
 Snapshot date:
 
-- `2026-03-21`
+- `2026-03-24`
 
 ## How To Read The Registry
 
@@ -71,9 +71,12 @@ Snapshot date:
 | Knob | Default | Scope | Meaning |
 | --- | --- | --- | --- |
 | `SOF_WORKER_THREADS` | host parallelism | all builds | Base worker parallelism used by the runtime. |
+| `SOF_RUNTIME_CURRENT_THREAD` | `false` | all builds | Run SOF on a dedicated current-thread Tokio runtime. |
+| `SOF_RUNTIME_CORE` | unset | all builds | Optional CPU core pin for the dedicated runtime thread when current-thread mode is enabled. |
 | `SOF_DATASET_WORKERS` | `SOF_WORKER_THREADS` | all builds | Number of dataset reconstruction workers. |
 | `SOF_PACKET_WORKERS` | `SOF_WORKER_THREADS` | all builds | Number of packet verify/FEC/reassembly workers. |
 | `SOF_PACKET_WORKER_QUEUE_CAPACITY` | `256` | all builds | Queue depth per packet worker. |
+| `SOF_PACKET_WORKER_BATCH_MAX_PACKETS` | `8` | all builds | Maximum packets grouped into one packet-worker burst result. |
 | `SOF_DATASET_MAX_TRACKED_SLOTS` | `2048` | all builds | Maximum tracked dataset slots kept in memory. |
 | `SOF_DATASET_RETAINED_SLOT_LAG` | `256` | all builds | Retention lag for dataset tracking state after slots advance. |
 | `SOF_FEC_MAX_TRACKED_SETS` | `8192` | all builds | Maximum tracked FEC sets. |

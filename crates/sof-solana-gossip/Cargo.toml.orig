@@ -108,6 +108,10 @@ version = "0.5.15"
 [dependencies.core_affinity]
 version = "0.8"
 
+[dependencies.ed25519-dalek]
+version = "2.2.0"
+features = ["batch"]
+
 [dependencies.flate2]
 version = "1.0.31"
 

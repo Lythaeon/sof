@@ -32,8 +32,9 @@ pub use derived_state::{
 pub use events::{
     AccountTouchEvent, AccountTouchEventRef, ClusterNodeInfo, ClusterTopologyEvent,
     ControlPlaneSource, DatasetEvent, LeaderScheduleEntry, LeaderScheduleEvent,
-    ObservedRecentBlockhashEvent, RawPacketEvent, ReorgEvent, ShredEvent, SlotStatusEvent,
-    TransactionEvent, TransactionEventRef,
+    ObservedRecentBlockhashEvent, RawPacketEvent, ReorgEvent, SerializedTransactionRange,
+    ShredEvent, SlotStatusEvent, TransactionBatchEvent, TransactionEvent, TransactionEventRef,
+    TransactionViewBatchEvent,
 };
 pub use extension::{
     ExtensionCapability, ExtensionContext, ExtensionManifest, ExtensionResourceSpec,
@@ -49,5 +50,6 @@ pub use extension_host::{
 pub use host::{PluginDispatchMode, PluginHost, PluginHostBuilder, PluginHostStartupError};
 pub use plugin::ObserverPlugin as Plugin;
 pub use plugin::{
-    ObserverPlugin, PluginConfig, PluginContext, PluginSetupError, TransactionInterest,
+    ObserverPlugin, PluginConfig, PluginContext, PluginSetupError, TransactionDispatchMode,
+    TransactionInterest,
 };

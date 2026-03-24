@@ -18,6 +18,30 @@ fn collect_hook_plugins(
 }
 
 /// Builder for constructing an immutable [`PluginHost`].
+///
+/// # Examples
+///
+/// ```rust
+/// use async_trait::async_trait;
+/// use sof::framework::{ObserverPlugin, PluginConfig, PluginHost};
+///
+/// struct TransactionsOnly;
+///
+/// #[async_trait]
+/// impl ObserverPlugin for TransactionsOnly {
+///     fn config(&self) -> PluginConfig {
+///         PluginConfig::new().with_transaction()
+///     }
+/// }
+///
+/// let host = PluginHost::builder()
+///     .with_event_queue_capacity(4096)
+///     .add_plugin(TransactionsOnly)
+///     .build();
+///
+/// assert_eq!(host.len(), 1);
+/// assert!(host.wants_transaction());
+/// ```
 pub struct PluginHostBuilder {
     /// Plugins accumulated in registration order.
     plugins: Vec<Arc<dyn ObserverPlugin>>,
@@ -42,6 +66,14 @@ impl Default for PluginHostBuilder {
 
 impl PluginHostBuilder {
     /// Creates an empty builder.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use sof::framework::PluginHostBuilder;
+    ///
+    /// let _builder = PluginHostBuilder::new();
+    /// ```
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -69,6 +101,25 @@ impl PluginHostBuilder {
     }
 
     /// Adds one plugin value by storing it behind `Arc`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use async_trait::async_trait;
+    /// use sof::framework::{ObserverPlugin, PluginConfig, PluginHost};
+    ///
+    /// struct DatasetPlugin;
+    ///
+    /// #[async_trait]
+    /// impl ObserverPlugin for DatasetPlugin {
+    ///     fn config(&self) -> PluginConfig {
+    ///         PluginConfig::new().with_dataset()
+    ///     }
+    /// }
+    ///
+    /// let host = PluginHost::builder().add_plugin(DatasetPlugin).build();
+    /// assert!(host.wants_dataset());
+    /// ```
     #[must_use]
     pub fn add_plugin<P>(mut self, plugin: P) -> Self
     where
@@ -149,6 +200,15 @@ impl PluginHostBuilder {
     }
 
     /// Finalizes the builder into an immutable host.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use sof::framework::PluginHostBuilder;
+    ///
+    /// let host = PluginHostBuilder::new().build();
+    /// assert!(host.is_empty());
+    /// ```
     #[must_use]
     pub fn build(self) -> PluginHost {
         let plugins: Arc<[Arc<dyn ObserverPlugin>]> = Arc::from(self.plugins);
@@ -171,6 +231,35 @@ impl PluginHostBuilder {
             collect_hook_plugins(&plugins, &plugin_subscriptions, |subscription| {
                 subscription.transaction
             });
+        let transaction_batch_plugins =
+            collect_hook_plugins(&plugins, &plugin_subscriptions, |subscription| {
+                subscription.transaction_batch
+            });
+        let transaction_view_batch_plugins =
+            collect_hook_plugins(&plugins, &plugin_subscriptions, |subscription| {
+                subscription.transaction_view_batch
+            });
+        let transaction_plugin_inline_preferences: Arc<[bool]> = Arc::from(
+            plugin_subscriptions
+                .iter()
+                .filter(|subscription| subscription.transaction)
+                .map(|subscription| subscription.inline_transaction)
+                .collect::<Vec<_>>(),
+        );
+        let transaction_batch_plugin_inline_preferences: Arc<[bool]> = Arc::from(
+            plugin_subscriptions
+                .iter()
+                .filter(|subscription| subscription.transaction_batch)
+                .map(|subscription| subscription.inline_transaction_batch)
+                .collect::<Vec<_>>(),
+        );
+        let transaction_view_batch_plugin_inline_preferences: Arc<[bool]> = Arc::from(
+            plugin_subscriptions
+                .iter()
+                .filter(|subscription| subscription.transaction_view_batch)
+                .map(|subscription| subscription.inline_transaction_view_batch)
+                .collect::<Vec<_>>(),
+        );
         let account_touch_plugins =
             collect_hook_plugins(&plugins, &plugin_subscriptions, |subscription| {
                 subscription.account_touch
@@ -199,6 +288,17 @@ impl PluginHostBuilder {
             shred: !shred_plugins.is_empty(),
             dataset: !dataset_plugins.is_empty(),
             transaction: !transaction_plugins.is_empty(),
+            inline_transaction: plugin_subscriptions
+                .iter()
+                .any(|subscription| subscription.inline_transaction),
+            transaction_batch: !transaction_batch_plugins.is_empty(),
+            inline_transaction_batch: plugin_subscriptions
+                .iter()
+                .any(|subscription| subscription.inline_transaction_batch),
+            transaction_view_batch: !transaction_view_batch_plugins.is_empty(),
+            inline_transaction_view_batch: plugin_subscriptions
+                .iter()
+                .any(|subscription| subscription.inline_transaction_view_batch),
             account_touch: !account_touch_plugins.is_empty(),
             slot_status: !slot_status_plugins.is_empty(),
             reorg: !reorg_plugins.is_empty(),
@@ -211,6 +311,8 @@ impl PluginHostBuilder {
                 raw_packet: raw_packet_plugins,
                 shred: shred_plugins,
                 dataset: dataset_plugins,
+                transaction_batch: transaction_batch_plugins.clone(),
+                transaction_view_batch: transaction_view_batch_plugins.clone(),
                 account_touch: account_touch_plugins.clone(),
                 slot_status: slot_status_plugins,
                 reorg: reorg_plugins,
@@ -231,6 +333,11 @@ impl PluginHostBuilder {
         PluginHost {
             plugins,
             transaction_plugins,
+            transaction_plugin_inline_preferences,
+            transaction_batch_plugins,
+            transaction_batch_plugin_inline_preferences,
+            transaction_view_batch_plugins,
+            transaction_view_batch_plugin_inline_preferences,
             account_touch_plugins,
             dispatcher,
             transaction_dispatcher,

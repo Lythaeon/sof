@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use super::stream::SlotStream;
 
@@ -134,6 +135,17 @@ pub struct CompletedDataSet {
     pub end_index: u32,
     pub payload_fragments: PayloadFragmentBatch,
     pub last_in_slot: bool,
+    pub first_shred_observed_at: Instant,
+    pub last_shred_observed_at: Instant,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct InlineContiguousDataSet {
+    pub slot: u64,
+    pub start_index: u32,
+    pub end_index: u32,
+    pub payload_fragments: PayloadFragmentBatch,
+    pub fragment_observed_ats: Vec<Instant>,
 }
 
 #[derive(Debug, Default)]
@@ -179,6 +191,25 @@ impl DataSetReassembler {
         last_in_slot: bool,
         payload_fragment: SharedPayloadFragment,
     ) -> Vec<CompletedDataSet> {
+        self.ingest_data_shred_meta_at(
+            slot,
+            index,
+            data_complete,
+            last_in_slot,
+            payload_fragment,
+            Instant::now(),
+        )
+    }
+
+    pub fn ingest_data_shred_meta_at(
+        &mut self,
+        slot: u64,
+        index: u32,
+        data_complete: bool,
+        last_in_slot: bool,
+        payload_fragment: SharedPayloadFragment,
+        observed_at: Instant,
+    ) -> Vec<CompletedDataSet> {
         self.purge_older_than(slot.saturating_sub(self.retained_slot_lag));
         self.evict_if_needed(slot);
 
@@ -186,13 +217,31 @@ impl DataSetReassembler {
             .slots
             .entry(slot)
             .or_insert_with(|| SlotStream::new(slot, self.tail_min_shreds_without_anchor));
-        stream.insert(index, data_complete, last_in_slot, payload_fragment);
+        stream.insert(
+            index,
+            data_complete,
+            last_in_slot,
+            payload_fragment,
+            observed_at,
+        );
 
         let completed = stream.drain_contiguous_datasets();
         if stream.finished {
             let _ = self.slots.remove(&slot);
         }
         completed
+    }
+
+    #[must_use]
+    pub fn inline_contiguous_dataset(&self, slot: u64) -> Option<InlineContiguousDataSet> {
+        self.slots.get(&slot)?.inline_contiguous_dataset()
+    }
+
+    #[must_use]
+    pub fn inline_contiguous_datasets(&self, slot: u64) -> Vec<InlineContiguousDataSet> {
+        self.slots
+            .get(&slot)
+            .map_or_else(Vec::new, SlotStream::inline_contiguous_datasets)
     }
 
     fn evict_if_needed(&mut self, incoming_slot: u64) {

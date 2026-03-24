@@ -6,7 +6,9 @@ use {
         crds_value::CrdsValue,
         ping_pong::{self, Pong},
     },
+    arrayvec::ArrayVec,
     bincode::serialize,
+    ed25519_dalek::{verify_batch, Signature as DalekSignature, VerifyingKey},
     serde::{Deserialize, Serialize},
     solana_keypair::signable::Signable,
     solana_perf::packet::PACKET_DATA_SIZE,
@@ -14,9 +16,11 @@ use {
     solana_sanitize::{Sanitize, SanitizeError},
     solana_signature::Signature,
     std::{
-        borrow::{Borrow, Cow},
+        borrow::Cow,
+        collections::HashMap,
         fmt::Debug,
         result::Result,
+        sync::OnceLock,
     },
 };
 
@@ -44,6 +48,8 @@ const PRUNE_DATA_PREFIX: &[u8] = b"\xffSOLANA_PRUNE_DATA";
 const GOSSIP_PING_TOKEN_SIZE: usize = 32;
 /// Minimum serialized size of a Protocol::PullResponse packet.
 pub(crate) const PULL_RESPONSE_MIN_SERIALIZED_SIZE: usize = 161;
+const DEFAULT_GOSSIP_BATCH_VERIFY_MIN_VALUES: usize = 8;
+const GOSSIP_BATCH_VERIFY_MIN_VALUES_ENV: &str = "SOF_GOSSIP_BATCH_VERIFY_MIN_VALUES";
 
 // TODO These messages should go through the gpu pipeline for spam filtering
 /// Gossip protocol messages base enum
@@ -78,7 +84,121 @@ pub(crate) struct PruneData {
     pub(crate) wallclock: u64,
 }
 
+struct PreparedCrdsValue {
+    verifying_key: VerifyingKey,
+    signature: DalekSignature,
+    buffer: ArrayVec<u8, PACKET_DATA_SIZE>,
+}
+
+enum VerifyingKeyCache {
+    Inline(ArrayVec<(Pubkey, Option<VerifyingKey>), 8>),
+    Heap(HashMap<Pubkey, Option<VerifyingKey>>),
+}
+
+impl VerifyingKeyCache {
+    fn new() -> Self {
+        Self::Inline(ArrayVec::new())
+    }
+
+    fn get_or_compute(&mut self, pubkey: Pubkey) -> Option<VerifyingKey> {
+        match self {
+            Self::Inline(entries) => {
+                if let Some((_, verifying_key)) =
+                    entries.iter().find(|(cached_pubkey, _)| *cached_pubkey == pubkey)
+                {
+                    return *verifying_key;
+                }
+                let verifying_key = compute_verifying_key(pubkey);
+                if entries.try_push((pubkey, verifying_key)).is_ok() {
+                    return verifying_key;
+                }
+                let mut map = HashMap::with_capacity(entries.len().saturating_add(1));
+                let previous_entries = std::mem::take(entries);
+                for (cached_pubkey, cached_verifying_key) in previous_entries {
+                    let _ = map.insert(cached_pubkey, cached_verifying_key);
+                }
+                let _ = map.insert(pubkey, verifying_key);
+                *self = Self::Heap(map);
+                verifying_key
+            }
+            Self::Heap(entries) => *entries
+                .entry(pubkey)
+                .or_insert_with(|| compute_verifying_key(pubkey)),
+        }
+    }
+}
+
+fn compute_verifying_key(pubkey: Pubkey) -> Option<VerifyingKey> {
+    let pubkey_bytes = pubkey.to_bytes();
+    VerifyingKey::from_bytes(&pubkey_bytes)
+        .ok()
+        .filter(|verifying_key| !verifying_key.is_weak())
+}
+
 impl Protocol {
+    fn verify_crds_values(values: &[CrdsValue]) -> bool {
+        let Some(prepared_values) = Self::prepare_crds_values(values) else {
+            return false;
+        };
+        if prepared_values.len() >= gossip_batch_verify_min_values()
+            && Self::verify_crds_values_batch(&prepared_values)
+        {
+            return true;
+        }
+        Self::verify_crds_values_strict(&prepared_values)
+    }
+
+    fn prepare_crds_values(values: &[CrdsValue]) -> Option<Vec<PreparedCrdsValue>> {
+        let mut verifying_keys = VerifyingKeyCache::new();
+        let mut prepared_values = Vec::with_capacity(values.len());
+        for value in values {
+            prepared_values.push(Self::prepare_crds_value(value, &mut verifying_keys)?);
+        }
+        Some(prepared_values)
+    }
+
+    fn prepare_crds_value(
+        value: &CrdsValue,
+        verifying_keys: &mut VerifyingKeyCache,
+    ) -> Option<PreparedCrdsValue> {
+        let Some(verifying_key) = verifying_keys.get_or_compute(value.pubkey()) else {
+            return None;
+        };
+        let signature = DalekSignature::from_bytes(value.signature().as_array());
+        let mut buffer = ArrayVec::<u8, PACKET_DATA_SIZE>::new();
+        bincode::serialize_into(&mut buffer, value.data()).ok()?;
+        Some(PreparedCrdsValue {
+            verifying_key,
+            signature,
+            buffer,
+        })
+    }
+
+    fn verify_crds_values_strict(values: &[PreparedCrdsValue]) -> bool {
+        for value in values {
+            if value
+                .verifying_key
+                .verify_strict(&value.buffer, &value.signature)
+                .is_err()
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn verify_crds_values_batch(values: &[PreparedCrdsValue]) -> bool {
+        let mut messages = Vec::with_capacity(values.len());
+        let mut signatures = Vec::with_capacity(values.len());
+        let mut verifying_keys = Vec::with_capacity(values.len());
+        for value in values {
+            messages.push(value.buffer.as_slice());
+            signatures.push(value.signature);
+            verifying_keys.push(value.verifying_key);
+        }
+        verify_batch(&messages, &signatures, &verifying_keys).is_ok()
+    }
+
     /// Returns the bincode serialized size (in bytes) of the Protocol.
     #[cfg(test)]
     fn bincode_serialized_size(&self) -> usize {
@@ -93,13 +213,29 @@ impl Protocol {
     pub(crate) fn verify(&self) -> bool {
         match self {
             Self::PullRequest(_, caller) => caller.verify(),
-            Self::PullResponse(_, data) => data.iter().all(CrdsValue::verify),
-            Self::PushMessage(_, data) => data.iter().all(CrdsValue::verify),
+            Self::PullResponse(_, data) => Self::verify_crds_values(data),
+            Self::PushMessage(_, data) => Self::verify_crds_values(data),
             Self::PruneMessage(_, data) => data.verify(),
             Self::PingMessage(ping) => ping.verify(),
             Self::PongMessage(pong) => pong.verify(),
         }
     }
+}
+
+fn gossip_batch_verify_min_values() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        parse_gossip_batch_verify_min_values(
+            std::env::var(GOSSIP_BATCH_VERIFY_MIN_VALUES_ENV).ok().as_deref(),
+        )
+    })
+}
+
+fn parse_gossip_batch_verify_min_values(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_GOSSIP_BATCH_VERIFY_MIN_VALUES)
 }
 
 impl PruneData {
@@ -120,33 +256,44 @@ impl PruneData {
         Cow::Owned(serialize(&data).expect("should serialize PruneData"))
     }
 
-    fn signable_data_with_prefix(&self) -> Cow<'_, [u8]> {
-        #[derive(Serialize)]
-        struct SignDataWithPrefix<'a> {
-            prefix: &'a [u8],
-            pubkey: &'a Pubkey,
-            prunes: &'a [Pubkey],
-            destination: &'a Pubkey,
-            wallclock: u64,
-        }
-        let data = SignDataWithPrefix {
-            prefix: PRUNE_DATA_PREFIX,
-            pubkey: &self.pubkey,
-            prunes: &self.prunes,
-            destination: &self.destination,
-            wallclock: self.wallclock,
-        };
-        Cow::Owned(serialize(&data).expect("should serialize PruneDataWithPrefix"))
-    }
-
     fn verify_data(&self, use_prefix: bool) -> bool {
-        let data = if !use_prefix {
-            self.signable_data_without_prefix()
+        let mut buffer = ArrayVec::<u8, PACKET_DATA_SIZE>::new();
+        let result = if !use_prefix {
+            #[derive(Serialize)]
+            struct SignData<'a> {
+                pubkey: &'a Pubkey,
+                prunes: &'a [Pubkey],
+                destination: &'a Pubkey,
+                wallclock: u64,
+            }
+            let data = SignData {
+                pubkey: &self.pubkey,
+                prunes: &self.prunes,
+                destination: &self.destination,
+                wallclock: self.wallclock,
+            };
+            bincode::serialize_into(&mut buffer, &data)
         } else {
-            self.signable_data_with_prefix()
+            #[derive(Serialize)]
+            struct SignDataWithPrefix<'a> {
+                prefix: &'a [u8],
+                pubkey: &'a Pubkey,
+                prunes: &'a [Pubkey],
+                destination: &'a Pubkey,
+                wallclock: u64,
+            }
+            let data = SignDataWithPrefix {
+                prefix: PRUNE_DATA_PREFIX,
+                pubkey: &self.pubkey,
+                prunes: &self.prunes,
+                destination: &self.destination,
+                wallclock: self.wallclock,
+            };
+            bincode::serialize_into(&mut buffer, &data)
         };
-        self.get_signature()
-            .verify(self.pubkey().as_ref(), data.borrow())
+        result
+            .map(|()| self.get_signature().verify(self.pubkey().as_ref(), &buffer))
+            .unwrap_or(false)
     }
 }
 
@@ -267,7 +414,7 @@ pub(crate) mod tests {
         rand::Rng,
         solana_clock::Slot,
         solana_hash::Hash,
-        solana_keypair::Keypair,
+        solana_keypair::{signable::Signable, Keypair},
         solana_perf::packet::Packet,
         solana_signer::Signer,
         solana_time_utils::timestamp,
@@ -725,5 +872,66 @@ pub(crate) mod tests {
             non_prefixed_data.as_slice(),
             "Prefixed and non-prefixed serialized data should be different"
         );
+    }
+
+    #[test]
+    fn test_verify_crds_values_batch_falls_back_to_strict_on_invalid_signature() {
+        let keypair = Keypair::new();
+        let mut values: Vec<_> = (0..DEFAULT_GOSSIP_BATCH_VERIFY_MIN_VALUES)
+            .map(|index| {
+                CrdsValue::new(
+                    CrdsData::LowestSlot(0, LowestSlot::new(keypair.pubkey(), index as u64, 0)),
+                    &keypair,
+                )
+            })
+            .collect();
+        let mut signature = *values[0].get_signature().as_array();
+        signature[0] ^= 1;
+        values[0].set_signature(Signature::from(signature));
+        let message = Protocol::PushMessage(keypair.pubkey(), values);
+        assert!(!message.verify());
+    }
+
+    #[test]
+    fn test_verify_crds_values_rejects_weak_pubkeys_before_batch_verify() {
+        let mut weak_pubkey_bytes = [0u8; 32];
+        weak_pubkey_bytes[0] = 1;
+        let weak_pubkey = Pubkey::new_from_array(weak_pubkey_bytes);
+        let values: Vec<_> = (0..DEFAULT_GOSSIP_BATCH_VERIFY_MIN_VALUES)
+            .map(|index| {
+                CrdsValue::new_unsigned(CrdsData::LowestSlot(
+                    0,
+                    LowestSlot::new(weak_pubkey, index as u64, timestamp()),
+                ))
+            })
+            .collect();
+        let message = Protocol::PullResponse(Pubkey::new_unique(), values);
+        assert!(!message.verify());
+    }
+
+    #[test]
+    fn test_parse_gossip_batch_verify_min_values_defaults_on_missing() {
+        assert_eq!(
+            parse_gossip_batch_verify_min_values(None),
+            DEFAULT_GOSSIP_BATCH_VERIFY_MIN_VALUES
+        );
+    }
+
+    #[test]
+    fn test_parse_gossip_batch_verify_min_values_rejects_zero_and_invalid() {
+        assert_eq!(
+            parse_gossip_batch_verify_min_values(Some("0")),
+            DEFAULT_GOSSIP_BATCH_VERIFY_MIN_VALUES
+        );
+        assert_eq!(
+            parse_gossip_batch_verify_min_values(Some("invalid")),
+            DEFAULT_GOSSIP_BATCH_VERIFY_MIN_VALUES
+        );
+    }
+
+    #[test]
+    fn test_parse_gossip_batch_verify_min_values_accepts_positive_override() {
+        assert_eq!(parse_gossip_batch_verify_min_values(Some("4")), 4);
+        assert_eq!(parse_gossip_batch_verify_min_values(Some("16")), 16);
     }
 }

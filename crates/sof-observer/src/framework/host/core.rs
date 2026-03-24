@@ -1,6 +1,8 @@
 use super::dispatch::{
-    ClassifiedTransactionDispatch, PluginDispatchEvent, PluginDispatcher,
-    SelectedAccountTouchDispatch, TransactionDispatchPriority, TransactionPluginDispatcher,
+    ClassifiedAccountTouchDispatch, ClassifiedTransactionBatchDispatch,
+    ClassifiedTransactionDispatch, ClassifiedTransactionViewBatchDispatch, PluginDispatchEvent,
+    PluginDispatcher, SelectedAccountTouchDispatch, TransactionDispatchPriority,
+    TransactionPluginDispatcher,
 };
 use super::state::{ObservedRecentBlockhashState, ObservedTpuLeaderState};
 use super::*;
@@ -8,14 +10,71 @@ use crate::framework::AccountTouchEvent;
 use crate::framework::PluginContext;
 use crate::framework::events::AccountTouchEventRef;
 use crate::framework::events::TransactionEventRef;
+use std::time::Instant;
+
+/// Selects which transaction subscribers should receive a callback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransactionDispatchScope {
+    /// Deliver transactions to both inline and deferred subscribers.
+    All,
+    /// Deliver only to plugins that explicitly requested inline dispatch.
+    InlineOnly,
+    /// Deliver only to plugins that still rely on deferred dispatch.
+    DeferredOnly,
+}
+
+impl TransactionDispatchScope {
+    /// Returns whether this scope includes callbacks for the requested inline mode.
+    const fn includes(self, inline_requested: bool) -> bool {
+        match self {
+            Self::All => true,
+            Self::InlineOnly => inline_requested,
+            Self::DeferredOnly => !inline_requested,
+        }
+    }
+}
 
 /// Immutable plugin registry and async event dispatcher.
+///
+/// Build this through [`PluginHost::builder`] and pass it into
+/// [`crate::ObserverRuntime::with_plugin_host`] when embedding SOF.
+///
+/// # Examples
+///
+/// ```rust
+/// use async_trait::async_trait;
+/// use sof::framework::{ObserverPlugin, PluginConfig, PluginHost};
+///
+/// struct BlockhashPlugin;
+///
+/// #[async_trait]
+/// impl ObserverPlugin for BlockhashPlugin {
+///     fn config(&self) -> PluginConfig {
+///         PluginConfig::new().with_recent_blockhash()
+///     }
+/// }
+///
+/// let host = PluginHost::builder().add_plugin(BlockhashPlugin).build();
+///
+/// assert_eq!(host.len(), 1);
+/// assert!(host.wants_recent_blockhash());
+/// ```
 #[derive(Clone)]
 pub struct PluginHost {
     /// Immutable plugin collection in registration order.
     pub(super) plugins: Arc<[Arc<dyn ObserverPlugin>]>,
     /// Plugins interested in transaction callbacks.
     pub(super) transaction_plugins: Arc<[Arc<dyn ObserverPlugin>]>,
+    /// Per-transaction-plugin inline delivery preference in registration order.
+    pub(super) transaction_plugin_inline_preferences: Arc<[bool]>,
+    /// Plugins interested in transaction-batch callbacks.
+    pub(super) transaction_batch_plugins: Arc<[Arc<dyn ObserverPlugin>]>,
+    /// Per-transaction-batch-plugin inline delivery preference in registration order.
+    pub(super) transaction_batch_plugin_inline_preferences: Arc<[bool]>,
+    /// Plugins interested in transaction-view-batch callbacks.
+    pub(super) transaction_view_batch_plugins: Arc<[Arc<dyn ObserverPlugin>]>,
+    /// Per-transaction-view-batch-plugin inline delivery preference in registration order.
+    pub(super) transaction_view_batch_plugin_inline_preferences: Arc<[bool]>,
     /// Plugins interested in account-touch callbacks.
     pub(super) account_touch_plugins: Arc<[Arc<dyn ObserverPlugin>]>,
     /// Optional async dispatcher state (absent when no plugins are registered).
@@ -37,6 +96,11 @@ impl Default for PluginHost {
         Self {
             plugins: Arc::from(Vec::<Arc<dyn ObserverPlugin>>::new()),
             transaction_plugins: Arc::from(Vec::<Arc<dyn ObserverPlugin>>::new()),
+            transaction_plugin_inline_preferences: Arc::from(Vec::<bool>::new()),
+            transaction_batch_plugins: Arc::from(Vec::<Arc<dyn ObserverPlugin>>::new()),
+            transaction_batch_plugin_inline_preferences: Arc::from(Vec::<bool>::new()),
+            transaction_view_batch_plugins: Arc::from(Vec::<Arc<dyn ObserverPlugin>>::new()),
+            transaction_view_batch_plugin_inline_preferences: Arc::from(Vec::<bool>::new()),
             account_touch_plugins: Arc::from(Vec::<Arc<dyn ObserverPlugin>>::new()),
             dispatcher: None,
             transaction_dispatcher: None,
@@ -79,6 +143,44 @@ impl PluginHost {
         self.subscriptions.transaction
     }
 
+    /// Returns true when at least one plugin requested inline transaction dispatch.
+    #[must_use]
+    pub const fn wants_inline_transaction_dispatch(&self) -> bool {
+        self.subscriptions.inline_transaction
+    }
+
+    /// Returns true when at least one plugin still relies on deferred transaction dispatch.
+    #[must_use]
+    pub fn wants_deferred_transaction_dispatch(&self) -> bool {
+        self.transaction_plugin_inline_preferences
+            .iter()
+            .any(|inline_requested| !*inline_requested)
+    }
+
+    /// Returns true when at least one plugin wants transaction-batch callbacks.
+    #[must_use]
+    pub const fn wants_transaction_batch(&self) -> bool {
+        self.subscriptions.transaction_batch
+    }
+
+    /// Returns true when at least one plugin requested inline transaction-batch dispatch.
+    #[must_use]
+    pub const fn wants_inline_transaction_batch_dispatch(&self) -> bool {
+        self.subscriptions.inline_transaction_batch
+    }
+
+    /// Returns true when at least one plugin wants transaction-view-batch callbacks.
+    #[must_use]
+    pub const fn wants_transaction_view_batch(&self) -> bool {
+        self.subscriptions.transaction_view_batch
+    }
+
+    /// Returns true when at least one plugin requested inline transaction-view-batch dispatch.
+    #[must_use]
+    pub const fn wants_inline_transaction_view_batch_dispatch(&self) -> bool {
+        self.subscriptions.inline_transaction_view_batch
+    }
+
     /// Returns true when at least one plugin wants account-touch callbacks.
     #[must_use]
     pub const fn wants_account_touch(&self) -> bool {
@@ -89,6 +191,42 @@ impl PluginHost {
     #[must_use]
     pub const fn wants_recent_blockhash(&self) -> bool {
         self.subscriptions.recent_blockhash
+    }
+
+    /// Returns true when at least one plugin wants raw-packet callbacks.
+    #[must_use]
+    pub const fn wants_raw_packet(&self) -> bool {
+        self.subscriptions.raw_packet
+    }
+
+    /// Returns true when at least one plugin wants parsed-shred callbacks.
+    #[must_use]
+    pub const fn wants_shred(&self) -> bool {
+        self.subscriptions.shred
+    }
+
+    /// Returns true when at least one plugin wants cluster-topology callbacks.
+    #[must_use]
+    pub const fn wants_cluster_topology(&self) -> bool {
+        self.subscriptions.cluster_topology
+    }
+
+    /// Returns true when at least one plugin wants leader-schedule callbacks.
+    #[must_use]
+    pub const fn wants_leader_schedule(&self) -> bool {
+        self.subscriptions.leader_schedule
+    }
+
+    /// Returns true when at least one plugin wants slot-status callbacks.
+    #[must_use]
+    pub const fn wants_slot_status(&self) -> bool {
+        self.subscriptions.slot_status
+    }
+
+    /// Returns true when at least one plugin wants reorg callbacks.
+    #[must_use]
+    pub const fn wants_reorg(&self) -> bool {
+        self.subscriptions.reorg
     }
 
     /// Returns total dropped hook events due to queue backpressure/closure.
@@ -217,22 +355,66 @@ impl PluginHost {
         &self,
         event: TransactionEventRef<'_>,
     ) -> ClassifiedTransactionDispatch {
-        if !self.subscriptions.transaction || self.transaction_dispatcher.is_none() {
+        self.classify_transaction_ref_in_scope(event, TransactionDispatchScope::All)
+    }
+
+    /// Classifies one decoded transaction within one explicit delivery scope.
+    #[must_use]
+    pub(crate) fn classify_transaction_ref_in_scope(
+        &self,
+        event: TransactionEventRef<'_>,
+        scope: TransactionDispatchScope,
+    ) -> ClassifiedTransactionDispatch {
+        if !self.wants_transaction_dispatch_in_scope(scope) || self.transaction_dispatcher.is_none()
+        {
             return ClassifiedTransactionDispatch::empty();
         }
-        let mut dispatch =
-            ClassifiedTransactionDispatch::with_capacity(self.transaction_plugins.len());
-        for plugin in self.transaction_plugins.iter() {
-            dispatch.push(plugin.transaction_interest_ref(event), Arc::clone(plugin));
+        let mut dispatch = ClassifiedTransactionDispatch::empty();
+        for (plugin, inline_requested) in self
+            .transaction_plugins
+            .iter()
+            .zip(self.transaction_plugin_inline_preferences.iter().copied())
+        {
+            if !scope.includes(inline_requested) {
+                continue;
+            }
+            dispatch.push(
+                plugin.transaction_interest_ref(event),
+                inline_requested,
+                Arc::clone(plugin),
+            );
         }
         dispatch
     }
 
+    /// Returns true when the requested transaction delivery scope has any listeners.
+    #[must_use]
+    pub(crate) fn wants_transaction_dispatch_in_scope(
+        &self,
+        scope: TransactionDispatchScope,
+    ) -> bool {
+        match scope {
+            TransactionDispatchScope::All => self.subscriptions.transaction,
+            TransactionDispatchScope::InlineOnly => self.subscriptions.inline_transaction,
+            TransactionDispatchScope::DeferredOnly => self.wants_deferred_transaction_dispatch(),
+        }
+    }
+
     /// Enqueues one already-classified decoded transaction hook to registered plugins.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "hot-path dispatch keeps scalar timing and dataset metadata explicit"
+    )]
     pub(crate) fn on_classified_transaction(
         &self,
         dispatch: ClassifiedTransactionDispatch,
         event: TransactionEvent,
+        completed_at: Instant,
+        first_shred_observed_at: Instant,
+        last_shred_observed_at: Instant,
+        inline_source: InlineTransactionDispatchSource,
+        dataset_tx_count: u32,
+        dataset_tx_position: u32,
     ) {
         if !self.subscriptions.transaction {
             return;
@@ -240,7 +422,18 @@ impl PluginHost {
         let Some(dispatcher) = &self.transaction_dispatcher else {
             return;
         };
-        let (critical, background) = dispatch.into_dispatches(Arc::new(event));
+        let (critical_inline, critical, background) = dispatch.into_dispatches(
+            event,
+            completed_at,
+            first_shred_observed_at,
+            last_shred_observed_at,
+            inline_source,
+            dataset_tx_count,
+            dataset_tx_position,
+        );
+        if let Some(dispatch_event) = critical_inline {
+            dispatcher.dispatch_inline_critical(dispatch_event);
+        }
         if let Some(dispatch_event) = critical {
             dispatcher.dispatch(TransactionDispatchPriority::Critical, dispatch_event);
         }
@@ -249,16 +442,58 @@ impl PluginHost {
         }
     }
 
+    /// Enqueues one completed-dataset transaction batch hook to registered plugins.
+    pub(crate) fn on_transaction_batch(&self, event: TransactionBatchEvent, completed_at: Instant) {
+        if !self.subscriptions.transaction_batch {
+            return;
+        }
+        let Some(dispatcher) = &self.dispatcher else {
+            return;
+        };
+        let dispatch = ClassifiedTransactionBatchDispatch::from_plugins(
+            self.transaction_batch_plugins.clone(),
+            &self.transaction_batch_plugin_inline_preferences,
+            event,
+            completed_at,
+        );
+        if let Some(dispatch_event) = dispatch {
+            dispatcher.dispatch(PluginDispatchEvent::TransactionBatch(dispatch_event));
+        }
+    }
+
+    /// Enqueues one completed-dataset transaction-view batch hook to registered plugins.
+    pub(crate) fn on_transaction_view_batch(
+        &self,
+        event: crate::framework::TransactionViewBatchEvent,
+        completed_at: Instant,
+    ) {
+        if !self.subscriptions.transaction_view_batch {
+            return;
+        }
+        let Some(dispatcher) = &self.dispatcher else {
+            return;
+        };
+        let dispatch = ClassifiedTransactionViewBatchDispatch::from_plugins(
+            self.transaction_view_batch_plugins.clone(),
+            &self.transaction_view_batch_plugin_inline_preferences,
+            event,
+            completed_at,
+        );
+        if let Some(dispatch_event) = dispatch {
+            dispatcher.dispatch(PluginDispatchEvent::TransactionViewBatch(dispatch_event));
+        }
+    }
+
     /// Selects interested account-touch plugins on borrowed transaction data.
     #[must_use]
     pub(crate) fn classify_account_touch_ref(
         &self,
         event: AccountTouchEventRef<'_>,
-    ) -> Vec<Arc<dyn ObserverPlugin>> {
+    ) -> ClassifiedAccountTouchDispatch {
         if !self.subscriptions.account_touch || self.dispatcher.is_none() {
-            return Vec::new();
+            return ClassifiedAccountTouchDispatch::empty();
         }
-        let mut selected = Vec::with_capacity(self.account_touch_plugins.len().min(4));
+        let mut selected = ClassifiedAccountTouchDispatch::empty();
         for plugin in self.account_touch_plugins.iter() {
             if plugin.accepts_account_touch_ref(event) {
                 selected.push(Arc::clone(plugin));
@@ -270,14 +505,14 @@ impl PluginHost {
     /// Enqueues one account-touch hook to only the interested plugins.
     pub(crate) fn on_selected_account_touch(
         &self,
-        plugins: Vec<Arc<dyn ObserverPlugin>>,
+        dispatch: ClassifiedAccountTouchDispatch,
         event: AccountTouchEvent,
     ) {
         if !self.subscriptions.account_touch {
             return;
         }
         if let Some(dispatcher) = &self.dispatcher
-            && let Some(event) = SelectedAccountTouchDispatch::from_plugins(plugins, event)
+            && let Some(event) = SelectedAccountTouchDispatch::from_classified(dispatch, event)
         {
             dispatcher.dispatch(PluginDispatchEvent::SelectedAccountTouch(event));
         }
@@ -324,7 +559,17 @@ impl PluginHost {
         if dispatch.is_empty() {
             return;
         }
-        self.on_classified_transaction(dispatch, event);
+        let now = Instant::now();
+        self.on_classified_transaction(
+            dispatch,
+            event,
+            now,
+            now,
+            now,
+            InlineTransactionDispatchSource::CompletedDatasetFallback,
+            1,
+            0,
+        );
     }
 
     /// Enqueues account-touch hook to registered plugins.
