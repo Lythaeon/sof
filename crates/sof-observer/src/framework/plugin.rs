@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
-use std::sync::Arc;
+use std::{cell::RefCell, sync::Arc};
 use thiserror::Error;
 
 use crate::framework::events::{
@@ -10,6 +10,56 @@ use crate::framework::events::{
     SlotStatusEvent, TransactionBatchEvent, TransactionEvent, TransactionEventRef,
     TransactionViewBatchEvent,
 };
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct CachedTransactionEventKey {
+    slot: u64,
+    signature: Option<Signature>,
+    tx_ptr: *const solana_transaction::versioned::VersionedTransaction,
+    kind: crate::event::TxKind,
+}
+
+struct CachedTransactionEvent {
+    key: CachedTransactionEventKey,
+    event: TransactionEvent,
+}
+
+thread_local! {
+    static CACHED_TRANSACTION_EVENT: RefCell<Option<CachedTransactionEvent>> = const { RefCell::new(None) };
+}
+
+fn cached_transaction_event_key(event: TransactionEventRef<'_>) -> CachedTransactionEventKey {
+    CachedTransactionEventKey {
+        slot: event.slot,
+        signature: event.signature,
+        tx_ptr: event.tx as *const _,
+        kind: event.kind,
+    }
+}
+
+fn with_cached_transaction_event<R>(
+    event: TransactionEventRef<'_>,
+    f: impl FnOnce(&TransactionEvent) -> R,
+) -> R {
+    let key = cached_transaction_event_key(event);
+    CACHED_TRANSACTION_EVENT.with(|cached| {
+        let mut cached = cached.borrow_mut();
+        if !cached
+            .as_ref()
+            .is_some_and(|cached_event| cached_event.key == key)
+        {
+            *cached = Some(CachedTransactionEvent {
+                key,
+                event: event.to_owned(),
+            });
+        }
+        let owned = &cached
+            .as_ref()
+            .expect("cached transaction event just inserted")
+            .event;
+        f(owned)
+    })
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 /// Priority class for accepted transaction callbacks.
@@ -492,7 +542,7 @@ pub trait ObserverPlugin: Send + Sync + 'static {
     /// Plugins that only need borrowed fields should prefer this hook over
     /// [`Self::accepts_transaction`].
     fn accepts_transaction_ref(&self, event: TransactionEventRef<'_>) -> bool {
-        self.accepts_transaction(&event.to_owned())
+        with_cached_transaction_event(event, |owned| self.accepts_transaction(owned))
     }
 
     /// Returns transaction-interest priority for one decoded transaction callback.
@@ -515,7 +565,7 @@ pub trait ObserverPlugin: Send + Sync + 'static {
     /// Priority-sensitive plugins should implement this hook directly so the
     /// dataset hot path can classify traffic without allocating.
     fn transaction_interest_ref(&self, event: TransactionEventRef<'_>) -> TransactionInterest {
-        self.transaction_interest(&event.to_owned())
+        with_cached_transaction_event(event, |owned| self.transaction_interest(owned))
     }
 
     /// Returns one compiled hot-path transaction matcher when the plugin uses
