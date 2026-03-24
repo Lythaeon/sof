@@ -94,6 +94,12 @@ pub enum TransactionInterest {
 /// plugin's custom matcher for simple "does this transaction mention these
 /// keys/signature?" cases.
 ///
+/// On the inline path, this is also the preferred way to reject irrelevant
+/// traffic. When every in-scope inline transaction plugin uses
+/// [`ObserverPlugin::transaction_prefilter`] and all matching prefilters return
+/// [`TransactionInterest::Ignore`], SOF can skip full owned
+/// `VersionedTransaction` decode for that transaction entirely.
+///
 /// Matching is performed against static message account keys and referenced
 /// address-table account keys. Loaded lookup addresses are not available on
 /// SOF's external shred path, so they are intentionally not part of this
@@ -637,6 +643,11 @@ pub trait ObserverPlugin: Send + Sync + 'static {
     ///
     /// When this is present, SOF can classify transactions without calling the
     /// plugin's custom borrowed classifier on the hot path.
+    ///
+    /// Prefer this over [`Self::transaction_interest_ref`] when the plugin only
+    /// needs exact signature matching or static/account-lookup key presence
+    /// checks. On the inline path, a prefilter-backed miss can let SOF skip full
+    /// owned transaction decode for that tx.
     fn transaction_prefilter(&self) -> Option<&TransactionPrefilter> {
         None
     }

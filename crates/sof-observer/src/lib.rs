@@ -109,6 +109,64 @@
 //! on the anchored contiguous inline path, and falls back to the completed-dataset point only when
 //! the early path is not yet reconstructable.
 //!
+//! # Prefer Compiled Transaction Prefilters
+//!
+//! ```no_run
+//! use async_trait::async_trait;
+//! use solana_pubkey::Pubkey;
+//! use sof::{
+//!     framework::{
+//!         ObserverPlugin, PluginConfig, PluginHost, TransactionDispatchMode,
+//!         TransactionInterest, TransactionPrefilter,
+//!     },
+//!     runtime::ObserverRuntime,
+//! };
+//!
+//! #[derive(Clone, Debug)]
+//! struct RaydiumPoolWatcher {
+//!     filter: TransactionPrefilter,
+//! }
+//!
+//! impl Default for RaydiumPoolWatcher {
+//!     fn default() -> Self {
+//!         let pool = Pubkey::new_unique();
+//!         let program = Pubkey::new_unique();
+//!         Self {
+//!             filter: TransactionPrefilter::new(TransactionInterest::Critical)
+//!                 .with_account_required([pool, program]),
+//!         }
+//!     }
+//! }
+//!
+//! #[async_trait]
+//! impl ObserverPlugin for RaydiumPoolWatcher {
+//!     fn config(&self) -> PluginConfig {
+//!         PluginConfig::new().with_transaction_mode(TransactionDispatchMode::Inline)
+//!     }
+//!
+//!     fn transaction_prefilter(&self) -> Option<&TransactionPrefilter> {
+//!         Some(&self.filter)
+//!     }
+//! }
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), sof::runtime::RuntimeError> {
+//!     let host = PluginHost::builder()
+//!         .add_plugin(RaydiumPoolWatcher::default())
+//!         .build();
+//!
+//!     ObserverRuntime::new()
+//!         .with_plugin_host(host)
+//!         .run_until_termination_signal()
+//!         .await
+//! }
+//! ```
+//!
+//! Prefer [`crate::framework::TransactionPrefilter`] when your plugin only
+//! matches exact signatures or account-key presence. On the inline path, SOF can
+//! use that compiled matcher on a sanitized transaction view and skip full owned
+//! transaction decode for misses.
+//!
 //! More user-facing examples live in `crates/sof-observer/README.md` and the published example
 //! programs under `crates/sof-observer/examples/`.
 

@@ -55,6 +55,16 @@ they are too host-specific to recommend as defaults:
 3. measure
 4. change one advanced knob at a time
 
+For transaction plugins, prefer API-level fast paths before runtime knob tuning:
+
+- use `TransactionDispatchMode::Inline` when the plugin actually benefits from
+  earliest tx visibility
+- use `TransactionPrefilter` for signature/account-key matching instead of
+  custom `transaction_interest_ref` logic when possible
+
+That combination lets SOF reject irrelevant inline traffic from sanitized
+transaction views and skip full owned tx decode on misses.
+
 This order matters because many queue and worker controls simply trade one failure mode for
 another.
 

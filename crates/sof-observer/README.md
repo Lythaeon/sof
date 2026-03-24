@@ -318,6 +318,48 @@ If other plugins or subsystems still need deferred dataset processing, SOF can d
 the inline transaction hook first and then continue the same dataset through the
 standard dataset-worker path for those remaining consumers.
 
+For account/signature-driven transaction filters, prefer `TransactionPrefilter`
+over custom `transaction_interest_ref` logic:
+
+```rust
+use async_trait::async_trait;
+use solana_pubkey::Pubkey;
+use sof::framework::{
+    Plugin, PluginConfig, TransactionDispatchMode, TransactionInterest, TransactionPrefilter,
+};
+
+#[derive(Clone, Debug)]
+struct PoolWatcher {
+    filter: TransactionPrefilter,
+}
+
+impl Default for PoolWatcher {
+    fn default() -> Self {
+        let pool = Pubkey::new_unique();
+        let program = Pubkey::new_unique();
+        Self {
+            filter: TransactionPrefilter::new(TransactionInterest::Critical)
+                .with_account_required([pool, program]),
+        }
+    }
+}
+
+#[async_trait]
+impl Plugin for PoolWatcher {
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_transaction_mode(TransactionDispatchMode::Inline)
+    }
+
+    fn transaction_prefilter(&self) -> Option<&TransactionPrefilter> {
+        Some(&self.filter)
+    }
+}
+```
+
+When every in-scope inline transaction plugin uses a compiled prefilter and all
+of them ignore the tx, SOF can classify that transaction from a sanitized view
+and skip full owned `VersionedTransaction` decode entirely.
+
 When observability is enabled, SOF exports exact inline latency counters:
 
 - `sof_inline_transaction_plugin_first_shred_lag_us_total`
