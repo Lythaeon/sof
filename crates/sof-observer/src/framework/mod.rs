@@ -51,5 +51,5 @@ pub use host::{PluginDispatchMode, PluginHost, PluginHostBuilder, PluginHostStar
 pub use plugin::ObserverPlugin as Plugin;
 pub use plugin::{
     ObserverPlugin, PluginConfig, PluginContext, PluginSetupError, TransactionDispatchMode,
-    TransactionInterest,
+    TransactionInterest, TransactionPrefilter,
 };

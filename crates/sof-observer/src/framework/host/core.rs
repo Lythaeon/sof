@@ -67,6 +67,8 @@ pub struct PluginHost {
     pub(super) transaction_plugins: Arc<[Arc<dyn ObserverPlugin>]>,
     /// Per-transaction-plugin inline delivery preference in registration order.
     pub(super) transaction_plugin_inline_preferences: Arc<[bool]>,
+    /// Optional compiled transaction prefilters in registration order.
+    pub(super) transaction_plugin_prefilters: Arc<[Option<crate::framework::TransactionPrefilter>]>,
     /// Plugins interested in transaction-batch callbacks.
     pub(super) transaction_batch_plugins: Arc<[Arc<dyn ObserverPlugin>]>,
     /// Per-transaction-batch-plugin inline delivery preference in registration order.
@@ -97,6 +99,9 @@ impl Default for PluginHost {
             plugins: Arc::from(Vec::<Arc<dyn ObserverPlugin>>::new()),
             transaction_plugins: Arc::from(Vec::<Arc<dyn ObserverPlugin>>::new()),
             transaction_plugin_inline_preferences: Arc::from(Vec::<bool>::new()),
+            transaction_plugin_prefilters: Arc::from(Vec::<
+                Option<crate::framework::TransactionPrefilter>,
+            >::new()),
             transaction_batch_plugins: Arc::from(Vec::<Arc<dyn ObserverPlugin>>::new()),
             transaction_batch_plugin_inline_preferences: Arc::from(Vec::<bool>::new()),
             transaction_view_batch_plugins: Arc::from(Vec::<Arc<dyn ObserverPlugin>>::new()),
@@ -370,16 +375,20 @@ impl PluginHost {
             return ClassifiedTransactionDispatch::empty();
         }
         let mut dispatch = ClassifiedTransactionDispatch::empty();
-        for (plugin, inline_requested) in self
+        for ((plugin, inline_requested), prefilter) in self
             .transaction_plugins
             .iter()
             .zip(self.transaction_plugin_inline_preferences.iter().copied())
+            .zip(self.transaction_plugin_prefilters.iter())
         {
             if !scope.includes(inline_requested) {
                 continue;
             }
             dispatch.push(
-                plugin.transaction_interest_ref(event),
+                prefilter.as_ref().map_or_else(
+                    || plugin.transaction_interest_ref(event),
+                    |filter| filter.classify_ref(event),
+                ),
                 inline_requested,
                 Arc::clone(plugin),
             );

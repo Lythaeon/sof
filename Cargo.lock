@@ -4924,6 +4924,7 @@ dependencies = [
  "sof-solana-gossip",
  "solana-entry",
  "solana-hash 3.1.0",
+ "solana-instruction",
  "solana-keypair",
  "solana-net-utils",
  "solana-packet",

@@ -1,4 +1,7 @@
 use async_trait::async_trait;
+use solana_pubkey::Pubkey;
+use solana_signature::Signature;
+use std::sync::Arc;
 use thiserror::Error;
 
 use crate::framework::events::{
@@ -17,6 +20,144 @@ pub enum TransactionInterest {
     Background,
     /// HFT-critical transaction visibility that should stay on the fast lane.
     Critical,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+/// Compiled transaction classifier for common signature/account-key matching cases.
+///
+/// This lets SOF classify transactions on the hot path without calling the
+/// plugin's custom matcher for simple "does this transaction mention these
+/// keys/signature?" cases.
+///
+/// Matching is performed against static message account keys and referenced
+/// address-table account keys. Loaded lookup addresses are not available on
+/// SOF's external shred path, so they are intentionally not part of this
+/// matcher.
+///
+/// # Examples
+///
+/// ```rust
+/// use sof::framework::{TransactionInterest, TransactionPrefilter};
+/// use solana_pubkey::Pubkey;
+///
+/// let pool = Pubkey::new_unique();
+/// let program = Pubkey::new_unique();
+///
+/// let filter = TransactionPrefilter::new(TransactionInterest::Critical)
+///     .with_account_required([pool, program]);
+///
+/// assert_eq!(filter.matched_interest(), TransactionInterest::Critical);
+/// ```
+pub struct TransactionPrefilter {
+    matched_interest: TransactionInterest,
+    signature: Option<Signature>,
+    account_include: Arc<[Pubkey]>,
+    account_exclude: Arc<[Pubkey]>,
+    account_required: Arc<[Pubkey]>,
+}
+
+impl TransactionPrefilter {
+    /// Creates an empty prefilter that returns the provided interest on match.
+    #[must_use]
+    pub fn new(matched_interest: TransactionInterest) -> Self {
+        Self {
+            matched_interest,
+            signature: None,
+            account_include: Arc::new([]),
+            account_exclude: Arc::new([]),
+            account_required: Arc::new([]),
+        }
+    }
+
+    /// Returns the interest emitted when this filter matches.
+    #[must_use]
+    pub const fn matched_interest(&self) -> TransactionInterest {
+        self.matched_interest
+    }
+
+    /// Requires one exact transaction signature.
+    #[must_use]
+    pub fn with_signature(mut self, signature: Signature) -> Self {
+        self.signature = Some(signature);
+        self
+    }
+
+    /// Requires at least one listed account key to be present.
+    #[must_use]
+    pub fn with_account_include<I>(mut self, keys: I) -> Self
+    where
+        I: IntoIterator<Item = Pubkey>,
+    {
+        self.account_include = Arc::from(keys.into_iter().collect::<Vec<_>>());
+        self
+    }
+
+    /// Rejects transactions that mention any listed account key.
+    #[must_use]
+    pub fn with_account_exclude<I>(mut self, keys: I) -> Self
+    where
+        I: IntoIterator<Item = Pubkey>,
+    {
+        self.account_exclude = Arc::from(keys.into_iter().collect::<Vec<_>>());
+        self
+    }
+
+    /// Requires all listed account keys to be present.
+    #[must_use]
+    pub fn with_account_required<I>(mut self, keys: I) -> Self
+    where
+        I: IntoIterator<Item = Pubkey>,
+    {
+        self.account_required = Arc::from(keys.into_iter().collect::<Vec<_>>());
+        self
+    }
+
+    /// Returns the matched interest or [`TransactionInterest::Ignore`].
+    #[must_use]
+    pub fn classify_ref(&self, event: TransactionEventRef<'_>) -> TransactionInterest {
+        if let Some(signature) = self.signature
+            && event.signature != Some(signature)
+        {
+            return TransactionInterest::Ignore;
+        }
+        if !self.account_include.is_empty()
+            && !self
+                .account_include
+                .iter()
+                .copied()
+                .any(|key| transaction_mentions_account_key(event.tx, key))
+        {
+            return TransactionInterest::Ignore;
+        }
+        if self
+            .account_exclude
+            .iter()
+            .copied()
+            .any(|key| transaction_mentions_account_key(event.tx, key))
+        {
+            return TransactionInterest::Ignore;
+        }
+        if !self
+            .account_required
+            .iter()
+            .copied()
+            .all(|key| transaction_mentions_account_key(event.tx, key))
+        {
+            return TransactionInterest::Ignore;
+        }
+        self.matched_interest
+    }
+}
+
+fn transaction_mentions_account_key(
+    tx: &solana_transaction::versioned::VersionedTransaction,
+    key: Pubkey,
+) -> bool {
+    tx.message.static_account_keys().contains(&key)
+        || tx
+            .message
+            .address_table_lookups()
+            .is_some_and(|lookups| lookups.iter().any(|lookup| lookup.account_key == key))
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -375,6 +516,15 @@ pub trait ObserverPlugin: Send + Sync + 'static {
     /// dataset hot path can classify traffic without allocating.
     fn transaction_interest_ref(&self, event: TransactionEventRef<'_>) -> TransactionInterest {
         self.transaction_interest(&event.to_owned())
+    }
+
+    /// Returns one compiled hot-path transaction matcher when the plugin uses
+    /// only common signature/account-key classification rules.
+    ///
+    /// When this is present, SOF can classify transactions without calling the
+    /// plugin's custom borrowed classifier on the hot path.
+    fn transaction_prefilter(&self) -> Option<&TransactionPrefilter> {
+        None
     }
 
     /// Called for each decoded transaction emitted from a completed contiguous data range.

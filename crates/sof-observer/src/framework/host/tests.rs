@@ -1,5 +1,8 @@
 use super::*;
 use async_trait::async_trait;
+use solana_instruction::{AccountMeta, Instruction};
+use solana_pubkey::Pubkey;
+use solana_signature::Signature;
 use solana_transaction::Transaction;
 use std::{
     sync::atomic::{AtomicBool, AtomicUsize},
@@ -9,7 +12,7 @@ use std::{
 use crate::event::TxKind;
 use crate::framework::{
     PluginConfig, PluginContext, PluginSetupError, TransactionDispatchMode, TransactionEventRef,
-    TransactionInterest, TxCommitmentStatus,
+    TransactionInterest, TransactionPrefilter, TxCommitmentStatus,
 };
 
 #[derive(Clone, Copy)]
@@ -318,6 +321,53 @@ impl ObserverPlugin for PriorityTransactionPlugin {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
         self.background_handled.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone)]
+struct PrefilterTransactionPlugin {
+    filter: TransactionPrefilter,
+}
+
+#[async_trait]
+impl ObserverPlugin for PrefilterTransactionPlugin {
+    fn name(&self) -> &'static str {
+        "prefilter-transaction-plugin"
+    }
+
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_inline_transaction()
+    }
+
+    fn transaction_prefilter(&self) -> Option<&TransactionPrefilter> {
+        Some(&self.filter)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ManualAccountMatchPlugin {
+    required_a: Pubkey,
+    required_b: Pubkey,
+}
+
+#[async_trait]
+impl ObserverPlugin for ManualAccountMatchPlugin {
+    fn name(&self) -> &'static str {
+        "manual-account-match-plugin"
+    }
+
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_inline_transaction()
+    }
+
+    fn transaction_interest_ref(&self, event: TransactionEventRef<'_>) -> TransactionInterest {
+        let has_a = tx_mentions_account_key(event.tx, self.required_a);
+        let has_b = tx_mentions_account_key(event.tx, self.required_b);
+        if has_a && has_b {
+            TransactionInterest::Critical
+        } else {
+            TransactionInterest::Ignore
+        }
     }
 }
 
@@ -793,6 +843,109 @@ async fn startup_failure_shuts_down_started_plugins() {
     assert_eq!(shutdown_count.load(Ordering::Relaxed), 1);
 }
 
+#[test]
+fn transaction_prefilter_matches_manual_account_classifier() {
+    let required_a = Pubkey::new_unique();
+    let required_b = Pubkey::new_unique();
+    let tx = test_transaction_with_static_accounts([required_a, required_b, Pubkey::new_unique()]);
+    let event = TransactionEventRef {
+        slot: 7,
+        commitment_status: TxCommitmentStatus::Processed,
+        confirmed_slot: None,
+        finalized_slot: None,
+        signature: Some(Signature::from([7_u8; 64])),
+        tx: &tx,
+        kind: TxKind::NonVote,
+    };
+
+    let manual_host = PluginHostBuilder::new()
+        .add_plugin(ManualAccountMatchPlugin {
+            required_a,
+            required_b,
+        })
+        .build();
+    let prefilter_host = PluginHostBuilder::new()
+        .add_plugin(PrefilterTransactionPlugin {
+            filter: TransactionPrefilter::new(TransactionInterest::Critical)
+                .with_account_required([required_a, required_b]),
+        })
+        .build();
+
+    let manual = manual_host.classify_transaction_ref(event);
+    let prefiltered = prefilter_host.classify_transaction_ref(event);
+
+    assert_eq!(manual.is_empty(), prefiltered.is_empty());
+}
+
+#[test]
+#[ignore = "profiling fixture for transaction prefilter A/B"]
+fn transaction_prefilter_profile_fixture() {
+    let plugin_count = std::env::var("SOF_TRANSACTION_PREFILTER_PROFILE_PLUGINS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(64);
+    let iterations = std::env::var("SOF_TRANSACTION_PREFILTER_PROFILE_ITERS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(200_000);
+    let required_a = Pubkey::new_unique();
+    let required_b = Pubkey::new_unique();
+    let tx = test_transaction_with_static_accounts([required_a, required_b, Pubkey::new_unique()]);
+    let event = TransactionEventRef {
+        slot: 42,
+        commitment_status: TxCommitmentStatus::Processed,
+        confirmed_slot: None,
+        finalized_slot: None,
+        signature: Some(Signature::from([42_u8; 64])),
+        tx: &tx,
+        kind: TxKind::NonVote,
+    };
+
+    let manual_host = PluginHostBuilder::new()
+        .add_plugins((0..plugin_count).map(|_| ManualAccountMatchPlugin {
+            required_a,
+            required_b,
+        }))
+        .build();
+    let prefilter_host = PluginHostBuilder::new()
+        .add_plugins((0..plugin_count).map(|_| {
+            PrefilterTransactionPlugin {
+                filter: TransactionPrefilter::new(TransactionInterest::Critical)
+                    .with_account_required([required_a, required_b]),
+            }
+        }))
+        .build();
+
+    let manual_started_at = Instant::now();
+    let mut manual_hits = 0_usize;
+    for _ in 0..iterations {
+        manual_hits = manual_hits.saturating_add(usize::from(
+            !manual_host.classify_transaction_ref(event).is_empty(),
+        ));
+    }
+    let manual_elapsed = manual_started_at.elapsed();
+
+    let prefilter_started_at = Instant::now();
+    let mut prefilter_hits = 0_usize;
+    for _ in 0..iterations {
+        prefilter_hits = prefilter_hits.saturating_add(usize::from(
+            !prefilter_host.classify_transaction_ref(event).is_empty(),
+        ));
+    }
+    let prefilter_elapsed = prefilter_started_at.elapsed();
+
+    assert_eq!(manual_hits, prefilter_hits);
+    println!(
+        "transaction_prefilter_profile_fixture plugins={} iterations={} manual_us={} prefilter_us={}",
+        plugin_count,
+        iterations,
+        manual_elapsed.as_micros(),
+        prefilter_elapsed.as_micros()
+    );
+}
+
 fn wait_until_counter(counter: &AtomicUsize, expected: usize, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -822,4 +975,32 @@ fn test_transaction_event_with_signature(slot: u64, signature_seed: u8) -> Trans
         tx: Arc::new(tx),
         kind: TxKind::NonVote,
     }
+}
+
+fn test_transaction_with_static_accounts<const N: usize>(
+    accounts: [Pubkey; N],
+) -> solana_transaction::versioned::VersionedTransaction {
+    let instruction = Instruction {
+        program_id: Pubkey::new_unique(),
+        accounts: accounts
+            .into_iter()
+            .map(|pubkey| AccountMeta::new_readonly(pubkey, false))
+            .collect(),
+        data: Vec::new(),
+    };
+    solana_transaction::versioned::VersionedTransaction::from(Transaction::new_with_payer(
+        &[instruction],
+        None,
+    ))
+}
+
+fn tx_mentions_account_key(
+    tx: &solana_transaction::versioned::VersionedTransaction,
+    key: Pubkey,
+) -> bool {
+    tx.message.static_account_keys().contains(&key)
+        || tx
+            .message
+            .address_table_lookups()
+            .is_some_and(|lookups| lookups.iter().any(|lookup| lookup.account_key == key))
 }

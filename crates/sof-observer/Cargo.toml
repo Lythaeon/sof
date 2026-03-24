@@ -71,6 +71,7 @@ xdp = { version = "0.7.3", optional = true }
 
 [dev-dependencies]
 criterion = "0.5.1"
+solana-instruction = "3.1.0"
 
 [[example]]
 name = "non_vote_tx_logger"

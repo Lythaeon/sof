@@ -246,6 +246,15 @@ impl PluginHostBuilder {
                 .map(|subscription| subscription.inline_transaction)
                 .collect::<Vec<_>>(),
         );
+        let transaction_plugin_prefilters: Arc<[Option<crate::framework::TransactionPrefilter>]> =
+            Arc::from(
+                plugins
+                    .iter()
+                    .zip(plugin_subscriptions.iter())
+                    .filter(|(_plugin, subscription)| subscription.transaction)
+                    .map(|(plugin, _subscription)| plugin.transaction_prefilter().cloned())
+                    .collect::<Vec<_>>(),
+            );
         let transaction_batch_plugin_inline_preferences: Arc<[bool]> = Arc::from(
             plugin_subscriptions
                 .iter()
@@ -334,6 +343,7 @@ impl PluginHostBuilder {
             plugins,
             transaction_plugins,
             transaction_plugin_inline_preferences,
+            transaction_plugin_prefilters,
             transaction_batch_plugins,
             transaction_batch_plugin_inline_preferences,
             transaction_view_batch_plugins,
