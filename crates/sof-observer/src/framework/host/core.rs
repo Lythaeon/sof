@@ -386,8 +386,8 @@ impl PluginHost {
             }
             dispatch.push(
                 prefilter.as_ref().map_or_else(
-                    || plugin.transaction_interest_ref(event),
-                    |filter| filter.classify_ref(event),
+                    || plugin.transaction_interest_ref(&event),
+                    |filter| filter.classify_ref(&event),
                 ),
                 inline_requested,
                 Arc::clone(plugin),
@@ -504,7 +504,7 @@ impl PluginHost {
         }
         let mut selected = ClassifiedAccountTouchDispatch::empty();
         for plugin in self.account_touch_plugins.iter() {
-            if plugin.accepts_account_touch_ref(event) {
+            if plugin.accepts_account_touch_ref(&event) {
                 selected.push(Arc::clone(plugin));
             }
         }

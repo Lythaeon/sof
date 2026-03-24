@@ -272,7 +272,7 @@ pub struct TransactionEventRef<'event> {
 impl TransactionEventRef<'_> {
     /// Materializes one owned transaction event only when downstream actually needs it.
     #[must_use]
-    pub fn to_owned(self) -> TransactionEvent {
+    pub fn to_owned(&self) -> TransactionEvent {
         TransactionEvent {
             slot: self.slot,
             commitment_status: self.commitment_status,

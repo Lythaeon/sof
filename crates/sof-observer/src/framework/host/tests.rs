@@ -80,7 +80,7 @@ impl ObserverPlugin for InlineCriticalTransactionPlugin {
         PluginConfig::new().with_inline_transaction()
     }
 
-    fn transaction_interest_ref(&self, _event: TransactionEventRef<'_>) -> TransactionInterest {
+    fn transaction_interest_ref(&self, _event: &TransactionEventRef<'_>) -> TransactionInterest {
         TransactionInterest::Critical
     }
 }
@@ -98,7 +98,7 @@ impl ObserverPlugin for StandardCriticalTransactionPlugin {
         PluginConfig::new().with_transaction()
     }
 
-    fn transaction_interest_ref(&self, _event: TransactionEventRef<'_>) -> TransactionInterest {
+    fn transaction_interest_ref(&self, _event: &TransactionEventRef<'_>) -> TransactionInterest {
         TransactionInterest::Critical
     }
 }
@@ -266,7 +266,7 @@ impl ObserverPlugin for FilteringTransactionPlugin {
         PluginConfig::new().with_transaction()
     }
 
-    fn accepts_transaction_ref(&self, event: TransactionEventRef<'_>) -> bool {
+    fn accepts_transaction_ref(&self, event: &TransactionEventRef<'_>) -> bool {
         let accept = event.slot.is_multiple_of(2);
         if accept {
             self.accepted.fetch_add(1, Ordering::Relaxed);
@@ -276,7 +276,7 @@ impl ObserverPlugin for FilteringTransactionPlugin {
         accept
     }
 
-    fn transaction_interest_ref(&self, event: TransactionEventRef<'_>) -> TransactionInterest {
+    fn transaction_interest_ref(&self, event: &TransactionEventRef<'_>) -> TransactionInterest {
         if self.accepts_transaction_ref(event) {
             TransactionInterest::Critical
         } else {
@@ -306,7 +306,7 @@ impl ObserverPlugin for PriorityTransactionPlugin {
         PluginConfig::new().with_transaction()
     }
 
-    fn transaction_interest_ref(&self, event: TransactionEventRef<'_>) -> TransactionInterest {
+    fn transaction_interest_ref(&self, event: &TransactionEventRef<'_>) -> TransactionInterest {
         if event.slot.is_multiple_of(2) {
             TransactionInterest::Critical
         } else {
@@ -360,7 +360,7 @@ impl ObserverPlugin for ManualAccountMatchPlugin {
         PluginConfig::new().with_inline_transaction()
     }
 
-    fn transaction_interest_ref(&self, event: TransactionEventRef<'_>) -> TransactionInterest {
+    fn transaction_interest_ref(&self, event: &TransactionEventRef<'_>) -> TransactionInterest {
         let has_a = tx_mentions_account_key(event.tx, self.required_a);
         let has_b = tx_mentions_account_key(event.tx, self.required_b);
         if has_a && has_b {

@@ -928,7 +928,7 @@ fn process_decoded_transaction(
             .is_some_and(|dispatch| !dispatch.is_empty())
     {
         Some(
-            crate::framework::plugin::clone_cached_transaction_event(transaction_event_ref)
+            crate::framework::plugin::clone_cached_transaction_event(&transaction_event_ref)
                 .unwrap_or_else(|| TransactionEvent {
                     slot: config.slot,
                     commitment_status: config.commitment_status,

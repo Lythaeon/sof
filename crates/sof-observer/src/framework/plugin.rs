@@ -28,7 +28,7 @@ thread_local! {
     static CACHED_TRANSACTION_EVENT: RefCell<Option<CachedTransactionEvent>> = const { RefCell::new(None) };
 }
 
-fn cached_transaction_event_key(event: TransactionEventRef<'_>) -> CachedTransactionEventKey {
+fn cached_transaction_event_key(event: &TransactionEventRef<'_>) -> CachedTransactionEventKey {
     CachedTransactionEventKey {
         slot: event.slot,
         signature: event.signature,
@@ -38,7 +38,7 @@ fn cached_transaction_event_key(event: TransactionEventRef<'_>) -> CachedTransac
 }
 
 fn with_cached_transaction_event<R>(
-    event: TransactionEventRef<'_>,
+    event: &TransactionEventRef<'_>,
     f: impl FnOnce(&TransactionEvent) -> R,
 ) -> R {
     let key = cached_transaction_event_key(event);
@@ -62,7 +62,7 @@ fn with_cached_transaction_event<R>(
 }
 
 pub(crate) fn clone_cached_transaction_event(
-    event: TransactionEventRef<'_>,
+    event: &TransactionEventRef<'_>,
 ) -> Option<TransactionEvent> {
     let key = cached_transaction_event_key(event);
     CACHED_TRANSACTION_EVENT.with(|cached| {
@@ -176,7 +176,7 @@ impl TransactionPrefilter {
 
     /// Returns the matched interest or [`TransactionInterest::Ignore`].
     #[must_use]
-    pub fn classify_ref(&self, event: TransactionEventRef<'_>) -> TransactionInterest {
+    pub fn classify_ref(&self, event: &TransactionEventRef<'_>) -> TransactionInterest {
         if let Some(signature) = self.signature
             && event.signature != Some(signature)
         {
@@ -553,7 +553,7 @@ pub trait ObserverPlugin: Send + Sync + 'static {
     ///
     /// Plugins that only need borrowed fields should prefer this hook over
     /// [`Self::accepts_transaction`].
-    fn accepts_transaction_ref(&self, event: TransactionEventRef<'_>) -> bool {
+    fn accepts_transaction_ref(&self, event: &TransactionEventRef<'_>) -> bool {
         with_cached_transaction_event(event, |owned| self.accepts_transaction(owned))
     }
 
@@ -576,7 +576,7 @@ pub trait ObserverPlugin: Send + Sync + 'static {
     ///
     /// Priority-sensitive plugins should implement this hook directly so the
     /// dataset hot path can classify traffic without allocating.
-    fn transaction_interest_ref(&self, event: TransactionEventRef<'_>) -> TransactionInterest {
+    fn transaction_interest_ref(&self, event: &TransactionEventRef<'_>) -> TransactionInterest {
         with_cached_transaction_event(event, |owned| self.transaction_interest(owned))
     }
 
@@ -627,7 +627,7 @@ pub trait ObserverPlugin: Send + Sync + 'static {
     ///
     /// Override this to reject irrelevant account-touch callbacks before the
     /// runtime allocates owned account-key vectors.
-    fn accepts_account_touch_ref(&self, _event: AccountTouchEventRef<'_>) -> bool {
+    fn accepts_account_touch_ref(&self, _event: &AccountTouchEventRef<'_>) -> bool {
         true
     }
 
