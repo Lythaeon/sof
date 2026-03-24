@@ -355,7 +355,7 @@ pub(super) enum AcceptedTransactionDispatch {
     /// Multiple interested plugins share the same event payload.
     Multi {
         /// Interested plugins.
-        plugins: Arc<[Arc<dyn ObserverPlugin>]>,
+        plugins: SmallVec<[Arc<dyn ObserverPlugin>; 2]>,
         /// Accepted transaction payload.
         event: Arc<TransactionEvent>,
         /// Time when the completed dataset became available to runtime processing.
@@ -606,7 +606,7 @@ impl AcceptedTransactionDispatch {
                 dataset_tx_position,
             }),
             _ => Some(Self::Multi {
-                plugins: Arc::from(plugins.into_vec()),
+                plugins,
                 event,
                 completed_at,
                 first_shred_observed_at,
@@ -867,7 +867,7 @@ pub(super) enum SelectedAccountTouchDispatch {
     /// Multiple interested plugins share the same event payload.
     Multi {
         /// Selected plugin callback targets.
-        plugins: Arc<[Arc<dyn ObserverPlugin>]>,
+        plugins: SmallVec<[Arc<dyn ObserverPlugin>; 2]>,
         /// Shared event payload for the selected plugin batch.
         event: Arc<AccountTouchEvent>,
     },
@@ -937,7 +937,7 @@ impl SelectedAccountTouchDispatch {
                 Some(Self::Single { plugin, event })
             }
             ClassifiedAccountTouchDispatch::Multi { plugins } => Some(Self::Multi {
-                plugins: Arc::from(plugins.into_vec()),
+                plugins,
                 event: Arc::new(event),
             }),
         }
