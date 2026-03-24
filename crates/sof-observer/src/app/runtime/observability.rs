@@ -538,6 +538,66 @@ fn render_metrics(
     );
     append_metric_family(
         &mut buffer,
+        "sof_inline_reassembler_data_shreds_total",
+        "Data shreds observed by the dedicated inline reassembler path.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_inline_reassembler_data_shreds_total",
+        snapshot.inline_reassembler_data_shreds_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_inline_reassembler_recovered_data_shreds_total",
+        "Recovered data shreds observed by the dedicated inline reassembler path.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_inline_reassembler_recovered_data_shreds_total",
+        snapshot.inline_reassembler_recovered_data_shreds_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_inline_reassembler_code_shreds_total",
+        "Code shreds observed by the dedicated inline reassembler path.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_inline_reassembler_code_shreds_total",
+        snapshot.inline_reassembler_code_shreds_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_inline_reassembler_fec_sets_ready_total",
+        "FEC sets that became fully ready in the dedicated inline reassembler path.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_inline_reassembler_fec_sets_ready_total",
+        snapshot.inline_reassembler_fec_sets_ready_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_inline_reassembler_ranges_retired_total",
+        "Completed ranges retired from the dedicated inline reassembler path.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_inline_reassembler_ranges_retired_total",
+        snapshot.inline_reassembler_ranges_retired_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
         "sof_decoded_datasets_total",
         "Completed datasets successfully decoded into entries.",
         PrometheusMetricType::Counter,
@@ -634,6 +694,683 @@ fn render_metrics(
     );
     append_metric_family(
         &mut buffer,
+        "sof_transaction_plugin_visibility_samples_total",
+        "Transaction plugin callbacks observed for visibility-lag tracking.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_transaction_plugin_visibility_samples_total",
+        snapshot.transaction_plugin_visibility_samples_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_transaction_plugin_visibility_lag_us_total",
+        "Total accumulated lag in microseconds from completed-dataset emission to transaction plugin callback start.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_transaction_plugin_visibility_lag_us_total",
+        snapshot.transaction_plugin_visibility_lag_us_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_latest_transaction_plugin_visibility_lag_us",
+        "Lag in microseconds from completed-dataset emission to the most recent transaction plugin callback start.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_latest_transaction_plugin_visibility_lag_us",
+        snapshot.latest_transaction_plugin_visibility_lag_us,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_max_transaction_plugin_visibility_lag_us",
+        "Maximum lag in microseconds from completed-dataset emission to transaction plugin callback start observed since startup.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_max_transaction_plugin_visibility_lag_us",
+        snapshot.max_transaction_plugin_visibility_lag_us,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_transaction_plugin_queue_wait_us_total",
+        "Total accumulated queue wait in microseconds from completed-dataset emission to transaction worker dequeue.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_transaction_plugin_queue_wait_us_total",
+        snapshot.transaction_plugin_queue_wait_us_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_latest_transaction_plugin_queue_wait_us",
+        "Queue wait in microseconds from completed-dataset emission to the most recent transaction worker dequeue.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_latest_transaction_plugin_queue_wait_us",
+        snapshot.latest_transaction_plugin_queue_wait_us,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_max_transaction_plugin_queue_wait_us",
+        "Maximum queue wait in microseconds from completed-dataset emission to transaction worker dequeue observed since startup.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_max_transaction_plugin_queue_wait_us",
+        snapshot.max_transaction_plugin_queue_wait_us,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_transaction_plugin_callback_duration_us_total",
+        "Total accumulated transaction plugin callback execution time in microseconds after dequeue.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_transaction_plugin_callback_duration_us_total",
+        snapshot.transaction_plugin_callback_duration_us_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_latest_transaction_plugin_callback_duration_us",
+        "Callback execution time in microseconds for the most recent transaction plugin fanout after dequeue.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_latest_transaction_plugin_callback_duration_us",
+        snapshot.latest_transaction_plugin_callback_duration_us,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_max_transaction_plugin_callback_duration_us",
+        "Maximum transaction plugin callback execution time in microseconds observed since startup.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_max_transaction_plugin_callback_duration_us",
+        snapshot.max_transaction_plugin_callback_duration_us,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_inline_transaction_plugin_latency_samples_total",
+        "Inline transaction plugin callbacks observed for exact ingress-to-callback latency tracking.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_inline_transaction_plugin_latency_samples_total",
+        snapshot.inline_transaction_plugin_latency_samples_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_inline_transaction_plugin_first_shred_lag_us_total",
+        "Total accumulated lag in microseconds from first shred observation to inline transaction plugin callback start.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_inline_transaction_plugin_first_shred_lag_us_total",
+        snapshot.inline_transaction_plugin_first_shred_lag_us_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_latest_inline_transaction_plugin_first_shred_lag_us",
+        "Lag in microseconds from first shred observation to the most recent inline transaction plugin callback start.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_latest_inline_transaction_plugin_first_shred_lag_us",
+        snapshot.latest_inline_transaction_plugin_first_shred_lag_us,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_max_inline_transaction_plugin_first_shred_lag_us",
+        "Maximum lag in microseconds from first shred observation to inline transaction plugin callback start observed since startup.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_max_inline_transaction_plugin_first_shred_lag_us",
+        snapshot.max_inline_transaction_plugin_first_shred_lag_us,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_inline_transaction_plugin_last_shred_lag_us_total",
+        "Total accumulated lag in microseconds from last shred observation to inline transaction plugin callback start.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_inline_transaction_plugin_last_shred_lag_us_total",
+        snapshot.inline_transaction_plugin_last_shred_lag_us_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_latest_inline_transaction_plugin_last_shred_lag_us",
+        "Lag in microseconds from last shred observation to the most recent inline transaction plugin callback start.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_latest_inline_transaction_plugin_last_shred_lag_us",
+        snapshot.latest_inline_transaction_plugin_last_shred_lag_us,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_max_inline_transaction_plugin_last_shred_lag_us",
+        "Maximum lag in microseconds from last shred observation to inline transaction plugin callback start observed since startup.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_max_inline_transaction_plugin_last_shred_lag_us",
+        snapshot.max_inline_transaction_plugin_last_shred_lag_us,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_inline_transaction_plugin_completed_dataset_lag_us_total",
+        "Total accumulated lag in microseconds from completed-dataset emission to inline transaction plugin callback start.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_inline_transaction_plugin_completed_dataset_lag_us_total",
+        snapshot.inline_transaction_plugin_completed_dataset_lag_us_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_latest_inline_transaction_plugin_completed_dataset_lag_us",
+        "Lag in microseconds from completed-dataset emission to the most recent inline transaction plugin callback start.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_latest_inline_transaction_plugin_completed_dataset_lag_us",
+        snapshot.latest_inline_transaction_plugin_completed_dataset_lag_us,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_max_inline_transaction_plugin_completed_dataset_lag_us",
+        "Maximum lag in microseconds from completed-dataset emission to inline transaction plugin callback start observed since startup.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_max_inline_transaction_plugin_completed_dataset_lag_us",
+        snapshot.max_inline_transaction_plugin_completed_dataset_lag_us,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_inline_transaction_plugin_source_latency_samples_total",
+        "Inline transaction plugin callbacks observed by inline source path.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_inline_transaction_plugin_source_latency_samples_total",
+        snapshot.inline_transaction_plugin_early_prefix_latency_samples_total,
+        Some(&[(
+            "source",
+            crate::framework::host::InlineTransactionDispatchSource::EarlyPrefix.as_str(),
+        )]),
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_inline_transaction_plugin_source_latency_samples_total",
+        snapshot.inline_transaction_plugin_completed_dataset_fallback_latency_samples_total,
+        Some(&[(
+            "source",
+            crate::framework::host::InlineTransactionDispatchSource::CompletedDatasetFallback
+                .as_str(),
+        )]),
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_inline_transaction_plugin_source_first_shred_lag_us_total",
+        "Total accumulated inline transaction lag in microseconds from first shred observation to callback start, split by inline source path.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_inline_transaction_plugin_source_first_shred_lag_us_total",
+        snapshot.inline_transaction_plugin_early_prefix_first_shred_lag_us_total,
+        Some(&[(
+            "source",
+            crate::framework::host::InlineTransactionDispatchSource::EarlyPrefix.as_str(),
+        )]),
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_inline_transaction_plugin_source_first_shred_lag_us_total",
+        snapshot.inline_transaction_plugin_completed_dataset_fallback_first_shred_lag_us_total,
+        Some(&[(
+            "source",
+            crate::framework::host::InlineTransactionDispatchSource::CompletedDatasetFallback
+                .as_str(),
+        )]),
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_inline_transaction_plugin_source_last_shred_lag_us_total",
+        "Total accumulated inline transaction lag in microseconds from last shred observation to callback start, split by inline source path.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_inline_transaction_plugin_source_last_shred_lag_us_total",
+        snapshot.inline_transaction_plugin_early_prefix_last_shred_lag_us_total,
+        Some(&[(
+            "source",
+            crate::framework::host::InlineTransactionDispatchSource::EarlyPrefix.as_str(),
+        )]),
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_inline_transaction_plugin_source_last_shred_lag_us_total",
+        snapshot.inline_transaction_plugin_completed_dataset_fallback_last_shred_lag_us_total,
+        Some(&[(
+            "source",
+            crate::framework::host::InlineTransactionDispatchSource::CompletedDatasetFallback
+                .as_str(),
+        )]),
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_inline_transaction_plugin_source_completed_dataset_lag_us_total",
+        "Total accumulated inline transaction lag in microseconds from reconstructability to callback start, split by inline source path.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_inline_transaction_plugin_source_completed_dataset_lag_us_total",
+        snapshot.inline_transaction_plugin_early_prefix_completed_dataset_lag_us_total,
+        Some(&[(
+            "source",
+            crate::framework::host::InlineTransactionDispatchSource::EarlyPrefix.as_str(),
+        )]),
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_inline_transaction_plugin_source_completed_dataset_lag_us_total",
+        snapshot
+            .inline_transaction_plugin_completed_dataset_fallback_completed_dataset_lag_us_total,
+        Some(&[(
+            "source",
+            crate::framework::host::InlineTransactionDispatchSource::CompletedDatasetFallback
+                .as_str(),
+        )]),
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_transaction_batch_plugin_visibility_samples_total",
+        "Total completed-dataset transaction-batch callbacks observed for visibility-lag tracking.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_transaction_batch_plugin_visibility_samples_total",
+        snapshot.transaction_batch_plugin_visibility_samples_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_transaction_batch_plugin_visibility_lag_us_total",
+        "Total accumulated lag in microseconds from completed-dataset emission to transaction-batch callback start.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_transaction_batch_plugin_visibility_lag_us_total",
+        snapshot.transaction_batch_plugin_visibility_lag_us_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_latest_transaction_batch_plugin_visibility_lag_us",
+        "Lag in microseconds from completed-dataset emission to the most recent transaction-batch callback start.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_latest_transaction_batch_plugin_visibility_lag_us",
+        snapshot.latest_transaction_batch_plugin_visibility_lag_us,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_max_transaction_batch_plugin_visibility_lag_us",
+        "Maximum lag in microseconds from completed-dataset emission to transaction-batch callback start observed since startup.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_max_transaction_batch_plugin_visibility_lag_us",
+        snapshot.max_transaction_batch_plugin_visibility_lag_us,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_transaction_batch_plugin_callback_duration_us_total",
+        "Total accumulated transaction-batch callback execution time in microseconds after dequeue.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_transaction_batch_plugin_callback_duration_us_total",
+        snapshot.transaction_batch_plugin_callback_duration_us_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_latest_transaction_batch_plugin_callback_duration_us",
+        "Callback execution time in microseconds for the most recent transaction-batch callback after dequeue.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_latest_transaction_batch_plugin_callback_duration_us",
+        snapshot.latest_transaction_batch_plugin_callback_duration_us,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_max_transaction_batch_plugin_callback_duration_us",
+        "Maximum transaction-batch callback execution time in microseconds observed since startup.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_max_transaction_batch_plugin_callback_duration_us",
+        snapshot.max_transaction_batch_plugin_callback_duration_us,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_transaction_view_batch_plugin_visibility_samples_total",
+        "Total completed-dataset transaction-view-batch callbacks observed for visibility-lag tracking.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_transaction_view_batch_plugin_visibility_samples_total",
+        snapshot.transaction_view_batch_plugin_visibility_samples_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_transaction_view_batch_plugin_visibility_lag_us_total",
+        "Total accumulated lag in microseconds from completed-dataset emission to transaction-view-batch callback start.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_transaction_view_batch_plugin_visibility_lag_us_total",
+        snapshot.transaction_view_batch_plugin_visibility_lag_us_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_latest_transaction_view_batch_plugin_visibility_lag_us",
+        "Lag in microseconds from completed-dataset emission to the most recent transaction-view-batch callback start.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_latest_transaction_view_batch_plugin_visibility_lag_us",
+        snapshot.latest_transaction_view_batch_plugin_visibility_lag_us,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_max_transaction_view_batch_plugin_visibility_lag_us",
+        "Maximum lag in microseconds from completed-dataset emission to transaction-view-batch callback start observed since startup.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_max_transaction_view_batch_plugin_visibility_lag_us",
+        snapshot.max_transaction_view_batch_plugin_visibility_lag_us,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_transaction_view_batch_plugin_callback_duration_us_total",
+        "Total accumulated transaction-view-batch callback execution time in microseconds after dequeue.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_transaction_view_batch_plugin_callback_duration_us_total",
+        snapshot.transaction_view_batch_plugin_callback_duration_us_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_latest_transaction_view_batch_plugin_callback_duration_us",
+        "Callback execution time in microseconds for the most recent transaction-view-batch callback after dequeue.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_latest_transaction_view_batch_plugin_callback_duration_us",
+        snapshot.latest_transaction_view_batch_plugin_callback_duration_us,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_max_transaction_view_batch_plugin_callback_duration_us",
+        "Maximum transaction-view-batch callback execution time in microseconds observed since startup.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_max_transaction_view_batch_plugin_callback_duration_us",
+        snapshot.max_transaction_view_batch_plugin_callback_duration_us,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_transaction_plugin_first_in_dataset_samples_total",
+        "Total transaction plugin callbacks observed for the first decoded transaction in a completed dataset.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_transaction_plugin_first_in_dataset_samples_total",
+        snapshot.transaction_plugin_first_in_dataset_samples_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_transaction_plugin_first_in_dataset_queue_wait_us_total",
+        "Total accumulated queue wait in microseconds for first-in-dataset transaction callbacks.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_transaction_plugin_first_in_dataset_queue_wait_us_total",
+        snapshot.transaction_plugin_first_in_dataset_queue_wait_us_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_max_transaction_plugin_first_in_dataset_queue_wait_us",
+        "Maximum queue wait in microseconds observed for first-in-dataset transaction callbacks.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_max_transaction_plugin_first_in_dataset_queue_wait_us",
+        snapshot.max_transaction_plugin_first_in_dataset_queue_wait_us,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_transaction_plugin_nonfirst_in_dataset_samples_total",
+        "Total transaction plugin callbacks observed for non-first decoded transactions in a completed dataset.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_transaction_plugin_nonfirst_in_dataset_samples_total",
+        snapshot.transaction_plugin_nonfirst_in_dataset_samples_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_transaction_plugin_nonfirst_in_dataset_queue_wait_us_total",
+        "Total accumulated queue wait in microseconds for non-first transaction callbacks in a completed dataset.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_transaction_plugin_nonfirst_in_dataset_queue_wait_us_total",
+        snapshot.transaction_plugin_nonfirst_in_dataset_queue_wait_us_total,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_max_transaction_plugin_nonfirst_in_dataset_queue_wait_us",
+        "Maximum queue wait in microseconds observed for non-first transaction callbacks in a completed dataset.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_max_transaction_plugin_nonfirst_in_dataset_queue_wait_us",
+        snapshot.max_transaction_plugin_nonfirst_in_dataset_queue_wait_us,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_latest_transaction_dataset_tx_position",
+        "Zero-based dataset-local position of the most recent transaction callback sample.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_latest_transaction_dataset_tx_position",
+        snapshot.latest_transaction_dataset_tx_position,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_max_transaction_dataset_tx_position",
+        "Maximum zero-based dataset-local transaction position observed since startup.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_max_transaction_dataset_tx_position",
+        snapshot.max_transaction_dataset_tx_position,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_latest_transaction_dataset_tx_count",
+        "Decoded transaction count in the completed dataset that produced the most recent transaction callback sample.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_latest_transaction_dataset_tx_count",
+        snapshot.latest_transaction_dataset_tx_count,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_max_transaction_dataset_tx_count",
+        "Maximum decoded transaction count observed for a completed dataset carrying transaction callbacks since startup.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_max_transaction_dataset_tx_count",
+        snapshot.max_transaction_dataset_tx_count,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_latest_dataset_worker_start_lag_ms",
+        "Lag in milliseconds from completed-dataset emission to dataset processing start for the most recent dataset job. Inline transaction dispatch reports the same timing for immediate inline processing.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_latest_dataset_worker_start_lag_ms",
+        snapshot.latest_dataset_worker_start_lag_ms,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_max_dataset_worker_start_lag_ms",
+        "Maximum lag in milliseconds from completed-dataset emission to dataset processing start observed since startup.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_max_dataset_worker_start_lag_ms",
+        snapshot.max_dataset_worker_start_lag_ms,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_latest_dataset_processing_duration_us",
+        "Processing duration in microseconds for the most recent completed dataset job.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_latest_dataset_processing_duration_us",
+        snapshot.latest_dataset_processing_duration_us,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_max_dataset_processing_duration_us",
+        "Maximum dataset processing duration in microseconds observed since startup.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_max_dataset_processing_duration_us",
+        snapshot.max_dataset_processing_duration_us,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
         "sof_latest_shred_age_ms",
         "Age in milliseconds of the most recent canonical shred observed by the runtime.",
         PrometheusMetricType::Gauge,
@@ -647,13 +1384,25 @@ fn render_metrics(
     append_metric_family(
         &mut buffer,
         "sof_latest_dataset_age_ms",
-        "Age in milliseconds of the most recent reconstructed dataset observed by the runtime.",
+        "Age in milliseconds since the runtime last observed a reconstructed dataset emitted by reassembly.",
         PrometheusMetricType::Gauge,
     );
     append_metric_value(
         &mut buffer,
         "sof_latest_dataset_age_ms",
         snapshot.latest_dataset_age_ms,
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_latest_substantial_dataset_age_ms",
+        "Age in milliseconds since the runtime last observed a substantial reconstructed dataset emitted by reassembly.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_latest_substantial_dataset_age_ms",
+        snapshot.latest_substantial_dataset_age_ms,
         None,
     );
     append_metric_family(
@@ -1691,6 +2440,7 @@ mod tests {
         assert!(metrics.contains("sof_latest_shred_age_ms "));
         assert!(metrics.contains("sof_udp_relay_forwarded_packets_total "));
         assert!(metrics.contains("sof_repair_requests_total "));
+        assert!(metrics.contains("sof_inline_transaction_plugin_source_latency_samples_total"));
     }
 
     #[tokio::test(flavor = "current_thread")]

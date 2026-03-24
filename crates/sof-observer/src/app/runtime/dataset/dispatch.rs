@@ -1,6 +1,11 @@
 use super::*;
+use crate::framework::host::TransactionDispatchScope;
 use std::num::NonZeroUsize;
 use std::sync::{OnceLock, atomic::AtomicBool};
+
+/// Caps per-worker burst size so one hot dispatch turn cannot create a large
+/// head-of-line stall inside a single queued job.
+const MAX_COMPLETED_DATASETS_PER_JOB: usize = 4;
 
 /// Reassembled dataset payload scheduled onto one dataset worker queue.
 struct CompletedDatasetJobItem {
@@ -8,6 +13,9 @@ struct CompletedDatasetJobItem {
     start_index: u32,
     end_index: u32,
     last_in_slot: bool,
+    completed_at: Instant,
+    first_shred_observed_at: Instant,
+    last_shred_observed_at: Instant,
     payload_fragments: crate::reassembly::dataset::PayloadFragmentBatch,
 }
 
@@ -158,6 +166,7 @@ pub(in crate::app::runtime) struct DatasetWorkerConfig {
 pub(in crate::app::runtime) struct DatasetWorkerShared {
     pub(in crate::app::runtime) derived_state_host: DerivedStateHost,
     pub(in crate::app::runtime) plugin_host: PluginHost,
+    pub(in crate::app::runtime) transaction_dispatch_scope: TransactionDispatchScope,
     pub(in crate::app::runtime) tx_event_tx: mpsc::Sender<TxObservedEvent>,
     pub(in crate::app::runtime) tx_commitment_tracker: Arc<CommitmentSlotTracker>,
     pub(in crate::app::runtime) tx_event_drop_count: Arc<AtomicU64>,
@@ -191,6 +200,7 @@ pub(in crate::app::runtime) fn spawn_dataset_workers(
         let dataset_jobs_completed_count = shared.dataset_jobs_completed_count.clone();
         let derived_state_host = shared.derived_state_host.clone();
         let plugin_host = shared.plugin_host.clone();
+        let transaction_dispatch_scope = shared.transaction_dispatch_scope;
         let attempt_cache_capacity = config.attempt_cache_capacity;
         let attempt_success_ttl = config.attempt_success_ttl;
         let attempt_failure_ttl = config.attempt_failure_ttl;
@@ -229,18 +239,28 @@ pub(in crate::app::runtime) fn spawn_dataset_workers(
                                 continue;
                             }
                             let _ = dataset_jobs_started_count.fetch_add(1, Ordering::Relaxed);
-                            crate::runtime_metrics::observe_dataset_job_started();
+                            crate::runtime_metrics::observe_dataset_job_started(
+                                u64::try_from(
+                                    now.saturating_duration_since(item.completed_at).as_millis(),
+                                )
+                                .unwrap_or(u64::MAX),
+                            );
+                            let processing_started_at = Instant::now();
                             let outcome = process::process_completed_dataset(
                                 process::DatasetProcessInput {
                                     slot: item.slot,
                                     start_index: item.start_index,
                                     end_index: item.end_index,
                                     last_in_slot: item.last_in_slot,
+                                    completed_at: item.completed_at,
+                                    first_shred_observed_at: item.first_shred_observed_at,
+                                    last_shred_observed_at: item.last_shred_observed_at,
                                     payload_fragments: item.payload_fragments,
                                 },
                                 &process::DatasetProcessContext {
                                     derived_state_host: &derived_state_host,
                                     plugin_host: &plugin_host,
+                                    transaction_dispatch_scope,
                                     tx_event_tx: &tx_event_tx,
                                     tx_commitment_tracker: tx_commitment_tracker.as_ref(),
                                     tx_event_drop_count: tx_event_drop_count.as_ref(),
@@ -254,7 +274,10 @@ pub(in crate::app::runtime) fn spawn_dataset_workers(
                                 &mut scratch,
                             );
                             let _ = dataset_jobs_completed_count.fetch_add(1, Ordering::Relaxed);
-                            crate::runtime_metrics::observe_dataset_job_completed();
+                            crate::runtime_metrics::observe_dataset_job_completed(
+                                u64::try_from(processing_started_at.elapsed().as_micros())
+                                    .unwrap_or(u64::MAX),
+                            );
                             attempt_cache.record(cache_key, now, outcome.status());
                         }
                     }
@@ -287,6 +310,7 @@ pub(in crate::app::runtime) fn spawn_dataset_workers(
 pub(in crate::app::runtime) fn dispatch_completed_dataset(
     dataset_dispatch: &[DatasetDispatchQueue],
     completed_datasets: Vec<crate::reassembly::dataset::CompletedDataSet>,
+    observed_at: Instant,
     dataset_jobs_enqueued_count: &AtomicU64,
     dataset_queue_drop_count: &AtomicU64,
 ) {
@@ -309,6 +333,9 @@ pub(in crate::app::runtime) fn dispatch_completed_dataset(
                 start_index: dataset.start_index,
                 end_index: dataset.end_index,
                 last_in_slot: dataset.last_in_slot,
+                completed_at: observed_at,
+                first_shred_observed_at: dataset.first_shred_observed_at,
+                last_shred_observed_at: dataset.last_shred_observed_at,
                 payload_fragments: dataset.payload_fragments,
             });
         }
@@ -317,11 +344,23 @@ pub(in crate::app::runtime) fn dispatch_completed_dataset(
         if items.is_empty() {
             continue;
         }
-        let item_count = u64::try_from(items.len()).unwrap_or(u64::MAX);
         let Some(queue) = dataset_dispatch.get(worker_index) else {
             continue;
         };
-        let overwritten = queue.push_overwrite_oldest(CompletedDatasetJob { items });
+        let item_count = u64::try_from(items.len()).unwrap_or(u64::MAX);
+        let mut overwritten = 0_u64;
+        let mut items = items.into_iter();
+        loop {
+            let chunk = items
+                .by_ref()
+                .take(MAX_COMPLETED_DATASETS_PER_JOB)
+                .collect::<Vec<_>>();
+            if chunk.is_empty() {
+                break;
+            }
+            overwritten = overwritten
+                .saturating_add(queue.push_overwrite_oldest(CompletedDatasetJob { items: chunk }));
+        }
         let _ = dataset_jobs_enqueued_count.fetch_add(item_count, Ordering::Relaxed);
         crate::runtime_metrics::observe_dataset_jobs_enqueued(item_count);
         if overwritten > 0 {
@@ -443,6 +482,7 @@ impl DatasetProcessOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reassembly::dataset::CompletedDataSet;
 
     fn build_job(slot: u64, start_index: u32, end_index: u32) -> CompletedDatasetJob {
         CompletedDatasetJob {
@@ -456,6 +496,9 @@ mod tests {
             start_index,
             end_index,
             last_in_slot: false,
+            completed_at: Instant::now(),
+            first_shred_observed_at: Instant::now(),
+            last_shred_observed_at: Instant::now(),
             payload_fragments:
                 crate::reassembly::dataset::PayloadFragmentBatch::from_owned_fragments(vec![
                     vec![0_u8; 1],
@@ -508,6 +551,52 @@ mod tests {
         assert_eq!(queue.len(), 2);
         let _ = queue.pop();
         assert_eq!(queue.len(), 0);
+    }
+
+    fn build_completed_dataset(slot: u64, start_index: u32, end_index: u32) -> CompletedDataSet {
+        CompletedDataSet {
+            slot,
+            start_index,
+            end_index,
+            payload_fragments:
+                crate::reassembly::dataset::PayloadFragmentBatch::from_owned_fragments(vec![
+                    vec![0_u8; 1],
+                ]),
+            last_in_slot: false,
+            first_shred_observed_at: Instant::now(),
+            last_shred_observed_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn dispatch_completed_dataset_splits_large_worker_bursts() {
+        let queue = DatasetDispatchQueue::new(8);
+        let dispatch = vec![queue.clone()];
+        let datasets = (0_u32..9)
+            .map(|index| build_completed_dataset(7, index, index))
+            .collect::<Vec<_>>();
+        let enqueued = AtomicU64::new(0);
+        let dropped = AtomicU64::new(0);
+
+        dispatch_completed_dataset(&dispatch, datasets, Instant::now(), &enqueued, &dropped);
+
+        assert_eq!(enqueued.load(Ordering::Relaxed), 9);
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(queue.len(), 9);
+
+        let Some(first) = queue.pop() else {
+            panic!("expected first queued dataset job");
+        };
+        let Some(second) = queue.pop() else {
+            panic!("expected second queued dataset job");
+        };
+        let Some(third) = queue.pop() else {
+            panic!("expected third queued dataset job");
+        };
+        assert_eq!(first.items.len(), MAX_COMPLETED_DATASETS_PER_JOB);
+        assert_eq!(second.items.len(), MAX_COMPLETED_DATASETS_PER_JOB);
+        assert_eq!(third.items.len(), 1);
+        assert!(queue.pop().is_none());
     }
 
     #[test]

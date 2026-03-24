@@ -7,11 +7,24 @@ use super::packet_workers::{
     PacketWorkerPoolConfig, WorkerAcceptedShred, WorkerAcceptedShredKind,
 };
 use super::*;
+use crate::framework::host::TransactionDispatchScope;
+use crate::framework::{SerializedTransactionRange, TransactionEvent, events::TransactionEventRef};
 use crate::reassembly::dataset::CompletedDataSet;
+use crate::reassembly::inline::InlineContiguousDataSetSink;
+use crate::relay::CacheInsertOutcome;
+use crossbeam_channel::Sender as CrossbeamSender;
+use solana_signature::Signature;
+use solana_transaction::versioned::VersionedTransaction;
+#[cfg(feature = "gossip-bootstrap")]
+use std::collections::VecDeque;
 use std::{
     future::Future,
     net::{IpAddr, Ipv4Addr},
     pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use thiserror::Error;
 
@@ -40,6 +53,124 @@ const CONTROL_PLANE_EVENT_TICK_MS: u64 = 250;
 const CONTROL_PLANE_EVENT_SNAPSHOT_SECS: u64 = 30;
 const PACKET_WORKER_QUEUE_OVERFLOW_POLICY: &str = "drop_newest";
 const PACKET_WORKER_FEC_PRESSURE_DIVISOR: u64 = 8;
+
+#[derive(Debug)]
+struct RelayCacheInsertRequest {
+    packet_bytes: Arc<[u8]>,
+    parsed_shred: ParsedShredHeader,
+    observed_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct RelayCacheInsertCounters {
+    inserts: AtomicU64,
+    replacements: AtomicU64,
+    evictions: AtomicU64,
+}
+
+impl RelayCacheInsertCounters {
+    fn observe(&self, outcome: CacheInsertOutcome) {
+        if outcome.inserted {
+            self.inserts.fetch_add(1, Ordering::Relaxed);
+        }
+        if outcome.replaced {
+            self.replacements.fetch_add(1, Ordering::Relaxed);
+        }
+        self.evictions.fetch_add(
+            u64::try_from(outcome.evicted).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.inserts.load(Ordering::Relaxed),
+            self.replacements.load(Ordering::Relaxed),
+            self.evictions.load(Ordering::Relaxed),
+        )
+    }
+}
+
+fn spawn_relay_cache_insert_worker(
+    relay_cache: SharedRelayCache,
+) -> (
+    CrossbeamSender<Vec<RelayCacheInsertRequest>>,
+    Arc<RelayCacheInsertCounters>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (tx, rx) = crossbeam_channel::unbounded::<Vec<RelayCacheInsertRequest>>();
+    let counters = Arc::new(RelayCacheInsertCounters::default());
+    let worker_counters = Arc::clone(&counters);
+    let handle = tokio::task::spawn_blocking(move || {
+        while let Ok(batch) = rx.recv() {
+            for request in batch {
+                let outcome = relay_cache.insert(
+                    request.packet_bytes.as_ref(),
+                    &request.parsed_shred,
+                    request.observed_at,
+                );
+                worker_counters.observe(outcome);
+            }
+        }
+    });
+    (tx, counters, handle)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InlineTransactionDispatchMode {
+    Disabled,
+    ExclusiveDatasetProcessing,
+    MixedWithDatasetWorkers,
+}
+
+impl InlineTransactionDispatchMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::ExclusiveDatasetProcessing => "exclusive_dataset",
+            Self::MixedWithDatasetWorkers => "mixed_inline_plus_workers",
+        }
+    }
+}
+
+const fn select_inline_transaction_dispatch_mode(
+    requested: bool,
+    inline_consumers: bool,
+    worker_processing_required: bool,
+) -> InlineTransactionDispatchMode {
+    if !requested || !inline_consumers {
+        return InlineTransactionDispatchMode::Disabled;
+    }
+    if worker_processing_required {
+        InlineTransactionDispatchMode::MixedWithDatasetWorkers
+    } else {
+        InlineTransactionDispatchMode::ExclusiveDatasetProcessing
+    }
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+enum DeferredControlPlaneEvent {
+    ClusterTopology(ClusterTopologyEvent),
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+impl DeferredControlPlaneEvent {
+    fn dispatch(
+        self,
+        plugin_host: &PluginHost,
+        derived_state_host: &DerivedStateHost,
+        derived_state_hooks_enabled: bool,
+    ) {
+        match self {
+            Self::ClusterTopology(event) => {
+                if derived_state_hooks_enabled {
+                    derived_state_host.on_cluster_topology(event.clone());
+                }
+                plugin_host.on_cluster_topology(event);
+            }
+        }
+    }
+}
 
 const fn feed_watermarks_from_fork_snapshot(
     snapshot: crate::app::state::ForkTrackerSnapshot,
@@ -150,6 +281,7 @@ async fn run_async_with_hosts_inner(
     #[cfg(feature = "gossip-bootstrap")]
     let packet_ingest_tx = tx.clone();
     let (tx_event_tx, tx_event_rx) = mpsc::channel::<TxObservedEvent>(TX_EVENT_CHANNEL_CAPACITY);
+    let (inline_noop_tx_event_tx, _inline_noop_tx_event_rx) = mpsc::channel::<TxObservedEvent>(1);
     let dataset_workers = read_dataset_workers();
     let tx_event_drop_count = Arc::new(AtomicU64::new(0));
     let dataset_decode_fail_count = Arc::new(AtomicU64::new(0));
@@ -166,6 +298,7 @@ async fn run_async_with_hosts_inner(
     let log_all_txs = read_log_all_txs();
     let log_non_vote_txs = read_log_non_vote_txs();
     let skip_vote_only_tx_detail_path = read_skip_vote_only_tx_detail_path();
+    let inline_transaction_dispatch_override = read_inline_transaction_dispatch_override();
     let log_dataset_reconstruction = read_log_dataset_reconstruction();
     let tx_confirmed_depth_slots = read_tx_confirmed_depth_slots();
     let tx_finalized_depth_slots = read_tx_finalized_depth_slots().max(tx_confirmed_depth_slots);
@@ -176,9 +309,40 @@ async fn run_async_with_hosts_inner(
         tx_confirmed_depth_slots,
         tx_finalized_depth_slots,
     );
+    let plugin_transaction_inline_consumers = plugin_host.wants_inline_transaction_dispatch();
+    let plugin_raw_packet_enabled = plugin_host.wants_raw_packet();
+    let plugin_shred_enabled = plugin_host.wants_shred();
+    let derived_state_dataset_consumers = derived_state_host.wants_transaction_applied()
+        || derived_state_host.wants_account_touch_observed()
+        || derived_state_host.wants_control_plane_observed();
+    let inline_transaction_dispatch_requested =
+        inline_transaction_dispatch_override.unwrap_or(plugin_transaction_inline_consumers);
+    let worker_dataset_processing_required = plugin_host.wants_dataset()
+        || plugin_host.wants_transaction_batch()
+        || plugin_host.wants_transaction_view_batch()
+        || plugin_host.wants_account_touch()
+        || plugin_host.wants_recent_blockhash()
+        || plugin_host.wants_deferred_transaction_dispatch()
+        || derived_state_dataset_consumers;
+    let inline_transaction_dispatch_mode = select_inline_transaction_dispatch_mode(
+        inline_transaction_dispatch_requested,
+        plugin_transaction_inline_consumers,
+        worker_dataset_processing_required,
+    );
+    let packet_worker_batch_max_packets = read_packet_worker_batch_max_packets();
+    let worker_transaction_dispatch_scope = match inline_transaction_dispatch_mode {
+        InlineTransactionDispatchMode::MixedWithDatasetWorkers => {
+            TransactionDispatchScope::DeferredOnly
+        }
+        InlineTransactionDispatchMode::Disabled
+        | InlineTransactionDispatchMode::ExclusiveDatasetProcessing => {
+            TransactionDispatchScope::All
+        }
+    };
     let dataset_worker_shared = DatasetWorkerShared {
         derived_state_host: derived_state_host.clone(),
         plugin_host: plugin_host.clone(),
+        transaction_dispatch_scope: worker_transaction_dispatch_scope,
         tx_event_tx: tx_event_tx.clone(),
         tx_commitment_tracker: tx_commitment_tracker.clone(),
         tx_event_drop_count: tx_event_drop_count.clone(),
@@ -204,6 +368,14 @@ async fn run_async_with_hosts_inner(
     );
     drop(dataset_worker_shared);
     drop(tx_event_tx);
+    let mut inline_dataset_attempt_cache = RecentDatasetAttemptCache::new(
+        dataset_attempt_cache_capacity,
+        dataset_attempt_success_ttl,
+        dataset_attempt_failure_ttl,
+    );
+    let mut inline_open_datasets = HashMap::<InlineOpenDatasetKey, InlineOpenDatasetState>::new();
+    let mut inline_dataset_start_indices_scratch = Vec::<u32>::new();
+    let mut inline_dataset_process_scratch = DatasetWorkerScratch::default();
     let plugin_hooks_enabled = !plugin_host.is_empty();
     if plugin_hooks_enabled {
         tracing::info!(plugins = ?plugin_host.plugin_names(), "observer plugins enabled");
@@ -308,6 +480,11 @@ async fn run_async_with_hosts_inner(
             Duration::from_millis(relay_cache_window_ms),
         ))
     });
+    let (relay_cache_insert_tx, relay_cache_insert_counters, mut relay_cache_insert_handle) =
+        relay_cache.as_ref().map_or((None, None, None), |cache| {
+            let (insert_tx, counters, handle) = spawn_relay_cache_insert_worker(cache.clone());
+            (Some(insert_tx), Some(counters), Some(handle))
+        });
     #[cfg(all(feature = "gossip-bootstrap", feature = "kernel-bypass"))]
     let udp_relay_enabled =
         if kernel_bypass_ingress_enabled && !kernel_bypass_gossip_control_plane_enabled {
@@ -457,15 +634,17 @@ async fn run_async_with_hosts_inner(
                 tracing::warn!("repair enabled but no repair client available");
                 (None, None, None, None)
             },
-            |repair_client| {
-                let (command_tx, result_rx, peer_snapshot, driver_handle) =
-                    spawn_repair_driver(repair_client, relay_cache.clone());
-                (
+            |repair_client| match spawn_repair_driver(repair_client, relay_cache.clone()) {
+                Ok((command_tx, result_rx, peer_snapshot, driver_handle)) => (
                     Some(command_tx),
                     Some(result_rx),
                     Some(peer_snapshot),
                     Some(driver_handle),
-                )
+                ),
+                Err(error) => {
+                    tracing::error!(?error, "failed to start repair driver");
+                    (None, None, None, None)
+                }
             },
         )
     } else {
@@ -553,6 +732,7 @@ async fn run_async_with_hosts_inner(
     let repair_dynamic_stream_healthy = false;
     let mut latest_shred_updated_at = Instant::now();
     let mut last_dataset_reconstructed_at = Instant::now();
+    let mut last_substantial_dataset_reconstructed_at = Instant::now();
     #[cfg(feature = "gossip-bootstrap")]
     let gossip_entrypoints = read_gossip_entrypoints();
     #[cfg(feature = "gossip-bootstrap")]
@@ -620,6 +800,9 @@ async fn run_async_with_hosts_inner(
     let mut dataset_reassembler = DataSetReassembler::new(dataset_max_tracked_slots)
         .with_retained_slot_lag(dataset_retained_slot_lag)
         .with_tail_min_shreds_without_anchor(dataset_tail_min_shreds_without_anchor);
+    let mut inline_reassembler =
+        crate::reassembly::inline::InlineDataReassembler::new(dataset_max_tracked_slots)
+            .with_retained_slot_lag(dataset_retained_slot_lag);
     let mut packet_count: u64 = 0;
     let mut source_port_8899_packets: u64 = 0;
     let mut source_port_8900_packets: u64 = 0;
@@ -643,9 +826,6 @@ async fn run_async_with_hosts_inner(
     let mut parse_invalid_data_size_count: u64 = 0;
     let mut parse_invalid_coding_header_count: u64 = 0;
     let mut parse_other_count: u64 = 0;
-    let mut relay_cache_inserts: u64 = 0;
-    let mut relay_cache_replacements: u64 = 0;
-    let mut relay_cache_evictions: u64 = 0;
     #[cfg(feature = "gossip-bootstrap")]
     let mut udp_relay_candidates: u64 = 0;
     #[cfg(not(feature = "gossip-bootstrap"))]
@@ -853,6 +1033,13 @@ async fn run_async_with_hosts_inner(
         derived_state_recovery_interval_ms.max(250),
     ));
     let mut logged_waiting_for_packets = false;
+    if inline_transaction_dispatch_requested && !plugin_transaction_inline_consumers {
+        tracing::warn!(
+            requested = inline_transaction_dispatch_requested,
+            plugin_transaction_consumers = plugin_transaction_inline_consumers,
+            "inline transaction dispatch requested but no plugin registered inline transaction delivery"
+        );
+    }
     tracing::info!(
         live_shreds_enabled,
         verify_enabled,
@@ -870,6 +1057,12 @@ async fn run_async_with_hosts_inner(
         packet_worker_queue_overflow_policy = PACKET_WORKER_QUEUE_OVERFLOW_POLICY,
         dedupe_capacity,
         dedupe_ttl_ms,
+        inline_transaction_dispatch_requested,
+        inline_transaction_dispatch = !matches!(
+            inline_transaction_dispatch_mode,
+            InlineTransactionDispatchMode::Disabled
+        ),
+        inline_transaction_dispatch_mode = inline_transaction_dispatch_mode.as_str(),
         relay_cache_enabled = relay_cache.is_some(),
         relay_cache_window_ms,
         relay_cache_max_shreds,
@@ -914,6 +1107,8 @@ async fn run_async_with_hosts_inner(
         Duration::from_secs(CONTROL_PLANE_EVENT_SNAPSHOT_SECS),
     );
     #[cfg(feature = "gossip-bootstrap")]
+    let mut pending_control_plane_events = VecDeque::<DeferredControlPlaneEvent>::new();
+    #[cfg(feature = "gossip-bootstrap")]
     let udp_relay_refresh = Duration::from_millis(udp_relay_refresh_ms.max(250));
     #[cfg(feature = "gossip-bootstrap")]
     let mut udp_relay_last_refresh = {
@@ -955,7 +1150,131 @@ async fn run_async_with_hosts_inner(
         None
     };
 
+    macro_rules! process_worker_result {
+        ($worker_result:expr) => {{
+            let worker_result = $worker_result;
+            let observed_at = Instant::now();
+            verify_verified_count =
+                verify_verified_count.saturating_add(worker_result.verify_verified_count);
+            verify_unknown_leader_count = verify_unknown_leader_count
+                .saturating_add(worker_result.verify_unknown_leader_count);
+            verify_invalid_merkle_count = verify_invalid_merkle_count
+                .saturating_add(worker_result.verify_invalid_merkle_count);
+            verify_invalid_signature_count = verify_invalid_signature_count
+                .saturating_add(worker_result.verify_invalid_signature_count);
+            verify_malformed_count =
+                verify_malformed_count.saturating_add(worker_result.verify_malformed_count);
+            verify_dropped_count =
+                verify_dropped_count.saturating_add(worker_result.verify_dropped_count);
+            let summary = PacketWorkerResultContext {
+                tx_commitment_tracker: tx_commitment_tracker.as_ref(),
+                plugin_host: &plugin_host,
+                derived_state_host: &derived_state_host,
+                inline_noop_tx_event_tx: &inline_noop_tx_event_tx,
+                tx_event_drop_count: tx_event_drop_count.as_ref(),
+                dataset_decode_fail_count: dataset_decode_fail_count.as_ref(),
+                dataset_tail_skip_count: dataset_tail_skip_count.as_ref(),
+                dataset_duplicate_drop_count: dataset_duplicate_drop_count.as_ref(),
+                derived_state_hooks_enabled,
+                log_dataset_reconstruction,
+                log_all_txs,
+                log_non_vote_txs,
+                skip_vote_only_tx_detail_path,
+                inline_transaction_dispatch_mode,
+                latest_shred_slot: &mut latest_shred_slot,
+                latest_shred_updated_at: &mut latest_shred_updated_at,
+                fork_tracker: &mut fork_tracker,
+                coverage_window: &mut coverage_window,
+                missing_tracker: &mut missing_tracker,
+                outstanding_repairs: &mut outstanding_repairs,
+                repair_outstanding_cleared_on_receive: &mut repair_outstanding_cleared_on_receive,
+                shred_dedupe_cache: &mut shred_dedupe_cache,
+                dedupe_canonical_duplicate_drop_count: &mut dedupe_canonical_duplicate_drop_count,
+                dedupe_canonical_conflict_drop_count: &mut dedupe_canonical_conflict_drop_count,
+                dataset_reassembler: &mut dataset_reassembler,
+                inline_reassembler: &mut inline_reassembler,
+                dataset_retained_slot_lag,
+                dataset_worker_queues: dataset_worker_pool.queues(),
+                dataset_jobs_enqueued_count: dataset_jobs_enqueued_count.as_ref(),
+                dataset_queue_drop_count: dataset_queue_drop_count.as_ref(),
+                inline_dataset_attempt_cache: &mut inline_dataset_attempt_cache,
+                inline_open_datasets: &mut inline_open_datasets,
+                inline_dataset_start_indices_scratch: &mut inline_dataset_start_indices_scratch,
+                inline_dataset_process_scratch: &mut inline_dataset_process_scratch,
+                last_dataset_reconstructed_at: &mut last_dataset_reconstructed_at,
+                last_substantial_dataset_reconstructed_at:
+                    &mut last_substantial_dataset_reconstructed_at,
+                data_count: &mut data_count,
+                code_count: &mut code_count,
+                recovered_data_count: &mut recovered_data_count,
+                data_complete_count: &mut data_complete_count,
+                last_in_slot_count: &mut last_in_slot_count,
+                source_port_8899_data: &mut source_port_8899_data,
+                source_port_8900_data: &mut source_port_8900_data,
+                source_port_other_data: &mut source_port_other_data,
+                source_port_8899_code: &mut source_port_8899_code,
+                source_port_8900_code: &mut source_port_8900_code,
+                source_port_other_code: &mut source_port_other_code,
+                fork_status_transitions_total: &mut fork_status_transitions_total,
+                fork_reorg_count: &mut fork_reorg_count,
+                fork_orphaned_slots_total: &mut fork_orphaned_slots_total,
+                #[cfg(feature = "gossip-bootstrap")]
+                emitted_slot_leaders: &mut emitted_slot_leaders,
+                #[cfg(feature = "gossip-bootstrap")]
+                verify_slot_leader_window,
+                #[cfg(feature = "gossip-bootstrap")]
+                repair_driver_enabled,
+                #[cfg(feature = "gossip-bootstrap")]
+                repair_source_hints: &mut repair_source_hints,
+                #[cfg(feature = "gossip-bootstrap")]
+                repair_command_tx: repair_command_tx.as_ref(),
+                #[cfg(feature = "gossip-bootstrap")]
+                repair_source_hint_batch_size,
+                #[cfg(feature = "gossip-bootstrap")]
+                repair_source_hint_flush_interval,
+                #[cfg(feature = "gossip-bootstrap")]
+                repair_source_hint_drops: &mut repair_source_hint_drops,
+                #[cfg(feature = "gossip-bootstrap")]
+                repair_source_hint_enqueued: &mut repair_source_hint_enqueued,
+                #[cfg(feature = "gossip-bootstrap")]
+                repair_source_hint_buffer_drops: &mut repair_source_hint_buffer_drops,
+                #[cfg(feature = "gossip-bootstrap")]
+                repair_source_hint_last_flush: &mut repair_source_hint_last_flush,
+            }
+            .process(
+                worker_result,
+                observed_at,
+                &mut packet_batch_dispatch_scratch,
+            );
+            crate::runtime_metrics::observe_recovered_data_packets(summary.recovered_data_packets);
+            dataset_ranges_emitted =
+                dataset_ranges_emitted.saturating_add(summary.completed_dataset_count);
+            crate::runtime_metrics::observe_completed_datasets(summary.completed_dataset_count);
+            dataset_ranges_emitted_from_recovered = dataset_ranges_emitted_from_recovered
+                .saturating_add(summary.completed_datasets_from_recovered);
+        }};
+    }
+
     'event_loop: loop {
+        #[cfg(feature = "gossip-bootstrap")]
+        if let Some(event) = pending_control_plane_events.pop_front() {
+            match packet_worker_pool.try_recv() {
+                Ok(worker_result) => {
+                    pending_control_plane_events.push_front(event);
+                    process_worker_result!(worker_result);
+                    continue;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    event.dispatch(
+                        &plugin_host,
+                        &derived_state_host,
+                        derived_state_hooks_enabled,
+                    );
+                    continue;
+                }
+            }
+        }
         tokio::select! {
             biased;
             () = async {
@@ -981,94 +1300,7 @@ async fn run_async_with_hosts_inner(
                     }
                     continue;
                 };
-                let observed_at = Instant::now();
-                verify_verified_count = verify_verified_count
-                    .saturating_add(worker_result.verify_verified_count);
-                verify_unknown_leader_count = verify_unknown_leader_count
-                    .saturating_add(worker_result.verify_unknown_leader_count);
-                verify_invalid_merkle_count = verify_invalid_merkle_count
-                    .saturating_add(worker_result.verify_invalid_merkle_count);
-                verify_invalid_signature_count = verify_invalid_signature_count
-                    .saturating_add(worker_result.verify_invalid_signature_count);
-                verify_malformed_count = verify_malformed_count
-                    .saturating_add(worker_result.verify_malformed_count);
-                verify_dropped_count = verify_dropped_count
-                    .saturating_add(worker_result.verify_dropped_count);
-                let summary = PacketWorkerResultContext {
-                    tx_commitment_tracker: tx_commitment_tracker.as_ref(),
-                    plugin_host: &plugin_host,
-                    derived_state_host: &derived_state_host,
-                    plugin_hooks_enabled,
-                    derived_state_hooks_enabled,
-                    latest_shred_slot: &mut latest_shred_slot,
-                    latest_shred_updated_at: &mut latest_shred_updated_at,
-                    fork_tracker: &mut fork_tracker,
-                    coverage_window: &mut coverage_window,
-                    missing_tracker: &mut missing_tracker,
-                    outstanding_repairs: &mut outstanding_repairs,
-                    repair_outstanding_cleared_on_receive: &mut repair_outstanding_cleared_on_receive,
-                    shred_dedupe_cache: &mut shred_dedupe_cache,
-                    dedupe_canonical_duplicate_drop_count: &mut dedupe_canonical_duplicate_drop_count,
-                    dedupe_canonical_conflict_drop_count: &mut dedupe_canonical_conflict_drop_count,
-                    dataset_reassembler: &mut dataset_reassembler,
-                    dataset_retained_slot_lag,
-                    dataset_worker_queues: dataset_worker_pool.queues(),
-                    dataset_jobs_enqueued_count: dataset_jobs_enqueued_count.as_ref(),
-                    dataset_queue_drop_count: dataset_queue_drop_count.as_ref(),
-                    last_dataset_reconstructed_at: &mut last_dataset_reconstructed_at,
-                    data_count: &mut data_count,
-                    code_count: &mut code_count,
-                    recovered_data_count: &mut recovered_data_count,
-                    data_complete_count: &mut data_complete_count,
-                    last_in_slot_count: &mut last_in_slot_count,
-                    source_port_8899_data: &mut source_port_8899_data,
-                    source_port_8900_data: &mut source_port_8900_data,
-                    source_port_other_data: &mut source_port_other_data,
-                    source_port_8899_code: &mut source_port_8899_code,
-                    source_port_8900_code: &mut source_port_8900_code,
-                    source_port_other_code: &mut source_port_other_code,
-                    fork_status_transitions_total: &mut fork_status_transitions_total,
-                    fork_reorg_count: &mut fork_reorg_count,
-                    fork_orphaned_slots_total: &mut fork_orphaned_slots_total,
-                    #[cfg(feature = "gossip-bootstrap")]
-                    emitted_slot_leaders: &mut emitted_slot_leaders,
-                    #[cfg(feature = "gossip-bootstrap")]
-                    verify_slot_leader_window,
-                    #[cfg(feature = "gossip-bootstrap")]
-                    repair_driver_enabled,
-                    #[cfg(feature = "gossip-bootstrap")]
-                    repair_source_hints: &mut repair_source_hints,
-                    #[cfg(feature = "gossip-bootstrap")]
-                    repair_command_tx: repair_command_tx.as_ref(),
-                    #[cfg(feature = "gossip-bootstrap")]
-                    repair_source_hint_batch_size,
-                    #[cfg(feature = "gossip-bootstrap")]
-                    repair_source_hint_flush_interval,
-                    #[cfg(feature = "gossip-bootstrap")]
-                    repair_source_hint_drops: &mut repair_source_hint_drops,
-                    #[cfg(feature = "gossip-bootstrap")]
-                    repair_source_hint_enqueued: &mut repair_source_hint_enqueued,
-                    #[cfg(feature = "gossip-bootstrap")]
-                    repair_source_hint_buffer_drops: &mut repair_source_hint_buffer_drops,
-                    #[cfg(feature = "gossip-bootstrap")]
-                    repair_source_hint_last_flush: &mut repair_source_hint_last_flush,
-                }
-                .process(
-                    worker_result,
-                    observed_at,
-                    &mut packet_batch_dispatch_scratch,
-                );
-                crate::runtime_metrics::observe_recovered_data_packets(
-                    summary.recovered_data_packets,
-                );
-                dataset_ranges_emitted = dataset_ranges_emitted.saturating_add(
-                    summary.completed_dataset_count,
-                );
-                crate::runtime_metrics::observe_completed_datasets(
-                    summary.completed_dataset_count,
-                );
-                dataset_ranges_emitted_from_recovered = dataset_ranges_emitted_from_recovered
-                    .saturating_add(summary.completed_datasets_from_recovered);
+                process_worker_result!(worker_result);
             }
             maybe_packet_batch = rx.recv(), if !ingest_closed => {
                 let Some(packet_batch) = maybe_packet_batch else {
@@ -1077,13 +1309,16 @@ async fn run_async_with_hosts_inner(
                     continue;
                 };
                 packet_batch_dispatch_scratch.refresh(&packet_worker_pool);
+                let mut deferred_parsed_shred_side_effects =
+                    Vec::with_capacity(packet_batch.len());
                 for packet in packet_batch {
                     let observed_at = Instant::now();
                     let source_addr = packet.source;
                     let packet_bytes = packet.bytes;
-                    let shared_observer_packet = (plugin_hooks_enabled || extension_hooks_enabled)
+                    let shared_observer_packet =
+                        (plugin_raw_packet_enabled || extension_hooks_enabled)
                         .then(|| Arc::clone(&packet_bytes));
-                    if plugin_hooks_enabled
+                    if plugin_raw_packet_enabled
                         && let Some(shared_packet) = shared_observer_packet.as_ref()
                     {
                         plugin_host.on_raw_packet(RawPacketEvent {
@@ -1111,63 +1346,53 @@ async fn run_async_with_hosts_inner(
                     if !live_shreds_enabled {
                         continue;
                     }
-                    #[cfg(feature = "gossip-bootstrap")]
-                    if repair_driver_enabled
-                        && crate::repair::is_repair_response_ping_packet(packet_bytes.as_ref())
-                        && let Some(command_tx) = repair_command_tx.as_ref()
-                    {
-                        match command_tx.try_send(RepairCommand::HandleResponsePing {
-                            packet: Arc::clone(&packet_bytes),
-                            from_addr: source_addr,
-                        }) {
-                            Ok(()) => {
-                                continue;
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                repair_ping_queue_drops = repair_ping_queue_drops.saturating_add(1);
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                repair_response_ping_errors =
-                                    repair_response_ping_errors.saturating_add(1);
-                            }
-                        }
-                    }
-                    #[cfg(feature = "gossip-bootstrap")]
-                    if repair_driver_enabled
-                        && crate::repair::is_supported_repair_request_packet(packet_bytes.as_ref())
-                        && let Some(command_tx) = repair_command_tx.as_ref()
-                    {
-                        match command_tx.try_send(RepairCommand::HandleServeRequest {
-                            packet: Arc::clone(&packet_bytes),
-                            from_addr: source_addr,
-                        }) {
-                            Ok(()) => {
-                                repair_serve_requests_enqueued =
-                                    repair_serve_requests_enqueued.saturating_add(1);
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                repair_serve_queue_drops = repair_serve_queue_drops.saturating_add(1);
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                repair_serve_errors = repair_serve_errors.saturating_add(1);
-                            }
-                        }
-                        continue;
-                    }
-                    match source_addr.port() {
-                        TURBINE_PRIMARY_SOURCE_PORT => {
-                            source_port_8899_packets = source_port_8899_packets.saturating_add(1);
-                        }
-                        TURBINE_SECONDARY_SOURCE_PORT => {
-                            source_port_8900_packets = source_port_8900_packets.saturating_add(1);
-                        }
-                        _ => {
-                            source_port_other_packets = source_port_other_packets.saturating_add(1);
-                        }
-                    }
                     let parsed_shred = match parse_shred_header(packet_bytes.as_ref()) {
                         Ok(parsed) => parsed,
                         Err(error) => {
+                            #[cfg(feature = "gossip-bootstrap")]
+                            if repair_driver_enabled
+                                && crate::repair::is_repair_response_ping_packet(packet_bytes.as_ref())
+                                && let Some(command_tx) = repair_command_tx.as_ref()
+                            {
+                                match command_tx.try_send(RepairCommand::HandleResponsePing {
+                                    packet: Arc::clone(&packet_bytes),
+                                    from_addr: source_addr,
+                                }) {
+                                    Ok(()) => {
+                                        continue;
+                                    }
+                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                        repair_ping_queue_drops = repair_ping_queue_drops.saturating_add(1);
+                                    }
+                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                        repair_response_ping_errors =
+                                            repair_response_ping_errors.saturating_add(1);
+                                    }
+                                }
+                            }
+                            #[cfg(feature = "gossip-bootstrap")]
+                            if repair_driver_enabled
+                                && crate::repair::is_supported_repair_request_packet(packet_bytes.as_ref())
+                                && let Some(command_tx) = repair_command_tx.as_ref()
+                            {
+                                match command_tx.try_send(RepairCommand::HandleServeRequest {
+                                    packet: Arc::clone(&packet_bytes),
+                                    from_addr: source_addr,
+                                }) {
+                                    Ok(()) => {
+                                        repair_serve_requests_enqueued =
+                                            repair_serve_requests_enqueued.saturating_add(1);
+                                    }
+                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                        repair_serve_queue_drops =
+                                            repair_serve_queue_drops.saturating_add(1);
+                                    }
+                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                        repair_serve_errors = repair_serve_errors.saturating_add(1);
+                                    }
+                                }
+                                continue;
+                            }
                             parse_error_count = parse_error_count.saturating_add(1);
                             match error {
                                 ParseError::PacketTooShort { .. } => {
@@ -1197,6 +1422,17 @@ async fn run_async_with_hosts_inner(
                             continue;
                         }
                     };
+                    match source_addr.port() {
+                        TURBINE_PRIMARY_SOURCE_PORT => {
+                            source_port_8899_packets = source_port_8899_packets.saturating_add(1);
+                        }
+                        TURBINE_SECONDARY_SOURCE_PORT => {
+                            source_port_8900_packets = source_port_8900_packets.saturating_add(1);
+                        }
+                        _ => {
+                            source_port_other_packets = source_port_other_packets.saturating_add(1);
+                        }
+                    }
                     if let Some(cache) = shred_dedupe_cache.as_mut() {
                         match cache.observe_shred(packet_bytes.as_ref(), &parsed_shred, observed_at)
                         {
@@ -1234,19 +1470,67 @@ async fn run_async_with_hosts_inner(
                             }
                         }
                     }
-                    if let Some(cache) = relay_cache.as_ref() {
-                        let outcome = cache.insert(&packet_bytes, &parsed_shred, observed_at);
-                        if outcome.inserted {
-                            relay_cache_inserts = relay_cache_inserts.saturating_add(1);
-                        }
-                        if outcome.replaced {
-                            relay_cache_replacements =
-                                relay_cache_replacements.saturating_add(1);
-                        }
-                        relay_cache_evictions = relay_cache_evictions
-                            .saturating_add(u64::try_from(outcome.evicted).unwrap_or(u64::MAX));
+                    let defer_parsed_shred_side_effects =
+                        relay_cache.is_some() || plugin_shred_enabled || udp_relay_enabled;
+                    let deferred_packet_bytes =
+                        defer_parsed_shred_side_effects.then(|| Arc::clone(&packet_bytes));
+                    let deferred_parsed_shred =
+                        defer_parsed_shred_side_effects.then(|| parsed_shred.clone());
+                    let worker_index = packet_worker_assignments.worker_for(
+                        parsed_shred_slot(&parsed_shred),
+                        parsed_shred_fec_set_index(&parsed_shred),
+                        packet_batch_dispatch_scratch.worker_loads(),
+                    );
+                    if let Some(batch) =
+                        packet_batch_dispatch_scratch.worker_batch_mut(worker_index)
+                    {
+                        batch.push(PacketWorkerInput {
+                            source: source_addr,
+                            packet_bytes,
+                            parsed_header: parsed_shred,
+                            observed_at,
+                        });
+                        packet_batch_dispatch_scratch.bump_worker_load(worker_index);
                     }
-                    if plugin_hooks_enabled {
+                    if let (Some(deferred_packet_bytes), Some(deferred_parsed_shred)) =
+                        (deferred_packet_bytes, deferred_parsed_shred)
+                    {
+                        deferred_parsed_shred_side_effects.push(DeferredParsedShredSideEffects {
+                            source_addr,
+                            packet_bytes: deferred_packet_bytes,
+                            parsed_shred: deferred_parsed_shred,
+                            observed_at,
+                        });
+                    }
+                }
+                for worker_index in 0..packet_batch_dispatch_scratch.worker_count() {
+                    let packets = packet_batch_dispatch_scratch.take_worker_batch(worker_index);
+                    if !dispatch_packet_worker_burst(
+                        &packet_worker_pool,
+                        &mut packet_batch_dispatch_scratch,
+                        worker_index,
+                        packets,
+                        packet_worker_batch_max_packets,
+                    ) {
+                        break 'event_loop;
+                    }
+                }
+                let mut relay_cache_insert_batch = Vec::new();
+                for deferred in deferred_parsed_shred_side_effects {
+                    let DeferredParsedShredSideEffects {
+                        source_addr,
+                        packet_bytes,
+                        parsed_shred,
+                        observed_at,
+                    } = deferred;
+                    if relay_cache_insert_tx.is_some() {
+                        relay_cache_insert_batch.push(RelayCacheInsertRequest {
+                            packet_bytes: Arc::clone(&packet_bytes),
+                            parsed_shred: parsed_shred.clone(),
+                            observed_at,
+                        });
+                    }
+                    if plugin_shred_enabled {
                         plugin_host.on_shred(ShredEvent {
                             source: source_addr,
                             packet: Arc::clone(&packet_bytes),
@@ -1361,37 +1645,11 @@ async fn run_async_with_hosts_inner(
                             }
                         }
                     }
-
-                    let worker_index = packet_worker_assignments.worker_for(
-                        parsed_shred_slot(&parsed_shred),
-                        parsed_shred_fec_set_index(&parsed_shred),
-                        packet_batch_dispatch_scratch.worker_loads(),
-                    );
-                    if let Some(batch) =
-                        packet_batch_dispatch_scratch.worker_batch_mut(worker_index)
-                    {
-                        batch.push(PacketWorkerInput {
-                            source: source_addr,
-                            packet_bytes,
-                            parsed_header: parsed_shred,
-                        });
-                        packet_batch_dispatch_scratch.bump_worker_load(worker_index);
-                    }
                 }
-                for worker_index in 0..packet_batch_dispatch_scratch.worker_count() {
-                    let packets = packet_batch_dispatch_scratch.take_worker_batch(worker_index);
-                    match packet_worker_pool.dispatch_worker_batch(worker_index, packets) {
-                        DispatchWorkerBatchOutcome::Enqueued => {}
-                        DispatchWorkerBatchOutcome::Dropped(packets) => {
-                            packet_batch_dispatch_scratch
-                                .recycle_worker_batch(worker_index, packets);
-                        }
-                        DispatchWorkerBatchOutcome::Closed(packets) => {
-                            packet_batch_dispatch_scratch
-                                .recycle_worker_batch(worker_index, packets);
-                            break 'event_loop;
-                        }
-                    }
+                if let Some(relay_cache_insert_tx) = relay_cache_insert_tx.as_ref()
+                    && !relay_cache_insert_batch.is_empty()
+                {
+                    drop(relay_cache_insert_tx.send(relay_cache_insert_batch));
                 }
             }
             maybe_repair_result = async {
@@ -1565,7 +1823,9 @@ async fn run_async_with_hosts_inner(
                         let latest_shred_age_ms =
                             duration_to_ms_u64(tick_now.saturating_duration_since(latest_shred_updated_at));
                         let dataset_stall_age_ms = duration_to_ms_u64(
-                            tick_now.saturating_duration_since(last_dataset_reconstructed_at),
+                            tick_now.saturating_duration_since(
+                                last_substantial_dataset_reconstructed_at,
+                            ),
                         );
                         let observed_shreds = data_count.saturating_add(code_count);
                         let stream_progress = observed_shreds > repair_last_shred_count_snapshot;
@@ -1675,7 +1935,9 @@ async fn run_async_with_hosts_inner(
                         let latest_shred_age_ms =
                             duration_to_ms_u64(now.saturating_duration_since(latest_shred_updated_at));
                         let latest_dataset_age_ms = duration_to_ms_u64(
-                            now.saturating_duration_since(last_dataset_reconstructed_at),
+                            now.saturating_duration_since(
+                                last_substantial_dataset_reconstructed_at,
+                            ),
                         );
                         let runtime_age_ms = duration_to_ms_u64(
                             now.saturating_duration_since(gossip_runtime_started_at),
@@ -1743,6 +2005,8 @@ async fn run_async_with_hosts_inner(
                                     gossip_runtime_stall_started_at = None;
                                     latest_shred_updated_at = gossip_runtime_started_at;
                                     last_dataset_reconstructed_at = gossip_runtime_started_at;
+                                    last_substantial_dataset_reconstructed_at =
+                                        gossip_runtime_started_at;
                                     if repair_enabled
                                         && let Some(repair_client) = runtime.repair_client.take()
                                     {
@@ -1853,7 +2117,7 @@ async fn run_async_with_hosts_inner(
                     }
                 }
                 #[cfg(feature = "gossip-bootstrap")]
-                if plugin_hooks_enabled
+                if (plugin_host.wants_cluster_topology() || derived_state_hooks_enabled)
                     && let Some(gossip_runtime) = runtime.gossip_runtime.as_ref()
                 {
                     let now = Instant::now();
@@ -1863,10 +2127,8 @@ async fn run_async_with_hosts_inner(
                         runtime.active_gossip_entrypoint.clone(),
                         now,
                     ) {
-                        if derived_state_hooks_enabled {
-                            derived_state_host.on_cluster_topology(topology_event.clone());
-                        }
-                        plugin_host.on_cluster_topology(topology_event);
+                        pending_control_plane_events
+                            .push_back(DeferredControlPlaneEvent::ClusterTopology(topology_event));
                     }
                 }
             }
@@ -2069,6 +2331,10 @@ async fn run_async_with_hosts_inner(
                 let latest_dataset_age_ms = duration_to_ms_u64(
                     Instant::now().saturating_duration_since(last_dataset_reconstructed_at),
                 );
+                let latest_substantial_dataset_age_ms = duration_to_ms_u64(
+                    Instant::now()
+                        .saturating_duration_since(last_substantial_dataset_reconstructed_at),
+                );
                 let extension_dispatch = if extension_hooks_enabled {
                     collect_extension_dispatch_telemetry(
                         extension_host.dispatch_metrics_by_extension(),
@@ -2096,6 +2362,14 @@ async fn run_async_with_hosts_inner(
                 let derived_state_consumer_telemetry = derived_state_host.consumer_telemetry();
                 let derived_state_replay_telemetry =
                     derived_state_host.replay_telemetry().unwrap_or_default();
+                let (
+                    relay_cache_inserts_total,
+                    relay_cache_replacements_total,
+                    relay_cache_evictions_total,
+                ) =
+                    relay_cache_insert_counters.as_ref().map_or((0, 0, 0), |counters| {
+                        counters.snapshot()
+                    });
                 sync_shred_dedupe_runtime_metrics(shred_dedupe_cache.as_ref());
                 crate::runtime_metrics::set_ingest_metrics(
                     ingest_packets_seen,
@@ -2113,58 +2387,61 @@ async fn run_async_with_hosts_inner(
                 crate::runtime_metrics::set_runtime_health_metrics(
                     latest_shred_age_ms,
                     latest_dataset_age_ms,
+                    latest_substantial_dataset_age_ms,
                     gossip_runtime_stall_age_ms,
                     repair_dynamic_stream_healthy,
                 );
                 crate::runtime_metrics::set_network_operability_metrics(
-                    relay_cache
-                        .as_ref()
-                        .map_or(0_u64, |cache| u64::try_from(cache.len()).unwrap_or(u64::MAX)),
-                    relay_cache_inserts,
-                    relay_cache_replacements,
-                    relay_cache_evictions,
-                    udp_relay_candidates,
-                    udp_relay_peers_telemetry,
-                    udp_relay_refreshes,
-                    udp_relay_forwarded_packets,
-                    udp_relay_send_attempts,
-                    udp_relay_send_errors,
-                    udp_relay_rate_limited_packets,
-                    udp_relay_source_filtered_packets,
-                    udp_relay_backoff_events,
-                    udp_relay_backoff_drops,
-                    repair_requests_total,
-                    repair_requests_enqueued,
-                    repair_requests_sent,
-                    repair_requests_no_peer,
-                    repair_request_errors,
-                    repair_request_queue_drops,
-                    repair_requests_skipped_outstanding,
-                    outstanding_repairs.as_ref().map_or(0_u64, |repairs| {
-                        u64::try_from(repairs.len()).unwrap_or(u64::MAX)
-                    }),
-                    repair_outstanding_purged,
-                    repair_outstanding_cleared_on_receive,
-                    repair_response_pings,
-                    repair_response_ping_errors,
-                    repair_ping_queue_drops,
-                    repair_serve_requests_enqueued,
-                    repair_serve_requests_handled,
-                    repair_serve_responses_sent,
-                    repair_serve_cache_misses,
-                    repair_serve_rate_limited,
-                    repair_serve_rate_limited_peer,
-                    repair_serve_rate_limited_bytes,
-                    repair_serve_errors,
-                    repair_serve_queue_drops,
-                    repair_source_hint_enqueued,
-                    repair_source_hint_drops,
-                    repair_source_hint_buffer_drops,
-                    repair_peer_total,
-                    repair_peer_active,
-                    gossip_switch_attempts,
-                    gossip_switch_successes,
-                    gossip_switch_fails,
+                    crate::runtime_metrics::NetworkOperabilityMetrics {
+                        relay_cache_entries: relay_cache.as_ref().map_or(0_u64, |cache| {
+                            u64::try_from(cache.len()).unwrap_or(u64::MAX)
+                        }),
+                        relay_cache_inserts_total,
+                        relay_cache_replacements_total,
+                        relay_cache_evictions_total,
+                        udp_relay_candidates,
+                        udp_relay_peers: udp_relay_peers_telemetry,
+                        udp_relay_refreshes_total: udp_relay_refreshes,
+                        udp_relay_forwarded_packets_total: udp_relay_forwarded_packets,
+                        udp_relay_send_attempts_total: udp_relay_send_attempts,
+                        udp_relay_send_errors_total: udp_relay_send_errors,
+                        udp_relay_rate_limited_packets_total: udp_relay_rate_limited_packets,
+                        udp_relay_source_filtered_packets_total: udp_relay_source_filtered_packets,
+                        udp_relay_backoff_events_total: udp_relay_backoff_events,
+                        udp_relay_backoff_drops_total: udp_relay_backoff_drops,
+                        repair_requests_total,
+                        repair_requests_enqueued_total: repair_requests_enqueued,
+                        repair_requests_sent_total: repair_requests_sent,
+                        repair_requests_no_peer_total: repair_requests_no_peer,
+                        repair_request_errors_total: repair_request_errors,
+                        repair_request_queue_drops_total: repair_request_queue_drops,
+                        repair_requests_skipped_outstanding_total: repair_requests_skipped_outstanding,
+                        repair_outstanding_entries: outstanding_repairs
+                            .as_ref()
+                            .map_or(0_u64, |repairs| u64::try_from(repairs.len()).unwrap_or(u64::MAX)),
+                        repair_outstanding_purged_total: repair_outstanding_purged,
+                        repair_outstanding_cleared_on_receive_total: repair_outstanding_cleared_on_receive,
+                        repair_response_pings_total: repair_response_pings,
+                        repair_response_ping_errors_total: repair_response_ping_errors,
+                        repair_ping_queue_drops_total: repair_ping_queue_drops,
+                        repair_serve_requests_enqueued_total: repair_serve_requests_enqueued,
+                        repair_serve_requests_handled_total: repair_serve_requests_handled,
+                        repair_serve_responses_sent_total: repair_serve_responses_sent,
+                        repair_serve_cache_misses_total: repair_serve_cache_misses,
+                        repair_serve_rate_limited_total: repair_serve_rate_limited,
+                        repair_serve_rate_limited_peer_total: repair_serve_rate_limited_peer,
+                        repair_serve_rate_limited_bytes_total: repair_serve_rate_limited_bytes,
+                        repair_serve_errors_total: repair_serve_errors,
+                        repair_serve_queue_drops_total: repair_serve_queue_drops,
+                        repair_source_hint_enqueued_total: repair_source_hint_enqueued,
+                        repair_source_hint_drops_total: repair_source_hint_drops,
+                        repair_source_hint_buffer_drops_total: repair_source_hint_buffer_drops,
+                        repair_peer_total,
+                        repair_peer_active,
+                        gossip_runtime_switch_attempts_total: gossip_switch_attempts,
+                        gossip_runtime_switch_successes_total: gossip_switch_successes,
+                        gossip_runtime_switch_failures_total: gossip_switch_fails,
+                    },
                 );
                 let runtime_stage_metrics = crate::runtime_metrics::snapshot();
                 telemetry_tick_count = telemetry_tick_count.saturating_add(1);
@@ -2230,9 +2507,9 @@ async fn run_async_with_hosts_inner(
                         relay_cache_window_ms = relay_cache_window_ms,
                         relay_cache_max_shreds = relay_cache_max_shreds,
                         relay_cache_entries = relay_cache.as_ref().map_or(0, SharedRelayCache::len),
-                        relay_cache_inserts = relay_cache_inserts,
-                        relay_cache_replacements = relay_cache_replacements,
-                        relay_cache_evictions = relay_cache_evictions,
+                        relay_cache_inserts = relay_cache_inserts_total,
+                        relay_cache_replacements = relay_cache_replacements_total,
+                        relay_cache_evictions = relay_cache_evictions_total,
                         udp_relay_enabled = udp_relay_enabled,
                         udp_relay_refresh_ms = udp_relay_refresh_ms_telemetry,
                         udp_relay_peer_candidates = udp_relay_peer_candidates_telemetry,
@@ -2332,6 +2609,14 @@ async fn run_async_with_hosts_inner(
                         dataset_jobs_started,
                         dataset_jobs_completed,
                         dataset_jobs_pending,
+                        dataset_worker_start_lag_ms =
+                            runtime_stage_metrics.latest_dataset_worker_start_lag_ms,
+                        dataset_worker_start_lag_ms_max =
+                            runtime_stage_metrics.max_dataset_worker_start_lag_ms,
+                        dataset_processing_duration_us =
+                            runtime_stage_metrics.latest_dataset_processing_duration_us,
+                        dataset_processing_duration_us_max =
+                            runtime_stage_metrics.max_dataset_processing_duration_us,
                         packet_worker_queue_depth = runtime_stage_metrics.packet_worker_queue_depth,
                         packet_worker_max_queue_depth =
                             runtime_stage_metrics.packet_worker_max_queue_depth,
@@ -2449,6 +2734,11 @@ async fn run_async_with_hosts_inner(
                         latest_dataset_age_ms = duration_to_ms_u64(
                             Instant::now().saturating_duration_since(last_dataset_reconstructed_at)
                         ),
+                        latest_substantial_dataset_age_ms = duration_to_ms_u64(
+                            Instant::now().saturating_duration_since(
+                                last_substantial_dataset_reconstructed_at,
+                            )
+                        ),
                         gossip_runtime_age_ms = gossip_runtime_age_ms,
                         gossip_runtime_stall_age_ms = gossip_runtime_stall_age_ms,
                         window_slots = coverage.slots_tracked,
@@ -2461,7 +2751,15 @@ async fn run_async_with_hosts_inner(
                         "ingest telemetry pressure detected"
                     );
                 } else if telemetry_log_now {
-                    tracing::info!(
+                let (
+                    relay_cache_inserts_snapshot,
+                    relay_cache_replacements_snapshot,
+                    relay_cache_evictions_snapshot,
+                ) =
+                    relay_cache_insert_counters.as_ref().map_or((0, 0, 0), |counters| {
+                        counters.snapshot()
+                    });
+                tracing::info!(
                     packets = packet_count,
                     source_8899_packets = source_port_8899_packets,
                     source_8900_packets = source_port_8900_packets,
@@ -2496,9 +2794,9 @@ async fn run_async_with_hosts_inner(
                     relay_cache_window_ms = relay_cache_window_ms,
                     relay_cache_max_shreds = relay_cache_max_shreds,
                     relay_cache_entries = relay_cache.as_ref().map_or(0, SharedRelayCache::len),
-                    relay_cache_inserts = relay_cache_inserts,
-                    relay_cache_replacements = relay_cache_replacements,
-                    relay_cache_evictions = relay_cache_evictions,
+                    relay_cache_inserts = relay_cache_inserts_snapshot,
+                    relay_cache_replacements = relay_cache_replacements_snapshot,
+                    relay_cache_evictions = relay_cache_evictions_snapshot,
                     udp_relay_enabled = udp_relay_enabled,
                     udp_relay_refresh_ms = udp_relay_refresh_ms_telemetry,
                     udp_relay_peer_candidates = udp_relay_peer_candidates_telemetry,
@@ -2598,6 +2896,14 @@ async fn run_async_with_hosts_inner(
                     dataset_jobs_started,
                     dataset_jobs_completed,
                     dataset_jobs_pending,
+                    dataset_worker_start_lag_ms =
+                        runtime_stage_metrics.latest_dataset_worker_start_lag_ms,
+                    dataset_worker_start_lag_ms_max =
+                        runtime_stage_metrics.max_dataset_worker_start_lag_ms,
+                    dataset_processing_duration_us =
+                        runtime_stage_metrics.latest_dataset_processing_duration_us,
+                    dataset_processing_duration_us_max =
+                        runtime_stage_metrics.max_dataset_processing_duration_us,
                     packet_worker_queue_depth = runtime_stage_metrics.packet_worker_queue_depth,
                     packet_worker_max_queue_depth =
                         runtime_stage_metrics.packet_worker_max_queue_depth,
@@ -2715,6 +3021,11 @@ async fn run_async_with_hosts_inner(
                     latest_dataset_age_ms = duration_to_ms_u64(
                         Instant::now().saturating_duration_since(last_dataset_reconstructed_at)
                     ),
+                    latest_substantial_dataset_age_ms = duration_to_ms_u64(
+                        Instant::now().saturating_duration_since(
+                            last_substantial_dataset_reconstructed_at,
+                        )
+                    ),
                     gossip_runtime_age_ms = gossip_runtime_age_ms,
                     gossip_runtime_stall_age_ms = gossip_runtime_stall_age_ms,
                     window_slots = coverage.slots_tracked,
@@ -2795,7 +3106,6 @@ async fn run_async_with_hosts_inner(
                             }
                         }
                         coverage_window.on_tx(slot);
-                        last_dataset_reconstructed_at = Instant::now();
                         if log_all_txs || (log_non_vote_txs && !matches!(kind, TxKind::VoteOnly)) {
                             tracing::info!(
                                 slot,
@@ -2819,11 +3129,26 @@ async fn run_async_with_hosts_inner(
                             slot,
                             vote_only.saturating_add(mixed).saturating_add(non_vote),
                         );
-                        last_dataset_reconstructed_at = Instant::now();
                     }
                 }
             }
         }
+    }
+    #[cfg(feature = "gossip-bootstrap")]
+    if repair_enabled {
+        stop_repair_driver(
+            &mut repair_command_tx,
+            &mut repair_result_rx,
+            &mut repair_peer_snapshot,
+            &mut repair_driver_handle,
+        )
+        .await;
+    }
+    drop(relay_cache_insert_tx);
+    if let Some(handle) = relay_cache_insert_handle.take()
+        && handle.await.is_err()
+    {
+        // Relay-cache insert worker was already cancelled by runtime teardown.
     }
     packet_worker_pool.shutdown().await;
     dataset_worker_pool.shutdown().await;
@@ -2894,12 +3219,145 @@ struct PacketWorkerResultSummary {
     completed_datasets_from_recovered: u64,
 }
 
+#[derive(Debug)]
+struct DeferredParsedShredSideEffects {
+    source_addr: SocketAddr,
+    packet_bytes: Arc<[u8]>,
+    parsed_shred: ParsedShredHeader,
+    observed_at: Instant,
+}
+
+struct DataLikeShredInput {
+    /// Slot carried by the shred.
+    slot: u64,
+    /// Shred index within the slot.
+    index: u32,
+    /// FEC set index for the shred.
+    fec_set_index: u32,
+    /// Parent slot if known.
+    parent_slot: Option<u64>,
+    /// Whether this shred marks data-complete for its dataset.
+    data_complete: bool,
+    /// Whether this shred marks the last shred in the slot.
+    last_in_slot: bool,
+    /// Reference tick extracted from the shred header.
+    reference_tick: u8,
+    /// Optional payload fragment retained for dataset reconstruction.
+    payload_fragment: Option<crate::reassembly::dataset::SharedPayloadFragment>,
+    /// Time when the packet carrying this shred entered runtime processing.
+    ingress_observed_at: Instant,
+    /// Source address for non-recovered shreds.
+    source_addr: Option<SocketAddr>,
+    /// Whether the shred originated from recovery rather than direct ingest.
+    recovered: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct InlineOpenDatasetKey {
+    slot: u64,
+    start_index: u32,
+}
+
+#[derive(Debug, Default)]
+struct InlineOpenDatasetState {
+    payload: Vec<u8>,
+    fragment_end_offsets: Vec<usize>,
+    fragment_observed_ats: Vec<Instant>,
+    prefix_max_observed_ats: Vec<Instant>,
+    ready_tx_ranges: Vec<SerializedTransactionRange>,
+    parse_cursor: crate::app::runtime::dataset::EntryStreamPrefixCursor,
+    emitted_tx_count: usize,
+}
+
+impl InlineOpenDatasetState {
+    fn advance_ready_ranges(&mut self) -> crate::app::runtime::dataset::EntryStreamPrefixAdvance {
+        self.parse_cursor
+            .advance(self.payload.as_slice(), &mut self.ready_tx_ranges)
+    }
+
+    const fn fully_emitted_for_payload_len(&self, payload_len: usize) -> bool {
+        self.payload.len() == payload_len
+            && self.emitted_tx_count == self.ready_tx_ranges.len()
+            && self.parse_cursor.is_complete_for(payload_len)
+    }
+
+    fn tx_ready_observed_at(&self, tx_end_offset: usize) -> Option<Instant> {
+        let fragment_index = self
+            .fragment_end_offsets
+            .partition_point(|&end_offset| end_offset < tx_end_offset);
+        self.prefix_max_observed_ats.get(fragment_index).copied()
+    }
+
+    fn tx_first_observed_at(&self, tx_start_offset: usize) -> Option<Instant> {
+        let fragment_index = self
+            .fragment_end_offsets
+            .partition_point(|&end_offset| end_offset <= tx_start_offset);
+        self.fragment_observed_ats.get(fragment_index).copied()
+    }
+}
+
+impl InlineContiguousDataSetSink for InlineOpenDatasetState {
+    fn existing_fragments(&self) -> usize {
+        self.fragment_end_offsets.len()
+    }
+
+    fn payload_len(&self) -> usize {
+        self.payload.len()
+    }
+
+    fn reset_inline_contiguous_dataset(&mut self) {
+        self.payload.clear();
+        self.fragment_end_offsets.clear();
+        self.fragment_observed_ats.clear();
+        self.prefix_max_observed_ats.clear();
+        self.ready_tx_ranges.clear();
+        self.parse_cursor = crate::app::runtime::dataset::EntryStreamPrefixCursor::default();
+        self.emitted_tx_count = 0;
+    }
+
+    fn reserve_inline_contiguous_dataset(
+        &mut self,
+        additional_fragments: usize,
+        additional_bytes: usize,
+    ) {
+        self.payload.reserve(additional_bytes);
+        self.fragment_end_offsets.reserve(additional_fragments);
+        self.fragment_observed_ats.reserve(additional_fragments);
+        self.prefix_max_observed_ats.reserve(additional_fragments);
+    }
+
+    fn append_inline_contiguous_fragment(
+        &mut self,
+        fragment: &crate::reassembly::dataset::SharedPayloadFragment,
+        observed_at: Instant,
+    ) {
+        self.payload.extend_from_slice(fragment.as_slice());
+        self.fragment_end_offsets.push(self.payload.len());
+        self.fragment_observed_ats.push(observed_at);
+        let prefix_max = self
+            .prefix_max_observed_ats
+            .last()
+            .copied()
+            .map_or(observed_at, |current| current.max(observed_at));
+        self.prefix_max_observed_ats.push(prefix_max);
+    }
+}
+
 struct PacketWorkerResultContext<'context> {
     tx_commitment_tracker: &'context CommitmentSlotTracker,
     plugin_host: &'context PluginHost,
     derived_state_host: &'context DerivedStateHost,
-    plugin_hooks_enabled: bool,
+    inline_noop_tx_event_tx: &'context mpsc::Sender<TxObservedEvent>,
+    tx_event_drop_count: &'context AtomicU64,
+    dataset_decode_fail_count: &'context AtomicU64,
+    dataset_tail_skip_count: &'context AtomicU64,
+    dataset_duplicate_drop_count: &'context AtomicU64,
     derived_state_hooks_enabled: bool,
+    log_dataset_reconstruction: bool,
+    log_all_txs: bool,
+    log_non_vote_txs: bool,
+    skip_vote_only_tx_detail_path: bool,
+    inline_transaction_dispatch_mode: InlineTransactionDispatchMode,
     latest_shred_slot: &'context mut Option<u64>,
     latest_shred_updated_at: &'context mut Instant,
     fork_tracker: &'context mut ForkTracker,
@@ -2911,11 +3369,17 @@ struct PacketWorkerResultContext<'context> {
     dedupe_canonical_duplicate_drop_count: &'context mut u64,
     dedupe_canonical_conflict_drop_count: &'context mut u64,
     dataset_reassembler: &'context mut DataSetReassembler,
+    inline_reassembler: &'context mut crate::reassembly::inline::InlineDataReassembler,
     dataset_retained_slot_lag: u64,
     dataset_worker_queues: &'context [DatasetDispatchQueue],
     dataset_jobs_enqueued_count: &'context AtomicU64,
     dataset_queue_drop_count: &'context AtomicU64,
+    inline_dataset_attempt_cache: &'context mut RecentDatasetAttemptCache,
+    inline_open_datasets: &'context mut HashMap<InlineOpenDatasetKey, InlineOpenDatasetState>,
+    inline_dataset_start_indices_scratch: &'context mut Vec<u32>,
+    inline_dataset_process_scratch: &'context mut DatasetWorkerScratch,
     last_dataset_reconstructed_at: &'context mut Instant,
+    last_substantial_dataset_reconstructed_at: &'context mut Instant,
     data_count: &'context mut u64,
     code_count: &'context mut u64,
     recovered_data_count: &'context mut u64,
@@ -2976,13 +3440,12 @@ impl PacketWorkerResultContext<'_> {
             verify_malformed_count: _,
             verify_dropped_count: _,
         } = worker_result;
-        #[cfg(feature = "gossip-bootstrap")]
-        self.emit_leader_events(leader_diff, observed_slot_leaders);
-
         let mut summary = PacketWorkerResultSummary::default();
         for shred in accepted_shreds {
             self.process_accepted_shred(shred, observed_at, &mut summary);
         }
+        #[cfg(feature = "gossip-bootstrap")]
+        self.emit_leader_events(leader_diff, observed_slot_leaders);
         packet_batch_dispatch_scratch.recycle_worker_batch(worker_index, reusable_packets);
         summary
     }
@@ -3047,17 +3510,20 @@ impl PacketWorkerResultContext<'_> {
             } => {
                 let source_addr = source_addr_or_unspecified(shred.source);
                 self.process_data_like_shred(
-                    shred.slot,
-                    shred.index,
-                    shred.fec_set_index,
-                    parent_slot,
-                    data_complete,
-                    last_in_slot,
-                    reference_tick,
-                    shred.payload_fragment,
+                    DataLikeShredInput {
+                        slot: shred.slot,
+                        index: shred.index,
+                        fec_set_index: shred.fec_set_index,
+                        parent_slot,
+                        data_complete,
+                        last_in_slot,
+                        reference_tick,
+                        payload_fragment: shred.payload_fragment,
+                        ingress_observed_at: shred.observed_at,
+                        source_addr: Some(source_addr),
+                        recovered: false,
+                    },
                     observed_at,
-                    Some(source_addr),
-                    false,
                     summary,
                 );
             }
@@ -3078,44 +3544,37 @@ impl PacketWorkerResultContext<'_> {
                 reference_tick,
             } => {
                 self.process_data_like_shred(
-                    shred.slot,
-                    shred.index,
-                    shred.fec_set_index,
-                    parent_slot,
-                    data_complete,
-                    last_in_slot,
-                    reference_tick,
-                    shred.payload_fragment,
+                    DataLikeShredInput {
+                        slot: shred.slot,
+                        index: shred.index,
+                        fec_set_index: shred.fec_set_index,
+                        parent_slot,
+                        data_complete,
+                        last_in_slot,
+                        reference_tick,
+                        payload_fragment: shred.payload_fragment,
+                        ingress_observed_at: shred.observed_at,
+                        source_addr: None,
+                        recovered: true,
+                    },
                     observed_at,
-                    None,
-                    true,
                     summary,
                 );
             }
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn process_data_like_shred(
         &mut self,
-        slot: u64,
-        index: u32,
-        fec_set_index: u32,
-        parent_slot: Option<u64>,
-        data_complete: bool,
-        last_in_slot: bool,
-        reference_tick: u8,
-        payload_fragment: Option<crate::reassembly::dataset::SharedPayloadFragment>,
+        input: DataLikeShredInput,
         observed_at: Instant,
-        source_addr: Option<SocketAddr>,
-        recovered: bool,
         summary: &mut PacketWorkerResultSummary,
     ) {
-        if recovered {
+        if input.recovered {
             summary.recovered_data_packets = summary.recovered_data_packets.saturating_add(1);
             *self.recovered_data_count = self.recovered_data_count.saturating_add(1);
-            self.coverage_window.on_recovered_data_shred(slot);
-        } else if let Some(source_addr) = source_addr {
+            self.coverage_window.on_recovered_data_shred(input.slot);
+        } else if let Some(source_addr) = input.source_addr {
             *self.data_count = self.data_count.saturating_add(1);
             observe_source_port(
                 source_addr,
@@ -3123,69 +3582,100 @@ impl PacketWorkerResultContext<'_> {
                 self.source_port_8900_data,
                 self.source_port_other_data,
             );
-            self.coverage_window.on_data_shred(slot);
+            self.coverage_window.on_data_shred(input.slot);
             #[cfg(feature = "gossip-bootstrap")]
             self.record_repair_source_hint(source_addr, observed_at);
         }
 
-        if data_complete {
+        if input.data_complete {
             *self.data_complete_count = self.data_complete_count.saturating_add(1);
         }
-        if last_in_slot {
+        if input.last_in_slot {
             *self.last_in_slot_count = self.last_in_slot_count.saturating_add(1);
         }
 
-        self.note_slot(slot, observed_at);
-        let fork_update = if recovered {
+        self.note_slot(input.slot, observed_at);
+        let fork_update = if input.recovered {
             self.fork_tracker
-                .observe_recovered_data_shred(slot, parent_slot)
+                .observe_recovered_data_shred(input.slot, input.parent_slot)
         } else {
-            self.fork_tracker.observe_data_shred(slot, parent_slot)
+            self.fork_tracker
+                .observe_data_shred(input.slot, input.parent_slot)
         };
         self.apply_fork_update(&fork_update);
-        self.clear_outstanding_repair(slot, index);
+        self.clear_outstanding_repair(input.slot, input.index);
 
         if let Some(tracker) = self.missing_tracker.as_mut() {
-            if recovered {
+            if input.recovered {
                 tracker.on_recovered_data_shred(
-                    slot,
-                    index,
-                    fec_set_index,
-                    last_in_slot,
-                    reference_tick,
+                    input.slot,
+                    input.index,
+                    input.fec_set_index,
+                    input.last_in_slot,
+                    input.reference_tick,
                     observed_at,
                 );
             } else {
                 tracker.on_data_shred(
-                    slot,
-                    index,
-                    fec_set_index,
-                    last_in_slot,
-                    reference_tick,
+                    input.slot,
+                    input.index,
+                    input.fec_set_index,
+                    input.last_in_slot,
+                    input.reference_tick,
                     observed_at,
                 );
             }
         }
 
-        if let Some(payload_fragment) = payload_fragment {
+        if let Some(payload_fragment) = input.payload_fragment {
+            let inline_enabled = !matches!(
+                self.inline_transaction_dispatch_mode,
+                InlineTransactionDispatchMode::Disabled
+            );
             if let Some(slot_floor) = self.dataset_slot_floor() {
                 self.dataset_reassembler.purge_older_than(slot_floor);
-                if slot < slot_floor {
+                self.inline_reassembler.purge_older_than(slot_floor);
+                self.inline_open_datasets
+                    .retain(|key, _| key.slot >= slot_floor);
+                if input.slot < slot_floor {
                     return;
                 }
             }
-            let completed_datasets = self.dataset_reassembler.ingest_data_shred_meta(
-                slot,
-                index,
-                data_complete,
-                last_in_slot,
+            if inline_enabled {
+                if input.recovered {
+                    crate::runtime_metrics::observe_inline_reassembler_recovered_data_shreds(1);
+                } else {
+                    crate::runtime_metrics::observe_inline_reassembler_data_shreds(1);
+                }
+                let inline_observation = self.inline_reassembler.observe_data_shred_meta_at(
+                    input.slot,
+                    input.index,
+                    input.fec_set_index,
+                    input.data_complete,
+                    input.last_in_slot,
+                    payload_fragment.clone(),
+                    input.ingress_observed_at,
+                );
+                if inline_observation.fec_set_became_ready {
+                    crate::runtime_metrics::observe_inline_reassembler_fec_sets_ready(1);
+                }
+            }
+            let completed_datasets = self.dataset_reassembler.ingest_data_shred_meta_at(
+                input.slot,
+                input.index,
+                input.data_complete,
+                input.last_in_slot,
                 payload_fragment,
+                input.ingress_observed_at,
             );
+            if inline_enabled {
+                self.process_open_inline_dataset(input.slot);
+            }
             let completed_count = self.dispatch_completed_datasets(completed_datasets, observed_at);
             summary.completed_dataset_count = summary
                 .completed_dataset_count
                 .saturating_add(completed_count);
-            if recovered {
+            if input.recovered {
                 summary.completed_datasets_from_recovered = summary
                     .completed_datasets_from_recovered
                     .saturating_add(completed_count);
@@ -3217,6 +3707,19 @@ impl PacketWorkerResultContext<'_> {
         if let Some(tracker) = self.missing_tracker.as_mut() {
             tracker.on_code_shred(slot, fec_set_index, num_data_shreds, observed_at);
         }
+        if !matches!(
+            self.inline_transaction_dispatch_mode,
+            InlineTransactionDispatchMode::Disabled
+        ) {
+            crate::runtime_metrics::observe_inline_reassembler_code_shreds(1);
+            let inline_observation =
+                self.inline_reassembler
+                    .observe_code_shred(slot, fec_set_index, num_data_shreds);
+            if inline_observation.fec_set_became_ready {
+                crate::runtime_metrics::observe_inline_reassembler_fec_sets_ready(1);
+                self.process_open_inline_dataset(slot);
+            }
+        }
         #[cfg(feature = "gossip-bootstrap")]
         self.record_repair_source_hint(source_addr, observed_at);
     }
@@ -3228,27 +3731,283 @@ impl PacketWorkerResultContext<'_> {
     ) -> u64 {
         let slot_floor = self.dataset_slot_floor();
         let mut completed_count = 0_u64;
-        let mut dispatchable = Vec::with_capacity(completed_datasets.len());
+        let mut worker_dispatchable = Vec::with_capacity(completed_datasets.len());
         for dataset in completed_datasets {
             if slot_floor.is_some_and(|floor| dataset.slot < floor) {
                 continue;
             }
             completed_count = completed_count.saturating_add(1);
             self.coverage_window.on_dataset_completed(dataset.slot);
+            *self.last_dataset_reconstructed_at = observed_at;
             let substantial_dataset =
                 dataset.payload_fragments.len() >= SUBSTANTIAL_DATASET_MIN_SHREDS;
-            dispatchable.push(dataset);
             if substantial_dataset {
-                *self.last_dataset_reconstructed_at = observed_at;
+                *self.last_substantial_dataset_reconstructed_at = observed_at;
+            }
+            let inline_completed_early =
+                self.finish_completed_inline_dataset_if_fully_emitted(&dataset);
+            match self.inline_transaction_dispatch_mode {
+                InlineTransactionDispatchMode::Disabled => worker_dispatchable.push(dataset),
+                InlineTransactionDispatchMode::ExclusiveDatasetProcessing => {
+                    if !inline_completed_early {
+                        self.process_completed_dataset_inline_transactions(&dataset, observed_at);
+                    }
+                }
+                InlineTransactionDispatchMode::MixedWithDatasetWorkers => {
+                    if !inline_completed_early {
+                        self.process_completed_dataset_inline_transactions(&dataset, observed_at);
+                    }
+                    worker_dispatchable.push(dataset);
+                }
             }
         }
-        dispatch_completed_dataset(
-            self.dataset_worker_queues,
-            dispatchable,
-            self.dataset_jobs_enqueued_count,
-            self.dataset_queue_drop_count,
-        );
+        if !worker_dispatchable.is_empty() {
+            dispatch_completed_dataset(
+                self.dataset_worker_queues,
+                worker_dispatchable,
+                observed_at,
+                self.dataset_jobs_enqueued_count,
+                self.dataset_queue_drop_count,
+            );
+        }
         completed_count
+    }
+
+    fn finish_completed_inline_dataset_if_fully_emitted(
+        &mut self,
+        dataset: &CompletedDataSet,
+    ) -> bool {
+        let key = InlineOpenDatasetKey {
+            slot: dataset.slot,
+            start_index: dataset.start_index,
+        };
+        let Some(state) = self.inline_open_datasets.get(&key) else {
+            return false;
+        };
+        if !state.fully_emitted_for_payload_len(dataset.payload_fragments.total_len()) {
+            return false;
+        }
+        let _ = self.inline_open_datasets.remove(&key);
+        self.inline_dataset_attempt_cache.record(
+            DatasetAttemptKey {
+                slot: dataset.slot,
+                start_index: dataset.start_index,
+                end_index: dataset.end_index,
+            },
+            Instant::now(),
+            DatasetAttemptStatus::Success,
+        );
+        self.inline_reassembler
+            .retire_range(dataset.slot, dataset.start_index, dataset.end_index);
+        crate::runtime_metrics::observe_inline_reassembler_ranges_retired(1);
+        true
+    }
+
+    fn process_completed_dataset_inline_transactions(
+        &mut self,
+        dataset: &CompletedDataSet,
+        observed_at: Instant,
+    ) {
+        let cache_key = DatasetAttemptKey {
+            slot: dataset.slot,
+            start_index: dataset.start_index,
+            end_index: dataset.end_index,
+        };
+        let now = Instant::now();
+        if self
+            .inline_dataset_attempt_cache
+            .is_recent_duplicate(cache_key, now)
+        {
+            let _ = self
+                .dataset_duplicate_drop_count
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let already_emitted_tx_count = self
+            .inline_open_datasets
+            .remove(&InlineOpenDatasetKey {
+                slot: dataset.slot,
+                start_index: dataset.start_index,
+            })
+            .map_or(0, |state| state.emitted_tx_count);
+        let outcome = process_completed_dataset_inline_transactions(
+            dataset.slot,
+            dataset.start_index,
+            dataset.end_index,
+            observed_at,
+            dataset.first_shred_observed_at,
+            dataset.last_shred_observed_at,
+            already_emitted_tx_count,
+            &dataset.payload_fragments,
+            &DatasetProcessContext {
+                derived_state_host: self.derived_state_host,
+                plugin_host: self.plugin_host,
+                transaction_dispatch_scope: TransactionDispatchScope::InlineOnly,
+                tx_event_tx: self.inline_noop_tx_event_tx,
+                tx_commitment_tracker: self.tx_commitment_tracker,
+                tx_event_drop_count: self.tx_event_drop_count,
+                dataset_decode_fail_count: self.dataset_decode_fail_count,
+                dataset_tail_skip_count: self.dataset_tail_skip_count,
+                log_dataset_reconstruction: self.log_dataset_reconstruction,
+                log_all_txs: self.log_all_txs,
+                log_non_vote_txs: self.log_non_vote_txs,
+                skip_vote_only_tx_detail_path: self.skip_vote_only_tx_detail_path,
+            },
+            self.inline_dataset_process_scratch,
+        );
+        self.inline_dataset_attempt_cache
+            .record(cache_key, now, outcome.status());
+        self.inline_reassembler
+            .retire_range(dataset.slot, dataset.start_index, dataset.end_index);
+        crate::runtime_metrics::observe_inline_reassembler_ranges_retired(1);
+    }
+
+    fn process_open_inline_dataset(&mut self, slot: u64) {
+        struct PreparedInlineTx {
+            tx: Arc<VersionedTransaction>,
+            kind: crate::app::runtime::dataset::TxKind,
+            signature: Option<Signature>,
+            tx_ready_observed_at: Instant,
+            tx_first_observed_at: Instant,
+            visible_tx_count: u32,
+            dataset_tx_offset: u32,
+        }
+
+        if matches!(
+            self.inline_transaction_dispatch_mode,
+            InlineTransactionDispatchMode::Disabled
+        ) {
+            return;
+        }
+        self.inline_reassembler
+            .fill_inline_contiguous_dataset_starts(slot, self.inline_dataset_start_indices_scratch);
+        if self.inline_dataset_start_indices_scratch.is_empty() {
+            return;
+        }
+        for &start_index in self.inline_dataset_start_indices_scratch.iter() {
+            let key = InlineOpenDatasetKey { slot, start_index };
+            let commitment_snapshot = self.tx_commitment_tracker.snapshot();
+            let commitment_status = TxCommitmentStatus::from_slot(
+                slot,
+                commitment_snapshot.confirmed_slot,
+                commitment_snapshot.finalized_slot,
+            );
+
+            let mut prepared = Vec::new();
+            let mut remove_state = false;
+            {
+                let state = self.inline_open_datasets.entry(key).or_default();
+                if self
+                    .inline_reassembler
+                    .sync_inline_contiguous_dataset(slot, start_index, state)
+                    .is_none()
+                {
+                    remove_state = true;
+                } else {
+                    match state.advance_ready_ranges() {
+                        crate::app::runtime::dataset::EntryStreamPrefixAdvance::Complete
+                        | crate::app::runtime::dataset::EntryStreamPrefixAdvance::Incomplete => {}
+                        crate::app::runtime::dataset::EntryStreamPrefixAdvance::Malformed => {
+                            remove_state = true;
+                        }
+                    }
+                    if remove_state {
+                        // handled after the mutable borrow of the state ends
+                    } else if state.emitted_tx_count < state.ready_tx_ranges.len() {
+                        let visible_tx_count =
+                            u32::try_from(state.ready_tx_ranges.len()).unwrap_or(u32::MAX);
+                        for (dataset_tx_offset, range) in state
+                            .ready_tx_ranges
+                            .iter()
+                            .enumerate()
+                            .skip(state.emitted_tx_count)
+                        {
+                            let start = usize::try_from(range.start()).ok();
+                            let end = usize::try_from(range.end()).ok();
+                            let Some(bytes) = start
+                                .zip(end)
+                                .and_then(|(start, end)| state.payload.get(start..end))
+                            else {
+                                remove_state = true;
+                                break;
+                            };
+                            let Ok(tx) = bincode::deserialize::<VersionedTransaction>(bytes) else {
+                                remove_state = true;
+                                break;
+                            };
+                            let Some(tx_ready_observed_at) =
+                                end.and_then(|end| state.tx_ready_observed_at(end))
+                            else {
+                                remove_state = true;
+                                break;
+                            };
+                            let Some(tx_first_observed_at) =
+                                start.and_then(|start| state.tx_first_observed_at(start))
+                            else {
+                                remove_state = true;
+                                break;
+                            };
+                            let kind = crate::app::runtime::dataset::classify_tx_kind(&tx);
+                            let signature = tx.signatures.first().copied();
+                            prepared.push(PreparedInlineTx {
+                                tx: Arc::new(tx),
+                                kind,
+                                signature,
+                                tx_ready_observed_at,
+                                tx_first_observed_at,
+                                visible_tx_count,
+                                dataset_tx_offset: u32::try_from(dataset_tx_offset)
+                                    .unwrap_or(u32::MAX),
+                            });
+                        }
+                        if !remove_state {
+                            state.emitted_tx_count = state.ready_tx_ranges.len();
+                        }
+                    }
+                }
+            }
+
+            if remove_state {
+                let _ = self.inline_open_datasets.remove(&key);
+                continue;
+            }
+
+            for prepared_tx in prepared {
+                let dispatch = self.plugin_host.classify_transaction_ref_in_scope(
+                    TransactionEventRef {
+                        slot,
+                        commitment_status,
+                        confirmed_slot: commitment_snapshot.confirmed_slot,
+                        finalized_slot: commitment_snapshot.finalized_slot,
+                        signature: prepared_tx.signature,
+                        tx: prepared_tx.tx.as_ref(),
+                        kind: prepared_tx.kind,
+                    },
+                    TransactionDispatchScope::InlineOnly,
+                );
+                if dispatch.is_empty() {
+                    continue;
+                }
+                self.plugin_host.on_classified_transaction(
+                    dispatch,
+                    TransactionEvent {
+                        slot,
+                        commitment_status,
+                        confirmed_slot: commitment_snapshot.confirmed_slot,
+                        finalized_slot: commitment_snapshot.finalized_slot,
+                        signature: prepared_tx.signature,
+                        tx: prepared_tx.tx,
+                        kind: prepared_tx.kind,
+                    },
+                    prepared_tx.tx_ready_observed_at,
+                    prepared_tx.tx_first_observed_at,
+                    prepared_tx.tx_ready_observed_at,
+                    crate::framework::host::InlineTransactionDispatchSource::EarlyPrefix,
+                    prepared_tx.visible_tx_count,
+                    prepared_tx.dataset_tx_offset,
+                );
+            }
+        }
     }
 
     fn dataset_slot_floor(&self) -> Option<u64> {
@@ -3280,7 +4039,6 @@ impl PacketWorkerResultContext<'_> {
                 tx_commitment_tracker: self.tx_commitment_tracker,
                 plugin_host: self.plugin_host,
                 derived_state_host: self.derived_state_host,
-                plugin_hooks_enabled: self.plugin_hooks_enabled,
                 derived_state_hooks_enabled: self.derived_state_hooks_enabled,
                 fork_status_transitions_total: self.fork_status_transitions_total,
                 fork_reorg_count: self.fork_reorg_count,
@@ -3295,7 +4053,7 @@ impl PacketWorkerResultContext<'_> {
         leader_diff: crate::verify::SlotLeaderDiff,
         observed_slot_leaders: Vec<(u64, [u8; 32])>,
     ) {
-        if !self.plugin_hooks_enabled {
+        if !self.plugin_host.wants_leader_schedule() && !self.derived_state_hooks_enabled {
             return;
         }
         emit_slot_leader_diff_event(
@@ -3497,6 +4255,45 @@ fn shard_fec_set_to_worker(slot: u64, fec_set_index: u32, worker_count: usize) -
         .unwrap_or(0)
 }
 
+fn dispatch_packet_worker_burst(
+    packet_worker_pool: &PacketWorkerPool,
+    packet_batch_dispatch_scratch: &mut PacketBatchDispatchScratch,
+    worker_index: usize,
+    mut packets: Vec<PacketWorkerInput>,
+    max_packets: usize,
+) -> bool {
+    while !packets.is_empty() {
+        let chunk = take_next_packet_worker_batch_chunk(&mut packets, max_packets);
+        match packet_worker_pool.dispatch_worker_batch(worker_index, chunk) {
+            DispatchWorkerBatchOutcome::Enqueued => {}
+            DispatchWorkerBatchOutcome::Dropped(mut dropped) => {
+                if !packets.is_empty() {
+                    dropped.append(&mut packets);
+                }
+                packet_batch_dispatch_scratch.recycle_worker_batch(worker_index, dropped);
+                return true;
+            }
+            DispatchWorkerBatchOutcome::Closed(mut dropped) => {
+                if !packets.is_empty() {
+                    dropped.append(&mut packets);
+                }
+                packet_batch_dispatch_scratch.recycle_worker_batch(worker_index, dropped);
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn take_next_packet_worker_batch_chunk<T>(packets: &mut Vec<T>, max_packets: usize) -> Vec<T> {
+    let max_packets = max_packets.max(1);
+    if packets.len() <= max_packets {
+        return std::mem::take(packets);
+    }
+    let tail = packets.split_off(max_packets);
+    std::mem::replace(packets, tail)
+}
+
 fn select_least_loaded_worker(worker_loads: &[u64], preferred_worker: usize) -> usize {
     if worker_loads.is_empty() {
         return 0;
@@ -3591,8 +4388,6 @@ struct ForkUpdateDispatchContext<'context> {
     plugin_host: &'context PluginHost,
     /// Derived-state host that receives authoritative fork events.
     derived_state_host: &'context DerivedStateHost,
-    /// Whether plugin fork hooks are enabled for this runtime.
-    plugin_hooks_enabled: bool,
     /// Whether derived-state fork hooks are enabled for this runtime.
     derived_state_hooks_enabled: bool,
     /// Aggregate count of slot status transitions seen so far.
@@ -3611,10 +4406,15 @@ fn apply_fork_update(update: &ForkTrackerUpdate, context: &mut ForkUpdateDispatc
     *context.fork_status_transitions_total = context
         .fork_status_transitions_total
         .saturating_add(u64::try_from(update.status_transitions.len()).unwrap_or(u64::MAX));
+    let plugin_slot_status_enabled = context.plugin_host.wants_slot_status();
+    let derived_slot_status_enabled = context.derived_state_hooks_enabled;
     for transition in &update.status_transitions {
         if transition.status == crate::event::ForkSlotStatus::Orphaned {
             *context.fork_orphaned_slots_total =
                 context.fork_orphaned_slots_total.saturating_add(1);
+        }
+        if !derived_slot_status_enabled && !plugin_slot_status_enabled {
+            continue;
         }
         let event = SlotStatusEvent {
             slot: transition.slot,
@@ -3625,15 +4425,20 @@ fn apply_fork_update(update: &ForkTrackerUpdate, context: &mut ForkUpdateDispatc
             confirmed_slot: update.snapshot.confirmed_slot,
             finalized_slot: update.snapshot.finalized_slot,
         };
-        if context.derived_state_hooks_enabled {
+        if derived_slot_status_enabled {
             context.derived_state_host.on_slot_status(event);
         }
-        if context.plugin_hooks_enabled {
+        if plugin_slot_status_enabled {
             context.plugin_host.on_slot_status(event);
         }
     }
     if let Some(reorg) = update.reorg.as_ref() {
         *context.fork_reorg_count = context.fork_reorg_count.saturating_add(1);
+        let plugin_reorg_enabled = context.plugin_host.wants_reorg();
+        let derived_reorg_enabled = context.derived_state_hooks_enabled;
+        if !derived_reorg_enabled && !plugin_reorg_enabled {
+            return;
+        }
         let event = ReorgEvent {
             old_tip: reorg.old_tip,
             new_tip: reorg.new_tip,
@@ -3643,10 +4448,10 @@ fn apply_fork_update(update: &ForkTrackerUpdate, context: &mut ForkUpdateDispatc
             confirmed_slot: update.snapshot.confirmed_slot,
             finalized_slot: update.snapshot.finalized_slot,
         };
-        if context.derived_state_hooks_enabled {
+        if derived_reorg_enabled {
             context.derived_state_host.on_reorg(event.clone());
         }
-        if context.plugin_hooks_enabled {
+        if plugin_reorg_enabled {
             context.plugin_host.on_reorg(event);
         }
     }
@@ -3726,9 +4531,20 @@ mod tests {
     use crate::framework::{
         CheckpointBarrierEvent, DerivedStateCheckpoint, DerivedStateConsumer,
         DerivedStateConsumerFault, DerivedStateConsumerFaultKind, DerivedStateFeedEnvelope,
-        DerivedStateFeedEvent, FeedSequence,
+        DerivedStateFeedEvent, FeedSequence, Plugin, PluginConfig, PluginContext,
+        PluginDispatchMode, PluginHost, PluginSetupError,
     };
+    use async_trait::async_trait;
+    use rand::{SeedableRng, rngs::StdRng};
+    use solana_entry::entry::{Entry, MaxDataShredsLen};
+    use solana_hash::Hash;
+    use solana_perf::test_tx::{new_test_vote_tx, test_tx};
+    use solana_transaction::versioned::VersionedTransaction;
     use std::sync::{Arc, Mutex};
+    use wincode::{
+        Serialize as _,
+        containers::{Elem, Vec as WincodeVec},
+    };
 
     #[test]
     fn extension_dispatch_telemetry_aggregates_totals_and_maxima() {
@@ -3768,6 +4584,212 @@ mod tests {
     fn extension_dispatch_telemetry_handles_empty_metrics() {
         let snapshot = collect_extension_dispatch_telemetry(Vec::new());
         assert_eq!(snapshot, ExtensionDispatchTelemetrySnapshot::default());
+    }
+
+    #[test]
+    fn inline_transaction_dispatch_mode_is_explicit() {
+        assert_eq!(
+            select_inline_transaction_dispatch_mode(false, true, false),
+            InlineTransactionDispatchMode::Disabled
+        );
+        assert_eq!(
+            select_inline_transaction_dispatch_mode(true, false, false),
+            InlineTransactionDispatchMode::Disabled
+        );
+        assert_eq!(
+            select_inline_transaction_dispatch_mode(true, true, false),
+            InlineTransactionDispatchMode::ExclusiveDatasetProcessing
+        );
+        assert_eq!(
+            select_inline_transaction_dispatch_mode(true, true, true),
+            InlineTransactionDispatchMode::MixedWithDatasetWorkers
+        );
+    }
+
+    #[derive(Debug, Clone, Copy, Default)]
+    struct ProfileInlineOnlyPlugin;
+
+    #[async_trait]
+    impl Plugin for ProfileInlineOnlyPlugin {
+        fn name(&self) -> &'static str {
+            "profile-inline-only"
+        }
+
+        fn config(&self) -> PluginConfig {
+            PluginConfig::new().with_inline_transaction()
+        }
+
+        async fn setup(&self, _ctx: PluginContext) -> Result<(), PluginSetupError> {
+            Ok(())
+        }
+
+        async fn on_transaction(&self, _event: &crate::framework::TransactionEvent) {}
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for perf"]
+    fn inline_open_dataset_profile_fixture() {
+        let iterations = std::env::var("SOF_INLINE_OPEN_DATASET_PROFILE_ITERS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(2_048);
+        let fragment_count = std::env::var("SOF_INLINE_OPEN_DATASET_PROFILE_FRAGMENTS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(32);
+        let payload = build_inline_profile_payload(32);
+        let fragments = split_inline_profile_payload(&payload, fragment_count);
+        let plugin_host = PluginHost::builder()
+            .with_dispatch_mode(PluginDispatchMode::Sequential)
+            .with_transaction_dispatch_workers(4)
+            .add_plugin(ProfileInlineOnlyPlugin)
+            .build();
+        let tx_commitment_tracker = CommitmentSlotTracker::new();
+        let started_at = Instant::now();
+        let mut dispatched_total = 0_usize;
+        let mut start_indices_scratch = Vec::<u32>::new();
+
+        for iteration in 0..iterations {
+            let slot = 3_000_000_u64.saturating_add(u64::try_from(iteration).unwrap_or(u64::MAX));
+            let mut reassembler =
+                crate::reassembly::inline::InlineDataReassembler::new(fragment_count.max(4));
+            let mut open_state = InlineOpenDatasetState::default();
+            for (index, fragment) in fragments.iter().enumerate() {
+                let observed_at = Instant::now();
+                let _ = reassembler.observe_data_shred_meta_at(
+                    slot,
+                    u32::try_from(index).unwrap_or(u32::MAX),
+                    0,
+                    index + 1 == fragments.len(),
+                    index + 1 == fragments.len(),
+                    crate::reassembly::dataset::SharedPayloadFragment::owned(fragment.clone()),
+                    observed_at,
+                );
+                reassembler.fill_inline_contiguous_dataset_starts(slot, &mut start_indices_scratch);
+                let Some(&start_index) = start_indices_scratch.first() else {
+                    continue;
+                };
+                let synced =
+                    reassembler.sync_inline_contiguous_dataset(slot, start_index, &mut open_state);
+                assert!(synced.is_some(), "inline dataset state should sync");
+                match open_state.advance_ready_ranges() {
+                    crate::app::runtime::dataset::EntryStreamPrefixAdvance::Complete
+                    | crate::app::runtime::dataset::EntryStreamPrefixAdvance::Incomplete => {}
+                    crate::app::runtime::dataset::EntryStreamPrefixAdvance::Malformed => {
+                        panic!("unexpected malformed inline prefix fixture")
+                    }
+                }
+                if open_state.emitted_tx_count >= open_state.ready_tx_ranges.len() {
+                    continue;
+                }
+                let commitment_snapshot = tx_commitment_tracker.snapshot();
+                let commitment_status = TxCommitmentStatus::from_slot(
+                    slot,
+                    commitment_snapshot.confirmed_slot,
+                    commitment_snapshot.finalized_slot,
+                );
+                let visible_tx_count =
+                    u32::try_from(open_state.ready_tx_ranges.len()).unwrap_or(u32::MAX);
+                for (dataset_tx_offset, range) in open_state
+                    .ready_tx_ranges
+                    .iter()
+                    .enumerate()
+                    .skip(open_state.emitted_tx_count)
+                {
+                    let start = usize::try_from(range.start()).expect("range start");
+                    let end = usize::try_from(range.end()).expect("range end");
+                    let bytes = open_state
+                        .payload
+                        .get(start..end)
+                        .expect("inline transaction bytes");
+                    let tx = bincode::deserialize::<VersionedTransaction>(bytes)
+                        .expect("deserialize inline transaction");
+                    let kind = crate::app::runtime::dataset::classify_tx_kind(&tx);
+                    let signature = tx.signatures.first().copied();
+                    let dispatch = plugin_host.classify_transaction_ref_in_scope(
+                        TransactionEventRef {
+                            slot,
+                            commitment_status,
+                            confirmed_slot: commitment_snapshot.confirmed_slot,
+                            finalized_slot: commitment_snapshot.finalized_slot,
+                            signature,
+                            tx: &tx,
+                            kind,
+                        },
+                        TransactionDispatchScope::InlineOnly,
+                    );
+                    if dispatch.is_empty() {
+                        continue;
+                    }
+                    let tx_ready_observed_at = open_state
+                        .tx_ready_observed_at(end)
+                        .expect("ready observed at");
+                    let tx_first_observed_at = open_state
+                        .tx_first_observed_at(start)
+                        .expect("first observed at");
+                    plugin_host.on_classified_transaction(
+                        dispatch,
+                        crate::framework::TransactionEvent {
+                            slot,
+                            commitment_status,
+                            confirmed_slot: commitment_snapshot.confirmed_slot,
+                            finalized_slot: commitment_snapshot.finalized_slot,
+                            signature,
+                            tx: Arc::new(tx),
+                            kind,
+                        },
+                        tx_ready_observed_at,
+                        tx_first_observed_at,
+                        tx_ready_observed_at,
+                        crate::framework::host::InlineTransactionDispatchSource::EarlyPrefix,
+                        visible_tx_count,
+                        u32::try_from(dataset_tx_offset).unwrap_or(u32::MAX),
+                    );
+                    dispatched_total = dispatched_total.saturating_add(1);
+                }
+                open_state.emitted_tx_count = open_state.ready_tx_ranges.len();
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(dispatched_total > 0);
+        println!(
+            "inline_open_dataset_profile_fixture iterations={} fragments={} dispatched={} elapsed_ms={}",
+            iterations,
+            fragment_count,
+            dispatched_total,
+            started_at.elapsed().as_millis()
+        );
+    }
+
+    #[test]
+    fn packet_worker_batch_chunking_preserves_order() {
+        let mut packets = (0..10).collect::<Vec<_>>();
+
+        let first = take_next_packet_worker_batch_chunk(&mut packets, 4);
+        let second = take_next_packet_worker_batch_chunk(&mut packets, 4);
+        let third = take_next_packet_worker_batch_chunk(&mut packets, 4);
+
+        assert_eq!(first, vec![0, 1, 2, 3]);
+        assert_eq!(second, vec![4, 5, 6, 7]);
+        assert_eq!(third, vec![8, 9]);
+        assert!(packets.is_empty());
+    }
+
+    #[test]
+    fn packet_worker_batch_chunking_treats_zero_limit_as_one() {
+        let mut packets = vec![7, 8, 9];
+
+        let first = take_next_packet_worker_batch_chunk(&mut packets, 0);
+        let second = take_next_packet_worker_batch_chunk(&mut packets, 0);
+        let third = take_next_packet_worker_batch_chunk(&mut packets, 0);
+
+        assert_eq!(first, vec![7]);
+        assert_eq!(second, vec![8]);
+        assert_eq!(third, vec![9]);
+        assert!(packets.is_empty());
     }
 
     #[test]
@@ -3813,6 +4835,30 @@ mod tests {
 
     struct DriverRecordingConsumer {
         state: Arc<Mutex<Vec<DerivedStateFeedEnvelope>>>,
+    }
+
+    fn build_inline_profile_payload(entry_count: usize) -> Vec<u8> {
+        let mut rng = StdRng::seed_from_u64(11);
+        let mut entries = Vec::with_capacity(entry_count);
+        for index in 0..entry_count {
+            let hash_byte = u8::try_from(index & 0xff).unwrap_or(u8::MAX);
+            entries.push(Entry {
+                num_hashes: 1,
+                hash: Hash::new_from_array([hash_byte; 32]),
+                transactions: vec![
+                    VersionedTransaction::from(test_tx()),
+                    VersionedTransaction::from(new_test_vote_tx(&mut rng)),
+                ],
+            });
+        }
+        WincodeVec::<Elem<Entry>, MaxDataShredsLen>::serialize(&entries)
+            .expect("serialize inline profile payload")
+    }
+
+    fn split_inline_profile_payload(payload: &[u8], fragment_count: usize) -> Vec<Vec<u8>> {
+        let fragment_count = fragment_count.max(1);
+        let chunk_len = payload.len().div_ceil(fragment_count).max(1);
+        payload.chunks(chunk_len).map(ToOwned::to_owned).collect()
     }
 
     impl DerivedStateConsumer for DriverRecordingConsumer {

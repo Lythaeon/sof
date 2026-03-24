@@ -54,7 +54,11 @@ pub(crate) fn run_with_hosts(
     extension_host: RuntimeExtensionHost,
     derived_state_host: DerivedStateHost,
 ) -> Result<(), RuntimeEntrypointError> {
+    let runtime_current_thread = read_runtime_current_thread();
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        if runtime_current_thread {
+            return run_with_fresh_runtime_thread(plugin_host, extension_host, derived_state_host);
+        }
         return match handle.runtime_flavor() {
             tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(|| {
                 handle.block_on(run_async_with_hosts(
@@ -96,6 +100,22 @@ pub(crate) fn run_with_hosts(
         };
     }
 
+    if runtime_current_thread {
+        pin_runtime_thread_if_requested();
+        let worker_threads = read_worker_threads();
+        return tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(worker_threads.saturating_mul(8))
+            .enable_all()
+            .build()
+            .map_err(|source| RuntimeEntrypointError::BuildTokioRuntime { source })?
+            .block_on(run_async_with_hosts(
+                plugin_host,
+                extension_host,
+                derived_state_host,
+                None,
+            ));
+    }
+
     let worker_threads = read_worker_threads();
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
@@ -109,6 +129,78 @@ pub(crate) fn run_with_hosts(
             derived_state_host,
             None,
         ))
+}
+
+fn run_with_fresh_runtime_thread(
+    plugin_host: PluginHost,
+    extension_host: RuntimeExtensionHost,
+    derived_state_host: DerivedStateHost,
+) -> Result<(), RuntimeEntrypointError> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let spawn_result = std::thread::Builder::new()
+        .name("sof-runtime-main".to_owned())
+        .spawn(move || {
+            pin_runtime_thread_if_requested();
+            let worker_threads = read_worker_threads();
+            let result = tokio::runtime::Builder::new_current_thread()
+                .max_blocking_threads(worker_threads.saturating_mul(8))
+                .enable_all()
+                .build()
+                .map_err(|source| RuntimeEntrypointError::BuildTokioRuntime { source })
+                .and_then(|runtime| {
+                    runtime.block_on(run_async_with_hosts(
+                        plugin_host,
+                        extension_host,
+                        derived_state_host,
+                        None,
+                    ))
+                });
+            drop(tx.send(result));
+        });
+    if let Err(source) = spawn_result {
+        return Err(RuntimeEntrypointError::BuildTokioRuntime { source });
+    }
+    rx.recv()
+        .map_err(|source| RuntimeEntrypointError::Runloop {
+            reason: format!("failed to receive runtime result from helper thread: {source}"),
+        })?
+}
+
+fn pin_runtime_thread_if_requested() {
+    let Some(core_index) = read_runtime_core() else {
+        return;
+    };
+    let Some(core_ids) = core_affinity::get_core_ids() else {
+        tracing::warn!(
+            core_index,
+            "failed to query CPU core ids for runtime pinning"
+        );
+        return;
+    };
+    let Some(core_slot) = core_index.checked_rem(core_ids.len()) else {
+        tracing::warn!(
+            core_index,
+            "runtime core index modulo failed for selected core set"
+        );
+        return;
+    };
+    let Some(core_id) = core_ids.get(core_slot).copied() else {
+        tracing::warn!(core_index, "runtime core index resolved to empty core set");
+        return;
+    };
+    if core_affinity::set_for_current(core_id) {
+        tracing::info!(
+            core_index,
+            assigned_core = core_id.id,
+            "pinned runtime thread to CPU core"
+        );
+    } else {
+        tracing::warn!(
+            core_index,
+            assigned_core = core_id.id,
+            "failed to pin runtime thread to CPU core"
+        );
+    }
 }
 
 pub(crate) async fn run_async() -> Result<(), RuntimeEntrypointError> {

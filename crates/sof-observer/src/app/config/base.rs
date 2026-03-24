@@ -17,6 +17,14 @@ pub fn read_worker_threads() -> usize {
         })
 }
 
+pub fn read_runtime_current_thread() -> bool {
+    read_bool_env("SOF_RUNTIME_CURRENT_THREAD", false)
+}
+
+pub fn read_runtime_core() -> Option<usize> {
+    read_env_var("SOF_RUNTIME_CORE").and_then(|value| value.parse::<usize>().ok())
+}
+
 pub fn read_dataset_workers() -> usize {
     read_env_var("SOF_DATASET_WORKERS")
         .and_then(|value| value.parse::<usize>().ok())
@@ -37,6 +45,14 @@ pub fn read_packet_worker_queue_capacity() -> usize {
         .filter(|value| *value > 0)
         .map(|value| value.min(65_536))
         .unwrap_or(256)
+}
+
+pub fn read_packet_worker_batch_max_packets() -> usize {
+    read_env_var("SOF_PACKET_WORKER_BATCH_MAX_PACKETS")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(256))
+        .unwrap_or(8)
 }
 
 pub fn read_dataset_max_tracked_slots() -> usize {
@@ -146,6 +162,11 @@ pub fn read_log_non_vote_txs() -> bool {
 
 pub fn read_skip_vote_only_tx_detail_path() -> bool {
     read_bool_env("SOF_SKIP_VOTE_ONLY_TX_DETAIL_PATH", false)
+}
+
+pub fn read_inline_transaction_dispatch_override() -> Option<bool> {
+    read_env_var("SOF_INLINE_TRANSACTION_DISPATCH")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 pub fn read_log_dataset_reconstruction() -> bool {

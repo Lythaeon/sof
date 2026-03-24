@@ -8,8 +8,8 @@ use std::{
 
 use crate::event::TxKind;
 use crate::framework::{
-    PluginConfig, PluginContext, PluginSetupError, TransactionEventRef, TransactionInterest,
-    TxCommitmentStatus,
+    PluginConfig, PluginContext, PluginSetupError, TransactionDispatchMode, TransactionEventRef,
+    TransactionInterest, TxCommitmentStatus,
 };
 
 #[derive(Clone, Copy)]
@@ -48,6 +48,119 @@ fn builder_registers_multiple_plugins_from_iterator() {
         .with_plugin(PluginB)
         .build();
     assert_eq!(host.len(), 3);
+}
+
+#[derive(Clone, Copy)]
+struct InlineTransactionPlugin;
+
+#[async_trait]
+impl ObserverPlugin for InlineTransactionPlugin {
+    fn name(&self) -> &'static str {
+        "inline-transaction-plugin"
+    }
+
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_inline_transaction()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InlineCriticalTransactionPlugin;
+
+#[async_trait]
+impl ObserverPlugin for InlineCriticalTransactionPlugin {
+    fn name(&self) -> &'static str {
+        "inline-critical-transaction-plugin"
+    }
+
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_inline_transaction()
+    }
+
+    fn transaction_interest_ref(&self, _event: TransactionEventRef<'_>) -> TransactionInterest {
+        TransactionInterest::Critical
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StandardCriticalTransactionPlugin;
+
+#[async_trait]
+impl ObserverPlugin for StandardCriticalTransactionPlugin {
+    fn name(&self) -> &'static str {
+        "standard-critical-transaction-plugin"
+    }
+
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_transaction()
+    }
+
+    fn transaction_interest_ref(&self, _event: TransactionEventRef<'_>) -> TransactionInterest {
+        TransactionInterest::Critical
+    }
+}
+
+#[test]
+fn builder_tracks_inline_transaction_preference() {
+    let standard_host = PluginHostBuilder::new()
+        .add_plugin(PriorityTransactionPlugin {
+            critical_handled: Arc::new(AtomicUsize::new(0)),
+            background_handled: Arc::new(AtomicUsize::new(0)),
+        })
+        .build();
+    assert!(standard_host.wants_transaction());
+    assert!(!standard_host.wants_inline_transaction_dispatch());
+
+    let inline_host = PluginHostBuilder::new()
+        .add_plugin(InlineTransactionPlugin)
+        .build();
+    assert!(inline_host.wants_transaction());
+    assert!(inline_host.wants_inline_transaction_dispatch());
+
+    let explicit_standard =
+        PluginConfig::new().with_transaction_mode(TransactionDispatchMode::Standard);
+    assert!(explicit_standard.transaction);
+    assert_eq!(
+        explicit_standard.transaction_dispatch_mode,
+        TransactionDispatchMode::Standard
+    );
+}
+
+#[test]
+fn transaction_classification_scopes_split_inline_and_deferred_plugins() {
+    let host = PluginHostBuilder::new()
+        .add_plugin(InlineCriticalTransactionPlugin)
+        .add_plugin(StandardCriticalTransactionPlugin)
+        .build();
+    let event = test_transaction_event(2);
+    let event_ref = TransactionEventRef {
+        slot: event.slot,
+        commitment_status: event.commitment_status,
+        confirmed_slot: event.confirmed_slot,
+        finalized_slot: event.finalized_slot,
+        signature: event.signature,
+        tx: event.tx.as_ref(),
+        kind: event.kind,
+    };
+
+    assert!(host.wants_transaction_dispatch_in_scope(TransactionDispatchScope::All));
+    assert!(host.wants_transaction_dispatch_in_scope(TransactionDispatchScope::InlineOnly));
+    assert!(host.wants_transaction_dispatch_in_scope(TransactionDispatchScope::DeferredOnly));
+    assert!(
+        !host
+            .classify_transaction_ref_in_scope(event_ref, TransactionDispatchScope::All)
+            .is_empty()
+    );
+    assert!(
+        !host
+            .classify_transaction_ref_in_scope(event_ref, TransactionDispatchScope::InlineOnly)
+            .is_empty()
+    );
+    assert!(
+        !host
+            .classify_transaction_ref_in_scope(event_ref, TransactionDispatchScope::DeferredOnly)
+            .is_empty()
+    );
 }
 
 #[derive(Clone, Copy)]

@@ -415,6 +415,27 @@ impl RuntimeSetup {
         self.with_env("SOF_SKIP_VOTE_ONLY_TX_DETAIL_PATH", enabled.to_string())
     }
 
+    /// Sets `SOF_INLINE_TRANSACTION_DISPATCH`.
+    ///
+    /// This is an explicit runtime override. By default, SOF automatically chooses
+    /// the inline transaction path when a compatible plugin opts in with
+    /// [`crate::framework::PluginConfig::with_inline_transaction`].
+    ///
+    /// Setting this to `false` forces the standard dataset-worker path even for
+    /// inline-capable plugins. Setting it to `true` keeps inline dispatch eligible,
+    /// but incompatible dataset or derived-state consumers still force a fallback to
+    /// the standard path.
+    #[must_use]
+    pub fn with_inline_transaction_dispatch(self, enabled: bool) -> Self {
+        self.with_env("SOF_INLINE_TRANSACTION_DISPATCH", enabled.to_string())
+    }
+
+    /// Forces the standard dataset-worker transaction path.
+    #[must_use]
+    pub fn with_standard_transaction_dispatch(self) -> Self {
+        self.with_inline_transaction_dispatch(false)
+    }
+
     /// Sets `SOF_LOG_DATASET_RECONSTRUCTION`.
     #[must_use]
     pub fn with_log_dataset_reconstruction(self, enabled: bool) -> Self {

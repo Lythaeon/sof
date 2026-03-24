@@ -103,8 +103,7 @@ pub(super) fn recover_missing_data(
         };
         let recovered =
             build_recovered_data_shred(&shard, &set.leader_signature, SIZE_OF_DATA_SHRED_PAYLOAD)?;
-        if let Entry::Vacant(vacant) = set.data_shreds.entry(index) {
-            let _ = vacant.insert(recovered.clone());
+        if set.insert_recovered_data_shred(fec_set_index, index, recovered.clone()) {
             recovered_payloads.push(recovered);
         }
     }

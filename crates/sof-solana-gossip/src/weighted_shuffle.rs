@@ -69,9 +69,7 @@ where
         let mut num_overflow: usize = 0;
         for (k, weight) in weights.enumerate() {
             let weight = *weight.borrow();
-            #[allow(clippy::neg_cmp_op_on_partial_ord)]
-            // weight < zero does not work for NaNs.
-            if !(weight >= Self::ZERO) {
+            if weight.partial_cmp(&Self::ZERO).is_none_or(|ordering| ordering.is_lt()) {
                 zeros.push(k);
                 num_negative += 1;
                 continue;

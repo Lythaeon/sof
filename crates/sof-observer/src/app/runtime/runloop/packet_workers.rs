@@ -5,6 +5,7 @@ pub(super) struct PacketWorkerInput {
     pub(super) source: SocketAddr,
     pub(super) packet_bytes: Arc<[u8]>,
     pub(super) parsed_header: ParsedShredHeader,
+    pub(super) observed_at: Instant,
 }
 
 #[derive(Debug)]
@@ -35,6 +36,7 @@ pub(super) enum WorkerAcceptedShredKind {
 #[derive(Debug)]
 pub(super) struct WorkerAcceptedShred {
     pub(super) source: Option<SocketAddr>,
+    pub(super) observed_at: Instant,
     pub(super) slot: u64,
     pub(super) index: u32,
     pub(super) fec_set_index: u32,
@@ -111,6 +113,15 @@ impl WorkerVerifyCounters {
                 self.malformed = self.malformed.saturating_add(1);
             }
         }
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.verified == 0
+            && self.unknown_leader == 0
+            && self.invalid_merkle == 0
+            && self.invalid_signature == 0
+            && self.malformed == 0
+            && self.dropped == 0
     }
 }
 
@@ -201,7 +212,6 @@ impl PacketWorkerPool {
         let sender_capacity = queue_capacity.max(1);
         let (result_tx, result_rx) =
             mpsc::channel::<PacketWorkerBatchResult>(worker_count.saturating_mul(sender_capacity));
-        let runtime_handle = tokio::runtime::Handle::current();
         #[cfg(feature = "gossip-bootstrap")]
         let known_pubkeys = SharedKnownPubkeys::default();
         let queue_depth = Arc::new(AtomicU64::new(0));
@@ -213,7 +223,6 @@ impl PacketWorkerPool {
         for _worker_id in 0..worker_count {
             let (worker_tx, mut worker_rx) = mpsc::channel::<PacketWorkerBatch>(sender_capacity);
             let worker_result_tx = result_tx.clone();
-            let worker_runtime_handle = runtime_handle.clone();
             #[cfg(feature = "gossip-bootstrap")]
             let worker_known_pubkeys = known_pubkeys.clone();
             let worker_telemetry = PacketWorkerTelemetry::new();
@@ -233,7 +242,7 @@ impl PacketWorkerPool {
                     FecRecoverer::new(fec_max_tracked_sets, fec_retained_slot_lag);
 
                 loop {
-                    let maybe_batch = worker_runtime_handle.block_on(worker_rx.recv());
+                    let maybe_batch = worker_rx.blocking_recv();
                     let Some(batch) = maybe_batch else {
                         break;
                     };
@@ -250,15 +259,16 @@ impl PacketWorkerPool {
                         &mut verifier_generation,
                         shred_verifier.as_mut(),
                     );
-                    let result = process_packet_batch(
+                    let forwarded_all_results = process_packet_batch_streaming(
                         batch,
                         shred_verifier.as_mut(),
                         verify_recovered_shreds,
                         verify_strict_unknown,
                         &mut fec_recoverer,
+                        |result| worker_result_tx.blocking_send(result).is_ok(),
                     );
                     worker_telemetry_state.set_tracked_fec_sets(fec_recoverer.tracked_sets());
-                    if worker_result_tx.blocking_send(result).is_err() {
+                    if !forwarded_all_results {
                         break;
                     }
                 }
@@ -343,6 +353,13 @@ impl PacketWorkerPool {
 
     pub(super) async fn recv(&mut self) -> Option<PacketWorkerBatchResult> {
         self.result_rx.recv().await
+    }
+
+    #[cfg(feature = "gossip-bootstrap")]
+    pub(super) fn try_recv(
+        &mut self,
+    ) -> Result<PacketWorkerBatchResult, tokio::sync::mpsc::error::TryRecvError> {
+        self.result_rx.try_recv()
     }
 
     pub(super) fn close_inputs(&mut self) {
@@ -430,125 +447,172 @@ fn refresh_known_pubkeys(
     *verifier_generation = generation;
 }
 
-fn process_packet_batch(
+fn process_packet_batch_streaming<F>(
     batch: PacketWorkerBatch,
     mut shred_verifier: Option<&mut ShredVerifier>,
     verify_recovered_shreds: bool,
     verify_strict_unknown: bool,
     fec_recoverer: &mut FecRecoverer,
-) -> PacketWorkerBatchResult {
+    mut emit_result: F,
+) -> bool
+where
+    F: FnMut(PacketWorkerBatchResult) -> bool,
+{
     let PacketWorkerBatch {
         worker_index,
         mut packets,
     } = batch;
-    let mut accepted_shreds = Vec::new();
-    #[cfg(feature = "gossip-bootstrap")]
-    let mut observed_slot_leaders = HashMap::<u64, [u8; 32]>::new();
-    let mut verify_counters = WorkerVerifyCounters::default();
+    let mut forwarded_all_results = true;
+    {
+        let mut drained_packets = packets.drain(..).peekable();
 
-    for packet in packets.drain(..) {
-        let observed_at = Instant::now();
-        let accepted = match verify_packet_with_counters(
-            shred_verifier.as_deref_mut(),
-            packet.packet_bytes.as_ref(),
-            observed_at,
-            verify_strict_unknown,
-            &mut verify_counters,
-        ) {
-            WorkerVerifyDecision::Accept => true,
-            WorkerVerifyDecision::Drop => false,
-        };
-        if !accepted {
-            continue;
-        }
-        #[cfg(feature = "gossip-bootstrap")]
-        maybe_record_observed_leader(
-            shred_verifier.as_deref(),
-            parsed_header_slot(&packet.parsed_header),
-            &mut observed_slot_leaders,
-        );
-        let recovered_packets = fec_recoverer.ingest_packet(packet.packet_bytes.as_ref());
-        push_primary_shred(packet, &mut accepted_shreds);
-
-        for recovered in recovered_packets {
-            let parsed_recovered = match parse_shred(&recovered) {
-                Ok(parsed) => parsed,
-                Err(_) => continue,
+        while let Some(packet) = drained_packets.next() {
+            let mut accepted_shreds = Vec::new();
+            #[cfg(feature = "gossip-bootstrap")]
+            let mut observed_slot_leaders = HashMap::<u64, [u8; 32]>::new();
+            let mut verify_counters = WorkerVerifyCounters::default();
+            let observed_at = packet.observed_at;
+            let accepted = match verify_packet_with_counters(
+                shred_verifier.as_deref_mut(),
+                packet.packet_bytes.as_ref(),
+                observed_at,
+                verify_strict_unknown,
+                &mut verify_counters,
+            ) {
+                WorkerVerifyDecision::Accept => true,
+                WorkerVerifyDecision::Drop => false,
             };
-            if verify_recovered_shreds {
-                let recovered_accepted = match verify_packet_with_counters(
-                    shred_verifier.as_deref_mut(),
-                    &recovered,
-                    observed_at,
-                    verify_strict_unknown,
-                    &mut verify_counters,
-                ) {
-                    WorkerVerifyDecision::Accept => true,
-                    WorkerVerifyDecision::Drop => false,
-                };
-                if !recovered_accepted {
-                    continue;
-                }
-            }
-            if let ParsedShred::Data(data) = parsed_recovered {
-                let Some(signature) = packet_signature_bytes(&recovered) else {
-                    continue;
-                };
-                let Some(variant) = packet_variant_byte(&recovered) else {
-                    continue;
-                };
+            if accepted {
                 #[cfg(feature = "gossip-bootstrap")]
                 maybe_record_observed_leader(
                     shred_verifier.as_deref(),
-                    data.common.slot,
+                    parsed_header_slot(&packet.parsed_header),
                     &mut observed_slot_leaders,
                 );
-                accepted_shreds.push(WorkerAcceptedShred {
-                    source: None,
-                    slot: data.common.slot,
-                    index: data.common.index,
-                    fec_set_index: data.common.fec_set_index,
-                    version: data.common.version,
-                    variant,
-                    signature,
-                    kind: WorkerAcceptedShredKind::RecoveredData {
-                        parent_slot: derive_parent_slot(
+                let recovered_packets = fec_recoverer.ingest_packet(packet.packet_bytes.as_ref());
+                push_primary_shred(packet, &mut accepted_shreds);
+
+                for recovered in recovered_packets {
+                    let parsed_recovered = match parse_shred(&recovered) {
+                        Ok(parsed) => parsed,
+                        Err(_) => continue,
+                    };
+                    if verify_recovered_shreds {
+                        let recovered_accepted = match verify_packet_with_counters(
+                            shred_verifier.as_deref_mut(),
+                            &recovered,
+                            observed_at,
+                            verify_strict_unknown,
+                            &mut verify_counters,
+                        ) {
+                            WorkerVerifyDecision::Accept => true,
+                            WorkerVerifyDecision::Drop => false,
+                        };
+                        if !recovered_accepted {
+                            continue;
+                        }
+                    }
+                    if let ParsedShred::Data(data) = parsed_recovered {
+                        let Some(signature) = packet_signature_bytes(&recovered) else {
+                            continue;
+                        };
+                        let Some(variant) = packet_variant_byte(&recovered) else {
+                            continue;
+                        };
+                        #[cfg(feature = "gossip-bootstrap")]
+                        maybe_record_observed_leader(
+                            shred_verifier.as_deref(),
                             data.common.slot,
-                            data.data_header.parent_offset,
-                        ),
-                        data_complete: data.data_header.data_complete(),
-                        last_in_slot: data.data_header.last_in_slot(),
-                        reference_tick: data.data_header.reference_tick(),
-                    },
-                    payload_fragment: Some(
-                        crate::reassembly::dataset::SharedPayloadFragment::owned(data.payload),
-                    ),
-                });
+                            &mut observed_slot_leaders,
+                        );
+                        accepted_shreds.push(WorkerAcceptedShred {
+                            source: None,
+                            observed_at,
+                            slot: data.common.slot,
+                            index: data.common.index,
+                            fec_set_index: data.common.fec_set_index,
+                            version: data.common.version,
+                            variant,
+                            signature,
+                            kind: WorkerAcceptedShredKind::RecoveredData {
+                                parent_slot: derive_parent_slot(
+                                    data.common.slot,
+                                    data.data_header.parent_offset,
+                                ),
+                                data_complete: data.data_header.data_complete(),
+                                last_in_slot: data.data_header.last_in_slot(),
+                                reference_tick: data.data_header.reference_tick(),
+                            },
+                            payload_fragment: Some(
+                                crate::reassembly::dataset::SharedPayloadFragment::owned(
+                                    data.payload,
+                                ),
+                            ),
+                        });
+                    }
+                }
+            }
+
+            #[cfg(feature = "gossip-bootstrap")]
+            let leader_diff = shred_verifier.as_deref_mut().map_or_else(
+                crate::verify::SlotLeaderDiff::default,
+                ShredVerifier::take_slot_leader_diff,
+            );
+            #[cfg(not(feature = "gossip-bootstrap"))]
+            let should_emit = !accepted_shreds.is_empty()
+                || !verify_counters.is_empty()
+                || drained_packets.peek().is_none();
+            #[cfg(feature = "gossip-bootstrap")]
+            let should_emit = !accepted_shreds.is_empty()
+                || !observed_slot_leaders.is_empty()
+                || !leader_diff.added.is_empty()
+                || !leader_diff.updated.is_empty()
+                || !leader_diff.removed_slots.is_empty()
+                || !verify_counters.is_empty()
+                || drained_packets.peek().is_none();
+            if !should_emit {
+                continue;
+            }
+
+            if !emit_result(PacketWorkerBatchResult {
+                worker_index,
+                reusable_packets: Vec::new(),
+                accepted_shreds,
+                #[cfg(feature = "gossip-bootstrap")]
+                leader_diff,
+                #[cfg(feature = "gossip-bootstrap")]
+                observed_slot_leaders: observed_slot_leaders.into_iter().collect(),
+                verify_verified_count: verify_counters.verified,
+                verify_unknown_leader_count: verify_counters.unknown_leader,
+                verify_invalid_merkle_count: verify_counters.invalid_merkle,
+                verify_invalid_signature_count: verify_counters.invalid_signature,
+                verify_malformed_count: verify_counters.malformed,
+                verify_dropped_count: verify_counters.dropped,
+            }) {
+                forwarded_all_results = false;
+                break;
             }
         }
     }
+    if !forwarded_all_results {
+        return false;
+    }
 
-    #[cfg(feature = "gossip-bootstrap")]
-    let leader_diff = shred_verifier
-        .map_or_else(crate::verify::SlotLeaderDiff::default, |verifier| {
-            verifier.take_slot_leader_diff()
-        });
-
-    PacketWorkerBatchResult {
+    emit_result(PacketWorkerBatchResult {
         worker_index,
         reusable_packets: packets,
-        accepted_shreds,
+        accepted_shreds: Vec::new(),
         #[cfg(feature = "gossip-bootstrap")]
-        leader_diff,
+        leader_diff: crate::verify::SlotLeaderDiff::default(),
         #[cfg(feature = "gossip-bootstrap")]
-        observed_slot_leaders: observed_slot_leaders.into_iter().collect(),
-        verify_verified_count: verify_counters.verified,
-        verify_unknown_leader_count: verify_counters.unknown_leader,
-        verify_invalid_merkle_count: verify_counters.invalid_merkle,
-        verify_invalid_signature_count: verify_counters.invalid_signature,
-        verify_malformed_count: verify_counters.malformed,
-        verify_dropped_count: verify_counters.dropped,
-    }
+        observed_slot_leaders: Vec::new(),
+        verify_verified_count: 0,
+        verify_unknown_leader_count: 0,
+        verify_invalid_merkle_count: 0,
+        verify_invalid_signature_count: 0,
+        verify_malformed_count: 0,
+        verify_dropped_count: 0,
+    })
 }
 
 #[cfg(feature = "gossip-bootstrap")]
@@ -581,6 +645,7 @@ fn push_primary_shred(packet: PacketWorkerInput, accepted_shreds: &mut Vec<Worke
             );
             accepted_shreds.push(WorkerAcceptedShred {
                 source: Some(packet.source),
+                observed_at: packet.observed_at,
                 slot: data.common.slot,
                 index: data.common.index,
                 fec_set_index: data.common.fec_set_index,
@@ -602,6 +667,7 @@ fn push_primary_shred(packet: PacketWorkerInput, accepted_shreds: &mut Vec<Worke
         ParsedShredHeader::Code(code) => {
             accepted_shreds.push(WorkerAcceptedShred {
                 source: Some(packet.source),
+                observed_at: packet.observed_at,
                 slot: code.common.slot,
                 index: code.common.index,
                 fec_set_index: code.common.fec_set_index,
@@ -735,6 +801,7 @@ mod tests {
                     source: SocketAddr::from(([127, 0, 0, 1], 8_899)),
                     packet_bytes: Arc::from(packet_bytes),
                     parsed_header,
+                    observed_at: Instant::now(),
                 }],
             ),
             DispatchWorkerBatchOutcome::Enqueued
@@ -749,6 +816,84 @@ mod tests {
         assert_eq!(worker_result.accepted_shreds.len(), 1);
         assert_eq!(worker_result.accepted_shreds[0].slot, 42);
         assert_eq!(worker_result.accepted_shreds[0].index, 7);
+
+        let recycle_result = tokio::time::timeout(Duration::from_secs(1), pool.recv())
+            .await
+            .expect("recycle result should arrive before timeout")
+            .expect("recycle result should be present");
+        assert!(recycle_result.accepted_shreds.is_empty());
+
+        let drained = tokio::time::timeout(Duration::from_secs(1), pool.recv())
+            .await
+            .expect("worker shutdown should complete before timeout");
+        assert!(drained.is_none());
+
+        pool.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn packet_worker_emits_results_before_batch_tail_finishes() {
+        let packet0 = build_data_shred_packet(42, 7, 7, 1, &[1, 2, 3, 4]);
+        let packet1 = build_data_shred_packet(42, 8, 8, 1, &[5, 6, 7, 8]);
+        let parsed_header0 = parse_shred_header(&packet0).expect("valid first test shred");
+        let parsed_header1 = parse_shred_header(&packet1).expect("valid second test shred");
+        let mut pool = PacketWorkerPool::new(PacketWorkerPoolConfig {
+            workers: 1,
+            queue_capacity: 4,
+            verify_enabled: false,
+            verify_recovered_shreds: false,
+            verify_strict_unknown: false,
+            verify_signature_cache_entries: 64,
+            verify_slot_leader_window: 64,
+            verify_unknown_retry: Duration::from_millis(100),
+            fec_max_tracked_sets: 8,
+            fec_retained_slot_lag: 16,
+        });
+
+        assert!(matches!(
+            pool.dispatch_worker_batch(
+                0,
+                vec![
+                    PacketWorkerInput {
+                        source: SocketAddr::from(([127, 0, 0, 1], 8_899)),
+                        packet_bytes: Arc::from(packet0),
+                        parsed_header: parsed_header0,
+                        observed_at: Instant::now(),
+                    },
+                    PacketWorkerInput {
+                        source: SocketAddr::from(([127, 0, 0, 1], 8_900)),
+                        packet_bytes: Arc::from(packet1),
+                        parsed_header: parsed_header1,
+                        observed_at: Instant::now(),
+                    },
+                ],
+            ),
+            DispatchWorkerBatchOutcome::Enqueued
+        ));
+
+        pool.close_inputs();
+
+        let first_result = tokio::time::timeout(Duration::from_secs(1), pool.recv())
+            .await
+            .expect("first worker result should arrive before timeout")
+            .expect("first worker result should be present");
+        assert_eq!(first_result.accepted_shreds.len(), 1);
+        assert_eq!(first_result.accepted_shreds[0].slot, 42);
+        assert_eq!(first_result.accepted_shreds[0].index, 7);
+
+        let second_result = tokio::time::timeout(Duration::from_secs(1), pool.recv())
+            .await
+            .expect("second worker result should arrive before timeout")
+            .expect("second worker result should be present");
+        assert_eq!(second_result.accepted_shreds.len(), 1);
+        assert_eq!(second_result.accepted_shreds[0].slot, 42);
+        assert_eq!(second_result.accepted_shreds[0].index, 8);
+
+        let recycle_result = tokio::time::timeout(Duration::from_secs(1), pool.recv())
+            .await
+            .expect("recycle result should arrive before timeout")
+            .expect("recycle result should be present");
+        assert!(recycle_result.accepted_shreds.is_empty());
 
         let drained = tokio::time::timeout(Duration::from_secs(1), pool.recv())
             .await

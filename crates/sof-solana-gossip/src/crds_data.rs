@@ -15,7 +15,7 @@ use {
     solana_time_utils::timestamp,
     solana_transaction::Transaction,
     solana_vote::vote_parser,
-    std::collections::BTreeSet,
+    std::{collections::BTreeSet, sync::OnceLock},
 };
 
 use crate::duplicate_shred::{DuplicateShred, DuplicateShredIndex, MAX_DUPLICATE_SHREDS};
@@ -332,31 +332,75 @@ impl Sanitize for LowestSlot {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, Serialize)]
 pub struct Vote {
     pub(crate) from: Pubkey,
     transaction: Transaction,
     pub(crate) wallclock: u64,
     #[serde(skip_serializing)]
-    slot: Option<Slot>,
+    slot: OnceLock<Option<Option<Slot>>>,
+}
+
+impl Clone for Vote {
+    fn clone(&self) -> Self {
+        Self {
+            from: self.from,
+            transaction: self.transaction.clone(),
+            wallclock: self.wallclock,
+            slot: Self::slot_cell(self.slot.get().cloned().flatten()),
+        }
+    }
+}
+
+impl PartialEq for Vote {
+    fn eq(&self, other: &Self) -> bool {
+        self.from == other.from
+            && self.transaction == other.transaction
+            && self.wallclock == other.wallclock
+    }
+}
+
+impl Eq for Vote {}
+
+impl Vote {
+    fn slot_cell(parsed_slot: Option<Option<Slot>>) -> OnceLock<Option<Option<Slot>>> {
+        let cell = OnceLock::new();
+        if let Some(parsed_slot) = parsed_slot {
+            let _ = cell.set(Some(parsed_slot));
+        }
+        cell
+    }
+
+    fn parse_slot(transaction: &Transaction) -> Option<Option<Slot>> {
+        vote_parser::parse_vote_transaction(transaction).map(|(_, vote, ..)| vote.last_voted_slot())
+    }
+
+    fn parsed_slot(&self) -> Option<Option<Slot>> {
+        self.slot
+            .get_or_init(|| Self::parse_slot(&self.transaction))
+            .to_owned()
+    }
 }
 
 impl Sanitize for Vote {
     fn sanitize(&self) -> Result<(), SanitizeError> {
         sanitize_wallclock(self.wallclock)?;
         self.from.sanitize()?;
-        self.transaction.sanitize()
+        self.transaction.sanitize()?;
+        self.parsed_slot().ok_or(SanitizeError::InvalidValue)?;
+        Ok(())
     }
 }
 
 impl Vote {
     // Returns None if cannot parse transaction into a vote.
     pub fn new(from: Pubkey, transaction: Transaction, wallclock: u64) -> Option<Self> {
-        vote_parser::parse_vote_transaction(&transaction).map(|(_, vote, ..)| Self {
+        let parsed_slot = Self::parse_slot(&transaction)?;
+        Some(Self {
             from,
             transaction,
             wallclock,
-            slot: vote.last_voted_slot(),
+            slot: Self::slot_cell(Some(parsed_slot)),
         })
     }
 
@@ -366,7 +410,7 @@ impl Vote {
             from: pubkey.unwrap_or_else(solana_pubkey::new_rand),
             transaction: Transaction::default(),
             wallclock: new_rand_timestamp(rng),
-            slot: None,
+            slot: OnceLock::new(),
         }
     }
 
@@ -375,7 +419,7 @@ impl Vote {
     }
 
     pub(crate) fn slot(&self) -> Option<Slot> {
-        self.slot
+        self.parsed_slot().flatten()
     }
 }
 
@@ -391,11 +435,12 @@ impl<'de> Deserialize<'de> for Vote {
             wallclock: u64,
         }
         let vote = Vote::deserialize(deserializer)?;
-        vote.transaction
-            .sanitize()
-            .map_err(serde::de::Error::custom)?;
-        Self::new(vote.from, vote.transaction, vote.wallclock)
-            .ok_or_else(|| serde::de::Error::custom("invalid vote tx"))
+        Ok(Self {
+            from: vote.from,
+            transaction: vote.transaction,
+            wallclock: vote.wallclock,
+            slot: OnceLock::new(),
+        })
     }
 }
 
@@ -522,15 +567,15 @@ mod test {
             rng.gen(), // wallclock
         )
         .unwrap();
-        assert_eq!(vote.slot, Some(7));
+        assert_eq!(vote.slot(), Some(7));
         let bytes = bincode::serialize(&vote).unwrap();
         let other = bincode::deserialize(&bytes[..]).unwrap();
         assert_eq!(vote, other);
-        assert_eq!(other.slot, Some(7));
+        assert_eq!(other.slot(), Some(7));
         let bytes = bincode::options().serialize(&vote).unwrap();
         let other = bincode::options().deserialize(&bytes[..]).unwrap();
         assert_eq!(vote, other);
-        assert_eq!(other.slot, Some(7));
+        assert_eq!(other.slot(), Some(7));
     }
 
     #[test]

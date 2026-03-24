@@ -74,15 +74,17 @@ args = [
     "${@}",
 ]
 
-[tasks.test-matrix]
-description = "Run tests across default and all-features profiles"
-workspace = false
-dependencies = ["test", "test-all-features"]
-
 [tasks.ci]
-description = "Run core contributor checks (format, architecture boundaries, clippy matrix, test matrix)"
+description = "Run core contributor checks (format, architecture boundaries, strict clippy, default/all-feature tests)"
 workspace = false
-dependencies = ["format-check", "arch-check", "clippy-matrix", "test-matrix"]
+dependencies = [
+    "format-check",
+    "arch-check",
+    "clippy",
+    "clippy-no-default-features",
+    "test",
+    "test-all-features",
+]
 
 [tasks.ci-full]
 description = "Run core contributor checks plus dependency policy checks"
@@ -122,11 +124,6 @@ args = [
     "-D",
     "warnings",
 ]
-
-[tasks.clippy-matrix]
-description = "Run strict clippy across both feature profiles"
-workspace = false
-dependencies = ["clippy", "clippy-no-default-features"]
 
 [tasks.arch-check]
 description = "Enforce ARD slice dependency boundaries"

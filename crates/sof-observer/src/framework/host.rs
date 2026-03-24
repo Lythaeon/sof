@@ -8,19 +8,17 @@ use std::{
     thread,
 };
 
-use arcshift::ArcShift;
-use solana_pubkey::Pubkey;
-use thiserror::Error;
-use tokio::sync::{Semaphore, mpsc};
-
 use crate::framework::{
     events::{
         ClusterTopologyEvent, DatasetEvent, LeaderScheduleEntry, LeaderScheduleEvent,
         ObservedRecentBlockhashEvent, RawPacketEvent, ReorgEvent, ShredEvent, SlotStatusEvent,
-        TransactionEvent,
+        TransactionBatchEvent, TransactionEvent,
     },
     plugin::{ObserverPlugin, PluginConfig},
 };
+use arcshift::ArcShift;
+use solana_pubkey::Pubkey;
+use thiserror::Error;
 
 /// Builder surface for assembling immutable plugin hosts.
 mod builder;
@@ -35,6 +33,7 @@ mod tests;
 
 pub use builder::PluginHostBuilder;
 pub use core::PluginHost;
+pub(crate) use core::TransactionDispatchScope;
 
 /// Default bounded queue capacity for asynchronous plugin hook dispatch.
 const DEFAULT_EVENT_QUEUE_CAPACITY: usize = 8_192;
@@ -93,6 +92,25 @@ impl PluginDispatchMode {
     }
 }
 
+/// Identifies how an inline transaction reached plugin dispatch.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum InlineTransactionDispatchSource {
+    /// The transaction became reconstructable from an anchored contiguous open-dataset prefix.
+    EarlyPrefix,
+    /// The transaction waited for the completed-dataset decode path before inline dispatch.
+    CompletedDatasetFallback,
+}
+
+impl InlineTransactionDispatchSource {
+    /// Returns a stable label for metrics export.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::EarlyPrefix => "early_prefix",
+            Self::CompletedDatasetFallback => "completed_dataset_fallback",
+        }
+    }
+}
+
 /// Normalizes panic payloads into string logs for hook-failure diagnostics.
 fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
     payload.downcast_ref::<&str>().map_or_else(
@@ -117,6 +135,16 @@ struct PluginHookSubscriptions {
     dataset: bool,
     /// At least one plugin wants transaction callbacks.
     transaction: bool,
+    /// At least one plugin requested inline transaction dispatch.
+    inline_transaction: bool,
+    /// At least one plugin wants transaction batch callbacks.
+    transaction_batch: bool,
+    /// At least one plugin requested inline transaction-batch dispatch.
+    inline_transaction_batch: bool,
+    /// At least one plugin wants transaction-view-batch callbacks.
+    transaction_view_batch: bool,
+    /// At least one plugin requested inline transaction-view-batch dispatch.
+    inline_transaction_view_batch: bool,
     /// At least one plugin wants account-touch callbacks.
     account_touch: bool,
     /// At least one plugin wants slot-status callbacks.
@@ -138,6 +166,23 @@ impl From<&PluginConfig> for PluginHookSubscriptions {
             shred: config.shred,
             dataset: config.dataset,
             transaction: config.transaction,
+            inline_transaction: config.transaction
+                && matches!(
+                    config.transaction_dispatch_mode,
+                    crate::framework::plugin::TransactionDispatchMode::Inline
+                ),
+            transaction_batch: config.transaction_batch,
+            inline_transaction_batch: config.transaction_batch
+                && matches!(
+                    config.transaction_batch_dispatch_mode,
+                    crate::framework::plugin::TransactionDispatchMode::Inline
+                ),
+            transaction_view_batch: config.transaction_view_batch,
+            inline_transaction_view_batch: config.transaction_view_batch
+                && matches!(
+                    config.transaction_view_batch_dispatch_mode,
+                    crate::framework::plugin::TransactionDispatchMode::Inline
+                ),
             account_touch: config.account_touch,
             slot_status: config.slot_status,
             reorg: config.reorg,

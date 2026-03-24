@@ -259,11 +259,19 @@ fn verify_gossip_packet_batches(
     stakes: &HashMap<Pubkey, u64>,
     stats: &GossipStats,
 ) -> VerifiedProtocolBatch {
-    packet_batches
+    let capacity = packet_batches
         .iter()
-        .flat_map(|packet_batch| packet_batch.iter())
-        .filter_map(|packet| verify_gossip_packet(packet, stakes, stats))
-        .collect()
+        .map(|packet_batch| packet_batch.len())
+        .sum();
+    let mut verified = Vec::with_capacity(capacity);
+    for packet_batch in packet_batches {
+        for packet in packet_batch {
+            if let Some(packet) = verify_gossip_packet(packet, stakes, stats) {
+                verified.push(packet);
+            }
+        }
+    }
+    verified
 }
 
 fn gossip_cpu_layout() -> GossipCpuLayout {

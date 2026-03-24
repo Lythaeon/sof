@@ -15,19 +15,27 @@ use {
     solana_sanitize::{Sanitize, SanitizeError},
     solana_signature::Signature,
     solana_signer::Signer,
-    std::borrow::{Borrow, Cow},
+    std::{borrow::Cow, sync::OnceLock},
 };
 
 use crate::duplicate_shred::DuplicateShredIndex;
 
 /// CrdsValue that is replicated across the cluster
-#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Clone, Debug)]
 pub struct CrdsValue {
     signature: Signature,
     data: CrdsData,
     #[serde(skip_serializing)]
-    hash: Hash, // Sha256 hash of [signature, data].
+    hash: OnceLock<Hash>, // Sha256 hash of [signature, data].
 }
+
+impl PartialEq for CrdsValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.signature == other.signature && self.data == other.data
+    }
+}
+
+impl Eq for CrdsValue {}
 
 impl Sanitize for CrdsValue {
     fn sanitize(&self) -> Result<(), SanitizeError> {
@@ -50,12 +58,15 @@ impl Signable for CrdsValue {
     }
 
     fn set_signature(&mut self, signature: Signature) {
-        self.signature = signature
+        self.signature = signature;
+        self.hash = OnceLock::new();
     }
 
     fn verify(&self) -> bool {
-        self.get_signature()
-            .verify(self.pubkey().as_ref(), self.signable_data().borrow())
+        let mut buffer = ArrayVec::<u8, PACKET_DATA_SIZE>::new();
+        bincode::serialize_into(&mut buffer, &self.data)
+            .map(|()| self.signature.verify(self.pubkey().as_ref(), &buffer))
+            .unwrap_or(false)
     }
 }
 
@@ -101,6 +112,18 @@ impl CrdsValueLabel {
 }
 
 impl CrdsValue {
+    fn compute_hash(signature: &Signature, data: &CrdsData) -> Hash {
+        let mut buffer = ArrayVec::<u8, PACKET_DATA_SIZE>::new();
+        bincode::serialize_into(&mut buffer, data).expect("failed to serialize CrdsData");
+        solana_sha256_hasher::hashv(&[signature.as_ref(), &buffer])
+    }
+
+    fn hash_cell(hash: Hash) -> OnceLock<Hash> {
+        let cell = OnceLock::new();
+        let _ = cell.set(hash);
+        cell
+    }
+
     pub fn new(data: CrdsData, keypair: &Keypair) -> Self {
         let bincode_serialized_data = bincode::serialize(&data).unwrap();
         let signature = keypair.sign_message(&bincode_serialized_data);
@@ -108,7 +131,7 @@ impl CrdsValue {
         Self {
             signature,
             data,
-            hash,
+            hash: Self::hash_cell(hash),
         }
     }
 
@@ -120,7 +143,7 @@ impl CrdsValue {
         Self {
             signature,
             data,
-            hash,
+            hash: Self::hash_cell(hash),
         }
     }
 
@@ -151,7 +174,8 @@ impl CrdsValue {
 
     #[inline]
     pub(crate) fn hash(&self) -> &Hash {
-        &self.hash
+        self.hash
+            .get_or_init(|| Self::compute_hash(&self.signature, &self.data))
     }
 
     /// Totally unsecure unverifiable wallclock of the node that generated this message
@@ -210,8 +234,9 @@ impl CrdsValue {
     }
 }
 
-// Manual implementation of Deserialize for CrdsValue in order to populate
-// CrdsValue.hash which is skipped in serialization.
+// Manual implementation of Deserialize for CrdsValue. The content hash is
+// computed lazily because ingress filtering and signature verification do not
+// need it, and many received values are dropped before they ever enter CRDS.
 impl<'de> Deserialize<'de> for CrdsValue {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -223,16 +248,10 @@ impl<'de> Deserialize<'de> for CrdsValue {
             data: CrdsData,
         }
         let CrdsValue { signature, data } = CrdsValue::deserialize(deserializer)?;
-        // To compute the hash of the received CrdsData we need to re-serialize it
-        // PACKET_DATA_SIZE is always enough since we have just received the value in a packet
-        // ArrayVec allows us to write serialized data into stack memory without initializing it
-        let mut buffer = ArrayVec::<u8, PACKET_DATA_SIZE>::new();
-        bincode::serialize_into(&mut buffer, &data).map_err(serde::de::Error::custom)?;
-        let hash = solana_sha256_hasher::hashv(&[signature.as_ref(), &buffer]);
         Ok(Self {
             signature,
             data,
-            hash,
+            hash: OnceLock::new(),
         })
     }
 }
@@ -417,5 +436,33 @@ mod test {
             bincode::deserialize::<Vec<CrdsValue>>(&bytes).unwrap(),
             values
         );
+    }
+
+    #[test]
+    fn test_deserialize_defers_hash_computation() {
+        let keypair = Keypair::new();
+        let original = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
+            &keypair.pubkey(),
+            timestamp(),
+        )));
+        let bytes = bincode::serialize(&original).unwrap();
+        let deserialized = bincode::deserialize::<CrdsValue>(&bytes).unwrap();
+        assert!(deserialized.hash.get().is_none());
+        assert_eq!(deserialized.hash(), original.hash());
+        assert!(deserialized.hash.get().is_some());
+    }
+
+    #[test]
+    fn test_sign_invalidates_cached_hash() {
+        let keypair = Keypair::new();
+        let mut value = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
+            &keypair.pubkey(),
+            timestamp(),
+        )));
+        let old_hash = *value.hash();
+        value.sign(&keypair);
+        assert!(value.hash.get().is_none());
+        assert!(value.verify());
+        assert_ne!(*value.hash(), old_hash);
     }
 }

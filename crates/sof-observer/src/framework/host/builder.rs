@@ -171,6 +171,35 @@ impl PluginHostBuilder {
             collect_hook_plugins(&plugins, &plugin_subscriptions, |subscription| {
                 subscription.transaction
             });
+        let transaction_batch_plugins =
+            collect_hook_plugins(&plugins, &plugin_subscriptions, |subscription| {
+                subscription.transaction_batch
+            });
+        let transaction_view_batch_plugins =
+            collect_hook_plugins(&plugins, &plugin_subscriptions, |subscription| {
+                subscription.transaction_view_batch
+            });
+        let transaction_plugin_inline_preferences: Arc<[bool]> = Arc::from(
+            plugin_subscriptions
+                .iter()
+                .filter(|subscription| subscription.transaction)
+                .map(|subscription| subscription.inline_transaction)
+                .collect::<Vec<_>>(),
+        );
+        let transaction_batch_plugin_inline_preferences: Arc<[bool]> = Arc::from(
+            plugin_subscriptions
+                .iter()
+                .filter(|subscription| subscription.transaction_batch)
+                .map(|subscription| subscription.inline_transaction_batch)
+                .collect::<Vec<_>>(),
+        );
+        let transaction_view_batch_plugin_inline_preferences: Arc<[bool]> = Arc::from(
+            plugin_subscriptions
+                .iter()
+                .filter(|subscription| subscription.transaction_view_batch)
+                .map(|subscription| subscription.inline_transaction_view_batch)
+                .collect::<Vec<_>>(),
+        );
         let account_touch_plugins =
             collect_hook_plugins(&plugins, &plugin_subscriptions, |subscription| {
                 subscription.account_touch
@@ -199,6 +228,17 @@ impl PluginHostBuilder {
             shred: !shred_plugins.is_empty(),
             dataset: !dataset_plugins.is_empty(),
             transaction: !transaction_plugins.is_empty(),
+            inline_transaction: plugin_subscriptions
+                .iter()
+                .any(|subscription| subscription.inline_transaction),
+            transaction_batch: !transaction_batch_plugins.is_empty(),
+            inline_transaction_batch: plugin_subscriptions
+                .iter()
+                .any(|subscription| subscription.inline_transaction_batch),
+            transaction_view_batch: !transaction_view_batch_plugins.is_empty(),
+            inline_transaction_view_batch: plugin_subscriptions
+                .iter()
+                .any(|subscription| subscription.inline_transaction_view_batch),
             account_touch: !account_touch_plugins.is_empty(),
             slot_status: !slot_status_plugins.is_empty(),
             reorg: !reorg_plugins.is_empty(),
@@ -211,6 +251,8 @@ impl PluginHostBuilder {
                 raw_packet: raw_packet_plugins,
                 shred: shred_plugins,
                 dataset: dataset_plugins,
+                transaction_batch: transaction_batch_plugins.clone(),
+                transaction_view_batch: transaction_view_batch_plugins.clone(),
                 account_touch: account_touch_plugins.clone(),
                 slot_status: slot_status_plugins,
                 reorg: reorg_plugins,
@@ -231,6 +273,11 @@ impl PluginHostBuilder {
         PluginHost {
             plugins,
             transaction_plugins,
+            transaction_plugin_inline_preferences,
+            transaction_batch_plugins,
+            transaction_batch_plugin_inline_preferences,
+            transaction_view_batch_plugins,
+            transaction_view_batch_plugin_inline_preferences,
             account_touch_plugins,
             dispatcher,
             transaction_dispatcher,

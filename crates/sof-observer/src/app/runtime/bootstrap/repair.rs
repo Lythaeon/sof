@@ -1,5 +1,7 @@
 #[cfg(feature = "gossip-bootstrap")]
 use super::*;
+#[cfg(feature = "gossip-bootstrap")]
+use tokio::sync::oneshot;
 
 #[cfg(feature = "gossip-bootstrap")]
 #[derive(Debug)]
@@ -48,6 +50,67 @@ pub(crate) enum RepairOutcome {
         source: SocketAddr,
         error: String,
     },
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RepairDriverStartError {
+    #[error("failed to spawn dedicated repair thread: {source}")]
+    SpawnThread { source: std::io::Error },
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+type RepairDriverParts = (
+    mpsc::Sender<RepairCommand>,
+    mpsc::Receiver<RepairOutcome>,
+    ArcShift<crate::repair::RepairPeerSnapshot>,
+    RepairDriverHandle,
+);
+
+#[cfg(feature = "gossip-bootstrap")]
+#[derive(Debug)]
+pub(crate) struct RepairDriverHandle {
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    join_handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+impl RepairDriverHandle {
+    #[expect(
+        clippy::missing_const_for_fn,
+        reason = "contains non-const std thread handle storage"
+    )]
+    fn new(shutdown_tx: oneshot::Sender<()>, join_handle: std::thread::JoinHandle<()>) -> Self {
+        Self {
+            shutdown_tx: Some(shutdown_tx),
+            join_handle: Some(join_handle),
+        }
+    }
+
+    fn abort(mut self) {
+        if let Some(shutdown_tx) = self.shutdown_tx.take()
+            && shutdown_tx.send(()).is_err()
+        {
+            // Driver thread already exited.
+        }
+        drop(self.join_handle.take());
+    }
+
+    async fn shutdown(mut self) {
+        if let Some(shutdown_tx) = self.shutdown_tx.take()
+            && shutdown_tx.send(()).is_err()
+        {
+            // Driver thread already exited.
+        }
+        if let Some(join_handle) = self.join_handle.take() {
+            drop(
+                tokio::task::spawn_blocking(move || {
+                    drop(join_handle.join());
+                })
+                .await,
+            );
+        }
+    }
 }
 
 #[cfg(feature = "gossip-bootstrap")]
@@ -135,121 +198,139 @@ pub(crate) fn flush_repair_source_hints(
 pub(crate) fn spawn_repair_driver(
     mut repair_client: crate::repair::GossipRepairClient,
     relay_cache: Option<SharedRelayCache>,
-) -> (
-    mpsc::Sender<RepairCommand>,
-    mpsc::Receiver<RepairOutcome>,
-    ArcShift<crate::repair::RepairPeerSnapshot>,
-    JoinHandle<()>,
-) {
+) -> Result<RepairDriverParts, RepairDriverStartError> {
     let (command_tx, mut command_rx) =
         mpsc::channel::<RepairCommand>(read_repair_command_queue_capacity());
     let (result_tx, result_rx) =
         mpsc::channel::<RepairOutcome>(read_repair_result_queue_capacity());
     let peer_snapshot = repair_client.peer_snapshot_handle();
-    let driver_handle = tokio::spawn(async move {
-        let mut slot_hint = 0_u64;
-        let mut refresh_tick = interval(Duration::from_millis(read_repair_peer_refresh_ms()));
-        refresh_tick.tick().await;
-        let _ = repair_client.refresh_peer_snapshot(slot_hint);
-        loop {
-            tokio::select! {
-                maybe_command = command_rx.recv() => {
-                    let Some(command) = maybe_command else {
-                        break;
-                    };
-                    match command {
-                        RepairCommand::Request { request } => {
-                            slot_hint = slot_hint.max(request.slot);
-                            let outcome = match repair_client
-                                .request_missing_shred(request.slot, request.index, request.kind)
-                                .await
-                            {
-                                Ok(Some(peer_addr)) => RepairOutcome::RequestSent { peer_addr },
-                                Ok(None) => RepairOutcome::RequestNoPeer { request },
-                                Err(error) => RepairOutcome::RequestError {
-                                    request,
-                                    error: error.to_string(),
-                                },
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+    let driver_thread = std::thread::Builder::new()
+        .name(String::from("sof-repair-driver"))
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(source) => {
+                    tracing::error!(
+                        ?source,
+                        "failed to build dedicated repair runtime"
+                    );
+                    return;
+                }
+            };
+            runtime.block_on(async move {
+                let mut slot_hint = 0_u64;
+                let mut refresh_tick = interval(Duration::from_millis(read_repair_peer_refresh_ms()));
+                refresh_tick.tick().await;
+                let _ = repair_client.refresh_peer_snapshot(slot_hint);
+                loop {
+                    tokio::select! {
+                        _ = &mut shutdown_rx => {
+                            break;
+                        }
+                        maybe_command = command_rx.recv() => {
+                            let Some(command) = maybe_command else {
+                                break;
                             };
-                            if result_tx.try_send(outcome).is_err() {
-                                // Receiver dropped; drop outcome.
-                            }
-                        }
-                        RepairCommand::NoteShredSources { sources } => {
-                            let _ = repair_client.note_shred_sources(&sources);
-                        }
-                        RepairCommand::HandleResponsePing { packet, from_addr } => {
-                            match repair_client
-                                .maybe_handle_response_ping(packet.as_ref(), from_addr)
-                                .await
-                            {
-                                Ok(true) => {
-                                    if result_tx
-                                        .try_send(RepairOutcome::ResponsePingHandledFrom {
-                                            source: from_addr,
-                                        })
-                                        .is_err()
+                            match command {
+                                RepairCommand::Request { request } => {
+                                    slot_hint = slot_hint.max(request.slot);
+                                    let outcome = match repair_client
+                                        .request_missing_shred(request.slot, request.index, request.kind)
+                                        .await
                                     {
-                                        // Receiver dropped; drop outcome.
-                                    }
-                                }
-                                Ok(false) => {}
-                                Err(error) => {
-                                    if result_tx
-                                        .try_send(RepairOutcome::ResponsePingError {
-                                            source: from_addr,
-                                            error: error.to_string(),
-                                        })
-                                        .is_err()
-                                    {
-                                        // Receiver dropped; drop outcome.
-                                    }
-                                }
-                            }
-                        }
-                        RepairCommand::HandleServeRequest { packet, from_addr } => {
-                            match repair_client
-                                .maybe_serve_repair_request(
-                                    packet.as_ref(),
-                                    from_addr,
-                                    relay_cache.as_ref(),
-                                )
-                                .await
-                            {
-                                Ok(Some(request)) => {
-                                    if result_tx
-                                        .try_send(RepairOutcome::ServeRequestHandled {
-                                            source: from_addr,
+                                        Ok(Some(peer_addr)) => RepairOutcome::RequestSent { peer_addr },
+                                        Ok(None) => RepairOutcome::RequestNoPeer { request },
+                                        Err(error) => RepairOutcome::RequestError {
                                             request,
-                                        })
-                                        .is_err()
-                                    {
+                                            error: error.to_string(),
+                                        },
+                                    };
+                                    if result_tx.try_send(outcome).is_err() {
                                         // Receiver dropped; drop outcome.
                                     }
                                 }
-                                Ok(None) => {}
-                                Err(error) => {
-                                    if result_tx
-                                        .try_send(RepairOutcome::ServeRequestError {
-                                            source: from_addr,
-                                            error: error.to_string(),
-                                        })
-                                        .is_err()
+                                RepairCommand::NoteShredSources { sources } => {
+                                    let _ = repair_client.note_shred_sources(&sources);
+                                }
+                                RepairCommand::HandleResponsePing { packet, from_addr } => {
+                                    match repair_client
+                                        .maybe_handle_response_ping(packet.as_ref(), from_addr)
+                                        .await
                                     {
-                                        // Receiver dropped; drop outcome.
+                                        Ok(true) => {
+                                            if result_tx
+                                                .try_send(RepairOutcome::ResponsePingHandledFrom {
+                                                    source: from_addr,
+                                                })
+                                                .is_err()
+                                            {
+                                                // Receiver dropped; drop outcome.
+                                            }
+                                        }
+                                        Ok(false) => {}
+                                        Err(error) => {
+                                            if result_tx
+                                                .try_send(RepairOutcome::ResponsePingError {
+                                                    source: from_addr,
+                                                    error: error.to_string(),
+                                                })
+                                                .is_err()
+                                            {
+                                                // Receiver dropped; drop outcome.
+                                            }
+                                        }
+                                    }
+                                }
+                                RepairCommand::HandleServeRequest { packet, from_addr } => {
+                                    match repair_client
+                                        .maybe_serve_repair_request(
+                                            packet.as_ref(),
+                                            from_addr,
+                                            relay_cache.as_ref(),
+                                        )
+                                        .await
+                                    {
+                                        Ok(Some(request)) => {
+                                            if result_tx
+                                                .try_send(RepairOutcome::ServeRequestHandled {
+                                                    source: from_addr,
+                                                    request,
+                                                })
+                                                .is_err()
+                                            {
+                                                // Receiver dropped; drop outcome.
+                                            }
+                                        }
+                                        Ok(None) => {}
+                                        Err(error) => {
+                                            if result_tx
+                                                .try_send(RepairOutcome::ServeRequestError {
+                                                    source: from_addr,
+                                                    error: error.to_string(),
+                                                })
+                                                .is_err()
+                                            {
+                                                // Receiver dropped; drop outcome.
+                                            }
+                                        }
                                     }
                                 }
                             }
+                        }
+                        _ = refresh_tick.tick() => {
+                            let _ = repair_client.refresh_peer_snapshot(slot_hint);
                         }
                     }
                 }
-                _ = refresh_tick.tick() => {
-                    let _ = repair_client.refresh_peer_snapshot(slot_hint);
-                }
-            }
-        }
-    });
-    (command_tx, result_rx, peer_snapshot, driver_handle)
+            });
+        })
+        .map_err(|source| RepairDriverStartError::SpawnThread { source })?;
+    let driver_handle = RepairDriverHandle::new(shutdown_tx, driver_thread);
+    Ok((command_tx, result_rx, peer_snapshot, driver_handle))
 }
 
 #[cfg(feature = "gossip-bootstrap")]
@@ -259,7 +340,7 @@ pub(crate) fn replace_repair_driver(
     repair_command_tx: &mut Option<mpsc::Sender<RepairCommand>>,
     repair_result_rx: &mut Option<mpsc::Receiver<RepairOutcome>>,
     repair_peer_snapshot: &mut Option<ArcShift<crate::repair::RepairPeerSnapshot>>,
-    repair_driver_handle: &mut Option<JoinHandle<()>>,
+    repair_driver_handle: &mut Option<RepairDriverHandle>,
 ) {
     *repair_command_tx = None;
     *repair_result_rx = None;
@@ -267,12 +348,17 @@ pub(crate) fn replace_repair_driver(
     if let Some(handle) = repair_driver_handle.take() {
         handle.abort();
     }
-    let (command_tx, result_rx, peer_snapshot, driver_handle) =
-        spawn_repair_driver(repair_client, relay_cache);
-    *repair_command_tx = Some(command_tx);
-    *repair_result_rx = Some(result_rx);
-    *repair_peer_snapshot = Some(peer_snapshot);
-    *repair_driver_handle = Some(driver_handle);
+    match spawn_repair_driver(repair_client, relay_cache) {
+        Ok((command_tx, result_rx, peer_snapshot, driver_handle)) => {
+            *repair_command_tx = Some(command_tx);
+            *repair_result_rx = Some(result_rx);
+            *repair_peer_snapshot = Some(peer_snapshot);
+            *repair_driver_handle = Some(driver_handle);
+        }
+        Err(error) => {
+            tracing::error!(?error, "failed to replace repair driver");
+        }
+    }
 }
 
 #[cfg(feature = "gossip-bootstrap")]
@@ -280,15 +366,12 @@ pub(crate) async fn stop_repair_driver(
     repair_command_tx: &mut Option<mpsc::Sender<RepairCommand>>,
     repair_result_rx: &mut Option<mpsc::Receiver<RepairOutcome>>,
     repair_peer_snapshot: &mut Option<ArcShift<crate::repair::RepairPeerSnapshot>>,
-    repair_driver_handle: &mut Option<JoinHandle<()>>,
+    repair_driver_handle: &mut Option<RepairDriverHandle>,
 ) {
     *repair_command_tx = None;
     *repair_result_rx = None;
     *repair_peer_snapshot = None;
     if let Some(handle) = repair_driver_handle.take() {
-        handle.abort();
-        if handle.await.is_err() {
-            // Driver task was already aborted/cancelled.
-        }
+        handle.shutdown().await;
     }
 }
