@@ -9,6 +9,32 @@ pub(super) struct UdpReceive {
     pub(super) rxq_ovfl_counter: Option<u64>,
 }
 
+#[cfg(target_os = "linux")]
+pub(super) struct UdpBatchScratch {
+    buffers: Vec<[u8; 2048]>,
+    io_vectors: Vec<libc::iovec>,
+    addrs: Vec<libc::sockaddr_storage>,
+    headers: Vec<libc::mmsghdr>,
+}
+
+#[cfg(target_os = "linux")]
+impl UdpBatchScratch {
+    pub(super) fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        // SAFETY: The libc socket structs are plain old data and immediately
+        // initialized before each syscall use.
+        let io_vectors = vec![unsafe { std::mem::zeroed() }; capacity];
+        let addrs = vec![unsafe { std::mem::zeroed() }; capacity];
+        let headers = vec![unsafe { std::mem::zeroed() }; capacity];
+        Self {
+            buffers: vec![[0_u8; 2048]; capacity],
+            io_vectors,
+            addrs,
+            headers,
+        }
+    }
+}
+
 pub(super) fn recv_udp_packet(
     socket: &std::net::UdpSocket,
     buffer: &mut [u8],
@@ -62,6 +88,78 @@ pub(super) fn recv_udp_packet(
 }
 
 #[cfg(target_os = "linux")]
+pub(super) fn recv_udp_batch(
+    socket: &std::net::UdpSocket,
+    scratch: &mut UdpBatchScratch,
+    batch: &mut RawPacketBatch,
+) -> std::io::Result<usize> {
+    let capacity = scratch.buffers.len();
+    for index in 0..capacity {
+        scratch.io_vectors[index] = libc::iovec {
+            iov_base: scratch.buffers[index].as_mut_ptr().cast(),
+            iov_len: scratch.buffers[index].len(),
+        };
+        scratch.headers[index] = libc::mmsghdr {
+            msg_hdr: libc::msghdr {
+                msg_name: (&mut scratch.addrs[index]) as *mut libc::sockaddr_storage
+                    as *mut libc::c_void,
+                msg_namelen: std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
+                msg_iov: (&mut scratch.io_vectors[index]) as *mut libc::iovec,
+                msg_iovlen: 1,
+                msg_control: std::ptr::null_mut(),
+                msg_controllen: 0,
+                msg_flags: 0,
+            },
+            msg_len: 0,
+        };
+    }
+
+    // SAFETY: All message headers, names, and iovecs point to valid writable
+    // memory for the duration of the syscall, and the socket fd remains live.
+    let received = unsafe {
+        libc::recvmmsg(
+            socket.as_raw_fd(),
+            scratch.headers.as_mut_ptr(),
+            capacity.min(u32::MAX as usize) as u32,
+            libc::MSG_WAITFORONE,
+            std::ptr::null_mut(),
+        )
+    };
+    if received < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let received = usize::try_from(received).unwrap_or(0);
+    if received == 0 {
+        return Ok(0);
+    }
+
+    batch.clear();
+    batch.reserve(received);
+    for index in 0..received {
+        let len = usize::try_from(scratch.headers[index].msg_len).unwrap_or(0);
+        let source =
+            sockaddr_storage_to_socket_addr_libc(&scratch.addrs[index]).ok_or_else(|| {
+                std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "udp recvmmsg source address is not inet/inet6",
+                )
+            })?;
+        let bytes = scratch.buffers[index].get(..len).ok_or_else(|| {
+            std::io::Error::new(
+                ErrorKind::InvalidData,
+                "udp recvmmsg returned packet larger than receive buffer",
+            )
+        })?;
+        batch.push(RawPacket {
+            source,
+            ingress: RawPacketIngress::Udp,
+            bytes: Arc::from(bytes),
+        });
+    }
+    Ok(received)
+}
+
+#[cfg(target_os = "linux")]
 fn nix_errno_to_io_error(error: nix::errno::Errno) -> std::io::Error {
     std::io::Error::from_raw_os_error(error as i32)
 }
@@ -76,6 +174,31 @@ fn sockaddr_storage_to_socket_addr(storage: &SockaddrStorage) -> Option<SocketAd
                 .as_sockaddr_in6()
                 .map(|address| SocketAddr::from(std::net::SocketAddrV6::from(*address)))
         })
+}
+
+#[cfg(target_os = "linux")]
+fn sockaddr_storage_to_socket_addr_libc(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
+    match i32::from(storage.ss_family) {
+        libc::AF_INET => {
+            // SAFETY: `ss_family` confirmed AF_INET, so reinterpret as sockaddr_in.
+            let address = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
+            Some(SocketAddr::from(std::net::SocketAddrV4::new(
+                std::net::Ipv4Addr::from(address.sin_addr.s_addr.to_ne_bytes()),
+                u16::from_be(address.sin_port),
+            )))
+        }
+        libc::AF_INET6 => {
+            // SAFETY: `ss_family` confirmed AF_INET6, so reinterpret as sockaddr_in6.
+            let address = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
+            Some(SocketAddr::from(std::net::SocketAddrV6::new(
+                std::net::Ipv6Addr::from(address.sin6_addr.s6_addr),
+                u16::from_be(address.sin6_port),
+                address.sin6_flowinfo,
+                address.sin6_scope_id,
+            )))
+        }
+        _ => None,
+    }
 }
 
 pub(super) fn flush_batch(
@@ -248,6 +371,109 @@ pub(super) fn maybe_pin_receiver_thread(socket: &std::net::UdpSocket) {
             core_index,
             assigned_core = core_id.id,
             "failed to pin UDP receiver thread to CPU core"
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    fn send_burst(
+        sender: &std::net::UdpSocket,
+        destination: SocketAddr,
+        packet_count: usize,
+    ) -> std::io::Result<()> {
+        let payload = [7_u8; 256];
+        for _ in 0..packet_count {
+            sender.send_to(&payload, destination)?;
+        }
+        Ok(())
+    }
+
+    fn receive_legacy_burst(
+        receiver: &std::net::UdpSocket,
+        packet_count: usize,
+    ) -> std::io::Result<usize> {
+        let mut buffer = vec![0_u8; 2048];
+        let mut received = 0_usize;
+        while received < packet_count {
+            let _packet = recv_udp_packet(receiver, &mut buffer, false)?;
+            received += 1;
+        }
+        Ok(received)
+    }
+
+    #[test]
+    fn recvmmsg_batch_matches_legacy_receive_count() {
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind sender");
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("set read timeout");
+        let destination = receiver.local_addr().expect("receiver addr");
+        let packet_count = 16;
+
+        send_burst(&sender, destination, packet_count).expect("send burst");
+        let mut scratch = UdpBatchScratch::new(packet_count);
+        let mut batch = Vec::with_capacity(packet_count);
+        let batch_received =
+            recv_udp_batch(&receiver, &mut scratch, &mut batch).expect("recvmmsg batch");
+        assert_eq!(batch_received, packet_count);
+        assert_eq!(batch.len(), packet_count);
+
+        send_burst(&sender, destination, packet_count).expect("send burst");
+        let legacy_received = receive_legacy_burst(&receiver, packet_count).expect("legacy burst");
+        assert_eq!(legacy_received, packet_count);
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for UDP receiver ingress"]
+    fn udp_receiver_recvmmsg_profile_fixture() {
+        let iterations = std::env::var("SOF_UDP_RECEIVER_PROFILE_ITERS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1_000);
+        let packet_count = std::env::var("SOF_UDP_RECEIVER_PROFILE_BURST")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(64);
+
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind sender");
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("set read timeout");
+        let destination = receiver.local_addr().expect("receiver addr");
+        let mut scratch = UdpBatchScratch::new(packet_count);
+        let mut batch = Vec::with_capacity(packet_count);
+
+        let legacy_started_at = Instant::now();
+        for _ in 0..iterations {
+            send_burst(&sender, destination, packet_count).expect("send legacy burst");
+            let received = receive_legacy_burst(&receiver, packet_count).expect("receive legacy");
+            assert_eq!(received, packet_count);
+        }
+        let legacy_elapsed = legacy_started_at.elapsed();
+
+        let batch_started_at = Instant::now();
+        for _ in 0..iterations {
+            send_burst(&sender, destination, packet_count).expect("send batch burst");
+            let received =
+                recv_udp_batch(&receiver, &mut scratch, &mut batch).expect("receive batch");
+            assert_eq!(received, packet_count);
+            assert_eq!(batch.len(), packet_count);
+        }
+        let batch_elapsed = batch_started_at.elapsed();
+
+        println!(
+            "udp_receiver_recvmmsg_profile_fixture iterations={} burst={} legacy_us={} recvmmsg_us={}",
+            iterations,
+            packet_count,
+            legacy_elapsed.as_micros(),
+            batch_elapsed.as_micros()
         );
     }
 }

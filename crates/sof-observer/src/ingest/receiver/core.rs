@@ -102,6 +102,15 @@ impl ReceiverTelemetry {
             .store(current_unix_ms(), Ordering::Relaxed);
     }
 
+    fn record_packets(&self, packet_count: usize) {
+        self.packets.fetch_add(
+            u64::try_from(packet_count).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.last_packet_unix_ms
+            .store(current_unix_ms(), Ordering::Relaxed);
+    }
+
     fn record_sent_batch(&self, packet_count: usize) {
         self.sent_batches.fetch_add(1, Ordering::Relaxed);
         self.sent_packets.fetch_add(
@@ -207,6 +216,8 @@ fn run_udp_receiver_with_socket(
     let track_rxq_ovfl = enable_rxq_ovfl_tracking(std_socket);
 
     let batch_size = read_udp_batch_size();
+    #[cfg(target_os = "linux")]
+    let mut batch_scratch = (!track_rxq_ovfl).then(|| io::UdpBatchScratch::new(batch_size));
     let mut buffer = vec![0_u8; 2048];
     let mut batch = Vec::with_capacity(batch_size);
     let mut batch_started_at: Option<Instant> = None;
@@ -215,6 +226,33 @@ fn run_udp_receiver_with_socket(
         if should_shutdown(shutdown) {
             flush_batch(tx, &mut batch, telemetry);
             return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(scratch) = batch_scratch.as_mut() {
+            match recv_udp_batch(std_socket, scratch, &mut batch) {
+                Ok(received) => {
+                    if received == 0 {
+                        continue;
+                    }
+                    if let Some(telemetry) = telemetry {
+                        telemetry.record_packets(received);
+                    }
+                    flush_batch(tx, &mut batch, telemetry);
+                    continue;
+                }
+                Err(error)
+                    if error.kind() == ErrorKind::WouldBlock
+                        || error.kind() == ErrorKind::TimedOut =>
+                {
+                    if should_shutdown(shutdown) {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    return Err(UdpReceiverError::Receive { source: error });
+                }
+            }
         }
         match recv_udp_packet(std_socket, &mut buffer, track_rxq_ovfl) {
             Ok(packet) => {
@@ -295,5 +333,6 @@ fn should_shutdown(shutdown: Option<&Arc<AtomicBool>>) -> bool {
 #[path = "io.rs"]
 mod io;
 use io::{
-    current_unix_ms, flush_batch, maybe_pin_receiver_thread, recv_udp_packet, tune_udp_socket,
+    current_unix_ms, flush_batch, maybe_pin_receiver_thread, recv_udp_batch, recv_udp_packet,
+    tune_udp_socket,
 };
