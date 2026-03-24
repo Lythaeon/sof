@@ -15,7 +15,6 @@ pub(super) struct UdpReceive {
 
 #[cfg(target_os = "linux")]
 pub(super) struct UdpBatchScratch {
-    buffers: Vec<[u8; 2048]>,
     io_vectors: Vec<libc::iovec>,
     addrs: Vec<libc::sockaddr_storage>,
     headers: Vec<libc::mmsghdr>,
@@ -31,7 +30,6 @@ impl UdpBatchScratch {
         let addrs = vec![unsafe { std::mem::zeroed() }; capacity];
         let headers = vec![unsafe { std::mem::zeroed() }; capacity];
         Self {
-            buffers: vec![[0_u8; 2048]; capacity],
             io_vectors,
             addrs,
             headers,
@@ -98,7 +96,7 @@ pub(super) fn recv_udp_batch(
     batch: &mut RawPacketBatch,
 ) -> std::io::Result<usize> {
     batch.clear();
-    recv_udp_batch_append(socket, scratch, batch, scratch.buffers.len())
+    recv_udp_batch_append(socket, scratch, batch, scratch.headers.len())
 }
 
 #[cfg(target_os = "linux")]
@@ -115,14 +113,14 @@ pub(super) fn recv_udp_batch_coalesced(
     let deadline = Instant::now() + batch_max_wait;
 
     loop {
-        let remaining_capacity = scratch.buffers.len().saturating_sub(batch.len());
+        let remaining_capacity = scratch.headers.len().saturating_sub(batch.len());
         if remaining_capacity == 0 {
             break;
         }
         match recv_udp_batch_append(socket, scratch, batch, remaining_capacity) {
             Ok(received) => {
                 total_received = total_received.saturating_add(received);
-                if batch.len() >= scratch.buffers.len() {
+                if batch.len() >= scratch.headers.len() {
                     break;
                 }
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -164,15 +162,22 @@ fn recv_udp_batch_append(
     batch: &mut RawPacketBatch,
     max_packets: usize,
 ) -> std::io::Result<usize> {
-    let capacity = scratch.buffers.len();
+    let capacity = scratch.headers.len();
     let count = capacity.min(max_packets);
     if count == 0 {
         return Ok(0);
     }
-    for index in 0..capacity {
+    let start_index = batch.ensure_receive_slots(count);
+    for index in 0..count {
+        let buffer_index = start_index.saturating_add(index);
+        let Some(buffer) = batch.receive_buffer_mut(buffer_index) else {
+            return Err(std::io::Error::other(
+                "raw packet batch receive buffer missing",
+            ));
+        };
         scratch.io_vectors[index] = libc::iovec {
-            iov_base: scratch.buffers[index].as_mut_ptr().cast(),
-            iov_len: scratch.buffers[index].len(),
+            iov_base: buffer.as_mut_ptr().cast(),
+            iov_len: buffer.len(),
         };
         scratch.headers[index] = libc::mmsghdr {
             msg_hdr: libc::msghdr {
@@ -211,6 +216,7 @@ fn recv_udp_batch_append(
     batch.reserve(received);
     for index in 0..received {
         let len = usize::try_from(scratch.headers[index].msg_len).unwrap_or(0);
+        let buffer_index = start_index.saturating_add(index);
         let source =
             sockaddr_storage_to_socket_addr_libc(&scratch.addrs[index]).ok_or_else(|| {
                 std::io::Error::new(
@@ -218,14 +224,8 @@ fn recv_udp_batch_append(
                     "udp recvmmsg source address is not inet/inet6",
                 )
             })?;
-        let bytes = scratch.buffers[index].get(..len).ok_or_else(|| {
-            std::io::Error::new(
-                ErrorKind::InvalidData,
-                "udp recvmmsg returned packet larger than receive buffer",
-            )
-        })?;
         batch
-            .push_packet(source, RawPacketIngress::Udp, bytes)
+            .push_received_metadata(source, RawPacketIngress::Udp, buffer_index, len)
             .map_err(|error| match error {
                 UdpReceiverError::InvalidPacketLength { len, capacity } => std::io::Error::new(
                     ErrorKind::InvalidData,
@@ -302,7 +302,7 @@ pub(super) fn flush_batch(
         return;
     }
     let packet_count = batch.len();
-    let outbound = std::mem::take(batch);
+    let outbound = batch.take_for_send();
     let drop_on_full = crate::ingest::config::read_udp_drop_on_channel_full();
     if tx.send_batch(outbound, drop_on_full) {
         if let Some(telemetry) = telemetry {
@@ -755,12 +755,65 @@ mod tests {
         }
         let contiguous_elapsed = contiguous_started_at.elapsed();
 
+        let recycler = RawPacketBatch::recycler_for_tests(packet_count);
+        let recycled_started_at = Instant::now();
+        for _ in 0..iterations {
+            let mut batch = RawPacketBatch::from_recycler_for_tests(&recycler);
+            for payload in &payloads {
+                batch
+                    .push_packet(source, RawPacketIngress::Udp, payload)
+                    .expect("push packet");
+            }
+            assert_eq!(batch.len(), packet_count);
+        }
+        let recycled_elapsed = recycled_started_at.elapsed();
+
         println!(
-            "udp_receiver_batch_materialization_profile_fixture iterations={} burst={} legacy_arc_us={} contiguous_us={}",
+            "udp_receiver_batch_materialization_profile_fixture iterations={} burst={} legacy_arc_us={} contiguous_us={} recycled_us={}",
             iterations,
             packet_count,
             legacy_elapsed.as_micros(),
-            contiguous_elapsed.as_micros()
+            contiguous_elapsed.as_micros(),
+            recycled_elapsed.as_micros()
+        );
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for recycled raw packet batch materialization"]
+    fn udp_receiver_batch_recycler_profile_fixture() {
+        let iterations = std::env::var("SOF_UDP_RECEIVER_PROFILE_ITERS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(50_000);
+        let packet_count = std::env::var("SOF_UDP_RECEIVER_PROFILE_BURST")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(64);
+        let source: SocketAddr = "127.0.0.1:8899".parse().expect("source addr");
+        let payloads: Vec<Vec<u8>> = (0..packet_count)
+            .map(|index| vec![u8::try_from(index % 251).unwrap_or(0); 256])
+            .collect();
+        let recycler = RawPacketBatch::recycler_for_tests(packet_count);
+
+        let started_at = Instant::now();
+        for _ in 0..iterations {
+            let mut batch = RawPacketBatch::from_recycler_for_tests(&recycler);
+            for payload in &payloads {
+                batch
+                    .push_packet(source, RawPacketIngress::Udp, payload)
+                    .expect("push packet");
+            }
+            assert_eq!(batch.len(), packet_count);
+        }
+        let elapsed = started_at.elapsed();
+
+        println!(
+            "udp_receiver_batch_recycler_profile_fixture iterations={} burst={} recycled_us={}",
+            iterations,
+            packet_count,
+            elapsed.as_micros()
         );
     }
 }

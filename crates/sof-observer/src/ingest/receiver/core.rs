@@ -6,6 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crossbeam_queue::ArrayQueue;
+
 // Linux-only ancillary control messages are used for RX queue overflow telemetry.
 // Runtime ingest remains cross-platform; non-Linux builds use the standard recv_from path.
 #[cfg(target_os = "linux")]
@@ -26,6 +28,7 @@ pub enum RawPacketIngress {
 }
 
 pub const UDP_PACKET_BUFFER_BYTES: usize = 2048;
+const RAW_PACKET_BATCH_RECYCLER_CAPACITY: usize = 256;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RawPacket {
@@ -35,41 +38,148 @@ pub struct RawPacket {
     pub len: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RawPacketBatch {
+    storage: Option<RawPacketBatchStorage>,
+    recycler: Option<Arc<RawPacketBatchRecycler>>,
+}
+
+#[derive(Debug, Default)]
+struct RawPacketBatchStorage {
     buffers: Vec<[u8; UDP_PACKET_BUFFER_BYTES]>,
     packets: Vec<RawPacket>,
 }
 
-impl RawPacketBatch {
-    #[must_use]
-    pub fn with_capacity(capacity: usize) -> Self {
+impl RawPacketBatchStorage {
+    fn with_capacity(capacity: usize) -> Self {
         Self {
             buffers: vec![[0_u8; UDP_PACKET_BUFFER_BYTES]; capacity],
             packets: Vec::with_capacity(capacity),
         }
     }
 
+    fn clear(&mut self) {
+        self.packets.clear();
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct RawPacketBatchRecycler {
+    packet_capacity: usize,
+    queue: ArrayQueue<RawPacketBatchStorage>,
+}
+
+impl RawPacketBatchRecycler {
+    fn new(packet_capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            packet_capacity: packet_capacity.max(1),
+            queue: ArrayQueue::new(RAW_PACKET_BATCH_RECYCLER_CAPACITY),
+        })
+    }
+
+    fn allocate(self: &Arc<Self>) -> RawPacketBatch {
+        let storage = self
+            .queue
+            .pop()
+            .unwrap_or_else(|| RawPacketBatchStorage::with_capacity(self.packet_capacity));
+        RawPacketBatch {
+            storage: Some(storage),
+            recycler: Some(Arc::clone(self)),
+        }
+    }
+
+    fn recycle(&self, mut storage: RawPacketBatchStorage) {
+        storage.clear();
+        let _ = self.queue.push(storage);
+    }
+}
+
+impl RawPacketBatch {
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            storage: Some(RawPacketBatchStorage::with_capacity(capacity)),
+            recycler: None,
+        }
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
-        self.packets.len()
+        self.storage
+            .as_ref()
+            .map_or(0, |storage| storage.packets.len())
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.packets.is_empty()
+        self.len() == 0
     }
 
     pub fn clear(&mut self) {
-        self.packets.clear();
+        if let Some(storage) = self.storage.as_mut() {
+            storage.clear();
+        }
     }
 
     pub fn reserve(&mut self, additional: usize) {
-        let needed = self.packets.len().saturating_add(additional);
-        if needed > self.buffers.len() {
-            self.buffers.resize(needed, [0_u8; UDP_PACKET_BUFFER_BYTES]);
+        let Some(storage) = self.storage.as_mut() else {
+            return;
+        };
+        let needed = storage.packets.len().saturating_add(additional);
+        if needed > storage.buffers.len() {
+            storage
+                .buffers
+                .resize(needed, [0_u8; UDP_PACKET_BUFFER_BYTES]);
         }
-        self.packets.reserve(additional);
+        storage.packets.reserve(additional);
+    }
+
+    pub(super) fn ensure_receive_slots(&mut self, additional: usize) -> usize {
+        let Some(storage) = self.storage.as_mut() else {
+            return 0;
+        };
+        let start_index = storage.packets.len();
+        let needed = start_index.saturating_add(additional);
+        if needed > storage.buffers.len() {
+            storage
+                .buffers
+                .resize(needed, [0_u8; UDP_PACKET_BUFFER_BYTES]);
+        }
+        start_index
+    }
+
+    pub(super) fn receive_buffer_mut(
+        &mut self,
+        buffer_index: usize,
+    ) -> Option<&mut [u8; UDP_PACKET_BUFFER_BYTES]> {
+        self.storage.as_mut()?.buffers.get_mut(buffer_index)
+    }
+
+    pub(super) fn push_received_metadata(
+        &mut self,
+        source: SocketAddr,
+        ingress: RawPacketIngress,
+        buffer_index: usize,
+        len: usize,
+    ) -> Result<(), UdpReceiverError> {
+        let Some(storage) = self.storage.as_mut() else {
+            return Err(UdpReceiverError::Receive {
+                source: std::io::Error::other("raw packet batch storage missing"),
+            });
+        };
+        if len > UDP_PACKET_BUFFER_BYTES {
+            return Err(UdpReceiverError::InvalidPacketLength {
+                len,
+                capacity: UDP_PACKET_BUFFER_BYTES,
+            });
+        }
+        storage.packets.push(RawPacket {
+            source,
+            ingress,
+            buffer_index,
+            len,
+        });
+        Ok(())
     }
 
     pub(super) fn push_packet(
@@ -78,34 +188,80 @@ impl RawPacketBatch {
         ingress: RawPacketIngress,
         bytes: &[u8],
     ) -> Result<(), UdpReceiverError> {
+        if self.storage.is_none() {
+            return Err(UdpReceiverError::Receive {
+                source: std::io::Error::other("raw packet batch storage missing"),
+            });
+        }
         if bytes.len() > UDP_PACKET_BUFFER_BYTES {
             return Err(UdpReceiverError::InvalidPacketLength {
                 len: bytes.len(),
                 capacity: UDP_PACKET_BUFFER_BYTES,
             });
         }
-        let buffer_index = self.packets.len();
-        if buffer_index == self.buffers.len() {
-            self.buffers.push([0_u8; UDP_PACKET_BUFFER_BYTES]);
-        }
-        self.buffers[buffer_index][..bytes.len()].copy_from_slice(bytes);
-        self.packets.push(RawPacket {
-            source,
-            ingress,
-            buffer_index,
-            len: bytes.len(),
-        });
-        Ok(())
+        let buffer_index = self.ensure_receive_slots(1);
+        let buffer =
+            self.receive_buffer_mut(buffer_index)
+                .ok_or_else(|| UdpReceiverError::Receive {
+                    source: std::io::Error::other("raw packet receive buffer missing"),
+                })?;
+        buffer[..bytes.len()].copy_from_slice(bytes);
+        self.push_received_metadata(source, ingress, buffer_index, bytes.len())
     }
 
     #[must_use]
     pub fn packets(&self) -> &[RawPacket] {
-        &self.packets
+        self.storage
+            .as_ref()
+            .map_or(&[], |storage| storage.packets.as_slice())
     }
 
     #[must_use]
     pub fn packet_bytes(&self, packet: RawPacket) -> &[u8] {
-        &self.buffers[packet.buffer_index][..packet.len]
+        let storage = self
+            .storage
+            .as_ref()
+            .expect("raw packet batch storage available");
+        &storage.buffers[packet.buffer_index][..packet.len]
+    }
+
+    fn take_for_send(&mut self) -> Self {
+        if let Some(recycler) = self.recycler.as_ref() {
+            let replacement = recycler.allocate();
+            return std::mem::replace(self, replacement);
+        }
+        let packet_capacity = self
+            .storage
+            .as_ref()
+            .map_or(1, |storage| storage.buffers.len().max(1));
+        std::mem::replace(self, Self::with_capacity(packet_capacity))
+    }
+
+    #[cfg(test)]
+    pub(super) fn recycler_for_tests(capacity: usize) -> Arc<RawPacketBatchRecycler> {
+        RawPacketBatchRecycler::new(capacity)
+    }
+
+    #[cfg(test)]
+    pub(super) fn from_recycler_for_tests(recycler: &Arc<RawPacketBatchRecycler>) -> Self {
+        recycler.allocate()
+    }
+}
+
+impl Default for RawPacketBatch {
+    fn default() -> Self {
+        Self::with_capacity(1)
+    }
+}
+
+impl Drop for RawPacketBatch {
+    fn drop(&mut self) {
+        let Some(recycler) = self.recycler.as_ref() else {
+            return;
+        };
+        if let Some(storage) = self.storage.take() {
+            recycler.recycle(storage);
+        }
     }
 }
 
@@ -293,8 +449,9 @@ fn run_udp_receiver_with_socket(
     let batch_size = read_udp_batch_size();
     #[cfg(target_os = "linux")]
     let mut batch_scratch = (!track_rxq_ovfl).then(|| io::UdpBatchScratch::new(batch_size));
+    let recycler = RawPacketBatchRecycler::new(batch_size);
     let mut buffer = vec![0_u8; UDP_PACKET_BUFFER_BYTES];
-    let mut batch = RawPacketBatch::with_capacity(batch_size);
+    let mut batch = recycler.allocate();
     let mut batch_started_at: Option<Instant> = None;
     let mut last_rxq_ovfl_counter: Option<u64> = None;
     loop {
