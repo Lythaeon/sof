@@ -12,6 +12,7 @@ use crate::framework::{SerializedTransactionRange, TransactionEvent, events::Tra
 use crate::reassembly::dataset::CompletedDataSet;
 use crate::reassembly::inline::InlineContiguousDataSetSink;
 use crate::relay::CacheInsertOutcome;
+use agave_transaction_view::transaction_view::SanitizedTransactionView;
 use crossbeam_channel::Sender as CrossbeamSender;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
@@ -3866,6 +3867,7 @@ impl PacketWorkerResultContext<'_> {
     fn process_open_inline_dataset(&mut self, slot: u64) {
         struct PreparedInlineTx {
             tx: Arc<VersionedTransaction>,
+            dispatch: crate::framework::host::ClassifiedTransactionDispatch,
             kind: crate::app::runtime::dataset::TxKind,
             signature: Option<Signature>,
             tx_ready_observed_at: Instant,
@@ -3932,6 +3934,21 @@ impl PacketWorkerResultContext<'_> {
                                 remove_state = true;
                                 break;
                             };
+                            let prefiltered_dispatch =
+                                SanitizedTransactionView::try_new_sanitized(bytes, true)
+                                    .ok()
+                                    .map(|view| {
+                                        self.plugin_host.classify_transaction_view_in_scope(
+                                            &view,
+                                            TransactionDispatchScope::InlineOnly,
+                                        )
+                                    });
+                            if prefiltered_dispatch.as_ref().is_some_and(|prefiltered| {
+                                prefiltered.dispatch.is_empty()
+                                    && !prefiltered.needs_full_classification
+                            }) {
+                                continue;
+                            }
                             let Ok(tx) = bincode::deserialize::<VersionedTransaction>(bytes) else {
                                 remove_state = true;
                                 break;
@@ -3950,8 +3967,29 @@ impl PacketWorkerResultContext<'_> {
                             };
                             let kind = crate::app::runtime::dataset::classify_tx_kind(&tx);
                             let signature = tx.signatures.first().copied();
+                            let dispatch = match prefiltered_dispatch {
+                                Some(prefiltered) if !prefiltered.needs_full_classification => {
+                                    prefiltered.dispatch
+                                }
+                                _ => self.plugin_host.classify_transaction_ref_in_scope(
+                                    TransactionEventRef {
+                                        slot,
+                                        commitment_status,
+                                        confirmed_slot: commitment_snapshot.confirmed_slot,
+                                        finalized_slot: commitment_snapshot.finalized_slot,
+                                        signature,
+                                        tx: &tx,
+                                        kind,
+                                    },
+                                    TransactionDispatchScope::InlineOnly,
+                                ),
+                            };
+                            if dispatch.is_empty() {
+                                continue;
+                            }
                             prepared.push(PreparedInlineTx {
                                 tx: Arc::new(tx),
+                                dispatch,
                                 kind,
                                 signature,
                                 tx_ready_observed_at,
@@ -3974,23 +4012,8 @@ impl PacketWorkerResultContext<'_> {
             }
 
             for prepared_tx in prepared {
-                let dispatch = self.plugin_host.classify_transaction_ref_in_scope(
-                    TransactionEventRef {
-                        slot,
-                        commitment_status,
-                        confirmed_slot: commitment_snapshot.confirmed_slot,
-                        finalized_slot: commitment_snapshot.finalized_slot,
-                        signature: prepared_tx.signature,
-                        tx: prepared_tx.tx.as_ref(),
-                        kind: prepared_tx.kind,
-                    },
-                    TransactionDispatchScope::InlineOnly,
-                );
-                if dispatch.is_empty() {
-                    continue;
-                }
                 self.plugin_host.on_classified_transaction(
-                    dispatch,
+                    prepared_tx.dispatch,
                     TransactionEvent {
                         slot,
                         commitment_status,
@@ -4533,13 +4556,15 @@ mod tests {
         CheckpointBarrierEvent, DerivedStateCheckpoint, DerivedStateConsumer,
         DerivedStateConsumerFault, DerivedStateConsumerFaultKind, DerivedStateFeedEnvelope,
         DerivedStateFeedEvent, FeedSequence, Plugin, PluginConfig, PluginContext,
-        PluginDispatchMode, PluginHost, PluginSetupError,
+        PluginDispatchMode, PluginHost, PluginSetupError, TransactionInterest,
+        TransactionPrefilter,
     };
     use async_trait::async_trait;
     use rand::{SeedableRng, rngs::StdRng};
     use solana_entry::entry::{Entry, MaxDataShredsLen};
     use solana_hash::Hash;
     use solana_perf::test_tx::{new_test_vote_tx, test_tx};
+    use solana_pubkey::Pubkey;
     use solana_transaction::versioned::VersionedTransaction;
     use std::sync::{Arc, Mutex};
     use wincode::{
@@ -4627,6 +4652,66 @@ mod tests {
         async fn on_transaction(&self, _event: &crate::framework::TransactionEvent) {}
     }
 
+    #[derive(Debug, Clone, Copy)]
+    struct ProfileInlineManualIgnorePlugin {
+        required_key: Pubkey,
+    }
+
+    #[async_trait]
+    impl Plugin for ProfileInlineManualIgnorePlugin {
+        fn name(&self) -> &'static str {
+            "profile-inline-manual-ignore"
+        }
+
+        fn config(&self) -> PluginConfig {
+            PluginConfig::new().with_inline_transaction()
+        }
+
+        fn transaction_interest_ref(
+            &self,
+            event: &crate::framework::TransactionEventRef<'_>,
+        ) -> TransactionInterest {
+            if event
+                .tx
+                .message
+                .static_account_keys()
+                .contains(&self.required_key)
+            {
+                TransactionInterest::Critical
+            } else {
+                TransactionInterest::Ignore
+            }
+        }
+
+        async fn setup(&self, _ctx: PluginContext) -> Result<(), PluginSetupError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct ProfileInlinePrefilterIgnorePlugin {
+        filter: TransactionPrefilter,
+    }
+
+    #[async_trait]
+    impl Plugin for ProfileInlinePrefilterIgnorePlugin {
+        fn name(&self) -> &'static str {
+            "profile-inline-prefilter-ignore"
+        }
+
+        fn config(&self) -> PluginConfig {
+            PluginConfig::new().with_inline_transaction()
+        }
+
+        fn transaction_prefilter(&self) -> Option<&TransactionPrefilter> {
+            Some(&self.filter)
+        }
+
+        async fn setup(&self, _ctx: PluginContext) -> Result<(), PluginSetupError> {
+            Ok(())
+        }
+    }
+
     #[test]
     #[ignore = "profiling fixture for perf"]
     fn inline_open_dataset_profile_fixture() {
@@ -4705,22 +4790,41 @@ mod tests {
                         .payload
                         .get(start..end)
                         .expect("inline transaction bytes");
+                    let prefiltered_dispatch =
+                        SanitizedTransactionView::try_new_sanitized(bytes, true)
+                            .ok()
+                            .map(|view| {
+                                plugin_host.classify_transaction_view_in_scope(
+                                    &view,
+                                    TransactionDispatchScope::InlineOnly,
+                                )
+                            });
+                    if prefiltered_dispatch.as_ref().is_some_and(|prefiltered| {
+                        prefiltered.dispatch.is_empty() && !prefiltered.needs_full_classification
+                    }) {
+                        continue;
+                    }
                     let tx = bincode::deserialize::<VersionedTransaction>(bytes)
                         .expect("deserialize inline transaction");
                     let kind = crate::app::runtime::dataset::classify_tx_kind(&tx);
                     let signature = tx.signatures.first().copied();
-                    let dispatch = plugin_host.classify_transaction_ref_in_scope(
-                        TransactionEventRef {
-                            slot,
-                            commitment_status,
-                            confirmed_slot: commitment_snapshot.confirmed_slot,
-                            finalized_slot: commitment_snapshot.finalized_slot,
-                            signature,
-                            tx: &tx,
-                            kind,
-                        },
-                        TransactionDispatchScope::InlineOnly,
-                    );
+                    let dispatch = match prefiltered_dispatch {
+                        Some(prefiltered) if !prefiltered.needs_full_classification => {
+                            prefiltered.dispatch
+                        }
+                        _ => plugin_host.classify_transaction_ref_in_scope(
+                            TransactionEventRef {
+                                slot,
+                                commitment_status,
+                                confirmed_slot: commitment_snapshot.confirmed_slot,
+                                finalized_slot: commitment_snapshot.finalized_slot,
+                                signature,
+                                tx: &tx,
+                                kind,
+                            },
+                            TransactionDispatchScope::InlineOnly,
+                        ),
+                    };
                     if dispatch.is_empty() {
                         continue;
                     }
@@ -4761,6 +4865,153 @@ mod tests {
             iterations,
             fragment_count,
             dispatched_total,
+            started_at.elapsed().as_millis()
+        );
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for inline prefilter decode skip A/B"]
+    fn inline_open_dataset_prefilter_profile_fixture() {
+        let mode = std::env::var("SOF_INLINE_PREFILTER_PROFILE_MODE")
+            .unwrap_or_else(|_| "manual".to_owned());
+        let iterations = std::env::var("SOF_INLINE_PREFILTER_PROFILE_ITERS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(2_048);
+        let fragment_count = std::env::var("SOF_INLINE_PREFILTER_PROFILE_FRAGMENTS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(32);
+        let payload = build_inline_profile_payload(32);
+        let fragments = split_inline_profile_payload(&payload, fragment_count);
+        let missing_key = Pubkey::new_unique();
+        let plugin_host = match mode.as_str() {
+            "prefilter" => PluginHost::builder()
+                .with_dispatch_mode(PluginDispatchMode::Sequential)
+                .with_transaction_dispatch_workers(4)
+                .add_plugin(ProfileInlinePrefilterIgnorePlugin {
+                    filter: TransactionPrefilter::new(TransactionInterest::Critical)
+                        .with_account_required([missing_key]),
+                })
+                .build(),
+            _ => PluginHost::builder()
+                .with_dispatch_mode(PluginDispatchMode::Sequential)
+                .with_transaction_dispatch_workers(4)
+                .add_plugin(ProfileInlineManualIgnorePlugin {
+                    required_key: missing_key,
+                })
+                .build(),
+        };
+        let tx_commitment_tracker = CommitmentSlotTracker::new();
+        let started_at = Instant::now();
+        let mut candidate_total = 0_usize;
+        let mut start_indices_scratch = Vec::<u32>::new();
+
+        for iteration in 0..iterations {
+            let slot = 4_000_000_u64.saturating_add(u64::try_from(iteration).unwrap_or(u64::MAX));
+            let mut reassembler =
+                crate::reassembly::inline::InlineDataReassembler::new(fragment_count.max(4));
+            let mut open_state = InlineOpenDatasetState::default();
+            for (index, fragment) in fragments.iter().enumerate() {
+                let observed_at = Instant::now();
+                let _ = reassembler.observe_data_shred_meta_at(
+                    slot,
+                    u32::try_from(index).unwrap_or(u32::MAX),
+                    0,
+                    index + 1 == fragments.len(),
+                    index + 1 == fragments.len(),
+                    crate::reassembly::dataset::SharedPayloadFragment::owned(fragment.clone()),
+                    observed_at,
+                );
+                reassembler.fill_inline_contiguous_dataset_starts(slot, &mut start_indices_scratch);
+                let Some(&start_index) = start_indices_scratch.first() else {
+                    continue;
+                };
+                let synced =
+                    reassembler.sync_inline_contiguous_dataset(slot, start_index, &mut open_state);
+                assert!(synced.is_some(), "inline dataset state should sync");
+                match open_state.advance_ready_ranges() {
+                    crate::app::runtime::dataset::EntryStreamPrefixAdvance::Complete
+                    | crate::app::runtime::dataset::EntryStreamPrefixAdvance::Incomplete => {}
+                    crate::app::runtime::dataset::EntryStreamPrefixAdvance::Malformed => {
+                        panic!("unexpected malformed inline prefix fixture")
+                    }
+                }
+                if open_state.emitted_tx_count >= open_state.ready_tx_ranges.len() {
+                    continue;
+                }
+                let commitment_snapshot = tx_commitment_tracker.snapshot();
+                let commitment_status = TxCommitmentStatus::from_slot(
+                    slot,
+                    commitment_snapshot.confirmed_slot,
+                    commitment_snapshot.finalized_slot,
+                );
+                for range in open_state
+                    .ready_tx_ranges
+                    .iter()
+                    .skip(open_state.emitted_tx_count)
+                {
+                    let start = usize::try_from(range.start()).expect("range start");
+                    let end = usize::try_from(range.end()).expect("range end");
+                    let bytes = open_state
+                        .payload
+                        .get(start..end)
+                        .expect("inline transaction bytes");
+                    let prefiltered_dispatch =
+                        SanitizedTransactionView::try_new_sanitized(bytes, true)
+                            .ok()
+                            .map(|view| {
+                                plugin_host.classify_transaction_view_in_scope(
+                                    &view,
+                                    TransactionDispatchScope::InlineOnly,
+                                )
+                            });
+                    if prefiltered_dispatch.as_ref().is_some_and(|prefiltered| {
+                        prefiltered.dispatch.is_empty() && !prefiltered.needs_full_classification
+                    }) {
+                        candidate_total = candidate_total.saturating_add(1);
+                        continue;
+                    }
+                    let tx = bincode::deserialize::<VersionedTransaction>(bytes)
+                        .expect("deserialize inline transaction");
+                    let kind = crate::app::runtime::dataset::classify_tx_kind(&tx);
+                    let signature = tx.signatures.first().copied();
+                    let dispatch = match prefiltered_dispatch {
+                        Some(prefiltered) if !prefiltered.needs_full_classification => {
+                            prefiltered.dispatch
+                        }
+                        _ => plugin_host.classify_transaction_ref_in_scope(
+                            TransactionEventRef {
+                                slot,
+                                commitment_status,
+                                confirmed_slot: commitment_snapshot.confirmed_slot,
+                                finalized_slot: commitment_snapshot.finalized_slot,
+                                signature,
+                                tx: &tx,
+                                kind,
+                            },
+                            TransactionDispatchScope::InlineOnly,
+                        ),
+                    };
+                    candidate_total = candidate_total.saturating_add(1);
+                    assert!(
+                        dispatch.is_empty(),
+                        "profile fixture expects ignored traffic"
+                    );
+                }
+                open_state.emitted_tx_count = open_state.ready_tx_ranges.len();
+            }
+        }
+
+        assert!(candidate_total > 0);
+        println!(
+            "inline_open_dataset_prefilter_profile_fixture mode={} iterations={} fragments={} candidates={} elapsed_ms={}",
+            mode,
+            iterations,
+            fragment_count,
+            candidate_total,
             started_at.elapsed().as_millis()
         );
     }

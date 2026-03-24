@@ -1,8 +1,11 @@
 use super::*;
+use agave_transaction_view::transaction_view::SanitizedTransactionView;
 use async_trait::async_trait;
 use solana_instruction::{AccountMeta, Instruction};
+use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
+use solana_signer::Signer as _;
 use solana_transaction::Transaction;
 use std::{
     sync::atomic::{AtomicBool, AtomicUsize},
@@ -878,6 +881,77 @@ fn transaction_prefilter_matches_manual_account_classifier() {
 }
 
 #[test]
+fn transaction_prefilter_view_classification_matches_decoded() {
+    let required_a = Pubkey::new_unique();
+    let required_b = Pubkey::new_unique();
+    let tx = test_transaction_with_static_accounts([required_a, required_b, Pubkey::new_unique()]);
+    let serialized = bincode::serialize(&tx).expect("serialize transaction");
+    let view =
+        SanitizedTransactionView::try_new_sanitized(serialized.as_slice(), true).expect("view");
+    let signature = tx.signatures.first().copied();
+    let event = TransactionEventRef {
+        slot: 42,
+        commitment_status: TxCommitmentStatus::Processed,
+        confirmed_slot: None,
+        finalized_slot: None,
+        signature,
+        tx: &tx,
+        kind: TxKind::NonVote,
+    };
+
+    let host = PluginHostBuilder::new()
+        .add_plugin(PrefilterTransactionPlugin {
+            filter: TransactionPrefilter::new(TransactionInterest::Critical)
+                .with_account_required([required_a, required_b]),
+        })
+        .build();
+
+    let decoded =
+        host.classify_transaction_ref_in_scope(event, TransactionDispatchScope::InlineOnly);
+    let viewed =
+        host.classify_transaction_view_in_scope(&view, TransactionDispatchScope::InlineOnly);
+
+    assert!(!viewed.needs_full_classification);
+    assert_eq!(decoded.is_empty(), viewed.dispatch.is_empty());
+}
+
+#[test]
+fn transaction_view_prefilter_marks_manual_plugins_for_full_decode() {
+    let required_a = Pubkey::new_unique();
+    let required_b = Pubkey::new_unique();
+    let tx = test_transaction_with_static_accounts([required_a, required_b, Pubkey::new_unique()]);
+    let serialized = bincode::serialize(&tx).expect("serialize transaction");
+    let view =
+        SanitizedTransactionView::try_new_sanitized(serialized.as_slice(), true).expect("view");
+    let signature = tx.signatures.first().copied();
+    let event = TransactionEventRef {
+        slot: 42,
+        commitment_status: TxCommitmentStatus::Processed,
+        confirmed_slot: None,
+        finalized_slot: None,
+        signature,
+        tx: &tx,
+        kind: TxKind::NonVote,
+    };
+
+    let host = PluginHostBuilder::new()
+        .add_plugin(ManualAccountMatchPlugin {
+            required_a,
+            required_b,
+        })
+        .build();
+
+    let decoded =
+        host.classify_transaction_ref_in_scope(event, TransactionDispatchScope::InlineOnly);
+    let viewed =
+        host.classify_transaction_view_in_scope(&view, TransactionDispatchScope::InlineOnly);
+
+    assert!(viewed.needs_full_classification);
+    assert!(viewed.dispatch.is_empty());
+    assert!(!decoded.is_empty());
+}
+
+#[test]
 #[ignore = "profiling fixture for transaction prefilter A/B"]
 fn transaction_prefilter_profile_fixture() {
     let plugin_count = std::env::var("SOF_TRANSACTION_PREFILTER_PROFILE_PLUGINS")
@@ -980,6 +1054,7 @@ fn test_transaction_event_with_signature(slot: u64, signature_seed: u8) -> Trans
 fn test_transaction_with_static_accounts<const N: usize>(
     accounts: [Pubkey; N],
 ) -> solana_transaction::versioned::VersionedTransaction {
+    let payer = Keypair::new();
     let instruction = Instruction {
         program_id: Pubkey::new_unique(),
         accounts: accounts
@@ -988,9 +1063,11 @@ fn test_transaction_with_static_accounts<const N: usize>(
             .collect(),
         data: Vec::new(),
     };
-    solana_transaction::versioned::VersionedTransaction::from(Transaction::new_with_payer(
+    solana_transaction::versioned::VersionedTransaction::from(Transaction::new_signed_with_payer(
         &[instruction],
-        None,
+        Some(&payer.pubkey()),
+        &[&payer],
+        solana_hash::Hash::new_unique(),
     ))
 }
 

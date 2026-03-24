@@ -1,3 +1,6 @@
+use agave_transaction_view::{
+    transaction_data::TransactionData, transaction_view::SanitizedTransactionView,
+};
 use async_trait::async_trait;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
@@ -209,6 +212,45 @@ impl TransactionPrefilter {
         }
         self.matched_interest
     }
+
+    /// Returns the matched interest or [`TransactionInterest::Ignore`] from one transaction view.
+    #[must_use]
+    pub(crate) fn classify_view_ref<D: TransactionData>(
+        &self,
+        view: &SanitizedTransactionView<D>,
+    ) -> TransactionInterest {
+        if let Some(signature) = self.signature
+            && view.signatures().first().copied() != Some(signature)
+        {
+            return TransactionInterest::Ignore;
+        }
+        if !self.account_include.is_empty()
+            && !self
+                .account_include
+                .iter()
+                .copied()
+                .any(|key| transaction_view_mentions_account_key(view, key))
+        {
+            return TransactionInterest::Ignore;
+        }
+        if self
+            .account_exclude
+            .iter()
+            .copied()
+            .any(|key| transaction_view_mentions_account_key(view, key))
+        {
+            return TransactionInterest::Ignore;
+        }
+        if !self
+            .account_required
+            .iter()
+            .copied()
+            .all(|key| transaction_view_mentions_account_key(view, key))
+        {
+            return TransactionInterest::Ignore;
+        }
+        self.matched_interest
+    }
 }
 
 fn transaction_mentions_account_key(
@@ -220,6 +262,16 @@ fn transaction_mentions_account_key(
             .message
             .address_table_lookups()
             .is_some_and(|lookups| lookups.iter().any(|lookup| lookup.account_key == key))
+}
+
+fn transaction_view_mentions_account_key<D: TransactionData>(
+    view: &SanitizedTransactionView<D>,
+    key: Pubkey,
+) -> bool {
+    view.static_account_keys().contains(&key)
+        || view
+            .address_table_lookup_iter()
+            .any(|lookup| *lookup.account_key == key)
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]

@@ -10,6 +10,9 @@ use crate::framework::AccountTouchEvent;
 use crate::framework::PluginContext;
 use crate::framework::events::AccountTouchEventRef;
 use crate::framework::events::TransactionEventRef;
+use agave_transaction_view::{
+    transaction_data::TransactionData, transaction_view::SanitizedTransactionView,
+};
 use std::time::Instant;
 
 /// Selects which transaction subscribers should receive a callback.
@@ -30,6 +33,23 @@ impl TransactionDispatchScope {
             Self::All => true,
             Self::InlineOnly => inline_requested,
             Self::DeferredOnly => !inline_requested,
+        }
+    }
+}
+
+/// Result of running only compiled transaction prefilters within one delivery scope.
+pub(crate) struct PrefilteredTransactionDispatch {
+    /// Preclassified dispatch targets from compiled prefilters.
+    pub(crate) dispatch: ClassifiedTransactionDispatch,
+    /// Whether full decoded classification is still required for plugins without prefilters.
+    pub(crate) needs_full_classification: bool,
+}
+
+impl PrefilteredTransactionDispatch {
+    const fn empty() -> Self {
+        Self {
+            dispatch: ClassifiedTransactionDispatch::empty(),
+            needs_full_classification: false,
         }
     }
 }
@@ -394,6 +414,44 @@ impl PluginHost {
             );
         }
         dispatch
+    }
+
+    /// Runs compiled transaction prefilters against one serialized transaction view.
+    #[must_use]
+    pub(crate) fn classify_transaction_view_in_scope<D: TransactionData>(
+        &self,
+        view: &SanitizedTransactionView<D>,
+        scope: TransactionDispatchScope,
+    ) -> PrefilteredTransactionDispatch {
+        if !self.wants_transaction_dispatch_in_scope(scope) || self.transaction_dispatcher.is_none()
+        {
+            return PrefilteredTransactionDispatch::empty();
+        }
+        let mut dispatch = ClassifiedTransactionDispatch::empty();
+        let mut needs_full_classification = false;
+        for ((plugin, inline_requested), prefilter) in self
+            .transaction_plugins
+            .iter()
+            .zip(self.transaction_plugin_inline_preferences.iter().copied())
+            .zip(self.transaction_plugin_prefilters.iter())
+        {
+            if !scope.includes(inline_requested) {
+                continue;
+            }
+            if let Some(filter) = prefilter.as_ref() {
+                dispatch.push(
+                    filter.classify_view_ref(view),
+                    inline_requested,
+                    Arc::clone(plugin),
+                );
+            } else {
+                needs_full_classification = true;
+            }
+        }
+        PrefilteredTransactionDispatch {
+            dispatch,
+            needs_full_classification,
+        }
     }
 
     /// Returns true when the requested transaction delivery scope has any listeners.

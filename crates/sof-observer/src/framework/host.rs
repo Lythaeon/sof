@@ -34,6 +34,7 @@ mod tests;
 pub use builder::PluginHostBuilder;
 pub use core::PluginHost;
 pub(crate) use core::TransactionDispatchScope;
+pub(crate) use dispatch::ClassifiedTransactionDispatch;
 pub(crate) use dispatch::TransactionDispatchMetricsBatch;
 
 /// Default bounded queue capacity for asynchronous plugin hook dispatch.
