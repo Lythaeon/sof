@@ -101,15 +101,15 @@ pub(in crate::app::runtime) fn process_completed_dataset(
     let joined_payload_for_view_extract = (plugin_transaction_view_batch_enabled
         || !requires_owned_decode)
         && payload_fragments.len() > 1;
-    let maybe_view_batch = (plugin_transaction_view_batch_enabled || !requires_owned_decode)
+    if let Some(view_batch) = (plugin_transaction_view_batch_enabled || !requires_owned_decode)
         .then(|| {
             extract_transaction_view_batch_from_payload_fragments(
                 &payload_fragments,
                 &mut scratch.payload,
             )
         })
-        .flatten();
-    if let Some(view_batch) = maybe_view_batch {
+        .flatten()
+    {
         let effective_start_index = start_index.saturating_add(view_batch.skipped_prefix_shreds);
         if !view_batch.transactions.is_empty() && plugin_transaction_view_batch_enabled {
             context.plugin_host.on_transaction_view_batch(
@@ -123,7 +123,7 @@ pub(in crate::app::runtime) fn process_completed_dataset(
                     commitment_status,
                     confirmed_slot: commitment_snapshot.confirmed_slot,
                     finalized_slot: commitment_snapshot.finalized_slot,
-                    payload: view_batch.payload.clone(),
+                    payload: Arc::from(view_batch.payload),
                     transactions: view_batch.transactions.clone(),
                 },
                 completed_at,
@@ -638,7 +638,7 @@ pub(in crate::app::runtime) fn parse_entry_stream_ready_transaction_ranges(
 
 fn process_completed_dataset_from_views(
     input: ViewOnlyDatasetProcessInput,
-    view_batch: &ExtractedTransactionViewBatch,
+    view_batch: &ExtractedTransactionViewBatch<'_>,
     context: &DatasetProcessContext<'_>,
 ) -> DatasetProcessOutcome {
     let ViewOnlyDatasetProcessInput {
@@ -825,7 +825,10 @@ fn process_decoded_transaction(
     config: &ProcessDecodedTransactionConfig<'_, '_>,
     state: &mut ProcessDecodedTransactionState<'_>,
 ) {
-    let tx_ref: &VersionedTransaction = tx.as_ref();
+    let tx_ref: &VersionedTransaction = match &tx {
+        std::borrow::Cow::Borrowed(tx) => tx,
+        std::borrow::Cow::Owned(tx) => tx,
+    };
     if state.observed_recent_blockhash.is_none() {
         *state.observed_recent_blockhash = Some(tx_ref.message.recent_blockhash().to_bytes());
     }
@@ -876,12 +879,15 @@ fn process_decoded_transaction(
             .as_ref()
             .is_some_and(|dispatch| !dispatch.is_empty()))
     .then(|| {
-        let static_account_keys = Arc::from(static_account_keys.to_vec());
-        let (writable_account_keys, readonly_account_keys) =
+        let (static_account_keys, writable_account_keys, readonly_account_keys) =
             if config.account_touch_needs_key_partitions {
                 partition_static_account_keys(tx_ref)
             } else {
-                (empty_pubkey_vec(), empty_pubkey_vec())
+                (
+                    Arc::from(static_account_keys),
+                    empty_pubkey_vec(),
+                    empty_pubkey_vec(),
+                )
             };
         AccountTouchEvent {
             slot: config.slot,
@@ -929,7 +935,10 @@ fn process_decoded_transaction(
                     confirmed_slot: config.confirmed_slot,
                     finalized_slot: config.finalized_slot,
                     signature,
-                    tx: Arc::new(tx.into_owned()),
+                    tx: Arc::new(match tx {
+                        std::borrow::Cow::Borrowed(tx) => tx.clone(),
+                        std::borrow::Cow::Owned(tx) => tx,
+                    }),
                     kind,
                 }),
         )
@@ -1037,8 +1046,8 @@ fn emit_detailed_tx_observed_event(
     }
 }
 
-struct ExtractedTransactionViewBatch {
-    payload: Arc<[u8]>,
+struct ExtractedTransactionViewBatch<'payload> {
+    payload: &'payload [u8],
     transactions: Arc<[SerializedTransactionRange]>,
     payload_len: usize,
     skipped_prefix_shreds: u32,
@@ -1058,7 +1067,9 @@ struct ViewOnlyDatasetProcessInput {
     emit_detailed_tx_events: bool,
 }
 
-fn partition_static_account_keys(tx: &VersionedTransaction) -> (Arc<[Pubkey]>, Arc<[Pubkey]>) {
+fn partition_static_account_keys(
+    tx: &VersionedTransaction,
+) -> (Arc<[Pubkey]>, Arc<[Pubkey]>, Arc<[Pubkey]>) {
     let static_account_keys = tx.message.static_account_keys();
     let mut writable_account_keys = Vec::with_capacity(static_account_keys.len());
     let mut readonly_account_keys = Vec::with_capacity(static_account_keys.len());
@@ -1070,6 +1081,7 @@ fn partition_static_account_keys(tx: &VersionedTransaction) -> (Arc<[Pubkey]>, A
         }
     }
     (
+        Arc::from(static_account_keys),
         Arc::from(writable_account_keys),
         Arc::from(readonly_account_keys),
     )
@@ -1155,10 +1167,10 @@ fn decode_entries_from_payload_fragments(
     None
 }
 
-fn extract_transaction_view_batch_from_payload_fragments(
-    payload_fragments: &crate::reassembly::dataset::PayloadFragmentBatch,
-    scratch_payload: &mut Vec<u8>,
-) -> Option<ExtractedTransactionViewBatch> {
+fn extract_transaction_view_batch_from_payload_fragments<'payload>(
+    payload_fragments: &'payload crate::reassembly::dataset::PayloadFragmentBatch,
+    scratch_payload: &'payload mut Vec<u8>,
+) -> Option<ExtractedTransactionViewBatch<'payload>> {
     let total_payload_len = payload_fragments.total_len();
     if total_payload_len == 0 {
         return None;
@@ -1185,7 +1197,7 @@ fn extract_transaction_view_batch_from_payload_fragments(
             continue;
         };
         return Some(ExtractedTransactionViewBatch {
-            payload: Arc::from(payload.to_vec()),
+            payload,
             transactions: Arc::from(ranges),
             payload_len,
             skipped_prefix_shreds: u32::try_from(skipped_prefix).ok()?,

@@ -21,15 +21,9 @@ impl CacheAlignedAtomicU64 {
         self.0.fetch_add(value, ordering)
     }
 
-    /// Performs a weak compare-exchange operation.
-    fn compare_exchange_weak(
-        &self,
-        current: u64,
-        new: u64,
-        success: Ordering,
-        failure: Ordering,
-    ) -> Result<u64, u64> {
-        self.0.compare_exchange_weak(current, new, success, failure)
+    /// Raises the counter to at least `value` and returns the previous value.
+    fn fetch_max(&self, value: u64, ordering: Ordering) -> u64 {
+        self.0.fetch_max(value, ordering)
     }
 }
 
@@ -1002,18 +996,7 @@ pub(crate) fn set_packet_worker_queue_depth(depth: u64) {
 
 /// Raises the maximum observed packet-worker queue depth when `depth` exceeds it.
 pub(crate) fn observe_packet_worker_max_queue_depth(depth: u64) {
-    let mut current = PACKET_WORKER_MAX_QUEUE_DEPTH.load(Ordering::Relaxed);
-    while depth > current {
-        match PACKET_WORKER_MAX_QUEUE_DEPTH.compare_exchange_weak(
-            current,
-            depth,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => break,
-            Err(observed) => current = observed,
-        }
-    }
+    let _ = PACKET_WORKER_MAX_QUEUE_DEPTH.fetch_max(depth, Ordering::Relaxed);
 }
 
 /// Adds packet-worker queue drops aggregated by dropped batches and packets.
@@ -1132,87 +1115,6 @@ pub(crate) fn observe_tx_event_drops(count: u64) {
     TX_EVENT_DROPPED_TOTAL.fetch_add(count, Ordering::Relaxed);
 }
 
-/// Records one transaction-plugin callback visibility lag from completed-dataset emission.
-pub(crate) fn observe_transaction_plugin_visibility_lag(lag_us: u64) {
-    TRANSACTION_PLUGIN_VISIBILITY_SAMPLES_TOTAL.fetch_add(1, Ordering::Relaxed);
-    TRANSACTION_PLUGIN_VISIBILITY_LAG_US_TOTAL.fetch_add(lag_us, Ordering::Relaxed);
-    LATEST_TRANSACTION_PLUGIN_VISIBILITY_LAG_US.store(lag_us, Ordering::Relaxed);
-    observe_max_counter(&MAX_TRANSACTION_PLUGIN_VISIBILITY_LAG_US, lag_us);
-}
-
-/// Records one transaction-plugin queue wait from completed-dataset emission to tx worker dequeue.
-pub(crate) fn observe_transaction_plugin_queue_wait(lag_us: u64) {
-    TRANSACTION_PLUGIN_QUEUE_WAIT_US_TOTAL.fetch_add(lag_us, Ordering::Relaxed);
-    LATEST_TRANSACTION_PLUGIN_QUEUE_WAIT_US.store(lag_us, Ordering::Relaxed);
-    observe_max_counter(&MAX_TRANSACTION_PLUGIN_QUEUE_WAIT_US, lag_us);
-}
-
-/// Records one transaction-plugin callback execution duration.
-pub(crate) fn observe_transaction_plugin_callback_duration(duration_us: u64) {
-    TRANSACTION_PLUGIN_CALLBACK_DURATION_US_TOTAL.fetch_add(duration_us, Ordering::Relaxed);
-    LATEST_TRANSACTION_PLUGIN_CALLBACK_DURATION_US.store(duration_us, Ordering::Relaxed);
-    observe_max_counter(&MAX_TRANSACTION_PLUGIN_CALLBACK_DURATION_US, duration_us);
-}
-
-/// Records one inline transaction-plugin callback latency sample across ingress boundaries.
-pub(crate) fn observe_inline_transaction_plugin_latency(
-    source: crate::framework::host::InlineTransactionDispatchSource,
-    first_shred_lag_us: u64,
-    last_shred_lag_us: u64,
-    completed_dataset_lag_us: u64,
-) {
-    INLINE_TRANSACTION_PLUGIN_LATENCY_SAMPLES_TOTAL.fetch_add(1, Ordering::Relaxed);
-
-    INLINE_TRANSACTION_PLUGIN_FIRST_SHRED_LAG_US_TOTAL
-        .fetch_add(first_shred_lag_us, Ordering::Relaxed);
-    LATEST_INLINE_TRANSACTION_PLUGIN_FIRST_SHRED_LAG_US
-        .store(first_shred_lag_us, Ordering::Relaxed);
-    observe_max_counter(
-        &MAX_INLINE_TRANSACTION_PLUGIN_FIRST_SHRED_LAG_US,
-        first_shred_lag_us,
-    );
-
-    INLINE_TRANSACTION_PLUGIN_LAST_SHRED_LAG_US_TOTAL
-        .fetch_add(last_shred_lag_us, Ordering::Relaxed);
-    LATEST_INLINE_TRANSACTION_PLUGIN_LAST_SHRED_LAG_US.store(last_shred_lag_us, Ordering::Relaxed);
-    observe_max_counter(
-        &MAX_INLINE_TRANSACTION_PLUGIN_LAST_SHRED_LAG_US,
-        last_shred_lag_us,
-    );
-
-    INLINE_TRANSACTION_PLUGIN_COMPLETED_DATASET_LAG_US_TOTAL
-        .fetch_add(completed_dataset_lag_us, Ordering::Relaxed);
-    LATEST_INLINE_TRANSACTION_PLUGIN_COMPLETED_DATASET_LAG_US
-        .store(completed_dataset_lag_us, Ordering::Relaxed);
-    observe_max_counter(
-        &MAX_INLINE_TRANSACTION_PLUGIN_COMPLETED_DATASET_LAG_US,
-        completed_dataset_lag_us,
-    );
-
-    match source {
-        crate::framework::host::InlineTransactionDispatchSource::EarlyPrefix => {
-            INLINE_TRANSACTION_PLUGIN_EARLY_PREFIX_LATENCY_SAMPLES_TOTAL
-                .fetch_add(1, Ordering::Relaxed);
-            INLINE_TRANSACTION_PLUGIN_EARLY_PREFIX_FIRST_SHRED_LAG_US_TOTAL
-                .fetch_add(first_shred_lag_us, Ordering::Relaxed);
-            INLINE_TRANSACTION_PLUGIN_EARLY_PREFIX_LAST_SHRED_LAG_US_TOTAL
-                .fetch_add(last_shred_lag_us, Ordering::Relaxed);
-            INLINE_TRANSACTION_PLUGIN_EARLY_PREFIX_COMPLETED_DATASET_LAG_US_TOTAL
-                .fetch_add(completed_dataset_lag_us, Ordering::Relaxed);
-        }
-        crate::framework::host::InlineTransactionDispatchSource::CompletedDatasetFallback => {
-            INLINE_TRANSACTION_PLUGIN_COMPLETED_DATASET_FALLBACK_LATENCY_SAMPLES_TOTAL
-                .fetch_add(1, Ordering::Relaxed);
-            INLINE_TRANSACTION_PLUGIN_COMPLETED_DATASET_FALLBACK_FIRST_SHRED_LAG_US_TOTAL
-                .fetch_add(first_shred_lag_us, Ordering::Relaxed);
-            INLINE_TRANSACTION_PLUGIN_COMPLETED_DATASET_FALLBACK_LAST_SHRED_LAG_US_TOTAL
-                .fetch_add(last_shred_lag_us, Ordering::Relaxed);
-            INLINE_TRANSACTION_PLUGIN_COMPLETED_DATASET_FALLBACK_COMPLETED_DATASET_LAG_US_TOTAL
-                .fetch_add(completed_dataset_lag_us, Ordering::Relaxed);
-        }
-    }
-}
-
 /// Records one completed-dataset transaction-batch plugin visibility lag.
 pub(crate) fn observe_transaction_batch_plugin_visibility_lag(lag_us: u64) {
     TRANSACTION_BATCH_PLUGIN_VISIBILITY_SAMPLES_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -1248,37 +1150,6 @@ pub(crate) fn observe_transaction_view_batch_plugin_callback_duration(duration_u
         &MAX_TRANSACTION_VIEW_BATCH_PLUGIN_CALLBACK_DURATION_US,
         duration_us,
     );
-}
-
-/// Records one transaction-plugin dataset-local position sample and its queue wait.
-pub(crate) fn observe_transaction_plugin_dataset_position(
-    dataset_tx_count: u32,
-    dataset_tx_position: u32,
-    queue_wait_us: u64,
-) {
-    let dataset_tx_count = u64::from(dataset_tx_count);
-    let dataset_tx_position = u64::from(dataset_tx_position);
-    LATEST_TRANSACTION_DATASET_TX_COUNT.store(dataset_tx_count, Ordering::Relaxed);
-    observe_max_counter(&MAX_TRANSACTION_DATASET_TX_COUNT, dataset_tx_count);
-    LATEST_TRANSACTION_DATASET_TX_POSITION.store(dataset_tx_position, Ordering::Relaxed);
-    observe_max_counter(&MAX_TRANSACTION_DATASET_TX_POSITION, dataset_tx_position);
-    if dataset_tx_position == 0 {
-        TRANSACTION_PLUGIN_FIRST_IN_DATASET_SAMPLES_TOTAL.fetch_add(1, Ordering::Relaxed);
-        TRANSACTION_PLUGIN_FIRST_IN_DATASET_QUEUE_WAIT_US_TOTAL
-            .fetch_add(queue_wait_us, Ordering::Relaxed);
-        observe_max_counter(
-            &MAX_TRANSACTION_PLUGIN_FIRST_IN_DATASET_QUEUE_WAIT_US,
-            queue_wait_us,
-        );
-    } else {
-        TRANSACTION_PLUGIN_NONFIRST_IN_DATASET_SAMPLES_TOTAL.fetch_add(1, Ordering::Relaxed);
-        TRANSACTION_PLUGIN_NONFIRST_IN_DATASET_QUEUE_WAIT_US_TOTAL
-            .fetch_add(queue_wait_us, Ordering::Relaxed);
-        observe_max_counter(
-            &MAX_TRANSACTION_PLUGIN_NONFIRST_IN_DATASET_QUEUE_WAIT_US,
-            queue_wait_us,
-        );
-    }
 }
 
 /// Publishes the latest runtime freshness and repair-health gauges.
@@ -1484,11 +1355,157 @@ pub(crate) fn set_network_operability_metrics(metrics: NetworkOperabilityMetrics
 
 /// Raises one monotonic runtime counter when `value` exceeds its current maximum.
 fn observe_max_counter(counter: &CacheAlignedAtomicU64, value: u64) {
-    let mut current = counter.load(Ordering::Relaxed);
-    while value > current {
-        match counter.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break,
-            Err(observed) => current = observed,
-        }
+    let _ = counter.fetch_max(value, Ordering::Relaxed);
+}
+
+pub(crate) fn observe_transaction_dispatch_metrics_batch(
+    batch: crate::framework::host::TransactionDispatchMetricsBatch,
+) {
+    if batch.visibility_samples_total != 0 {
+        TRANSACTION_PLUGIN_VISIBILITY_SAMPLES_TOTAL
+            .fetch_add(batch.visibility_samples_total, Ordering::Relaxed);
+        TRANSACTION_PLUGIN_VISIBILITY_LAG_US_TOTAL
+            .fetch_add(batch.visibility_lag_us_total, Ordering::Relaxed);
+        LATEST_TRANSACTION_PLUGIN_VISIBILITY_LAG_US
+            .store(batch.latest_visibility_lag_us, Ordering::Relaxed);
+        observe_max_counter(
+            &MAX_TRANSACTION_PLUGIN_VISIBILITY_LAG_US,
+            batch.max_visibility_lag_us,
+        );
+    }
+
+    if batch.queue_wait_us_total != 0 || batch.latest_queue_wait_us != 0 {
+        TRANSACTION_PLUGIN_QUEUE_WAIT_US_TOTAL
+            .fetch_add(batch.queue_wait_us_total, Ordering::Relaxed);
+        LATEST_TRANSACTION_PLUGIN_QUEUE_WAIT_US
+            .store(batch.latest_queue_wait_us, Ordering::Relaxed);
+        observe_max_counter(
+            &MAX_TRANSACTION_PLUGIN_QUEUE_WAIT_US,
+            batch.max_queue_wait_us,
+        );
+    }
+
+    if batch.callback_duration_us_total != 0 || batch.latest_callback_duration_us != 0 {
+        TRANSACTION_PLUGIN_CALLBACK_DURATION_US_TOTAL
+            .fetch_add(batch.callback_duration_us_total, Ordering::Relaxed);
+        LATEST_TRANSACTION_PLUGIN_CALLBACK_DURATION_US
+            .store(batch.latest_callback_duration_us, Ordering::Relaxed);
+        observe_max_counter(
+            &MAX_TRANSACTION_PLUGIN_CALLBACK_DURATION_US,
+            batch.max_callback_duration_us,
+        );
+    }
+
+    LATEST_TRANSACTION_DATASET_TX_COUNT
+        .store(u64::from(batch.latest_dataset_tx_count), Ordering::Relaxed);
+    observe_max_counter(
+        &MAX_TRANSACTION_DATASET_TX_COUNT,
+        u64::from(batch.max_dataset_tx_count),
+    );
+    LATEST_TRANSACTION_DATASET_TX_POSITION.store(
+        u64::from(batch.latest_dataset_tx_position),
+        Ordering::Relaxed,
+    );
+    observe_max_counter(
+        &MAX_TRANSACTION_DATASET_TX_POSITION,
+        u64::from(batch.max_dataset_tx_position),
+    );
+
+    if batch.first_in_dataset_samples_total != 0 {
+        TRANSACTION_PLUGIN_FIRST_IN_DATASET_SAMPLES_TOTAL
+            .fetch_add(batch.first_in_dataset_samples_total, Ordering::Relaxed);
+        TRANSACTION_PLUGIN_FIRST_IN_DATASET_QUEUE_WAIT_US_TOTAL.fetch_add(
+            batch.first_in_dataset_queue_wait_us_total,
+            Ordering::Relaxed,
+        );
+        observe_max_counter(
+            &MAX_TRANSACTION_PLUGIN_FIRST_IN_DATASET_QUEUE_WAIT_US,
+            batch.max_first_in_dataset_queue_wait_us,
+        );
+    }
+
+    if batch.nonfirst_in_dataset_samples_total != 0 {
+        TRANSACTION_PLUGIN_NONFIRST_IN_DATASET_SAMPLES_TOTAL
+            .fetch_add(batch.nonfirst_in_dataset_samples_total, Ordering::Relaxed);
+        TRANSACTION_PLUGIN_NONFIRST_IN_DATASET_QUEUE_WAIT_US_TOTAL.fetch_add(
+            batch.nonfirst_in_dataset_queue_wait_us_total,
+            Ordering::Relaxed,
+        );
+        observe_max_counter(
+            &MAX_TRANSACTION_PLUGIN_NONFIRST_IN_DATASET_QUEUE_WAIT_US,
+            batch.max_nonfirst_in_dataset_queue_wait_us,
+        );
+    }
+
+    if batch.inline_latency_samples_total != 0 {
+        INLINE_TRANSACTION_PLUGIN_LATENCY_SAMPLES_TOTAL
+            .fetch_add(batch.inline_latency_samples_total, Ordering::Relaxed);
+        INLINE_TRANSACTION_PLUGIN_FIRST_SHRED_LAG_US_TOTAL
+            .fetch_add(batch.inline_first_shred_lag_us_total, Ordering::Relaxed);
+        LATEST_INLINE_TRANSACTION_PLUGIN_FIRST_SHRED_LAG_US
+            .store(batch.latest_inline_first_shred_lag_us, Ordering::Relaxed);
+        observe_max_counter(
+            &MAX_INLINE_TRANSACTION_PLUGIN_FIRST_SHRED_LAG_US,
+            batch.max_inline_first_shred_lag_us,
+        );
+
+        INLINE_TRANSACTION_PLUGIN_LAST_SHRED_LAG_US_TOTAL
+            .fetch_add(batch.inline_last_shred_lag_us_total, Ordering::Relaxed);
+        LATEST_INLINE_TRANSACTION_PLUGIN_LAST_SHRED_LAG_US
+            .store(batch.latest_inline_last_shred_lag_us, Ordering::Relaxed);
+        observe_max_counter(
+            &MAX_INLINE_TRANSACTION_PLUGIN_LAST_SHRED_LAG_US,
+            batch.max_inline_last_shred_lag_us,
+        );
+
+        INLINE_TRANSACTION_PLUGIN_COMPLETED_DATASET_LAG_US_TOTAL.fetch_add(
+            batch.inline_completed_dataset_lag_us_total,
+            Ordering::Relaxed,
+        );
+        LATEST_INLINE_TRANSACTION_PLUGIN_COMPLETED_DATASET_LAG_US.store(
+            batch.latest_inline_completed_dataset_lag_us,
+            Ordering::Relaxed,
+        );
+        observe_max_counter(
+            &MAX_INLINE_TRANSACTION_PLUGIN_COMPLETED_DATASET_LAG_US,
+            batch.max_inline_completed_dataset_lag_us,
+        );
+    }
+
+    if batch.early_prefix_latency_samples_total != 0 {
+        INLINE_TRANSACTION_PLUGIN_EARLY_PREFIX_LATENCY_SAMPLES_TOTAL
+            .fetch_add(batch.early_prefix_latency_samples_total, Ordering::Relaxed);
+        INLINE_TRANSACTION_PLUGIN_EARLY_PREFIX_FIRST_SHRED_LAG_US_TOTAL.fetch_add(
+            batch.early_prefix_first_shred_lag_us_total,
+            Ordering::Relaxed,
+        );
+        INLINE_TRANSACTION_PLUGIN_EARLY_PREFIX_LAST_SHRED_LAG_US_TOTAL.fetch_add(
+            batch.early_prefix_last_shred_lag_us_total,
+            Ordering::Relaxed,
+        );
+        INLINE_TRANSACTION_PLUGIN_EARLY_PREFIX_COMPLETED_DATASET_LAG_US_TOTAL.fetch_add(
+            batch.early_prefix_completed_dataset_lag_us_total,
+            Ordering::Relaxed,
+        );
+    }
+
+    if batch.completed_dataset_fallback_latency_samples_total != 0 {
+        INLINE_TRANSACTION_PLUGIN_COMPLETED_DATASET_FALLBACK_LATENCY_SAMPLES_TOTAL.fetch_add(
+            batch.completed_dataset_fallback_latency_samples_total,
+            Ordering::Relaxed,
+        );
+        INLINE_TRANSACTION_PLUGIN_COMPLETED_DATASET_FALLBACK_FIRST_SHRED_LAG_US_TOTAL.fetch_add(
+            batch.completed_dataset_fallback_first_shred_lag_us_total,
+            Ordering::Relaxed,
+        );
+        INLINE_TRANSACTION_PLUGIN_COMPLETED_DATASET_FALLBACK_LAST_SHRED_LAG_US_TOTAL.fetch_add(
+            batch.completed_dataset_fallback_last_shred_lag_us_total,
+            Ordering::Relaxed,
+        );
+        INLINE_TRANSACTION_PLUGIN_COMPLETED_DATASET_FALLBACK_COMPLETED_DATASET_LAG_US_TOTAL
+            .fetch_add(
+                batch.completed_dataset_fallback_completed_dataset_lag_us_total,
+                Ordering::Relaxed,
+            );
     }
 }
