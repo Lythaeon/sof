@@ -61,6 +61,18 @@ fn with_cached_transaction_event<R>(
     })
 }
 
+pub(crate) fn clone_cached_transaction_event(
+    event: TransactionEventRef<'_>,
+) -> Option<TransactionEvent> {
+    let key = cached_transaction_event_key(event);
+    CACHED_TRANSACTION_EVENT.with(|cached| {
+        cached
+            .borrow()
+            .as_ref()
+            .and_then(|cached_event| (cached_event.key == key).then(|| cached_event.event.clone()))
+    })
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 /// Priority class for accepted transaction callbacks.
 pub enum TransactionInterest {

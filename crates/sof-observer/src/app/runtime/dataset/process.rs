@@ -921,15 +921,18 @@ fn process_decoded_transaction(
             .as_ref()
             .is_some_and(|dispatch| !dispatch.is_empty())
     {
-        Some(TransactionEvent {
-            slot: config.slot,
-            commitment_status: config.commitment_status,
-            confirmed_slot: config.confirmed_slot,
-            finalized_slot: config.finalized_slot,
-            signature,
-            tx: Arc::new(tx.into_owned()),
-            kind,
-        })
+        Some(
+            crate::framework::plugin::clone_cached_transaction_event(transaction_event_ref)
+                .unwrap_or_else(|| TransactionEvent {
+                    slot: config.slot,
+                    commitment_status: config.commitment_status,
+                    confirmed_slot: config.confirmed_slot,
+                    finalized_slot: config.finalized_slot,
+                    signature,
+                    tx: Arc::new(tx.into_owned()),
+                    kind,
+                }),
+        )
     } else {
         None
     };
