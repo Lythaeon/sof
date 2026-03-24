@@ -777,6 +777,64 @@ mod tests {
         packet
     }
 
+    #[test]
+    #[ignore = "profiling fixture for packet worker primary FEC ingest"]
+    fn packet_worker_primary_fec_profile_fixture() {
+        let iterations = std::env::var("SOF_PACKET_WORKER_FEC_PROFILE_ITERS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(50_000);
+        let packets = (0..iterations)
+            .map(|iteration| {
+                let slot =
+                    9_000_000_u64.saturating_add(u64::try_from(iteration).unwrap_or(u64::MAX));
+                let index = u32::try_from(iteration % 32).unwrap_or(u32::MAX);
+                let fec_set_index = index;
+                let payload = [
+                    u8::try_from(iteration & 0xff).unwrap_or_default(),
+                    u8::try_from((iteration >> 8) & 0xff).unwrap_or_default(),
+                    u8::try_from((iteration >> 16) & 0xff).unwrap_or_default(),
+                    u8::try_from((iteration >> 24) & 0xff).unwrap_or_default(),
+                ];
+                let packet_bytes = build_data_shred_packet(slot, index, fec_set_index, 1, &payload);
+                let parsed_header = parse_shred_header(&packet_bytes).expect("valid test shred");
+                (Arc::<[u8]>::from(packet_bytes), parsed_header)
+            })
+            .collect::<Vec<_>>();
+        let mut fec_recoverer = FecRecoverer::new(128, 1);
+        let started_at = Instant::now();
+        let mut emitted = 0_u64;
+        for (packet_bytes, parsed_header) in packets {
+            let forwarded = process_packet_batch_streaming(
+                PacketWorkerBatch {
+                    worker_index: 0,
+                    packets: vec![PacketWorkerInput {
+                        source: SocketAddr::from(([127, 0, 0, 1], 8_899)),
+                        packet_bytes,
+                        parsed_header,
+                        observed_at: Instant::now(),
+                    }],
+                },
+                None,
+                false,
+                false,
+                &mut fec_recoverer,
+                |_| {
+                    emitted = emitted.saturating_add(1);
+                    true
+                },
+            );
+            assert!(forwarded);
+        }
+        println!(
+            "packet_worker_primary_fec_profile_fixture iterations={} emitted={} elapsed_ms={}",
+            iterations,
+            emitted,
+            started_at.elapsed().as_millis()
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn closing_inputs_still_drains_enqueued_batches() {
         let packet_bytes = build_data_shred_packet(42, 7, 7, 1, &[1, 2, 3, 4]);
