@@ -2,8 +2,10 @@ use super::*;
 use crate::ingest::config::{
     read_udp_busy_poll_budget, read_udp_busy_poll_us, read_udp_prefer_busy_poll,
 };
+#[cfg(all(target_os = "linux", test))]
+use nix::poll::PollFlags;
 #[cfg(target_os = "linux")]
-use nix::poll::{PollFd, PollFlags, ppoll};
+use nix::poll::{PollFd, ppoll};
 #[cfg(target_os = "linux")]
 use nix::sys::time::TimeSpec;
 
@@ -89,6 +91,7 @@ pub(super) fn recv_udp_packet(
     })
 }
 
+#[cfg(test)]
 #[cfg(target_os = "linux")]
 pub(super) fn recv_udp_batch(
     socket: &std::net::UdpSocket,

@@ -1,7 +1,7 @@
 use std::io::{ErrorKind, IoSliceMut};
 use std::net::SocketAddr;
 #[cfg(target_os = "linux")]
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -10,6 +10,8 @@ use crossbeam_queue::ArrayQueue;
 
 // Linux-only ancillary control messages are used for RX queue overflow telemetry.
 // Runtime ingest remains cross-platform; non-Linux builds use the standard recv_from path.
+#[cfg(target_os = "linux")]
+use nix::poll::{PollFd, PollFlags};
 #[cfg(target_os = "linux")]
 use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg};
 use socket2::SockRef;
@@ -432,23 +434,45 @@ fn run_udp_receiver_with_socket(
     telemetry: Option<&ReceiverTelemetry>,
     shutdown: Option<&Arc<AtomicBool>>,
 ) -> Result<(), UdpReceiverError> {
-    std_socket
-        .set_nonblocking(false)
-        .map_err(|source| UdpReceiverError::SetBlockingMode { source })?;
     tune_udp_socket(std_socket);
     maybe_pin_receiver_thread(std_socket);
 
     let batch_max_wait = Duration::from_millis(read_udp_batch_max_wait_ms());
     let idle_wait = Duration::from_millis(read_udp_idle_wait_ms()).max(batch_max_wait);
-    std_socket
-        .set_read_timeout(Some(idle_wait))
-        .map_err(|source| UdpReceiverError::SetReadTimeout { source })?;
-    let mut current_wait = idle_wait;
     let track_rxq_ovfl = enable_rxq_ovfl_tracking(std_socket);
 
     let batch_size = read_udp_batch_size();
     #[cfg(target_os = "linux")]
     let mut batch_scratch = (!track_rxq_ovfl).then(|| io::UdpBatchScratch::new(batch_size));
+    #[cfg(target_os = "linux")]
+    let mut poll_fd =
+        (!track_rxq_ovfl).then(|| [PollFd::new(std_socket.as_fd(), PollFlags::POLLIN)]);
+    #[cfg(target_os = "linux")]
+    if batch_scratch.is_some() {
+        std_socket
+            .set_nonblocking(true)
+            .map_err(|source| UdpReceiverError::SetBlockingMode { source })?;
+    } else {
+        std_socket
+            .set_nonblocking(false)
+            .map_err(|source| UdpReceiverError::SetBlockingMode { source })?;
+        std_socket
+            .set_read_timeout(Some(idle_wait))
+            .map_err(|source| UdpReceiverError::SetReadTimeout { source })?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std_socket
+            .set_nonblocking(false)
+            .map_err(|source| UdpReceiverError::SetBlockingMode { source })?;
+        std_socket
+            .set_read_timeout(Some(idle_wait))
+            .map_err(|source| UdpReceiverError::SetReadTimeout { source })?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let mut current_wait = idle_wait;
+    #[cfg(target_os = "linux")]
+    let mut current_wait = batch_scratch.as_ref().map_or(idle_wait, |_| batch_max_wait);
     let recycler = RawPacketBatchRecycler::new(batch_size);
     let mut buffer = vec![0_u8; UDP_PACKET_BUFFER_BYTES];
     let mut batch = recycler.allocate();
@@ -460,8 +484,15 @@ fn run_udp_receiver_with_socket(
             return Ok(());
         }
         #[cfg(target_os = "linux")]
-        if let Some(scratch) = batch_scratch.as_mut() {
-            match recv_udp_batch(std_socket, scratch, &mut batch) {
+        if let (Some(scratch), Some(poll_fd)) = (batch_scratch.as_mut(), poll_fd.as_mut()) {
+            match recv_udp_batch_coalesced(
+                std_socket,
+                scratch,
+                &mut batch,
+                idle_wait,
+                batch_max_wait,
+                poll_fd,
+            ) {
                 Ok(received) => {
                     if received == 0 {
                         continue;
@@ -561,6 +592,6 @@ fn should_shutdown(shutdown: Option<&Arc<AtomicBool>>) -> bool {
 #[path = "io.rs"]
 mod io;
 use io::{
-    current_unix_ms, flush_batch, maybe_pin_receiver_thread, recv_udp_batch, recv_udp_packet,
-    tune_udp_socket,
+    current_unix_ms, flush_batch, maybe_pin_receiver_thread, recv_udp_batch_coalesced,
+    recv_udp_packet, tune_udp_socket,
 };
