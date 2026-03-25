@@ -189,9 +189,15 @@ async fn main() -> Result<(), sof::runtime::RuntimeError> {
     // Publish batches from your bypass receiver thread:
     // let _ok = tx.send_batch(batch, false);
     // Spawn your kernel-bypass receiver and forward batches into `tx`.
-    sof::runtime::run_async_with_kernel_bypass_ingress(rx).await
+    sof::runtime::ObserverRuntime::new()
+        .with_kernel_bypass_ingress(rx)
+        .run_until_termination_signal()
+        .await
 }
 ```
+
+The packaged noop inline observer example now supports AF_XDP external ingress directly when built
+with `--features "kernel-bypass gossip-bootstrap"` and launched with `SOF_AF_XDP_IFACE=<iface>`.
 
 Run the kernel-bypass ingress metrics example for 180 seconds:
 

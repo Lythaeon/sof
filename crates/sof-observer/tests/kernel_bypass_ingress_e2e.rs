@@ -14,7 +14,7 @@ use std::{
 use async_trait::async_trait;
 use sof::{
     framework::{ObserverPlugin, PluginConfig, PluginHost, RawPacketEvent, ShredEvent},
-    ingest::{RawPacket, RawPacketBatch, RawPacketIngress},
+    ingest::{RawPacketBatch, RawPacketIngress},
     protocol::shred_wire::{SIZE_OF_DATA_SHRED_PAYLOAD, VARIANT_MERKLE_DATA},
     runtime,
     shred::wire::SIZE_OF_DATA_SHRED_HEADERS,
@@ -107,7 +107,7 @@ impl ObserverPlugin for RawIngressCounterPlugin {
     }
 }
 
-fn build_raw_packet(sequence: u64, source_port: u16) -> RawPacket {
+fn build_raw_packet_bytes(sequence: u64) -> Vec<u8> {
     let slot = (sequence / 128).saturating_add(1);
     let index = u32::try_from(sequence % 128).unwrap_or(0);
     let fec_set_index = index;
@@ -132,11 +132,7 @@ fn build_raw_packet(sequence: u64, source_port: u16) -> RawPacket {
     let payload_end = SIZE_OF_DATA_SHRED_HEADERS.saturating_add(SHRED_PAYLOAD_BYTES);
     fill_bytes(&mut bytes, 88, payload_end, 0xAB);
 
-    RawPacket {
-        source: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), source_port),
-        ingress: RawPacketIngress::Udp,
-        bytes: bytes.into(),
-    }
+    bytes
 }
 
 fn write_bytes(buffer: &mut [u8], offset: usize, value: &[u8]) {
@@ -200,14 +196,18 @@ async fn kernel_bypass_ingress_e2e_delivers_packets_to_plugins() {
     let mut sequence = 0_u64;
     let batch_count = TOTAL_PACKETS / BATCH_SIZE;
     for _ in 0..batch_count {
-        let mut batch = Vec::with_capacity(BATCH_SIZE);
+        let mut batch = RawPacketBatch::with_capacity(BATCH_SIZE);
         for _ in 0..BATCH_SIZE {
             let source_port = match sequence % 3 {
                 0 => 8_899,
                 1 => 8_900,
                 _ => 9_001,
             };
-            batch.push(build_raw_packet(sequence, source_port));
+            let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), source_port);
+            let bytes = build_raw_packet_bytes(sequence);
+            batch
+                .push_packet_bytes(source, RawPacketIngress::Udp, &bytes)
+                .expect("synthetic packet fits in raw packet batch buffer");
             sequence = sequence.saturating_add(1);
         }
         let send_result = tx.send(batch).await;

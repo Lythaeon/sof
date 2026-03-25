@@ -29,7 +29,7 @@ use sof::{
     framework::{
         ObserverPlugin, PluginConfig, PluginDispatchMode, PluginHost, RawPacketEvent, ShredEvent,
     },
-    ingest::{RawPacket, RawPacketIngress},
+    ingest::{RawPacketBatch, RawPacketIngress},
     runtime::KernelBypassIngressSender,
 };
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
@@ -400,7 +400,7 @@ pub(crate) fn build_af_xdp_socket(config: &AfXdpConfig) -> Result<AfXdpSocketSta
 pub(crate) fn parse_udp_payload_to_raw_packet(
     frame: &[u8],
     filter: PortFilter,
-) -> Result<Option<RawPacket>, FrameParseOutcome> {
+) -> Result<Option<(SocketAddr, &[u8])>, FrameParseOutcome> {
     const ETH_LEN: usize = 14;
     const ETH_TYPE_OFFSET: usize = 12;
     const ETH_P_IPV4: u16 = 0x0800;
@@ -451,15 +451,12 @@ pub(crate) fn parse_udp_payload_to_raw_packet(
         IpAddr::V4(read_ipv4_addr(frame, checked_add(ip_offset, 12)?)?),
         src_port,
     );
-    Ok(Some(RawPacket {
+    Ok(Some((
         source,
-        ingress: RawPacketIngress::Udp,
-        bytes: frame
+        frame
             .get(payload_start..payload_end)
-            .ok_or(FrameParseOutcome::ParseError)?
-            .to_vec()
-            .into(),
-    }))
+            .ok_or(FrameParseOutcome::ParseError)?,
+    )))
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
@@ -510,7 +507,7 @@ pub(crate) fn run_af_xdp_producer(
 ) -> Result<AfXdpProducerStats, ExampleError> {
     let mut state = build_af_xdp_socket(config)?;
     let mut slab = HeapSlab::with_capacity(usize::try_from(config.ring_depth).unwrap_or(0));
-    let mut batch = Vec::with_capacity(config.batch_size);
+    let mut batch = RawPacketBatch::with_capacity(config.batch_size);
     let started_at = Instant::now();
     let mut stats = AfXdpProducerStats::default();
 
@@ -537,17 +534,18 @@ pub(crate) fn run_af_xdp_producer(
             };
             stats.frames_seen = stats.frames_seen.saturating_add(1);
             match parse_udp_payload_to_raw_packet(&frame, config.filter) {
-                Ok(Some(raw_packet)) => {
+                Ok(Some((source, payload))) => {
                     stats.udp_frames_forwarded = stats.udp_frames_forwarded.saturating_add(1);
                     stats.bytes_forwarded = stats
                         .bytes_forwarded
-                        .saturating_add(u64::try_from(raw_packet.bytes.len()).unwrap_or(u64::MAX));
-                    batch.push(raw_packet);
+                        .saturating_add(u64::try_from(payload.len()).unwrap_or(u64::MAX));
+                    batch.push_packet_bytes(source, RawPacketIngress::Udp, payload)?;
                     if batch.len() >= config.batch_size {
                         if !tx.send_batch(std::mem::take(&mut batch), false) {
                             state.umem.free_packet(frame);
                             return Ok(stats);
                         }
+                        batch = RawPacketBatch::with_capacity(config.batch_size);
                         stats.batches_sent = stats.batches_sent.saturating_add(1);
                     }
                 }

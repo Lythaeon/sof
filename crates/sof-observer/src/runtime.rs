@@ -1,4 +1,4 @@
-use std::{future::Future, net::SocketAddr, path::PathBuf};
+use std::{future::Future, net::SocketAddr, path::PathBuf, pin::Pin};
 
 use crate::framework::{
     DerivedStateHost, DerivedStateReplayBackend, DerivedStateReplayDurability, PluginHost,
@@ -10,6 +10,8 @@ use sof_gossip_tuning::{
     TvuReceiveSocketCount,
 };
 use thiserror::Error;
+
+type ShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 /// Public runtime error surface for packaged SOF entrypoints.
 #[derive(Debug, Error)]
@@ -1108,7 +1110,7 @@ pub fn run_with_hosts_and_setup(
 ///     .await
 /// }
 /// ```
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct ObserverRuntime {
     /// Plugin host invoked by the packaged observer runtime.
     plugin_host: PluginHost,
@@ -1118,6 +1120,9 @@ pub struct ObserverRuntime {
     derived_state_host: DerivedStateHost,
     /// Programmatic setup overrides applied before startup.
     setup: RuntimeSetup,
+    /// Optional externally supplied ingress receiver used by kernel-bypass mode.
+    #[cfg(feature = "kernel-bypass")]
+    packet_ingest_rx: Option<KernelBypassIngressReceiver>,
 }
 
 impl ObserverRuntime {
@@ -1173,18 +1178,49 @@ impl ObserverRuntime {
         self
     }
 
+    #[cfg(feature = "kernel-bypass")]
+    /// Replaces the built-in UDP ingress with an externally supplied kernel-bypass ingress receiver.
+    #[must_use]
+    pub fn with_kernel_bypass_ingress(
+        mut self,
+        packet_ingest_rx: impl Into<KernelBypassIngressReceiver>,
+    ) -> Self {
+        self.packet_ingest_rx = Some(packet_ingest_rx.into());
+        self
+    }
+
     /// Runs the configured runtime until it exits on its own.
     ///
     /// # Errors
     /// Returns any runtime initialization or shutdown error from the underlying observer runtime.
     pub async fn run(self) -> Result<(), RuntimeError> {
+        self.run_with_optional_shutdown(None).await
+    }
+
+    async fn run_with_optional_shutdown(
+        self,
+        shutdown_signal: Option<ShutdownSignal>,
+    ) -> Result<(), RuntimeError> {
         crate::runtime_env::clear_runtime_env_overrides();
         self.setup.apply();
+        #[cfg(feature = "kernel-bypass")]
+        if let Some(packet_ingest_rx) = self.packet_ingest_rx {
+            return Ok(
+                crate::app::runtime::run_async_with_hosts_and_kernel_bypass_ingress(
+                    self.plugin_host,
+                    self.extension_host,
+                    self.derived_state_host,
+                    shutdown_signal,
+                    packet_ingest_rx,
+                )
+                .await?,
+            );
+        }
         Ok(crate::app::runtime::run_async_with_hosts(
             self.plugin_host,
             self.extension_host,
             self.derived_state_host,
-            None,
+            shutdown_signal,
         )
         .await?)
     }
@@ -1212,26 +1248,17 @@ impl ObserverRuntime {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        crate::runtime_env::clear_runtime_env_overrides();
-        self.setup.apply();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             shutdown_signal.await;
             if shutdown_tx.send(()).is_err() {}
         });
-        Ok(crate::app::runtime::run_async_with_hosts(
-            self.plugin_host,
-            self.extension_host,
-            self.derived_state_host,
-            Some(Box::pin(async move {
-                if shutdown_rx.await.is_err() {
-                    tracing::warn!(
-                        "runtime shutdown trigger task dropped before notifying runloop"
-                    );
-                }
-            })),
-        )
-        .await?)
+        self.run_with_optional_shutdown(Some(Box::pin(async move {
+            if shutdown_rx.await.is_err() {
+                tracing::warn!("runtime shutdown trigger task dropped before notifying runloop");
+            }
+        })))
+        .await
     }
 
     /// Runs the configured runtime until the process receives a termination signal.

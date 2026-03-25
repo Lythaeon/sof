@@ -184,6 +184,25 @@ impl RawPacketBatch {
         Ok(())
     }
 
+    pub fn push_packet_bytes(
+        &mut self,
+        source: SocketAddr,
+        ingress: RawPacketIngress,
+        bytes: &[u8],
+    ) -> std::io::Result<()> {
+        self.push_packet(source, ingress, bytes)
+            .map_err(|error| match error {
+                UdpReceiverError::InvalidPacketLength { len, capacity } => std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("udp packet length {len} exceeds buffer capacity {capacity}"),
+                ),
+                UdpReceiverError::Receive { source } => source,
+                UdpReceiverError::BindSocket { source, .. }
+                | UdpReceiverError::SetBlockingMode { source }
+                | UdpReceiverError::SetReadTimeout { source } => source,
+            })
+    }
+
     pub(super) fn push_packet(
         &mut self,
         source: SocketAddr,
