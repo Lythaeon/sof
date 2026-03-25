@@ -15,6 +15,7 @@ pub(crate) async fn maybe_switch_gossip_runtime(
     runtime: &mut ReceiverRuntime,
     packet_ingest_tx: &ingest::RawPacketBatchSender,
     entrypoints: &[String],
+    entrypoint_bias: Option<&GossipEntrypointBias>,
 ) -> Result<Option<String>, GossipRuntimeSwitchError> {
     let candidate_pool = collect_runtime_switch_entrypoints(
         runtime,
@@ -24,7 +25,7 @@ pub(crate) async fn maybe_switch_gossip_runtime(
     if candidate_pool.len() <= 1 {
         return Ok(None);
     }
-    let prioritized = prioritize_gossip_entrypoints(&candidate_pool).await;
+    let prioritized = prioritize_gossip_entrypoints(&candidate_pool, entrypoint_bias).await;
     let previous_entrypoint = runtime.active_gossip_entrypoint.clone();
     let alternate_candidates: Vec<String> = prioritized
         .iter()

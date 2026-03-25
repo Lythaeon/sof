@@ -7,6 +7,8 @@ use super::packet_workers::{
     PacketWorkerPoolConfig, WorkerAcceptedShred, WorkerAcceptedShredKind,
 };
 use super::*;
+#[cfg(feature = "gossip-bootstrap")]
+use crate::app::runtime::bootstrap::gossip::GossipEntrypointBias;
 use crate::framework::host::TransactionDispatchScope;
 use crate::framework::{SerializedTransactionRange, TransactionEvent, events::TransactionEventRef};
 use crate::reassembly::dataset::CompletedDataSet;
@@ -17,7 +19,7 @@ use crossbeam_channel::Sender as CrossbeamSender;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 #[cfg(feature = "gossip-bootstrap")]
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::{
     future::Future,
     net::{IpAddr, Ipv4Addr},
@@ -54,6 +56,182 @@ const CONTROL_PLANE_EVENT_TICK_MS: u64 = 250;
 const CONTROL_PLANE_EVENT_SNAPSHOT_SECS: u64 = 30;
 const PACKET_WORKER_QUEUE_OVERFLOW_POLICY: &str = "drop_newest";
 const PACKET_WORKER_FEC_PRESSURE_DIVISOR: u64 = 8;
+#[cfg(feature = "gossip-bootstrap")]
+const GOSSIP_SOURCE_SCORE_DECAY_INTERVAL_SECS: u64 = 5;
+#[cfg(feature = "gossip-bootstrap")]
+const GOSSIP_SOURCE_SCORE_STALE_AFTER_SECS: u64 = 30;
+#[cfg(feature = "gossip-bootstrap")]
+const GOSSIP_SOURCE_SCORE_TOP_IPS: usize = 12;
+
+#[cfg(feature = "gossip-bootstrap")]
+#[derive(Clone, Copy, Debug, Default)]
+struct GossipSourceScore {
+    latest_slot: u64,
+    data_shreds: u64,
+    code_shreds: u64,
+    data_complete: u64,
+    last_in_slot: u64,
+    last_seen_at: Option<Instant>,
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+impl GossipSourceScore {
+    fn note_data_shred(
+        &mut self,
+        slot: u64,
+        data_complete: bool,
+        last_in_slot: bool,
+        now: Instant,
+    ) {
+        self.latest_slot = self.latest_slot.max(slot);
+        self.data_shreds = self.data_shreds.saturating_add(1);
+        if data_complete {
+            self.data_complete = self.data_complete.saturating_add(1);
+        }
+        if last_in_slot {
+            self.last_in_slot = self.last_in_slot.saturating_add(1);
+        }
+        self.last_seen_at = Some(now);
+    }
+
+    fn note_code_shred(&mut self, slot: u64, now: Instant) {
+        self.latest_slot = self.latest_slot.max(slot);
+        self.code_shreds = self.code_shreds.saturating_add(1);
+        self.last_seen_at = Some(now);
+    }
+
+    fn rank(self, now: Instant) -> (u64, u64, u64, u64) {
+        let freshness_ms = self
+            .last_seen_at
+            .map(|seen_at| {
+                let age_ms = duration_to_ms_u64(now.saturating_duration_since(seen_at));
+                duration_to_ms_u64(Duration::from_secs(GOSSIP_SOURCE_SCORE_STALE_AFTER_SECS))
+                    .saturating_sub(age_ms)
+            })
+            .unwrap_or(0);
+        let useful_score = self
+            .data_shreds
+            .saturating_mul(2)
+            .saturating_add(self.code_shreds)
+            .saturating_add(self.data_complete.saturating_mul(8))
+            .saturating_add(self.last_in_slot.saturating_mul(16));
+        (
+            self.latest_slot,
+            useful_score,
+            freshness_ms,
+            self.data_shreds.saturating_add(self.code_shreds),
+        )
+    }
+
+    fn decay(&mut self) {
+        self.data_shreds /= 2;
+        self.code_shreds /= 2;
+        self.data_complete /= 2;
+        self.last_in_slot /= 2;
+    }
+
+    fn is_stale(self, now: Instant) -> bool {
+        self.last_seen_at.is_none_or(|seen_at| {
+            now.saturating_duration_since(seen_at)
+                > Duration::from_secs(GOSSIP_SOURCE_SCORE_STALE_AFTER_SECS)
+        })
+    }
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+#[derive(Debug, Default)]
+struct GossipSourceTracker {
+    scores_by_ip: HashMap<IpAddr, GossipSourceScore>,
+    last_decay_at: Option<Instant>,
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+impl GossipSourceTracker {
+    fn note_data_shred(
+        &mut self,
+        source_addr: SocketAddr,
+        slot: u64,
+        data_complete: bool,
+        last_in_slot: bool,
+        now: Instant,
+    ) {
+        self.decay_if_needed(now);
+        self.scores_by_ip
+            .entry(source_addr.ip())
+            .or_default()
+            .note_data_shred(slot, data_complete, last_in_slot, now);
+    }
+
+    fn note_code_shred(&mut self, source_addr: SocketAddr, slot: u64, now: Instant) {
+        self.decay_if_needed(now);
+        self.scores_by_ip
+            .entry(source_addr.ip())
+            .or_default()
+            .note_code_shred(slot, now);
+    }
+
+    fn ranked_source_ips(&mut self, now: Instant, limit: usize) -> Vec<IpAddr> {
+        self.decay_if_needed(now);
+        let mut ranked: Vec<(IpAddr, GossipSourceScore)> = self
+            .scores_by_ip
+            .iter()
+            .filter_map(|(ip, score)| (!score.is_stale(now)).then_some((*ip, *score)))
+            .collect();
+        ranked.sort_unstable_by(|left, right| {
+            right
+                .1
+                .rank(now)
+                .cmp(&left.1.rank(now))
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        ranked
+            .into_iter()
+            .take(limit)
+            .map(|(ip, _)| ip)
+            .collect::<Vec<_>>()
+    }
+
+    fn top_sources_summary(&mut self, now: Instant, limit: usize) -> String {
+        let ranked_ips = self.ranked_source_ips(now, limit);
+        if ranked_ips.is_empty() {
+            return "-".to_owned();
+        }
+        ranked_ips
+            .into_iter()
+            .filter_map(|ip| {
+                self.scores_by_ip
+                    .get(&ip)
+                    .copied()
+                    .map(|score| format!("{}@slot{}:{}", ip, score.latest_slot, score.rank(now).1))
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn entrypoint_bias(&mut self, now: Instant, limit: usize) -> Option<GossipEntrypointBias> {
+        let ranked_ips = self.ranked_source_ips(now, limit);
+        (!ranked_ips.is_empty()).then(|| GossipEntrypointBias::new(ranked_ips))
+    }
+
+    fn decay_if_needed(&mut self, now: Instant) {
+        let should_decay = self.last_decay_at.is_none_or(|last_decay_at| {
+            now.saturating_duration_since(last_decay_at)
+                >= Duration::from_secs(GOSSIP_SOURCE_SCORE_DECAY_INTERVAL_SECS)
+        });
+        if !should_decay {
+            return;
+        }
+        self.last_decay_at = Some(now);
+        self.scores_by_ip.retain(|_, score| {
+            score.decay();
+            !score.is_stale(now)
+                && (score.data_shreds > 0
+                    || score.code_shreds > 0
+                    || score.data_complete > 0
+                    || score.last_in_slot > 0)
+        });
+    }
+}
 
 #[derive(Debug)]
 struct RelayCacheInsertRequest {
@@ -1012,6 +1190,8 @@ async fn run_async_with_hosts_inner(
         Duration::from_millis(read_repair_source_hint_flush_ms());
     #[cfg(feature = "gossip-bootstrap")]
     let mut repair_source_hint_last_flush = Instant::now();
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut gossip_source_tracker = GossipSourceTracker::default();
     let mut latest_shred_slot: Option<u64> = None;
     let mut fork_status_transitions_total: u64 = 0;
     let mut fork_reorg_count: u64 = 0;
@@ -1241,6 +1421,8 @@ async fn run_async_with_hosts_inner(
                 repair_source_hint_buffer_drops: &mut repair_source_hint_buffer_drops,
                 #[cfg(feature = "gossip-bootstrap")]
                 repair_source_hint_last_flush: &mut repair_source_hint_last_flush,
+                #[cfg(feature = "gossip-bootstrap")]
+                gossip_source_tracker: &mut gossip_source_tracker,
             }
             .process(
                 worker_result,
@@ -1993,10 +2175,13 @@ async fn run_async_with_hosts_inner(
                                 .await;
                                 repair_driver_enabled = false;
                             }
+                            let gossip_entrypoint_bias =
+                                gossip_source_tracker.entrypoint_bias(now, GOSSIP_SOURCE_SCORE_TOP_IPS);
                             match maybe_switch_gossip_runtime(
                                 &mut runtime,
                                 &packet_ingest_tx,
                                 &gossip_entrypoints,
+                                gossip_entrypoint_bias.as_ref(),
                             )
                             .await
                             {
@@ -2185,6 +2370,11 @@ async fn run_async_with_hosts_inner(
                 #[cfg(feature = "gossip-bootstrap")]
                 let gossip_active_entrypoint =
                     runtime.active_gossip_entrypoint.as_deref().unwrap_or("");
+                #[cfg(feature = "gossip-bootstrap")]
+                let gossip_ranked_source_ips =
+                    gossip_source_tracker.top_sources_summary(Instant::now(), 6);
+                #[cfg(not(feature = "gossip-bootstrap"))]
+                let gossip_ranked_source_ips = "-".to_owned();
                 #[cfg(not(feature = "gossip-bootstrap"))]
                 let gossip_active_entrypoint = "";
                 #[cfg(feature = "gossip-bootstrap")]
@@ -2706,6 +2896,7 @@ async fn run_async_with_hosts_inner(
                         repair_source_hint_drops = repair_source_hint_drops,
                         repair_source_hint_buffer_drops = repair_source_hint_buffer_drops,
                         gossip_active_entrypoint = gossip_active_entrypoint,
+                        gossip_ranked_source_ips = gossip_ranked_source_ips,
                         gossip_runtime_switch_enabled = gossip_switch_enabled,
                         gossip_runtime_switch_stall_ms = gossip_switch_stall_ms,
                         gossip_runtime_switch_dataset_stall_ms = gossip_switch_dataset_stall_ms,
@@ -2993,6 +3184,7 @@ async fn run_async_with_hosts_inner(
                     repair_source_hint_drops = repair_source_hint_drops,
                     repair_source_hint_buffer_drops = repair_source_hint_buffer_drops,
                     gossip_active_entrypoint = gossip_active_entrypoint,
+                    gossip_ranked_source_ips = gossip_ranked_source_ips,
                     gossip_runtime_switch_enabled = gossip_switch_enabled,
                     gossip_runtime_switch_stall_ms = gossip_switch_stall_ms,
                     gossip_runtime_switch_dataset_stall_ms = gossip_switch_dataset_stall_ms,
@@ -3418,6 +3610,8 @@ struct PacketWorkerResultContext<'context> {
     repair_source_hint_buffer_drops: &'context mut u64,
     #[cfg(feature = "gossip-bootstrap")]
     repair_source_hint_last_flush: &'context mut Instant,
+    #[cfg(feature = "gossip-bootstrap")]
+    gossip_source_tracker: &'context mut GossipSourceTracker,
 }
 
 impl PacketWorkerResultContext<'_> {
@@ -3586,6 +3780,14 @@ impl PacketWorkerResultContext<'_> {
             );
             self.coverage_window.on_data_shred(input.slot);
             #[cfg(feature = "gossip-bootstrap")]
+            self.gossip_source_tracker.note_data_shred(
+                source_addr,
+                input.slot,
+                input.data_complete,
+                input.last_in_slot,
+                observed_at,
+            );
+            #[cfg(feature = "gossip-bootstrap")]
             self.record_repair_source_hint(source_addr, observed_at);
         }
 
@@ -3701,6 +3903,9 @@ impl PacketWorkerResultContext<'_> {
             self.source_port_8900_code,
             self.source_port_other_code,
         );
+        #[cfg(feature = "gossip-bootstrap")]
+        self.gossip_source_tracker
+            .note_code_shred(source_addr, slot, observed_at);
         self.note_slot(slot, observed_at);
         let fork_update = self.fork_tracker.observe_code_shred(slot);
         self.apply_fork_update(&fork_update);

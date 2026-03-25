@@ -74,7 +74,8 @@ pub(crate) async fn start_receiver(
                     .unwrap_or_else(|| "-".to_owned()),
                 "gossip runtime port plan initialized"
             );
-            let prioritized_entrypoints = prioritize_gossip_entrypoints(&gossip_entrypoints).await;
+            let prioritized_entrypoints =
+                prioritize_gossip_entrypoints(&gossip_entrypoints, None).await;
             if log_startup_steps {
                 tracing::info!(
                     step = "gossip_bootstrap_prioritized",
