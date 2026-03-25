@@ -51,7 +51,7 @@ def main() -> int:
     parser.add_argument("--pid", type=int, required=True, help="Target process PID")
     parser.add_argument(
         "--map-path",
-        default="/sys/fs/bpf/sof_xdp_maps/xsks_map",
+        default="/sys/fs/bpf/xsks_map",
         help="Pinned XSKMAP path",
     )
     parser.add_argument("--queue-id", type=int, default=0, help="XSKMAP queue key")
