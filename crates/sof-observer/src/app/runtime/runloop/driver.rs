@@ -471,6 +471,11 @@ async fn run_async_with_hosts_inner(
     let dataset_jobs_started_count = Arc::new(AtomicU64::new(0));
     let dataset_jobs_completed_count = Arc::new(AtomicU64::new(0));
     let dataset_queue_capacity = read_dataset_queue_capacity();
+    let dataset_decode_failures_unhealthy_per_tick =
+        read_runtime_dataset_decode_failures_unhealthy_per_tick();
+    let dataset_tail_skips_unhealthy_per_tick =
+        read_runtime_dataset_tail_skips_unhealthy_per_tick();
+    let dataset_unhealthy_sustain_ticks = read_runtime_dataset_unhealthy_sustain_ticks();
     let dataset_attempt_cache_capacity = read_dataset_attempt_cache_capacity();
     let dataset_attempt_success_ttl = Duration::from_millis(read_dataset_attempt_success_ttl_ms());
     let dataset_attempt_failure_ttl = Duration::from_millis(read_dataset_attempt_failure_ttl_ms());
@@ -918,6 +923,9 @@ async fn run_async_with_hosts_inner(
     let gossip_runtime_switch_enabled =
         repair_enabled && read_gossip_runtime_switch_enabled() && !read_gossip_bootstrap_only();
     #[cfg(feature = "gossip-bootstrap")]
+    let gossip_runtime_switch_proactive_enabled =
+        gossip_runtime_switch_enabled && read_gossip_runtime_switch_proactive_enabled();
+    #[cfg(feature = "gossip-bootstrap")]
     let gossip_runtime_switch_stall_ms = read_gossip_runtime_switch_stall_ms();
     #[cfg(feature = "gossip-bootstrap")]
     let gossip_runtime_switch_dataset_stall_ms = read_gossip_runtime_switch_dataset_stall_ms();
@@ -927,6 +935,18 @@ async fn run_async_with_hosts_inner(
     #[cfg(feature = "gossip-bootstrap")]
     let gossip_runtime_switch_warmup =
         Duration::from_millis(read_gossip_runtime_switch_warmup_ms());
+    #[cfg(feature = "gossip-bootstrap")]
+    let gossip_runtime_switch_proactive_eval =
+        Duration::from_millis(read_gossip_runtime_switch_proactive_eval_ms());
+    #[cfg(feature = "gossip-bootstrap")]
+    let gossip_runtime_switch_proactive_active_rank_max =
+        read_gossip_runtime_switch_proactive_active_rank_max();
+    #[cfg(feature = "gossip-bootstrap")]
+    let gossip_runtime_switch_proactive_stable_evals =
+        read_gossip_runtime_switch_proactive_stable_evals();
+    #[cfg(feature = "gossip-bootstrap")]
+    let gossip_runtime_switch_proactive_min_runtime_age =
+        Duration::from_millis(read_gossip_runtime_switch_proactive_min_runtime_age_ms());
     #[cfg(feature = "gossip-bootstrap")]
     let gossip_runtime_switch_overlap =
         Duration::from_millis(read_gossip_runtime_switch_overlap_ms());
@@ -939,9 +959,15 @@ async fn run_async_with_hosts_inner(
     #[cfg(feature = "gossip-bootstrap")]
     let mut last_gossip_runtime_switch_attempt = Instant::now();
     #[cfg(feature = "gossip-bootstrap")]
+    let mut last_gossip_runtime_proactive_sample = Instant::now();
+    #[cfg(feature = "gossip-bootstrap")]
     let mut gossip_runtime_started_at = Instant::now();
     #[cfg(feature = "gossip-bootstrap")]
     let mut gossip_runtime_stall_started_at: Option<Instant> = None;
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut gossip_runtime_proactive_top_sources: Vec<IpAddr> = Vec::new();
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut gossip_runtime_proactive_top_sources_stable_evals: usize = 0;
 
     let dataset_max_tracked_slots = read_dataset_max_tracked_slots();
     let dataset_retained_slot_lag = read_dataset_retained_slot_lag();
@@ -1201,6 +1227,10 @@ async fn run_async_with_hosts_inner(
     let mut coverage_window = SlotCoverageWindow::new(read_coverage_window_slots());
     let mut telemetry_tick = interval(Duration::from_secs(TELEMETRY_INTERVAL_SECS));
     let mut telemetry_tick_count: u64 = 0;
+    let mut last_dataset_decode_failures_total: u64 = 0;
+    let mut last_dataset_tail_skips_total: u64 = 0;
+    let mut dataset_unhealthy_consecutive_ticks: u64 = 0;
+    let mut runtime_dataset_health_degraded = false;
     let mut repair_tick = interval(Duration::from_millis(read_repair_tick_ms()));
     let mut control_plane_tick = interval(Duration::from_millis(CONTROL_PLANE_EVENT_TICK_MS));
     let derived_state_checkpoint_enabled =
@@ -2157,8 +2187,73 @@ async fn run_async_with_hosts_inner(
                         let runtime_ready_for_switch = runtime.gossip_runtime.is_none()
                             || now.saturating_duration_since(gossip_runtime_started_at)
                                 >= runtime_switch_warmup;
-                        if switch_stalled
-                            && stall_ready_for_switch
+                        let gossip_entrypoint_bias =
+                            gossip_source_tracker.entrypoint_bias(now, GOSSIP_SOURCE_SCORE_TOP_IPS);
+                        let proactive_signal = gossip_entrypoint_bias.as_ref().map(|bias| {
+                            bias.ranked_source_ips()
+                                .iter()
+                                .take(3)
+                                .copied()
+                                .collect::<Vec<_>>()
+                        });
+                        let proactive_sample_ready = last_gossip_runtime_proactive_sample
+                            .elapsed()
+                            >= gossip_runtime_switch_proactive_eval;
+                        if proactive_sample_ready {
+                            last_gossip_runtime_proactive_sample = now;
+                            if let Some(current_signal) = proactive_signal.as_ref() {
+                                if *current_signal == gossip_runtime_proactive_top_sources {
+                                    gossip_runtime_proactive_top_sources_stable_evals =
+                                        gossip_runtime_proactive_top_sources_stable_evals
+                                            .saturating_add(1);
+                                } else {
+                                    gossip_runtime_proactive_top_sources = current_signal.clone();
+                                    gossip_runtime_proactive_top_sources_stable_evals = 1;
+                                }
+                            } else {
+                                gossip_runtime_proactive_top_sources.clear();
+                                gossip_runtime_proactive_top_sources_stable_evals = 0;
+                            }
+                        }
+                        let proactive_switch_ready = gossip_runtime_switch_proactive_enabled
+                            && !switch_stalled
+                            && runtime_ready_for_switch
+                            && now.saturating_duration_since(gossip_runtime_started_at)
+                                >= gossip_runtime_switch_proactive_min_runtime_age
+                            && last_gossip_runtime_switch_attempt.elapsed()
+                                >= gossip_runtime_switch_cooldown
+                            && proactive_sample_ready
+                            && gossip_runtime_proactive_top_sources_stable_evals
+                                >= gossip_runtime_switch_proactive_stable_evals
+                            && gossip_entrypoint_bias.is_some();
+                        if proactive_switch_ready {
+                            if let Some(bias) = gossip_entrypoint_bias.as_ref() {
+                                tracing::info!(
+                                    active_entrypoint = runtime
+                                        .active_gossip_entrypoint
+                                        .as_deref()
+                                        .unwrap_or_default(),
+                                    source_signal_stable_evals = gossip_runtime_proactive_top_sources_stable_evals,
+                                    source_signal_required_evals = gossip_runtime_switch_proactive_stable_evals,
+                                    min_runtime_age_ms = duration_to_ms_u64(
+                                        gossip_runtime_switch_proactive_min_runtime_age
+                                    ),
+                                    proactive_rank_max = gossip_runtime_switch_proactive_active_rank_max,
+                                    evaluation_interval_ms = duration_to_ms_u64(
+                                        gossip_runtime_switch_proactive_eval
+                                    ),
+                                    ranked_source_ips = %bias
+                                        .ranked_source_ips()
+                                        .iter()
+                                        .take(6)
+                                        .map(ToString::to_string)
+                                        .collect::<Vec<_>>()
+                                        .join(","),
+                                    "triggering proactive gossip runtime switch evaluation"
+                                );
+                            }
+                        }
+                        if (switch_stalled && stall_ready_for_switch || proactive_switch_ready)
                             && runtime_ready_for_switch
                             && last_gossip_runtime_switch_attempt.elapsed() >= gossip_runtime_switch_cooldown
                         {
@@ -2175,8 +2270,6 @@ async fn run_async_with_hosts_inner(
                                 .await;
                                 repair_driver_enabled = false;
                             }
-                            let gossip_entrypoint_bias =
-                                gossip_source_tracker.entrypoint_bias(now, GOSSIP_SOURCE_SCORE_TOP_IPS);
                             match maybe_switch_gossip_runtime(
                                 &mut runtime,
                                 &packet_ingest_tx,
@@ -2190,6 +2283,8 @@ async fn run_async_with_hosts_inner(
                                         gossip_runtime_switch_success.saturating_add(1);
                                     gossip_runtime_started_at = Instant::now();
                                     gossip_runtime_stall_started_at = None;
+                                    gossip_runtime_proactive_top_sources.clear();
+                                    gossip_runtime_proactive_top_sources_stable_evals = 0;
                                     latest_shred_updated_at = gossip_runtime_started_at;
                                     last_dataset_reconstructed_at = gossip_runtime_started_at;
                                     last_substantial_dataset_reconstructed_at =
@@ -2554,6 +2649,58 @@ async fn run_async_with_hosts_inner(
                 let derived_state_consumer_telemetry = derived_state_host.consumer_telemetry();
                 let derived_state_replay_telemetry =
                     derived_state_host.replay_telemetry().unwrap_or_default();
+                let dataset_decode_failures_total =
+                    dataset_decode_fail_count.load(Ordering::Relaxed);
+                let dataset_tail_skips_total = dataset_tail_skip_count.load(Ordering::Relaxed);
+                let dataset_duplicate_drops_total =
+                    dataset_duplicate_drop_count.load(Ordering::Relaxed);
+                let dataset_decode_failures_delta = dataset_decode_failures_total
+                    .saturating_sub(last_dataset_decode_failures_total);
+                let dataset_tail_skips_delta =
+                    dataset_tail_skips_total.saturating_sub(last_dataset_tail_skips_total);
+                last_dataset_decode_failures_total = dataset_decode_failures_total;
+                last_dataset_tail_skips_total = dataset_tail_skips_total;
+                let dataset_unhealthy_this_tick =
+                    (dataset_decode_failures_unhealthy_per_tick > 0
+                        && dataset_decode_failures_delta
+                            >= dataset_decode_failures_unhealthy_per_tick)
+                        || (dataset_tail_skips_unhealthy_per_tick > 0
+                            && dataset_tail_skips_delta
+                                >= dataset_tail_skips_unhealthy_per_tick);
+                if dataset_unhealthy_this_tick {
+                    dataset_unhealthy_consecutive_ticks =
+                        dataset_unhealthy_consecutive_ticks.saturating_add(1);
+                } else {
+                    dataset_unhealthy_consecutive_ticks = 0;
+                }
+                let dataset_health_degraded =
+                    dataset_unhealthy_consecutive_ticks >= dataset_unhealthy_sustain_ticks;
+                if dataset_health_degraded != runtime_dataset_health_degraded {
+                    runtime_dataset_health_degraded = dataset_health_degraded;
+                    if let Some(observability_handle) = observability_handle.as_ref() {
+                        if runtime_dataset_health_degraded {
+                            observability_handle.mark_not_ready();
+                        } else {
+                            observability_handle.mark_ready();
+                        }
+                    }
+                    if runtime_dataset_health_degraded {
+                        tracing::warn!(
+                            dataset_decode_failures_delta,
+                            dataset_tail_skips_delta,
+                            dataset_decode_failures_unhealthy_per_tick,
+                            dataset_tail_skips_unhealthy_per_tick,
+                            dataset_unhealthy_sustain_ticks,
+                            "runtime readiness degraded by persistent dataset reconstruction failures"
+                        );
+                    } else {
+                        tracing::info!(
+                            dataset_decode_failures_delta,
+                            dataset_tail_skips_delta,
+                            "runtime readiness restored after dataset reconstruction pressure subsided"
+                        );
+                    }
+                }
                 let (
                     relay_cache_inserts_total,
                     relay_cache_replacements_total,
@@ -2656,6 +2803,7 @@ async fn run_async_with_hosts_inner(
                     || runtime_stage_metrics.packet_worker_dropped_packets_total > 0
                     || tx_event_drop_count.load(Ordering::Relaxed) > 0
                     || extension_dispatch.dropped_events > 0
+                    || runtime_dataset_health_degraded
                     || derived_state_unhealthy_consumers > 0
                     || derived_state_pending_recovery > 0
                     || derived_state_rebuild_required > 0
@@ -2789,9 +2937,9 @@ async fn run_async_with_hosts_inner(
                             ?derived_state_pending_recovery_names,
                         derived_state_rebuild_consumers = ?derived_state_rebuild_names,
                         derived_state_consumers = ?derived_state_consumer_telemetry,
-                        dataset_decode_failures = dataset_decode_fail_count.load(Ordering::Relaxed),
-                        dataset_tail_skips = dataset_tail_skip_count.load(Ordering::Relaxed),
-                        dataset_duplicate_drops = dataset_duplicate_drop_count.load(Ordering::Relaxed),
+                        dataset_decode_failures = dataset_decode_failures_total,
+                        dataset_tail_skips = dataset_tail_skips_total,
+                        dataset_duplicate_drops = dataset_duplicate_drops_total,
                         dataset_queue_capacity_per_worker = dataset_queue_capacity,
                         dataset_queue_capacity_total = dataset_queue_capacity_total,
                         dataset_worker_count = dataset_worker_count,
@@ -3077,9 +3225,9 @@ async fn run_async_with_hosts_inner(
                         ?derived_state_pending_recovery_names,
                     derived_state_rebuild_consumers = ?derived_state_rebuild_names,
                     derived_state_consumers = ?derived_state_consumer_telemetry,
-                    dataset_decode_failures = dataset_decode_fail_count.load(Ordering::Relaxed),
-                    dataset_tail_skips = dataset_tail_skip_count.load(Ordering::Relaxed),
-                    dataset_duplicate_drops = dataset_duplicate_drop_count.load(Ordering::Relaxed),
+                    dataset_decode_failures = dataset_decode_failures_total,
+                    dataset_tail_skips = dataset_tail_skips_total,
+                    dataset_duplicate_drops = dataset_duplicate_drops_total,
                     dataset_queue_capacity_per_worker = dataset_queue_capacity,
                     dataset_queue_capacity_total = dataset_queue_capacity_total,
                     dataset_worker_count = dataset_worker_count,

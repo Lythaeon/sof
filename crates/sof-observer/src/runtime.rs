@@ -559,6 +559,33 @@ impl RuntimeSetup {
         self.with_env("SOF_VERIFY_RECOVERED_SHREDS", enabled.to_string())
     }
 
+    /// Sets `SOF_RUNTIME_DATASET_DECODE_FAILURES_UNHEALTHY_PER_TICK`.
+    #[must_use]
+    pub fn with_runtime_dataset_decode_failures_unhealthy_per_tick(self, failures: u64) -> Self {
+        self.with_env(
+            "SOF_RUNTIME_DATASET_DECODE_FAILURES_UNHEALTHY_PER_TICK",
+            failures.to_string(),
+        )
+    }
+
+    /// Sets `SOF_RUNTIME_DATASET_TAIL_SKIPS_UNHEALTHY_PER_TICK`.
+    #[must_use]
+    pub fn with_runtime_dataset_tail_skips_unhealthy_per_tick(self, tail_skips: u64) -> Self {
+        self.with_env(
+            "SOF_RUNTIME_DATASET_TAIL_SKIPS_UNHEALTHY_PER_TICK",
+            tail_skips.to_string(),
+        )
+    }
+
+    /// Sets `SOF_RUNTIME_DATASET_UNHEALTHY_SUSTAIN_TICKS`.
+    #[must_use]
+    pub fn with_runtime_dataset_unhealthy_sustain_ticks(self, ticks: u64) -> Self {
+        self.with_env(
+            "SOF_RUNTIME_DATASET_UNHEALTHY_SUSTAIN_TICKS",
+            ticks.to_string(),
+        )
+    }
+
     /// Sets `SOF_VERIFY_SLOT_WINDOW`.
     #[must_use]
     pub fn with_verify_slot_window(self, slot_window: u64) -> Self {
@@ -810,6 +837,75 @@ impl RuntimeSetup {
         self.with_env(
             "SOF_GOSSIP_RUNTIME_SWITCH_WARMUP_MS",
             switch_warmup_ms.to_string(),
+        )
+    }
+
+    /// Sets `SOF_GOSSIP_RUNTIME_SWITCH_PROACTIVE_ENABLED`.
+    #[must_use]
+    pub fn with_gossip_runtime_switch_proactive_enabled(self, enabled: bool) -> Self {
+        self.with_env(
+            "SOF_GOSSIP_RUNTIME_SWITCH_PROACTIVE_ENABLED",
+            enabled.to_string(),
+        )
+    }
+
+    /// Sets `SOF_GOSSIP_RUNTIME_SWITCH_PROACTIVE_EVAL_MS`.
+    #[must_use]
+    pub fn with_gossip_runtime_switch_proactive_eval_ms(self, eval_ms: u64) -> Self {
+        self.with_env(
+            "SOF_GOSSIP_RUNTIME_SWITCH_PROACTIVE_EVAL_MS",
+            eval_ms.to_string(),
+        )
+    }
+
+    /// Sets `SOF_GOSSIP_RUNTIME_SWITCH_PROACTIVE_ACTIVE_RANK_MAX`.
+    #[must_use]
+    pub fn with_gossip_runtime_switch_proactive_active_rank_max(
+        self,
+        active_rank_max: usize,
+    ) -> Self {
+        self.with_env(
+            "SOF_GOSSIP_RUNTIME_SWITCH_PROACTIVE_ACTIVE_RANK_MAX",
+            active_rank_max.to_string(),
+        )
+    }
+
+    /// Sets `SOF_GOSSIP_RUNTIME_SWITCH_PRIORITIZED_CANDIDATES_MAX`.
+    #[must_use]
+    pub fn with_gossip_runtime_switch_prioritized_candidates_max(
+        self,
+        candidates_max: usize,
+    ) -> Self {
+        self.with_env(
+            "SOF_GOSSIP_RUNTIME_SWITCH_PRIORITIZED_CANDIDATES_MAX",
+            candidates_max.to_string(),
+        )
+    }
+
+    /// Sets `SOF_GOSSIP_RUNTIME_SWITCH_STABILIZE_MIN_PEERS`.
+    #[must_use]
+    pub fn with_gossip_runtime_switch_stabilize_min_peers(self, min_peers: usize) -> Self {
+        self.with_env(
+            "SOF_GOSSIP_RUNTIME_SWITCH_STABILIZE_MIN_PEERS",
+            min_peers.to_string(),
+        )
+    }
+
+    /// Sets `SOF_GOSSIP_RUNTIME_SWITCH_PROACTIVE_STABLE_EVALS`.
+    #[must_use]
+    pub fn with_gossip_runtime_switch_proactive_stable_evals(self, stable_evals: usize) -> Self {
+        self.with_env(
+            "SOF_GOSSIP_RUNTIME_SWITCH_PROACTIVE_STABLE_EVALS",
+            stable_evals.to_string(),
+        )
+    }
+
+    /// Sets `SOF_GOSSIP_RUNTIME_SWITCH_PROACTIVE_MIN_RUNTIME_AGE_MS`.
+    #[must_use]
+    pub fn with_gossip_runtime_switch_proactive_min_runtime_age_ms(self, age_ms: u64) -> Self {
+        self.with_env(
+            "SOF_GOSSIP_RUNTIME_SWITCH_PROACTIVE_MIN_RUNTIME_AGE_MS",
+            age_ms.to_string(),
         )
     }
 
@@ -1788,6 +1884,28 @@ mod tests {
             String::from("SOF_UDP_RECEIVER_PIN_BY_PORT"),
             String::from("false")
         )));
+    }
+
+    #[test]
+    fn runtime_dataset_health_thresholds_serialize_into_env_overrides() {
+        let setup = RuntimeSetup::new()
+            .with_runtime_dataset_decode_failures_unhealthy_per_tick(7)
+            .with_runtime_dataset_tail_skips_unhealthy_per_tick(11)
+            .with_runtime_dataset_unhealthy_sustain_ticks(5);
+        let overrides = setup.env_overrides.into_iter().collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            overrides.get("SOF_RUNTIME_DATASET_DECODE_FAILURES_UNHEALTHY_PER_TICK"),
+            Some(&"7".to_owned())
+        );
+        assert_eq!(
+            overrides.get("SOF_RUNTIME_DATASET_TAIL_SKIPS_UNHEALTHY_PER_TICK"),
+            Some(&"11".to_owned())
+        );
+        assert_eq!(
+            overrides.get("SOF_RUNTIME_DATASET_UNHEALTHY_SUSTAIN_TICKS"),
+            Some(&"5".to_owned())
+        );
     }
 
     #[test]

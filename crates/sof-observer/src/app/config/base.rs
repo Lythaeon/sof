@@ -191,7 +191,7 @@ pub fn read_log_repair_peer_traffic_every() -> u64 {
 }
 
 pub fn read_verify_shreds() -> bool {
-    read_bool_env("SOF_VERIFY_SHREDS", false)
+    read_bool_env("SOF_VERIFY_SHREDS", true)
 }
 
 pub fn read_verify_strict_unknown() -> bool {
@@ -199,7 +199,26 @@ pub fn read_verify_strict_unknown() -> bool {
 }
 
 pub fn read_verify_recovered_shreds() -> bool {
-    read_bool_env("SOF_VERIFY_RECOVERED_SHREDS", false)
+    read_bool_env("SOF_VERIFY_RECOVERED_SHREDS", true)
+}
+
+pub fn read_runtime_dataset_decode_failures_unhealthy_per_tick() -> u64 {
+    read_env_var("SOF_RUNTIME_DATASET_DECODE_FAILURES_UNHEALTHY_PER_TICK")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(32)
+}
+
+pub fn read_runtime_dataset_tail_skips_unhealthy_per_tick() -> u64 {
+    read_env_var("SOF_RUNTIME_DATASET_TAIL_SKIPS_UNHEALTHY_PER_TICK")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(256)
+}
+
+pub fn read_runtime_dataset_unhealthy_sustain_ticks() -> u64 {
+    read_env_var("SOF_RUNTIME_DATASET_UNHEALTHY_SUSTAIN_TICKS")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(3)
 }
 
 pub fn read_verify_signature_cache_entries() -> usize {
