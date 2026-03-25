@@ -60,7 +60,7 @@ fn runtime_tuning_matches_supported_sof_surface() {
     let tuning = GossipTuningProfile::preset(HostProfilePreset::Vps).supported_runtime_tuning();
     assert_eq!(tuning.ingest_queue_mode, IngestQueueMode::Lockfree);
     assert_eq!(tuning.udp_batch_size, VPS_UDP_BATCH_SIZE);
-    assert!(tuning.udp_receiver_pin_by_port);
+    assert!(!tuning.udp_receiver_pin_by_port);
     assert_eq!(tuning.tvu_receive_sockets.get(), VPS_TVU_RECEIVE_SOCKETS);
     assert_eq!(tuning.gossip_consume_threads, VPS_GOSSIP_THREADS);
     assert_eq!(tuning.gossip_listen_threads, VPS_GOSSIP_THREADS);
@@ -149,7 +149,7 @@ fn application_service_projects_profile_through_port() {
 
     assert_eq!(port.mode, Some(IngestQueueMode::Lockfree));
     assert_eq!(port.batch_size, Some(VPS_UDP_BATCH_SIZE));
-    assert_eq!(port.pin_by_port, Some(true));
+    assert_eq!(port.pin_by_port, Some(false));
     assert_eq!(
         port.sockets.map(TvuReceiveSocketCount::get),
         Some(VPS_TVU_RECEIVE_SOCKETS)

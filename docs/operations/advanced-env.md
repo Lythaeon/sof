@@ -49,8 +49,8 @@ gossip queue/worker capacities used by SOF's bootstrap path. Downstream users do
 Current validated public-host preset (`HostProfilePreset::Vps`):
 
 - `SOF_UDP_BATCH_SIZE=96`
-- `SOF_TVU_SOCKETS=2`
-- `SOF_UDP_RECEIVER_PIN_BY_PORT=true`
+- `SOF_TVU_SOCKETS=4`
+- `SOF_UDP_RECEIVER_PIN_BY_PORT=false`
 - `SOF_GOSSIP_RECEIVER_CHANNEL_CAPACITY=131072`
 - `SOF_GOSSIP_SOCKET_CONSUME_CHANNEL_CAPACITY=65536`
 - `SOF_GOSSIP_RESPONSE_CHANNEL_CAPACITY=65536`
@@ -300,6 +300,16 @@ Programmatic equivalent for the currently supported subset:
 Busy-poll knobs are explicit and disabled by default. When enabled they apply to both SOF's direct
 UDP ingest sockets and the observer-facing UDP sockets in the bundled gossip bootstrap path.
 Treat them as host-class experiments, not universal defaults.
+
+Measured public-VPS note from the current 4-core sweep:
+
+- default gossip-bootstrap with `SOF_TVU_SOCKETS=4` gave the best tx-availability latency among the tested socket-count shapes
+- `SOF_TVU_SOCKETS=2` raised throughput on that host but regressed `first`, `last`, and `ready`
+- `SOF_TVU_SOCKETS=8` regressed both throughput and tx-availability latency
+- Linux busy-poll (`SOF_UDP_BUSY_POLL_US=50`, `SOF_UDP_BUSY_POLL_BUDGET=64`, `SOF_UDP_PREFER_BUSY_POLL=true`) also regressed the measured tx path there
+- raising host `net.core.rmem_*` and `net.core.netdev_*` limits improved throughput but still worsened tx-availability latency
+
+So treat socket count, busy-poll, and host receive-buffer sizing as measured tradeoffs, not monotonic improvements.
 - `RuntimeSetup::with_sof_gossip_runtime_tuning(...)`
 - `RuntimeSetup::with_gossip_tuning_profile(...)`
 

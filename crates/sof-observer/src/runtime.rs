@@ -1717,8 +1717,12 @@ mod tests {
         assert!(
             setup
                 .env_overrides
-                .contains(&(String::from("SOF_TVU_SOCKETS"), String::from("2")))
+                .contains(&(String::from("SOF_TVU_SOCKETS"), String::from("4")))
         );
+        assert!(setup.env_overrides.contains(&(
+            String::from("SOF_UDP_RECEIVER_PIN_BY_PORT"),
+            String::from("false")
+        )));
         assert!(setup.env_overrides.contains(&(
             String::from("SOF_GOSSIP_RECEIVER_CHANNEL_CAPACITY"),
             String::from("131072")
@@ -1755,7 +1759,7 @@ mod tests {
         )));
         assert!(setup.env_overrides.contains(&(
             String::from("SOF_UDP_RECEIVER_PIN_BY_PORT"),
-            String::from("true")
+            String::from("false")
         )));
     }
 

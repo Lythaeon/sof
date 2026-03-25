@@ -24,8 +24,8 @@ pub const DEFAULT_INGEST_QUEUE_CAPACITY: u32 = 262_144;
 pub const VPS_UDP_BATCH_SIZE: u16 = 96;
 /// Shred dedupe capacity validated on the public VPS profile.
 pub const VPS_SHRED_DEDUP_CAPACITY: usize = 524_288;
-/// Built-in dual-socket fanout for the VPS preset.
-pub const VPS_TVU_RECEIVE_SOCKETS: usize = 2;
+/// Built-in four-socket fanout for the current 4-core VPS preset.
+pub const VPS_TVU_RECEIVE_SOCKETS: usize = 4;
 /// Current upstream gossip channel capacity compiled into `solana-gossip`.
 pub const LEGACY_GOSSIP_CHANNEL_CAPACITY: u32 = 4_096;
 /// VPS gossip receiver queue target validated on constrained public hosts.

@@ -29,14 +29,14 @@ This crate keeps those values explicit, validated, and reusable.
 | Preset | Intended Host Profile |
 | --- | --- |
 | `Home` | small self-hosted machine, conservative fanout |
-| `Vps` | validated public host profile with deeper gossip queues and dual-socket fanout |
+| `Vps` | validated public host profile with deeper gossip queues and four TVU receive sockets |
 | `Dedicated` | dedicated ingest machine with more aggressive fanout |
 
 The `Vps` preset now mirrors the live public-host profile validated against mainnet traffic:
 
 - `SOF_UDP_BATCH_SIZE=96`
-- `SOF_TVU_SOCKETS=2`
-- `SOF_UDP_RECEIVER_PIN_BY_PORT=true`
+- `SOF_TVU_SOCKETS=4`
+- `SOF_UDP_RECEIVER_PIN_BY_PORT=false`
 - `SOF_GOSSIP_RECEIVER_CHANNEL_CAPACITY=131072`
 - `SOF_GOSSIP_SOCKET_CONSUME_CHANNEL_CAPACITY=65536`
 - `SOF_GOSSIP_RESPONSE_CHANNEL_CAPACITY=65536`

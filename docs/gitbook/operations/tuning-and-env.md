@@ -26,8 +26,8 @@ string overrides.
 The typed `Vps` preset now reflects the validated public-host profile:
 
 - `SOF_UDP_BATCH_SIZE=96`
-- `SOF_TVU_SOCKETS=2`
-- `SOF_UDP_RECEIVER_PIN_BY_PORT=true`
+- `SOF_TVU_SOCKETS=4`
+- `SOF_UDP_RECEIVER_PIN_BY_PORT=false`
 - `SOF_UDP_BUSY_POLL_US` / `SOF_UDP_BUSY_POLL_BUDGET` / `SOF_UDP_PREFER_BUSY_POLL` (Linux-only, off by default; use only when you want lower interrupt jitter and accept higher CPU burn)
 - `SOF_GOSSIP_RECEIVER_CHANNEL_CAPACITY=131072`
 - `SOF_GOSSIP_SOCKET_CONSUME_CHANNEL_CAPACITY=65536`
@@ -47,6 +47,15 @@ they are too host-specific to recommend as defaults:
 - `SOF_PACKET_WORKER_BATCH_MAX_PACKETS` changes how much accepted-shred work one
   packet-worker burst can hand back at once. Smaller values reduce burst
   head-of-line delay but add more queue churn.
+
+Measured public-VPS note from the current 4-core sweep:
+
+- default `SOF_TVU_SOCKETS=4` beat both `2` and `8` on tx-availability latency
+- `SOF_TVU_SOCKETS=2` improved throughput but made tx visibility slower
+- Linux busy-poll also made tx visibility slower on that host
+- larger host kernel receive buffers improved throughput but still hurt tx-availability latency
+
+So tune these only with before/after captures on the actual host you care about.
 
 ## Preferred Tuning Order
 
