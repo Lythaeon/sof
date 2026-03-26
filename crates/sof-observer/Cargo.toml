@@ -27,8 +27,6 @@ provider-grpc = [
     "dep:helius-laserstream",
     "dep:laserstream-core-proto",
 ]
-yellowstone-grpc = ["provider-grpc"]
-laserstream = ["provider-grpc"]
 provider-websocket = []
 
 [dependencies]
