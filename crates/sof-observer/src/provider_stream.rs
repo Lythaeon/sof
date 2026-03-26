@@ -77,7 +77,6 @@ use solana_sdk_ids::{compute_budget, vote};
 use solana_signature::Signature;
 #[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
 use solana_transaction::versioned::VersionedTransaction;
-use std::sync::Arc;
 
 /// Default queue capacity for processed provider-stream ingress.
 pub const DEFAULT_PROVIDER_STREAM_QUEUE_CAPACITY: usize = 8_192;
@@ -193,7 +192,7 @@ pub struct SerializedTransactionEvent {
     /// Transaction signature if present.
     pub signature: Option<Signature>,
     /// Serialized transaction bytes.
-    pub bytes: Arc<[u8]>,
+    pub bytes: Box<[u8]>,
 }
 
 /// Creates one bounded queue for processed provider-stream updates.

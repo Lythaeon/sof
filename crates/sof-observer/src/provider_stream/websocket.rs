@@ -489,7 +489,7 @@ fn parse_transaction_notification(
     let signature = notification
         .signature
         .and_then(|signature| Signature::from_str(&signature).ok());
-    let tx_payload: std::sync::Arc<[u8]> = std::mem::take(tx_bytes).into();
+    let tx_payload = std::mem::take(tx_bytes).into_boxed_slice();
     Ok(Some(ProviderStreamUpdate::SerializedTransaction(
         SerializedTransactionEvent {
             slot: notification.slot,

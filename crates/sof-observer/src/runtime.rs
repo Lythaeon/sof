@@ -2320,7 +2320,7 @@ mod tests {
                         confirmed_slot: event.confirmed_slot,
                         finalized_slot: event.finalized_slot,
                         signature: event.signature,
-                        bytes: bytes.into(),
+                        bytes: bytes.into_boxed_slice(),
                     },
                 )
             }
