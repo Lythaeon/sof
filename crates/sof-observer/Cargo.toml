@@ -26,6 +26,7 @@ provider-grpc = [
     "dep:yellowstone-grpc-proto",
     "dep:helius-laserstream",
     "dep:laserstream-core-proto",
+    "dep:laserstream-core-client",
 ]
 provider-websocket = []
 
@@ -74,6 +75,7 @@ crossbeam-channel = "0.5.15"
 crossbeam-skiplist = "0.1"
 async-trait = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+futures-channel = "0.3.32"
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 signal-hook = "0.3"
 smallvec = "1.15"
@@ -82,6 +84,7 @@ yellowstone-grpc-client = { version = "12.2.0", optional = true }
 yellowstone-grpc-proto = { version = "12.1.0", optional = true }
 helius-laserstream = { version = "0.1.9", optional = true }
 laserstream-core-proto = { version = "9.0.2", optional = true }
+laserstream-core-client = { version = "9.0.2", optional = true }
 
 [dev-dependencies]
 criterion = "0.5.1"

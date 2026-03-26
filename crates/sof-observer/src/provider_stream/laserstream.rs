@@ -13,16 +13,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures_util::StreamExt;
+use futures_channel::mpsc as futures_mpsc;
+use futures_util::{SinkExt, StreamExt};
 use helius_laserstream::{
     ChannelOptions, LaserstreamConfig as ClientConfig, LaserstreamError as ClientError, grpc,
     subscribe,
 };
-use laserstream_core_proto::prelude::{
-    CompiledInstruction as ProtoCompiledInstruction, Message as ProtoMessage,
-    MessageAddressTableLookup as ProtoMessageAddressTableLookup,
-    MessageHeader as ProtoMessageHeader, SubscribeUpdateTransactionInfo,
-    Transaction as LaserStreamTransaction,
+use laserstream_core_client::{ClientTlsConfig, Interceptor};
+use laserstream_core_proto::prelude::Transaction as LaserStreamTransaction;
+use laserstream_core_proto::tonic::{
+    Status, codec::CompressionEncoding, metadata::MetadataValue, transport::Endpoint,
 };
 use solana_hash::Hash;
 use solana_message::{
@@ -46,6 +46,8 @@ use crate::{
 };
 
 const INTERNAL_WATERMARK_SLOT_FILTER: &str = "__sof_watermark_slots";
+const LASERSTREAM_SDK_NAME: &str = "sof";
+const LASERSTREAM_SDK_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// LaserStream subscription commitment used for provider-stream transaction updates.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -359,22 +361,21 @@ pub enum LaserStreamError {
 /// let (tx, _rx) = create_provider_stream_queue(1024);
 /// let config =
 ///     LaserStreamConfig::new("https://laserstream-mainnet-fra.helius-rpc.com", "api-key");
-/// let handle = spawn_laserstream_transaction_source(
-///     &config,
-///     tx,
-/// );
+/// let handle = spawn_laserstream_transaction_source(config, tx).await?;
 /// handle.abort();
 /// # Ok(())
 /// # }
 /// ```
-#[must_use]
-pub fn spawn_laserstream_transaction_source(
-    config: &LaserStreamConfig,
+///
+/// # Errors
+///
+/// Returns any connection/bootstrap error before the forwarder task starts.
+pub async fn spawn_laserstream_transaction_source(
+    config: LaserStreamConfig,
     sender: ProviderStreamSender,
-) -> JoinHandle<Result<(), LaserStreamError>> {
-    let config = config.clone();
-    tokio::spawn(async move {
-        preflight_laserstream_connection(&config);
+) -> Result<JoinHandle<Result<(), LaserStreamError>>, LaserStreamError> {
+    preflight_laserstream_connection(&config).await?;
+    Ok(tokio::spawn(async move {
         let mut attempts = 0_u32;
         loop {
             let mut session_established = false;
@@ -412,7 +413,7 @@ pub fn spawn_laserstream_transaction_source(
             }
             tokio::time::sleep(config.reconnect_delay).await;
         }
-    })
+    }))
 }
 
 async fn run_laserstream_transaction_connection(
@@ -485,9 +486,133 @@ async fn run_laserstream_transaction_connection(
     }
 }
 
-fn preflight_laserstream_connection(config: &LaserStreamConfig) {
+async fn preflight_laserstream_connection(
+    config: &LaserStreamConfig,
+) -> Result<(), LaserStreamError> {
     let request = config.subscribe_request();
-    let _ = subscribe(config.client_config(), request);
+    let _subscription = connect_and_subscribe_once(config, request).await?;
+    Ok(())
+}
+
+#[derive(Clone)]
+struct SofLaserStreamInterceptor {
+    x_token: Option<laserstream_core_proto::tonic::metadata::AsciiMetadataValue>,
+}
+
+impl SofLaserStreamInterceptor {
+    fn new(api_key: &str) -> Result<Self, Status> {
+        let x_token =
+            if api_key.is_empty() {
+                None
+            } else {
+                Some(api_key.parse().map_err(|error| {
+                    Status::invalid_argument(format!("Invalid API key: {error}"))
+                })?)
+            };
+        Ok(Self { x_token })
+    }
+}
+
+impl Interceptor for SofLaserStreamInterceptor {
+    fn call(
+        &mut self,
+        mut request: laserstream_core_proto::tonic::Request<()>,
+    ) -> Result<laserstream_core_proto::tonic::Request<()>, Status> {
+        if let Some(ref x_token) = self.x_token {
+            request.metadata_mut().insert("x-token", x_token.clone());
+        }
+        request.metadata_mut().insert(
+            "x-sdk-name",
+            MetadataValue::from_static(LASERSTREAM_SDK_NAME),
+        );
+        let sdk_version = MetadataValue::try_from(LASERSTREAM_SDK_VERSION)
+            .map_err(|error| Status::internal(format!("invalid sdk version metadata: {error}")))?;
+        request.metadata_mut().insert("x-sdk-version", sdk_version);
+        Ok(request)
+    }
+}
+
+async fn connect_and_subscribe_once(
+    config: &LaserStreamConfig,
+    request: grpc::SubscribeRequest,
+) -> Result<
+    (
+        impl futures_util::Sink<grpc::SubscribeRequest, Error = futures_mpsc::SendError> + Send,
+        impl futures_util::Stream<Item = Result<grpc::SubscribeUpdate, Status>> + Send,
+    ),
+    LaserStreamError,
+> {
+    let options = config.client_config().channel_options;
+    let interceptor = SofLaserStreamInterceptor::new(&config.api_key)
+        .map_err(|error| LaserStreamError::Protocol(error.to_string()))?;
+
+    let mut endpoint = Endpoint::from_shared(config.endpoint.clone())
+        .map_err(|error| LaserStreamError::Protocol(format!("failed to parse endpoint: {error}")))?
+        .connect_timeout(Duration::from_secs(
+            options.connect_timeout_secs.unwrap_or(10),
+        ))
+        .timeout(Duration::from_secs(options.timeout_secs.unwrap_or(30)))
+        .http2_keep_alive_interval(Duration::from_secs(
+            options.http2_keep_alive_interval_secs.unwrap_or(30),
+        ))
+        .keep_alive_timeout(Duration::from_secs(
+            options.keep_alive_timeout_secs.unwrap_or(5),
+        ))
+        .keep_alive_while_idle(options.keep_alive_while_idle.unwrap_or(true))
+        .initial_stream_window_size(options.initial_stream_window_size.or(Some(1024 * 1024 * 4)))
+        .initial_connection_window_size(
+            options
+                .initial_connection_window_size
+                .or(Some(1024 * 1024 * 8)),
+        )
+        .http2_adaptive_window(options.http2_adaptive_window.unwrap_or(true))
+        .tcp_nodelay(options.tcp_nodelay.unwrap_or(true))
+        .buffer_size(options.buffer_size.or(Some(1024 * 64)));
+    if let Some(tcp_keepalive_secs) = options.tcp_keepalive_secs {
+        endpoint = endpoint.tcp_keepalive(Some(Duration::from_secs(tcp_keepalive_secs)));
+    }
+    endpoint = endpoint
+        .tls_config(ClientTlsConfig::new().with_enabled_roots())
+        .map_err(|error| LaserStreamError::Protocol(format!("TLS config error: {error}")))?;
+
+    let channel = endpoint
+        .connect()
+        .await
+        .map_err(|error| LaserStreamError::Protocol(format!("connection failed: {error}")))?;
+    let mut geyser_client =
+        grpc::geyser_client::GeyserClient::with_interceptor(channel, interceptor);
+    geyser_client = geyser_client
+        .max_decoding_message_size(options.max_decoding_message_size.unwrap_or(1_000_000_000))
+        .max_encoding_message_size(options.max_encoding_message_size.unwrap_or(32_000_000));
+    if let Some(send_comp) = options.send_compression {
+        let encoding = match send_comp {
+            helius_laserstream::CompressionEncoding::Gzip => CompressionEncoding::Gzip,
+            helius_laserstream::CompressionEncoding::Zstd => CompressionEncoding::Zstd,
+        };
+        geyser_client = geyser_client.send_compressed(encoding);
+    }
+    if let Some(ref accept_comps) = options.accept_compression {
+        for comp in accept_comps {
+            let encoding = match comp {
+                helius_laserstream::CompressionEncoding::Gzip => CompressionEncoding::Gzip,
+                helius_laserstream::CompressionEncoding::Zstd => CompressionEncoding::Zstd,
+            };
+            geyser_client = geyser_client.accept_compressed(encoding);
+        }
+    }
+
+    let (mut subscribe_tx, subscribe_rx) = futures_mpsc::unbounded();
+    subscribe_tx.send(request).await.map_err(|error| {
+        LaserStreamError::Protocol(format!(
+            "failed to send initial subscription request: {error}"
+        ))
+    })?;
+    let response = geyser_client
+        .subscribe(subscribe_rx)
+        .await
+        .map_err(|error| LaserStreamError::Protocol(format!("subscription failed: {error}")))?;
+
+    Ok((subscribe_tx, response.into_inner()))
 }
 
 fn transaction_event_from_update(
@@ -613,6 +738,11 @@ fn convert_transaction(
 mod tests {
     use super::*;
     use crate::provider_stream::yellowstone::{YellowstoneGrpcCommitment, YellowstoneGrpcConfig};
+    use laserstream_core_proto::prelude::{
+        CompiledInstruction as ProtoCompiledInstruction, Message as ProtoMessage,
+        MessageAddressTableLookup as ProtoMessageAddressTableLookup,
+        MessageHeader as ProtoMessageHeader, SubscribeUpdateTransactionInfo,
+    };
     use solana_instruction::Instruction;
     use solana_keypair::Keypair;
     use solana_message::{Message, VersionedMessage};
