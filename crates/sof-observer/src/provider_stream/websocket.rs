@@ -6,7 +6,7 @@
 //! LaserStream by requesting full base64 transaction payloads and converting
 //! them into [`crate::framework::TransactionEvent`] values before dispatch.
 
-use std::{str::FromStr, sync::Arc, time::Duration};
+use std::{borrow::Cow, str::FromStr, sync::Arc, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, StreamExt};
@@ -481,19 +481,18 @@ fn parse_transaction_notification(
     }
     tx_bytes.clear();
     STANDARD
-        .decode_vec(notification.transaction.transaction.0, tx_bytes)
+        .decode_vec(notification.transaction.transaction.0.as_bytes(), tx_bytes)
         .map_err(|_error| {
             WebsocketTransactionError::Convert("invalid base64 transaction payload")
         })?;
     let tx = bincode::deserialize::<VersionedTransaction>(tx_bytes).map_err(|_error| {
         WebsocketTransactionError::Convert("failed to deserialize transaction")
     })?;
-    let signature = notification
-        .signature
-        .map(|signature| Signature::from_str(&signature))
-        .transpose()
-        .map_err(|_error| WebsocketTransactionError::Convert("invalid signature"))?
-        .or_else(|| tx.signatures.first().copied());
+    let signature = tx.signatures.first().copied().or_else(|| {
+        notification
+            .signature
+            .and_then(|signature| Signature::from_str(&signature).ok())
+    });
     Ok(Some(TransactionEvent {
         slot: notification.slot,
         commitment_status: commitment_status.as_tx_commitment(),
@@ -528,33 +527,41 @@ struct WebsocketSubscriptionAck {
 }
 
 #[derive(Debug, Deserialize)]
-struct WebsocketTransactionEnvelopeMessage {
+struct WebsocketTransactionEnvelopeMessage<'a> {
     #[serde(default)]
     error: Option<Value>,
     #[serde(default)]
-    params: Option<WebsocketTransactionParams>,
+    #[serde(borrow)]
+    params: Option<WebsocketTransactionParams<'a>>,
 }
 
 #[derive(Debug, Deserialize)]
-struct WebsocketTransactionParams {
-    result: WebsocketTransactionNotification,
+struct WebsocketTransactionParams<'a> {
+    #[serde(borrow)]
+    result: WebsocketTransactionNotification<'a>,
 }
 
 #[derive(Debug, Deserialize)]
-struct WebsocketTransactionNotification {
+struct WebsocketTransactionNotification<'a> {
     slot: u64,
     #[serde(default)]
-    signature: Option<String>,
-    transaction: WebsocketTransactionEnvelope,
+    #[serde(borrow)]
+    signature: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    transaction: WebsocketTransactionEnvelope<'a>,
 }
 
 #[derive(Debug, Deserialize)]
-struct WebsocketTransactionEnvelope {
-    transaction: WebsocketEncodedTransaction,
+struct WebsocketTransactionEnvelope<'a> {
+    #[serde(borrow)]
+    transaction: WebsocketEncodedTransaction<'a>,
 }
 
 #[derive(Debug, Deserialize)]
-struct WebsocketEncodedTransaction(String, String);
+struct WebsocketEncodedTransaction<'a>(
+    #[serde(borrow)] Cow<'a, str>,
+    #[serde(borrow)] Cow<'a, str>,
+);
 
 #[cfg(all(test, feature = "provider-grpc"))]
 mod tests {
@@ -566,6 +573,76 @@ mod tests {
     use solana_keypair::Keypair;
     use solana_message::{Message, VersionedMessage};
     use solana_signer::Signer;
+    use std::time::Instant;
+
+    fn sample_notification_payload() -> Vec<u8> {
+        let signer = Keypair::new();
+        let message = Message::new(&[], Some(&signer.pubkey()));
+        let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&signer])
+            .expect("tx");
+        let signature = tx.signatures[0];
+        let tx_bytes = bincode::serialize(&tx).expect("serialize tx");
+        json!({
+            "jsonrpc":"2.0",
+            "method":"transactionNotification",
+            "params":{
+                "result":{
+                    "slot":55,
+                    "signature":signature.to_string(),
+                    "transaction":{
+                        "transaction":[BASE64_STANDARD.encode(tx_bytes),"base64"]
+                    }
+                }
+            }
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn parse_transaction_notification_baseline(
+        bytes: &mut [u8],
+        commitment_status: WebsocketTransactionCommitment,
+    ) -> Result<Option<TransactionEvent>, WebsocketTransactionError> {
+        let value: WebsocketTransactionEnvelopeMessage =
+            simd_from_slice(bytes).map_err(|error| {
+                WebsocketTransactionError::Protocol(format!("invalid websocket json: {error}"))
+            })?;
+        if let Some(error) = value.error {
+            return Err(WebsocketTransactionError::Protocol(format!(
+                "websocket provider error: {error}"
+            )));
+        }
+        let Some(notification) = value.params.map(|params| params.result) else {
+            return Ok(None);
+        };
+        if notification.transaction.transaction.1 != "base64" {
+            return Err(WebsocketTransactionError::Convert(
+                "unsupported websocket transaction encoding",
+            ));
+        }
+        let tx_bytes = STANDARD
+            .decode(notification.transaction.transaction.0.as_bytes())
+            .map_err(|_error| {
+                WebsocketTransactionError::Convert("invalid base64 transaction payload")
+            })?;
+        let tx = bincode::deserialize::<VersionedTransaction>(&tx_bytes).map_err(|_error| {
+            WebsocketTransactionError::Convert("failed to deserialize transaction")
+        })?;
+        let signature = tx.signatures.first().copied().or_else(|| {
+            notification
+                .signature
+                .and_then(|signature| Signature::from_str(&signature).ok())
+        });
+        Ok(Some(TransactionEvent {
+            slot: notification.slot,
+            commitment_status: commitment_status.as_tx_commitment(),
+            confirmed_slot: None,
+            finalized_slot: None,
+            signature,
+            kind: classify_provider_transaction_kind(&tx),
+            tx: Arc::new(tx),
+        }))
+    }
 
     #[test]
     fn websocket_filter_shape_matches_yellowstone_config() {
@@ -656,27 +733,20 @@ mod tests {
 
     #[test]
     fn websocket_transaction_notification_decodes_full_transaction() {
-        let signer = Keypair::new();
-        let message = Message::new(&[], Some(&signer.pubkey()));
-        let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&signer])
-            .expect("tx");
-        let signature = tx.signatures[0];
-        let tx_bytes = bincode::serialize(&tx).expect("serialize tx");
-        let payload = json!({
-            "jsonrpc":"2.0",
-            "method":"transactionNotification",
-            "params":{
-                "result":{
-                    "slot":55,
-                    "signature":signature.to_string(),
-                    "transaction":{
-                        "transaction":[BASE64_STANDARD.encode(tx_bytes),"base64"]
-                    }
-                }
-            }
-        });
+        let payload = sample_notification_payload();
+        let mut signature_probe = payload.clone();
+        let mut tx_bytes = Vec::new();
+        let signature = parse_transaction_notification(
+            &mut signature_probe,
+            &mut tx_bytes,
+            WebsocketTransactionCommitment::Confirmed,
+        )
+        .expect("notification should parse")
+        .expect("transaction event")
+        .signature
+        .expect("signature");
 
-        let mut payload = payload.to_string().into_bytes();
+        let mut payload = payload;
         let mut tx_bytes = Vec::new();
         let event = parse_transaction_notification(
             &mut payload,
@@ -690,5 +760,88 @@ mod tests {
         assert_eq!(event.signature, Some(signature));
         assert_eq!(event.commitment_status, TxCommitmentStatus::Confirmed);
         assert_eq!(event.kind, TxKind::NonVote);
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for websocket transaction parsing A/B"]
+    fn websocket_transaction_parse_profile_fixture() {
+        const ITERATIONS: usize = 200_000;
+
+        let payload = sample_notification_payload();
+
+        let baseline_started = Instant::now();
+        for _ in 0..ITERATIONS {
+            let mut frame = payload.clone();
+            let event = parse_transaction_notification_baseline(
+                &mut frame,
+                WebsocketTransactionCommitment::Confirmed,
+            )
+            .expect("baseline parse")
+            .expect("baseline event");
+            std::hint::black_box(event);
+        }
+        let baseline_elapsed = baseline_started.elapsed();
+
+        let optimized_started = Instant::now();
+        let mut frame_bytes = Vec::new();
+        let mut tx_bytes = Vec::new();
+        for _ in 0..ITERATIONS {
+            let frame = frame_bytes_mut(&mut frame_bytes, &payload);
+            let event = parse_transaction_notification(
+                frame,
+                &mut tx_bytes,
+                WebsocketTransactionCommitment::Confirmed,
+            )
+            .expect("optimized parse")
+            .expect("optimized event");
+            std::hint::black_box(event);
+        }
+        let optimized_elapsed = optimized_started.elapsed();
+
+        eprintln!(
+            "websocket_transaction_parse_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            ITERATIONS,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
+        );
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for baseline websocket transaction parsing"]
+    fn websocket_transaction_parse_baseline_profile_fixture() {
+        const ITERATIONS: usize = 200_000;
+
+        let payload = sample_notification_payload();
+        for _ in 0..ITERATIONS {
+            let mut frame = payload.clone();
+            let event = parse_transaction_notification_baseline(
+                &mut frame,
+                WebsocketTransactionCommitment::Confirmed,
+            )
+            .expect("baseline parse")
+            .expect("baseline event");
+            std::hint::black_box(event);
+        }
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for optimized websocket transaction parsing"]
+    fn websocket_transaction_parse_optimized_profile_fixture() {
+        const ITERATIONS: usize = 200_000;
+
+        let payload = sample_notification_payload();
+        let mut frame_bytes = Vec::new();
+        let mut tx_bytes = Vec::new();
+        for _ in 0..ITERATIONS {
+            let frame = frame_bytes_mut(&mut frame_bytes, &payload);
+            let event = parse_transaction_notification(
+                frame,
+                &mut tx_bytes,
+                WebsocketTransactionCommitment::Confirmed,
+            )
+            .expect("optimized parse")
+            .expect("optimized event");
+            std::hint::black_box(event);
+        }
     }
 }
