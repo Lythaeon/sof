@@ -93,6 +93,9 @@ pub struct LaserStreamConfig {
 impl LaserStreamConfig {
     /// Creates a transaction-stream config for one LaserStream endpoint.
     ///
+    /// By default no vote/failed filter is applied, so the stream remains
+    /// inclusive unless you narrow it explicitly.
+    ///
     /// # Examples
     ///
     /// ```rust
@@ -110,8 +113,8 @@ impl LaserStreamConfig {
             endpoint: endpoint.into(),
             api_key: api_key.into(),
             commitment: LaserStreamCommitment::Processed,
-            vote: Some(false),
-            failed: Some(false),
+            vote: None,
+            failed: None,
             signature: None,
             account_include: Vec::new(),
             account_exclude: Vec::new(),
@@ -533,6 +536,15 @@ mod tests {
             laser_filter.account_required,
             yellowstone_filter.account_required
         );
+    }
+
+    #[test]
+    fn laserstream_config_defaults_do_not_filter_vote_or_failed() {
+        let request =
+            LaserStreamConfig::new("https://laserstream.example", "token").subscribe_request();
+        let filter = request.transactions.get("sof").expect("sof filter");
+        assert_eq!(filter.vote, None);
+        assert_eq!(filter.failed, None);
     }
 
     fn sample_transaction() -> VersionedTransaction {

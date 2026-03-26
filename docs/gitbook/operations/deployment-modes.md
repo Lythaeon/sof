@@ -38,6 +38,11 @@ SOF exposes this category through `ProviderStreamMode`. In that mode:
 - build flags are provider-specific:
   - `provider-grpc` for Yellowstone gRPC and LaserStream gRPC
   - `provider-websocket`
+- provider adapter defaults are inclusive: vote and failed transactions stay in
+  the stream unless you explicitly filter them out
+- strict provider capability policy only rejects hooks that provider runtime can
+  never emit; it does not reject generic provider updates such as recent
+  blockhash, slot status, or cluster topology when your producer supplies them
 
 That means deployment mode is not only about network topology. It is also about how much of the
 low-level substrate SOF is owning for the application:

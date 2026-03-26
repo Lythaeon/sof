@@ -1540,6 +1540,11 @@ async fn run_provider_stream_runtime(
     mode: ProviderStreamMode,
     mut provider_stream_rx: ProviderStreamReceiver,
 ) -> Result<(), RuntimeError> {
+    enforce_provider_stream_capability_policy(mode, &plugin_host)?;
+    plugin_host
+        .startup()
+        .await
+        .map_err(|error| RuntimeError::Runloop(error.to_string()))?;
     let extension_report = extension_host.startup().await;
     if extension_report.failed_extensions > 0 {
         tracing::warn!(
@@ -1548,11 +1553,6 @@ async fn run_provider_stream_runtime(
             "provider-stream runtime started with extension startup failures"
         );
     }
-    plugin_host
-        .startup()
-        .await
-        .map_err(|error| RuntimeError::Runloop(error.to_string()))?;
-    enforce_provider_stream_capability_policy(mode, &plugin_host)?;
     derived_state_host.initialize();
     tracing::info!(mode = mode.as_str(), "starting SOF provider-stream runtime");
 
@@ -1741,6 +1741,7 @@ fn provider_stream_unsupported_hooks(
     mode: ProviderStreamMode,
     plugin_host: &PluginHost,
 ) -> Vec<&'static str> {
+    let _ = mode;
     let mut unsupported = Vec::new();
     if plugin_host.wants_raw_packet() {
         unsupported.push("on_raw_packet");
@@ -1762,43 +1763,6 @@ fn provider_stream_unsupported_hooks(
     }
     if plugin_host.wants_transaction_batch() {
         unsupported.push("on_transaction_batch");
-    }
-    match mode {
-        ProviderStreamMode::YellowstoneGrpc | ProviderStreamMode::LaserStream => {
-            if plugin_host.wants_transaction_log() {
-                unsupported.push("on_transaction_log");
-            }
-            if plugin_host.wants_transaction_view_batch() {
-                unsupported.push("on_transaction_view_batch");
-            }
-            if plugin_host.wants_recent_blockhash() {
-                unsupported.push("on_recent_blockhash");
-            }
-            if plugin_host.wants_slot_status() {
-                unsupported.push("on_slot_status");
-            }
-            if plugin_host.wants_cluster_topology() {
-                unsupported.push("on_cluster_topology");
-            }
-        }
-        #[cfg(feature = "provider-websocket")]
-        ProviderStreamMode::WebsocketTransaction => {
-            if plugin_host.wants_transaction_log() {
-                unsupported.push("on_transaction_log");
-            }
-            if plugin_host.wants_transaction_view_batch() {
-                unsupported.push("on_transaction_view_batch");
-            }
-            if plugin_host.wants_recent_blockhash() {
-                unsupported.push("on_recent_blockhash");
-            }
-            if plugin_host.wants_slot_status() {
-                unsupported.push("on_slot_status");
-            }
-            if plugin_host.wants_cluster_topology() {
-                unsupported.push("on_cluster_topology");
-            }
-        }
     }
     unsupported
 }
@@ -2211,11 +2175,19 @@ pub async fn run_async_with_hosts_and_setup(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Arc, time::Instant};
+    use std::{
+        collections::BTreeMap,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Instant,
+    };
 
     use super::*;
     use crate::framework::{
-        ObserverPlugin, PluginConfig, RawPacketEvent, TransactionInterest, TransactionPrefilter,
+        ExtensionContext, ExtensionManifest, ObserverPlugin, PluginConfig, PluginContext,
+        RawPacketEvent, RuntimeExtension, TransactionInterest, TransactionPrefilter,
     };
     use async_trait::async_trait;
     use sof_gossip_tuning::{GossipTuningProfile, HostProfilePreset, IngestQueueMode};
@@ -2255,6 +2227,13 @@ mod tests {
     }
 
     struct TransactionOnlyPlugin;
+    struct RecentBlockhashPlugin;
+    struct StartupCounterPlugin {
+        counter: Arc<AtomicUsize>,
+    }
+    struct StartupCounterExtension {
+        counter: Arc<AtomicUsize>,
+    }
 
     #[async_trait]
     impl ObserverPlugin for RawPacketPlugin {
@@ -2280,6 +2259,41 @@ mod tests {
     impl ObserverPlugin for TransactionOnlyPlugin {
         fn config(&self) -> PluginConfig {
             PluginConfig::new().with_transaction()
+        }
+    }
+
+    #[async_trait]
+    impl ObserverPlugin for RecentBlockhashPlugin {
+        fn config(&self) -> PluginConfig {
+            PluginConfig::new().with_recent_blockhash()
+        }
+    }
+
+    #[async_trait]
+    impl ObserverPlugin for StartupCounterPlugin {
+        fn config(&self) -> PluginConfig {
+            PluginConfig::new().with_raw_packet()
+        }
+
+        async fn setup(
+            &self,
+            _ctx: PluginContext,
+        ) -> Result<(), crate::framework::PluginSetupError> {
+            self.counter.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn on_raw_packet(&self, _event: RawPacketEvent) {}
+    }
+
+    #[async_trait]
+    impl RuntimeExtension for StartupCounterExtension {
+        async fn setup(
+            &self,
+            _ctx: ExtensionContext,
+        ) -> Result<ExtensionManifest, crate::framework::extension::ExtensionSetupError> {
+            self.counter.fetch_add(1, Ordering::Relaxed);
+            Ok(ExtensionManifest::default())
         }
     }
 
@@ -2755,6 +2769,60 @@ mod tests {
             }
             other => panic!("expected strict provider capability failure, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn provider_stream_strict_policy_allows_supported_provider_updates() {
+        crate::runtime_env::set_runtime_env_overrides([(
+            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+            String::from("strict"),
+        )]);
+        let plugin_host = PluginHost::builder()
+            .add_plugin(TransactionOnlyPlugin)
+            .add_plugin(RecentBlockhashPlugin)
+            .build();
+        let result = enforce_provider_stream_capability_policy(
+            ProviderStreamMode::YellowstoneGrpc,
+            &plugin_host,
+        );
+        crate::runtime_env::clear_runtime_env_overrides();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn provider_stream_strict_policy_fails_before_plugin_and_extension_startup() {
+        crate::runtime_env::set_runtime_env_overrides([(
+            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+            String::from("strict"),
+        )]);
+        let plugin_counter = Arc::new(AtomicUsize::new(0));
+        let extension_counter = Arc::new(AtomicUsize::new(0));
+        let plugin_host = PluginHost::builder()
+            .add_plugin(StartupCounterPlugin {
+                counter: Arc::clone(&plugin_counter),
+            })
+            .build();
+        let extension_host = RuntimeExtensionHost::builder()
+            .add_extension(StartupCounterExtension {
+                counter: Arc::clone(&extension_counter),
+            })
+            .build();
+        let (_tx, rx) = crate::provider_stream::create_provider_stream_queue(1);
+
+        let result = run_provider_stream_runtime(
+            plugin_host,
+            extension_host,
+            DerivedStateHost::builder().build(),
+            None,
+            ProviderStreamMode::YellowstoneGrpc,
+            rx,
+        )
+        .await;
+        crate::runtime_env::clear_runtime_env_overrides();
+
+        assert!(matches!(result, Err(RuntimeError::Runloop(_))));
+        assert_eq!(plugin_counter.load(Ordering::Relaxed), 0);
+        assert_eq!(extension_counter.load(Ordering::Relaxed), 0);
     }
 
     #[test]

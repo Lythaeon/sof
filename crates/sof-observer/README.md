@@ -74,6 +74,17 @@ Built-in hook surface by provider mode:
 - LaserStream gRPC: `on_transaction`
 - websocket `transactionSubscribe`: `on_transaction`
 
+Provider config defaults are inclusive:
+
+- vote transactions are included unless you explicitly set a vote filter
+- failed transactions are included unless you explicitly set a failed filter
+
+`SOF_PROVIDER_STREAM_CAPABILITY_POLICY=strict` only rejects hooks that provider
+runtime cannot ever emit, such as `on_raw_packet` or `on_shred`. It does not
+reject generic provider updates like `on_recent_blockhash`, `on_slot_status`,
+or `on_cluster_topology` when a custom producer pushes those updates into the
+provider queue.
+
 SOF's internal transaction classifier hooks, including `transaction_prefilter`,
 `accepts_transaction_ref`, and `transaction_interest_ref`, work on the
 Yellowstone, LaserStream, and websocket transaction adapters because all three

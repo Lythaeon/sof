@@ -132,6 +132,12 @@ SOF's runtime-owned observability endpoint exposes low-cardinality operational m
 | `SOF_SHRED_DEDUP_CAPACITY` | `262144` | all builds | Capacity of the semantic shred dedupe cache. |
 | `SOF_SHRED_DEDUP_TTL_MS` | `250` | all builds | Base eviction TTL for dedupe entries. |
 
+## Provider Stream
+
+| Knob | Default | Scope | Meaning |
+| --- | --- | --- | --- |
+| `SOF_PROVIDER_STREAM_CAPABILITY_POLICY` | `warn` | all builds | Startup policy when provider runtime cannot satisfy requested hooks. `strict` rejects only hooks that are impossible in provider-stream mode such as raw-packet or shred hooks; it still allows generic provider updates like recent blockhash, slot status, and cluster topology when the producer supplies them. |
+
 ## Gossip Selection
 
 | Knob | Default | Scope | Meaning |

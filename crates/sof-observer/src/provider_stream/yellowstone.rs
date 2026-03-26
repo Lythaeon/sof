@@ -81,6 +81,9 @@ pub struct YellowstoneGrpcConfig {
 impl YellowstoneGrpcConfig {
     /// Creates a transaction-stream config for one Yellowstone endpoint.
     ///
+    /// By default no vote/failed filter is applied, so the stream remains
+    /// inclusive unless you narrow it explicitly.
+    ///
     /// # Examples
     ///
     /// ```rust
@@ -95,8 +98,8 @@ impl YellowstoneGrpcConfig {
             endpoint: endpoint.into(),
             x_token: None,
             commitment: YellowstoneGrpcCommitment::Processed,
-            vote: Some(false),
-            failed: Some(false),
+            vote: None,
+            failed: None,
             signature: None,
             account_include: Vec::new(),
             account_exclude: Vec::new(),
@@ -551,6 +554,14 @@ mod tests {
         ];
         let message = SolanaMessage::new(&instructions, Some(&signer.pubkey()));
         VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&signer]).expect("tx")
+    }
+
+    #[test]
+    fn yellowstone_config_defaults_do_not_filter_vote_or_failed() {
+        let request = YellowstoneGrpcConfig::new("http://127.0.0.1:10000").subscribe_request();
+        let filter = request.transactions.get("sof").expect("sof filter");
+        assert_eq!(filter.vote, None);
+        assert_eq!(filter.failed, None);
     }
 
     fn proto_transaction_from_versioned(tx: &VersionedTransaction) -> Transaction {

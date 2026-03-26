@@ -78,6 +78,9 @@ pub struct WebsocketTransactionConfig {
 impl WebsocketTransactionConfig {
     /// Creates a websocket transaction-stream config for one endpoint.
     ///
+    /// By default no vote/failed filter is applied, so the stream remains
+    /// inclusive unless you narrow it explicitly.
+    ///
     /// # Examples
     ///
     /// ```rust
@@ -91,8 +94,8 @@ impl WebsocketTransactionConfig {
         Self {
             endpoint: endpoint.into(),
             commitment: WebsocketTransactionCommitment::Processed,
-            vote: Some(false),
-            failed: Some(false),
+            vote: None,
+            failed: None,
             signature: None,
             account_include: Vec::new(),
             account_exclude: Vec::new(),
@@ -741,6 +744,14 @@ mod tests {
             br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"boom"}}"#.to_vec();
         let error = handle_subscription_text(&mut error).expect_err("provider error should fail");
         assert!(error.to_string().contains("subscription error"));
+    }
+
+    #[test]
+    fn websocket_config_defaults_do_not_filter_vote_or_failed() {
+        let request = WebsocketTransactionConfig::new("wss://example.invalid").subscribe_request();
+        let filter = request["params"][0].as_object().expect("filter object");
+        assert!(!filter.contains_key("vote"));
+        assert!(!filter.contains_key("failed"));
     }
 
     #[test]
