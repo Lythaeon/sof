@@ -302,6 +302,7 @@ pub(crate) fn classify_provider_transaction_kind(tx: &VersionedTransaction) -> T
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn classify_provider_transaction_kind_view<D: TransactionData>(
     view: &SanitizedTransactionView<D>,
 ) -> TxKind {

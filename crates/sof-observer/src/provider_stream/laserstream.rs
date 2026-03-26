@@ -261,7 +261,12 @@ impl LaserStreamConfig {
         self
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn subscribe_request(&self) -> grpc::SubscribeRequest {
+        self.subscribe_request_with_state(0)
+    }
+
+    pub(crate) fn subscribe_request_with_state(&self, tracked_slot: u64) -> grpc::SubscribeRequest {
         let filter = grpc::SubscribeRequestFilterTransactions {
             vote: self.vote,
             failed: self.failed,
@@ -292,7 +297,7 @@ impl LaserStreamConfig {
             )]),
             transactions: HashMap::from([("sof".to_owned(), filter)]),
             commitment: Some(self.commitment.as_proto() as i32),
-            from_slot: self.initial_from_slot(),
+            from_slot: self.replay_from_slot(tracked_slot),
             ..grpc::SubscribeRequest::default()
         }
     }
@@ -321,10 +326,23 @@ impl LaserStreamConfig {
         config
     }
 
-    fn initial_from_slot(&self) -> Option<u64> {
+    fn replay_from_slot(&self, tracked_slot: u64) -> Option<u64> {
         match self.replay_mode {
-            ProviderReplayMode::Live | ProviderReplayMode::Resume => None,
-            ProviderReplayMode::FromSlot(slot) => Some(slot),
+            ProviderReplayMode::Live => None,
+            ProviderReplayMode::Resume => {
+                if tracked_slot == 0 {
+                    None
+                } else {
+                    Some(tracked_slot)
+                }
+            }
+            ProviderReplayMode::FromSlot(slot) => {
+                if tracked_slot == 0 {
+                    Some(slot)
+                } else {
+                    Some(tracked_slot)
+                }
+            }
         }
     }
 }
@@ -377,10 +395,18 @@ pub async fn spawn_laserstream_transaction_source(
     preflight_laserstream_connection(&config).await?;
     Ok(tokio::spawn(async move {
         let mut attempts = 0_u32;
+        let mut tracked_slot = 0_u64;
+        let mut watermarks = ProviderCommitmentWatermarks::default();
         loop {
             let mut session_established = false;
-            match run_laserstream_transaction_connection(&config, &sender, &mut session_established)
-                .await
+            match run_laserstream_transaction_connection(
+                &config,
+                &sender,
+                &mut tracked_slot,
+                &mut watermarks,
+                &mut session_established,
+            )
+            .await
             {
                 Ok(()) => {
                     tracing::warn!(
@@ -419,15 +445,16 @@ pub async fn spawn_laserstream_transaction_source(
 async fn run_laserstream_transaction_connection(
     config: &LaserStreamConfig,
     sender: &ProviderStreamSender,
+    tracked_slot: &mut u64,
+    watermarks: &mut ProviderCommitmentWatermarks,
     session_established: &mut bool,
 ) -> Result<(), LaserStreamError> {
     *session_established = false;
     let commitment = config.commitment.as_tx_commitment();
-    let request = config.subscribe_request();
+    let request = config.subscribe_request_with_state(*tracked_slot);
     let (stream, _handle) = subscribe(config.client_config(), request);
     tokio::pin!(stream);
     *session_established = true;
-    let mut watermarks = ProviderCommitmentWatermarks::default();
     let mut last_progress = Instant::now();
     loop {
         tokio::select! {
@@ -450,6 +477,7 @@ async fn run_laserstream_transaction_connection(
                 last_progress = Instant::now();
                 match update.update_oneof {
                     Some(grpc::subscribe_update::UpdateOneof::Slot(slot_update)) => {
+                        *tracked_slot = (*tracked_slot).max(slot_update.slot);
                         if update
                             .filters
                             .iter()
@@ -467,12 +495,13 @@ async fn run_laserstream_transaction_connection(
                         }
                     }
                     Some(grpc::subscribe_update::UpdateOneof::Transaction(tx_update)) => {
+                        *tracked_slot = (*tracked_slot).max(tx_update.slot);
                         watermarks.observe_transaction_commitment(tx_update.slot, commitment);
                         let event = transaction_event_from_update(
                             tx_update.slot,
                             tx_update.transaction,
                             commitment,
-                            watermarks,
+                            *watermarks,
                         )?;
                         sender
                             .send(ProviderStreamUpdate::Transaction(event))
@@ -489,7 +518,7 @@ async fn run_laserstream_transaction_connection(
 async fn preflight_laserstream_connection(
     config: &LaserStreamConfig,
 ) -> Result<(), LaserStreamError> {
-    let request = config.subscribe_request();
+    let request = config.subscribe_request_with_state(0);
     let _subscription = connect_and_subscribe_once(config, request).await?;
     Ok(())
 }
@@ -836,6 +865,22 @@ mod tests {
             .with_replay_mode(ProviderReplayMode::Live)
             .subscribe_request();
         assert_eq!(request.from_slot, None);
+    }
+
+    #[test]
+    fn laserstream_resume_replay_uses_tracked_slot() {
+        let request = LaserStreamConfig::new("https://laserstream.example", "token")
+            .with_replay_mode(ProviderReplayMode::Resume)
+            .subscribe_request_with_state(777);
+        assert_eq!(request.from_slot, Some(777));
+    }
+
+    #[test]
+    fn laserstream_from_slot_reconnect_uses_tracked_slot() {
+        let request = LaserStreamConfig::new("https://laserstream.example", "token")
+            .with_replay_mode(ProviderReplayMode::FromSlot(321))
+            .subscribe_request_with_state(777);
+        assert_eq!(request.from_slot, Some(777));
     }
 
     fn sample_transaction() -> VersionedTransaction {

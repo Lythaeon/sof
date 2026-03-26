@@ -325,18 +325,22 @@ pub enum WebsocketTransactionError {
 /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let (tx, _rx) = create_provider_stream_queue(1024);
 /// let config = WebsocketTransactionConfig::new("wss://mainnet.helius-rpc.com/?api-key=example");
-/// let handle = spawn_websocket_transaction_source(&config, tx);
+/// let handle = spawn_websocket_transaction_source(&config, tx).await?;
 /// handle.abort();
 /// # Ok(())
 /// # }
 /// ```
-#[must_use]
-pub fn spawn_websocket_transaction_source(
+///
+/// # Errors
+///
+/// Returns any connection/bootstrap error before the forwarder task starts.
+pub async fn spawn_websocket_transaction_source(
     config: &WebsocketTransactionConfig,
     sender: ProviderStreamSender,
-) -> JoinHandle<Result<(), WebsocketTransactionError>> {
+) -> Result<JoinHandle<Result<(), WebsocketTransactionError>>, WebsocketTransactionError> {
     let config = config.clone();
-    tokio::spawn(async move {
+    preflight_websocket_connection(&config).await?;
+    Ok(tokio::spawn(async move {
         let mut attempts = 0_u32;
         let mut last_seen_slot = None;
         let mut watermarks = ProviderCommitmentWatermarks::default();
@@ -378,7 +382,7 @@ pub fn spawn_websocket_transaction_source(
             }
             tokio::time::sleep(config.reconnect_delay).await;
         }
-    })
+    }))
 }
 
 async fn run_websocket_transaction_connection(
@@ -590,6 +594,7 @@ fn parse_transaction_notification(
     }))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn materialize_transaction_baseline(
     bytes: &mut [u8],
     commitment_status: WebsocketTransactionCommitment,
@@ -718,6 +723,21 @@ async fn replay_websocket_gap(
             *last_seen_slot = Some((*last_seen_slot).unwrap_or(slot).max(slot));
         }
     }
+    Ok(())
+}
+
+async fn preflight_websocket_connection(
+    config: &WebsocketTransactionConfig,
+) -> Result<(), WebsocketTransactionError> {
+    let (stream, _response) = connect_async(config.endpoint()).await?;
+    let (mut write, mut read) = stream.split();
+    write
+        .send(WsMessage::Text(
+            config.subscribe_request().to_string().into(),
+        ))
+        .await?;
+    wait_for_subscription_ack(&mut read).await?;
+    let _ = write.close().await;
     Ok(())
 }
 
@@ -1210,7 +1230,9 @@ mod tests {
             .with_max_reconnect_attempts(1)
             .with_ping_interval(Duration::from_millis(250))
             .with_reconnect_delay(Duration::from_millis(10));
-        let handle = spawn_websocket_transaction_source(&config, tx);
+        let handle = spawn_websocket_transaction_source(&config, tx)
+            .await
+            .expect("spawn websocket source");
 
         let update = timeout(Duration::from_secs(2), rx.recv())
             .await
@@ -1228,6 +1250,22 @@ mod tests {
         handle.abort();
         let _ = handle.await;
         server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn websocket_spawn_fails_fast_on_dead_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+        drop(listener);
+
+        let (tx, _rx) = create_provider_stream_queue(1);
+        let error = spawn_websocket_transaction_source(
+            &WebsocketTransactionConfig::new(format!("ws://{addr}")),
+            tx,
+        )
+        .await
+        .expect_err("dead endpoint should fail during preflight");
+        assert!(error.to_string().contains("IO error") || error.to_string().contains("Connection"));
     }
 
     #[test]

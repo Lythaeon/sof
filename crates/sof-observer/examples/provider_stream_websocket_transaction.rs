@@ -77,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config = config.with_account_required(required);
     }
 
-    let source = spawn_websocket_transaction_source(&config, provider_tx);
+    let source = spawn_websocket_transaction_source(&config, provider_tx).await?;
     let host = PluginHost::builder()
         .add_plugin(WebsocketTransactionPlugin)
         .build();

@@ -1596,10 +1596,19 @@ async fn run_provider_stream_runtime(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ProviderReplayDedupeKey {
+    slot: u64,
+    signature: Signature,
+    commitment_status: u8,
+    confirmed_slot: Option<u64>,
+    finalized_slot: Option<u64>,
+}
+
 #[derive(Default)]
 struct ProviderReplayDedupe {
-    seen: HashSet<(u64, Signature)>,
-    order: VecDeque<(u64, Signature)>,
+    seen: HashSet<ProviderReplayDedupeKey>,
+    order: VecDeque<ProviderReplayDedupeKey>,
     capacity: usize,
 }
 
@@ -1630,16 +1639,36 @@ impl ProviderReplayDedupe {
     }
 }
 
-fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<(u64, Signature)> {
+fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderReplayDedupeKey> {
     match update {
         ProviderStreamUpdate::Transaction(event) => event
             .signature
             .or_else(|| event.tx.signatures.first().copied())
-            .map(|signature| (event.slot, signature)),
+            .map(|signature| ProviderReplayDedupeKey {
+                slot: event.slot,
+                signature,
+                commitment_status: provider_replay_commitment_key(event.commitment_status),
+                confirmed_slot: event.confirmed_slot,
+                finalized_slot: event.finalized_slot,
+            }),
         ProviderStreamUpdate::SerializedTransaction(event) => {
-            event.signature.map(|signature| (event.slot, signature))
+            event.signature.map(|signature| ProviderReplayDedupeKey {
+                slot: event.slot,
+                signature,
+                commitment_status: provider_replay_commitment_key(event.commitment_status),
+                confirmed_slot: event.confirmed_slot,
+                finalized_slot: event.finalized_slot,
+            })
         }
         _ => None,
+    }
+}
+
+const fn provider_replay_commitment_key(commitment_status: crate::event::TxCommitmentStatus) -> u8 {
+    match commitment_status {
+        crate::event::TxCommitmentStatus::Processed => 0,
+        crate::event::TxCommitmentStatus::Confirmed => 1,
+        crate::event::TxCommitmentStatus::Finalized => 2,
     }
 }
 
@@ -2501,6 +2530,28 @@ mod tests {
         }
     }
 
+    fn sample_confirmed_provider_transaction_update() -> ProviderStreamUpdate {
+        match sample_provider_transaction_update() {
+            ProviderStreamUpdate::Transaction(mut event) => {
+                event.commitment_status = crate::event::TxCommitmentStatus::Confirmed;
+                event.confirmed_slot = Some(event.slot);
+                ProviderStreamUpdate::Transaction(event)
+            }
+            other => other,
+        }
+    }
+
+    fn sample_confirmed_serialized_provider_transaction_update() -> ProviderStreamUpdate {
+        match sample_serialized_provider_transaction_update() {
+            ProviderStreamUpdate::SerializedTransaction(mut event) => {
+                event.commitment_status = crate::event::TxCommitmentStatus::Confirmed;
+                event.confirmed_slot = Some(event.slot);
+                ProviderStreamUpdate::SerializedTransaction(event)
+            }
+            other => other,
+        }
+    }
+
     #[test]
     fn typed_derived_state_config_serializes_into_env_overrides() {
         let setup = RuntimeSetup::new().with_derived_state_config(DerivedStateRuntimeConfig {
@@ -2865,6 +2916,26 @@ mod tests {
 
         assert!(!dedupe.observe(&update));
         assert!(dedupe.observe(&update));
+    }
+
+    #[test]
+    fn provider_replay_dedupe_keeps_higher_commitment_transaction_update() {
+        let initial = sample_provider_transaction_update();
+        let progressed = sample_confirmed_provider_transaction_update();
+        let mut dedupe = ProviderReplayDedupe::new(8);
+
+        assert!(!dedupe.observe(&initial));
+        assert!(!dedupe.observe(&progressed));
+    }
+
+    #[test]
+    fn provider_replay_dedupe_keeps_higher_commitment_serialized_update() {
+        let initial = sample_serialized_provider_transaction_update();
+        let progressed = sample_confirmed_serialized_provider_transaction_update();
+        let mut dedupe = ProviderReplayDedupe::new(8);
+
+        assert!(!dedupe.observe(&initial));
+        assert!(!dedupe.observe(&progressed));
     }
 
     #[tokio::test]
