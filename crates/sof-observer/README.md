@@ -17,6 +17,7 @@ Core responsibilities:
 - dataset reconstruction and transaction extraction
 - plugin-driven event hooks for custom logic
 - local transaction commitment status tagging (`processed` / `confirmed` / `finalized`) without RPC dependency
+- one transaction commitment selector across raw shreds, Yellowstone, LaserStream, and websocket
 
 ## Why Not Rebuild This Per Application
 
@@ -128,6 +129,21 @@ SOF's internal transaction classifier hooks, including `transaction_prefilter`,
 `accepts_transaction_ref`, and `transaction_interest_ref`, work on the
 Yellowstone, LaserStream, and websocket transaction adapters because all three
 feed full transactions into `on_transaction`.
+
+Transaction-family hooks can also choose delivery commitment uniformly across
+all ingest modes:
+
+```rust
+use sof::framework::{PluginConfig, TxCommitmentStatus};
+
+let config = PluginConfig::new()
+    .with_transaction()
+    .at_commitment(TxCommitmentStatus::Confirmed);
+
+let exact = PluginConfig::new()
+    .with_transaction()
+    .only_at_commitment(TxCommitmentStatus::Finalized);
+```
 
 `sof-tx` is a different case: the existing SOF adapters are complete today on
 raw-shred/gossip runtimes, or on `ProviderStreamMode::Generic` when the custom

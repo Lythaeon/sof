@@ -45,6 +45,7 @@ SOF absorbs that work once and exposes a stable runtime surface.
 That gives you:
 
 - one runtime model across raw shreds and processed provider streams
+- one transaction commitment selector across gossip, trusted raw shreds, gRPC providers, and websocket providers
 - lower-copy, lower-churn hot paths that are already tuned
 - explicit trust modes instead of silent verification shortcuts
 - bounded degradation, health signals, and typed error surfaces
@@ -80,6 +81,16 @@ You can feed SOF from:
 - a custom processed provider producer
 
 And still keep the same local runtime/plugin surface where the semantics line up.
+
+Transaction-family plugins can choose delivery commitment once at the SOF layer:
+
+```rust
+use sof::framework::{PluginConfig, TxCommitmentStatus};
+
+let config = PluginConfig::new()
+    .with_transaction()
+    .at_commitment(TxCommitmentStatus::Confirmed);
+```
 
 ## When SOF Is Fastest
 

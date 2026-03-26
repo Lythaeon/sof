@@ -1149,9 +1149,11 @@ fn process_completed_dataset_with_prefiltered_transactions(
             .zip(end)
             .and_then(|(start, end)| view_batch.payload.get(start..end))?;
         let view = SanitizedTransactionView::try_new_sanitized(bytes, true).ok()?;
-        let prefiltered = context
-            .plugin_host
-            .classify_transaction_view_in_scope(&view, context.transaction_dispatch_scope);
+        let prefiltered = context.plugin_host.classify_transaction_view_in_scope(
+            &view,
+            commitment_status,
+            context.transaction_dispatch_scope,
+        );
         if prefiltered.needs_full_classification {
             return None;
         }

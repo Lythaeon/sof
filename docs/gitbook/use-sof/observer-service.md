@@ -36,7 +36,7 @@ That means your service shape is:
 use async_trait::async_trait;
 use sof::{
     event::TxKind,
-    framework::{Plugin, PluginConfig, PluginHost, TransactionEvent},
+    framework::{Plugin, PluginConfig, PluginHost, TransactionEvent, TxCommitmentStatus},
     runtime::ObserverRuntime,
 };
 
@@ -46,7 +46,9 @@ struct NonVoteLogger;
 #[async_trait]
 impl Plugin for NonVoteLogger {
     fn config(&self) -> PluginConfig {
-        PluginConfig::new().with_transaction()
+        PluginConfig::new()
+            .with_transaction()
+            .at_commitment(TxCommitmentStatus::Confirmed)
     }
 
     async fn on_transaction(&self, event: &TransactionEvent) {
@@ -67,6 +69,9 @@ async fn main() -> Result<(), sof::runtime::RuntimeError> {
         .await
 }
 ```
+
+Use `.at_commitment(...)` when the service should ignore lower-confidence traffic,
+or `.only_at_commitment(...)` when it should react only to one exact commitment.
 
 This is the right first service because it proves all of the important boundaries:
 

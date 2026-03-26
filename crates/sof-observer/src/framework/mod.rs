@@ -50,6 +50,6 @@ pub use extension_host::{
 pub use host::{PluginDispatchMode, PluginHost, PluginHostBuilder, PluginHostStartupError};
 pub use plugin::ObserverPlugin as Plugin;
 pub use plugin::{
-    ObserverPlugin, PluginConfig, PluginContext, PluginSetupError, TransactionDispatchMode,
-    TransactionInterest, TransactionPrefilter,
+    ObserverPlugin, PluginConfig, PluginContext, PluginSetupError, TransactionCommitmentSelector,
+    TransactionDispatchMode, TransactionInterest, TransactionPrefilter,
 };

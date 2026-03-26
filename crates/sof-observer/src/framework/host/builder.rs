@@ -250,6 +250,16 @@ impl PluginHostBuilder {
                 .map(|subscription| subscription.inline_transaction)
                 .collect::<Vec<_>>(),
         );
+        let transaction_plugin_commitments: Arc<
+            [crate::framework::plugin::TransactionCommitmentSelector],
+        > = Arc::from(
+            plugins
+                .iter()
+                .zip(plugin_subscriptions.iter())
+                .filter(|(_plugin, subscription)| subscription.transaction)
+                .map(|(plugin, _subscription)| plugin.config().transaction_commitment)
+                .collect::<Vec<_>>(),
+        );
         let transaction_plugin_prefilters: Arc<[Option<crate::framework::TransactionPrefilter>]> =
             Arc::from(
                 plugins
@@ -266,11 +276,41 @@ impl PluginHostBuilder {
                 .map(|subscription| subscription.inline_transaction_batch)
                 .collect::<Vec<_>>(),
         );
+        let transaction_log_plugin_commitments: Arc<
+            [crate::framework::plugin::TransactionCommitmentSelector],
+        > = Arc::from(
+            plugins
+                .iter()
+                .zip(plugin_subscriptions.iter())
+                .filter(|(_plugin, subscription)| subscription.transaction_log)
+                .map(|(plugin, _subscription)| plugin.config().transaction_commitment)
+                .collect::<Vec<_>>(),
+        );
+        let transaction_batch_plugin_commitments: Arc<
+            [crate::framework::plugin::TransactionCommitmentSelector],
+        > = Arc::from(
+            plugins
+                .iter()
+                .zip(plugin_subscriptions.iter())
+                .filter(|(_plugin, subscription)| subscription.transaction_batch)
+                .map(|(plugin, _subscription)| plugin.config().transaction_commitment)
+                .collect::<Vec<_>>(),
+        );
         let transaction_view_batch_plugin_inline_preferences: Arc<[bool]> = Arc::from(
             plugin_subscriptions
                 .iter()
                 .filter(|subscription| subscription.transaction_view_batch)
                 .map(|subscription| subscription.inline_transaction_view_batch)
+                .collect::<Vec<_>>(),
+        );
+        let transaction_view_batch_plugin_commitments: Arc<
+            [crate::framework::plugin::TransactionCommitmentSelector],
+        > = Arc::from(
+            plugins
+                .iter()
+                .zip(plugin_subscriptions.iter())
+                .filter(|(_plugin, subscription)| subscription.transaction_view_batch)
+                .map(|(plugin, _subscription)| plugin.config().transaction_commitment)
                 .collect::<Vec<_>>(),
         );
         let account_touch_plugins =
@@ -301,6 +341,12 @@ impl PluginHostBuilder {
             shred: !shred_plugins.is_empty(),
             dataset: !dataset_plugins.is_empty(),
             transaction: !transaction_plugins.is_empty(),
+            transaction_min_commitment: transaction_plugin_commitments
+                .iter()
+                .copied()
+                .map(crate::framework::plugin::TransactionCommitmentSelector::minimum_required)
+                .min()
+                .unwrap_or(crate::event::TxCommitmentStatus::Processed),
             transaction_prefilter: transaction_plugin_prefilters.iter().any(Option::is_some),
             transaction_log: !transaction_log_plugins.is_empty(),
             inline_transaction: plugin_subscriptions
@@ -349,12 +395,16 @@ impl PluginHostBuilder {
         PluginHost {
             plugins,
             transaction_plugins,
+            transaction_plugin_commitments,
             transaction_log_plugins,
+            transaction_log_plugin_commitments,
             transaction_plugin_inline_preferences,
             transaction_plugin_prefilters,
             transaction_batch_plugins,
+            transaction_batch_plugin_commitments,
             transaction_batch_plugin_inline_preferences,
             transaction_view_batch_plugins,
+            transaction_view_batch_plugin_commitments,
             transaction_view_batch_plugin_inline_preferences,
             account_touch_plugins,
             dispatcher,

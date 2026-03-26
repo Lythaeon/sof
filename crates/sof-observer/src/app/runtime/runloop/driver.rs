@@ -4478,6 +4478,7 @@ impl PacketWorkerResultContext<'_> {
                                     .map(|view| {
                                         self.plugin_host.classify_transaction_view_in_scope(
                                             &view,
+                                            commitment_status,
                                             TransactionDispatchScope::InlineOnly,
                                         )
                                     });
@@ -5334,6 +5335,7 @@ mod tests {
                             .map(|view| {
                                 plugin_host.classify_transaction_view_in_scope(
                                     &view,
+                                    commitment_status,
                                     TransactionDispatchScope::InlineOnly,
                                 )
                             });
@@ -5503,6 +5505,7 @@ mod tests {
                             .map(|view| {
                                 plugin_host.classify_transaction_view_in_scope(
                                     &view,
+                                    commitment_status,
                                     TransactionDispatchScope::InlineOnly,
                                 )
                             });

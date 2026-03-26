@@ -2097,7 +2097,7 @@ fn dispatch_provider_stream_serialized_transaction(
     derived_state_host: &DerivedStateHost,
     event: &crate::provider_stream::SerializedTransactionEvent,
 ) {
-    let wants_transaction = plugin_host.wants_transaction();
+    let wants_transaction = plugin_host.transaction_enabled_at_commitment(event.commitment_status);
     let wants_recent_blockhash = plugin_host.wants_recent_blockhash();
     let wants_derived_state_transaction = derived_state_host.wants_transaction_applied();
     if !wants_transaction && !wants_recent_blockhash && !wants_derived_state_transaction {
@@ -2107,7 +2107,7 @@ fn dispatch_provider_stream_serialized_transaction(
     let mut signature = event.signature;
     let mut recent_blockhash = None;
     let needs_view_prefilter = wants_transaction
-        && plugin_host.has_transaction_prefilter()
+        && plugin_host.has_transaction_prefilter_at_commitment(event.commitment_status)
         && !wants_derived_state_transaction;
     let should_try_view = wants_recent_blockhash || needs_view_prefilter;
     if should_try_view
@@ -2120,8 +2120,11 @@ fn dispatch_provider_stream_serialized_transaction(
             recent_blockhash = Some(view.recent_blockhash().to_bytes());
         }
         if needs_view_prefilter {
-            let prefiltered = plugin_host
-                .classify_transaction_view_in_scope(&view, TransactionDispatchScope::All);
+            let prefiltered = plugin_host.classify_transaction_view_in_scope(
+                &view,
+                event.commitment_status,
+                TransactionDispatchScope::All,
+            );
             if !prefiltered.needs_full_classification
                 && prefiltered.dispatch.is_empty()
                 && !wants_derived_state_transaction
@@ -2983,7 +2986,8 @@ mod tests {
         derived_state_host: &DerivedStateHost,
         event: &crate::provider_stream::SerializedTransactionEvent,
     ) {
-        let wants_transaction = plugin_host.wants_transaction();
+        let wants_transaction =
+            plugin_host.transaction_enabled_at_commitment(event.commitment_status);
         let wants_recent_blockhash = plugin_host.wants_recent_blockhash();
         let wants_derived_state_transaction = derived_state_host.wants_transaction_applied();
         if !wants_transaction && !wants_recent_blockhash && !wants_derived_state_transaction {
@@ -3002,8 +3006,11 @@ mod tests {
                 recent_blockhash = Some(view.recent_blockhash().to_bytes());
             }
             if wants_transaction {
-                let prefiltered = plugin_host
-                    .classify_transaction_view_in_scope(&view, TransactionDispatchScope::All);
+                let prefiltered = plugin_host.classify_transaction_view_in_scope(
+                    &view,
+                    event.commitment_status,
+                    TransactionDispatchScope::All,
+                );
                 if !prefiltered.needs_full_classification
                     && prefiltered.dispatch.is_empty()
                     && !wants_derived_state_transaction

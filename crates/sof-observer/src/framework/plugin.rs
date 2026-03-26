@@ -310,20 +310,59 @@ pub enum TransactionDispatchMode {
     Inline,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+/// Commitment selector applied to transaction-family plugin hooks.
+pub enum TransactionCommitmentSelector {
+    /// Deliver transactions at or above one minimum commitment.
+    AtLeast(crate::event::TxCommitmentStatus),
+    /// Deliver transactions only at one exact commitment.
+    Only(crate::event::TxCommitmentStatus),
+}
+
+impl Default for TransactionCommitmentSelector {
+    fn default() -> Self {
+        Self::AtLeast(crate::event::TxCommitmentStatus::Processed)
+    }
+}
+
+impl TransactionCommitmentSelector {
+    /// Returns true when one transaction event should be delivered under this selector.
+    #[must_use]
+    pub fn matches(self, commitment_status: crate::event::TxCommitmentStatus) -> bool {
+        match self {
+            Self::AtLeast(minimum) => commitment_status.satisfies_minimum(minimum),
+            Self::Only(expected) => commitment_status == expected,
+        }
+    }
+
+    /// Returns the lowest commitment this selector can ever accept.
+    #[must_use]
+    pub const fn minimum_required(self) -> crate::event::TxCommitmentStatus {
+        match self {
+            Self::AtLeast(minimum) | Self::Only(minimum) => minimum,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 /// Static hook subscriptions requested by one plugin during host construction.
 ///
 /// # Examples
 ///
 /// ```rust
-/// use sof::framework::{PluginConfig, TransactionDispatchMode};
+/// use sof::framework::{PluginConfig, TransactionDispatchMode, TxCommitmentStatus};
 ///
 /// let config = PluginConfig::new()
 ///     .with_transaction_mode(TransactionDispatchMode::Inline)
+///     .at_commitment(TxCommitmentStatus::Confirmed)
 ///     .with_recent_blockhash()
 ///     .with_leader_schedule();
 ///
 /// assert!(config.transaction);
+/// assert_eq!(
+///     config.transaction_commitment,
+///     sof::framework::TransactionCommitmentSelector::AtLeast(TxCommitmentStatus::Confirmed)
+/// );
 /// assert!(config.recent_blockhash);
 /// assert!(config.leader_schedule);
 /// ```
@@ -338,6 +377,8 @@ pub struct PluginConfig {
     pub transaction: bool,
     /// Enables `on_transaction_log`.
     pub transaction_log: bool,
+    /// Commitment selector applied to transaction-family hooks.
+    pub transaction_commitment: TransactionCommitmentSelector,
     /// Requested delivery path for `on_transaction`.
     pub transaction_dispatch_mode: TransactionDispatchMode,
     /// Enables `on_transaction_batch`.
@@ -404,6 +445,29 @@ impl PluginConfig {
     #[must_use]
     pub const fn with_transaction(mut self) -> Self {
         self.transaction = true;
+        self
+    }
+
+    /// Sets the minimum commitment required before transaction-family hooks are delivered.
+    ///
+    /// This applies uniformly to:
+    /// - `on_transaction`
+    /// - `on_transaction_log`
+    /// - `on_transaction_batch`
+    /// - `on_transaction_view_batch`
+    #[must_use]
+    pub const fn at_commitment(mut self, commitment: crate::event::TxCommitmentStatus) -> Self {
+        self.transaction_commitment = TransactionCommitmentSelector::AtLeast(commitment);
+        self
+    }
+
+    /// Delivers transaction-family hooks only at one exact commitment.
+    #[must_use]
+    pub const fn only_at_commitment(
+        mut self,
+        commitment: crate::event::TxCommitmentStatus,
+    ) -> Self {
+        self.transaction_commitment = TransactionCommitmentSelector::Only(commitment);
         self
     }
 

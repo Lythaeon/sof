@@ -301,25 +301,39 @@ pub(super) struct ClassifiedTransactionBatchDispatch;
 impl ClassifiedTransactionBatchDispatch {
     /// Builds one shared batch dispatch only when at least one plugin subscribed.
     pub(super) fn from_plugins(
-        plugins: Arc<[Arc<dyn ObserverPlugin>]>,
+        plugins: &[Arc<dyn ObserverPlugin>],
+        commitment_selectors: &[crate::framework::plugin::TransactionCommitmentSelector],
         inline_preferences: &[bool],
         event: crate::framework::TransactionBatchEvent,
         completed_at: Instant,
     ) -> Option<AcceptedTransactionBatchDispatch> {
-        match plugins.len() {
+        let selected_indices: SmallVec<[usize; 4]> = commitment_selectors
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(index, selector)| {
+                selector.matches(event.commitment_status).then_some(index)
+            })
+            .collect();
+        match selected_indices.len() {
             0 => None,
             1 => Some(AcceptedTransactionBatchDispatch::Single {
-                plugin: Arc::clone(plugins.first()?),
+                plugin: Arc::clone(plugins.get(*selected_indices.first()?)?),
                 event,
                 completed_at,
             }),
             _ => Some(AcceptedTransactionBatchDispatch::Multi {
-                plugins,
+                plugins: Arc::from(
+                    selected_indices
+                        .iter()
+                        .filter_map(|index| plugins.get(*index).cloned())
+                        .collect::<Vec<_>>(),
+                ),
                 event: Arc::new(event),
                 completed_at,
-                prefers_inline: inline_preferences
+                prefers_inline: selected_indices
                     .iter()
-                    .all(|prefers_inline| *prefers_inline),
+                    .all(|index| inline_preferences.get(*index).copied().unwrap_or(false)),
             }),
         }
     }
@@ -331,25 +345,39 @@ pub(super) struct ClassifiedTransactionViewBatchDispatch;
 impl ClassifiedTransactionViewBatchDispatch {
     /// Builds one shared view-batch dispatch only when at least one plugin subscribed.
     pub(super) fn from_plugins(
-        plugins: Arc<[Arc<dyn ObserverPlugin>]>,
+        plugins: &[Arc<dyn ObserverPlugin>],
+        commitment_selectors: &[crate::framework::plugin::TransactionCommitmentSelector],
         inline_preferences: &[bool],
         event: crate::framework::TransactionViewBatchEvent,
         completed_at: Instant,
     ) -> Option<AcceptedTransactionViewBatchDispatch> {
-        match plugins.len() {
+        let selected_indices: SmallVec<[usize; 4]> = commitment_selectors
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(index, selector)| {
+                selector.matches(event.commitment_status).then_some(index)
+            })
+            .collect();
+        match selected_indices.len() {
             0 => None,
             1 => Some(AcceptedTransactionViewBatchDispatch::Single {
-                plugin: Arc::clone(plugins.first()?),
+                plugin: Arc::clone(plugins.get(*selected_indices.first()?)?),
                 event,
                 completed_at,
             }),
             _ => Some(AcceptedTransactionViewBatchDispatch::Multi {
-                plugins,
+                plugins: Arc::from(
+                    selected_indices
+                        .iter()
+                        .filter_map(|index| plugins.get(*index).cloned())
+                        .collect::<Vec<_>>(),
+                ),
                 event: Arc::new(event),
                 completed_at,
-                prefers_inline: inline_preferences
+                prefers_inline: selected_indices
                     .iter()
-                    .all(|prefers_inline| *prefers_inline),
+                    .all(|index| inline_preferences.get(*index).copied().unwrap_or(false)),
             }),
         }
     }
@@ -957,12 +985,15 @@ pub(super) enum SelectedTransactionLogDispatch {
 impl SelectedTransactionLogDispatch {
     pub(super) fn from_plugins(
         plugins: &[Arc<dyn ObserverPlugin>],
+        commitment_selectors: &[crate::framework::plugin::TransactionCommitmentSelector],
         event: crate::framework::TransactionLogEvent,
     ) -> Option<Self> {
         let interested: SmallVec<[Arc<dyn ObserverPlugin>; 4]> = plugins
             .iter()
-            .filter(|plugin| plugin.accepts_transaction_log(&event))
-            .cloned()
+            .zip(commitment_selectors.iter().copied())
+            .filter(|(_plugin, selector)| selector.matches(event.commitment_status))
+            .filter(|(plugin, _selector)| plugin.accepts_transaction_log(&event))
+            .map(|(plugin, _minimum)| Arc::clone(plugin))
             .collect();
         match interested.len() {
             0 => None,

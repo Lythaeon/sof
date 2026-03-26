@@ -8,14 +8,16 @@ use solana_signature::Signature;
 use solana_signer::Signer as _;
 use solana_transaction::Transaction;
 use std::{
-    sync::atomic::{AtomicBool, AtomicUsize},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 
 use crate::event::TxKind;
 use crate::framework::{
-    PluginConfig, PluginContext, PluginSetupError, TransactionDispatchMode, TransactionEventRef,
-    TransactionInterest, TransactionLogEvent, TransactionPrefilter, TxCommitmentStatus,
+    PluginConfig, PluginContext, PluginSetupError, SerializedTransactionRange,
+    TransactionBatchEvent, TransactionDispatchMode, TransactionEvent, TransactionEventRef,
+    TransactionInterest, TransactionLogEvent, TransactionPrefilter, TransactionViewBatchEvent,
+    TxCommitmentStatus,
 };
 
 #[derive(Clone, Copy)]
@@ -932,8 +934,11 @@ fn transaction_prefilter_view_classification_matches_decoded() {
 
     let decoded =
         host.classify_transaction_ref_in_scope(event, TransactionDispatchScope::InlineOnly);
-    let viewed =
-        host.classify_transaction_view_in_scope(&view, TransactionDispatchScope::InlineOnly);
+    let viewed = host.classify_transaction_view_in_scope(
+        &view,
+        TxCommitmentStatus::Processed,
+        TransactionDispatchScope::InlineOnly,
+    );
 
     assert!(!viewed.needs_full_classification);
     assert_eq!(decoded.is_empty(), viewed.dispatch.is_empty());
@@ -967,12 +972,266 @@ fn transaction_view_prefilter_marks_manual_plugins_for_full_decode() {
 
     let decoded =
         host.classify_transaction_ref_in_scope(event, TransactionDispatchScope::InlineOnly);
-    let viewed =
-        host.classify_transaction_view_in_scope(&view, TransactionDispatchScope::InlineOnly);
+    let viewed = host.classify_transaction_view_in_scope(
+        &view,
+        TxCommitmentStatus::Processed,
+        TransactionDispatchScope::InlineOnly,
+    );
 
     assert!(viewed.needs_full_classification);
     assert!(viewed.dispatch.is_empty());
     assert!(!decoded.is_empty());
+}
+
+#[test]
+fn transaction_commitment_selector_filters_transaction_dispatch() {
+    struct ConfirmedTransactionPlugin {
+        counter: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ObserverPlugin for ConfirmedTransactionPlugin {
+        fn config(&self) -> PluginConfig {
+            PluginConfig::new()
+                .with_transaction()
+                .at_commitment(TxCommitmentStatus::Confirmed)
+        }
+
+        async fn on_transaction(&self, _event: &TransactionEvent) {
+            self.counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let host = PluginHostBuilder::new()
+        .add_plugin(ConfirmedTransactionPlugin {
+            counter: Arc::clone(&counter),
+        })
+        .build();
+
+    let mut processed = test_transaction_event(10);
+    processed.commitment_status = TxCommitmentStatus::Processed;
+    host.on_transaction(processed);
+
+    let mut confirmed = test_transaction_event(11);
+    confirmed.commitment_status = TxCommitmentStatus::Confirmed;
+    host.on_transaction(confirmed);
+
+    assert!(wait_until_counter(
+        counter.as_ref(),
+        1,
+        Duration::from_secs(2)
+    ));
+}
+
+#[test]
+fn transaction_commitment_selector_only_matches_exact_commitment() {
+    struct ConfirmedOnlyTransactionPlugin {
+        counter: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ObserverPlugin for ConfirmedOnlyTransactionPlugin {
+        fn config(&self) -> PluginConfig {
+            PluginConfig::new()
+                .with_transaction()
+                .only_at_commitment(TxCommitmentStatus::Confirmed)
+        }
+
+        async fn on_transaction(&self, _event: &TransactionEvent) {
+            self.counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let host = PluginHostBuilder::new()
+        .add_plugin(ConfirmedOnlyTransactionPlugin {
+            counter: Arc::clone(&counter),
+        })
+        .build();
+
+    let mut finalized = test_transaction_event(12);
+    finalized.commitment_status = TxCommitmentStatus::Finalized;
+    host.on_transaction(finalized);
+
+    let mut confirmed = test_transaction_event(13);
+    confirmed.commitment_status = TxCommitmentStatus::Confirmed;
+    host.on_transaction(confirmed);
+
+    assert!(wait_until_counter(
+        counter.as_ref(),
+        1,
+        Duration::from_secs(2)
+    ));
+}
+
+#[test]
+fn transaction_log_commitment_selector_filters_dispatch() {
+    struct ConfirmedLogPlugin {
+        counter: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ObserverPlugin for ConfirmedLogPlugin {
+        fn config(&self) -> PluginConfig {
+            PluginConfig {
+                transaction_log: true,
+                ..PluginConfig::new().at_commitment(TxCommitmentStatus::Confirmed)
+            }
+        }
+
+        async fn on_transaction_log(&self, _event: &TransactionLogEvent) {
+            self.counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let host = PluginHostBuilder::new()
+        .add_plugin(ConfirmedLogPlugin {
+            counter: Arc::clone(&counter),
+        })
+        .build();
+
+    host.on_transaction_log(TransactionLogEvent {
+        slot: 10,
+        commitment_status: TxCommitmentStatus::Processed,
+        signature: Signature::from([10_u8; 64]),
+        err: None,
+        logs: Arc::from(Vec::<String>::new()),
+        matched_filter: None,
+    });
+    host.on_transaction_log(TransactionLogEvent {
+        slot: 11,
+        commitment_status: TxCommitmentStatus::Confirmed,
+        signature: Signature::from([11_u8; 64]),
+        err: None,
+        logs: Arc::from(Vec::<String>::new()),
+        matched_filter: None,
+    });
+
+    assert!(wait_until_counter(
+        counter.as_ref(),
+        1,
+        Duration::from_secs(2)
+    ));
+}
+
+#[test]
+fn transaction_batch_and_view_commitment_selector_filter_dispatch() {
+    struct ConfirmedBatchPlugin {
+        batch_counter: Arc<AtomicUsize>,
+        view_counter: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ObserverPlugin for ConfirmedBatchPlugin {
+        fn config(&self) -> PluginConfig {
+            PluginConfig::new()
+                .at_commitment(TxCommitmentStatus::Confirmed)
+                .with_transaction_batch()
+                .with_transaction_view_batch()
+        }
+
+        async fn on_transaction_batch(&self, _event: &TransactionBatchEvent) {
+            self.batch_counter.fetch_add(1, Ordering::Relaxed);
+        }
+
+        async fn on_transaction_view_batch(&self, _event: &TransactionViewBatchEvent) {
+            self.view_counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let batch_counter = Arc::new(AtomicUsize::new(0));
+    let view_counter = Arc::new(AtomicUsize::new(0));
+    let host = PluginHostBuilder::new()
+        .add_plugin(ConfirmedBatchPlugin {
+            batch_counter: Arc::clone(&batch_counter),
+            view_counter: Arc::clone(&view_counter),
+        })
+        .build();
+
+    let tx = test_transaction_with_static_accounts([Pubkey::new_unique(), Pubkey::new_unique()]);
+    let payload = bincode::serialize(&tx).expect("serialize transaction");
+    let payload_len = payload.len();
+
+    host.on_transaction_batch(
+        TransactionBatchEvent {
+            slot: 20,
+            start_index: 0,
+            end_index: 0,
+            last_in_slot: false,
+            shreds: 1,
+            payload_len,
+            commitment_status: TxCommitmentStatus::Processed,
+            confirmed_slot: None,
+            finalized_slot: None,
+            transactions: Arc::from(vec![tx.clone()].into_boxed_slice()),
+        },
+        Instant::now(),
+    );
+    host.on_transaction_view_batch(
+        TransactionViewBatchEvent {
+            slot: 20,
+            start_index: 0,
+            end_index: 0,
+            last_in_slot: false,
+            shreds: 1,
+            payload_len,
+            commitment_status: TxCommitmentStatus::Processed,
+            confirmed_slot: None,
+            finalized_slot: None,
+            payload: Arc::from(payload.clone().into_boxed_slice()),
+            transactions: Arc::from(
+                vec![SerializedTransactionRange::new(0, payload_len as u32)].into_boxed_slice(),
+            ),
+        },
+        Instant::now(),
+    );
+
+    host.on_transaction_batch(
+        TransactionBatchEvent {
+            slot: 21,
+            start_index: 0,
+            end_index: 0,
+            last_in_slot: false,
+            shreds: 1,
+            payload_len,
+            commitment_status: TxCommitmentStatus::Confirmed,
+            confirmed_slot: Some(21),
+            finalized_slot: None,
+            transactions: Arc::from(vec![tx].into_boxed_slice()),
+        },
+        Instant::now(),
+    );
+    host.on_transaction_view_batch(
+        TransactionViewBatchEvent {
+            slot: 21,
+            start_index: 0,
+            end_index: 0,
+            last_in_slot: false,
+            shreds: 1,
+            payload_len,
+            commitment_status: TxCommitmentStatus::Confirmed,
+            confirmed_slot: Some(21),
+            finalized_slot: None,
+            payload: Arc::from(payload.into_boxed_slice()),
+            transactions: Arc::from(
+                vec![SerializedTransactionRange::new(0, payload_len as u32)].into_boxed_slice(),
+            ),
+        },
+        Instant::now(),
+    );
+
+    assert!(wait_until_counter(
+        batch_counter.as_ref(),
+        1,
+        Duration::from_secs(2),
+    ));
+    assert!(wait_until_counter(
+        view_counter.as_ref(),
+        1,
+        Duration::from_secs(2),
+    ));
 }
 
 #[test]

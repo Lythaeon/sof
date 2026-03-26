@@ -137,6 +137,8 @@ struct PluginHookSubscriptions {
     dataset: bool,
     /// At least one plugin wants transaction callbacks.
     transaction: bool,
+    /// Lowest commitment required by any transaction subscriber.
+    transaction_min_commitment: crate::event::TxCommitmentStatus,
     /// At least one transaction plugin exposes a compiled prefilter.
     transaction_prefilter: bool,
     /// At least one plugin wants transaction-log callbacks.
@@ -172,6 +174,7 @@ impl From<&PluginConfig> for PluginHookSubscriptions {
             shred: config.shred,
             dataset: config.dataset,
             transaction: config.transaction,
+            transaction_min_commitment: config.transaction_commitment.minimum_required(),
             transaction_prefilter: false,
             transaction_log: config.transaction_log,
             inline_transaction: config.transaction

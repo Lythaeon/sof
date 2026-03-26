@@ -24,9 +24,17 @@ Preferred style for sparse plugin configs:
 
 ```rust
 fn config(&self) -> PluginConfig {
-    PluginConfig::new().with_transaction().with_dataset()
+    PluginConfig::new()
+        .with_transaction()
+        .at_commitment(TxCommitmentStatus::Confirmed)
+        .with_dataset()
 }
 ```
+
+Transaction-family hooks support both threshold and exact commitment selection:
+
+- `.at_commitment(TxCommitmentStatus::Confirmed)`
+- `.only_at_commitment(TxCommitmentStatus::Finalized)`
 
 When many flags are enabled, raw struct syntax is also fine:
 

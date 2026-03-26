@@ -32,7 +32,7 @@
 //! use async_trait::async_trait;
 //! use sof::{
 //!     event::TxKind,
-//!     framework::{ObserverPlugin, PluginConfig, PluginHost, TransactionEvent},
+//!     framework::{ObserverPlugin, PluginConfig, PluginHost, TransactionEvent, TxCommitmentStatus},
 //!     runtime::ObserverRuntime,
 //! };
 //!
@@ -42,7 +42,9 @@
 //! #[async_trait]
 //! impl ObserverPlugin for NonVoteLogger {
 //!     fn config(&self) -> PluginConfig {
-//!         PluginConfig::new().with_transaction()
+//!         PluginConfig::new()
+//!             .with_transaction()
+//!             .at_commitment(TxCommitmentStatus::Confirmed)
 //!     }
 //!
 //!     async fn on_transaction(&self, event: &TransactionEvent) {
@@ -72,6 +74,7 @@
 //!     event::TxKind,
 //!     framework::{
 //!         ObserverPlugin, PluginConfig, PluginHost, TransactionDispatchMode, TransactionEvent,
+//!         TxCommitmentStatus,
 //!     },
 //!     runtime::ObserverRuntime,
 //! };
@@ -82,7 +85,9 @@
 //! #[async_trait]
 //! impl ObserverPlugin for InlineTxLogger {
 //!     fn config(&self) -> PluginConfig {
-//!         PluginConfig::new().with_transaction_mode(TransactionDispatchMode::Inline)
+//!         PluginConfig::new()
+//!             .with_transaction_mode(TransactionDispatchMode::Inline)
+//!             .at_commitment(TxCommitmentStatus::Processed)
 //!     }
 //!
 //!     async fn on_transaction(&self, event: &TransactionEvent) {
