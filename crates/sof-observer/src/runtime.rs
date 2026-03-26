@@ -1,6 +1,13 @@
 #![allow(clippy::missing_docs_in_private_items)]
 
-use std::{future::Future, net::SocketAddr, path::PathBuf, pin::Pin, time::Instant};
+use std::{
+    collections::{HashSet, VecDeque},
+    future::Future,
+    net::SocketAddr,
+    path::PathBuf,
+    pin::Pin,
+    time::Instant,
+};
 
 use crate::framework::host::TransactionDispatchScope;
 use crate::framework::{
@@ -14,10 +21,12 @@ use sof_gossip_tuning::{
     QueueCapacity, ReceiverCoalesceWindow, RuntimeTuningPort, SofRuntimeTuning,
     TvuReceiveSocketCount,
 };
+use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 use thiserror::Error;
 
 type ShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+const PROVIDER_REPLAY_DEDUPE_CAPACITY: usize = 65_536;
 
 /// Public runtime error surface for packaged SOF entrypoints.
 #[derive(Debug, Error)]
@@ -1557,6 +1566,7 @@ async fn run_provider_stream_runtime(
     tracing::info!(mode = mode.as_str(), "starting SOF provider-stream runtime");
 
     let mut shutdown_signal = shutdown_signal;
+    let mut replay_dedupe = ProviderReplayDedupe::new(PROVIDER_REPLAY_DEDUPE_CAPACITY);
     loop {
         tokio::select! {
             () = async {
@@ -1572,6 +1582,9 @@ async fn run_provider_stream_runtime(
                 let Some(update) = update else {
                     break;
                 };
+                if replay_dedupe.observe(&update) {
+                    continue;
+                }
                 dispatch_provider_stream_update(&plugin_host, &derived_state_host, update);
             }
         }
@@ -1581,6 +1594,53 @@ async fn run_provider_stream_runtime(
     extension_host.shutdown().await;
     tracing::info!(mode = mode.as_str(), "SOF provider-stream runtime stopped");
     Ok(())
+}
+
+#[derive(Default)]
+struct ProviderReplayDedupe {
+    seen: HashSet<(u64, Signature)>,
+    order: VecDeque<(u64, Signature)>,
+    capacity: usize,
+}
+
+impl ProviderReplayDedupe {
+    fn new(capacity: usize) -> Self {
+        Self {
+            seen: HashSet::with_capacity(capacity),
+            order: VecDeque::with_capacity(capacity),
+            capacity: capacity.max(1),
+        }
+    }
+
+    fn observe(&mut self, update: &ProviderStreamUpdate) -> bool {
+        let Some(key) = provider_replay_dedupe_key(update) else {
+            return false;
+        };
+        if self.seen.contains(&key) {
+            return true;
+        }
+        self.seen.insert(key);
+        self.order.push_back(key);
+        if self.order.len() > self.capacity
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.seen.remove(&oldest);
+        }
+        false
+    }
+}
+
+fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<(u64, Signature)> {
+    match update {
+        ProviderStreamUpdate::Transaction(event) => event
+            .signature
+            .or_else(|| event.tx.signatures.first().copied())
+            .map(|signature| (event.slot, signature)),
+        ProviderStreamUpdate::SerializedTransaction(event) => {
+            event.signature.map(|signature| (event.slot, signature))
+        }
+        _ => None,
+    }
 }
 
 fn dispatch_provider_stream_update(
@@ -2787,6 +2847,24 @@ mod tests {
         );
         crate::runtime_env::clear_runtime_env_overrides();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn provider_replay_dedupe_skips_duplicate_transaction_updates() {
+        let update = sample_provider_transaction_update();
+        let mut dedupe = ProviderReplayDedupe::new(8);
+
+        assert!(!dedupe.observe(&update));
+        assert!(dedupe.observe(&update));
+    }
+
+    #[test]
+    fn provider_replay_dedupe_skips_duplicate_serialized_transaction_updates() {
+        let update = sample_serialized_provider_transaction_update();
+        let mut dedupe = ProviderReplayDedupe::new(8);
+
+        assert!(!dedupe.observe(&update));
+        assert!(dedupe.observe(&update));
     }
 
     #[tokio::test]

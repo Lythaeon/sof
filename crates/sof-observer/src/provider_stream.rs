@@ -62,20 +62,16 @@
 use tokio::sync::mpsc;
 
 use crate::event::TxCommitmentStatus;
-#[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
 use crate::event::TxKind;
 use crate::framework::{
     ClusterTopologyEvent, ObservedRecentBlockhashEvent, SlotStatusEvent, TransactionEvent,
     TransactionLogEvent, TransactionViewBatchEvent,
 };
-#[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
 use agave_transaction_view::{
     transaction_data::TransactionData, transaction_view::SanitizedTransactionView,
 };
-#[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
 use solana_sdk_ids::{compute_budget, vote};
 use solana_signature::Signature;
-#[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
 use solana_transaction::versioned::VersionedTransaction;
 
 /// Default queue capacity for processed provider-stream ingress.
@@ -275,7 +271,6 @@ pub fn create_provider_stream_queue(
     mpsc::channel(capacity.max(1))
 }
 
-#[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
 /// Classifies provider-fed transactions consistently across built-in adapters.
 pub(crate) fn classify_provider_transaction_kind(tx: &VersionedTransaction) -> TxKind {
     let mut has_vote = false;
@@ -307,7 +302,6 @@ pub(crate) fn classify_provider_transaction_kind(tx: &VersionedTransaction) -> T
     }
 }
 
-#[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
 pub(crate) fn classify_provider_transaction_kind_view<D: TransactionData>(
     view: &SanitizedTransactionView<D>,
 ) -> TxKind {

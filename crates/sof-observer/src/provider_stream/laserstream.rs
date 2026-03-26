@@ -7,7 +7,11 @@
 //! surface: commitment, signature, vote/failed flags, and account
 //! include/exclude/required filters.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use futures_util::StreamExt;
 use helius_laserstream::{
@@ -87,8 +91,10 @@ pub struct LaserStreamConfig {
     account_required: Vec<Pubkey>,
     connect_timeout: Option<Duration>,
     timeout: Option<Duration>,
+    stall_timeout: Option<Duration>,
     max_decoding_message_size: Option<usize>,
     max_encoding_message_size: Option<usize>,
+    reconnect_delay: Duration,
     max_reconnect_attempts: Option<u32>,
     replay_mode: ProviderReplayMode,
 }
@@ -124,8 +130,10 @@ impl LaserStreamConfig {
             account_required: Vec::new(),
             connect_timeout: Some(Duration::from_secs(10)),
             timeout: Some(Duration::from_secs(30)),
+            stall_timeout: Some(Duration::from_secs(30)),
             max_decoding_message_size: Some(64 * 1024 * 1024),
             max_encoding_message_size: None,
+            reconnect_delay: Duration::from_secs(1),
             max_reconnect_attempts: None,
             replay_mode: ProviderReplayMode::Resume,
         }
@@ -209,6 +217,13 @@ impl LaserStreamConfig {
         self
     }
 
+    /// Sets the idle watchdog timeout for one stream session.
+    #[must_use]
+    pub const fn with_stall_timeout(mut self, timeout: Duration) -> Self {
+        self.stall_timeout = Some(timeout);
+        self
+    }
+
     /// Sets the max decoding message size.
     #[must_use]
     pub const fn with_max_decoding_message_size(mut self, bytes: usize) -> Self {
@@ -227,6 +242,13 @@ impl LaserStreamConfig {
     #[must_use]
     pub const fn with_max_reconnect_attempts(mut self, attempts: u32) -> Self {
         self.max_reconnect_attempts = Some(attempts);
+        self
+    }
+
+    /// Sets the reconnect backoff used after stream failures.
+    #[must_use]
+    pub const fn with_reconnect_delay(mut self, delay: Duration) -> Self {
+        self.reconnect_delay = delay;
         self
     }
 
@@ -314,6 +336,9 @@ pub enum LaserStreamError {
     /// Provider update could not be converted into a SOF event.
     #[error("laserstream transaction conversion failed: {0}")]
     Convert(&'static str),
+    /// LaserStream protocol/runtime failure.
+    #[error("laserstream protocol error: {0}")]
+    Protocol(String),
     /// Provider-stream queue is closed.
     #[error("provider-stream queue closed")]
     QueueClosed,
@@ -347,50 +372,122 @@ pub fn spawn_laserstream_transaction_source(
     config: &LaserStreamConfig,
     sender: ProviderStreamSender,
 ) -> JoinHandle<Result<(), LaserStreamError>> {
+    let config = config.clone();
+    tokio::spawn(async move {
+        preflight_laserstream_connection(&config);
+        let mut attempts = 0_u32;
+        loop {
+            let mut session_established = false;
+            match run_laserstream_transaction_connection(&config, &sender, &mut session_established)
+                .await
+            {
+                Ok(()) => {
+                    tracing::warn!(
+                        endpoint = config.endpoint(),
+                        "provider stream laserstream session ended unexpectedly; reconnecting"
+                    );
+                }
+                Err(LaserStreamError::QueueClosed) => {
+                    return Err(LaserStreamError::QueueClosed);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        endpoint = config.endpoint(),
+                        "provider stream laserstream session ended; reconnecting"
+                    );
+                }
+            }
+            if session_established {
+                attempts = 0;
+            } else {
+                attempts = attempts.saturating_add(1);
+            }
+            if let Some(max_attempts) = config.max_reconnect_attempts
+                && attempts >= max_attempts
+            {
+                return Err(LaserStreamError::Protocol(format!(
+                    "exhausted laserstream reconnect attempts after {attempts} failures"
+                )));
+            }
+            tokio::time::sleep(config.reconnect_delay).await;
+        }
+    })
+}
+
+async fn run_laserstream_transaction_connection(
+    config: &LaserStreamConfig,
+    sender: &ProviderStreamSender,
+    session_established: &mut bool,
+) -> Result<(), LaserStreamError> {
+    *session_established = false;
     let commitment = config.commitment.as_tx_commitment();
     let request = config.subscribe_request();
     let (stream, _handle) = subscribe(config.client_config(), request);
-    tokio::spawn(async move {
-        tokio::pin!(stream);
-        let mut watermarks = ProviderCommitmentWatermarks::default();
-        while let Some(update) = stream.next().await {
-            let update = update?;
-            match update.update_oneof {
-                Some(grpc::subscribe_update::UpdateOneof::Slot(slot_update)) => {
-                    if update
-                        .filters
-                        .iter()
-                        .any(|filter| filter == INTERNAL_WATERMARK_SLOT_FILTER)
-                    {
-                        match grpc::SlotStatus::try_from(slot_update.status).ok() {
-                            Some(grpc::SlotStatus::SlotConfirmed) => {
-                                watermarks.observe_confirmed_slot(slot_update.slot);
+    tokio::pin!(stream);
+    *session_established = true;
+    let mut watermarks = ProviderCommitmentWatermarks::default();
+    let mut last_progress = Instant::now();
+    loop {
+        tokio::select! {
+            () = async {
+                if let Some(timeout) = config.stall_timeout {
+                    tokio::time::sleep_until((last_progress + timeout).into()).await;
+                } else {
+                    futures_util::future::pending::<()>().await;
+                }
+            } => {
+                return Err(LaserStreamError::Protocol(
+                    "laserstream stream stalled without inbound progress".to_owned(),
+                ));
+            }
+            maybe_update = stream.next() => {
+                let Some(update) = maybe_update else {
+                    return Ok(());
+                };
+                let update = update?;
+                last_progress = Instant::now();
+                match update.update_oneof {
+                    Some(grpc::subscribe_update::UpdateOneof::Slot(slot_update)) => {
+                        if update
+                            .filters
+                            .iter()
+                            .any(|filter| filter == INTERNAL_WATERMARK_SLOT_FILTER)
+                        {
+                            match grpc::SlotStatus::try_from(slot_update.status).ok() {
+                                Some(grpc::SlotStatus::SlotConfirmed) => {
+                                    watermarks.observe_confirmed_slot(slot_update.slot);
+                                }
+                                Some(grpc::SlotStatus::SlotFinalized) => {
+                                    watermarks.observe_finalized_slot(slot_update.slot);
+                                }
+                                _ => {}
                             }
-                            Some(grpc::SlotStatus::SlotFinalized) => {
-                                watermarks.observe_finalized_slot(slot_update.slot);
-                            }
-                            _ => {}
                         }
                     }
+                    Some(grpc::subscribe_update::UpdateOneof::Transaction(tx_update)) => {
+                        watermarks.observe_transaction_commitment(tx_update.slot, commitment);
+                        let event = transaction_event_from_update(
+                            tx_update.slot,
+                            tx_update.transaction,
+                            commitment,
+                            watermarks,
+                        )?;
+                        sender
+                            .send(ProviderStreamUpdate::Transaction(event))
+                            .await
+                            .map_err(|_error| LaserStreamError::QueueClosed)?;
+                    }
+                    _ => {}
                 }
-                Some(grpc::subscribe_update::UpdateOneof::Transaction(tx_update)) => {
-                    watermarks.observe_transaction_commitment(tx_update.slot, commitment);
-                    let event = transaction_event_from_update(
-                        tx_update.slot,
-                        tx_update.transaction,
-                        commitment,
-                        watermarks,
-                    )?;
-                    sender
-                        .send(ProviderStreamUpdate::Transaction(event))
-                        .await
-                        .map_err(|_error| LaserStreamError::QueueClosed)?;
-                }
-                _ => {}
             }
         }
-        Ok(())
-    })
+    }
+}
+
+fn preflight_laserstream_connection(config: &LaserStreamConfig) {
+    let request = config.subscribe_request();
+    let _ = subscribe(config.client_config(), request);
 }
 
 fn transaction_event_from_update(

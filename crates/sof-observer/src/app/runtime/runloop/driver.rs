@@ -14,6 +14,7 @@ use crate::framework::{SerializedTransactionRange, TransactionEvent, events::Tra
 use crate::reassembly::dataset::CompletedDataSet;
 use crate::reassembly::inline::InlineContiguousDataSetSink;
 use crate::relay::CacheInsertOutcome;
+use crate::runtime::ShredTrustMode;
 use agave_transaction_view::transaction_view::SanitizedTransactionView;
 use crossbeam_channel::Sender as CrossbeamSender;
 use solana_signature::Signature;
@@ -820,9 +821,28 @@ async fn run_async_with_hosts_inner(
     if !live_shreds_enabled && verify_enabled {
         tracing::warn!("SOF_VERIFY_SHREDS=true ignored because SOF_LIVE_SHREDS_ENABLED=false");
     }
+    let shred_trust_mode = read_shred_trust_mode();
+    if live_shreds_enabled
+        && !verify_enabled
+        && matches!(shred_trust_mode, ShredTrustMode::TrustedRawShredProvider)
+    {
+        tracing::warn!(
+            trust_mode = shred_trust_mode.as_str(),
+            "running raw-shred ingest with local shred verification disabled; this mode assumes an authenticated trusted upstream"
+        );
+    }
     let verify_enabled = live_shreds_enabled && verify_enabled;
     let verify_strict_unknown = read_verify_strict_unknown();
     let verify_recovered_shreds = read_verify_recovered_shreds();
+    if live_shreds_enabled
+        && !verify_recovered_shreds
+        && matches!(shred_trust_mode, ShredTrustMode::TrustedRawShredProvider)
+    {
+        tracing::warn!(
+            trust_mode = shred_trust_mode.as_str(),
+            "running raw-shred ingest with recovered shred verification disabled; this mode assumes an authenticated trusted upstream"
+        );
+    }
     let verify_signature_cache_entries = read_verify_signature_cache_entries();
     let verify_unknown_retry = Duration::from_millis(read_verify_unknown_retry_ms());
     let dedupe_capacity = read_shred_dedupe_capacity();

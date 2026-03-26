@@ -665,14 +665,11 @@ async fn replay_websocket_gap(
 
     let client = reqwest::Client::new();
     let head = rpc_get_slot(&client, &http_endpoint, config.commitment).await?;
-    if head <= previous_slot {
+    if head < previous_slot {
         return Ok(());
     }
 
-    let start_slot = previous_slot.saturating_add(1).max(
-        head.saturating_add(1)
-            .saturating_sub(config.replay_max_slots.max(1)),
-    );
+    let start_slot = websocket_replay_start_slot(previous_slot, head, config.replay_max_slots);
     for slot in start_slot..=head {
         let Some(block) = rpc_get_block(&client, &http_endpoint, slot, config.commitment).await?
         else {
@@ -722,6 +719,13 @@ async fn replay_websocket_gap(
         }
     }
     Ok(())
+}
+
+fn websocket_replay_start_slot(previous_slot: u64, head: u64, replay_max_slots: u64) -> u64 {
+    previous_slot.max(
+        head.saturating_add(1)
+            .saturating_sub(replay_max_slots.max(1)),
+    )
 }
 
 fn websocket_http_endpoint(config: &WebsocketTransactionConfig) -> Option<String> {
@@ -1128,6 +1132,12 @@ mod tests {
             websocket_http_endpoint(&config).as_deref(),
             Some("https://example.invalid/?api-key=1")
         );
+    }
+
+    #[test]
+    fn websocket_replay_start_slot_includes_last_seen_slot() {
+        assert_eq!(websocket_replay_start_slot(55, 55, 128), 55);
+        assert_eq!(websocket_replay_start_slot(55, 60, 128), 55);
     }
 
     #[test]
