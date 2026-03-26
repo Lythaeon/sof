@@ -25,24 +25,36 @@ pub(crate) async fn maybe_switch_gossip_runtime(
     if candidate_pool.len() <= 1 {
         return Ok(None);
     }
-    let prioritized = prioritize_gossip_entrypoints(&candidate_pool, entrypoint_bias).await;
     let previous_entrypoint = runtime.active_gossip_entrypoint.clone();
-    let alternate_candidates: Vec<String> = prioritized
+    let prioritized_candidates_max = read_gossip_runtime_switch_prioritized_candidates_max();
+    let mut alternate_candidates: Vec<String> = candidate_pool
         .iter()
         .filter(|entrypoint| Some(entrypoint.as_str()) != previous_entrypoint.as_deref())
         .cloned()
         .collect();
+    if let Some(bias) = entrypoint_bias {
+        alternate_candidates.sort_unstable_by(|left, right| {
+            bias.rank_for_entrypoint(left)
+                .unwrap_or(usize::MAX)
+                .cmp(&bias.rank_for_entrypoint(right).unwrap_or(usize::MAX))
+                .then_with(|| left.cmp(right))
+        });
+    }
+    if alternate_candidates.len() > prioritized_candidates_max {
+        alternate_candidates.truncate(prioritized_candidates_max);
+    }
+    let prioritized = prioritize_gossip_entrypoints(&alternate_candidates, entrypoint_bias).await;
 
     let mut candidates = Vec::new();
     let probe_enabled = read_gossip_entrypoint_probe_enabled();
     if probe_enabled {
-        for entrypoint in alternate_candidates {
+        for entrypoint in prioritized {
             if probe_gossip_entrypoint_live(&entrypoint).await {
                 candidates.push(entrypoint);
             }
         }
     } else {
-        candidates.extend(alternate_candidates);
+        candidates.extend(prioritized);
     }
 
     if candidates.is_empty() {
@@ -146,7 +158,8 @@ pub(crate) async fn maybe_switch_gossip_runtime(
     let stabilize_sustain = Duration::from_millis(read_gossip_runtime_switch_stabilize_ms());
     let stabilize_max_wait =
         Duration::from_millis(read_gossip_runtime_switch_stabilize_max_wait_ms());
-    let stabilize_effective_max_wait = stabilize_max_wait.min(
+    let stabilize_min_peers = read_gossip_runtime_switch_stabilize_min_peers();
+    let stabilize_effective_max_wait = stabilize_max_wait.max(
         overlap
             .saturating_add(Duration::from_millis(500))
             .max(Duration::from_millis(1_500)),
@@ -178,7 +191,14 @@ pub(crate) async fn maybe_switch_gossip_runtime(
                     stabilize_effective_max_wait,
                 )
                 .await;
-                if !stabilization.stabilized {
+                let discovered_peers = runtime
+                    .gossip_runtime
+                    .as_ref()
+                    .map(|candidate| candidate.cluster_info.all_peers().len())
+                    .unwrap_or_default();
+                let stabilized_by_peers =
+                    stabilization.packets_seen > 0 && discovered_peers >= stabilize_min_peers;
+                if !stabilization.stabilized && !stabilized_by_peers {
                     tracing::warn!(
                         previous_entrypoint = previous_entrypoint.as_deref().unwrap_or(""),
                         rejected_entrypoint = %entrypoint,
@@ -188,8 +208,10 @@ pub(crate) async fn maybe_switch_gossip_runtime(
                         rejected_port_range = format_port_range(target_port_range),
                         waited_ms = duration_to_ms_u64(stabilization.elapsed),
                         packets_seen = stabilization.packets_seen,
+                        peers_discovered = discovered_peers,
                         sustain_ms = duration_to_ms_u64(stabilize_sustain),
                         min_packets = stabilize_min_packets,
+                        min_peers = stabilize_min_peers,
                         configured_max_wait_ms = duration_to_ms_u64(stabilize_max_wait),
                         effective_max_wait_ms = duration_to_ms_u64(stabilize_effective_max_wait),
                         "new gossip runtime did not stabilize during overlap; reverting to previous runtime"
@@ -215,6 +237,16 @@ pub(crate) async fn maybe_switch_gossip_runtime(
                     }
                     return Ok(None);
                 }
+                if !stabilization.stabilized && stabilized_by_peers {
+                    tracing::warn!(
+                        previous_entrypoint = previous_entrypoint.as_deref().unwrap_or(""),
+                        accepted_entrypoint = %entrypoint,
+                        packets_seen = stabilization.packets_seen,
+                        peers_discovered = discovered_peers,
+                        min_peers = stabilize_min_peers,
+                        "accepting new gossip runtime via peer discovery despite low packet flow"
+                    );
+                }
                 stop_gossip_runtime_components(
                     old_receiver_handles.take().unwrap_or_default(),
                     old_gossip_runtime.take(),
@@ -231,6 +263,7 @@ pub(crate) async fn maybe_switch_gossip_runtime(
                     new_port_range = format_port_range(target_port_range),
                     stabilization_wait_ms = duration_to_ms_u64(stabilization.elapsed),
                     stabilization_packets = stabilization.packets_seen,
+                    stabilization_peers = discovered_peers,
                     "gossip runtime handoff complete"
                 );
                 return Ok(Some(entrypoint));

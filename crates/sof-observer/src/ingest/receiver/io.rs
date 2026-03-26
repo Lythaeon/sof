@@ -1,3 +1,7 @@
+#![allow(clippy::indexing_slicing)]
+#![allow(clippy::shadow_unrelated)]
+#![allow(clippy::arithmetic_side_effects)]
+
 use super::*;
 use crate::ingest::config::{
     read_udp_busy_poll_budget, read_udp_busy_poll_us, read_udp_prefer_busy_poll,
@@ -29,7 +33,11 @@ impl UdpBatchScratch {
         // SAFETY: The libc socket structs are plain old data and immediately
         // initialized before each syscall use.
         let io_vectors = vec![unsafe { std::mem::zeroed() }; capacity];
+        // SAFETY: The libc socket structs are plain old data and immediately
+        // initialized before each syscall use.
         let addrs = vec![unsafe { std::mem::zeroed() }; capacity];
+        // SAFETY: The libc socket structs are plain old data and immediately
+        // initialized before each syscall use.
         let headers = vec![unsafe { std::mem::zeroed() }; capacity];
         Self {
             io_vectors,
@@ -236,8 +244,10 @@ fn recv_udp_batch_append(
                         "udp recvmmsg returned packet length {len} beyond buffer capacity {capacity}"
                     ),
                 ),
-                UdpReceiverError::Receive { source } => source,
-                _ => std::io::Error::new(
+                UdpReceiverError::Receive { source: io_error } => io_error,
+                UdpReceiverError::BindSocket { .. }
+                | UdpReceiverError::SetBlockingMode { .. }
+                | UdpReceiverError::SetReadTimeout { .. } => std::io::Error::new(
                     ErrorKind::InvalidData,
                     "udp recvmmsg packet push failed",
                 ),

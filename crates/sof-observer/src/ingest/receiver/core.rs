@@ -1,3 +1,5 @@
+#![allow(clippy::indexing_slicing)]
+
 use std::io::{ErrorKind, IoSliceMut};
 use std::net::SocketAddr;
 #[cfg(target_os = "linux")]
@@ -92,7 +94,7 @@ impl RawPacketBatchRecycler {
 
     fn recycle(&self, mut storage: RawPacketBatchStorage) {
         storage.clear();
-        let _ = self.queue.push(storage);
+        drop(self.queue.push(storage));
     }
 }
 
@@ -196,10 +198,12 @@ impl RawPacketBatch {
                     ErrorKind::InvalidData,
                     format!("udp packet length {len} exceeds buffer capacity {capacity}"),
                 ),
-                UdpReceiverError::Receive { source } => source,
-                UdpReceiverError::BindSocket { source, .. }
-                | UdpReceiverError::SetBlockingMode { source }
-                | UdpReceiverError::SetReadTimeout { source } => source,
+                UdpReceiverError::Receive { source: io_error } => io_error,
+                UdpReceiverError::BindSocket {
+                    source: io_error, ..
+                }
+                | UdpReceiverError::SetBlockingMode { source: io_error }
+                | UdpReceiverError::SetReadTimeout { source: io_error } => io_error,
             })
     }
 
@@ -239,11 +243,9 @@ impl RawPacketBatch {
 
     #[must_use]
     pub fn packet_bytes(&self, packet: RawPacket) -> &[u8] {
-        let storage = self
-            .storage
-            .as_ref()
-            .expect("raw packet batch storage available");
-        &storage.buffers[packet.buffer_index][..packet.len]
+        self.storage.as_ref().map_or(&[], |storage| {
+            &storage.buffers[packet.buffer_index][..packet.len]
+        })
     }
 
     fn take_for_send(&mut self) -> Self {

@@ -1,3 +1,5 @@
+#![allow(clippy::missing_docs_in_private_items)]
+
 use agave_transaction_view::{
     transaction_data::TransactionData, transaction_view::SanitizedTransactionView,
 };
@@ -31,7 +33,9 @@ thread_local! {
     static CACHED_TRANSACTION_EVENT: RefCell<Option<CachedTransactionEvent>> = const { RefCell::new(None) };
 }
 
-fn cached_transaction_event_key(event: &TransactionEventRef<'_>) -> CachedTransactionEventKey {
+const fn cached_transaction_event_key(
+    event: &TransactionEventRef<'_>,
+) -> CachedTransactionEventKey {
     CachedTransactionEventKey {
         slot: event.slot,
         signature: event.signature,
@@ -56,11 +60,12 @@ fn with_cached_transaction_event<R>(
                 event: event.to_owned(),
             });
         }
-        let owned = &cached
-            .as_ref()
-            .expect("cached transaction event just inserted")
-            .event;
-        f(owned)
+        if let Some(cached_event) = cached.as_ref() {
+            f(&cached_event.event)
+        } else {
+            let owned = event.to_owned();
+            f(&owned)
+        }
     })
 }
 
@@ -148,7 +153,7 @@ impl TransactionPrefilter {
 
     /// Requires one exact transaction signature.
     #[must_use]
-    pub fn with_signature(mut self, signature: Signature) -> Self {
+    pub const fn with_signature(mut self, signature: Signature) -> Self {
         self.signature = Some(signature);
         self
     }

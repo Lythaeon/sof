@@ -59,7 +59,7 @@ impl GossipEntrypointBias {
         }
     }
 
-    fn rank_for_entrypoint(&self, entrypoint: &str) -> Option<usize> {
+    pub(crate) fn rank_for_entrypoint(&self, entrypoint: &str) -> Option<usize> {
         let resolved_ip = entrypoint
             .to_socket_addrs()
             .ok()
@@ -70,8 +70,12 @@ impl GossipEntrypointBias {
             .position(|ip| *ip == resolved_ip)
     }
 
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.ranked_source_ips.is_empty()
+    }
+
+    pub(crate) fn ranked_source_ips(&self) -> &[IpAddr] {
+        &self.ranked_source_ips
     }
 }
 

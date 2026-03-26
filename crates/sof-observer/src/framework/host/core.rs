@@ -1,3 +1,5 @@
+#![allow(clippy::missing_docs_in_private_items)]
+
 use super::dispatch::{
     ClassifiedAccountTouchDispatch, ClassifiedTransactionBatchDispatch,
     ClassifiedTransactionDispatch, ClassifiedTransactionViewBatchDispatch, PluginDispatchEvent,
@@ -5,6 +7,7 @@ use super::dispatch::{
     TransactionPluginDispatcher,
 };
 use super::state::{ObservedRecentBlockhashState, ObservedTpuLeaderState};
+
 use super::*;
 use crate::framework::AccountTouchEvent;
 use crate::framework::PluginContext;

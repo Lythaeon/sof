@@ -5,6 +5,11 @@ application-level events, metrics, or logs.
 
 This is the lowest-friction real product shape for `sof`.
 
+Low-friction does not automatically mean lowest-latency. If latency is the reason you are here,
+the service also needs early shred visibility from either direct low-latency validator or peer
+access, or from an external shred propagation network. SOF's efficient local processing only pays
+off once ingress is early enough to matter.
+
 ## Use This When
 
 - you need transaction or slot observation
@@ -112,6 +117,9 @@ async fn main() -> Result<(), sof::runtime::RuntimeError> {
 
 That keeps `on_transaction` on the low-latency inline path. Other dataset
 consumers can still continue on the dataset-worker path in parallel.
+
+Inline dispatch removes local scheduling and queueing overhead. It does not fix late ingress. If
+the host sees shreds late, inline still starts from late data.
 
 ## What You Usually Add Next
 

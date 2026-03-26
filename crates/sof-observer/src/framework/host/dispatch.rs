@@ -1,16 +1,53 @@
+#![allow(clippy::missing_docs_in_private_items)]
+#![allow(clippy::result_large_err)]
+
 use super::*;
 use crate::framework::AccountTouchEvent;
 use crate::framework::TransactionInterest;
 use crossbeam_queue::ArrayQueue;
 use futures_util::{FutureExt, StreamExt, stream};
 use smallvec::SmallVec;
+use solana_pubkey::Pubkey;
+use solana_signature::Signature;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::panic::AssertUnwindSafe;
+use std::str::FromStr;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc::TrySendError as StdTrySendError;
 use std::time::Instant;
+
+struct DebugTxTraceConfig {
+    pool_account: Pubkey,
+}
+
+fn debug_tx_trace_config() -> Option<&'static DebugTxTraceConfig> {
+    static CONFIG: OnceLock<Option<DebugTxTraceConfig>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            std::env::var("SOF_DEBUG_TRACE_TX_POOL")
+                .ok()
+                .and_then(|value| Pubkey::from_str(&value).ok())
+                .map(|pool_account| DebugTxTraceConfig { pool_account })
+        })
+        .as_ref()
+}
+
+fn debug_tx_trace_signature(event: &TransactionEvent) -> Option<Signature> {
+    let config = debug_tx_trace_config()?;
+    if !event
+        .tx
+        .message
+        .static_account_keys()
+        .contains(&config.pool_account)
+    {
+        return None;
+    }
+    event
+        .signature
+        .or_else(|| event.tx.signatures.first().copied())
+}
 
 /// Names one plugin callback family for queue-drop telemetry and worker logs.
 #[derive(Clone, Copy, Debug)]
@@ -486,27 +523,30 @@ impl ClassifiedTransactionDispatch {
                 let has_critical_inline = !critical_inline_plugins.is_empty();
                 let has_critical = !critical_plugins.is_empty();
                 let has_background = !background_plugins.is_empty();
-                let mut remaining_lanes = usize::from(has_critical_inline)
-                    + usize::from(has_critical)
-                    + usize::from(has_background);
+                let mut remaining_lanes = 0usize;
+                if has_critical_inline {
+                    remaining_lanes = remaining_lanes.saturating_add(1);
+                }
+                if has_critical {
+                    remaining_lanes = remaining_lanes.saturating_add(1);
+                }
+                if has_background {
+                    remaining_lanes = remaining_lanes.saturating_add(1);
+                }
+                let fallback_event = event.clone();
                 let mut shared_event = Some(event);
-                let mut next_lane_event = || {
+                let mut next_lane_event = || -> Option<TransactionEvent> {
                     remaining_lanes = remaining_lanes.saturating_sub(1);
                     if remaining_lanes == 0 {
-                        shared_event
-                            .take()
-                            .expect("shared transaction event available for final lane")
+                        shared_event.take()
                     } else {
-                        shared_event
-                            .as_ref()
-                            .expect("shared transaction event available for clone")
-                            .clone()
+                        shared_event.as_ref().cloned()
                     }
                 };
-                let critical_inline = has_critical_inline.then(|| {
+                let critical_inline = if has_critical_inline {
                     AcceptedTransactionDispatch::from_plugins(
                         critical_inline_plugins,
-                        next_lane_event(),
+                        next_lane_event().unwrap_or_else(|| fallback_event.clone()),
                         completed_at,
                         first_shred_observed_at,
                         last_shred_observed_at,
@@ -515,12 +555,13 @@ impl ClassifiedTransactionDispatch {
                         dataset_tx_count,
                         dataset_tx_position,
                     )
-                    .expect("non-empty lane yields dispatch")
-                });
-                let critical = has_critical.then(|| {
+                } else {
+                    None
+                };
+                let critical = if has_critical {
                     AcceptedTransactionDispatch::from_plugins(
                         critical_plugins,
-                        next_lane_event(),
+                        next_lane_event().unwrap_or_else(|| fallback_event.clone()),
                         completed_at,
                         first_shred_observed_at,
                         last_shred_observed_at,
@@ -529,12 +570,13 @@ impl ClassifiedTransactionDispatch {
                         dataset_tx_count,
                         dataset_tx_position,
                     )
-                    .expect("non-empty lane yields dispatch")
-                });
-                let background = has_background.then(|| {
+                } else {
+                    None
+                };
+                let background = if has_background {
                     AcceptedTransactionDispatch::from_plugins(
                         background_plugins,
-                        next_lane_event(),
+                        next_lane_event().unwrap_or_else(|| fallback_event.clone()),
                         completed_at,
                         first_shred_observed_at,
                         last_shred_observed_at,
@@ -543,8 +585,9 @@ impl ClassifiedTransactionDispatch {
                         dataset_tx_count,
                         dataset_tx_position,
                     )
-                    .expect("non-empty lane yields dispatch")
-                });
+                } else {
+                    None
+                };
                 (critical_inline, critical, background)
             }
         }
@@ -978,7 +1021,7 @@ fn spawn_dispatch_worker(
                 while batch.len() < DISPATCH_WORKER_DRAIN_BATCH_MAX {
                     match rx.try_recv() {
                         Ok(event) => batch.push(event),
-                        Err(StdTrySendError::Full(_)) | Err(StdTrySendError::Disconnected(_)) => {
+                        Err(StdTrySendError::Full(())) | Err(StdTrySendError::Disconnected(())) => {
                             break;
                         }
                     }
@@ -1127,7 +1170,7 @@ fn spawn_transaction_dispatch_worker(
             while batch.len() < TX_DISPATCH_WORKER_DRAIN_BATCH_MAX {
                 match rx.try_recv() {
                     Ok(event) => batch.push(event),
-                    Err(StdTrySendError::Full(_)) | Err(StdTrySendError::Disconnected(_)) => {
+                    Err(StdTrySendError::Full(())) | Err(StdTrySendError::Disconnected(())) => {
                         break;
                     }
                 }
@@ -1140,7 +1183,7 @@ fn spawn_transaction_dispatch_worker(
                     );
                 }
             });
-            crate::runtime_metrics::observe_transaction_dispatch_metrics_batch(metrics_batch);
+            crate::runtime_metrics::observe_transaction_dispatch_metrics_batch(&metrics_batch);
         }
     });
     if let Err(error) = spawn_result {
@@ -1771,26 +1814,37 @@ async fn dispatch_accepted_transaction_event(
                     .as_micros(),
             )
             .unwrap_or(u64::MAX);
-            let inline_latency =
-                (priority == TransactionDispatchPriority::InlineCritical).then(|| {
-                    InlineLatencyObservation {
-                        source: inline_source,
-                        first_shred_lag_us: u64::try_from(
-                            dequeued_at
-                                .saturating_duration_since(first_shred_observed_at)
-                                .as_micros(),
-                        )
-                        .unwrap_or(u64::MAX),
-                        last_shred_lag_us: u64::try_from(
-                            dequeued_at
-                                .saturating_duration_since(last_shred_observed_at)
-                                .as_micros(),
-                        )
-                        .unwrap_or(u64::MAX),
-                        completed_dataset_lag_us: queue_wait_us,
-                    }
-                });
             let callback_started_at = Instant::now();
+            let first_shred_lag_us = u64::try_from(
+                callback_started_at
+                    .saturating_duration_since(first_shred_observed_at)
+                    .as_micros(),
+            )
+            .unwrap_or(u64::MAX);
+            let last_shred_lag_us = u64::try_from(
+                callback_started_at
+                    .saturating_duration_since(last_shred_observed_at)
+                    .as_micros(),
+            )
+            .unwrap_or(u64::MAX);
+            if let Some(signature) = debug_tx_trace_signature(&event) {
+                tracing::info!(
+                    signature = %signature,
+                    priority = priority.as_str(),
+                    queue_wait_us,
+                    first_shred_to_callback_us = first_shred_lag_us,
+                    last_shred_to_callback_us = last_shred_lag_us,
+                    ready_to_callback_us = queue_wait_us,
+                    "debug tx timing trace"
+                );
+            }
+            let inline_latency = (priority == TransactionDispatchPriority::InlineCritical)
+                .then_some(InlineLatencyObservation {
+                    source: inline_source,
+                    first_shred_lag_us,
+                    last_shred_lag_us,
+                    completed_dataset_lag_us: queue_wait_us,
+                });
             if let Err(panic) =
                 AssertUnwindSafe(plugin.on_transaction_with_interest(&event, interest))
                     .catch_unwind()
@@ -1834,26 +1888,37 @@ async fn dispatch_accepted_transaction_event(
                     .as_micros(),
             )
             .unwrap_or(u64::MAX);
-            let inline_latency =
-                (priority == TransactionDispatchPriority::InlineCritical).then(|| {
-                    InlineLatencyObservation {
-                        source: inline_source,
-                        first_shred_lag_us: u64::try_from(
-                            dequeued_at
-                                .saturating_duration_since(first_shred_observed_at)
-                                .as_micros(),
-                        )
-                        .unwrap_or(u64::MAX),
-                        last_shred_lag_us: u64::try_from(
-                            dequeued_at
-                                .saturating_duration_since(last_shred_observed_at)
-                                .as_micros(),
-                        )
-                        .unwrap_or(u64::MAX),
-                        completed_dataset_lag_us: queue_wait_us,
-                    }
-                });
             let callback_started_at = Instant::now();
+            let first_shred_lag_us = u64::try_from(
+                callback_started_at
+                    .saturating_duration_since(first_shred_observed_at)
+                    .as_micros(),
+            )
+            .unwrap_or(u64::MAX);
+            let last_shred_lag_us = u64::try_from(
+                callback_started_at
+                    .saturating_duration_since(last_shred_observed_at)
+                    .as_micros(),
+            )
+            .unwrap_or(u64::MAX);
+            if let Some(signature) = debug_tx_trace_signature(event.as_ref()) {
+                tracing::info!(
+                    signature = %signature,
+                    priority = priority.as_str(),
+                    queue_wait_us,
+                    first_shred_to_callback_us = first_shred_lag_us,
+                    last_shred_to_callback_us = last_shred_lag_us,
+                    ready_to_callback_us = queue_wait_us,
+                    "debug tx timing trace"
+                );
+            }
+            let inline_latency = (priority == TransactionDispatchPriority::InlineCritical)
+                .then_some(InlineLatencyObservation {
+                    source: inline_source,
+                    first_shred_lag_us,
+                    last_shred_lag_us,
+                    completed_dataset_lag_us: queue_wait_us,
+                });
             dispatch_hook_event(
                 plugins.as_ref(),
                 PluginHookKind::Transaction,

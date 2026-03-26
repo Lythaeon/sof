@@ -205,9 +205,12 @@ async fn kernel_bypass_ingress_e2e_delivers_packets_to_plugins() {
             };
             let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), source_port);
             let bytes = build_raw_packet_bytes(sequence);
-            batch
-                .push_packet_bytes(source, RawPacketIngress::Udp, &bytes)
-                .expect("synthetic packet fits in raw packet batch buffer");
+            let push_result = batch.push_packet_bytes(source, RawPacketIngress::Udp, &bytes);
+            assert!(
+                push_result.is_ok(),
+                "synthetic packet fits in raw packet batch buffer: {:?}",
+                push_result.err()
+            );
             sequence = sequence.saturating_add(1);
         }
         let send_result = tx.send(batch).await;

@@ -1358,8 +1358,9 @@ fn observe_max_counter(counter: &CacheAlignedAtomicU64, value: u64) {
     let _ = counter.fetch_max(value, Ordering::Relaxed);
 }
 
+/// Applies one batch of queued transaction-dispatch metrics to the runtime counters.
 pub(crate) fn observe_transaction_dispatch_metrics_batch(
-    batch: crate::framework::host::TransactionDispatchMetricsBatch,
+    batch: &crate::framework::host::TransactionDispatchMetricsBatch,
 ) {
     if batch.visibility_samples_total != 0 {
         TRANSACTION_PLUGIN_VISIBILITY_SAMPLES_TOTAL

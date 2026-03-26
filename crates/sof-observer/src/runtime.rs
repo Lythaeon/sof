@@ -1,3 +1,5 @@
+#![allow(clippy::missing_docs_in_private_items)]
+
 use std::{future::Future, net::SocketAddr, path::PathBuf, pin::Pin};
 
 use crate::framework::{
@@ -64,6 +66,7 @@ pub enum ShredTrustMode {
 }
 
 impl ShredTrustMode {
+    /// Returns the env-string representation used by `SOF_SHRED_TRUST_MODE`.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {

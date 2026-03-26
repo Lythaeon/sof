@@ -2,10 +2,7 @@ use std::{
     ffi::CString,
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
@@ -101,7 +98,7 @@ pub(crate) fn read_af_xdp_config() -> AfXdpConfig {
 pub(crate) fn run_af_xdp_producer_until(
     tx: &KernelBypassIngressSender,
     config: &AfXdpConfig,
-    shutdown: Arc<AtomicBool>,
+    shutdown: &AtomicBool,
 ) -> Result<AfXdpProducerStats, ExampleError> {
     let mut state = build_af_xdp_socket(config)?;
     let mut slab = HeapSlab::with_capacity(usize::try_from(config.ring_depth).unwrap_or(0));

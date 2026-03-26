@@ -27,7 +27,7 @@ use sof::{
 };
 #[cfg(feature = "kernel-bypass")]
 use sof::{
-    ingest::{RawPacket, RawPacketIngress},
+    ingest::{RawPacketBatch, RawPacketIngress},
     protocol::shred_wire::{SIZE_OF_DATA_SHRED_PAYLOAD, VARIANT_MERKLE_DATA},
     runtime::{KernelBypassIngressSender, create_kernel_bypass_ingress_queue},
     shred::wire::SIZE_OF_DATA_SHRED_HEADERS,
@@ -223,7 +223,7 @@ pub(crate) enum IngressSource {
 
 #[cfg(feature = "kernel-bypass")]
 /// Example helper used by this binary.
-pub(crate) fn build_raw_packet(sequence: u64, source_port: u16) -> RawPacket {
+pub(crate) fn build_raw_packet_bytes(sequence: u64) -> Vec<u8> {
     let slot = (sequence / 128).saturating_add(1);
     let index = u32::try_from(sequence % 128).unwrap_or(0);
     let fec_set_index = index;
@@ -250,11 +250,7 @@ pub(crate) fn build_raw_packet(sequence: u64, source_port: u16) -> RawPacket {
         payload.fill(0xAB);
     }
 
-    RawPacket {
-        source: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), source_port),
-        ingress: RawPacketIngress::Udp,
-        bytes: bytes.into(),
-    }
+    bytes
 }
 
 #[cfg(feature = "kernel-bypass")]
@@ -269,19 +265,25 @@ pub(crate) fn produce_kernel_bypass_ingress(
     let mut sequence = 0_u64;
     let mut stats = ProducerStats::default();
     while started_at.elapsed() < run_for {
-        let mut batch = Vec::with_capacity(batch_size);
+        let mut batch = RawPacketBatch::with_capacity(batch_size);
         for _ in 0..batch_size {
             let source_port = match sequence % 3 {
                 0 => 8_899,
                 1 => 8_900,
                 _ => 9_001,
             };
-            let packet = build_raw_packet(sequence, source_port);
+            let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), source_port);
+            let packet_bytes = build_raw_packet_bytes(sequence);
             stats.packets = stats.packets.saturating_add(1);
             stats.bytes = stats
                 .bytes
-                .saturating_add(u64::try_from(packet.bytes.len()).unwrap_or(u64::MAX));
-            batch.push(packet);
+                .saturating_add(u64::try_from(packet_bytes.len()).unwrap_or(u64::MAX));
+            if batch
+                .push_packet_bytes(source, RawPacketIngress::Udp, &packet_bytes)
+                .is_err()
+            {
+                return stats;
+            }
             sequence = sequence.saturating_add(1);
         }
         if !tx.send_batch(batch, false) {

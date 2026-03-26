@@ -20,6 +20,21 @@ It starts from live Solana network traffic. In practice that means:
 That is why SOF can be lower latency than an RPC-first architecture: it is closer to the traffic
 source.
 
+## What Actually Determines Whether SOF Is Fast
+
+The biggest latency limiter is usually not SOF's local processing cost. It is shred visibility:
+how quickly the host sees useful shreds in the first place.
+
+That means two separate things must both be true for a genuinely low-latency setup:
+
+- SOF needs early ingress, such as direct low-latency validator or peer access, or an external
+  shred propagation network feeding the host
+- your application logic should stay on the same host or in the same process so it benefits from
+  SOF's local parsing, control-plane state, and event delivery
+
+If the host sees traffic late, SOF can still be simpler and more controllable than RPC-first
+systems, but it will not magically become early just because the local runtime is efficient.
+
 ## What A Shred Is
 
 The shortest useful definition:

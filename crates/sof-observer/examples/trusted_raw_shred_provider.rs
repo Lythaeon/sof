@@ -89,7 +89,7 @@ async fn main() -> Result<(), RuntimeError> {
         );
 
         let producer_task = tokio::task::spawn_blocking(move || {
-            af_xdp_ingress::run_af_xdp_producer_until(&tx, &config, producer_stop)
+            af_xdp_ingress::run_af_xdp_producer_until(&tx, &config, &producer_stop)
         });
         let producer_wait_task = tokio::spawn(async move {
             let result = producer_task.await.map_err(|error| {
@@ -110,9 +110,7 @@ async fn main() -> Result<(), RuntimeError> {
         let producer_result = producer_wait_task.await.map_err(|error| {
             RuntimeError::Runloop(format!("AF_XDP producer waiter join failed: {error}"))
         })?;
-        if let Err(error) = producer_result {
-            return Err(error);
-        }
+        producer_result?;
         return runtime_result;
     }
 

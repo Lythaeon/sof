@@ -1276,9 +1276,9 @@ fn process_completed_dataset_with_prefiltered_transactions(
     Some(DatasetProcessOutcome::Decoded)
 }
 
-fn partition_static_account_keys(
-    tx: &VersionedTransaction,
-) -> (Arc<[Pubkey]>, Arc<[Pubkey]>, Arc<[Pubkey]>) {
+type PartitionedStaticAccountKeys = (Arc<[Pubkey]>, Arc<[Pubkey]>, Arc<[Pubkey]>);
+
+fn partition_static_account_keys(tx: &VersionedTransaction) -> PartitionedStaticAccountKeys {
     let static_account_keys = tx.message.static_account_keys();
     let mut writable_account_keys = Vec::with_capacity(static_account_keys.len());
     let mut readonly_account_keys = Vec::with_capacity(static_account_keys.len());
@@ -2107,8 +2107,7 @@ mod tests {
                 .tx
                 .message
                 .static_account_keys()
-                .iter()
-                .any(|key| *key == self.ignored_account)
+                .contains(&self.ignored_account)
             {
                 TransactionInterest::Critical
             } else {
@@ -2463,7 +2462,7 @@ mod tests {
             .filter(|value| *value > 0)
             .unwrap_or(20_000);
         let mode = std::env::var("SOF_COMPLETED_DATASET_PREFILTER_PROFILE_MODE")
-            .unwrap_or_else(|_| "manual".to_string());
+            .unwrap_or_else(|_| "manual".to_owned());
         let ignored_account = Pubkey::new_unique();
         let payload = build_profile_payload(PROFILE_ENTRY_COUNT);
         let payload_fragments =

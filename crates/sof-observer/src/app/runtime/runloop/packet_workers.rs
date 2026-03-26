@@ -1,4 +1,7 @@
+#![allow(clippy::missing_docs_in_private_items)]
+
 use super::*;
+use std::sync::atomic::AtomicBool;
 
 #[derive(Debug)]
 pub(super) struct PacketWorkerInput {
@@ -84,7 +87,7 @@ pub(super) struct PacketWorkerPoolConfig {
     pub(super) fec_retained_slot_lag: u64,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct WorkerVerifyCounters {
     verified: u64,
     unknown_leader: u64,
@@ -115,13 +118,15 @@ impl WorkerVerifyCounters {
         }
     }
 
-    const fn is_empty(&self) -> bool {
-        self.verified == 0
-            && self.unknown_leader == 0
-            && self.invalid_merkle == 0
-            && self.invalid_signature == 0
-            && self.malformed == 0
-            && self.dropped == 0
+    const fn merge_from(&mut self, other: &Self) {
+        self.verified = self.verified.saturating_add(other.verified);
+        self.unknown_leader = self.unknown_leader.saturating_add(other.unknown_leader);
+        self.invalid_merkle = self.invalid_merkle.saturating_add(other.invalid_merkle);
+        self.invalid_signature = self
+            .invalid_signature
+            .saturating_add(other.invalid_signature);
+        self.malformed = self.malformed.saturating_add(other.malformed);
+        self.dropped = self.dropped.saturating_add(other.dropped);
     }
 }
 
@@ -189,6 +194,7 @@ pub(super) struct PacketWorkerPool {
     worker_handles: Vec<JoinHandle<()>>,
     #[cfg(feature = "gossip-bootstrap")]
     known_pubkeys: SharedKnownPubkeys,
+    verify_strict_unknown: Arc<AtomicBool>,
     telemetry: Vec<PacketWorkerTelemetry>,
     queue_depth: Arc<AtomicU64>,
     max_queue_depth: Arc<AtomicU64>,
@@ -214,6 +220,7 @@ impl PacketWorkerPool {
             mpsc::channel::<PacketWorkerBatchResult>(worker_count.saturating_mul(sender_capacity));
         #[cfg(feature = "gossip-bootstrap")]
         let known_pubkeys = SharedKnownPubkeys::default();
+        let verify_strict_unknown = Arc::new(AtomicBool::new(verify_strict_unknown));
         let queue_depth = Arc::new(AtomicU64::new(0));
         let max_queue_depth = Arc::new(AtomicU64::new(0));
         let mut senders = Vec::with_capacity(worker_count);
@@ -228,6 +235,7 @@ impl PacketWorkerPool {
             let worker_telemetry = PacketWorkerTelemetry::new();
             let worker_telemetry_state = worker_telemetry.clone();
             let worker_queue_depth = Arc::clone(&queue_depth);
+            let worker_verify_strict_unknown = Arc::clone(&verify_strict_unknown);
             let worker_handle = tokio::task::spawn_blocking(move || {
                 let mut shred_verifier = verify_enabled.then(|| {
                     ShredVerifier::new(
@@ -259,11 +267,12 @@ impl PacketWorkerPool {
                         &mut verifier_generation,
                         shred_verifier.as_mut(),
                     );
+                    let strict_unknown = worker_verify_strict_unknown.load(Ordering::Relaxed);
                     let forwarded_all_results = process_packet_batch_streaming(
                         batch,
                         shred_verifier.as_mut(),
                         verify_recovered_shreds,
-                        verify_strict_unknown,
+                        strict_unknown,
                         &mut fec_recoverer,
                         |result| worker_result_tx.blocking_send(result).is_ok(),
                     );
@@ -284,6 +293,7 @@ impl PacketWorkerPool {
             worker_handles,
             #[cfg(feature = "gossip-bootstrap")]
             known_pubkeys,
+            verify_strict_unknown,
             telemetry,
             queue_depth,
             max_queue_depth,
@@ -364,6 +374,10 @@ impl PacketWorkerPool {
 
     pub(super) fn close_inputs(&mut self) {
         self.senders.clear();
+    }
+
+    pub(super) fn set_verify_strict_unknown(&self, enabled: bool) {
+        self.verify_strict_unknown.store(enabled, Ordering::Relaxed);
     }
 
     #[cfg(feature = "gossip-bootstrap")]
@@ -466,6 +480,8 @@ where
     {
         let mut drained_packets = packets.drain(..).peekable();
 
+        let mut pending_verify_counters = WorkerVerifyCounters::default();
+
         while let Some(packet) = drained_packets.next() {
             let mut accepted_shreds = Vec::new();
             #[cfg(feature = "gossip-bootstrap")]
@@ -559,20 +575,20 @@ where
                 ShredVerifier::take_slot_leader_diff,
             );
             #[cfg(not(feature = "gossip-bootstrap"))]
-            let should_emit = !accepted_shreds.is_empty()
-                || !verify_counters.is_empty()
-                || drained_packets.peek().is_none();
+            let should_emit = !accepted_shreds.is_empty() || drained_packets.peek().is_none();
             #[cfg(feature = "gossip-bootstrap")]
             let should_emit = !accepted_shreds.is_empty()
                 || !observed_slot_leaders.is_empty()
                 || !leader_diff.added.is_empty()
                 || !leader_diff.updated.is_empty()
                 || !leader_diff.removed_slots.is_empty()
-                || !verify_counters.is_empty()
                 || drained_packets.peek().is_none();
             if !should_emit {
+                pending_verify_counters.merge_from(&verify_counters);
                 continue;
             }
+
+            verify_counters.merge_from(&std::mem::take(&mut pending_verify_counters));
 
             if !emit_result(PacketWorkerBatchResult {
                 worker_index,
@@ -706,7 +722,7 @@ fn verify_packet_with_counters(
     let Some(shred_verifier) = shred_verifier else {
         return WorkerVerifyDecision::Accept;
     };
-    let verify_status = shred_verifier.verify_packet(packet, observed_at);
+    let verify_status = shred_verifier.verify_packet(packet, observed_at, verify_strict_unknown);
     verify_counters.observe(verify_status);
     if verify_status.is_accepted(verify_strict_unknown) {
         WorkerVerifyDecision::Accept
