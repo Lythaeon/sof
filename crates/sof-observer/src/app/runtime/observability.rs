@@ -1,8 +1,9 @@
 use std::{
+    collections::HashMap,
     io,
     net::SocketAddr,
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -16,6 +17,7 @@ use tokio::{
 
 use crate::{
     framework::{DerivedStateConsumerRecoveryState, DerivedStateHost, RuntimeExtensionHost},
+    provider_stream::{ProviderSourceHealthEvent, ProviderSourceHealthStatus},
     runtime_metrics,
 };
 
@@ -35,6 +37,7 @@ pub(crate) struct RuntimeObservabilityHandle {
 struct RuntimeObservabilityState {
     live: AtomicBool,
     ready: AtomicBool,
+    provider_sources: RwLock<HashMap<&'static str, ProviderSourceHealthEvent>>,
 }
 
 impl RuntimeObservabilityHandle {
@@ -50,23 +53,41 @@ impl RuntimeObservabilityHandle {
         self.inner.ready.store(false, Ordering::Relaxed);
     }
 
+    pub(crate) fn observe_provider_source_health(&self, event: &ProviderSourceHealthEvent) {
+        let Ok(mut sources) = self.inner.provider_sources.write() else {
+            return;
+        };
+        sources.insert(event.source.as_str(), event.clone());
+        let all_healthy = sources
+            .values()
+            .all(|source| matches!(source.status, ProviderSourceHealthStatus::Healthy));
+        self.inner.ready.store(all_healthy, Ordering::Relaxed);
+    }
+
     fn mark_stopped(&self) {
         self.inner.ready.store(false, Ordering::Relaxed);
         self.inner.live.store(false, Ordering::Relaxed);
     }
 
     fn snapshot(&self) -> RuntimeObservabilitySnapshot {
+        let mut provider_sources = self.inner.provider_sources.read().map_or_else(
+            |_error| Vec::new(),
+            |sources| sources.values().cloned().collect(),
+        );
+        provider_sources.sort_by_key(|event| (event.source.as_str(), event.reason.as_str()));
         RuntimeObservabilitySnapshot {
             live: self.inner.live.load(Ordering::Relaxed),
             ready: self.inner.ready.load(Ordering::Relaxed),
+            provider_sources,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 struct RuntimeObservabilitySnapshot {
     live: bool,
     ready: bool,
+    provider_sources: Vec<ProviderSourceHealthEvent>,
 }
 
 pub(crate) struct RuntimeObservabilityService {
@@ -234,6 +255,64 @@ fn render_metrics(
         u8::from(state.ready),
         None,
     );
+    append_metric_family(
+        &mut buffer,
+        "sof_provider_sources_reconnecting",
+        "Provider sources currently reconnecting.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_provider_sources_reconnecting",
+        state
+            .provider_sources
+            .iter()
+            .filter(|event| matches!(event.status, ProviderSourceHealthStatus::Reconnecting))
+            .count(),
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_provider_sources_unhealthy",
+        "Provider sources currently unhealthy.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_provider_sources_unhealthy",
+        state
+            .provider_sources
+            .iter()
+            .filter(|event| matches!(event.status, ProviderSourceHealthStatus::Unhealthy))
+            .count(),
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_provider_source_status",
+        "Typed provider source health state by source.",
+        PrometheusMetricType::Gauge,
+    );
+    for event in &state.provider_sources {
+        let labels = [
+            ("source", event.source.as_str()),
+            (
+                "status",
+                match event.status {
+                    ProviderSourceHealthStatus::Healthy => "healthy",
+                    ProviderSourceHealthStatus::Reconnecting => "reconnecting",
+                    ProviderSourceHealthStatus::Unhealthy => "unhealthy",
+                },
+            ),
+            ("reason", event.reason.as_str()),
+        ];
+        append_metric_value(
+            &mut buffer,
+            "sof_provider_source_status",
+            1_u8,
+            Some(&labels),
+        );
+    }
 
     let snapshot = runtime_metrics::snapshot();
     append_metric_family(
@@ -2441,6 +2520,30 @@ mod tests {
         assert!(metrics.contains("sof_udp_relay_forwarded_packets_total "));
         assert!(metrics.contains("sof_repair_requests_total "));
         assert!(metrics.contains("sof_inline_transaction_plugin_source_latency_samples_total"));
+    }
+
+    #[test]
+    fn metrics_include_provider_source_health() {
+        let handle = RuntimeObservabilityHandle::default();
+        handle.mark_live();
+        handle.observe_provider_source_health(&ProviderSourceHealthEvent {
+            source: crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
+            status: ProviderSourceHealthStatus::Reconnecting,
+            reason: crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
+            message: "upstream stalled".to_owned(),
+        });
+        let metrics = render_metrics(
+            &handle,
+            &RuntimeExtensionHost::builder().build(),
+            &DerivedStateHost::builder().build(),
+        );
+
+        assert!(metrics.contains("sof_runtime_ready 0"));
+        assert!(metrics.contains("sof_provider_sources_reconnecting 1"));
+        assert!(metrics.contains("sof_provider_sources_unhealthy 0"));
+        assert!(metrics.contains(
+            "sof_provider_source_status{source=\"yellowstone_grpc\",status=\"reconnecting\",reason=\"upstream_protocol_failure\"} 1"
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]

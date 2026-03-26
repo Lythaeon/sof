@@ -145,7 +145,7 @@ pub struct TransactionBatchEvent {
     pub transactions: Arc<[VersionedTransaction]>,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 /// One authoritative serialized transaction byte range inside a completed dataset payload.
 pub struct SerializedTransactionRange {
     /// Start offset of the serialized transaction inside the contiguous dataset payload.

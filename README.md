@@ -99,6 +99,11 @@ Built-in durability behavior:
 - built-in provider adapters emit explicit source health transitions into SOF,
   and unexpected provider ingress closure is treated as a runtime failure rather
   than a clean stop
+  - provider-source health is exported through the runtime observability
+    endpoint too, so reconnecting/unhealthy sources are not log-only anymore
+  - generic provider replay dedupe also covers transaction-log and
+    transaction-view-batch updates now, not just transaction/control-plane
+    events
 
 Provider config defaults are inclusive:
 

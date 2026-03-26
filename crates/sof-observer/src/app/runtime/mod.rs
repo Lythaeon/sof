@@ -21,7 +21,7 @@ pub(crate) use entrypoints::{
     run_async_with_plugin_host_and_kernel_bypass_ingress,
 };
 use logging::init_tracing;
-use observability::{RuntimeObservabilityHandle, RuntimeObservabilityService};
+pub(crate) use observability::{RuntimeObservabilityHandle, RuntimeObservabilityService};
 use prelude::*;
 
 #[cfg(feature = "gossip-bootstrap")]

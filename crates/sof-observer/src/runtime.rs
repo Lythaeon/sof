@@ -10,6 +10,8 @@ use std::{
     time::Instant,
 };
 
+use crate::app::config::read_observability_bind_addr;
+use crate::app::runtime::RuntimeObservabilityService;
 use crate::framework::host::TransactionDispatchScope;
 use crate::framework::{
     DerivedStateHost, DerivedStateReplayBackend, DerivedStateReplayDurability, PluginHost,
@@ -39,9 +41,64 @@ pub enum RuntimeError {
     /// Tokio runtime initialization failed before ingest started.
     #[error("failed to build tokio runtime: {0}")]
     BuildTokioRuntime(std::io::Error),
+    /// Provider-stream runtime exited with a structured operational error.
+    #[error(transparent)]
+    ProviderStream(#[from] ProviderStreamRuntimeError),
     /// Runtime runloop exited with an operational error.
     #[error("runtime runloop failed: {0}")]
     Runloop(String),
+}
+
+/// Structured provider-stream runtime error surface.
+#[derive(Debug, Error)]
+pub enum ProviderStreamRuntimeError {
+    /// Provider-stream observability endpoint failed before ingest started.
+    #[error("failed to start provider-stream observability endpoint on {bind_addr}: {detail}")]
+    ObservabilityStart {
+        /// Requested bind address for the provider runtime observability endpoint.
+        bind_addr: SocketAddr,
+        /// Underlying socket/listener failure string.
+        detail: String,
+    },
+    /// One provider-stream startup stage failed before the runtime loop began.
+    #[error("provider-stream startup failed: {message}")]
+    Startup {
+        /// Human-readable startup failure detail.
+        message: String,
+    },
+    /// Requested hooks are not available for this provider-stream mode.
+    #[error(
+        "provider-stream mode {mode} does not support requested hooks: {unsupported_hooks:?}",
+        mode = .mode.as_str()
+    )]
+    UnsupportedHooks {
+        /// Provider-stream mode being validated.
+        mode: ProviderStreamMode,
+        /// Unsupported hook or feed labels.
+        unsupported_hooks: Vec<String>,
+    },
+    /// Built-in provider modes rejected unsupported hooks that only generic producers can satisfy.
+    #[error(
+        "built-in provider-stream mode {mode} does not support requested hooks: {unsupported_hooks:?}; use raw-shred/gossip mode or ProviderStreamMode::Generic with a custom producer for richer control-plane surfaces",
+        mode = .mode.as_str()
+    )]
+    BuiltInUnsupportedHooks {
+        /// Built-in processed provider mode being validated.
+        mode: ProviderStreamMode,
+        /// Unsupported hook or feed labels.
+        unsupported_hooks: Vec<String>,
+    },
+    /// Provider ingress channel closed unexpectedly.
+    #[error(
+        "provider-stream ingress channel closed unexpectedly for mode {mode}",
+        mode = .mode.as_str()
+    )]
+    IngressClosed {
+        /// Provider-stream mode active when the ingress channel closed.
+        mode: ProviderStreamMode,
+        /// Last degraded source states observed before closure.
+        degraded_sources: Vec<ProviderSourceHealthEvent>,
+    },
 }
 
 impl From<crate::app::runtime::RuntimeEntrypointError> for RuntimeError {
@@ -1555,10 +1612,36 @@ async fn run_provider_stream_runtime(
     mut provider_stream_rx: ProviderStreamReceiver,
 ) -> Result<(), RuntimeError> {
     enforce_provider_stream_capability_policy(mode, &plugin_host, &derived_state_host)?;
+    let observability = if let Some(bind_addr) = read_observability_bind_addr() {
+        let service = RuntimeObservabilityService::start(
+            bind_addr,
+            extension_host.clone(),
+            derived_state_host.clone(),
+        )
+        .await
+        .map_err(|source| ProviderStreamRuntimeError::ObservabilityStart {
+            bind_addr,
+            detail: source.to_string(),
+        })?;
+        tracing::info!(
+            bind_addr = %service.local_addr(),
+            mode = mode.as_str(),
+            "provider-stream runtime observability endpoint enabled"
+        );
+        Some(service)
+    } else {
+        None
+    };
+    let observability_handle = observability
+        .as_ref()
+        .map(RuntimeObservabilityService::handle)
+        .cloned();
     plugin_host
         .startup()
         .await
-        .map_err(|error| RuntimeError::Runloop(error.to_string()))?;
+        .map_err(|error| ProviderStreamRuntimeError::Startup {
+            message: error.to_string(),
+        })?;
     let extension_report = extension_host.startup().await;
     if extension_report.failed_extensions > 0 {
         tracing::warn!(
@@ -1568,12 +1651,15 @@ async fn run_provider_stream_runtime(
         );
     }
     derived_state_host.initialize();
+    if let Some(handle) = observability_handle.as_ref() {
+        handle.mark_ready();
+    }
     tracing::info!(mode = mode.as_str(), "starting SOF provider-stream runtime");
 
     let mut shutdown_signal = shutdown_signal;
     let mut replay_dedupe = ProviderReplayDedupe::new(PROVIDER_REPLAY_DEDUPE_CAPACITY);
     let mut provider_health = ProviderStreamHealth::default();
-    loop {
+    let result = loop {
         tokio::select! {
             biased;
             () = async {
@@ -1583,18 +1669,19 @@ async fn run_provider_stream_runtime(
                     futures_util::future::pending::<()>().await;
                 }
             } => {
-                break;
+                break Ok(());
             }
             update = provider_stream_rx.recv() => {
                 let Some(update) = update else {
-                    let reason = provider_health.closed_reason(mode);
-                    plugin_host.shutdown().await;
-                    extension_host.shutdown().await;
-                    tracing::error!(mode = mode.as_str(), reason, "SOF provider-stream runtime stopped after provider ingress closed unexpectedly");
-                    return Err(RuntimeError::Runloop(reason));
+                    let error = provider_health.closed_error(mode);
+                    tracing::error!(mode = mode.as_str(), error = %error, "SOF provider-stream runtime stopped after provider ingress closed unexpectedly");
+                    break Err(RuntimeError::ProviderStream(error));
                 };
                 if let ProviderStreamUpdate::Health(event) = &update {
                     provider_health.observe(event);
+                    if let Some(handle) = observability_handle.as_ref() {
+                        handle.observe_provider_source_health(event);
+                    }
                     continue;
                 }
                 if replay_dedupe.observe(&update) {
@@ -1603,12 +1690,17 @@ async fn run_provider_stream_runtime(
                 dispatch_provider_stream_update(&plugin_host, &derived_state_host, update);
             }
         }
-    }
+    };
 
     plugin_host.shutdown().await;
     extension_host.shutdown().await;
-    tracing::info!(mode = mode.as_str(), "SOF provider-stream runtime stopped");
-    Ok(())
+    if let Some(service) = observability {
+        service.shutdown().await;
+    }
+    if result.is_ok() {
+        tracing::info!(mode = mode.as_str(), "SOF provider-stream runtime stopped");
+    }
+    result
 }
 
 #[derive(Default)]
@@ -1650,7 +1742,7 @@ impl ProviderStreamHealth {
         }
     }
 
-    fn closed_reason(&self, mode: ProviderStreamMode) -> String {
+    fn degraded_sources(&self) -> Vec<ProviderSourceHealthEvent> {
         let mut degraded = self
             .sources
             .values()
@@ -1661,36 +1753,17 @@ impl ProviderStreamHealth {
                         | ProviderSourceHealthStatus::Unhealthy
                 )
             })
+            .cloned()
             .collect::<Vec<_>>();
         degraded.sort_by_key(|event| event.source.as_str());
-        if degraded.is_empty() {
-            return format!(
-                "provider-stream ingress channel closed unexpectedly for mode {}",
-                mode.as_str()
-            );
+        degraded
+    }
+
+    fn closed_error(&self, mode: ProviderStreamMode) -> ProviderStreamRuntimeError {
+        ProviderStreamRuntimeError::IngressClosed {
+            mode,
+            degraded_sources: self.degraded_sources(),
         }
-        let details = degraded
-            .into_iter()
-            .map(|event| {
-                format!(
-                    "{}={}:{}:{}",
-                    event.source.as_str(),
-                    match event.status {
-                        ProviderSourceHealthStatus::Healthy => "healthy",
-                        ProviderSourceHealthStatus::Reconnecting => "reconnecting",
-                        ProviderSourceHealthStatus::Unhealthy => "unhealthy",
-                    },
-                    event.reason.as_str(),
-                    event.message
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "provider-stream ingress channel closed unexpectedly for mode {} after source degradation: {}",
-            mode.as_str(),
-            details
-        )
     }
 }
 
@@ -1818,15 +1891,62 @@ fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderR
             kind: 5,
             fingerprint: provider_replay_fingerprint(event),
         }),
-        ProviderStreamUpdate::Health(_)
-        | ProviderStreamUpdate::TransactionLog(_)
-        | ProviderStreamUpdate::TransactionViewBatch(_) => None,
+        ProviderStreamUpdate::TransactionLog(event) => {
+            Some(ProviderReplayDedupeKey::ControlPlane {
+                slot: event.slot,
+                kind: 6,
+                fingerprint: provider_replay_transaction_log_fingerprint(event),
+            })
+        }
+        ProviderStreamUpdate::TransactionViewBatch(event) => {
+            Some(ProviderReplayDedupeKey::ControlPlane {
+                slot: event.slot,
+                kind: 7,
+                fingerprint: provider_replay_transaction_view_batch_fingerprint(event),
+            })
+        }
+        ProviderStreamUpdate::Health(_) => None,
     }
 }
 
 fn provider_replay_fingerprint<T: Hash>(value: &T) -> u64 {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn provider_replay_transaction_log_fingerprint(
+    event: &crate::framework::TransactionLogEvent,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    event.signature.hash(&mut hasher);
+    provider_replay_commitment_key(event.commitment_status).hash(&mut hasher);
+    event.matched_filter.hash(&mut hasher);
+    if let Some(err) = &event.err {
+        err.to_string().hash(&mut hasher);
+    }
+    for line in event.logs.iter() {
+        line.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn provider_replay_transaction_view_batch_fingerprint(
+    event: &crate::framework::TransactionViewBatchEvent,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    event.start_index.hash(&mut hasher);
+    event.end_index.hash(&mut hasher);
+    event.last_in_slot.hash(&mut hasher);
+    event.shreds.hash(&mut hasher);
+    event.payload_len.hash(&mut hasher);
+    provider_replay_commitment_key(event.commitment_status).hash(&mut hasher);
+    event.confirmed_slot.hash(&mut hasher);
+    event.finalized_slot.hash(&mut hasher);
+    event.payload.as_ref().hash(&mut hasher);
+    for range in event.transactions.iter() {
+        range.hash(&mut hasher);
+    }
     hasher.finish()
 }
 
@@ -2076,11 +2196,11 @@ fn enforce_provider_stream_capability_policy(
         return Ok(());
     }
     if mode != ProviderStreamMode::Generic {
-        return Err(RuntimeError::Runloop(format!(
-            "built-in provider-stream mode {} does not support requested hooks: {}; use raw-shred/gossip mode or ProviderStreamMode::Generic with a custom producer for richer control-plane surfaces",
-            mode.as_str(),
-            unsupported.join(", ")
-        )));
+        return Err(ProviderStreamRuntimeError::BuiltInUnsupportedHooks {
+            mode,
+            unsupported_hooks: unsupported.into_iter().map(String::from).collect(),
+        }
+        .into());
     }
     match ProviderStreamCapabilityPolicy::from_runtime_env() {
         ProviderStreamCapabilityPolicy::Warn => {
@@ -2091,11 +2211,13 @@ fn enforce_provider_stream_capability_policy(
             );
             Ok(())
         }
-        ProviderStreamCapabilityPolicy::Strict => Err(RuntimeError::Runloop(format!(
-            "provider-stream mode {} does not support requested hooks: {}",
-            mode.as_str(),
-            unsupported.join(",")
-        ))),
+        ProviderStreamCapabilityPolicy::Strict => {
+            Err(ProviderStreamRuntimeError::UnsupportedHooks {
+                mode,
+                unsupported_hooks: unsupported.into_iter().map(String::from).collect(),
+            }
+            .into())
+        }
     }
 }
 
@@ -2980,6 +3102,36 @@ mod tests {
         })
     }
 
+    fn sample_provider_transaction_log_update(slot: u64) -> ProviderStreamUpdate {
+        ProviderStreamUpdate::TransactionLog(crate::framework::TransactionLogEvent {
+            slot,
+            commitment_status: crate::event::TxCommitmentStatus::Processed,
+            signature: Signature::from([slot as u8; 64]),
+            err: None,
+            logs: Arc::from([String::from("program log: hello")]),
+            matched_filter: None,
+        })
+    }
+
+    fn sample_provider_transaction_view_batch_update(slot: u64) -> ProviderStreamUpdate {
+        let payload: Arc<[u8]> = Arc::from([1_u8, 2, 3, 4]);
+        let transactions: Arc<[crate::framework::SerializedTransactionRange]> =
+            Arc::from([crate::framework::SerializedTransactionRange::new(0, 4)]);
+        ProviderStreamUpdate::TransactionViewBatch(crate::framework::TransactionViewBatchEvent {
+            slot,
+            start_index: 0,
+            end_index: 0,
+            last_in_slot: false,
+            shreds: 1,
+            payload_len: payload.len(),
+            commitment_status: crate::event::TxCommitmentStatus::Processed,
+            confirmed_slot: None,
+            finalized_slot: None,
+            payload,
+            transactions,
+        })
+    }
+
     #[test]
     fn typed_derived_state_config_serializes_into_env_overrides() {
         let setup = RuntimeSetup::new().with_derived_state_config(DerivedStateRuntimeConfig {
@@ -3306,9 +3458,14 @@ mod tests {
         );
         crate::runtime_env::clear_runtime_env_overrides();
         match result {
-            Err(RuntimeError::Runloop(message)) => {
-                assert!(message.contains("yellowstone_grpc"));
-                assert!(message.contains("on_raw_packet"));
+            Err(RuntimeError::ProviderStream(
+                ProviderStreamRuntimeError::BuiltInUnsupportedHooks {
+                    mode,
+                    unsupported_hooks,
+                },
+            )) => {
+                assert_eq!(mode, ProviderStreamMode::YellowstoneGrpc);
+                assert!(unsupported_hooks.contains(&String::from("on_raw_packet")));
             }
             other => panic!("expected strict provider capability failure, got {other:?}"),
         }
@@ -3350,9 +3507,12 @@ mod tests {
         );
         crate::runtime_env::clear_runtime_env_overrides();
         match result {
-            Err(RuntimeError::Runloop(message)) => {
-                assert!(message.contains("built-in provider-stream mode"));
-                assert!(message.contains("on_recent_blockhash"));
+            Err(RuntimeError::ProviderStream(
+                ProviderStreamRuntimeError::BuiltInUnsupportedHooks {
+                    unsupported_hooks, ..
+                },
+            )) => {
+                assert!(unsupported_hooks.contains(&String::from("on_recent_blockhash")));
             }
             other => panic!("expected built-in recent-blockhash capability failure, got {other:?}"),
         }
@@ -3376,9 +3536,19 @@ mod tests {
         );
         crate::runtime_env::clear_runtime_env_overrides();
         match result {
-            Err(RuntimeError::Runloop(message)) => {
-                assert!(message.contains("derived_state.account_touch_observed"));
-                assert!(message.contains("derived_state.control_plane_observed"));
+            Err(RuntimeError::ProviderStream(
+                ProviderStreamRuntimeError::BuiltInUnsupportedHooks {
+                    unsupported_hooks, ..
+                },
+            )) => {
+                assert!(
+                    unsupported_hooks
+                        .contains(&String::from("derived_state.account_touch_observed"))
+                );
+                assert!(
+                    unsupported_hooks
+                        .contains(&String::from("derived_state.control_plane_observed"))
+                );
             }
             other => panic!("expected strict provider capability failure, got {other:?}"),
         }
@@ -3417,12 +3587,18 @@ mod tests {
         );
         crate::runtime_env::clear_runtime_env_overrides();
         match result {
-            Err(RuntimeError::Runloop(message)) => {
-                assert!(message.contains("built-in provider-stream mode"));
-                assert!(message.contains("on_cluster_topology"));
-                assert!(message.contains("on_leader_schedule"));
-                assert!(message.contains("on_reorg"));
-                assert!(message.contains("derived_state.control_plane_observed"));
+            Err(RuntimeError::ProviderStream(
+                ProviderStreamRuntimeError::BuiltInUnsupportedHooks {
+                    unsupported_hooks, ..
+                },
+            )) => {
+                assert!(unsupported_hooks.contains(&String::from("on_cluster_topology")));
+                assert!(unsupported_hooks.contains(&String::from("on_leader_schedule")));
+                assert!(unsupported_hooks.contains(&String::from("on_reorg")));
+                assert!(
+                    unsupported_hooks
+                        .contains(&String::from("derived_state.control_plane_observed"))
+                );
             }
             other => panic!("expected built-in provider capability failure, got {other:?}"),
         }
@@ -3479,10 +3655,13 @@ mod tests {
         );
         crate::runtime_env::clear_runtime_env_overrides();
         match result {
-            Err(RuntimeError::Runloop(message)) => {
-                assert!(message.contains("built-in provider-stream mode"));
-                assert!(message.contains("on_cluster_topology"));
-                assert!(message.contains("on_leader_schedule"));
+            Err(RuntimeError::ProviderStream(
+                ProviderStreamRuntimeError::BuiltInUnsupportedHooks {
+                    unsupported_hooks, ..
+                },
+            )) => {
+                assert!(unsupported_hooks.contains(&String::from("on_cluster_topology")));
+                assert!(unsupported_hooks.contains(&String::from("on_leader_schedule")));
             }
             other => panic!("expected sof-tx live adapter failure, got {other:?}"),
         }
@@ -3505,9 +3684,15 @@ mod tests {
         );
         crate::runtime_env::clear_runtime_env_overrides();
         match result {
-            Err(RuntimeError::Runloop(message)) => {
-                assert!(message.contains("built-in provider-stream mode"));
-                assert!(message.contains("derived_state.control_plane_observed"));
+            Err(RuntimeError::ProviderStream(
+                ProviderStreamRuntimeError::BuiltInUnsupportedHooks {
+                    unsupported_hooks, ..
+                },
+            )) => {
+                assert!(
+                    unsupported_hooks
+                        .contains(&String::from("derived_state.control_plane_observed"))
+                );
             }
             other => panic!("expected sof-tx replay adapter failure, got {other:?}"),
         }
@@ -3599,6 +3784,24 @@ mod tests {
         assert!(dedupe.observe(&update));
     }
 
+    #[test]
+    fn provider_replay_dedupe_skips_duplicate_transaction_log_updates() {
+        let update = sample_provider_transaction_log_update(42);
+        let mut dedupe = ProviderReplayDedupe::new(8);
+
+        assert!(!dedupe.observe(&update));
+        assert!(dedupe.observe(&update));
+    }
+
+    #[test]
+    fn provider_replay_dedupe_skips_duplicate_transaction_view_batch_updates() {
+        let update = sample_provider_transaction_view_batch_update(42);
+        let mut dedupe = ProviderReplayDedupe::new(8);
+
+        assert!(!dedupe.observe(&update));
+        assert!(dedupe.observe(&update));
+    }
+
     #[tokio::test]
     async fn provider_stream_strict_policy_fails_before_plugin_and_extension_startup() {
         crate::runtime_env::set_runtime_env_overrides([(
@@ -3630,7 +3833,12 @@ mod tests {
         .await;
         crate::runtime_env::clear_runtime_env_overrides();
 
-        assert!(matches!(result, Err(RuntimeError::Runloop(_))));
+        assert!(matches!(
+            result,
+            Err(RuntimeError::ProviderStream(
+                ProviderStreamRuntimeError::BuiltInUnsupportedHooks { .. }
+            ))
+        ));
         assert_eq!(plugin_counter.load(Ordering::Relaxed), 0);
         assert_eq!(extension_counter.load(Ordering::Relaxed), 0);
     }
@@ -3655,9 +3863,12 @@ mod tests {
         .await;
 
         match result {
-            Err(RuntimeError::Runloop(message)) => {
-                assert!(message.contains("provider-stream ingress channel closed unexpectedly"));
-                assert!(message.contains("yellowstone_grpc"));
+            Err(RuntimeError::ProviderStream(ProviderStreamRuntimeError::IngressClosed {
+                mode,
+                degraded_sources,
+            })) => {
+                assert_eq!(mode, ProviderStreamMode::YellowstoneGrpc);
+                assert!(degraded_sources.is_empty());
             }
             other => panic!("expected provider ingress closure failure, got {other:?}"),
         }
@@ -3694,11 +3905,24 @@ mod tests {
         .await;
 
         match result {
-            Err(RuntimeError::Runloop(message)) => {
-                assert!(message.contains("provider-stream ingress channel closed unexpectedly"));
-                assert!(message.contains(
-                    "yellowstone_grpc=reconnecting:upstream_protocol_failure:upstream stalled"
-                ));
+            Err(RuntimeError::ProviderStream(ProviderStreamRuntimeError::IngressClosed {
+                degraded_sources,
+                ..
+            })) => {
+                assert_eq!(degraded_sources.len(), 1);
+                assert_eq!(
+                    degraded_sources[0].source,
+                    crate::provider_stream::ProviderSourceId::YellowstoneGrpc
+                );
+                assert_eq!(
+                    degraded_sources[0].status,
+                    crate::provider_stream::ProviderSourceHealthStatus::Reconnecting
+                );
+                assert_eq!(
+                    degraded_sources[0].reason,
+                    crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure
+                );
+                assert_eq!(degraded_sources[0].message, "upstream stalled");
             }
             other => panic!("expected degraded provider closure failure, got {other:?}"),
         }

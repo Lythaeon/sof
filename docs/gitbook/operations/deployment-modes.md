@@ -68,6 +68,10 @@ SOF exposes this category through `ProviderStreamMode`. In that mode:
 - built-in provider adapters now emit explicit source health transitions into
   SOF, and unexpected provider ingress closure is treated as a runtime failure
   instead of a clean stop
+  - those source states are also exposed via the runtime observability endpoint
+    so reconnecting/unhealthy providers are visible as metrics
+  - generic provider replay dedupe also covers `TransactionLog` and
+    `TransactionViewBatch` updates, not only transaction/control-plane events
 
 That means deployment mode is not only about network topology. It is also about how much of the
 low-level substrate SOF is owning for the application:
