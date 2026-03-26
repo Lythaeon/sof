@@ -354,7 +354,7 @@ async fn run_websocket_transaction_connection(
                 let frame = frame?;
                 match frame {
                     WsMessage::Text(text) => {
-                        let mut bytes = text.to_string().into_bytes();
+                        let mut bytes = text.as_str().as_bytes().to_vec();
                         if let Some(event) =
                             parse_transaction_notification(&mut bytes, config.commitment)?
                         {
@@ -407,7 +407,7 @@ where
             let frame = frame?;
             match frame {
                 WsMessage::Text(text) => {
-                    let mut bytes = text.to_string().into_bytes();
+                    let mut bytes = text.as_str().as_bytes().to_vec();
                     if handle_subscription_text(&mut bytes)? {
                         return Ok(());
                     }
