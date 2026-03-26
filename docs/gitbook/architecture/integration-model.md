@@ -28,6 +28,9 @@ Provider mode matters here:
 - `ProviderStreamMode::Generic` is the path for custom producers that want to
   feed richer control-plane updates through the same host surface
 
+That asymmetry is deliberate, not accidental. Switching ingress modes changes
+both transport and semantics.
+
 ## 2. Runtime Extensions
 
 Runtime extensions are the capability and resource-management surface.
@@ -69,6 +72,11 @@ One important boundary:
 - built-in Yellowstone, LaserStream, and websocket adapters are not a complete
   `sof-tx` control-plane source today
 - `ProviderStreamMode::Generic` can be, if the producer supplies the full feed
+
+So users should think in two steps:
+
+1. what ingest path reaches the host earliest
+2. what semantic surface that path can honestly emit
 
 ## Common Mistake To Avoid
 

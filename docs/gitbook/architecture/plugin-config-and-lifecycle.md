@@ -102,6 +102,27 @@ When a `PluginHost` is passed into the packaged SOF runtime:
 If one plugin fails during startup, SOF aborts runtime startup and shuts down any plugins that had
 already started.
 
+## Ordering, Backpressure, and Concurrency
+
+These rules should be treated as part of the plugin contract:
+
+- hook subscriptions are static after host construction
+- borrowed classifiers run on the hot path before SOF decides whether to allocate/queue a callback
+- normal async hook delivery is off the ingest hot path through bounded queues
+- queue pressure drops plugin events instead of blocking ingest
+- `PluginDispatchMode::Sequential` preserves registration order for one queued event
+- `PluginDispatchMode::BoundedConcurrent(n)` keeps parallelism bounded but does not promise the
+  same strict per-event callback ordering
+
+If your downstream logic needs stronger replay or ordering guarantees than that, it belongs on the
+derived-state surface rather than the observational plugin surface.
+
+## Ownership Model
+
+SOF uses borrowed references on the hot path when it can, then hands async hooks runtime-managed
+event values by shared reference. Plugin code should treat those callback arguments as callback
+scope data, not as objects whose lifetime it owns outside the hook turn.
+
 ## What Stays Dynamic
 
 `PluginConfig` is only for static hook enablement.

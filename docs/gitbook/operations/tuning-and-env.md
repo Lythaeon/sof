@@ -57,6 +57,12 @@ they are too host-specific to recommend as defaults:
   packet-worker burst can hand back at once. Smaller values reduce burst
   head-of-line delay but add more queue churn.
 
+Pinning and placement should be read narrowly:
+
+- SOF exposes useful single-host controls
+- SOF does not yet claim full NUMA-aware scheduling
+- multi-socket and high-core-count hosts still need measured placement decisions
+
 Measured public-VPS note from the current 4-core sweep:
 
 - default `SOF_TVU_SOCKETS=4` beat both `2` and `8` on tx-availability latency
@@ -142,6 +148,7 @@ Useful runtime-owned endpoint metrics while tuning:
 - worker counts exceed the host's ability to keep CPU caches warm
 - repair traffic grows faster than recovered useful data
 - changes are made without any metric or before/after capture
+- pinning is applied without checking whether it improved locality or just made queue imbalance worse
 
 ## Practical Advice
 

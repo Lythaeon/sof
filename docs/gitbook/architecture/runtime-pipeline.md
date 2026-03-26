@@ -85,3 +85,21 @@ pressure:
 
 That makes the runtime easier to tune for low-latency hosts than systems that quietly turn every
 problem into more queued memory.
+
+## Scheduling Model
+
+SOF's current scheduling model is explicit but not magical:
+
+- packet ingest fans out into packet workers
+- completed datasets fan out into dataset workers
+- plugin hooks run through bounded dispatch queues
+- provider modes run supervised source sessions and then enter the same downstream host surface
+
+What SOF does not claim yet:
+
+- full NUMA-aware scheduling
+- automatic multi-socket placement
+- a universal best pinning policy across hosts
+
+Some pinning controls exist, but low-latency placement is still an operator concern that should be
+measured on the actual machine.

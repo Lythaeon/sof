@@ -828,7 +828,7 @@ async fn run_async_with_hosts_inner(
     {
         tracing::warn!(
             trust_mode = shred_trust_mode.as_str(),
-            "running raw-shred ingest with local shred verification disabled; this mode assumes an authenticated trusted upstream"
+            "running raw-shred ingest with local shred verification disabled; use this only with an authenticated trusted upstream, not public gossip or public peers"
         );
     }
     let verify_enabled = live_shreds_enabled && verify_enabled;
@@ -840,7 +840,7 @@ async fn run_async_with_hosts_inner(
     {
         tracing::warn!(
             trust_mode = shred_trust_mode.as_str(),
-            "running raw-shred ingest with recovered shred verification disabled; this mode assumes an authenticated trusted upstream"
+            "running raw-shred ingest with recovered shred verification disabled; use this only with an authenticated trusted upstream, not public gossip or public peers"
         );
     }
     let verify_signature_cache_entries = read_verify_signature_cache_entries();

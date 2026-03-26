@@ -27,6 +27,24 @@ It is a packaged runtime substrate for Solana applications:
 
 The goal is simple: application code should focus on the Solana logic you care about, while SOF owns the hard low-level work underneath it.
 
+## Plugin And Consumer Contract
+
+SOF's plugin surface is intentionally bounded. The important rules are:
+
+- plugin hook subscriptions are static at startup; SOF does not add or remove plugins at runtime
+- borrowed classifier hooks such as `transaction_prefilter`, `accepts_transaction_ref`, and
+  `transaction_interest_ref` run on the hot path and should stay cheap
+- normal async plugin hooks run off the ingest hot path through bounded dispatch queues
+- queue pressure drops plugin events instead of stalling packet ingest
+- `PluginDispatchMode::Sequential` preserves registration order for one queued event
+- `PluginDispatchMode::BoundedConcurrent(n)` trades that strict per-event callback ordering for
+  bounded parallelism
+- plugins are the observational surface, not the authoritative replay contract; if you need
+  restart-safe deterministic state, use derived-state consumers instead
+
+That is deliberate. SOF protects ingest first, then gives you explicit ways to choose where you
+want latency, ordering, and replay guarantees.
+
 ## Why Build On SOF
 
 Most Solana teams do not fail on business logic first. They burn time on the substrate:
@@ -82,6 +100,15 @@ You can feed SOF from:
 
 And still keep the same local runtime/plugin surface where the semantics line up.
 
+That last clause matters. Switching ingest modes is not just a transport change:
+
+- raw-shred modes can emit the richest local control-plane surface
+- built-in processed providers are intentionally transaction-first
+- `ProviderStreamMode::Generic` is the escape hatch when a custom producer needs to feed richer
+  control-plane updates into SOF
+
+So ingress choice is also a semantic choice.
+
 Transaction-family plugins can choose delivery commitment once at the SOF layer:
 
 ```rust
@@ -126,6 +153,11 @@ Raw shred trust modes:
   - verification off by default
   - meant for trusted private shred feeds
   - lower observer-side CPU cost
+
+`trusted_raw_shred_provider` is intentionally not the safe default. Use it only when your upstream
+trust boundary is explicit, for example validator-adjacent raw shred distribution or a private
+provider you have already decided to trust operationally. If that sentence is not clearly true for
+your deployment, stay on `public_untrusted`.
 
 Trusted raw-shred mode still uses the normal SOF downstream path after admission:
 
@@ -195,6 +227,24 @@ That includes:
 - fail-fast capability checks where semantics cannot be met
 
 The rule is: if a mode cannot honestly provide a surface, SOF should either make that limitation explicit or reject the configuration.
+
+## Scheduling And Runtime Shape
+
+SOF already has an explicit scheduling model, even though it is not yet a full NUMA-aware runtime:
+
+- raw-shred ingest fans work out into packet workers and dataset workers
+- provider modes run their own supervised source sessions and then enter the same downstream host
+  surface where semantics line up
+- plugin dispatch is explicitly queued and bounded
+- selected runtime threads can be pinned with host/runtime controls
+
+What SOF does not claim yet:
+
+- a first-class NUMA scheduler
+- automatic topology-aware pin placement for every host
+- universal “best” worker geometry across all CPUs and providers
+
+For latency-sensitive deployments, thread placement and host topology still need measurement.
 
 ## The Workspace
 

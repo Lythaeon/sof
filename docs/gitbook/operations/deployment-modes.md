@@ -24,6 +24,10 @@ application.
 | `public_untrusted` | you want to own the whole stack and keep independent verification | higher CPU cost and usually later visibility than private shred distribution |
 | `trusted_raw_shred_provider` | you have access to a trusted private shred feed and want SOF's fastest practical path | you are explicitly depending on upstream trust instead of only public-edge verification |
 
+`trusted_raw_shred_provider` should be treated as a trust-boundary decision, not just a
+performance knob. It is intended for validator-adjacent or privately authenticated raw shred
+distribution. If you are still on public gossip or public peers, this is the wrong posture.
+
 `processed_provider_stream` products such as Yellowstone gRPC, LaserStream, or websocket feeds are
 useful, but they are a different category from raw-shred SOF ingest. They are not raw-shred trust
 modes, so they are not values of `SOF_SHRED_TRUST_MODE`.
@@ -88,8 +92,14 @@ SOF exposes this category through `ProviderStreamMode`. In that mode:
     terminate cleanly instead of being treated as a failed live stream
 - generic provider capability warnings are persistent runtime state now, not
   only one startup log line
-  - under `SOF_PROVIDER_STREAM_CAPABILITY_POLICY=warn`, unsupported requested
-    hooks are exported through runtime observability metrics
+- under `SOF_PROVIDER_STREAM_CAPABILITY_POLICY=warn`, unsupported requested
+  hooks are exported through runtime observability metrics
+
+That semantic asymmetry is part of the design:
+
+- raw-shred modes maximize local observer richness
+- built-in processed providers maximize reuse of provider-defined transaction streams
+- generic provider mode exists when a producer needs to restore richer control-plane semantics
 
 That means deployment mode is not only about network topology. It is also about how much of the
 low-level substrate SOF is owning for the application:

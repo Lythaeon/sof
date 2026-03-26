@@ -42,6 +42,22 @@ That is also why SOF tries to keep semantics consistent across ingress modes. Th
 developer writes one plugin/runtime consumer model while SOF owns the provider-specific runtime
 plumbing and performance discipline underneath it.
 
+## Plugin Contract
+
+The plugin model is intentionally explicit:
+
+- hook subscriptions are static at startup
+- borrowed classifiers run on the hot path and should stay cheap
+- async hooks run off the ingest hot path through bounded queues
+- queue pressure drops hook events instead of stalling ingest
+- `PluginDispatchMode::Sequential` preserves registration order for one queued event
+- `PluginDispatchMode::BoundedConcurrent(n)` gives bounded parallelism instead of strict per-event
+  callback ordering
+- plugins are not the authoritative replay surface; derived-state consumers are
+
+That means SOF is trying to protect the runtime first and make ordering/backpressure tradeoffs
+visible, not implicit.
+
 ## Explicit Trust Model
 
 SOF exposes two explicit raw-shred trust modes:
@@ -163,6 +179,13 @@ LaserStream, and websocket adapters remain transaction-first today.
 That tradeoff should be explicit: public gossip is the independent baseline, trusted raw shred
 distribution is the fast path, and processed provider streams are a different observer model.
 
+Switching ingress families is therefore not only a connectivity choice. It is also a semantic
+choice:
+
+- raw-shred modes expose the richest local observer/control-plane surface
+- built-in processed providers are narrower on purpose
+- `ProviderStreamMode::Generic` exists when a custom producer needs to restore that richer surface
+
 Programmatic setup uses the typed runtime API:
 
 ```rust
@@ -177,6 +200,10 @@ The equivalent env knob is:
 ```bash
 SOF_SHRED_TRUST_MODE=trusted_raw_shred_provider
 ```
+
+Do not treat this as a generic “fast mode” switch. It is only correct when the upstream raw shred
+source is explicitly trusted. If you are still on public gossip or public peers, `public_untrusted`
+is the right mode.
 
 If you need to analyze only a specific gossip peer set, pin runtime switching to the configured
 entrypoints:
@@ -224,6 +251,25 @@ Build flags:
 - Keep more runtime work on borrowed/shared data instead of eagerly allocating owned transaction or dataset payload copies
 - Drop duplicate or conflicting shred observations before they can re-emit duplicate dataset or transaction events downstream
 - Treat robustness and accuracy as first-class runtime behavior, not downstream application glue
+
+## Scheduling Model Today
+
+SOF already has an explicit execution shape:
+
+- raw ingress fans out into packet workers
+- completed datasets fan out into dataset workers
+- provider sessions are supervised independently and feed the same downstream runtime surface where
+  semantics line up
+- plugin dispatch is explicitly queued and bounded
+
+What is not claimed yet:
+
+- a first-class NUMA-aware scheduler
+- automatic host-topology placement
+- one universal worker geometry for every host class
+
+Pinning and thread-count controls exist, but high-end placement still needs measurement on the
+actual host.
 
 ## Install
 
