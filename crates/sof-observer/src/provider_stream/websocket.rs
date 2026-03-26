@@ -24,7 +24,8 @@ use crate::{
     event::TxCommitmentStatus,
     framework::TransactionEvent,
     provider_stream::{
-        ProviderStreamSender, ProviderStreamUpdate, classify_provider_transaction_kind,
+        ProviderStreamSender, ProviderStreamUpdate, SerializedTransactionEvent,
+        classify_provider_transaction_kind,
     },
 };
 
@@ -355,7 +356,7 @@ async fn run_websocket_transaction_connection(
                 let frame = frame?;
                 match frame {
                     WsMessage::Text(text) => {
-                        if let Some(event) =
+                        if let Some(update) =
                             parse_transaction_notification(
                                 frame_bytes_mut(&mut scratch.frame_bytes, text.as_str().as_bytes()),
                                 &mut scratch.tx_bytes,
@@ -363,13 +364,13 @@ async fn run_websocket_transaction_connection(
                             )?
                         {
                             sender
-                                .send(ProviderStreamUpdate::Transaction(event))
+                                .send(update)
                                 .await
                                 .map_err(|_error| WebsocketTransactionError::QueueClosed)?;
                         }
                     }
                     WsMessage::Binary(bytes) => {
-                        if let Some(event) =
+                        if let Some(update) =
                             parse_transaction_notification(
                                 frame_bytes_mut(&mut scratch.frame_bytes, bytes.as_ref()),
                                 &mut scratch.tx_bytes,
@@ -377,7 +378,7 @@ async fn run_websocket_transaction_connection(
                             )?
                         {
                             sender
-                                .send(ProviderStreamUpdate::Transaction(event))
+                                .send(update)
                                 .await
                                 .map_err(|_error| WebsocketTransactionError::QueueClosed)?;
                         }
@@ -462,7 +463,7 @@ fn parse_transaction_notification(
     bytes: &mut [u8],
     tx_bytes: &mut Vec<u8>,
     commitment_status: WebsocketTransactionCommitment,
-) -> Result<Option<TransactionEvent>, WebsocketTransactionError> {
+) -> Result<Option<ProviderStreamUpdate>, WebsocketTransactionError> {
     let value: WebsocketTransactionEnvelopeMessage = simd_from_slice(bytes).map_err(|error| {
         WebsocketTransactionError::Protocol(format!("invalid websocket json: {error}"))
     })?;
@@ -485,7 +486,48 @@ fn parse_transaction_notification(
         .map_err(|_error| {
             WebsocketTransactionError::Convert("invalid base64 transaction payload")
         })?;
-    let tx = bincode::deserialize::<VersionedTransaction>(tx_bytes).map_err(|_error| {
+    let signature = notification
+        .signature
+        .and_then(|signature| Signature::from_str(&signature).ok());
+    let tx_payload: std::sync::Arc<[u8]> = std::mem::take(tx_bytes).into();
+    Ok(Some(ProviderStreamUpdate::SerializedTransaction(
+        SerializedTransactionEvent {
+            slot: notification.slot,
+            commitment_status: commitment_status.as_tx_commitment(),
+            confirmed_slot: None,
+            finalized_slot: None,
+            signature,
+            bytes: tx_payload,
+        },
+    )))
+}
+
+fn materialize_transaction_baseline(
+    bytes: &mut [u8],
+    commitment_status: WebsocketTransactionCommitment,
+) -> Result<Option<TransactionEvent>, WebsocketTransactionError> {
+    let value: WebsocketTransactionEnvelopeMessage = simd_from_slice(bytes).map_err(|error| {
+        WebsocketTransactionError::Protocol(format!("invalid websocket json: {error}"))
+    })?;
+    if let Some(error) = value.error {
+        return Err(WebsocketTransactionError::Protocol(format!(
+            "websocket provider error: {error}"
+        )));
+    }
+    let Some(notification) = value.params.map(|params| params.result) else {
+        return Ok(None);
+    };
+    if notification.transaction.transaction.1 != "base64" {
+        return Err(WebsocketTransactionError::Convert(
+            "unsupported websocket transaction encoding",
+        ));
+    }
+    let tx_bytes = STANDARD
+        .decode(notification.transaction.transaction.0.as_bytes())
+        .map_err(|_error| {
+            WebsocketTransactionError::Convert("invalid base64 transaction payload")
+        })?;
+    let tx = bincode::deserialize::<VersionedTransaction>(&tx_bytes).map_err(|_error| {
         WebsocketTransactionError::Convert("failed to deserialize transaction")
     })?;
     let signature = tx.signatures.first().copied().or_else(|| {
@@ -613,51 +655,6 @@ mod tests {
         .into_bytes()
     }
 
-    fn parse_transaction_notification_baseline(
-        bytes: &mut [u8],
-        commitment_status: WebsocketTransactionCommitment,
-    ) -> Result<Option<TransactionEvent>, WebsocketTransactionError> {
-        let value: WebsocketTransactionEnvelopeMessage =
-            simd_from_slice(bytes).map_err(|error| {
-                WebsocketTransactionError::Protocol(format!("invalid websocket json: {error}"))
-            })?;
-        if let Some(error) = value.error {
-            return Err(WebsocketTransactionError::Protocol(format!(
-                "websocket provider error: {error}"
-            )));
-        }
-        let Some(notification) = value.params.map(|params| params.result) else {
-            return Ok(None);
-        };
-        if notification.transaction.transaction.1 != "base64" {
-            return Err(WebsocketTransactionError::Convert(
-                "unsupported websocket transaction encoding",
-            ));
-        }
-        let tx_bytes = STANDARD
-            .decode(notification.transaction.transaction.0.as_bytes())
-            .map_err(|_error| {
-                WebsocketTransactionError::Convert("invalid base64 transaction payload")
-            })?;
-        let tx = bincode::deserialize::<VersionedTransaction>(&tx_bytes).map_err(|_error| {
-            WebsocketTransactionError::Convert("failed to deserialize transaction")
-        })?;
-        let signature = tx.signatures.first().copied().or_else(|| {
-            notification
-                .signature
-                .and_then(|signature| Signature::from_str(&signature).ok())
-        });
-        Ok(Some(TransactionEvent {
-            slot: notification.slot,
-            commitment_status: commitment_status.as_tx_commitment(),
-            confirmed_slot: None,
-            finalized_slot: None,
-            signature,
-            kind: classify_provider_transaction_kind(&tx),
-            tx: Arc::new(tx),
-        }))
-    }
-
     #[cfg(feature = "provider-grpc")]
     #[test]
     fn websocket_filter_shape_matches_yellowstone_config() {
@@ -749,30 +746,16 @@ mod tests {
     #[test]
     fn websocket_transaction_notification_decodes_full_transaction() {
         let payload = sample_notification_payload();
-        let mut signature_probe = payload.clone();
-        let mut tx_bytes = Vec::new();
-        let signature = parse_transaction_notification(
-            &mut signature_probe,
-            &mut tx_bytes,
-            WebsocketTransactionCommitment::Confirmed,
-        )
-        .expect("notification should parse")
-        .expect("transaction event")
-        .signature
-        .expect("signature");
-
         let mut payload = payload;
-        let mut tx_bytes = Vec::new();
-        let event = parse_transaction_notification(
+        let event = materialize_transaction_baseline(
             &mut payload,
-            &mut tx_bytes,
             WebsocketTransactionCommitment::Confirmed,
         )
         .expect("notification should parse")
         .expect("transaction event");
 
         assert_eq!(event.slot, 55);
-        assert_eq!(event.signature, Some(signature));
+        assert!(event.signature.is_some());
         assert_eq!(event.commitment_status, TxCommitmentStatus::Confirmed);
         assert_eq!(event.kind, TxKind::NonVote);
     }
@@ -830,10 +813,10 @@ mod tests {
             .expect("provider update timeout")
             .expect("provider update");
         match update {
-            ProviderStreamUpdate::Transaction(event) => {
+            ProviderStreamUpdate::SerializedTransaction(event) => {
                 assert_eq!(event.slot, 55);
-                assert_eq!(event.kind, TxKind::NonVote);
                 assert!(event.signature.is_some());
+                assert!(!event.bytes.is_empty());
             }
             other => panic!("expected transaction update, got {other:?}"),
         }
@@ -853,7 +836,7 @@ mod tests {
         let baseline_started = Instant::now();
         for _ in 0..iterations {
             let mut frame = payload.clone();
-            let event = parse_transaction_notification_baseline(
+            let event = materialize_transaction_baseline(
                 &mut frame,
                 WebsocketTransactionCommitment::Confirmed,
             )
@@ -895,7 +878,7 @@ mod tests {
         let payload = sample_notification_payload();
         for _ in 0..iterations {
             let mut frame = payload.clone();
-            let event = parse_transaction_notification_baseline(
+            let event = materialize_transaction_baseline(
                 &mut frame,
                 WebsocketTransactionCommitment::Confirmed,
             )

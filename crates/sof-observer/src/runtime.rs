@@ -2,16 +2,19 @@
 
 use std::{future::Future, net::SocketAddr, path::PathBuf, pin::Pin, time::Instant};
 
+use crate::framework::host::TransactionDispatchScope;
 use crate::framework::{
     DerivedStateHost, DerivedStateReplayBackend, DerivedStateReplayDurability, PluginHost,
-    RuntimeExtensionHost,
+    RuntimeExtensionHost, TransactionEvent,
 };
 use crate::provider_stream::{ProviderStreamMode, ProviderStreamReceiver, ProviderStreamUpdate};
+use agave_transaction_view::transaction_view::SanitizedTransactionView;
 use sof_gossip_tuning::{
     CpuCoreIndex, GossipChannelTuning, GossipTuningProfile, GossipTuningService, IngestQueueMode,
     QueueCapacity, ReceiverCoalesceWindow, RuntimeTuningPort, SofRuntimeTuning,
     TvuReceiveSocketCount,
 };
+use solana_transaction::versioned::VersionedTransaction;
 use thiserror::Error;
 
 type ShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
@@ -1602,6 +1605,9 @@ fn dispatch_provider_stream_update(
                 plugin_host.on_transaction(event);
             }
         }
+        ProviderStreamUpdate::SerializedTransaction(event) => {
+            dispatch_provider_stream_serialized_transaction(plugin_host, derived_state_host, event);
+        }
         ProviderStreamUpdate::TransactionLog(event) => {
             if plugin_host.wants_transaction_log() {
                 plugin_host.on_transaction_log(event);
@@ -1636,6 +1642,95 @@ fn dispatch_provider_stream_update(
                 plugin_host.on_cluster_topology(event);
             }
         }
+    }
+}
+
+fn dispatch_provider_stream_serialized_transaction(
+    plugin_host: &PluginHost,
+    derived_state_host: &DerivedStateHost,
+    event: crate::provider_stream::SerializedTransactionEvent,
+) {
+    let wants_transaction = plugin_host.wants_transaction();
+    let wants_recent_blockhash = plugin_host.wants_recent_blockhash();
+    let wants_derived_state_transaction = derived_state_host.wants_transaction_applied();
+    if !wants_transaction && !wants_recent_blockhash && !wants_derived_state_transaction {
+        return;
+    }
+
+    let mut signature = event.signature;
+    let mut recent_blockhash = None;
+    let mut kind = None;
+    if let Ok(view) = SanitizedTransactionView::try_new_sanitized(event.bytes.as_ref(), true) {
+        if signature.is_none() {
+            signature = view.signatures().first().copied();
+        }
+        kind = Some(crate::provider_stream::classify_provider_transaction_kind_view(&view));
+        if wants_recent_blockhash {
+            recent_blockhash = Some(view.recent_blockhash().to_bytes());
+        }
+        if wants_transaction {
+            let prefiltered = plugin_host
+                .classify_transaction_view_in_scope(&view, TransactionDispatchScope::All);
+            if !prefiltered.needs_full_classification
+                && prefiltered.dispatch.is_empty()
+                && !wants_derived_state_transaction
+            {
+                if let Some(recent_blockhash) = recent_blockhash {
+                    plugin_host.on_recent_blockhash(
+                        crate::framework::ObservedRecentBlockhashEvent {
+                            slot: event.slot,
+                            recent_blockhash,
+                            dataset_tx_count: 1,
+                        },
+                    );
+                }
+                return;
+            }
+        }
+        if !wants_transaction && !wants_derived_state_transaction {
+            if let Some(recent_blockhash) = recent_blockhash {
+                plugin_host.on_recent_blockhash(crate::framework::ObservedRecentBlockhashEvent {
+                    slot: event.slot,
+                    recent_blockhash,
+                    dataset_tx_count: 1,
+                });
+            }
+            return;
+        }
+    }
+
+    let Ok(tx) = bincode::deserialize::<VersionedTransaction>(event.bytes.as_ref()) else {
+        tracing::warn!(
+            slot = event.slot,
+            "failed to deserialize provider serialized transaction"
+        );
+        return;
+    };
+    let tx = std::sync::Arc::new(tx);
+    let event = TransactionEvent {
+        slot: event.slot,
+        commitment_status: event.commitment_status,
+        confirmed_slot: event.confirmed_slot,
+        finalized_slot: event.finalized_slot,
+        signature: signature.or_else(|| tx.signatures.first().copied()),
+        kind: kind
+            .unwrap_or_else(|| crate::provider_stream::classify_provider_transaction_kind(&tx)),
+        tx,
+    };
+    if wants_recent_blockhash {
+        plugin_host.on_recent_blockhash(crate::framework::ObservedRecentBlockhashEvent {
+            slot: event.slot,
+            recent_blockhash: recent_blockhash
+                .unwrap_or_else(|| event.tx.message.recent_blockhash().to_bytes()),
+            dataset_tx_count: 1,
+        });
+    }
+    if wants_derived_state_transaction {
+        let tx_index = derived_state_host.reserve_slot_tx_indexes(event.slot, 1);
+        derived_state_host.on_transaction(tx_index, event.clone());
+    }
+    if wants_transaction {
+        plugin_host.on_transaction(event);
     }
 }
 
@@ -2116,7 +2211,9 @@ mod tests {
     use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
     use super::*;
-    use crate::framework::{ObserverPlugin, PluginConfig, RawPacketEvent};
+    use crate::framework::{
+        ObserverPlugin, PluginConfig, RawPacketEvent, TransactionInterest, TransactionPrefilter,
+    };
     use async_trait::async_trait;
     use sof_gossip_tuning::{GossipTuningProfile, HostProfilePreset, IngestQueueMode};
     use solana_keypair::Keypair;
@@ -2150,6 +2247,10 @@ mod tests {
 
     struct RawPacketPlugin;
 
+    struct PrefilterIgnorePlugin {
+        filter: TransactionPrefilter,
+    }
+
     #[async_trait]
     impl ObserverPlugin for RawPacketPlugin {
         fn config(&self) -> PluginConfig {
@@ -2157,6 +2258,17 @@ mod tests {
         }
 
         async fn on_raw_packet(&self, _event: RawPacketEvent) {}
+    }
+
+    #[async_trait]
+    impl ObserverPlugin for PrefilterIgnorePlugin {
+        fn config(&self) -> PluginConfig {
+            PluginConfig::new().with_transaction()
+        }
+
+        fn transaction_prefilter(&self) -> Option<&TransactionPrefilter> {
+            Some(&self.filter)
+        }
     }
 
     fn dispatch_provider_stream_update_baseline(
@@ -2175,6 +2287,7 @@ mod tests {
                 derived_state_host.on_transaction(tx_index, event.clone());
                 plugin_host.on_transaction(event);
             }
+            ProviderStreamUpdate::SerializedTransaction(_) => {}
             ProviderStreamUpdate::TransactionLog(event) => {
                 plugin_host.on_transaction_log(event);
             }
@@ -2193,6 +2306,25 @@ mod tests {
                 derived_state_host.on_cluster_topology(event.clone());
                 plugin_host.on_cluster_topology(event);
             }
+        }
+    }
+
+    fn sample_serialized_provider_transaction_update() -> ProviderStreamUpdate {
+        match sample_provider_transaction_update() {
+            ProviderStreamUpdate::Transaction(event) => {
+                let bytes = bincode::serialize(event.tx.as_ref()).expect("serialize tx");
+                ProviderStreamUpdate::SerializedTransaction(
+                    crate::provider_stream::SerializedTransactionEvent {
+                        slot: event.slot,
+                        commitment_status: event.commitment_status,
+                        confirmed_slot: event.confirmed_slot,
+                        finalized_slot: event.finalized_slot,
+                        signature: event.signature,
+                        bytes: bytes.into(),
+                    },
+                )
+            }
+            other => other,
         }
     }
 
@@ -2556,5 +2688,91 @@ mod tests {
             baseline_elapsed.as_micros(),
             optimized_elapsed.as_micros(),
         );
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for provider serialized tx ignore fast-path"]
+    fn provider_stream_serialized_transaction_prefilter_ignore_profile_fixture() {
+        let iterations = profile_iterations(500_000);
+        let plugin_host = PluginHost::builder()
+            .add_plugin(PrefilterIgnorePlugin {
+                filter: TransactionPrefilter::new(TransactionInterest::Critical)
+                    .with_account_required([solana_pubkey::Pubkey::new_unique()]),
+            })
+            .build();
+        let derived_state_host = DerivedStateHost::builder().build();
+        let baseline_update = sample_provider_transaction_update();
+        let optimized_update = sample_serialized_provider_transaction_update();
+
+        let baseline_started = Instant::now();
+        for _ in 0..iterations {
+            dispatch_provider_stream_update_baseline(
+                &plugin_host,
+                &derived_state_host,
+                baseline_update.clone(),
+            );
+        }
+        let baseline_elapsed = baseline_started.elapsed();
+
+        let optimized_started = Instant::now();
+        for _ in 0..iterations {
+            dispatch_provider_stream_update(
+                &plugin_host,
+                &derived_state_host,
+                optimized_update.clone(),
+            );
+        }
+        let optimized_elapsed = optimized_started.elapsed();
+
+        eprintln!(
+            "provider_stream_serialized_transaction_prefilter_ignore_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            iterations,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
+        );
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for baseline provider serialized tx ignore path"]
+    fn provider_stream_serialized_transaction_prefilter_ignore_baseline_profile_fixture() {
+        let iterations = profile_iterations(500_000);
+        let plugin_host = PluginHost::builder()
+            .add_plugin(PrefilterIgnorePlugin {
+                filter: TransactionPrefilter::new(TransactionInterest::Critical)
+                    .with_account_required([solana_pubkey::Pubkey::new_unique()]),
+            })
+            .build();
+        let derived_state_host = DerivedStateHost::builder().build();
+        let baseline_update = sample_provider_transaction_update();
+
+        for _ in 0..iterations {
+            dispatch_provider_stream_update_baseline(
+                &plugin_host,
+                &derived_state_host,
+                baseline_update.clone(),
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for optimized provider serialized tx ignore path"]
+    fn provider_stream_serialized_transaction_prefilter_ignore_optimized_profile_fixture() {
+        let iterations = profile_iterations(500_000);
+        let plugin_host = PluginHost::builder()
+            .add_plugin(PrefilterIgnorePlugin {
+                filter: TransactionPrefilter::new(TransactionInterest::Critical)
+                    .with_account_required([solana_pubkey::Pubkey::new_unique()]),
+            })
+            .build();
+        let derived_state_host = DerivedStateHost::builder().build();
+        let optimized_update = sample_serialized_provider_transaction_update();
+
+        for _ in 0..iterations {
+            dispatch_provider_stream_update(
+                &plugin_host,
+                &derived_state_host,
+                optimized_update.clone(),
+            );
+        }
     }
 }

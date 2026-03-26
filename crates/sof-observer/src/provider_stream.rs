@@ -61,6 +61,7 @@
 
 use tokio::sync::mpsc;
 
+use crate::event::TxCommitmentStatus;
 #[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
 use crate::event::TxKind;
 use crate::framework::{
@@ -68,9 +69,15 @@ use crate::framework::{
     TransactionLogEvent, TransactionViewBatchEvent,
 };
 #[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
+use agave_transaction_view::{
+    transaction_data::TransactionData, transaction_view::SanitizedTransactionView,
+};
+#[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
 use solana_sdk_ids::{compute_budget, vote};
+use solana_signature::Signature;
 #[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
 use solana_transaction::versioned::VersionedTransaction;
+use std::sync::Arc;
 
 /// Default queue capacity for processed provider-stream ingress.
 pub const DEFAULT_PROVIDER_STREAM_QUEUE_CAPACITY: usize = 8_192;
@@ -111,6 +118,8 @@ impl ProviderStreamMode {
 pub enum ProviderStreamUpdate {
     /// One provider transaction mapped onto SOF's transaction hook surface.
     Transaction(TransactionEvent),
+    /// One serialized provider transaction that can still be filtered before full decode.
+    SerializedTransaction(SerializedTransactionEvent),
     /// One provider/websocket transaction-log notification.
     TransactionLog(TransactionLogEvent),
     /// One provider transaction-view batch mapped onto SOF's view-batch surface.
@@ -126,6 +135,12 @@ pub enum ProviderStreamUpdate {
 impl From<TransactionEvent> for ProviderStreamUpdate {
     fn from(event: TransactionEvent) -> Self {
         Self::Transaction(event)
+    }
+}
+
+impl From<SerializedTransactionEvent> for ProviderStreamUpdate {
+    fn from(event: SerializedTransactionEvent) -> Self {
+        Self::SerializedTransaction(event)
     }
 }
 
@@ -164,6 +179,23 @@ pub type ProviderStreamSender = mpsc::Sender<ProviderStreamUpdate>;
 /// Receiver type for processed provider-stream ingress.
 pub type ProviderStreamReceiver = mpsc::Receiver<ProviderStreamUpdate>;
 
+/// One serialized provider-fed transaction that has not yet been materialized.
+#[derive(Debug, Clone)]
+pub struct SerializedTransactionEvent {
+    /// Slot containing this transaction.
+    pub slot: u64,
+    /// Commitment status for this transaction slot when event was emitted.
+    pub commitment_status: TxCommitmentStatus,
+    /// Latest observed confirmed slot watermark when event was emitted.
+    pub confirmed_slot: Option<u64>,
+    /// Latest observed finalized slot watermark when event was emitted.
+    pub finalized_slot: Option<u64>,
+    /// Transaction signature if present.
+    pub signature: Option<Signature>,
+    /// Serialized transaction bytes.
+    pub bytes: Arc<[u8]>,
+}
+
 /// Creates one bounded queue for processed provider-stream updates.
 ///
 /// # Examples
@@ -200,6 +232,36 @@ pub(crate) fn classify_provider_transaction_kind(tx: &VersionedTransaction) -> T
                 if has_vote {
                     return TxKind::Mixed;
                 }
+            }
+        }
+    }
+    if has_vote && !has_non_vote_non_budget {
+        TxKind::VoteOnly
+    } else if has_vote {
+        TxKind::Mixed
+    } else {
+        TxKind::NonVote
+    }
+}
+
+#[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
+pub(crate) fn classify_provider_transaction_kind_view<D: TransactionData>(
+    view: &SanitizedTransactionView<D>,
+) -> TxKind {
+    let mut has_vote = false;
+    let mut has_non_vote_non_budget = false;
+    for (program_id, _) in view.program_instructions_iter() {
+        if *program_id == vote::id() {
+            has_vote = true;
+            if has_non_vote_non_budget {
+                return TxKind::Mixed;
+            }
+            continue;
+        }
+        if *program_id != compute_budget::id() {
+            has_non_vote_non_budget = true;
+            if has_vote {
+                return TxKind::Mixed;
             }
         }
     }
