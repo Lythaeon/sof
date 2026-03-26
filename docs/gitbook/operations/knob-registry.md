@@ -122,9 +122,10 @@ SOF's runtime-owned observability endpoint exposes low-cardinality operational m
 
 | Knob | Default | Scope | Meaning |
 | --- | --- | --- | --- |
-| `SOF_VERIFY_SHREDS` | `false` | all builds | Enable shred verification. |
+| `SOF_SHRED_TRUST_MODE` | `public_untrusted` | all builds | Raw-shred trust posture. Applies only to raw-shred ingest. `public_untrusted` keeps local verification on by default; `trusted_raw_shred_provider` disables it by default unless explicitly overridden. |
+| `SOF_VERIFY_SHREDS` | trust-mode default | all builds | Enable shred verification explicitly. Overrides `SOF_SHRED_TRUST_MODE` if set. |
 | `SOF_VERIFY_STRICT` | `false` | all builds | Reject unknown leaders more aggressively during verification. |
-| `SOF_VERIFY_RECOVERED_SHREDS` | `false` | all builds | Verify recovered shreds after FEC recovery. |
+| `SOF_VERIFY_RECOVERED_SHREDS` | trust-mode default | all builds | Verify recovered shreds after FEC recovery explicitly. Overrides `SOF_SHRED_TRUST_MODE` if set. |
 | `SOF_VERIFY_SIGNATURE_CACHE` | `65536` | all builds | Signature verification cache entries. |
 | `SOF_VERIFY_SLOT_WINDOW` | `4096` | all builds | Slot-leader verification window. |
 | `SOF_VERIFY_UNKNOWN_RETRY_MS` | `2000` | all builds | Retry interval for unknown-leader verification state. |

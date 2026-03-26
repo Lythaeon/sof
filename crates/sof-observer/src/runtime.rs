@@ -54,6 +54,25 @@ pub struct RuntimeObservabilityConfig {
     pub bind_addr: Option<SocketAddr>,
 }
 
+/// Explicit trust posture for raw-shred ingest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShredTrustMode {
+    /// Public gossip or public peers. Keep local verification on.
+    PublicUntrusted,
+    /// Trusted raw shred provider. Prefer provider trust over local verification cost.
+    TrustedRawShredProvider,
+}
+
+impl ShredTrustMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PublicUntrusted => "public_untrusted",
+            Self::TrustedRawShredProvider => "trusted_raw_shred_provider",
+        }
+    }
+}
+
 /// Typed replay retention configuration for derived-state consumers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DerivedStateReplayConfig {
@@ -541,10 +560,16 @@ impl RuntimeSetup {
         self.with_env("SOF_LIVE_SHREDS_ENABLED", enabled.to_string())
     }
 
-    /// Sets `SOF_VERIFY_SHREDS`.
+    /// Sets `SOF_VERIFY_SHREDS` explicitly, overriding the trust-mode default.
     #[must_use]
     pub fn with_verify_shreds(self, enabled: bool) -> Self {
         self.with_env("SOF_VERIFY_SHREDS", enabled.to_string())
+    }
+
+    /// Sets `SOF_SHRED_TRUST_MODE` for raw-shred ingest.
+    #[must_use]
+    pub fn with_shred_trust_mode(self, mode: ShredTrustMode) -> Self {
+        self.with_env("SOF_SHRED_TRUST_MODE", mode.as_str())
     }
 
     /// Sets `SOF_VERIFY_STRICT`.
@@ -553,7 +578,7 @@ impl RuntimeSetup {
         self.with_env("SOF_VERIFY_STRICT", enabled.to_string())
     }
 
-    /// Sets `SOF_VERIFY_RECOVERED_SHREDS`.
+    /// Sets `SOF_VERIFY_RECOVERED_SHREDS` explicitly, overriding the trust-mode default.
     #[must_use]
     pub fn with_verify_recovered_shreds(self, enabled: bool) -> Self {
         self.with_env("SOF_VERIFY_RECOVERED_SHREDS", enabled.to_string())
@@ -906,6 +931,48 @@ impl RuntimeSetup {
         self.with_env(
             "SOF_GOSSIP_RUNTIME_SWITCH_PROACTIVE_MIN_RUNTIME_AGE_MS",
             age_ms.to_string(),
+        )
+    }
+
+    /// Sets `SOF_GOSSIP_LOAD_SHED_ENABLED`.
+    #[must_use]
+    pub fn with_gossip_load_shed_enabled(self, enabled: bool) -> Self {
+        self.with_env("SOF_GOSSIP_LOAD_SHED_ENABLED", enabled.to_string())
+    }
+
+    /// Sets `SOF_GOSSIP_LOAD_SHED_QUEUE_PRESSURE_PCT`.
+    #[must_use]
+    pub fn with_gossip_load_shed_queue_pressure_pct(self, pressure_pct: u64) -> Self {
+        self.with_env(
+            "SOF_GOSSIP_LOAD_SHED_QUEUE_PRESSURE_PCT",
+            pressure_pct.to_string(),
+        )
+    }
+
+    /// Sets `SOF_VERIFY_STRICT_UNKNOWN_QUEUE_PRESSURE_PCT`.
+    #[must_use]
+    pub fn with_verify_strict_unknown_queue_pressure_pct(self, pressure_pct: u64) -> Self {
+        self.with_env(
+            "SOF_VERIFY_STRICT_UNKNOWN_QUEUE_PRESSURE_PCT",
+            pressure_pct.to_string(),
+        )
+    }
+
+    /// Sets `SOF_GOSSIP_LOAD_SHED_KEEP_TOP_SOURCES`.
+    #[must_use]
+    pub fn with_gossip_load_shed_keep_top_sources(self, keep_top_sources: usize) -> Self {
+        self.with_env(
+            "SOF_GOSSIP_LOAD_SHED_KEEP_TOP_SOURCES",
+            keep_top_sources.to_string(),
+        )
+    }
+
+    /// Sets `SOF_GOSSIP_SOCKET_CONSUME_VERIFY_QUEUE_CAPACITY`.
+    #[must_use]
+    pub fn with_gossip_socket_consume_verify_queue_capacity(self, capacity: usize) -> Self {
+        self.with_env(
+            "SOF_GOSSIP_SOCKET_CONSUME_VERIFY_QUEUE_CAPACITY",
+            capacity.to_string(),
         )
     }
 
@@ -1937,6 +2004,38 @@ mod tests {
     }
 
     #[test]
+    fn gossip_load_shed_tuning_sets_expected_env_overrides() {
+        let setup = RuntimeSetup::new()
+            .with_gossip_load_shed_enabled(true)
+            .with_gossip_load_shed_queue_pressure_pct(65)
+            .with_verify_strict_unknown_queue_pressure_pct(12)
+            .with_gossip_load_shed_keep_top_sources(3)
+            .with_gossip_socket_consume_verify_queue_capacity(1024);
+        let overrides = setup.env_overrides.into_iter().collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            overrides.get("SOF_GOSSIP_LOAD_SHED_ENABLED"),
+            Some(&"true".to_owned())
+        );
+        assert_eq!(
+            overrides.get("SOF_GOSSIP_LOAD_SHED_QUEUE_PRESSURE_PCT"),
+            Some(&"65".to_owned())
+        );
+        assert_eq!(
+            overrides.get("SOF_VERIFY_STRICT_UNKNOWN_QUEUE_PRESSURE_PCT"),
+            Some(&"12".to_owned())
+        );
+        assert_eq!(
+            overrides.get("SOF_GOSSIP_LOAD_SHED_KEEP_TOP_SOURCES"),
+            Some(&"3".to_owned())
+        );
+        assert_eq!(
+            overrides.get("SOF_GOSSIP_SOCKET_CONSUME_VERIFY_QUEUE_CAPACITY"),
+            Some(&"1024".to_owned())
+        );
+    }
+
+    #[test]
     fn typed_ingest_queue_mode_uses_expected_strings() {
         let setup = RuntimeSetup::new().with_ingest_queue_mode_typed(IngestQueueMode::Bounded);
         assert_eq!(
@@ -1993,6 +2092,19 @@ mod tests {
         assert_eq!(
             overrides.get("SOF_UDP_PREFER_BUSY_POLL"),
             Some(&"true".to_owned())
+        );
+    }
+
+    #[test]
+    fn typed_shred_trust_mode_uses_expected_strings() {
+        let setup =
+            RuntimeSetup::new().with_shred_trust_mode(ShredTrustMode::TrustedRawShredProvider);
+        assert_eq!(
+            setup.env_overrides.last(),
+            Some(&(
+                String::from("SOF_SHRED_TRUST_MODE"),
+                String::from("trusted_raw_shred_provider"),
+            ))
         );
     }
 }

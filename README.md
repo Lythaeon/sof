@@ -6,6 +6,43 @@ It is built more like financial systems infrastructure than a typical crypto fra
 bounded pipelines, local control-plane state, restart-safe derived-state feeds, and execution
 paths designed for services that care about latency, replay, and operational discipline.
 
+SOF removes external API and service-layer overhead. It does not remove the upstream visibility
+problem by itself. End-to-end latency still depends first on how quickly your host sees shreds.
+If you want SOF to be meaningfully faster than RPC-first or provider-stream architectures, give it
+the earliest ingress you can:
+
+- direct low-latency access to validators or other useful peers
+- or an external shred propagation network feeding the host
+
+That is when SOF's lower-overhead local ingest, parsing, control-plane derivation, and in-process
+consumer model matter most: the data reaches your application on the same system without another
+heavy external dependency in the hot path.
+
+## Trust And Ingress Modes
+
+SOF has two explicit raw-shred trust modes:
+
+- `public_untrusted`: public gossip or other public peers, verification on by default, highest
+  independence, highest observer-side CPU cost
+- `trusted_raw_shred_provider`: raw shred distribution from a provider you explicitly trust,
+  verification off by default, earlier ingress and lower observer-side CPU cost
+
+`processed_provider_stream` products such as Yellowstone gRPC, LaserStream, or websocket feeds are
+useful, but they are a different ingest category. They are not `SOF_SHRED_TRUST_MODE` values
+because they do not hand SOF raw shreds.
+
+The intended positioning is straightforward:
+
+- use public gossip/direct peers when you want independence and are willing to own the whole stack
+- use a trusted raw shred network when you want SOF's fastest practical raw-shred path
+- use processed provider streams when you do not need the raw-shred SOF model
+
+The trust tradeoff should be explicit: a trusted raw shred provider replaces some local
+verification and public-edge independence with upstream trust in exchange for earlier ingress and
+much lower CPU waste than public multi-source gossip. See
+[`docs/gitbook/operations/deployment-modes.md`](docs/gitbook/operations/deployment-modes.md) for
+the full deployment matrix.
+
 It is split into three user-facing crates:
 
 - `sof`: observer/runtime crate for shred ingest, relay/cache, dataset reconstruction, plugin and runtime-extension events, fork/reorg tracking, and local commitment tagging without RPC dependency

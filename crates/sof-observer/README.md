@@ -14,6 +14,41 @@ Core responsibilities:
 - plugin-driven event hooks for custom logic
 - local transaction commitment status tagging (`processed` / `confirmed` / `finalized`) without RPC dependency
 
+## Explicit Trust Model
+
+SOF exposes two explicit raw-shred trust modes:
+
+- `public_untrusted`
+  - public gossip or direct public peers
+  - keep shred verification on by default
+  - highest independence, highest observer-side CPU cost
+- `trusted_raw_shred_provider`
+  - raw shreds delivered by a provider or private shred-distribution network you explicitly trust
+  - best fit when you want SOF's shred-native model without paying public-gossip verification cost
+  - this is the expected fast path for low-latency production SOF
+
+`processed_provider_stream` products such as Yellowstone gRPC, LaserStream, or websocket feeds are
+easier to consume, but they are a different product category. They are not `SOF_SHRED_TRUST_MODE`
+values because they do not feed SOF raw shreds.
+
+That tradeoff should be explicit: public gossip is the independent baseline, trusted raw shred
+distribution is the fast path, and processed provider streams are a different observer model.
+
+Programmatic setup uses the typed runtime API:
+
+```rust
+use sof::runtime::{RuntimeSetup, ShredTrustMode};
+
+let setup = RuntimeSetup::new()
+    .with_shred_trust_mode(ShredTrustMode::TrustedRawShredProvider);
+```
+
+The equivalent env knob is:
+
+```bash
+SOF_SHRED_TRUST_MODE=trusted_raw_shred_provider
+```
+
 ## At a Glance
 
 - Embed SOF directly inside a Tokio application
