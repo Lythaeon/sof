@@ -31,6 +31,10 @@ SOF has two explicit raw-shred trust modes:
 useful, but they are a different ingest category. They are not `SOF_SHRED_TRUST_MODE` values
 because they do not hand SOF raw shreds.
 
+SOF exposes that ingest family explicitly through `ProviderStreamMode`. Use it when you want
+Yellowstone/LaserStream-style provider feeds to enter the SOF plugin runtime directly without
+pretending they are raw shreds.
+
 The intended positioning is straightforward:
 
 - use public gossip/direct peers when you want independence and are willing to own the whole stack

@@ -183,6 +183,8 @@ pub mod framework;
 pub mod ingest;
 #[doc(hidden)]
 pub mod protocol;
+/// Processed provider-stream ingress types and adapters.
+pub mod provider_stream;
 #[doc(hidden)]
 pub mod reassembly;
 #[doc(hidden)]

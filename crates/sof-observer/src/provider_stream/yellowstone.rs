@@ -1,0 +1,455 @@
+#![allow(clippy::missing_docs_in_private_items)]
+
+//! Yellowstone gRPC adapters for SOF processed provider-stream ingress.
+
+use std::{collections::HashMap, time::Duration};
+
+use futures_util::{SinkExt, StreamExt};
+use solana_hash::Hash;
+use solana_message::{
+    Message, MessageHeader, VersionedMessage,
+    compiled_instruction::CompiledInstruction,
+    v0::{Message as MessageV0, MessageAddressTableLookup},
+};
+use solana_pubkey::Pubkey;
+use solana_sdk_ids::{compute_budget, vote};
+use solana_signature::Signature;
+use solana_transaction::versioned::VersionedTransaction;
+use thiserror::Error;
+use tokio::task::JoinHandle;
+use yellowstone_grpc_client::{GeyserGrpcBuilderError, GeyserGrpcClient, GeyserGrpcClientError};
+use yellowstone_grpc_proto::prelude::{
+    CommitmentLevel, SubscribeRequest, SubscribeRequestFilterTransactions, SubscribeRequestPing,
+    subscribe_update::UpdateOneof,
+};
+
+use crate::{
+    event::{TxCommitmentStatus, TxKind},
+    framework::TransactionEvent,
+    provider_stream::{ProviderStreamSender, ProviderStreamUpdate},
+};
+
+/// Yellowstone subscription commitment used for provider-stream transaction updates.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum YellowstoneGrpcCommitment {
+    /// Processed commitment.
+    #[default]
+    Processed,
+    /// Confirmed commitment.
+    Confirmed,
+    /// Finalized commitment.
+    Finalized,
+}
+
+impl YellowstoneGrpcCommitment {
+    const fn as_proto(self) -> CommitmentLevel {
+        match self {
+            Self::Processed => CommitmentLevel::Processed,
+            Self::Confirmed => CommitmentLevel::Confirmed,
+            Self::Finalized => CommitmentLevel::Finalized,
+        }
+    }
+
+    const fn as_tx_commitment(self) -> TxCommitmentStatus {
+        match self {
+            Self::Processed => TxCommitmentStatus::Processed,
+            Self::Confirmed => TxCommitmentStatus::Confirmed,
+            Self::Finalized => TxCommitmentStatus::Finalized,
+        }
+    }
+}
+
+/// Connection and filter config for Yellowstone transaction subscriptions.
+#[derive(Clone, Debug)]
+pub struct YellowstoneGrpcConfig {
+    endpoint: String,
+    x_token: Option<String>,
+    commitment: YellowstoneGrpcCommitment,
+    vote: Option<bool>,
+    failed: Option<bool>,
+    signature: Option<Signature>,
+    account_include: Vec<Pubkey>,
+    account_exclude: Vec<Pubkey>,
+    account_required: Vec<Pubkey>,
+    max_decoding_message_size: usize,
+    connect_timeout: Option<Duration>,
+}
+
+impl YellowstoneGrpcConfig {
+    /// Creates a transaction-stream config for one Yellowstone endpoint.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use sof::provider_stream::yellowstone::YellowstoneGrpcConfig;
+    ///
+    /// let config = YellowstoneGrpcConfig::new("http://127.0.0.1:10000");
+    /// assert_eq!(config.endpoint(), "http://127.0.0.1:10000");
+    /// ```
+    #[must_use]
+    pub fn new(endpoint: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            x_token: None,
+            commitment: YellowstoneGrpcCommitment::Processed,
+            vote: Some(false),
+            failed: Some(false),
+            signature: None,
+            account_include: Vec::new(),
+            account_exclude: Vec::new(),
+            account_required: Vec::new(),
+            max_decoding_message_size: 64 * 1024 * 1024,
+            connect_timeout: Some(Duration::from_secs(10)),
+        }
+    }
+
+    /// Returns the configured endpoint.
+    #[must_use]
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// Sets the provider x-token.
+    #[must_use]
+    pub fn with_x_token(mut self, x_token: impl Into<String>) -> Self {
+        self.x_token = Some(x_token.into());
+        self
+    }
+
+    /// Sets the Yellowstone commitment.
+    #[must_use]
+    pub const fn with_commitment(mut self, commitment: YellowstoneGrpcCommitment) -> Self {
+        self.commitment = commitment;
+        self
+    }
+
+    /// Sets the vote filter.
+    #[must_use]
+    pub const fn with_vote(mut self, vote: bool) -> Self {
+        self.vote = Some(vote);
+        self
+    }
+
+    /// Sets the failed filter.
+    #[must_use]
+    pub const fn with_failed(mut self, failed: bool) -> Self {
+        self.failed = Some(failed);
+        self
+    }
+
+    /// Narrows the stream to one signature.
+    #[must_use]
+    pub const fn with_signature(mut self, signature: Signature) -> Self {
+        self.signature = Some(signature);
+        self
+    }
+
+    /// Requires at least one listed account key to appear.
+    #[must_use]
+    pub fn with_account_include<I>(mut self, keys: I) -> Self
+    where
+        I: IntoIterator<Item = Pubkey>,
+    {
+        self.account_include.extend(keys);
+        self
+    }
+
+    /// Rejects listed account keys.
+    #[must_use]
+    pub fn with_account_exclude<I>(mut self, keys: I) -> Self
+    where
+        I: IntoIterator<Item = Pubkey>,
+    {
+        self.account_exclude.extend(keys);
+        self
+    }
+
+    /// Requires all listed account keys to appear.
+    #[must_use]
+    pub fn with_account_required<I>(mut self, keys: I) -> Self
+    where
+        I: IntoIterator<Item = Pubkey>,
+    {
+        self.account_required.extend(keys);
+        self
+    }
+
+    /// Sets the max decoding message size.
+    #[must_use]
+    pub const fn with_max_decoding_message_size(mut self, bytes: usize) -> Self {
+        self.max_decoding_message_size = bytes;
+        self
+    }
+
+    /// Sets the connect timeout.
+    #[must_use]
+    pub const fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = Some(timeout);
+        self
+    }
+
+    fn subscribe_request(&self) -> SubscribeRequest {
+        let filter = SubscribeRequestFilterTransactions {
+            vote: self.vote,
+            failed: self.failed,
+            signature: self.signature.map(|signature| signature.to_string()),
+            account_include: self
+                .account_include
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            account_exclude: self
+                .account_exclude
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            account_required: self
+                .account_required
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        };
+        SubscribeRequest {
+            transactions: HashMap::from([("sof".to_owned(), filter)]),
+            commitment: Some(self.commitment.as_proto() as i32),
+            ..SubscribeRequest::default()
+        }
+    }
+}
+
+/// Yellowstone transaction-stream error surface.
+#[derive(Debug, Error)]
+pub enum YellowstoneGrpcError {
+    /// Builder/connect failure.
+    #[error(transparent)]
+    Build(#[from] GeyserGrpcBuilderError),
+    /// Subscribe or stream error from the client.
+    #[error(transparent)]
+    Client(#[from] GeyserGrpcClientError),
+    /// Stream status error.
+    #[error("yellowstone stream status: {0}")]
+    Status(#[from] yellowstone_grpc_proto::tonic::Status),
+    /// Provider update could not be converted into a SOF event.
+    #[error("yellowstone transaction conversion failed: {0}")]
+    Convert(&'static str),
+    /// Provider-stream queue is closed.
+    #[error("provider-stream queue closed")]
+    QueueClosed,
+}
+
+/// Spawns one Yellowstone gRPC transaction forwarder into a SOF provider-stream queue.
+///
+/// # Examples
+///
+/// ```no_run
+/// use sof::provider_stream::{
+///     create_provider_stream_queue,
+///     yellowstone::{spawn_yellowstone_grpc_transaction_source, YellowstoneGrpcConfig},
+/// };
+///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let (tx, _rx) = create_provider_stream_queue(1024);
+/// let handle = spawn_yellowstone_grpc_transaction_source(
+///     YellowstoneGrpcConfig::new("http://127.0.0.1:10000"),
+///     tx,
+/// )
+/// .await?;
+/// handle.abort();
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Errors
+///
+/// Returns any connection/bootstrap error before the forwarder task starts.
+pub async fn spawn_yellowstone_grpc_transaction_source(
+    config: YellowstoneGrpcConfig,
+    sender: ProviderStreamSender,
+) -> Result<JoinHandle<Result<(), YellowstoneGrpcError>>, YellowstoneGrpcError> {
+    let mut builder = GeyserGrpcClient::build_from_shared(config.endpoint.clone())?
+        .x_token(config.x_token.clone())?
+        .max_decoding_message_size(config.max_decoding_message_size);
+    if let Some(timeout) = config.connect_timeout {
+        builder = builder.connect_timeout(timeout);
+    }
+    let mut client = builder.connect().await?;
+    let commitment = config.commitment.as_tx_commitment();
+    let request = config.subscribe_request();
+    let (mut subscribe_tx, mut stream) = client.subscribe_with_request(Some(request)).await?;
+    Ok(tokio::spawn(async move {
+        while let Some(update) = stream.next().await {
+            let update = update?;
+            match update.update_oneof {
+                Some(UpdateOneof::Transaction(tx_update)) => {
+                    let event = transaction_event_from_update(
+                        tx_update.slot,
+                        tx_update.transaction,
+                        commitment,
+                    )?;
+                    sender
+                        .send(ProviderStreamUpdate::Transaction(event))
+                        .await
+                        .map_err(|_error| YellowstoneGrpcError::QueueClosed)?;
+                }
+                Some(UpdateOneof::Ping(_)) => {
+                    subscribe_tx
+                        .send(SubscribeRequest {
+                            ping: Some(SubscribeRequestPing { id: 1 }),
+                            ..SubscribeRequest::default()
+                        })
+                        .await
+                        .map_err(GeyserGrpcClientError::SubscribeSendError)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }))
+}
+
+fn transaction_event_from_update(
+    slot: u64,
+    transaction: Option<yellowstone_grpc_proto::prelude::SubscribeUpdateTransactionInfo>,
+    commitment_status: TxCommitmentStatus,
+) -> Result<TransactionEvent, YellowstoneGrpcError> {
+    let transaction =
+        transaction.ok_or(YellowstoneGrpcError::Convert("missing transaction payload"))?;
+    let signature = Signature::try_from(transaction.signature.as_slice())
+        .map(Some)
+        .map_err(|_error| YellowstoneGrpcError::Convert("invalid signature"))?;
+    let tx = convert_transaction(
+        transaction
+            .transaction
+            .ok_or(YellowstoneGrpcError::Convert(
+                "missing versioned transaction",
+            ))?,
+    )?;
+    Ok(TransactionEvent {
+        slot,
+        commitment_status,
+        confirmed_slot: None,
+        finalized_slot: None,
+        signature,
+        kind: classify_tx_kind(&tx),
+        tx: std::sync::Arc::new(tx),
+    })
+}
+
+fn convert_transaction(
+    tx: yellowstone_grpc_proto::prelude::Transaction,
+) -> Result<VersionedTransaction, YellowstoneGrpcError> {
+    let signatures = tx
+        .signatures
+        .into_iter()
+        .map(|signature| {
+            Signature::try_from(signature.as_slice()).map_err(|_error| {
+                YellowstoneGrpcError::Convert("failed to parse transaction signature")
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let message = convert_message(
+        tx.message
+            .ok_or(YellowstoneGrpcError::Convert("missing transaction message"))?,
+    )?;
+    Ok(VersionedTransaction {
+        signatures,
+        message,
+    })
+}
+
+fn convert_message(
+    message: yellowstone_grpc_proto::prelude::Message,
+) -> Result<VersionedMessage, YellowstoneGrpcError> {
+    let header = message
+        .header
+        .ok_or(YellowstoneGrpcError::Convert("missing message header"))?;
+    let header = MessageHeader {
+        num_required_signatures: u8::try_from(header.num_required_signatures)
+            .map_err(|_error| YellowstoneGrpcError::Convert("invalid num_required_signatures"))?,
+        num_readonly_signed_accounts: u8::try_from(header.num_readonly_signed_accounts).map_err(
+            |_error| YellowstoneGrpcError::Convert("invalid num_readonly_signed_accounts"),
+        )?,
+        num_readonly_unsigned_accounts: u8::try_from(header.num_readonly_unsigned_accounts)
+            .map_err(|_error| {
+                YellowstoneGrpcError::Convert("invalid num_readonly_unsigned_accounts")
+            })?,
+    };
+    let account_keys = message
+        .account_keys
+        .into_iter()
+        .map(|key| {
+            Pubkey::try_from(key.as_slice())
+                .map_err(|_error| YellowstoneGrpcError::Convert("invalid account key"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let recent_blockhash = <[u8; 32]>::try_from(message.recent_blockhash.as_slice())
+        .map(Hash::new_from_array)
+        .map_err(|_error| YellowstoneGrpcError::Convert("invalid recent blockhash"))?;
+    let instructions = message
+        .instructions
+        .into_iter()
+        .map(|instruction| {
+            Ok(CompiledInstruction {
+                program_id_index: u8::try_from(instruction.program_id_index).map_err(|_error| {
+                    YellowstoneGrpcError::Convert("invalid compiled instruction program id index")
+                })?,
+                accounts: instruction.accounts,
+                data: instruction.data,
+            })
+        })
+        .collect::<Result<Vec<_>, YellowstoneGrpcError>>()?;
+    if message.versioned {
+        let address_table_lookups = message
+            .address_table_lookups
+            .into_iter()
+            .map(|lookup| {
+                Ok(MessageAddressTableLookup {
+                    account_key: Pubkey::try_from(lookup.account_key.as_slice()).map_err(
+                        |_error| YellowstoneGrpcError::Convert("invalid address table account key"),
+                    )?,
+                    writable_indexes: lookup.writable_indexes,
+                    readonly_indexes: lookup.readonly_indexes,
+                })
+            })
+            .collect::<Result<Vec<_>, YellowstoneGrpcError>>()?;
+        Ok(VersionedMessage::V0(MessageV0 {
+            header,
+            account_keys,
+            recent_blockhash,
+            instructions,
+            address_table_lookups,
+        }))
+    } else {
+        Ok(VersionedMessage::Legacy(Message {
+            header,
+            account_keys,
+            recent_blockhash,
+            instructions,
+        }))
+    }
+}
+
+fn classify_tx_kind(tx: &VersionedTransaction) -> TxKind {
+    let mut has_vote = false;
+    let mut has_non_vote_non_budget = false;
+    let keys = tx.message.static_account_keys();
+    for instruction in tx.message.instructions() {
+        if let Some(program_id) = keys.get(usize::from(instruction.program_id_index)) {
+            if *program_id == vote::id() {
+                has_vote = true;
+                continue;
+            }
+            if *program_id != compute_budget::id() {
+                has_non_vote_non_budget = true;
+            }
+        }
+    }
+    if has_vote && !has_non_vote_non_budget {
+        TxKind::VoteOnly
+    } else if has_vote {
+        TxKind::Mixed
+    } else {
+        TxKind::NonVote
+    }
+}

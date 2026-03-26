@@ -31,6 +31,10 @@ SOF exposes two explicit raw-shred trust modes:
 easier to consume, but they are a different product category. They are not `SOF_SHRED_TRUST_MODE`
 values because they do not feed SOF raw shreds.
 
+SOF exposes those processed feeds through `ProviderStreamMode`. In that path, provider updates go
+straight into transaction or transaction-view-batch dispatch instead of the packet/shred/FEC
+pipeline.
+
 That tradeoff should be explicit: public gossip is the independent baseline, trusted raw shred
 distribution is the fast path, and processed provider streams are a different observer model.
 
@@ -61,6 +65,8 @@ reconstruction or plugin delivery.
 
 See the concrete example in
 [`examples/trusted_raw_shred_provider.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/trusted_raw_shred_provider.rs).
+For Yellowstone gRPC, see
+[`examples/provider_stream_yellowstone_grpc.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/provider_stream_yellowstone_grpc.rs).
 
 ## At a Glance
 

@@ -1,11 +1,12 @@
 #![allow(clippy::missing_docs_in_private_items)]
 
-use std::{future::Future, net::SocketAddr, path::PathBuf, pin::Pin};
+use std::{future::Future, net::SocketAddr, path::PathBuf, pin::Pin, time::Instant};
 
 use crate::framework::{
     DerivedStateHost, DerivedStateReplayBackend, DerivedStateReplayDurability, PluginHost,
     RuntimeExtensionHost,
 };
+use crate::provider_stream::{ProviderStreamMode, ProviderStreamReceiver, ProviderStreamUpdate};
 use sof_gossip_tuning::{
     CpuCoreIndex, GossipChannelTuning, GossipTuningProfile, GossipTuningService, IngestQueueMode,
     QueueCapacity, ReceiverCoalesceWindow, RuntimeTuningPort, SofRuntimeTuning,
@@ -1289,6 +1290,8 @@ pub struct ObserverRuntime {
     /// Optional externally supplied ingress receiver used by kernel-bypass mode.
     #[cfg(feature = "kernel-bypass")]
     packet_ingest_rx: Option<KernelBypassIngressReceiver>,
+    /// Optional externally supplied processed provider-stream receiver.
+    provider_stream: Option<(ProviderStreamMode, ProviderStreamReceiver)>,
 }
 
 impl ObserverRuntime {
@@ -1344,6 +1347,34 @@ impl ObserverRuntime {
         self
     }
 
+    /// Replaces the raw-shred runtime with a processed provider-stream ingress.
+    ///
+    /// Processed provider streams such as Yellowstone gRPC or LaserStream feed
+    /// transactions directly into SOF's plugin/derived-state transaction
+    /// surfaces. They bypass packet, shred, FEC, and reconstruction stages.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use sof::{
+    ///     provider_stream::{create_provider_stream_queue, ProviderStreamMode},
+    ///     runtime::ObserverRuntime,
+    /// };
+    ///
+    /// let (_tx, rx) = create_provider_stream_queue(128);
+    /// let _runtime = ObserverRuntime::new()
+    ///     .with_provider_stream_ingress(ProviderStreamMode::YellowstoneGrpc, rx);
+    /// ```
+    #[must_use]
+    pub fn with_provider_stream_ingress(
+        mut self,
+        mode: ProviderStreamMode,
+        provider_stream_rx: ProviderStreamReceiver,
+    ) -> Self {
+        self.provider_stream = Some((mode, provider_stream_rx));
+        self
+    }
+
     #[cfg(feature = "kernel-bypass")]
     /// Replaces the built-in UDP ingress with an externally supplied kernel-bypass ingress receiver.
     #[must_use]
@@ -1369,6 +1400,17 @@ impl ObserverRuntime {
     ) -> Result<(), RuntimeError> {
         crate::runtime_env::clear_runtime_env_overrides();
         self.setup.apply();
+        if let Some((mode, provider_stream_rx)) = self.provider_stream {
+            return run_provider_stream_runtime(
+                self.plugin_host,
+                self.extension_host,
+                self.derived_state_host,
+                shutdown_signal,
+                mode,
+                provider_stream_rx,
+            )
+            .await;
+        }
         #[cfg(feature = "kernel-bypass")]
         if let Some(packet_ingest_rx) = self.packet_ingest_rx {
             return Ok(
@@ -1439,6 +1481,90 @@ impl ObserverRuntime {
             wait_for_termination_signal().await;
         })
         .await
+    }
+}
+
+async fn run_provider_stream_runtime(
+    plugin_host: PluginHost,
+    extension_host: RuntimeExtensionHost,
+    derived_state_host: DerivedStateHost,
+    shutdown_signal: Option<ShutdownSignal>,
+    mode: ProviderStreamMode,
+    mut provider_stream_rx: ProviderStreamReceiver,
+) -> Result<(), RuntimeError> {
+    let extension_report = extension_host.startup().await;
+    if extension_report.failed_extensions > 0 {
+        tracing::warn!(
+            mode = mode.as_str(),
+            failed_extensions = extension_report.failed_extensions,
+            "provider-stream runtime started with extension startup failures"
+        );
+    }
+    plugin_host
+        .startup()
+        .await
+        .map_err(|error| RuntimeError::Runloop(error.to_string()))?;
+    derived_state_host.initialize();
+    tracing::info!(mode = mode.as_str(), "starting SOF provider-stream runtime");
+
+    let mut shutdown_signal = shutdown_signal;
+    loop {
+        tokio::select! {
+            () = async {
+                if let Some(signal) = shutdown_signal.as_mut() {
+                    signal.await;
+                } else {
+                    futures_util::future::pending::<()>().await;
+                }
+            } => {
+                break;
+            }
+            update = provider_stream_rx.recv() => {
+                let Some(update) = update else {
+                    break;
+                };
+                dispatch_provider_stream_update(&plugin_host, &derived_state_host, update);
+            }
+        }
+    }
+
+    plugin_host.shutdown().await;
+    extension_host.shutdown().await;
+    tracing::info!(mode = mode.as_str(), "SOF provider-stream runtime stopped");
+    Ok(())
+}
+
+fn dispatch_provider_stream_update(
+    plugin_host: &PluginHost,
+    derived_state_host: &DerivedStateHost,
+    update: ProviderStreamUpdate,
+) {
+    match update {
+        ProviderStreamUpdate::Transaction(event) => {
+            plugin_host.on_recent_blockhash(crate::framework::ObservedRecentBlockhashEvent {
+                slot: event.slot,
+                recent_blockhash: event.tx.message.recent_blockhash().to_bytes(),
+                dataset_tx_count: 1,
+            });
+            let tx_index = derived_state_host.reserve_slot_tx_indexes(event.slot, 1);
+            derived_state_host.on_transaction(tx_index, event.clone());
+            plugin_host.on_transaction(event);
+        }
+        ProviderStreamUpdate::TransactionViewBatch(event) => {
+            plugin_host.on_transaction_view_batch(event, Instant::now());
+        }
+        ProviderStreamUpdate::RecentBlockhash(event) => {
+            derived_state_host.on_recent_blockhash(event.clone());
+            plugin_host.on_recent_blockhash(event);
+        }
+        ProviderStreamUpdate::SlotStatus(event) => {
+            derived_state_host.on_slot_status(event);
+            plugin_host.on_slot_status(event);
+        }
+        ProviderStreamUpdate::ClusterTopology(event) => {
+            derived_state_host.on_cluster_topology(event.clone());
+            plugin_host.on_cluster_topology(event);
+        }
     }
 }
 

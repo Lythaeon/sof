@@ -22,6 +22,12 @@ inside those modes. Pick both deliberately.
 useful, but they are a different category from raw-shred SOF ingest. They are not raw-shred trust
 modes, so they are not values of `SOF_SHRED_TRUST_MODE`.
 
+SOF exposes this category through `ProviderStreamMode`. In that mode:
+
+- upstream provider data goes directly into transaction or transaction-view-batch dispatch
+- SOF does not run packet parsing, shred verification, FEC recovery, or dataset reconstruction
+- plugin and derived-state logic can still stay on the SOF runtime surface
+
 Raw-shred trust posture can be set either by env:
 
 ```bash
