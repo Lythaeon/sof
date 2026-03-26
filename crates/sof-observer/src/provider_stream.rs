@@ -15,6 +15,38 @@
 //! `RecentBlockhash`, `SlotStatus`, `ClusterTopology`, `LeaderSchedule`, or
 //! `Reorg` updates directly.
 //!
+//! `ProviderStreamMode::Generic` is therefore not an “arbitrary payload” mode.
+//! It is a typed custom-adapter mode. Your producer can ingest any upstream
+//! format it wants, but before data enters SOF it must be mapped into one of
+//! the typed `ProviderStreamUpdate` variants below.
+//!
+//! Variant-to-runtime mapping:
+//!
+//! - `Transaction`:
+//!   - drives `on_transaction`
+//!   - drives derived-state transaction apply when enabled
+//!   - synthesizes `on_recent_blockhash` from the transaction message when that
+//!     hook is requested
+//! - `SerializedTransaction`:
+//!   - same transaction-family path, but lets SOF prefilter before full decode
+//! - `TransactionLog`:
+//!   - drives `on_transaction_log`
+//! - `TransactionViewBatch`:
+//!   - drives `on_transaction_view_batch`
+//! - `RecentBlockhash`:
+//!   - drives `on_recent_blockhash`
+//! - `SlotStatus`:
+//!   - drives `on_slot_status`
+//! - `ClusterTopology`:
+//!   - drives `on_cluster_topology`
+//! - `LeaderSchedule`:
+//!   - drives `on_leader_schedule`
+//! - `Reorg`:
+//!   - drives `on_reorg`
+//! - `Health`:
+//!   - updates provider health/readiness/observability
+//!   - does not dispatch into plugin hooks
+//!
 //! # Feed Provider Transactions Into SOF
 //!
 //! ```no_run
@@ -83,8 +115,29 @@ pub const DEFAULT_PROVIDER_STREAM_QUEUE_CAPACITY: usize = 8_192;
 pub enum ProviderStreamMode {
     /// Generic custom provider-stream ingress supplied by the embedding application.
     ///
-    /// This mode is for producers that push `ProviderStreamUpdate` items directly
-    /// and may supply a richer control-plane surface than the built-in adapters.
+    /// This mode is for producers that push typed `ProviderStreamUpdate` items
+    /// directly into SOF. It is not a free-form payload mode: your custom
+    /// adapter is responsible for converting upstream provider data into SOF's
+    /// typed transaction, control-plane, or health updates.
+    ///
+    /// Use it when:
+    ///
+    /// - you have a processed provider that is not one of the built-in adapters
+    /// - you need richer control-plane signals than the built-in processed
+    ///   providers expose
+    /// - you want a bounded replay/batch producer to feed SOF directly
+    ///
+    /// The runtime dispatch contract is:
+    ///
+    /// - `Transaction` / `SerializedTransaction` -> transaction-family hooks
+    /// - `TransactionLog` -> `on_transaction_log`
+    /// - `TransactionViewBatch` -> `on_transaction_view_batch`
+    /// - `RecentBlockhash` -> `on_recent_blockhash`
+    /// - `SlotStatus` -> `on_slot_status`
+    /// - `ClusterTopology` -> `on_cluster_topology`
+    /// - `LeaderSchedule` -> `on_leader_schedule`
+    /// - `Reorg` -> `on_reorg`
+    /// - `Health` -> runtime health/readiness only
     Generic,
     /// Yellowstone gRPC / Geyser-style processed transaction feeds.
     ///

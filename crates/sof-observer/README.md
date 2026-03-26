@@ -203,6 +203,50 @@ choice:
 - built-in processed providers are narrower on purpose
 - `ProviderStreamMode::Generic` exists when a custom producer needs to restore that richer surface
 
+`ProviderStreamMode::Generic` is a typed adapter boundary, not an arbitrary
+payload channel. A custom producer may ingest any upstream format, but before
+data enters SOF it must be mapped into `ProviderStreamUpdate`.
+
+That update surface is:
+
+- `Transaction`
+- `SerializedTransaction`
+- `TransactionLog`
+- `TransactionViewBatch`
+- `RecentBlockhash`
+- `SlotStatus`
+- `ClusterTopology`
+- `LeaderSchedule`
+- `Reorg`
+- `Health`
+
+The runtime then routes those typed updates into the normal SOF surfaces:
+
+- `Transaction` / `SerializedTransaction`
+  - `on_transaction`
+  - derived-state transaction apply when enabled
+  - synthesized `on_recent_blockhash` from the transaction message when requested
+- `TransactionLog`
+  - `on_transaction_log`
+- `TransactionViewBatch`
+  - `on_transaction_view_batch`
+- `RecentBlockhash`
+  - `on_recent_blockhash`
+- `SlotStatus`
+  - `on_slot_status`
+- `ClusterTopology`
+  - `on_cluster_topology`
+- `LeaderSchedule`
+  - `on_leader_schedule`
+- `Reorg`
+  - `on_reorg`
+- `Health`
+  - provider health/readiness/observability only
+  - not a plugin callback
+
+So `Generic` should be read as “custom provider adapter feeds SOF's typed
+provider event surface,” not “SOF accepts any arbitrary provider blob.”
+
 Programmatic setup uses the typed runtime API:
 
 ```rust

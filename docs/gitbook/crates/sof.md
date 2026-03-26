@@ -257,6 +257,50 @@ Important boundary:
 - `sof-tx` adapter completeness still depends on a full control-plane feed, not
   only transaction updates
 
+What `ProviderStreamMode::Generic` actually means:
+
+- it is not an arbitrary payload lane
+- it is a typed custom-adapter mode
+- your producer can ingest any upstream format, but it must convert that data
+  into SOF's `ProviderStreamUpdate` variants before sending it into the runtime
+
+The accepted update shapes are:
+
+- `Transaction`
+- `SerializedTransaction`
+- `TransactionLog`
+- `TransactionViewBatch`
+- `RecentBlockhash`
+- `SlotStatus`
+- `ClusterTopology`
+- `LeaderSchedule`
+- `Reorg`
+- `Health`
+
+And the runtime behavior is fixed:
+
+- `Transaction` / `SerializedTransaction`
+  - drive transaction-family hooks
+  - may also feed derived-state transaction apply
+  - can synthesize `on_recent_blockhash` from the transaction message when requested
+- `TransactionLog`
+  - drives `on_transaction_log`
+- `TransactionViewBatch`
+  - drives `on_transaction_view_batch`
+- `RecentBlockhash`
+  - drives `on_recent_blockhash`
+- `SlotStatus`
+  - drives `on_slot_status`
+- `ClusterTopology`
+  - drives `on_cluster_topology`
+- `LeaderSchedule`
+  - drives `on_leader_schedule`
+- `Reorg`
+  - drives `on_reorg`
+- `Health`
+  - updates provider health/readiness/observability
+  - does not invoke plugin callbacks
+
 ## When To Use Plugins vs Runtime Extensions
 
 Use plugins when you want decoded semantic events:
