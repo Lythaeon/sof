@@ -16,7 +16,7 @@ This registry is intentionally different from the tuning guide:
 
 Snapshot date:
 
-- `2026-03-24`
+- `2026-03-26`
 
 ## How To Read The Registry
 
@@ -137,6 +137,7 @@ SOF's runtime-owned observability endpoint exposes low-cardinality operational m
 | Knob | Default | Scope | Meaning |
 | --- | --- | --- | --- |
 | `SOF_PROVIDER_STREAM_CAPABILITY_POLICY` | `warn` | all builds | Startup policy when `ProviderStreamMode::Generic` cannot satisfy requested hooks. Built-in processed providers already fail fast on unsupported surfaces and remain transaction-first; `strict` vs `warn` only affects the flexible generic producer path. |
+| `SOF_PROVIDER_STREAM_ALLOW_EOF` | `false` | all builds | Allow `ProviderStreamMode::Generic` to terminate cleanly on EOF for bounded replay/batch producers, instead of treating ingress closure as a failed live stream. |
 
 ## Gossip Selection
 

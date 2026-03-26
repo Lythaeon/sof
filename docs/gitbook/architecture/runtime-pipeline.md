@@ -21,7 +21,7 @@ ingress
 
 ### Ingress
 
-Traffic enters through one of three sources:
+Traffic enters through one of the raw-ingest sources:
 
 - direct UDP listener
 - gossip bootstrap path

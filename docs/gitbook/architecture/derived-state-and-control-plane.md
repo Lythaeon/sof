@@ -16,6 +16,16 @@ From live shred flow, the runtime can surface:
 That means downstream services can make decisions from local state instead of paying the latency
 and failure cost of routing every check through RPC.
 
+Processed provider mode is different:
+
+- built-in Yellowstone, LaserStream, and websocket adapters are transaction-first
+- they can still drive transaction consumers and recent-blockhash extraction from
+  observed transactions
+- they do not, by themselves, form the full live control-plane surface needed by
+  `sof-tx` adapters
+- `ProviderStreamMode::Generic` is the processed-provider path that can carry
+  richer control-plane updates when a custom producer has them
+
 ## Why `sof-tx` Cares
 
 Direct or hybrid transaction submission only works well when you have timely answers for:

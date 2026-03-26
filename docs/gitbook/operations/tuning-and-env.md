@@ -20,6 +20,15 @@ When enabled, SOF exposes:
 - `/healthz`
 - `/readyz`
 
+If you are starting in processed provider mode instead of raw-shred ingest, the
+safe baseline is different:
+
+- keep the provider endpoint and auth config explicit in code
+- keep replay and durability settings at their defaults first
+- do not tune packet-worker, dataset-worker, FEC, or relay/repair knobs before
+  you have measured a raw-shred runtime, because built-in provider mode does not
+  use those packet/shred stages the same way
+
 If you configure the runtime in code, prefer `RuntimeSetup` and `sof-gossip-tuning` instead of raw
 string overrides.
 

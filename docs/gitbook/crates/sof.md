@@ -1,7 +1,8 @@
 # `sof`
 
-`sof` is the packaged observer/runtime crate for low-latency shred ingestion and local
-control-plane signals.
+`sof` is the packaged observer/runtime crate for low-latency Solana observation.
+It can start from raw shreds or from processed provider streams while keeping one
+runtime surface for plugins, derived state, and local control-plane consumers.
 
 If the words “shred”, “relay”, or “repair” still feel too low-level right now, read
 [Before You Start](../getting-started/before-you-start.md) before treating this page as your first
@@ -10,14 +11,19 @@ stop.
 ## Core Responsibilities
 
 - packet ingress from direct UDP, gossip bootstrap, or external kernel-bypass receivers
+- processed provider ingress from Yellowstone gRPC, LaserStream gRPC, websocket
+  `transactionSubscribe`, or `ProviderStreamMode::Generic`
 - shred parse, optional verification, FEC recovery, and dataset reconstruction
 - plugin-driven event emission for transactions, slots, topology, and blockhash observations
 - runtime extension hosting for filtered packet/resource consumers
 - bounded relay and repair behavior
 - local canonical and commitment tracking without requiring an RPC dependency
 
-You do not need to understand the raw shred format to use the crate well. What matters is that
-`sof` starts from live packet traffic and turns it into higher-level local signals and events.
+You do not need to understand the raw shred format to use the crate well. What
+matters is that `sof` turns early Solana ingress into higher-level local
+signals and events. In raw-shred modes, SOF owns packet/shred/reassembly work.
+In processed provider modes, SOF owns the provider/runtime boundary and keeps
+the downstream semantics aligned where the provider surface allows it.
 
 ## Where It Fits
 
@@ -229,6 +235,28 @@ Build flag:
 sof = { version = "0.12.0", features = ["kernel-bypass"] }
 ```
 
+### Processed provider streams
+
+Best for:
+
+- teams that already buy or run a processed transaction feed
+- services that want SOF's plugin and runtime surface without raw-shred ingest
+- custom producers that can feed `ProviderStreamMode::Generic`
+
+Build flags:
+
+```toml
+sof = { version = "0.12.0", features = ["provider-grpc"] }
+sof = { version = "0.12.0", features = ["provider-websocket"] }
+```
+
+Important boundary:
+
+- built-in Yellowstone, LaserStream, and websocket adapters are transaction-first
+- `ProviderStreamMode::Generic` is the flexible processed-provider mode
+- `sof-tx` adapter completeness still depends on a full control-plane feed, not
+  only transaction updates
+
 ## When To Use Plugins vs Runtime Extensions
 
 Use plugins when you want decoded semantic events:
@@ -276,6 +304,10 @@ RPC.
 | `derived_state_slot_mirror` | replayable stateful-consumer pattern; requires `SOF_RUN_EXAMPLE=1` |
 | `tpu_leader_logger` | local leader and TPU endpoint observation |
 | `kernel_bypass_ingress_metrics` | external ingress handoff |
+| `provider_stream_yellowstone_grpc` | built-in Yellowstone processed-provider mode |
+| `provider_stream_laserstream` | built-in LaserStream processed-provider mode |
+| `provider_stream_websocket_transaction` | built-in websocket `transactionSubscribe` mode |
+| `trusted_raw_shred_provider` | trusted raw-shred ingress with SOF downstream processing |
 
 The quickest way forward is to open the example that matches the service being built:
 
@@ -283,6 +315,9 @@ The quickest way forward is to open the example that matches the service being b
 - [`observer_with_non_vote_plugin.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/observer_with_non_vote_plugin.rs)
 - [`observer_with_multiple_plugins.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/observer_with_multiple_plugins.rs)
 - [`tpu_leader_logger.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/tpu_leader_logger.rs)
+- [`provider_stream_yellowstone_grpc.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/provider_stream_yellowstone_grpc.rs)
+- [`provider_stream_laserstream.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/provider_stream_laserstream.rs)
+- [`provider_stream_websocket_transaction.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/provider_stream_websocket_transaction.rs)
 
 ## A Good Mental Model For Implementation
 
