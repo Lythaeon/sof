@@ -37,6 +37,12 @@ That creates two raw-shred SOF trust modes plus one different provider-stream ca
 | Self-operated validator with Geyser | your own validator and plugin pipeline | operate validator-shaped infrastructure yourself | teams that already need validator-level data access or want full validator-adjacent control |
 | SOF | live observed network traffic | operate a focused observer/runtime host | low-latency analytics, monitoring, automation, custom streams, and execution-adjacent services |
 
+Another way to read the table:
+
+- RPC/provider-first architectures optimize for consuming an already-productized API
+- SOF optimizes for owning one efficient runtime foundation and letting your application code sit
+  directly on top of it
+
 ## SOF vs RPC
 
 | Question | RPC-first | SOF |
@@ -73,6 +79,15 @@ Managed providers are a strong fit when the main goal is to consume streams quic
 
 SOF is a stronger fit when the goal is to own the ingest path, filtering logic, runtime behavior,
 and downstream product surface.
+
+It is also a stronger fit when you do not want every Solana service in your stack to separately
+rebuild:
+
+- provider adapters
+- filter parity across providers
+- reconnect and backoff logic
+- low-level performance work around allocations, copies, SIMD, and cache behavior
+- correctness boundaries such as duplicate suppression, replay, and verification posture
 
 It is also the stronger latency fit when you can put SOF on a host with better shred visibility
 than the hosted stream consumer path you would otherwise depend on.
@@ -113,6 +128,15 @@ focus.
 | Solana-specific runtime features | depends on your implementation | built in |
 | Ability to customize | maximum | high, within SOF's runtime model |
 | Time to production | depends on your team and scope | usually shorter |
+
+The biggest difference is usually not just time to first prototype. It is how much low-level work
+you avoid repeating across every service:
+
+- tuning for lower instructions and lower cache waste
+- cutting allocator/copy churn in provider and packet paths
+- pressure controls and bounded worker behavior
+- robust reconnect / replay / restart behavior
+- consistent plugin/filter semantics across ingress modes
 
 ## When SOF Is The Right Choice
 

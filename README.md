@@ -18,6 +18,38 @@ That is when SOF's lower-overhead local ingest, parsing, control-plane derivatio
 consumer model matter most: the data reaches your application on the same system without another
 heavy external dependency in the hot path.
 
+## Why Build On SOF Instead Of Starting From Scratch
+
+Most Solana teams do not want to spend their engineering budget rebuilding the same low-level
+runtime machinery for every new service.
+
+The hard part is usually not the business logic. It is everything underneath it:
+
+- provider-specific ingest and reconnect behavior
+- packet parsing, duplicate suppression, verification, and reconstruction
+- reducing instructions, copies, allocator churn, and cache misses in the hot path
+- keeping hooks and filters consistent across raw-shred and provider-stream modes
+- bounded degradation, health/readiness signals, restart behavior, and runtime observability
+
+SOF exists to absorb that cost once and make it reusable.
+
+That means a Solana team can build on a runtime already optimized for:
+
+- fewer unnecessary instructions in hot paths
+- fewer avoidable allocations and copies
+- shared or borrowed data where it is safe to do so
+- SIMD-friendly parsing where it actually helps
+- consistent hook semantics across multiple ingress/provider modes
+- correctness boundaries such as semantic dedupe, explicit verification posture, and replay-safe
+  downstream behavior
+
+The practical value is simple: application developers can focus on their Solana program or service
+logic while SOF owns the low-level ingest/runtime discipline.
+
+SOF also treats robustness and accuracy as first-class runtime concerns. Duplicate/conflict
+suppression, verification posture, replayable derived state, and bounded runtime behavior are part
+of the framework itself instead of ad hoc application glue.
+
 ## Trust And Ingress Modes
 
 SOF has two explicit raw-shred trust modes:
@@ -81,12 +113,14 @@ It is split into three user-facing crates:
 ## Highlights
 
 - Multi-core packet ingest, FEC recovery, and dataset reconstruction
+- Provider adapters and hook paths optimized once at the framework level instead of per app
 - Bundled gossip backend tuning for queue depths, worker counts, CPU pinning, and small-batch serial fallbacks
 - Local market-facing control-plane signals for leader, topology, blockhash, replay, and fork state
 - Local `processed` / `confirmed` / `finalized` transaction tagging
 - Semantic shred dedupe that suppresses duplicate or conflicting downstream event emission
 - Plugin hooks and runtime extensions for downstream logic
 - Lower-copy hot paths through shared dataset payload fragments and borrowed transaction classification
+- Provider-stream parsing optimized for lower copy / lower churn paths where possible
 - Replayable derived-state feed for restart-safe stateful services
 - First-class `sof-tx` adapters for live plugin and replayable derived-state control-plane inputs
 - Flow-safety policy evaluation for stale or degraded tx-control-plane state

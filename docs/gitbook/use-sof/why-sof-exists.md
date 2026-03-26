@@ -28,6 +28,23 @@ That removes the biggest latency killer for observer-driven services: late shred
 that part is solved, SOF can keep parsing, control-plane derivation, and downstream logic on the
 same system instead of paying for another heavy external service boundary.
 
+There is another practical problem too:
+
+even when a team knows exactly what it wants to build on Solana, rebuilding the ingest/runtime
+layer from scratch is usually tedious, performance-sensitive, and easy to get subtly wrong.
+
+The cost is not just reading packets or subscribing to a provider. It is also:
+
+- getting provider-specific connection and reconnect behavior right
+- reducing instructions, copies, allocator churn, and cache misses in the hot path
+- preserving one consistent hook/filter model across different upstreams
+- treating duplicate suppression, verification posture, and replay behavior as correctness
+  boundaries instead of optional cleanup
+- keeping the runtime observable and bounded under pressure
+
+SOF exists to make that substrate reusable so Solana developers can focus on the logic they
+actually care about.
+
 One more constraint should be explicit:
 
 SOF does not assume every upstream is equally trusted.
@@ -60,6 +77,8 @@ SOF fits services that need one or more of these:
 - locally derived control-plane state such as recent blockhash and leader context
 - explicit bounded behavior under pressure instead of unbounded background machinery
 - a foundation for analytics, monitoring, automation, or low-latency submission
+- a reusable runtime foundation so every service does not need to reinvent Solana ingest,
+  provider handling, and correctness machinery
 
 The project started from the idea that there should be a middle ground between:
 
@@ -81,6 +100,7 @@ That means the project optimizes for:
 - predictable, bounded runtime behavior
 - explicit operational tradeoffs
 - modular downstream consumers such as plugins, derived state, and `sof-tx`
+- a place where low-level Solana runtime optimizations are implemented once instead of in every app
 
 ## Why Not Just Use RPC?
 
@@ -98,6 +118,7 @@ SOF becomes attractive for services that need:
 - fewer external dependencies in the data path
 - control over how traffic is parsed, retained, and surfaced
 - direct integration into your own service architecture
+- a framework that already owns the performance and correctness details under the application
 
 That benefit is strongest when SOF is not only local to the application, but also close to the
 traffic source.
@@ -121,4 +142,5 @@ services.
 ## The Core Idea In One Sentence
 
 SOF exists for services that need to see live Solana traffic early, derive useful local state from
-it, and act without building on top of a heavy RPC-first or validator-first stack.
+it, and act without rebuilding a heavy RPC-first, validator-first, or ad hoc ingest stack from
+scratch every time.

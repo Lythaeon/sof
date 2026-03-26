@@ -3,6 +3,12 @@
 SOF can be deployed in three main runtime modes, but there are also two different trust postures
 inside those modes. Pick both deliberately.
 
+One design goal stays the same across all of them:
+
+SOF should let downstream teams reuse one runtime foundation rather than rebuilding provider
+ingest, packet handling, reconstruction, performance tuning, and correctness boundaries per
+application.
+
 ## Mode Comparison
 
 | Mode | Use When | Main Tradeoff |
@@ -32,6 +38,13 @@ SOF exposes this category through `ProviderStreamMode`. In that mode:
 - build flags are provider-specific:
   - `provider-grpc` for Yellowstone gRPC and LaserStream gRPC
   - `provider-websocket`
+
+That means deployment mode is not only about network topology. It is also about how much of the
+low-level substrate SOF is owning for the application:
+
+- ingest and reconstruction on raw shreds
+- or provider-adapter/runtime behavior on processed feeds
+- while keeping the same downstream runtime surface where semantics line up
 
 Raw-shred trust posture can be set either by env:
 

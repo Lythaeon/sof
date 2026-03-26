@@ -6,6 +6,10 @@ It is built for low-latency Solana data ingest, local runtime-derived signals, a
 need infrastructure-style control over replay, control-plane freshness, and bounded multicore
 packet handling.
 
+The point is not only to expose hooks. It is to give Solana developers an already-optimized and
+already-operated runtime foundation so they do not have to rebuild low-level ingest behavior for
+every new service.
+
 Core responsibilities:
 
 - shred ingestion (direct UDP, relay, optional gossip bootstrap)
@@ -13,6 +17,29 @@ Core responsibilities:
 - dataset reconstruction and transaction extraction
 - plugin-driven event hooks for custom logic
 - local transaction commitment status tagging (`processed` / `confirmed` / `finalized`) without RPC dependency
+
+## Why Not Rebuild This Per Application
+
+Most teams can write the application logic they want much faster than they can correctly and
+efficiently rebuild the substrate under it.
+
+If you build this layer from scratch for every Solana service, you end up re-solving the same
+problems:
+
+- raw or provider-stream ingest
+- reconnect and backoff behavior
+- duplicate suppression and other correctness boundaries
+- verification posture and trust modeling
+- packet/FEC/dataset reconstruction work
+- low-level hot-path tuning around instructions, cache misses, allocations, and copies
+- health, readiness, telemetry, and bounded degradation under pressure
+
+SOF packages that work into one runtime so application developers can stay focused on the Solana
+program or downstream service they actually want to build.
+
+That is also why SOF tries to keep semantics consistent across ingress modes. The goal is that a
+developer writes one plugin/runtime consumer model while SOF owns the provider-specific runtime
+plumbing and performance discipline underneath it.
 
 ## Explicit Trust Model
 
@@ -108,12 +135,14 @@ Build flags:
 - Attach `Plugin` or `RuntimeExtension` consumers
 - Run with built-in UDP ingress or external kernel-bypass ingress
 - Treat SOF as a local market-data and control-plane engine, not just a passive observer
+- Reuse one optimized runtime foundation instead of rebuilding ingest/perf/correctness plumbing per service
 - Use packet-worker and dataset-worker fanout to keep multi-core hosts busy under sustained shred load
 - Consume local slot/reorg/transaction/account-touch signals
 - Use the replayable derived-state feed for restart-safe stateful consumers
 - Apply typed gossip and ingest tuning profiles instead of env-string bundles
 - Keep more runtime work on borrowed/shared data instead of eagerly allocating owned transaction or dataset payload copies
 - Drop duplicate or conflicting shred observations before they can re-emit duplicate dataset or transaction events downstream
+- Treat robustness and accuracy as first-class runtime behavior, not downstream application glue
 
 ## Install
 
