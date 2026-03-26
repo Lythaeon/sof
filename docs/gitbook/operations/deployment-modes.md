@@ -41,6 +41,16 @@ let setup = RuntimeSetup::new()
 If `SOF_VERIFY_SHREDS` or `SOF_VERIFY_RECOVERED_SHREDS` is set explicitly, it overrides the trust
 mode defaults.
 
+Trusted raw shred ingress still follows the normal SOF downstream path after admission:
+
+1. raw packet parse/classification
+2. optional FEC recovery
+3. dataset and transaction reconstruction
+4. plugin and runtime-extension dispatch
+
+The trust-mode change only changes the default verification posture. It does not skip the rest of
+the observer pipeline.
+
 ## Direct UDP Listener
 
 Best for:
@@ -92,6 +102,10 @@ Important behavior:
 - built-in UDP receive path is replaced by your external receiver
 - downstream parse, verify, reassembly, and event surfaces stay the same
 - this is the natural fit when a trusted shred-distribution network or custom NIC path feeds SOF
+
+Example:
+
+- [`trusted_raw_shred_provider.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/trusted_raw_shred_provider.rs)
 
 Build flag:
 

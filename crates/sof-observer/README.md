@@ -49,6 +49,19 @@ The equivalent env knob is:
 SOF_SHRED_TRUST_MODE=trusted_raw_shred_provider
 ```
 
+Trusted raw shred ingress still runs through the normal SOF pipeline after admission:
+
+- parse and classify raw packets
+- optional FEC recovery
+- dataset and transaction reconstruction
+- plugin and runtime-extension dispatch
+
+The trust-mode change only affects the default verification posture. It does not bypass
+reconstruction or plugin delivery.
+
+See the concrete example in
+[`examples/trusted_raw_shred_provider.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/trusted_raw_shred_provider.rs).
+
 ## At a Glance
 
 - Embed SOF directly inside a Tokio application

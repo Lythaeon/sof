@@ -43,6 +43,10 @@ much lower CPU waste than public multi-source gossip. See
 [`docs/gitbook/operations/deployment-modes.md`](docs/gitbook/operations/deployment-modes.md) for
 the full deployment matrix.
 
+In trusted raw shred mode, SOF still runs its normal downstream observer path after packets are
+admitted: parse, FEC/reassembly, dataset reconstruction, and plugin dispatch. The default change
+is the verification posture, not a separate plugin/runtime surface.
+
 It is split into three user-facing crates:
 
 - `sof`: observer/runtime crate for shred ingest, relay/cache, dataset reconstruction, plugin and runtime-extension events, fork/reorg tracking, and local commitment tagging without RPC dependency
