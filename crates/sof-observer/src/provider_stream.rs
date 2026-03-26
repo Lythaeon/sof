@@ -21,7 +21,7 @@
 //!
 //! use solana_hash::Hash;
 //! use solana_keypair::Keypair;
-//! use solana_message::Message;
+//! use solana_message::{Message, VersionedMessage};
 //! use solana_signer::Signer;
 //! use solana_transaction::versioned::VersionedTransaction;
 //! use sof::{
@@ -38,7 +38,7 @@
 //! let (tx, rx) = create_provider_stream_queue(128);
 //! let signer = Keypair::new();
 //! let message = Message::new(&[], Some(&signer.pubkey()));
-//! let transaction = VersionedTransaction::try_new(message.into(), &[&signer])?;
+//! let transaction = VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&signer])?;
 //!
 //! tx.send(ProviderStreamUpdate::Transaction(TransactionEvent {
 //!     slot: 1,
@@ -61,10 +61,16 @@
 
 use tokio::sync::mpsc;
 
+#[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
+use crate::event::TxKind;
 use crate::framework::{
     ClusterTopologyEvent, ObservedRecentBlockhashEvent, SlotStatusEvent, TransactionEvent,
     TransactionLogEvent, TransactionViewBatchEvent,
 };
+#[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
+use solana_sdk_ids::{compute_budget, vote};
+#[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
+use solana_transaction::versioned::VersionedTransaction;
 
 /// Default queue capacity for processed provider-stream ingress.
 pub const DEFAULT_PROVIDER_STREAM_QUEUE_CAPACITY: usize = 8_192;
@@ -172,6 +178,32 @@ pub fn create_provider_stream_queue(
     capacity: usize,
 ) -> (ProviderStreamSender, ProviderStreamReceiver) {
     mpsc::channel(capacity.max(1))
+}
+
+#[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
+/// Classifies provider-fed transactions consistently across built-in adapters.
+pub(crate) fn classify_provider_transaction_kind(tx: &VersionedTransaction) -> TxKind {
+    let mut has_vote = false;
+    let mut has_non_vote_non_budget = false;
+    let keys = tx.message.static_account_keys();
+    for instruction in tx.message.instructions() {
+        if let Some(program_id) = keys.get(usize::from(instruction.program_id_index)) {
+            if *program_id == vote::id() {
+                has_vote = true;
+                continue;
+            }
+            if *program_id != compute_budget::id() {
+                has_non_vote_non_budget = true;
+            }
+        }
+    }
+    if has_vote && !has_non_vote_non_budget {
+        TxKind::VoteOnly
+    } else if has_vote {
+        TxKind::Mixed
+    } else {
+        TxKind::NonVote
+    }
 }
 
 #[cfg(feature = "provider-grpc")]

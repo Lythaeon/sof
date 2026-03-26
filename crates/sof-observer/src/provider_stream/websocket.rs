@@ -12,8 +12,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use simd_json::serde::from_slice as simd_from_slice;
 use solana_pubkey::Pubkey;
-use solana_sdk_ids::{compute_budget, vote};
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 use thiserror::Error;
@@ -21,9 +21,11 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMessage};
 
 use crate::{
-    event::{TxCommitmentStatus, TxKind},
+    event::TxCommitmentStatus,
     framework::TransactionEvent,
-    provider_stream::{ProviderStreamSender, ProviderStreamUpdate},
+    provider_stream::{
+        ProviderStreamSender, ProviderStreamUpdate, classify_provider_transaction_kind,
+    },
 };
 
 /// Commitment level used for websocket `transactionSubscribe` notifications.
@@ -352,7 +354,10 @@ async fn run_websocket_transaction_connection(
                 let frame = frame?;
                 match frame {
                     WsMessage::Text(text) => {
-                        if let Some(event) = parse_transaction_notification(&text, config.commitment)? {
+                        let mut bytes = text.to_string().into_bytes();
+                        if let Some(event) =
+                            parse_transaction_notification(&mut bytes, config.commitment)?
+                        {
                             sender
                                 .send(ProviderStreamUpdate::Transaction(event))
                                 .await
@@ -360,10 +365,10 @@ async fn run_websocket_transaction_connection(
                         }
                     }
                     WsMessage::Binary(bytes) => {
-                        let text = String::from_utf8(bytes.to_vec()).map_err(|error| {
-                            WebsocketTransactionError::Protocol(format!("invalid websocket utf8: {error}"))
-                        })?;
-                        if let Some(event) = parse_transaction_notification(&text, config.commitment)? {
+                        let mut bytes = bytes.to_vec();
+                        if let Some(event) =
+                            parse_transaction_notification(&mut bytes, config.commitment)?
+                        {
                             sender
                                 .send(ProviderStreamUpdate::Transaction(event))
                                 .await
@@ -402,17 +407,14 @@ where
             let frame = frame?;
             match frame {
                 WsMessage::Text(text) => {
-                    if handle_subscription_text(&text)? {
+                    let mut bytes = text.to_string().into_bytes();
+                    if handle_subscription_text(&mut bytes)? {
                         return Ok(());
                     }
                 }
                 WsMessage::Binary(bytes) => {
-                    let text = String::from_utf8(bytes.to_vec()).map_err(|error| {
-                        WebsocketTransactionError::Protocol(format!(
-                            "invalid websocket utf8: {error}"
-                        ))
-                    })?;
-                    if handle_subscription_text(&text)? {
+                    let mut bytes = bytes.to_vec();
+                    if handle_subscription_text(&mut bytes)? {
                         return Ok(());
                     }
                 }
@@ -434,39 +436,33 @@ where
     })?
 }
 
-fn handle_subscription_text(text: &str) -> Result<bool, WebsocketTransactionError> {
-    let value: Value = serde_json::from_str(text).map_err(|error| {
+fn handle_subscription_text(bytes: &mut [u8]) -> Result<bool, WebsocketTransactionError> {
+    let value: WebsocketSubscriptionAck = simd_from_slice(bytes).map_err(|error| {
         WebsocketTransactionError::Protocol(format!("invalid websocket json: {error}"))
     })?;
-    if let Some(error) = value.get("error") {
+    if let Some(error) = value.error {
         return Err(WebsocketTransactionError::Protocol(format!(
             "websocket subscription error: {error}"
         )));
     }
-    Ok(value.get("id").and_then(Value::as_i64) == Some(1) && value.get("result").is_some())
+    Ok(value.id == Some(1) && value.result.is_some())
 }
 
 fn parse_transaction_notification(
-    text: &str,
+    bytes: &mut [u8],
     commitment_status: WebsocketTransactionCommitment,
 ) -> Result<Option<TransactionEvent>, WebsocketTransactionError> {
-    let value: Value = serde_json::from_str(text).map_err(|error| {
+    let value: WebsocketTransactionEnvelopeMessage = simd_from_slice(bytes).map_err(|error| {
         WebsocketTransactionError::Protocol(format!("invalid websocket json: {error}"))
     })?;
-    if let Some(error) = value.get("error") {
+    if let Some(error) = value.error {
         return Err(WebsocketTransactionError::Protocol(format!(
             "websocket provider error: {error}"
         )));
     }
-    let Some(result) = value.pointer("/params/result") else {
+    let Some(notification) = value.params.map(|params| params.result) else {
         return Ok(None);
     };
-    let notification: WebsocketTransactionNotification = serde_json::from_value(result.clone())
-        .map_err(|error| {
-            WebsocketTransactionError::Protocol(format!(
-                "invalid websocket transaction notification: {error}"
-            ))
-        })?;
     if notification.transaction.transaction.1 != "base64" {
         return Err(WebsocketTransactionError::Convert(
             "unsupported websocket transaction encoding",
@@ -492,33 +488,32 @@ fn parse_transaction_notification(
         confirmed_slot: None,
         finalized_slot: None,
         signature,
-        kind: classify_tx_kind(&tx),
+        kind: classify_provider_transaction_kind(&tx),
         tx: Arc::new(tx),
     }))
 }
 
-fn classify_tx_kind(tx: &VersionedTransaction) -> TxKind {
-    let mut has_vote = false;
-    let mut has_non_vote_non_budget = false;
-    let keys = tx.message.static_account_keys();
-    for instruction in tx.message.instructions() {
-        if let Some(program_id) = keys.get(usize::from(instruction.program_id_index)) {
-            if *program_id == vote::id() {
-                has_vote = true;
-                continue;
-            }
-            if *program_id != compute_budget::id() {
-                has_non_vote_non_budget = true;
-            }
-        }
-    }
-    if has_vote && !has_non_vote_non_budget {
-        TxKind::VoteOnly
-    } else if has_vote {
-        TxKind::Mixed
-    } else {
-        TxKind::NonVote
-    }
+#[derive(Debug, Deserialize)]
+struct WebsocketSubscriptionAck {
+    #[serde(default)]
+    id: Option<i64>,
+    #[serde(default)]
+    result: Option<Value>,
+    #[serde(default)]
+    error: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebsocketTransactionEnvelopeMessage {
+    #[serde(default)]
+    error: Option<Value>,
+    #[serde(default)]
+    params: Option<WebsocketTransactionParams>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebsocketTransactionParams {
+    result: WebsocketTransactionNotification,
 }
 
 #[derive(Debug, Deserialize)]
@@ -540,7 +535,13 @@ struct WebsocketEncodedTransaction(String, String);
 #[cfg(all(test, feature = "provider-grpc"))]
 mod tests {
     use super::*;
+    use crate::event::TxKind;
     use crate::provider_stream::yellowstone::{YellowstoneGrpcCommitment, YellowstoneGrpcConfig};
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use serde_json::json;
+    use solana_keypair::Keypair;
+    use solana_message::{Message, VersionedMessage};
+    use solana_signer::Signer;
 
     #[test]
     fn websocket_filter_shape_matches_yellowstone_config() {
@@ -610,5 +611,56 @@ mod tests {
                     .expect("required json")
             )
         );
+    }
+
+    #[test]
+    fn websocket_subscription_ack_accepts_successful_response() {
+        let mut ack = br#"{"jsonrpc":"2.0","id":1,"result":42}"#.to_vec();
+        assert!(handle_subscription_text(&mut ack).expect("ack should parse"));
+
+        let mut ping = br#"{"jsonrpc":"2.0","method":"ping"}"#.to_vec();
+        assert!(!handle_subscription_text(&mut ping).expect("non-ack payload"));
+    }
+
+    #[test]
+    fn websocket_subscription_ack_rejects_provider_error() {
+        let mut error =
+            br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"boom"}}"#.to_vec();
+        let error = handle_subscription_text(&mut error).expect_err("provider error should fail");
+        assert!(error.to_string().contains("subscription error"));
+    }
+
+    #[test]
+    fn websocket_transaction_notification_decodes_full_transaction() {
+        let signer = Keypair::new();
+        let message = Message::new(&[], Some(&signer.pubkey()));
+        let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&signer])
+            .expect("tx");
+        let signature = tx.signatures[0];
+        let tx_bytes = bincode::serialize(&tx).expect("serialize tx");
+        let payload = json!({
+            "jsonrpc":"2.0",
+            "method":"transactionNotification",
+            "params":{
+                "result":{
+                    "slot":55,
+                    "signature":signature.to_string(),
+                    "transaction":{
+                        "transaction":[BASE64_STANDARD.encode(tx_bytes),"base64"]
+                    }
+                }
+            }
+        });
+
+        let mut payload = payload.to_string().into_bytes();
+        let event =
+            parse_transaction_notification(&mut payload, WebsocketTransactionCommitment::Confirmed)
+                .expect("notification should parse")
+                .expect("transaction event");
+
+        assert_eq!(event.slot, 55);
+        assert_eq!(event.signature, Some(signature));
+        assert_eq!(event.commitment_status, TxCommitmentStatus::Confirmed);
+        assert_eq!(event.kind, TxKind::NonVote);
     }
 }

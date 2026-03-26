@@ -17,16 +17,17 @@ use helius_laserstream::{
 use laserstream_core_proto::convert_from::create_tx_versioned;
 use laserstream_core_proto::prelude::Transaction as LaserStreamTransaction;
 use solana_pubkey::Pubkey;
-use solana_sdk_ids::{compute_budget, vote};
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 use thiserror::Error;
 use tokio::task::JoinHandle;
 
 use crate::{
-    event::{TxCommitmentStatus, TxKind},
+    event::TxCommitmentStatus,
     framework::TransactionEvent,
-    provider_stream::{ProviderStreamSender, ProviderStreamUpdate},
+    provider_stream::{
+        ProviderStreamSender, ProviderStreamUpdate, classify_provider_transaction_kind,
+    },
 };
 
 /// LaserStream subscription commitment used for provider-stream transaction updates.
@@ -361,7 +362,7 @@ fn transaction_event_from_update(
         confirmed_slot: None,
         finalized_slot: None,
         signature,
-        kind: classify_tx_kind(&tx),
+        kind: classify_provider_transaction_kind(&tx),
         tx: Arc::new(tx),
     })
 }
@@ -370,30 +371,6 @@ fn convert_transaction(
     tx: LaserStreamTransaction,
 ) -> Result<VersionedTransaction, LaserStreamError> {
     create_tx_versioned(tx).map_err(LaserStreamError::Convert)
-}
-
-fn classify_tx_kind(tx: &VersionedTransaction) -> TxKind {
-    let mut has_vote = false;
-    let mut has_non_vote_non_budget = false;
-    let keys = tx.message.static_account_keys();
-    for instruction in tx.message.instructions() {
-        if let Some(program_id) = keys.get(usize::from(instruction.program_id_index)) {
-            if *program_id == vote::id() {
-                has_vote = true;
-                continue;
-            }
-            if *program_id != compute_budget::id() {
-                has_non_vote_non_budget = true;
-            }
-        }
-    }
-    if has_vote && !has_non_vote_non_budget {
-        TxKind::VoteOnly
-    } else if has_vote {
-        TxKind::Mixed
-    } else {
-        TxKind::NonVote
-    }
 }
 
 #[cfg(all(test, feature = "provider-grpc"))]
