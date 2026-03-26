@@ -41,9 +41,12 @@ SOF exposes this category through `ProviderStreamMode`. In that mode:
 - provider adapter defaults are inclusive: vote and failed transactions stay in
   the stream unless you explicitly filter them out
 - built-in provider durability is mode-specific:
-  - Yellowstone gRPC reconnect uses replay cursor tracking (`from_slot`) and
+  - Yellowstone gRPC has explicit replay modes:
+    - `Live`: start at the current stream head
+    - `Resume` (default): start live, then resume from tracked slot after reconnect
+    - `FromSlot(n)`: begin from one explicit slot before switching to tracked resume behavior
+  - LaserStream exposes the same replay modes on top of SDK replay and
     internal slot-watermark tracking
-  - LaserStream uses SDK replay and internal slot-watermark tracking
   - websocket `transactionSubscribe` uses a stall watchdog and best-effort HTTP
     gap backfill when a matching HTTP endpoint is available
 - strict provider capability policy only rejects hooks that provider runtime can

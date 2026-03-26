@@ -36,8 +36,8 @@ use crate::{
     event::{TxCommitmentStatus, TxKind},
     framework::TransactionEvent,
     provider_stream::{
-        ProviderCommitmentWatermarks, ProviderStreamSender, ProviderStreamUpdate,
-        classify_provider_transaction_kind,
+        ProviderCommitmentWatermarks, ProviderReplayMode, ProviderStreamSender,
+        ProviderStreamUpdate, classify_provider_transaction_kind,
     },
 };
 
@@ -90,7 +90,7 @@ pub struct LaserStreamConfig {
     max_decoding_message_size: Option<usize>,
     max_encoding_message_size: Option<usize>,
     max_reconnect_attempts: Option<u32>,
-    replay: bool,
+    replay_mode: ProviderReplayMode,
 }
 
 impl LaserStreamConfig {
@@ -127,7 +127,7 @@ impl LaserStreamConfig {
             max_decoding_message_size: Some(64 * 1024 * 1024),
             max_encoding_message_size: None,
             max_reconnect_attempts: None,
-            replay: true,
+            replay_mode: ProviderReplayMode::Resume,
         }
     }
 
@@ -230,10 +230,10 @@ impl LaserStreamConfig {
         self
     }
 
-    /// Sets replay behavior on reconnects.
+    /// Sets provider replay behavior.
     #[must_use]
-    pub const fn with_replay(mut self, replay: bool) -> Self {
-        self.replay = replay;
+    pub const fn with_replay_mode(mut self, mode: ProviderReplayMode) -> Self {
+        self.replay_mode = mode;
         self
     }
 
@@ -268,6 +268,7 @@ impl LaserStreamConfig {
             )]),
             transactions: HashMap::from([("sof".to_owned(), filter)]),
             commitment: Some(self.commitment.as_proto() as i32),
+            from_slot: self.initial_from_slot(),
             ..grpc::SubscribeRequest::default()
         }
     }
@@ -289,11 +290,18 @@ impl LaserStreamConfig {
 
         let mut config = ClientConfig::new(self.endpoint.clone(), self.api_key.clone())
             .with_channel_options(options)
-            .with_replay(self.replay);
+            .with_replay(!matches!(self.replay_mode, ProviderReplayMode::Live));
         if let Some(attempts) = self.max_reconnect_attempts {
             config = config.with_max_reconnect_attempts(attempts);
         }
         config
+    }
+
+    fn initial_from_slot(&self) -> Option<u64> {
+        match self.replay_mode {
+            ProviderReplayMode::Live | ProviderReplayMode::Resume => None,
+            ProviderReplayMode::FromSlot(slot) => Some(slot),
+        }
     }
 }
 
@@ -584,6 +592,23 @@ mod tests {
         let request =
             LaserStreamConfig::new("https://laserstream.example", "token").subscribe_request();
         assert!(request.slots.contains_key(INTERNAL_WATERMARK_SLOT_FILTER));
+        assert_eq!(request.from_slot, None);
+    }
+
+    #[test]
+    fn laserstream_replay_mode_can_start_from_explicit_slot() {
+        let request = LaserStreamConfig::new("https://laserstream.example", "token")
+            .with_replay_mode(ProviderReplayMode::FromSlot(321))
+            .subscribe_request();
+        assert_eq!(request.from_slot, Some(321));
+    }
+
+    #[test]
+    fn laserstream_live_mode_starts_at_stream_head() {
+        let request = LaserStreamConfig::new("https://laserstream.example", "token")
+            .with_replay_mode(ProviderReplayMode::Live)
+            .subscribe_request();
+        assert_eq!(request.from_slot, None);
     }
 
     fn sample_transaction() -> VersionedTransaction {

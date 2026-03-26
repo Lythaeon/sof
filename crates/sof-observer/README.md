@@ -76,8 +76,11 @@ Built-in hook surface by provider mode:
 
 Built-in durability behavior:
 
-- Yellowstone gRPC: reconnects with replay cursor tracking and slot-watermark tracking
-- LaserStream gRPC: uses SDK replay plus slot-watermark tracking
+- Yellowstone gRPC: explicit replay modes
+  - `Live`: start at stream head
+  - `Resume` (default): start live, resume from tracked slot after reconnect
+  - `FromSlot(n)`: start from slot `n`, then continue with tracked resume behavior
+- LaserStream gRPC: same explicit replay modes on top of SDK replay and slot-watermark tracking
 - websocket `transactionSubscribe`: uses a stall watchdog and best-effort HTTP RPC gap backfill on
   reconnect when SOF has a matching HTTP endpoint; otherwise reconnects are live-only
 

@@ -29,8 +29,8 @@ use crate::{
     event::{TxCommitmentStatus, TxKind},
     framework::TransactionEvent,
     provider_stream::{
-        ProviderCommitmentWatermarks, ProviderStreamSender, ProviderStreamUpdate,
-        classify_provider_transaction_kind,
+        ProviderCommitmentWatermarks, ProviderReplayMode, ProviderStreamSender,
+        ProviderStreamUpdate, classify_provider_transaction_kind,
     },
 };
 
@@ -84,7 +84,7 @@ pub struct YellowstoneGrpcConfig {
     ping_interval: Option<Duration>,
     reconnect_delay: Duration,
     max_reconnect_attempts: Option<u32>,
-    replay: bool,
+    replay_mode: ProviderReplayMode,
 }
 
 impl YellowstoneGrpcConfig {
@@ -119,7 +119,7 @@ impl YellowstoneGrpcConfig {
             ping_interval: Some(Duration::from_secs(30)),
             reconnect_delay: Duration::from_secs(1),
             max_reconnect_attempts: None,
-            replay: true,
+            replay_mode: ProviderReplayMode::Resume,
         }
     }
 
@@ -236,10 +236,10 @@ impl YellowstoneGrpcConfig {
         self
     }
 
-    /// Sets replay behavior on reconnects.
+    /// Sets provider replay behavior.
     #[must_use]
-    pub const fn with_replay(mut self, replay: bool) -> Self {
-        self.replay = replay;
+    pub const fn with_replay_mode(mut self, mode: ProviderReplayMode) -> Self {
+        self.replay_mode = mode;
         self
     }
 
@@ -280,15 +280,39 @@ impl YellowstoneGrpcConfig {
             commitment: Some(self.commitment.as_proto() as i32),
             ..SubscribeRequest::default()
         };
-        if self.replay && tracked_slot > 0 {
-            request.from_slot = Some(match self.commitment {
-                YellowstoneGrpcCommitment::Processed => tracked_slot.saturating_sub(31),
-                YellowstoneGrpcCommitment::Confirmed | YellowstoneGrpcCommitment::Finalized => {
-                    tracked_slot
-                }
-            });
+        if let Some(from_slot) = self.replay_from_slot(tracked_slot) {
+            request.from_slot = Some(from_slot);
         }
         request
+    }
+
+    const fn replay_from_slot(&self, tracked_slot: u64) -> Option<u64> {
+        let base_slot = match self.replay_mode {
+            ProviderReplayMode::Live => return None,
+            ProviderReplayMode::Resume => {
+                if tracked_slot == 0 {
+                    return None;
+                }
+                tracked_slot
+            }
+            ProviderReplayMode::FromSlot(slot) => {
+                if tracked_slot == 0 {
+                    slot
+                } else {
+                    if tracked_slot >= slot {
+                        tracked_slot
+                    } else {
+                        slot
+                    }
+                }
+            }
+        };
+        Some(match self.commitment {
+            YellowstoneGrpcCommitment::Processed => base_slot.saturating_sub(31),
+            YellowstoneGrpcCommitment::Confirmed | YellowstoneGrpcCommitment::Finalized => {
+                base_slot
+            }
+        })
     }
 }
 
@@ -680,10 +704,19 @@ mod tests {
     #[test]
     fn yellowstone_subscribe_request_tracks_slots_and_replay_cursor() {
         let request = YellowstoneGrpcConfig::new("http://127.0.0.1:10000")
+            .with_replay_mode(ProviderReplayMode::FromSlot(200))
             .with_commitment(YellowstoneGrpcCommitment::Processed)
-            .subscribe_request_with_state(200);
+            .subscribe_request_with_state(0);
         assert!(request.slots.contains_key(INTERNAL_SLOT_FILTER));
         assert_eq!(request.from_slot, Some(169));
+    }
+
+    #[test]
+    fn yellowstone_live_mode_starts_at_stream_head() {
+        let request = YellowstoneGrpcConfig::new("http://127.0.0.1:10000")
+            .with_replay_mode(ProviderReplayMode::Live)
+            .subscribe_request_with_state(500);
+        assert_eq!(request.from_slot, None);
     }
 
     fn proto_transaction_from_versioned(tx: &VersionedTransaction) -> Transaction {

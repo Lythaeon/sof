@@ -112,6 +112,33 @@ impl ProviderStreamMode {
     }
 }
 
+/// Replay policy for processed provider transaction streams.
+///
+/// # Examples
+///
+/// ```rust
+/// use sof::provider_stream::ProviderReplayMode;
+///
+/// let live = ProviderReplayMode::Live;
+/// let resume = ProviderReplayMode::Resume;
+/// let from_slot = ProviderReplayMode::FromSlot(1_000_000);
+///
+/// assert!(matches!(live, ProviderReplayMode::Live));
+/// assert!(matches!(resume, ProviderReplayMode::Resume));
+/// assert!(matches!(from_slot, ProviderReplayMode::FromSlot(1_000_000)));
+/// ```
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ProviderReplayMode {
+    /// Start from the provider's live edge and do not request historical replay.
+    Live,
+    /// Start live and resume from the last tracked slot after reconnects.
+    #[default]
+    Resume,
+    /// Request historical replay starting at one explicit slot, then continue
+    /// with tracked resume behavior after reconnects.
+    FromSlot(u64),
+}
+
 /// One processed provider-stream update accepted by SOF.
 #[derive(Debug, Clone)]
 pub enum ProviderStreamUpdate {
