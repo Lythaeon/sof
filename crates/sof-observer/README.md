@@ -83,6 +83,9 @@ Built-in durability behavior:
 - LaserStream gRPC: same explicit replay modes on top of SDK replay and slot-watermark tracking
 - websocket `transactionSubscribe`: uses a stall watchdog and best-effort HTTP RPC gap backfill on
   reconnect when SOF has a matching HTTP endpoint; otherwise reconnects are live-only
+  - this remains best-effort because `transactionSubscribe` itself has no replay cursor
+  - SOF can fill recent slot gaps and suppress replay duplicates, but it cannot promise stronger
+    durability than the websocket provider plus HTTP RPC backfill path can actually provide
 
 Provider config defaults are inclusive:
 

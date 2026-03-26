@@ -49,6 +49,11 @@ SOF exposes this category through `ProviderStreamMode`. In that mode:
     internal slot-watermark tracking
   - websocket `transactionSubscribe` uses a stall watchdog and best-effort HTTP
     gap backfill when a matching HTTP endpoint is available
+    - it is still a best-effort mode because `transactionSubscribe` has no
+      provider-native replay cursor
+    - SOF can replay recent slots and dedupe the recovered transactions, but it
+      cannot promise stronger durability than the websocket provider plus HTTP
+      RPC backfill path can expose
 - strict provider capability policy only rejects hooks that provider runtime can
   never emit; it does not reject generic provider updates such as recent
   blockhash, slot status, or cluster topology when your producer supplies them
