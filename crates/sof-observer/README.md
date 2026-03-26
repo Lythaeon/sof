@@ -35,6 +35,11 @@ SOF exposes those processed feeds through `ProviderStreamMode`. In that path, pr
 straight into transaction or transaction-view-batch dispatch instead of the packet/shred/FEC
 pipeline.
 
+Implemented provider-stream adapters:
+
+- Yellowstone gRPC
+- LaserStream gRPC
+
 That tradeoff should be explicit: public gossip is the independent baseline, trusted raw shred
 distribution is the fast path, and processed provider streams are a different observer model.
 
@@ -75,6 +80,8 @@ See the concrete example in
 [`examples/trusted_raw_shred_provider.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/trusted_raw_shred_provider.rs).
 For Yellowstone gRPC, see
 [`examples/provider_stream_yellowstone_grpc.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/provider_stream_yellowstone_grpc.rs).
+For LaserStream, see
+[`examples/provider_stream_laserstream.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/provider_stream_laserstream.rs).
 
 ## At a Glance
 

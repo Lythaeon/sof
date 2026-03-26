@@ -149,3 +149,7 @@ pub fn create_provider_stream_queue(
 #[cfg(feature = "yellowstone-grpc")]
 /// Yellowstone gRPC adapter helpers.
 pub mod yellowstone;
+
+#[cfg(feature = "laserstream")]
+/// Helius LaserStream adapter helpers.
+pub mod laserstream;

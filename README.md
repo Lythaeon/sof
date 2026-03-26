@@ -35,6 +35,11 @@ SOF exposes that ingest family explicitly through `ProviderStreamMode`. Use it w
 Yellowstone/LaserStream-style provider feeds to enter the SOF plugin runtime directly without
 pretending they are raw shreds.
 
+Implemented provider-stream adapters today:
+
+- Yellowstone gRPC
+- LaserStream gRPC
+
 The intended positioning is straightforward:
 
 - use public gossip/direct peers when you want independence and are willing to own the whole stack

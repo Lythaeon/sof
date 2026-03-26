@@ -22,6 +22,7 @@ default = []
 gossip-bootstrap = ["dep:solana-gossip"]
 kernel-bypass = ["dep:xdp"]
 yellowstone-grpc = ["dep:yellowstone-grpc-client", "dep:yellowstone-grpc-proto"]
+laserstream = ["dep:helius-laserstream", "dep:laserstream-core-proto"]
 
 [dependencies]
 agave-transaction-view = { version = "3.1.8", features = ["agave-unstable-api"] }
@@ -72,6 +73,8 @@ smallvec = "1.15"
 xdp = { version = "0.7.3", optional = true }
 yellowstone-grpc-client = { version = "12.2.0", optional = true }
 yellowstone-grpc-proto = { version = "12.1.0", optional = true }
+helius-laserstream = { version = "0.1.9", optional = true }
+laserstream-core-proto = { version = "9.0.2", optional = true }
 
 [dev-dependencies]
 criterion = "0.5.1"
@@ -133,6 +136,11 @@ path = "examples/af_xdp_kernel_bypass_ingress_metrics.rs"
 name = "provider_stream_yellowstone_grpc"
 path = "examples/provider_stream_yellowstone_grpc.rs"
 required-features = ["yellowstone-grpc"]
+
+[[example]]
+name = "provider_stream_laserstream"
+path = "examples/provider_stream_laserstream.rs"
+required-features = ["laserstream"]
 
 [[bin]]
 name = "gossip_protocol_profile"

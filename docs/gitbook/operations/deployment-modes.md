@@ -27,6 +27,7 @@ SOF exposes this category through `ProviderStreamMode`. In that mode:
 - upstream provider data goes directly into transaction or transaction-view-batch dispatch
 - SOF does not run packet parsing, shred verification, FEC recovery, or dataset reconstruction
 - plugin and derived-state logic can still stay on the SOF runtime surface
+- current adapters include Yellowstone gRPC and LaserStream gRPC
 
 Raw-shred trust posture can be set either by env:
 

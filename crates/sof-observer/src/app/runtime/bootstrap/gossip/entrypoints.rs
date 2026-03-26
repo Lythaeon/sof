@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     fn pinned_entrypoints_do_not_expand_runtime_switch_pool() {
-        // Test-local env mutation is scoped to this case and restored below.
+        // SAFETY: test-local env mutation is scoped to this case and restored below.
         unsafe { std::env::set_var("SOF_GOSSIP_ENTRYPOINT_PINNED", "true") };
         let (_tx, tx_event_rx) = mpsc::channel(1);
         let runtime = ReceiverRuntime {
@@ -195,7 +195,7 @@ mod tests {
             &["127.0.0.1:8001".to_owned(), "127.0.0.1:8001".to_owned()],
             32,
         );
-        // Restore the test-local env override before asserting.
+        // SAFETY: restore the test-local env override before asserting.
         unsafe { std::env::remove_var("SOF_GOSSIP_ENTRYPOINT_PINNED") };
         assert_eq!(candidates, vec!["127.0.0.1:8001".to_owned()]);
     }
