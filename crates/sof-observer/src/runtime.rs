@@ -1659,16 +1659,20 @@ fn dispatch_provider_stream_serialized_transaction(
 
     let mut signature = event.signature;
     let mut recent_blockhash = None;
-    let mut kind = None;
-    if let Ok(view) = SanitizedTransactionView::try_new_sanitized(event.bytes.as_ref(), true) {
+    let needs_view_prefilter = wants_transaction
+        && plugin_host.has_transaction_prefilter()
+        && !wants_derived_state_transaction;
+    let should_try_view = wants_recent_blockhash || needs_view_prefilter;
+    if should_try_view
+        && let Ok(view) = SanitizedTransactionView::try_new_sanitized(event.bytes.as_ref(), true)
+    {
         if signature.is_none() {
             signature = view.signatures().first().copied();
         }
-        kind = Some(crate::provider_stream::classify_provider_transaction_kind_view(&view));
         if wants_recent_blockhash {
             recent_blockhash = Some(view.recent_blockhash().to_bytes());
         }
-        if wants_transaction {
+        if needs_view_prefilter {
             let prefiltered = plugin_host
                 .classify_transaction_view_in_scope(&view, TransactionDispatchScope::All);
             if !prefiltered.needs_full_classification
@@ -1713,8 +1717,7 @@ fn dispatch_provider_stream_serialized_transaction(
         confirmed_slot: event.confirmed_slot,
         finalized_slot: event.finalized_slot,
         signature: signature.or_else(|| tx.signatures.first().copied()),
-        kind: kind
-            .unwrap_or_else(|| crate::provider_stream::classify_provider_transaction_kind(&tx)),
+        kind: crate::provider_stream::classify_provider_transaction_kind(&tx),
         tx,
     };
     if wants_recent_blockhash {
@@ -2251,6 +2254,8 @@ mod tests {
         filter: TransactionPrefilter,
     }
 
+    struct TransactionOnlyPlugin;
+
     #[async_trait]
     impl ObserverPlugin for RawPacketPlugin {
         fn config(&self) -> PluginConfig {
@@ -2268,6 +2273,13 @@ mod tests {
 
         fn transaction_prefilter(&self) -> Option<&TransactionPrefilter> {
             Some(&self.filter)
+        }
+    }
+
+    #[async_trait]
+    impl ObserverPlugin for TransactionOnlyPlugin {
+        fn config(&self) -> PluginConfig {
+            PluginConfig::new().with_transaction()
         }
     }
 
@@ -2306,6 +2318,93 @@ mod tests {
                 derived_state_host.on_cluster_topology(event.clone());
                 plugin_host.on_cluster_topology(event);
             }
+        }
+    }
+
+    fn dispatch_provider_stream_serialized_transaction_baseline(
+        plugin_host: &PluginHost,
+        derived_state_host: &DerivedStateHost,
+        event: crate::provider_stream::SerializedTransactionEvent,
+    ) {
+        let wants_transaction = plugin_host.wants_transaction();
+        let wants_recent_blockhash = plugin_host.wants_recent_blockhash();
+        let wants_derived_state_transaction = derived_state_host.wants_transaction_applied();
+        if !wants_transaction && !wants_recent_blockhash && !wants_derived_state_transaction {
+            return;
+        }
+
+        let mut signature = event.signature;
+        let mut recent_blockhash = None;
+        let mut kind = None;
+        if let Ok(view) = SanitizedTransactionView::try_new_sanitized(event.bytes.as_ref(), true) {
+            if signature.is_none() {
+                signature = view.signatures().first().copied();
+            }
+            kind = Some(crate::provider_stream::classify_provider_transaction_kind_view(&view));
+            if wants_recent_blockhash {
+                recent_blockhash = Some(view.recent_blockhash().to_bytes());
+            }
+            if wants_transaction {
+                let prefiltered = plugin_host
+                    .classify_transaction_view_in_scope(&view, TransactionDispatchScope::All);
+                if !prefiltered.needs_full_classification
+                    && prefiltered.dispatch.is_empty()
+                    && !wants_derived_state_transaction
+                {
+                    if let Some(recent_blockhash) = recent_blockhash {
+                        plugin_host.on_recent_blockhash(
+                            crate::framework::ObservedRecentBlockhashEvent {
+                                slot: event.slot,
+                                recent_blockhash,
+                                dataset_tx_count: 1,
+                            },
+                        );
+                    }
+                    return;
+                }
+            }
+            if !wants_transaction && !wants_derived_state_transaction {
+                if let Some(recent_blockhash) = recent_blockhash {
+                    plugin_host.on_recent_blockhash(
+                        crate::framework::ObservedRecentBlockhashEvent {
+                            slot: event.slot,
+                            recent_blockhash,
+                            dataset_tx_count: 1,
+                        },
+                    );
+                }
+                return;
+            }
+        }
+
+        let Ok(tx) = bincode::deserialize::<VersionedTransaction>(event.bytes.as_ref()) else {
+            return;
+        };
+        let tx = Arc::new(tx);
+        let event = TransactionEvent {
+            slot: event.slot,
+            commitment_status: event.commitment_status,
+            confirmed_slot: event.confirmed_slot,
+            finalized_slot: event.finalized_slot,
+            signature: signature.or_else(|| tx.signatures.first().copied()),
+            kind: kind
+                .unwrap_or_else(|| crate::provider_stream::classify_provider_transaction_kind(&tx)),
+            tx,
+        };
+        if wants_recent_blockhash {
+            plugin_host.on_recent_blockhash(crate::framework::ObservedRecentBlockhashEvent {
+                slot: event.slot,
+                recent_blockhash: recent_blockhash
+                    .unwrap_or_else(|| event.tx.message.recent_blockhash().to_bytes()),
+                dataset_tx_count: 1,
+            });
+        }
+        if wants_derived_state_transaction {
+            let tx_index = derived_state_host.reserve_slot_tx_indexes(event.slot, 1);
+            derived_state_host.on_transaction(tx_index, event.clone());
+        }
+        if wants_transaction {
+            plugin_host.on_transaction(event);
         }
     }
 
@@ -2774,5 +2873,47 @@ mod tests {
                 optimized_update.clone(),
             );
         }
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for provider serialized tx accepted path"]
+    fn provider_stream_serialized_transaction_accept_profile_fixture() {
+        let iterations = profile_iterations(500_000);
+        let plugin_host = PluginHost::builder()
+            .add_plugin(TransactionOnlyPlugin)
+            .build();
+        let derived_state_host = DerivedStateHost::builder().build();
+        let baseline_update = sample_serialized_provider_transaction_update();
+        let optimized_update = baseline_update.clone();
+
+        let baseline_started = Instant::now();
+        for _ in 0..iterations {
+            let ProviderStreamUpdate::SerializedTransaction(event) = baseline_update.clone() else {
+                unreachable!("serialized update fixture");
+            };
+            dispatch_provider_stream_serialized_transaction_baseline(
+                &plugin_host,
+                &derived_state_host,
+                event,
+            );
+        }
+        let baseline_elapsed = baseline_started.elapsed();
+
+        let optimized_started = Instant::now();
+        for _ in 0..iterations {
+            dispatch_provider_stream_update(
+                &plugin_host,
+                &derived_state_host,
+                optimized_update.clone(),
+            );
+        }
+        let optimized_elapsed = optimized_started.elapsed();
+
+        eprintln!(
+            "provider_stream_serialized_transaction_accept_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            iterations,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
+        );
     }
 }

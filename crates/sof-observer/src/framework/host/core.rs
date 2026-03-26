@@ -174,6 +174,12 @@ impl PluginHost {
         self.subscriptions.transaction
     }
 
+    /// Returns true when at least one transaction subscriber exposes a compiled prefilter.
+    #[must_use]
+    pub const fn has_transaction_prefilter(&self) -> bool {
+        self.subscriptions.transaction_prefilter
+    }
+
     /// Returns true when at least one plugin wants transaction-log callbacks.
     #[must_use]
     pub const fn wants_transaction_log(&self) -> bool {

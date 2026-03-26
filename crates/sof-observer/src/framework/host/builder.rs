@@ -301,6 +301,7 @@ impl PluginHostBuilder {
             shred: !shred_plugins.is_empty(),
             dataset: !dataset_plugins.is_empty(),
             transaction: !transaction_plugins.is_empty(),
+            transaction_prefilter: transaction_plugin_prefilters.iter().any(Option::is_some),
             transaction_log: !transaction_log_plugins.is_empty(),
             inline_transaction: plugin_subscriptions
                 .iter()
