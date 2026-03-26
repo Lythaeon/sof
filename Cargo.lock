@@ -5388,7 +5388,7 @@ dependencies = [
 
 [[package]]
 name = "sof"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "agave-transaction-view",
  "arcshift",
@@ -5450,11 +5450,11 @@ dependencies = [
 
 [[package]]
 name = "sof-gossip-tuning"
-version = "0.12.0"
+version = "0.13.0"
 
 [[package]]
 name = "sof-solana-gossip"
-version = "3.1.8-sof.5"
+version = "3.1.8-sof.6"
 dependencies = [
  "agave-feature-set",
  "agave-logger",
@@ -5521,7 +5521,7 @@ dependencies = [
 
 [[package]]
 name = "sof-tx"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "arcshift",
  "async-trait",

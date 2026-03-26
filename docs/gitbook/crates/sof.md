@@ -219,7 +219,7 @@ Best for:
 Build flag:
 
 ```toml
-sof = { version = "0.12.0", features = ["gossip-bootstrap"] }
+sof = { version = "0.13.0", features = ["gossip-bootstrap"] }
 ```
 
 ### External kernel-bypass ingress
@@ -232,7 +232,7 @@ Best for:
 Build flag:
 
 ```toml
-sof = { version = "0.12.0", features = ["kernel-bypass"] }
+sof = { version = "0.13.0", features = ["kernel-bypass"] }
 ```
 
 ### Processed provider streams
@@ -246,8 +246,8 @@ Best for:
 Build flags:
 
 ```toml
-sof = { version = "0.12.0", features = ["provider-grpc"] }
-sof = { version = "0.12.0", features = ["provider-websocket"] }
+sof = { version = "0.13.0", features = ["provider-grpc"] }
+sof = { version = "0.13.0", features = ["provider-websocket"] }
 ```
 
 Important boundary:

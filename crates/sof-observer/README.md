@@ -1,23 +1,27 @@
 # sof
 
-`sof` is the SOF observer/runtime crate.
+`sof` is the observer/runtime crate in the SOF stack.
 
-It is built for low-latency Solana data ingest, local runtime-derived signals, and services that
-need infrastructure-style control over replay, control-plane freshness, and bounded multicore
-packet handling.
+This crate is what you depend on when you want to:
 
-The point is not only to expose hooks. It is to give Solana developers an already-optimized and
-already-operated runtime foundation so they do not have to rebuild low-level ingest behavior for
-every new service.
+- ingest Solana data from raw shreds or processed providers
+- run plugins against a bounded, multicore runtime
+- derive local control-plane and commitment signals without rebuilding the ingest substrate
+- expose readiness, health, replay, and queue-pressure semantics through one runtime surface
 
-Core responsibilities:
+The crate is intentionally infrastructure-shaped. It is not just a hook registry. It owns the
+runtime plumbing under those hooks so application code can stay focused on Solana logic instead of
+transport, replay, reconnect, dispatch, and observability.
 
-- shred ingestion (direct UDP, relay, optional gossip bootstrap)
-- optional shred verification
+Crate responsibilities:
+
+- raw shred ingestion (direct UDP, relay, optional gossip bootstrap)
+- trusted raw-shred ingest with explicit verification posture
+- processed provider ingest (Yellowstone, LaserStream, websocket `transactionSubscribe`, generic)
 - dataset reconstruction and transaction extraction
-- plugin-driven event hooks for custom logic
-- local transaction commitment status tagging (`processed` / `confirmed` / `finalized`) without RPC dependency
-- one transaction commitment selector across raw shreds, Yellowstone, LaserStream, and websocket
+- plugin and derived-state dispatch
+- local commitment tagging (`processed` / `confirmed` / `finalized`) without RPC dependency
+- bounded runtime health, readiness, and queue observability
 
 ## Why Not Rebuild This Per Application
 
@@ -300,13 +304,13 @@ cargo add sof
 Optional gossip bootstrap support at compile time:
 
 ```toml
-sof = { version = "0.12.0", features = ["gossip-bootstrap"] }
+sof = { version = "0.13.0", features = ["gossip-bootstrap"] }
 ```
 
 Optional external `kernel-bypass` ingress support:
 
 ```toml
-sof = { version = "0.12.0", features = ["kernel-bypass"] }
+sof = { version = "0.13.0", features = ["kernel-bypass"] }
 ```
 
 The bundled `sof-solana-gossip` backend defaults to SOF's lightweight in-memory duplicate/conflict
