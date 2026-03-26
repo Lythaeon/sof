@@ -50,6 +50,9 @@ The plugin model is intentionally explicit:
 - borrowed classifiers run on the hot path and should stay cheap
 - async hooks run off the ingest hot path through bounded queues
 - queue pressure drops hook events instead of stalling ingest
+- non-transaction hooks share one bounded queue
+- accepted transactions use separate inline-critical, critical, and background lanes
+- full queues drop the incoming event; SOF does not evict older queued plugin events
 - `PluginDispatchMode::Sequential` preserves registration order for one queued event
 - `PluginDispatchMode::BoundedConcurrent(n)` gives bounded parallelism instead of strict per-event
   callback ordering
@@ -57,6 +60,16 @@ The plugin model is intentionally explicit:
 
 That means SOF is trying to protect the runtime first and make ordering/backpressure tradeoffs
 visible, not implicit.
+
+Queue telemetry is available at aggregate host/lane level:
+
+- `sof_plugin_general_queue_depth`
+- `sof_plugin_general_dropped_events_total`
+- `sof_plugin_transaction_inline_critical_queue_depth`
+- `sof_plugin_transaction_critical_queue_depth`
+- `sof_plugin_transaction_background_queue_depth`
+
+Per-plugin pressure visibility is not exposed yet.
 
 ## Explicit Trust Model
 
@@ -270,6 +283,13 @@ What is not claimed yet:
 
 Pinning and thread-count controls exist, but high-end placement still needs measurement on the
 actual host.
+
+Current playbook:
+
+- public single-socket VPS: start from `sof-gossip-tuning`'s validated `Vps` preset
+- processed provider mode: tune replay/durability and source health first, not packet/shred knobs
+- trusted raw-shred mode: keep receive, packet-worker, and dataset-worker placement local to the same socket when possible
+- multi-socket hosts: treat cross-socket fanout as opt-in after measurement, not a default
 
 ## Install
 

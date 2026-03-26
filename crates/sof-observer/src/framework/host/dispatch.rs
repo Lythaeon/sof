@@ -193,6 +193,10 @@ pub(super) struct PluginDispatcher {
     tx: EventDispatchSender,
     /// Counter of hook events dropped due to queue pressure or closure.
     dropped_events: Arc<AtomicU64>,
+    /// Current queue depth.
+    queue_depth: Arc<AtomicU64>,
+    /// Maximum queue depth observed since startup.
+    max_queue_depth: Arc<AtomicU64>,
 }
 
 impl PluginDispatcher {
@@ -207,8 +211,15 @@ impl PluginDispatcher {
         }
         let (tx, rx) = create_event_dispatch_queue(queue_capacity.max(1));
         let dropped_events = Arc::new(AtomicU64::new(0));
+        let queue_depth = Arc::clone(&tx.queue.queue_depth);
+        let max_queue_depth = Arc::clone(&tx.queue.max_queue_depth);
         spawn_dispatch_worker(targets, rx, dispatch_mode.normalized());
-        Some(Self { tx, dropped_events })
+        Some(Self {
+            tx,
+            dropped_events,
+            queue_depth,
+            max_queue_depth,
+        })
     }
 
     /// Attempts non-blocking enqueue of one hook event.
@@ -228,6 +239,16 @@ impl PluginDispatcher {
     /// Returns total number of dropped hook events.
     pub(super) fn dropped_count(&self) -> u64 {
         self.dropped_events.load(Ordering::Relaxed)
+    }
+
+    /// Returns current queue depth across the general plugin dispatcher.
+    pub(super) fn queue_depth(&self) -> u64 {
+        self.queue_depth.load(Ordering::Relaxed)
+    }
+
+    /// Returns maximum queue depth observed since startup.
+    pub(super) fn max_queue_depth(&self) -> u64 {
+        self.max_queue_depth.load(Ordering::Relaxed)
     }
 
     /// Increments dropped counters and emits sampled warning logs.
@@ -740,6 +761,22 @@ pub(super) struct TransactionPluginDispatcher {
     background_dropped_events: Arc<AtomicU64>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct TransactionDispatchQueueMetrics {
+    /// Current queue depth for the inline-critical lane.
+    pub(crate) inline_critical_queue_depth: u64,
+    /// Maximum queue depth observed for the inline-critical lane.
+    pub(crate) inline_critical_max_queue_depth: u64,
+    /// Current aggregate queue depth across critical lanes.
+    pub(crate) critical_queue_depth: u64,
+    /// Maximum aggregate queue depth observed across critical lanes.
+    pub(crate) critical_max_queue_depth: u64,
+    /// Current aggregate queue depth across background lanes.
+    pub(crate) background_queue_depth: u64,
+    /// Maximum aggregate queue depth observed across background lanes.
+    pub(crate) background_max_queue_depth: u64,
+}
+
 impl TransactionPluginDispatcher {
     /// Creates per-priority worker queues for accepted transaction callbacks.
     pub(super) fn new(
@@ -857,6 +894,43 @@ impl TransactionPluginDispatcher {
     /// Returns dropped background transaction callbacks.
     pub(super) fn background_dropped_count(&self) -> u64 {
         self.background_dropped_events.load(Ordering::Relaxed)
+    }
+
+    /// Returns queue-depth telemetry aggregated by transaction-dispatch lane.
+    pub(super) fn queue_metrics(&self) -> TransactionDispatchQueueMetrics {
+        TransactionDispatchQueueMetrics {
+            inline_critical_queue_depth: self
+                .inline_critical_txs
+                .iter()
+                .map(TxDispatchSender::queue_depth)
+                .sum(),
+            inline_critical_max_queue_depth: self
+                .inline_critical_txs
+                .iter()
+                .map(TxDispatchSender::max_queue_depth)
+                .max()
+                .unwrap_or(0),
+            critical_queue_depth: self
+                .critical_txs
+                .iter()
+                .map(TxDispatchSender::queue_depth)
+                .sum(),
+            critical_max_queue_depth: self
+                .critical_txs
+                .iter()
+                .map(TxDispatchSender::max_queue_depth)
+                .sum(),
+            background_queue_depth: self
+                .background_txs
+                .iter()
+                .map(TxDispatchSender::queue_depth)
+                .sum(),
+            background_max_queue_depth: self
+                .background_txs
+                .iter()
+                .map(TxDispatchSender::max_queue_depth)
+                .sum(),
+        }
     }
 
     /// Records one dropped transaction callback.
@@ -1123,6 +1197,8 @@ fn spawn_dispatch_worker(
 
 struct EventDispatchQueue {
     ring: ArrayQueue<PluginDispatchEvent>,
+    queue_depth: Arc<AtomicU64>,
+    max_queue_depth: Arc<AtomicU64>,
     worker_thread: OnceLock<std::thread::Thread>,
     closed: AtomicBool,
     sender_count: AtomicUsize,
@@ -1139,6 +1215,8 @@ struct EventDispatchReceiver {
 fn create_event_dispatch_queue(capacity: usize) -> (EventDispatchSender, EventDispatchReceiver) {
     let queue = Arc::new(EventDispatchQueue {
         ring: ArrayQueue::new(capacity.max(1)),
+        queue_depth: Arc::new(AtomicU64::new(0)),
+        max_queue_depth: Arc::new(AtomicU64::new(0)),
         worker_thread: OnceLock::new(),
         closed: AtomicBool::new(false),
         sender_count: AtomicUsize::new(1),
@@ -1159,6 +1237,14 @@ impl EventDispatchSender {
         if self.queue.closed.load(Ordering::Acquire) {
             return Err(StdTrySendError::Disconnected(event));
         }
+        let queue_depth = self
+            .queue
+            .queue_depth
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        self.queue
+            .max_queue_depth
+            .fetch_max(queue_depth, Ordering::Relaxed);
         match self.queue.ring.push(event) {
             Ok(()) => {
                 if let Some(thread) = self.queue.worker_thread.get() {
@@ -1167,6 +1253,7 @@ impl EventDispatchSender {
                 Ok(())
             }
             Err(event) => {
+                self.queue.queue_depth.fetch_sub(1, Ordering::Relaxed);
                 if self.queue.closed.load(Ordering::Acquire) {
                     Err(StdTrySendError::Disconnected(event))
                 } else {
@@ -1205,6 +1292,7 @@ impl EventDispatchReceiver {
     fn recv(&mut self) -> Option<PluginDispatchEvent> {
         loop {
             if let Some(event) = self.queue.ring.pop() {
+                self.queue.queue_depth.fetch_sub(1, Ordering::Relaxed);
                 return Some(event);
             }
             if self.queue.closed.load(Ordering::Acquire) {
@@ -1216,6 +1304,7 @@ impl EventDispatchReceiver {
 
     fn try_recv(&mut self) -> Result<PluginDispatchEvent, StdTrySendError<()>> {
         if let Some(event) = self.queue.ring.pop() {
+            self.queue.queue_depth.fetch_sub(1, Ordering::Relaxed);
             return Ok(event);
         }
         if self.queue.closed.load(Ordering::Acquire) {
@@ -1280,6 +1369,8 @@ fn spawn_transaction_dispatch_worker(
 
 struct TxDispatchQueue {
     ring: ArrayQueue<AcceptedTransactionDispatch>,
+    queue_depth: Arc<AtomicU64>,
+    max_queue_depth: Arc<AtomicU64>,
     worker_thread: OnceLock<std::thread::Thread>,
     closed: AtomicBool,
     sender_count: AtomicUsize,
@@ -1467,6 +1558,8 @@ impl TransactionDispatchMetricsBatch {
 fn create_tx_dispatch_queue(capacity: usize) -> (TxDispatchSender, TxDispatchReceiver) {
     let queue = Arc::new(TxDispatchQueue {
         ring: ArrayQueue::new(capacity.max(1)),
+        queue_depth: Arc::new(AtomicU64::new(0)),
+        max_queue_depth: Arc::new(AtomicU64::new(0)),
         worker_thread: OnceLock::new(),
         closed: AtomicBool::new(false),
         sender_count: AtomicUsize::new(1),
@@ -1487,6 +1580,14 @@ impl TxDispatchSender {
         if self.queue.closed.load(Ordering::Acquire) {
             return Err(StdTrySendError::Disconnected(event));
         }
+        let queue_depth = self
+            .queue
+            .queue_depth
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        self.queue
+            .max_queue_depth
+            .fetch_max(queue_depth, Ordering::Relaxed);
         match self.queue.ring.push(event) {
             Ok(()) => {
                 if let Some(thread) = self.queue.worker_thread.get() {
@@ -1495,6 +1596,7 @@ impl TxDispatchSender {
                 Ok(())
             }
             Err(event) => {
+                self.queue.queue_depth.fetch_sub(1, Ordering::Relaxed);
                 if self.queue.closed.load(Ordering::Acquire) {
                     Err(StdTrySendError::Disconnected(event))
                 } else {
@@ -1511,6 +1613,16 @@ impl Clone for TxDispatchSender {
         Self {
             queue: Arc::clone(&self.queue),
         }
+    }
+}
+
+impl TxDispatchSender {
+    fn queue_depth(&self) -> u64 {
+        self.queue.queue_depth.load(Ordering::Relaxed)
+    }
+
+    fn max_queue_depth(&self) -> u64 {
+        self.queue.max_queue_depth.load(Ordering::Relaxed)
     }
 }
 
@@ -1533,6 +1645,7 @@ impl TxDispatchReceiver {
     fn recv(&mut self) -> Option<AcceptedTransactionDispatch> {
         loop {
             if let Some(event) = self.queue.ring.pop() {
+                self.queue.queue_depth.fetch_sub(1, Ordering::Relaxed);
                 return Some(event);
             }
             if self.queue.closed.load(Ordering::Acquire) {
@@ -1544,6 +1657,7 @@ impl TxDispatchReceiver {
 
     fn try_recv(&mut self) -> Result<AcceptedTransactionDispatch, StdTrySendError<()>> {
         if let Some(event) = self.queue.ring.pop() {
+            self.queue.queue_depth.fetch_sub(1, Ordering::Relaxed);
             return Ok(event);
         }
         if self.queue.closed.load(Ordering::Acquire) {

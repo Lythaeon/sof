@@ -16,7 +16,9 @@ use tokio::{
 };
 
 use crate::{
-    framework::{DerivedStateConsumerRecoveryState, DerivedStateHost, RuntimeExtensionHost},
+    framework::{
+        DerivedStateConsumerRecoveryState, DerivedStateHost, PluginHost, RuntimeExtensionHost,
+    },
     provider_stream::{ProviderSourceHealthEvent, ProviderSourceHealthStatus},
     runtime_metrics,
 };
@@ -133,6 +135,7 @@ pub(crate) struct RuntimeObservabilityService {
 impl RuntimeObservabilityService {
     pub(crate) async fn start(
         bind_addr: SocketAddr,
+        plugin_host: PluginHost,
         extension_host: RuntimeExtensionHost,
         derived_state_host: DerivedStateHost,
     ) -> io::Result<Self> {
@@ -152,12 +155,14 @@ impl RuntimeObservabilityService {
                             break;
                         };
                         let request_handle = service_handle.clone();
+                        let request_plugin_host = plugin_host.clone();
                         let request_extension_host = extension_host.clone();
                         let request_derived_state_host = derived_state_host.clone();
                         tokio::spawn(async move {
                             if let Err(error) = handle_connection(
                                 stream,
                                 request_handle,
+                                request_plugin_host,
                                 request_extension_host,
                                 request_derived_state_host,
                             )
@@ -200,13 +205,14 @@ impl RuntimeObservabilityService {
 async fn handle_connection(
     mut stream: TcpStream,
     handle: RuntimeObservabilityHandle,
+    plugin_host: PluginHost,
     extension_host: RuntimeExtensionHost,
     derived_state_host: DerivedStateHost,
 ) -> io::Result<()> {
     let response = match read_request_path(&mut stream).await? {
         Some(METRICS_PATH) => HttpResponse::ok(
             CONTENT_TYPE_PROMETHEUS,
-            render_metrics(&handle, &extension_host, &derived_state_host),
+            render_metrics(&handle, &plugin_host, &extension_host, &derived_state_host),
         ),
         Some(HEALTH_PATH) => {
             let snapshot = handle.snapshot();
@@ -264,6 +270,7 @@ async fn read_request_path(stream: &mut TcpStream) -> io::Result<Option<&'static
 
 fn render_metrics(
     handle: &RuntimeObservabilityHandle,
+    plugin_host: &PluginHost,
     extension_host: &RuntimeExtensionHost,
     derived_state_host: &DerivedStateHost,
 ) -> String {
@@ -2100,6 +2107,140 @@ fn render_metrics(
 
     append_metric_family(
         &mut buffer,
+        "sof_plugin_general_dropped_events_total",
+        "Non-transaction plugin events dropped by the bounded plugin dispatcher.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_plugin_general_queue_depth",
+        "Current non-transaction plugin dispatch queue depth.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_plugin_general_max_queue_depth",
+        "Maximum non-transaction plugin dispatch queue depth observed since startup.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_plugin_transaction_critical_dropped_events_total",
+        "Critical accepted-transaction plugin events dropped by bounded dispatch lanes.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_plugin_transaction_background_dropped_events_total",
+        "Background accepted-transaction plugin events dropped by bounded dispatch lanes.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_plugin_transaction_inline_critical_queue_depth",
+        "Current inline-critical accepted-transaction dispatch queue depth.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_plugin_transaction_inline_critical_max_queue_depth",
+        "Maximum inline-critical accepted-transaction dispatch queue depth observed since startup.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_plugin_transaction_critical_queue_depth",
+        "Current aggregate critical accepted-transaction dispatch queue depth.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_plugin_transaction_critical_max_queue_depth",
+        "Maximum aggregate critical accepted-transaction dispatch queue depth observed since startup.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_plugin_transaction_background_queue_depth",
+        "Current aggregate background accepted-transaction dispatch queue depth.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_plugin_transaction_background_max_queue_depth",
+        "Maximum aggregate background accepted-transaction dispatch queue depth observed since startup.",
+        PrometheusMetricType::Gauge,
+    );
+    let tx_queue_metrics = plugin_host.transaction_queue_metrics();
+    append_metric_value(
+        &mut buffer,
+        "sof_plugin_general_dropped_events_total",
+        plugin_host.general_dropped_event_count(),
+        None,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_plugin_general_queue_depth",
+        plugin_host.general_queue_depth(),
+        None,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_plugin_general_max_queue_depth",
+        plugin_host.general_max_queue_depth(),
+        None,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_plugin_transaction_critical_dropped_events_total",
+        plugin_host.transaction_dropped_event_count(),
+        None,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_plugin_transaction_background_dropped_events_total",
+        plugin_host.background_transaction_dropped_event_count(),
+        None,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_plugin_transaction_inline_critical_queue_depth",
+        tx_queue_metrics.inline_critical_queue_depth,
+        None,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_plugin_transaction_inline_critical_max_queue_depth",
+        tx_queue_metrics.inline_critical_max_queue_depth,
+        None,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_plugin_transaction_critical_queue_depth",
+        tx_queue_metrics.critical_queue_depth,
+        None,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_plugin_transaction_critical_max_queue_depth",
+        tx_queue_metrics.critical_max_queue_depth,
+        None,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_plugin_transaction_background_queue_depth",
+        tx_queue_metrics.background_queue_depth,
+        None,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_plugin_transaction_background_max_queue_depth",
+        tx_queue_metrics.background_max_queue_depth,
+        None,
+    );
+
+    append_metric_family(
+        &mut buffer,
         "sof_runtime_extension_dropped_events_total",
         "Runtime extension events dropped by dispatcher.",
         PrometheusMetricType::Counter,
@@ -2569,6 +2710,7 @@ mod tests {
         handle.mark_ready();
         let metrics = render_metrics(
             &handle,
+            &PluginHost::builder().build(),
             &RuntimeExtensionHost::builder().build(),
             &DerivedStateHost::builder().build(),
         );
@@ -2577,6 +2719,8 @@ mod tests {
         assert!(metrics.contains("sof_runtime_ready 1"));
         assert!(metrics.contains("sof_ingest_packets_seen_total "));
         assert!(metrics.contains("sof_packet_worker_queue_depth "));
+        assert!(metrics.contains("sof_plugin_general_queue_depth "));
+        assert!(metrics.contains("sof_plugin_transaction_critical_queue_depth "));
         assert!(metrics.contains("sof_latest_shred_age_ms "));
         assert!(metrics.contains("sof_udp_relay_forwarded_packets_total "));
         assert!(metrics.contains("sof_repair_requests_total "));
@@ -2595,6 +2739,7 @@ mod tests {
         });
         let metrics = render_metrics(
             &handle,
+            &PluginHost::builder().build(),
             &RuntimeExtensionHost::builder().build(),
             &DerivedStateHost::builder().build(),
         );
@@ -2617,6 +2762,7 @@ mod tests {
         );
         let metrics = render_metrics(
             &handle,
+            &PluginHost::builder().build(),
             &RuntimeExtensionHost::builder().build(),
             &DerivedStateHost::builder().build(),
         );
@@ -2634,6 +2780,7 @@ mod tests {
     async fn service_serves_health_and_metrics_endpoints() {
         let service = RuntimeObservabilityService::start(
             "127.0.0.1:0".parse().expect("valid bind addr"),
+            PluginHost::builder().build(),
             RuntimeExtensionHost::builder().build(),
             DerivedStateHost::builder().build(),
         )

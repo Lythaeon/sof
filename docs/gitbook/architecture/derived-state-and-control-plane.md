@@ -71,3 +71,27 @@ Derived-state consumers now follow the same broad discipline as plugins:
 
 That split matters because startup hooks are operational, while checkpoint methods define replay
 continuity.
+
+## Lifecycle and Rebuild Semantics
+
+The intended derived-state lifecycle is:
+
+1. consumer `setup`
+2. checkpoint load
+3. retained replay tail and/or configured replay source application
+4. live event application
+5. checkpoint flush on the configured durability boundary
+6. consumer `shutdown`
+
+Persistence guarantees depend on what you configured:
+
+- without a checkpoint store, the consumer is live-only
+- with a checkpoint store, recovery starts from the last durable checkpoint
+- with a retained replay tail, SOF can bridge recent history on top of that checkpoint
+
+Rebuild semantics are explicit too:
+
+- if replay continuity is intact, SOF re-applies retained history and returns to live mode
+- if replay continuity is broken, the consumer is marked unhealthy instead of silently pretending recovery succeeded
+
+That is why derived state is the authoritative state surface and plugins are not.

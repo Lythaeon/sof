@@ -63,6 +63,13 @@ Pinning and placement should be read narrowly:
 - SOF does not yet claim full NUMA-aware scheduling
 - multi-socket and high-core-count hosts still need measured placement decisions
 
+Current playbook:
+
+- public single-socket VPS: start from `sof-gossip-tuning`'s validated `Vps` preset
+- processed provider mode: tune replay, durability, and source health before touching packet/shred worker knobs
+- trusted raw-shred mode: keep receive, packet-worker, and dataset-worker placement on the same socket when possible
+- multi-socket hosts: prefer one socket first unless measurement proves cross-socket fanout helps more than it hurts
+
 Measured public-VPS note from the current 4-core sweep:
 
 - default `SOF_TVU_SOCKETS=4` beat both `2` and `8` on tx-availability latency
@@ -133,6 +140,13 @@ Useful runtime-owned endpoint metrics while tuning:
 - `sof_ingest_dropped_packets_total`
 - `sof_dataset_queue_depth`
 - `sof_packet_worker_queue_depth`
+- `sof_plugin_general_queue_depth`
+- `sof_plugin_general_dropped_events_total`
+- `sof_plugin_transaction_inline_critical_queue_depth`
+- `sof_plugin_transaction_critical_queue_depth`
+- `sof_plugin_transaction_background_queue_depth`
+- `sof_plugin_transaction_critical_dropped_events_total`
+- `sof_plugin_transaction_background_dropped_events_total`
 - `sof_shred_dedupe_capacity_evictions_total`
 - `sof_udp_relay_forwarded_packets_total`
 - `sof_udp_relay_source_filtered_packets_total`

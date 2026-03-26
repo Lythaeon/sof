@@ -110,6 +110,9 @@ These rules should be treated as part of the plugin contract:
 - borrowed classifiers run on the hot path before SOF decides whether to allocate/queue a callback
 - normal async hook delivery is off the ingest hot path through bounded queues
 - queue pressure drops plugin events instead of blocking ingest
+- non-transaction hooks share one bounded queue
+- accepted transactions use separate bounded inline-critical, critical, and background lanes
+- full queues drop the arriving event; SOF does not evict older queued plugin events
 - `PluginDispatchMode::Sequential` preserves registration order for one queued event
 - `PluginDispatchMode::BoundedConcurrent(n)` keeps parallelism bounded but does not promise the
   same strict per-event callback ordering
@@ -122,6 +125,23 @@ derived-state surface rather than the observational plugin surface.
 SOF uses borrowed references on the hot path when it can, then hands async hooks runtime-managed
 event values by shared reference. Plugin code should treat those callback arguments as callback
 scope data, not as objects whose lifetime it owns outside the hook turn.
+
+## Cost Model Guidance
+
+SOF does not currently enforce a universal nanosecond or microsecond budget per
+plugin hook, because the right number depends on host class and ingress mode.
+
+But the intended shape is explicit:
+
+- borrowed classifier hooks should usually be allocation-free
+- borrowed classifiers should stay branch-light and data-local
+- expensive work should move out of the hot-path classifier and into async
+  callback code or downstream worker state
+- if callback work is large enough to make queue depth or dropped-event metrics
+  climb, the plugin is too expensive for the current host/runtime posture
+
+Treat borrowed classifiers as "cheap enough to run for every candidate tx under
+load", not as a place for arbitrary business logic.
 
 ## What Stays Dynamic
 

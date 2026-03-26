@@ -1641,6 +1641,7 @@ async fn run_provider_stream_runtime(
     let observability = if let Some(bind_addr) = read_observability_bind_addr() {
         let service = RuntimeObservabilityService::start(
             bind_addr,
+            plugin_host.clone(),
             extension_host.clone(),
             derived_state_host.clone(),
         )

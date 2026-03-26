@@ -4,7 +4,7 @@ use super::dispatch::{
     ClassifiedAccountTouchDispatch, ClassifiedTransactionBatchDispatch,
     ClassifiedTransactionDispatch, ClassifiedTransactionViewBatchDispatch, PluginDispatchEvent,
     PluginDispatcher, SelectedAccountTouchDispatch, SelectedTransactionLogDispatch,
-    TransactionDispatchPriority, TransactionPluginDispatcher,
+    TransactionDispatchPriority, TransactionDispatchQueueMetrics, TransactionPluginDispatcher,
 };
 use super::state::{ObservedRecentBlockhashState, ObservedTpuLeaderState};
 
@@ -318,6 +318,22 @@ impl PluginHost {
         self.subscriptions.reorg
     }
 
+    /// Returns current queue depth for non-transaction plugin dispatch.
+    #[must_use]
+    pub fn general_queue_depth(&self) -> u64 {
+        self.dispatcher
+            .as_ref()
+            .map_or(0, PluginDispatcher::queue_depth)
+    }
+
+    /// Returns maximum queue depth observed for non-transaction plugin dispatch.
+    #[must_use]
+    pub fn general_max_queue_depth(&self) -> u64 {
+        self.dispatcher
+            .as_ref()
+            .map_or(0, PluginDispatcher::max_queue_depth)
+    }
+
     /// Returns total dropped hook events due to queue backpressure/closure.
     #[must_use]
     pub fn dropped_event_count(&self) -> u64 {
@@ -348,6 +364,16 @@ impl PluginHost {
         self.transaction_dispatcher
             .as_ref()
             .map_or(0, TransactionPluginDispatcher::background_dropped_count)
+    }
+
+    /// Returns aggregated transaction-dispatch queue metrics by lane.
+    #[must_use]
+    pub(crate) fn transaction_queue_metrics(&self) -> TransactionDispatchQueueMetrics {
+        self.transaction_dispatcher
+            .as_ref()
+            .map_or_else(TransactionDispatchQueueMetrics::default, |dispatcher| {
+                dispatcher.queue_metrics()
+            })
     }
 
     /// Returns plugin identifiers in registration order.

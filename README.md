@@ -36,6 +36,9 @@ SOF's plugin surface is intentionally bounded. The important rules are:
   `transaction_interest_ref` run on the hot path and should stay cheap
 - normal async plugin hooks run off the ingest hot path through bounded dispatch queues
 - queue pressure drops plugin events instead of stalling packet ingest
+- non-transaction hooks share one bounded general queue
+- accepted transactions use separate bounded lanes for inline-critical, critical, and background work
+- full queues drop the incoming event; SOF does not evict older queued plugin events to make room
 - `PluginDispatchMode::Sequential` preserves registration order for one queued event
 - `PluginDispatchMode::BoundedConcurrent(n)` trades that strict per-event callback ordering for
   bounded parallelism
@@ -44,6 +47,14 @@ SOF's plugin surface is intentionally bounded. The important rules are:
 
 That is deliberate. SOF protects ingest first, then gives you explicit ways to choose where you
 want latency, ordering, and replay guarantees.
+
+Queue visibility exists too, but today it is aggregate:
+
+- general plugin queue depth and drop counters
+- transaction lane queue depth and drop counters
+- dataset and packet-worker queue depth and drop counters
+
+Per-plugin queue pressure is not a first-class metric surface yet.
 
 ## Why Build On SOF
 
@@ -245,6 +256,13 @@ What SOF does not claim yet:
 - universal “best” worker geometry across all CPUs and providers
 
 For latency-sensitive deployments, thread placement and host topology still need measurement.
+
+Current operator playbook:
+
+- single-socket VPS or public host: start with the validated `sof-gossip-tuning` VPS profile
+- processed provider mode: leave packet/shred/FEC knobs alone first and validate provider durability and health before tuning workers
+- trusted raw-shred mode: keep NIC-facing ingest, packet workers, and dataset workers on the same socket when possible
+- multi-socket hosts: prefer one socket first unless measurement proves the extra cross-socket fanout is worth it
 
 ## The Workspace
 

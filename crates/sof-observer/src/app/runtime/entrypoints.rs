@@ -273,6 +273,7 @@ async fn run_async_with_hosts_and_optional_shutdown(
     let observability = if let Some(bind_addr) = read_observability_bind_addr() {
         let service = RuntimeObservabilityService::start(
             bind_addr,
+            plugin_host.clone(),
             extension_host.clone(),
             derived_state_host.clone(),
         )
@@ -378,6 +379,7 @@ pub(crate) async fn run_async_with_hosts_and_kernel_bypass_ingress(
     let observability = if let Some(bind_addr) = read_observability_bind_addr() {
         let service = RuntimeObservabilityService::start(
             bind_addr,
+            plugin_host.clone(),
             extension_host.clone(),
             derived_state_host.clone(),
         )
