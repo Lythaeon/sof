@@ -24,7 +24,8 @@ use crate::{
     event::TxCommitmentStatus,
     framework::TransactionEvent,
     provider_stream::{
-        ProviderCommitmentWatermarks, ProviderStreamSender, ProviderStreamUpdate,
+        ProviderCommitmentWatermarks, ProviderSourceHealthEvent, ProviderSourceHealthReason,
+        ProviderSourceHealthStatus, ProviderSourceId, ProviderStreamSender, ProviderStreamUpdate,
         SerializedTransactionEvent, classify_provider_transaction_kind,
     },
 };
@@ -356,16 +357,32 @@ pub async fn spawn_websocket_transaction_source(
             .await
             {
                 Ok(()) => {
-                    let error = WebsocketTransactionError::Protocol(
-                        "websocket transaction stream ended unexpectedly".to_owned(),
+                    let detail = "websocket transaction stream ended unexpectedly".to_owned();
+                    tracing::warn!(
+                        detail,
+                        endpoint = config.endpoint(),
+                        "provider stream websocket session ended; reconnecting"
                     );
-                    tracing::warn!(%error, endpoint = config.endpoint(), "provider stream websocket session ended; reconnecting");
+                    send_provider_health(
+                        &sender,
+                        ProviderSourceHealthStatus::Reconnecting,
+                        ProviderSourceHealthReason::UpstreamStreamClosedUnexpectedly,
+                        detail,
+                    )
+                    .await?;
                 }
                 Err(WebsocketTransactionError::QueueClosed) => {
                     return Err(WebsocketTransactionError::QueueClosed);
                 }
                 Err(error) => {
                     tracing::warn!(%error, endpoint = config.endpoint(), "provider stream websocket session ended; reconnecting");
+                    send_provider_health(
+                        &sender,
+                        ProviderSourceHealthStatus::Reconnecting,
+                        websocket_health_reason(&error),
+                        error.to_string(),
+                    )
+                    .await?;
                 }
             }
             if session_established {
@@ -376,9 +393,16 @@ pub async fn spawn_websocket_transaction_source(
             if let Some(max_attempts) = config.max_reconnect_attempts
                 && attempts >= max_attempts
             {
-                return Err(WebsocketTransactionError::Protocol(format!(
-                    "exhausted websocket reconnect attempts after {attempts} failures"
-                )));
+                let detail =
+                    format!("exhausted websocket reconnect attempts after {attempts} failures");
+                send_provider_health(
+                    &sender,
+                    ProviderSourceHealthStatus::Unhealthy,
+                    ProviderSourceHealthReason::ReconnectBudgetExhausted,
+                    detail.clone(),
+                )
+                .await?;
+                return Err(WebsocketTransactionError::Protocol(detail));
             }
             tokio::time::sleep(config.reconnect_delay).await;
         }
@@ -404,6 +428,13 @@ async fn run_websocket_transaction_connection(
 
     wait_for_subscription_ack(&mut read).await?;
     *session_established = true;
+    send_provider_health(
+        sender,
+        ProviderSourceHealthStatus::Healthy,
+        ProviderSourceHealthReason::SubscriptionAckReceived,
+        "subscription acknowledged".to_owned(),
+    )
+    .await?;
     if config.replay_on_reconnect && last_seen_slot.is_some() {
         replay_websocket_gap(config, sender, last_seen_slot, watermarks).await?;
     }
@@ -486,6 +517,37 @@ async fn run_websocket_transaction_connection(
                     _ => {}
                 }
             }
+        }
+    }
+}
+
+async fn send_provider_health(
+    sender: &ProviderStreamSender,
+    status: ProviderSourceHealthStatus,
+    reason: ProviderSourceHealthReason,
+    message: String,
+) -> Result<(), WebsocketTransactionError> {
+    sender
+        .send(ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
+            source: ProviderSourceId::WebsocketTransaction,
+            status,
+            reason,
+            message,
+        }))
+        .await
+        .map_err(|_error| WebsocketTransactionError::QueueClosed)
+}
+
+const fn websocket_health_reason(error: &WebsocketTransactionError) -> ProviderSourceHealthReason {
+    match error {
+        WebsocketTransactionError::Transport(_) => {
+            ProviderSourceHealthReason::UpstreamTransportFailure
+        }
+        WebsocketTransactionError::Protocol(_) | WebsocketTransactionError::Convert(_) => {
+            ProviderSourceHealthReason::UpstreamProtocolFailure
+        }
+        WebsocketTransactionError::QueueClosed => {
+            ProviderSourceHealthReason::UpstreamProtocolFailure
         }
     }
 }
@@ -1239,18 +1301,29 @@ mod tests {
             .await
             .expect("spawn websocket source");
 
-        let update = timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("provider update timeout")
-            .expect("provider update");
-        match update {
-            ProviderStreamUpdate::SerializedTransaction(event) => {
-                assert_eq!(event.slot, 55);
-                assert!(event.signature.is_some());
-                assert!(!event.bytes.is_empty());
+        let mut saw_health = false;
+        let event = loop {
+            let update = timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("provider update timeout")
+                .expect("provider update");
+            match update {
+                ProviderStreamUpdate::Health(event) => {
+                    saw_health = true;
+                    assert_eq!(
+                        event.source,
+                        crate::provider_stream::ProviderSourceId::WebsocketTransaction
+                    );
+                    continue;
+                }
+                ProviderStreamUpdate::SerializedTransaction(event) => break event,
+                other => panic!("expected transaction update, got {other:?}"),
             }
-            other => panic!("expected transaction update, got {other:?}"),
-        }
+        };
+        assert!(saw_health);
+        assert_eq!(event.slot, 55);
+        assert!(event.signature.is_some());
+        assert!(!event.bytes.is_empty());
 
         handle.abort();
         let _ = handle.await;

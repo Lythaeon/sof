@@ -1,7 +1,7 @@
 #![allow(clippy::missing_docs_in_private_items)]
 
 use std::{
-    collections::{HashSet, VecDeque, hash_map::DefaultHasher},
+    collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher},
     future::Future,
     hash::{Hash, Hasher},
     net::SocketAddr,
@@ -15,7 +15,10 @@ use crate::framework::{
     DerivedStateHost, DerivedStateReplayBackend, DerivedStateReplayDurability, PluginHost,
     RuntimeExtensionHost, TransactionEvent,
 };
-use crate::provider_stream::{ProviderStreamMode, ProviderStreamReceiver, ProviderStreamUpdate};
+use crate::provider_stream::{
+    ProviderSourceHealthEvent, ProviderSourceHealthStatus, ProviderSourceId, ProviderStreamMode,
+    ProviderStreamReceiver, ProviderStreamUpdate,
+};
 use agave_transaction_view::transaction_view::SanitizedTransactionView;
 use sof_gossip_tuning::{
     CpuCoreIndex, GossipChannelTuning, GossipTuningProfile, GossipTuningService, IngestQueueMode,
@@ -1569,8 +1572,10 @@ async fn run_provider_stream_runtime(
 
     let mut shutdown_signal = shutdown_signal;
     let mut replay_dedupe = ProviderReplayDedupe::new(PROVIDER_REPLAY_DEDUPE_CAPACITY);
+    let mut provider_health = ProviderStreamHealth::default();
     loop {
         tokio::select! {
+            biased;
             () = async {
                 if let Some(signal) = shutdown_signal.as_mut() {
                     signal.await;
@@ -1582,8 +1587,16 @@ async fn run_provider_stream_runtime(
             }
             update = provider_stream_rx.recv() => {
                 let Some(update) = update else {
-                    break;
+                    let reason = provider_health.closed_reason(mode);
+                    plugin_host.shutdown().await;
+                    extension_host.shutdown().await;
+                    tracing::error!(mode = mode.as_str(), reason, "SOF provider-stream runtime stopped after provider ingress closed unexpectedly");
+                    return Err(RuntimeError::Runloop(reason));
                 };
+                if let ProviderStreamUpdate::Health(event) = &update {
+                    provider_health.observe(event);
+                    continue;
+                }
                 if replay_dedupe.observe(&update) {
                     continue;
                 }
@@ -1596,6 +1609,89 @@ async fn run_provider_stream_runtime(
     extension_host.shutdown().await;
     tracing::info!(mode = mode.as_str(), "SOF provider-stream runtime stopped");
     Ok(())
+}
+
+#[derive(Default)]
+struct ProviderStreamHealth {
+    sources: HashMap<ProviderSourceId, ProviderSourceHealthEvent>,
+}
+
+impl ProviderStreamHealth {
+    fn observe(&mut self, event: &ProviderSourceHealthEvent) {
+        let previous = self.sources.insert(event.source, event.clone());
+        if previous.as_ref() == Some(event) {
+            return;
+        }
+        match event.status {
+            ProviderSourceHealthStatus::Healthy => {
+                tracing::info!(
+                    source = event.source.as_str(),
+                    reason = event.reason.as_str(),
+                    message = event.message.as_str(),
+                    "provider source is healthy"
+                );
+            }
+            ProviderSourceHealthStatus::Reconnecting => {
+                tracing::warn!(
+                    source = event.source.as_str(),
+                    reason = event.reason.as_str(),
+                    message = event.message.as_str(),
+                    "provider source is reconnecting"
+                );
+            }
+            ProviderSourceHealthStatus::Unhealthy => {
+                tracing::error!(
+                    source = event.source.as_str(),
+                    reason = event.reason.as_str(),
+                    message = event.message.as_str(),
+                    "provider source is unhealthy"
+                );
+            }
+        }
+    }
+
+    fn closed_reason(&self, mode: ProviderStreamMode) -> String {
+        let mut degraded = self
+            .sources
+            .values()
+            .filter(|event| {
+                matches!(
+                    event.status,
+                    ProviderSourceHealthStatus::Reconnecting
+                        | ProviderSourceHealthStatus::Unhealthy
+                )
+            })
+            .collect::<Vec<_>>();
+        degraded.sort_by_key(|event| event.source.as_str());
+        if degraded.is_empty() {
+            return format!(
+                "provider-stream ingress channel closed unexpectedly for mode {}",
+                mode.as_str()
+            );
+        }
+        let details = degraded
+            .into_iter()
+            .map(|event| {
+                format!(
+                    "{}={}:{}:{}",
+                    event.source.as_str(),
+                    match event.status {
+                        ProviderSourceHealthStatus::Healthy => "healthy",
+                        ProviderSourceHealthStatus::Reconnecting => "reconnecting",
+                        ProviderSourceHealthStatus::Unhealthy => "unhealthy",
+                    },
+                    event.reason.as_str(),
+                    event.message
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "provider-stream ingress channel closed unexpectedly for mode {} after source degradation: {}",
+            mode.as_str(),
+            details
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1722,6 +1818,7 @@ fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderR
             kind: 5,
             fingerprint: provider_replay_fingerprint(event),
         }),
+        ProviderStreamUpdate::Health(_) => None,
         _ => None,
     }
 }
@@ -1815,6 +1912,7 @@ fn dispatch_provider_stream_update(
                 plugin_host.on_reorg(event);
             }
         }
+        ProviderStreamUpdate::Health(_) => {}
     }
 }
 
@@ -1932,6 +2030,9 @@ fn provider_stream_unsupported_hooks(
         unsupported.push("on_transaction_batch");
     }
     if mode != ProviderStreamMode::Generic {
+        if plugin_host.wants_recent_blockhash() {
+            unsupported.push("on_recent_blockhash");
+        }
         if plugin_host.wants_transaction_log() {
             unsupported.push("on_transaction_log");
         }
@@ -2691,6 +2792,7 @@ mod tests {
                 derived_state_host.on_reorg(event.clone());
                 plugin_host.on_reorg(event);
             }
+            ProviderStreamUpdate::Health(_) => {}
         }
     }
 
@@ -3183,7 +3285,6 @@ mod tests {
         )]);
         let plugin_host = PluginHost::builder()
             .add_plugin(TransactionOnlyPlugin)
-            .add_plugin(RecentBlockhashPlugin)
             .build();
         let derived_state_host = DerivedStateHost::builder().build();
         let result = enforce_provider_stream_capability_policy(
@@ -3193,6 +3294,31 @@ mod tests {
         );
         crate::runtime_env::clear_runtime_env_overrides();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn built_in_provider_modes_reject_recent_blockhash_even_under_warn() {
+        crate::runtime_env::set_runtime_env_overrides([(
+            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+            String::from("warn"),
+        )]);
+        let plugin_host = PluginHost::builder()
+            .add_plugin(RecentBlockhashPlugin)
+            .build();
+        let derived_state_host = DerivedStateHost::builder().build();
+        let result = enforce_provider_stream_capability_policy(
+            ProviderStreamMode::YellowstoneGrpc,
+            &plugin_host,
+            &derived_state_host,
+        );
+        crate::runtime_env::clear_runtime_env_overrides();
+        match result {
+            Err(RuntimeError::Runloop(message)) => {
+                assert!(message.contains("built-in provider-stream mode"));
+                assert!(message.contains("on_recent_blockhash"));
+            }
+            other => panic!("expected built-in recent-blockhash capability failure, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3470,6 +3596,74 @@ mod tests {
         assert!(matches!(result, Err(RuntimeError::Runloop(_))));
         assert_eq!(plugin_counter.load(Ordering::Relaxed), 0);
         assert_eq!(extension_counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn provider_stream_runtime_errors_when_ingress_channel_closes_unexpectedly() {
+        let plugin_host = PluginHost::builder()
+            .add_plugin(TransactionOnlyPlugin)
+            .build();
+        let extension_host = RuntimeExtensionHost::builder().build();
+        let (_tx, rx) = crate::provider_stream::create_provider_stream_queue(1);
+
+        let result = run_provider_stream_runtime(
+            plugin_host,
+            extension_host,
+            DerivedStateHost::builder().build(),
+            None,
+            ProviderStreamMode::YellowstoneGrpc,
+            rx,
+        )
+        .await;
+
+        match result {
+            Err(RuntimeError::Runloop(message)) => {
+                assert!(message.contains("provider-stream ingress channel closed unexpectedly"));
+                assert!(message.contains("yellowstone_grpc"));
+            }
+            other => panic!("expected provider ingress closure failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_stream_runtime_surfaces_degraded_source_on_channel_close() {
+        let plugin_host = PluginHost::builder()
+            .add_plugin(TransactionOnlyPlugin)
+            .build();
+        let extension_host = RuntimeExtensionHost::builder().build();
+        let (tx, rx) = crate::provider_stream::create_provider_stream_queue(4);
+        tx.send(
+            crate::provider_stream::ProviderSourceHealthEvent {
+                source: crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
+                status: crate::provider_stream::ProviderSourceHealthStatus::Reconnecting,
+                reason: crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
+                message: "upstream stalled".to_owned(),
+            }
+            .into(),
+        )
+        .await
+        .expect("health sent");
+        drop(tx);
+
+        let result = run_provider_stream_runtime(
+            plugin_host,
+            extension_host,
+            DerivedStateHost::builder().build(),
+            None,
+            ProviderStreamMode::YellowstoneGrpc,
+            rx,
+        )
+        .await;
+
+        match result {
+            Err(RuntimeError::Runloop(message)) => {
+                assert!(message.contains("provider-stream ingress channel closed unexpectedly"));
+                assert!(message.contains(
+                    "yellowstone_grpc=reconnecting:upstream_protocol_failure:upstream stalled"
+                ));
+            }
+            other => panic!("expected degraded provider closure failure, got {other:?}"),
+        }
     }
 
     #[test]

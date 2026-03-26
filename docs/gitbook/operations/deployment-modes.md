@@ -58,10 +58,16 @@ SOF exposes this category through `ProviderStreamMode`. In that mode:
       RPC backfill path can expose
 - built-in processed provider modes are fixed-surface and fail fast when you
   request hooks they do not emit
+- built-in processed provider adapters are transaction-first only
+  - they do not expose standalone `on_recent_blockhash`, `on_slot_status`,
+    `on_cluster_topology`, `on_leader_schedule`, or `on_reorg`
 - `ProviderStreamMode::Generic` is the flexible mode for custom producers; there
   `SOF_PROVIDER_STREAM_CAPABILITY_POLICY` controls whether unsupported requests
   warn or fail
 - the same capability checks apply to derived-state consumers, not just plugins
+- built-in provider adapters now emit explicit source health transitions into
+  SOF, and unexpected provider ingress closure is treated as a runtime failure
+  instead of a clean stop
 
 That means deployment mode is not only about network topology. It is also about how much of the
 low-level substrate SOF is owning for the application:

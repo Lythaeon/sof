@@ -40,8 +40,9 @@ use crate::{
     event::{TxCommitmentStatus, TxKind},
     framework::TransactionEvent,
     provider_stream::{
-        ProviderCommitmentWatermarks, ProviderReplayMode, ProviderStreamSender,
-        ProviderStreamUpdate, classify_provider_transaction_kind,
+        ProviderCommitmentWatermarks, ProviderReplayMode, ProviderSourceHealthEvent,
+        ProviderSourceHealthReason, ProviderSourceHealthStatus, ProviderSourceId,
+        ProviderStreamSender, ProviderStreamUpdate, classify_provider_transaction_kind,
     },
 };
 
@@ -409,10 +410,19 @@ pub async fn spawn_laserstream_transaction_source(
             .await
             {
                 Ok(()) => {
+                    let detail = "laserstream stream ended unexpectedly".to_owned();
                     tracing::warn!(
                         endpoint = config.endpoint(),
+                        detail,
                         "provider stream laserstream session ended unexpectedly; reconnecting"
                     );
+                    send_provider_health(
+                        &sender,
+                        ProviderSourceHealthStatus::Reconnecting,
+                        ProviderSourceHealthReason::UpstreamStreamClosedUnexpectedly,
+                        detail,
+                    )
+                    .await?;
                 }
                 Err(LaserStreamError::QueueClosed) => {
                     return Err(LaserStreamError::QueueClosed);
@@ -423,6 +433,13 @@ pub async fn spawn_laserstream_transaction_source(
                         endpoint = config.endpoint(),
                         "provider stream laserstream session ended; reconnecting"
                     );
+                    send_provider_health(
+                        &sender,
+                        ProviderSourceHealthStatus::Reconnecting,
+                        laserstream_health_reason(&error),
+                        error.to_string(),
+                    )
+                    .await?;
                 }
             }
             if session_established {
@@ -433,9 +450,16 @@ pub async fn spawn_laserstream_transaction_source(
             if let Some(max_attempts) = config.max_reconnect_attempts
                 && attempts >= max_attempts
             {
-                return Err(LaserStreamError::Protocol(format!(
-                    "exhausted laserstream reconnect attempts after {attempts} failures"
-                )));
+                let detail =
+                    format!("exhausted laserstream reconnect attempts after {attempts} failures");
+                send_provider_health(
+                    &sender,
+                    ProviderSourceHealthStatus::Unhealthy,
+                    ProviderSourceHealthReason::ReconnectBudgetExhausted,
+                    detail.clone(),
+                )
+                .await?;
+                return Err(LaserStreamError::Protocol(detail));
             }
             tokio::time::sleep(config.reconnect_delay).await;
         }
@@ -455,6 +479,13 @@ async fn run_laserstream_transaction_connection(
     let (stream, _handle) = subscribe(config.client_config(), request);
     tokio::pin!(stream);
     *session_established = true;
+    send_provider_health(
+        sender,
+        ProviderSourceHealthStatus::Healthy,
+        ProviderSourceHealthReason::SubscriptionAckReceived,
+        "subscription acknowledged".to_owned(),
+    )
+    .await?;
     let mut last_progress = Instant::now();
     loop {
         tokio::select! {
@@ -512,6 +543,33 @@ async fn run_laserstream_transaction_connection(
                 }
             }
         }
+    }
+}
+
+async fn send_provider_health(
+    sender: &ProviderStreamSender,
+    status: ProviderSourceHealthStatus,
+    reason: ProviderSourceHealthReason,
+    message: String,
+) -> Result<(), LaserStreamError> {
+    sender
+        .send(ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
+            source: ProviderSourceId::LaserStream,
+            status,
+            reason,
+            message,
+        }))
+        .await
+        .map_err(|_error| LaserStreamError::QueueClosed)
+}
+
+const fn laserstream_health_reason(error: &LaserStreamError) -> ProviderSourceHealthReason {
+    match error {
+        LaserStreamError::Client(_) => ProviderSourceHealthReason::UpstreamTransportFailure,
+        LaserStreamError::Convert(_) | LaserStreamError::Protocol(_) => {
+            ProviderSourceHealthReason::UpstreamProtocolFailure
+        }
+        LaserStreamError::QueueClosed => ProviderSourceHealthReason::UpstreamProtocolFailure,
     }
 }
 

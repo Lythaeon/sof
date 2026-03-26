@@ -136,7 +136,7 @@ SOF's runtime-owned observability endpoint exposes low-cardinality operational m
 
 | Knob | Default | Scope | Meaning |
 | --- | --- | --- | --- |
-| `SOF_PROVIDER_STREAM_CAPABILITY_POLICY` | `warn` | all builds | Startup policy when provider runtime cannot satisfy requested hooks. `strict` rejects only hooks that are impossible in provider-stream mode such as raw-packet or shred hooks; it still allows generic provider updates like recent blockhash, slot status, and cluster topology when the producer supplies them. |
+| `SOF_PROVIDER_STREAM_CAPABILITY_POLICY` | `warn` | all builds | Startup policy when `ProviderStreamMode::Generic` cannot satisfy requested hooks. Built-in processed providers already fail fast on unsupported surfaces and remain transaction-first; `strict` vs `warn` only affects the flexible generic producer path. |
 
 ## Gossip Selection
 

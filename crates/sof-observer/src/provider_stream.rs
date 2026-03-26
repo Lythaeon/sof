@@ -163,6 +163,8 @@ pub enum ProviderStreamUpdate {
     LeaderSchedule(LeaderScheduleEvent),
     /// One provider reorg/fork update.
     Reorg(ReorgEvent),
+    /// One provider source health transition observed by a built-in or generic source.
+    Health(ProviderSourceHealthEvent),
 }
 
 impl From<TransactionEvent> for ProviderStreamUpdate {
@@ -216,6 +218,96 @@ impl From<LeaderScheduleEvent> for ProviderStreamUpdate {
 impl From<ReorgEvent> for ProviderStreamUpdate {
     fn from(event: ReorgEvent) -> Self {
         Self::Reorg(event)
+    }
+}
+
+impl From<ProviderSourceHealthEvent> for ProviderStreamUpdate {
+    fn from(event: ProviderSourceHealthEvent) -> Self {
+        Self::Health(event)
+    }
+}
+
+/// One provider source health transition observed by SOF.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ProviderSourceHealthEvent {
+    /// Stable source identifier, for example `WebsocketTransaction`.
+    pub source: ProviderSourceId,
+    /// Current health state for this source.
+    pub status: ProviderSourceHealthStatus,
+    /// Typed reason for the transition.
+    pub reason: ProviderSourceHealthReason,
+    /// Human-readable message attached to the transition.
+    pub message: String,
+}
+
+/// Stable provider source identifier used in runtime health reporting.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub enum ProviderSourceId {
+    /// Generic custom provider source label supplied by the embedding app.
+    Generic(&'static str),
+    /// Built-in Yellowstone gRPC source.
+    YellowstoneGrpc,
+    /// Built-in LaserStream source.
+    LaserStream,
+    #[cfg(feature = "provider-websocket")]
+    /// Built-in websocket `transactionSubscribe` source.
+    WebsocketTransaction,
+}
+
+impl ProviderSourceId {
+    /// Returns the stable string label used in logs and error messages.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Generic(label) => label,
+            Self::YellowstoneGrpc => "yellowstone_grpc",
+            Self::LaserStream => "laserstream",
+            #[cfg(feature = "provider-websocket")]
+            Self::WebsocketTransaction => "websocket_transaction",
+        }
+    }
+}
+
+/// Health state for one provider source feeding SOF.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ProviderSourceHealthStatus {
+    /// Source is healthy and delivering updates.
+    Healthy,
+    /// Source is reconnecting or recovering after a disruption.
+    Reconnecting,
+    /// Source exhausted recovery and is no longer healthy.
+    Unhealthy,
+}
+
+/// Typed reason for one provider source health transition.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub enum ProviderSourceHealthReason {
+    /// Subscription/setup completed and the provider acknowledged the stream.
+    SubscriptionAckReceived,
+    /// The provider stream ended without an explicit terminal error.
+    UpstreamStreamClosedUnexpectedly,
+    /// Transport-layer failure such as websocket or tonic I/O.
+    UpstreamTransportFailure,
+    /// Protocol or payload-shape failure.
+    UpstreamProtocolFailure,
+    /// Replay/backfill recovery failed.
+    ReplayBackfillFailure,
+    /// Reconnect budget was exhausted.
+    ReconnectBudgetExhausted,
+}
+
+impl ProviderSourceHealthReason {
+    /// Returns the stable string label used in logs and runtime errors.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SubscriptionAckReceived => "subscription_ack_received",
+            Self::UpstreamStreamClosedUnexpectedly => "upstream_stream_closed_unexpectedly",
+            Self::UpstreamTransportFailure => "upstream_transport_failure",
+            Self::UpstreamProtocolFailure => "upstream_protocol_failure",
+            Self::ReplayBackfillFailure => "replay_backfill_failure",
+            Self::ReconnectBudgetExhausted => "reconnect_budget_exhausted",
+        }
     }
 }
 

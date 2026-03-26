@@ -78,6 +78,9 @@ Built-in hook surface by provider mode:
 - Yellowstone gRPC: `on_transaction`
 - LaserStream gRPC: `on_transaction`
 - websocket `transactionSubscribe`: `on_transaction`
+- built-in processed providers do not expose standalone control-plane hooks such
+  as `on_recent_blockhash`, `on_slot_status`, `on_cluster_topology`,
+  `on_leader_schedule`, or `on_reorg`
 
 Built-in durability behavior:
 
@@ -93,6 +96,9 @@ Built-in durability behavior:
   - this is still bounded by provider semantics: `transactionSubscribe` has no native replay cursor
   - SOF can backfill recent slots and dedupe replayed txs safely, but it cannot guarantee stronger
     recovery than the websocket provider plus HTTP RPC can expose
+- built-in provider adapters emit explicit source health transitions into SOF,
+  and unexpected provider ingress closure is treated as a runtime failure rather
+  than a clean stop
 
 Provider config defaults are inclusive:
 

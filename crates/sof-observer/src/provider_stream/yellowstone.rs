@@ -29,8 +29,9 @@ use crate::{
     event::{TxCommitmentStatus, TxKind},
     framework::TransactionEvent,
     provider_stream::{
-        ProviderCommitmentWatermarks, ProviderReplayMode, ProviderStreamSender,
-        ProviderStreamUpdate, classify_provider_transaction_kind,
+        ProviderCommitmentWatermarks, ProviderReplayMode, ProviderSourceHealthEvent,
+        ProviderSourceHealthReason, ProviderSourceHealthStatus, ProviderSourceId,
+        ProviderStreamSender, ProviderStreamUpdate, classify_provider_transaction_kind,
     },
 };
 
@@ -385,10 +386,19 @@ pub async fn spawn_yellowstone_grpc_transaction_source(
             .await
             {
                 Ok(()) => {
+                    let detail = "yellowstone stream ended unexpectedly".to_owned();
                     tracing::warn!(
                         endpoint = config.endpoint(),
+                        detail,
                         "provider stream yellowstone session ended unexpectedly; reconnecting"
                     );
+                    send_provider_health(
+                        &sender,
+                        ProviderSourceHealthStatus::Reconnecting,
+                        ProviderSourceHealthReason::UpstreamStreamClosedUnexpectedly,
+                        detail,
+                    )
+                    .await?;
                 }
                 Err(YellowstoneGrpcError::QueueClosed) => {
                     return Err(YellowstoneGrpcError::QueueClosed);
@@ -399,6 +409,13 @@ pub async fn spawn_yellowstone_grpc_transaction_source(
                         endpoint = config.endpoint(),
                         "provider stream yellowstone session ended; reconnecting"
                     );
+                    send_provider_health(
+                        &sender,
+                        ProviderSourceHealthStatus::Reconnecting,
+                        yellowstone_health_reason(&error),
+                        error.to_string(),
+                    )
+                    .await?;
                 }
             }
             if session_established {
@@ -409,9 +426,16 @@ pub async fn spawn_yellowstone_grpc_transaction_source(
             if let Some(max_attempts) = config.max_reconnect_attempts
                 && attempts >= max_attempts
             {
-                return Err(YellowstoneGrpcError::Protocol(format!(
-                    "exhausted yellowstone reconnect attempts after {attempts} failures"
-                )));
+                let detail =
+                    format!("exhausted yellowstone reconnect attempts after {attempts} failures");
+                send_provider_health(
+                    &sender,
+                    ProviderSourceHealthStatus::Unhealthy,
+                    ProviderSourceHealthReason::ReconnectBudgetExhausted,
+                    detail.clone(),
+                )
+                .await?;
+                return Err(YellowstoneGrpcError::Protocol(detail));
             }
             tokio::time::sleep(config.reconnect_delay).await;
         }
@@ -438,6 +462,13 @@ async fn run_yellowstone_transaction_connection(
         .subscribe_with_request(Some(config.subscribe_request_with_state(*tracked_slot)))
         .await?;
     *session_established = true;
+    send_provider_health(
+        sender,
+        ProviderSourceHealthStatus::Healthy,
+        ProviderSourceHealthReason::SubscriptionAckReceived,
+        "subscription acknowledged".to_owned(),
+    )
+    .await?;
     let mut ping = config.ping_interval.map(tokio::time::interval);
     let mut last_progress = Instant::now();
     loop {
@@ -515,6 +546,35 @@ async fn run_yellowstone_transaction_connection(
                 }
             }
         }
+    }
+}
+
+async fn send_provider_health(
+    sender: &ProviderStreamSender,
+    status: ProviderSourceHealthStatus,
+    reason: ProviderSourceHealthReason,
+    message: String,
+) -> Result<(), YellowstoneGrpcError> {
+    sender
+        .send(ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
+            source: ProviderSourceId::YellowstoneGrpc,
+            status,
+            reason,
+            message,
+        }))
+        .await
+        .map_err(|_error| YellowstoneGrpcError::QueueClosed)
+}
+
+const fn yellowstone_health_reason(error: &YellowstoneGrpcError) -> ProviderSourceHealthReason {
+    match error {
+        YellowstoneGrpcError::Build(_)
+        | YellowstoneGrpcError::Client(_)
+        | YellowstoneGrpcError::Status(_) => ProviderSourceHealthReason::UpstreamTransportFailure,
+        YellowstoneGrpcError::Convert(_) | YellowstoneGrpcError::Protocol(_) => {
+            ProviderSourceHealthReason::UpstreamProtocolFailure
+        }
+        YellowstoneGrpcError::QueueClosed => ProviderSourceHealthReason::UpstreamProtocolFailure,
     }
 }
 
