@@ -195,6 +195,43 @@ pub struct SerializedTransactionEvent {
     pub bytes: Box<[u8]>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ProviderCommitmentWatermarks {
+    pub(crate) confirmed_slot: Option<u64>,
+    pub(crate) finalized_slot: Option<u64>,
+}
+
+impl ProviderCommitmentWatermarks {
+    #[inline]
+    pub(crate) fn observe_transaction_commitment(
+        &mut self,
+        slot: u64,
+        commitment_status: TxCommitmentStatus,
+    ) {
+        match commitment_status {
+            TxCommitmentStatus::Processed => {}
+            TxCommitmentStatus::Confirmed => {
+                self.confirmed_slot = Some(self.confirmed_slot.unwrap_or(slot).max(slot));
+            }
+            TxCommitmentStatus::Finalized => {
+                self.confirmed_slot = Some(self.confirmed_slot.unwrap_or(slot).max(slot));
+                self.finalized_slot = Some(self.finalized_slot.unwrap_or(slot).max(slot));
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn observe_confirmed_slot(&mut self, slot: u64) {
+        self.confirmed_slot = Some(self.confirmed_slot.unwrap_or(slot).max(slot));
+    }
+
+    #[inline]
+    pub(crate) fn observe_finalized_slot(&mut self, slot: u64) {
+        self.observe_confirmed_slot(slot);
+        self.finalized_slot = Some(self.finalized_slot.unwrap_or(slot).max(slot));
+    }
+}
+
 /// Creates one bounded queue for processed provider-stream updates.
 ///
 /// # Examples

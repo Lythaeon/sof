@@ -74,6 +74,13 @@ Built-in hook surface by provider mode:
 - LaserStream gRPC: `on_transaction`
 - websocket `transactionSubscribe`: `on_transaction`
 
+Built-in durability behavior:
+
+- Yellowstone gRPC: reconnects with replay cursor tracking and slot-watermark tracking
+- LaserStream gRPC: uses SDK replay plus slot-watermark tracking
+- websocket `transactionSubscribe`: uses a stall watchdog and best-effort HTTP RPC gap backfill on
+  reconnect when SOF has a matching HTTP endpoint; otherwise reconnects are live-only
+
 Provider config defaults are inclusive:
 
 - vote transactions are included unless you explicitly set a vote filter

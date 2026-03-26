@@ -36,9 +36,12 @@ use crate::{
     event::{TxCommitmentStatus, TxKind},
     framework::TransactionEvent,
     provider_stream::{
-        ProviderStreamSender, ProviderStreamUpdate, classify_provider_transaction_kind,
+        ProviderCommitmentWatermarks, ProviderStreamSender, ProviderStreamUpdate,
+        classify_provider_transaction_kind,
     },
 };
+
+const INTERNAL_WATERMARK_SLOT_FILTER: &str = "__sof_watermark_slots";
 
 /// LaserStream subscription commitment used for provider-stream transaction updates.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -256,6 +259,13 @@ impl LaserStreamConfig {
                 .collect(),
         };
         grpc::SubscribeRequest {
+            slots: HashMap::from([(
+                INTERNAL_WATERMARK_SLOT_FILTER.to_owned(),
+                grpc::SubscribeRequestFilterSlots {
+                    filter_by_commitment: Some(true),
+                    ..grpc::SubscribeRequestFilterSlots::default()
+                },
+            )]),
             transactions: HashMap::from([("sof".to_owned(), filter)]),
             commitment: Some(self.commitment.as_proto() as i32),
             ..grpc::SubscribeRequest::default()
@@ -334,20 +344,41 @@ pub fn spawn_laserstream_transaction_source(
     let (stream, _handle) = subscribe(config.client_config(), request);
     tokio::spawn(async move {
         tokio::pin!(stream);
+        let mut watermarks = ProviderCommitmentWatermarks::default();
         while let Some(update) = stream.next().await {
             let update = update?;
-            if let Some(grpc::subscribe_update::UpdateOneof::Transaction(tx_update)) =
-                update.update_oneof
-            {
-                let event = transaction_event_from_update(
-                    tx_update.slot,
-                    tx_update.transaction,
-                    commitment,
-                )?;
-                sender
-                    .send(ProviderStreamUpdate::Transaction(event))
-                    .await
-                    .map_err(|_error| LaserStreamError::QueueClosed)?;
+            match update.update_oneof {
+                Some(grpc::subscribe_update::UpdateOneof::Slot(slot_update)) => {
+                    if update
+                        .filters
+                        .iter()
+                        .any(|filter| filter == INTERNAL_WATERMARK_SLOT_FILTER)
+                    {
+                        match grpc::SlotStatus::try_from(slot_update.status).ok() {
+                            Some(grpc::SlotStatus::SlotConfirmed) => {
+                                watermarks.observe_confirmed_slot(slot_update.slot);
+                            }
+                            Some(grpc::SlotStatus::SlotFinalized) => {
+                                watermarks.observe_finalized_slot(slot_update.slot);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Some(grpc::subscribe_update::UpdateOneof::Transaction(tx_update)) => {
+                    watermarks.observe_transaction_commitment(tx_update.slot, commitment);
+                    let event = transaction_event_from_update(
+                        tx_update.slot,
+                        tx_update.transaction,
+                        commitment,
+                        watermarks,
+                    )?;
+                    sender
+                        .send(ProviderStreamUpdate::Transaction(event))
+                        .await
+                        .map_err(|_error| LaserStreamError::QueueClosed)?;
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -358,6 +389,7 @@ fn transaction_event_from_update(
     slot: u64,
     transaction: Option<grpc::SubscribeUpdateTransactionInfo>,
     commitment_status: TxCommitmentStatus,
+    watermarks: ProviderCommitmentWatermarks,
 ) -> Result<TransactionEvent, LaserStreamError> {
     let transaction =
         transaction.ok_or(LaserStreamError::Convert("missing transaction payload"))?;
@@ -377,8 +409,8 @@ fn transaction_event_from_update(
     Ok(TransactionEvent {
         slot,
         commitment_status,
-        confirmed_slot: None,
-        finalized_slot: None,
+        confirmed_slot: watermarks.confirmed_slot,
+        finalized_slot: watermarks.finalized_slot,
         signature: signature.or_else(|| tx.signatures.first().copied()),
         kind: if is_vote {
             TxKind::VoteOnly
@@ -545,6 +577,13 @@ mod tests {
         let filter = request.transactions.get("sof").expect("sof filter");
         assert_eq!(filter.vote, None);
         assert_eq!(filter.failed, None);
+    }
+
+    #[test]
+    fn laserstream_subscribe_request_tracks_slots_for_watermarks() {
+        let request =
+            LaserStreamConfig::new("https://laserstream.example", "token").subscribe_request();
+        assert!(request.slots.contains_key(INTERNAL_WATERMARK_SLOT_FILTER));
     }
 
     fn sample_transaction() -> VersionedTransaction {
@@ -834,9 +873,13 @@ mod tests {
 
     #[test]
     fn laserstream_transaction_event_from_update_decodes_transaction() {
-        let event =
-            transaction_event_from_update(77, Some(sample_update()), TxCommitmentStatus::Confirmed)
-                .expect("event");
+        let event = transaction_event_from_update(
+            77,
+            Some(sample_update()),
+            TxCommitmentStatus::Confirmed,
+            ProviderCommitmentWatermarks::default(),
+        )
+        .expect("event");
         assert_eq!(event.slot, 77);
         assert_eq!(event.kind, crate::event::TxKind::Mixed);
         assert!(event.signature.is_some());
@@ -848,6 +891,7 @@ mod tests {
             78,
             Some(sample_vote_update()),
             TxCommitmentStatus::Confirmed,
+            ProviderCommitmentWatermarks::default(),
         )
         .expect("event");
         assert_eq!(event.slot, 78);
@@ -880,6 +924,7 @@ mod tests {
                 77,
                 Some(update.clone()),
                 TxCommitmentStatus::Processed,
+                ProviderCommitmentWatermarks::default(),
             )
             .expect("optimized event");
             std::hint::black_box(event);
@@ -922,6 +967,7 @@ mod tests {
                 77,
                 Some(update.clone()),
                 TxCommitmentStatus::Processed,
+                ProviderCommitmentWatermarks::default(),
             )
             .expect("optimized event");
             std::hint::black_box(event);
@@ -953,6 +999,7 @@ mod tests {
                 78,
                 Some(update.clone()),
                 TxCommitmentStatus::Processed,
+                ProviderCommitmentWatermarks::default(),
             )
             .expect("optimized event");
             std::hint::black_box(event);

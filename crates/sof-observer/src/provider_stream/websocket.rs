@@ -24,8 +24,8 @@ use crate::{
     event::TxCommitmentStatus,
     framework::TransactionEvent,
     provider_stream::{
-        ProviderStreamSender, ProviderStreamUpdate, SerializedTransactionEvent,
-        classify_provider_transaction_kind,
+        ProviderCommitmentWatermarks, ProviderStreamSender, ProviderStreamUpdate,
+        SerializedTransactionEvent, classify_provider_transaction_kind,
     },
 };
 
@@ -63,6 +63,7 @@ impl WebsocketTransactionCommitment {
 #[derive(Clone, Debug)]
 pub struct WebsocketTransactionConfig {
     endpoint: String,
+    http_endpoint: Option<String>,
     commitment: WebsocketTransactionCommitment,
     vote: Option<bool>,
     failed: Option<bool>,
@@ -71,8 +72,11 @@ pub struct WebsocketTransactionConfig {
     account_exclude: Vec<Pubkey>,
     account_required: Vec<Pubkey>,
     ping_interval: Option<Duration>,
+    stall_timeout: Option<Duration>,
     reconnect_delay: Duration,
     max_reconnect_attempts: Option<u32>,
+    replay_on_reconnect: bool,
+    replay_max_slots: u64,
 }
 
 impl WebsocketTransactionConfig {
@@ -93,6 +97,7 @@ impl WebsocketTransactionConfig {
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
+            http_endpoint: None,
             commitment: WebsocketTransactionCommitment::Processed,
             vote: None,
             failed: None,
@@ -101,8 +106,11 @@ impl WebsocketTransactionConfig {
             account_exclude: Vec::new(),
             account_required: Vec::new(),
             ping_interval: Some(Duration::from_secs(60)),
+            stall_timeout: Some(Duration::from_secs(30)),
             reconnect_delay: Duration::from_secs(1),
             max_reconnect_attempts: None,
+            replay_on_reconnect: true,
+            replay_max_slots: 128,
         }
     }
 
@@ -110,6 +118,19 @@ impl WebsocketTransactionConfig {
     #[must_use]
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    /// Returns the configured HTTP RPC endpoint used for reconnect backfill.
+    #[must_use]
+    pub fn http_endpoint(&self) -> Option<&str> {
+        self.http_endpoint.as_deref()
+    }
+
+    /// Sets the HTTP RPC endpoint used for reconnect backfill.
+    #[must_use]
+    pub fn with_http_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.http_endpoint = Some(endpoint.into());
+        self
     }
 
     /// Sets the commitment level.
@@ -177,6 +198,13 @@ impl WebsocketTransactionConfig {
         self
     }
 
+    /// Sets the idle watchdog timeout for one websocket session.
+    #[must_use]
+    pub const fn with_stall_timeout(mut self, timeout: Duration) -> Self {
+        self.stall_timeout = Some(timeout);
+        self
+    }
+
     /// Sets the reconnect backoff used after websocket failures.
     #[must_use]
     pub const fn with_reconnect_delay(mut self, delay: Duration) -> Self {
@@ -188,6 +216,20 @@ impl WebsocketTransactionConfig {
     #[must_use]
     pub const fn with_max_reconnect_attempts(mut self, attempts: u32) -> Self {
         self.max_reconnect_attempts = Some(attempts);
+        self
+    }
+
+    /// Enables or disables best-effort HTTP backfill after reconnect.
+    #[must_use]
+    pub const fn with_replay_on_reconnect(mut self, replay: bool) -> Self {
+        self.replay_on_reconnect = replay;
+        self
+    }
+
+    /// Sets the maximum reconnect backfill window in slots.
+    #[must_use]
+    pub const fn with_replay_max_slots(mut self, slots: u64) -> Self {
+        self.replay_max_slots = slots;
         self
     }
 
@@ -296,8 +338,17 @@ pub fn spawn_websocket_transaction_source(
     let config = config.clone();
     tokio::spawn(async move {
         let mut attempts = 0_u32;
+        let mut last_seen_slot = None;
+        let mut watermarks = ProviderCommitmentWatermarks::default();
         loop {
-            match run_websocket_transaction_connection(&config, &sender).await {
+            match run_websocket_transaction_connection(
+                &config,
+                &sender,
+                &mut last_seen_slot,
+                &mut watermarks,
+            )
+            .await
+            {
                 Ok(()) => {
                     let error = WebsocketTransactionError::Protocol(
                         "websocket transaction stream ended unexpectedly".to_owned(),
@@ -327,6 +378,8 @@ pub fn spawn_websocket_transaction_source(
 async fn run_websocket_transaction_connection(
     config: &WebsocketTransactionConfig,
     sender: &ProviderStreamSender,
+    last_seen_slot: &mut Option<u64>,
+    watermarks: &mut ProviderCommitmentWatermarks,
 ) -> Result<(), WebsocketTransactionError> {
     let (stream, _response) = connect_async(config.endpoint()).await?;
     let (mut write, mut read) = stream.split();
@@ -338,8 +391,12 @@ async fn run_websocket_transaction_connection(
         .await?;
 
     wait_for_subscription_ack(&mut read).await?;
+    if config.replay_on_reconnect && last_seen_slot.is_some() {
+        replay_websocket_gap(config, sender, last_seen_slot, watermarks).await?;
+    }
     let mut ping = config.ping_interval.map(tokio::time::interval);
     let mut scratch = WebsocketParseScratch::default();
+    let mut last_progress = tokio::time::Instant::now();
 
     loop {
         tokio::select! {
@@ -352,11 +409,23 @@ async fn run_websocket_transaction_connection(
             } => {
                 write.send(WsMessage::Ping(Vec::new().into())).await?;
             }
+            () = async {
+                if let Some(timeout) = config.stall_timeout {
+                    tokio::time::sleep_until(last_progress + timeout).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                return Err(WebsocketTransactionError::Protocol(
+                    "websocket transaction stream stalled without inbound progress".to_owned(),
+                ));
+            }
             maybe_frame = read.next() => {
                 let Some(frame) = maybe_frame else {
                     return Ok(());
                 };
                 let frame = frame?;
+                last_progress = tokio::time::Instant::now();
                 match frame {
                     WsMessage::Text(text) => {
                         if let Some(update) =
@@ -364,10 +433,13 @@ async fn run_websocket_transaction_connection(
                                 frame_bytes_mut(&mut scratch.frame_bytes, text.as_str().as_bytes()),
                                 &mut scratch.tx_bytes,
                                 config.commitment,
+                                watermarks,
                             )?
                         {
+                            *last_seen_slot =
+                                Some((*last_seen_slot).unwrap_or(update.slot).max(update.slot));
                             sender
-                                .send(update)
+                                .send(ProviderStreamUpdate::SerializedTransaction(update))
                                 .await
                                 .map_err(|_error| WebsocketTransactionError::QueueClosed)?;
                         }
@@ -378,10 +450,13 @@ async fn run_websocket_transaction_connection(
                                 frame_bytes_mut(&mut scratch.frame_bytes, bytes.as_ref()),
                                 &mut scratch.tx_bytes,
                                 config.commitment,
+                                watermarks,
                             )?
                         {
+                            *last_seen_slot =
+                                Some((*last_seen_slot).unwrap_or(update.slot).max(update.slot));
                             sender
-                                .send(update)
+                                .send(ProviderStreamUpdate::SerializedTransaction(update))
                                 .await
                                 .map_err(|_error| WebsocketTransactionError::QueueClosed)?;
                         }
@@ -466,7 +541,8 @@ fn parse_transaction_notification(
     bytes: &mut [u8],
     tx_bytes: &mut Vec<u8>,
     commitment_status: WebsocketTransactionCommitment,
-) -> Result<Option<ProviderStreamUpdate>, WebsocketTransactionError> {
+    watermarks: &mut ProviderCommitmentWatermarks,
+) -> Result<Option<SerializedTransactionEvent>, WebsocketTransactionError> {
     let value: WebsocketTransactionEnvelopeMessage = simd_from_slice(bytes).map_err(|error| {
         WebsocketTransactionError::Protocol(format!("invalid websocket json: {error}"))
     })?;
@@ -492,17 +568,17 @@ fn parse_transaction_notification(
     let signature = notification
         .signature
         .and_then(|signature| Signature::from_str(&signature).ok());
+    watermarks
+        .observe_transaction_commitment(notification.slot, commitment_status.as_tx_commitment());
     let tx_payload = std::mem::take(tx_bytes).into_boxed_slice();
-    Ok(Some(ProviderStreamUpdate::SerializedTransaction(
-        SerializedTransactionEvent {
-            slot: notification.slot,
-            commitment_status: commitment_status.as_tx_commitment(),
-            confirmed_slot: None,
-            finalized_slot: None,
-            signature,
-            bytes: tx_payload,
-        },
-    )))
+    Ok(Some(SerializedTransactionEvent {
+        slot: notification.slot,
+        commitment_status: commitment_status.as_tx_commitment(),
+        confirmed_slot: watermarks.confirmed_slot,
+        finalized_slot: watermarks.finalized_slot,
+        signature,
+        bytes: tx_payload,
+    }))
 }
 
 fn materialize_transaction_baseline(
@@ -561,6 +637,203 @@ fn frame_bytes_mut<'a>(buffer: &'a mut Vec<u8>, bytes: &[u8]) -> &'a mut [u8] {
     buffer.as_mut_slice()
 }
 
+async fn replay_websocket_gap(
+    config: &WebsocketTransactionConfig,
+    sender: &ProviderStreamSender,
+    last_seen_slot: &mut Option<u64>,
+    watermarks: &mut ProviderCommitmentWatermarks,
+) -> Result<(), WebsocketTransactionError> {
+    let Some(previous_slot) = *last_seen_slot else {
+        return Ok(());
+    };
+    let Some(http_endpoint) = websocket_http_endpoint(config) else {
+        tracing::warn!(
+            endpoint = config.endpoint(),
+            "websocket reconnect backfill is enabled but no HTTP RPC endpoint is available"
+        );
+        return Ok(());
+    };
+
+    let client = reqwest::Client::new();
+    let head = rpc_get_slot(&client, &http_endpoint, config.commitment).await?;
+    if head <= previous_slot {
+        return Ok(());
+    }
+
+    let start_slot = previous_slot.saturating_add(1).max(
+        head.saturating_add(1)
+            .saturating_sub(config.replay_max_slots.max(1)),
+    );
+    for slot in start_slot..=head {
+        let Some(block) = rpc_get_block(&client, &http_endpoint, slot, config.commitment).await?
+        else {
+            continue;
+        };
+        for transaction in block.transactions {
+            let tx_bytes = STANDARD
+                .decode(transaction.transaction.0.as_bytes())
+                .map_err(|_error| {
+                    WebsocketTransactionError::Convert("invalid base64 transaction payload")
+                })?;
+            let tx = bincode::deserialize::<VersionedTransaction>(&tx_bytes).map_err(|_error| {
+                WebsocketTransactionError::Convert("failed to deserialize transaction")
+            })?;
+            let kind = classify_provider_transaction_kind(&tx);
+            let failed = transaction
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.err.as_ref())
+                .is_some();
+            if !websocket_transaction_matches_filter(config, &tx, kind, failed) {
+                continue;
+            }
+            watermarks.observe_transaction_commitment(slot, config.commitment.as_tx_commitment());
+            sender
+                .send(ProviderStreamUpdate::Transaction(TransactionEvent {
+                    slot,
+                    commitment_status: config.commitment.as_tx_commitment(),
+                    confirmed_slot: watermarks.confirmed_slot,
+                    finalized_slot: watermarks.finalized_slot,
+                    signature: tx.signatures.first().copied(),
+                    kind,
+                    tx: Arc::new(tx),
+                }))
+                .await
+                .map_err(|_error| WebsocketTransactionError::QueueClosed)?;
+            *last_seen_slot = Some((*last_seen_slot).unwrap_or(slot).max(slot));
+        }
+    }
+    Ok(())
+}
+
+fn websocket_http_endpoint(config: &WebsocketTransactionConfig) -> Option<String> {
+    if let Some(endpoint) = config.http_endpoint() {
+        return Some(endpoint.to_owned());
+    }
+    if let Some(rest) = config.endpoint().strip_prefix("wss://") {
+        return Some(format!("https://{rest}"));
+    }
+    if let Some(rest) = config.endpoint().strip_prefix("ws://") {
+        return Some(format!("http://{rest}"));
+    }
+    None
+}
+
+async fn rpc_get_slot(
+    client: &reqwest::Client,
+    endpoint: &str,
+    commitment: WebsocketTransactionCommitment,
+) -> Result<u64, WebsocketTransactionError> {
+    let response: RpcJsonResponse<u64> = client
+        .post(endpoint)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSlot",
+            "params": [{ "commitment": commitment.as_str() }],
+        }))
+        .send()
+        .await
+        .map_err(|error| {
+            WebsocketTransactionError::Protocol(format!("http rpc getSlot failed: {error}"))
+        })?
+        .json()
+        .await
+        .map_err(|error| {
+            WebsocketTransactionError::Protocol(format!("http rpc getSlot decode failed: {error}"))
+        })?;
+    if let Some(error) = response.error {
+        return Err(WebsocketTransactionError::Protocol(format!(
+            "http rpc getSlot returned error: {error}"
+        )));
+    }
+    response.result.ok_or_else(|| {
+        WebsocketTransactionError::Protocol("http rpc getSlot returned no result".to_owned())
+    })
+}
+
+async fn rpc_get_block(
+    client: &reqwest::Client,
+    endpoint: &str,
+    slot: u64,
+    commitment: WebsocketTransactionCommitment,
+) -> Result<Option<RpcBlockResponse>, WebsocketTransactionError> {
+    let response: RpcJsonResponse<RpcBlockResponse> = client
+        .post(endpoint)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getBlock",
+            "params": [
+                slot,
+                {
+                    "commitment": commitment.as_str(),
+                    "encoding": "base64",
+                    "transactionDetails": "full",
+                    "maxSupportedTransactionVersion": 0,
+                    "rewards": false
+                }
+            ],
+        }))
+        .send()
+        .await
+        .map_err(|error| {
+            WebsocketTransactionError::Protocol(format!("http rpc getBlock failed: {error}"))
+        })?
+        .json()
+        .await
+        .map_err(|error| {
+            WebsocketTransactionError::Protocol(format!("http rpc getBlock decode failed: {error}"))
+        })?;
+    if let Some(error) = response.error {
+        return Err(WebsocketTransactionError::Protocol(format!(
+            "http rpc getBlock returned error: {error}"
+        )));
+    }
+    Ok(response.result)
+}
+
+fn websocket_transaction_matches_filter(
+    config: &WebsocketTransactionConfig,
+    tx: &VersionedTransaction,
+    kind: crate::event::TxKind,
+    failed: bool,
+) -> bool {
+    if let Some(signature) = config.signature
+        && tx.signatures.first().copied() != Some(signature)
+    {
+        return false;
+    }
+    if let Some(expect_vote) = config.vote {
+        let is_vote = kind == crate::event::TxKind::VoteOnly;
+        if is_vote != expect_vote {
+            return false;
+        }
+    }
+    if let Some(expect_failed) = config.failed
+        && failed != expect_failed
+    {
+        return false;
+    }
+    let keys = tx.message.static_account_keys();
+    if !config.account_include.is_empty()
+        && !config.account_include.iter().any(|key| keys.contains(key))
+    {
+        return false;
+    }
+    if !config.account_exclude.is_empty()
+        && config.account_exclude.iter().any(|key| keys.contains(key))
+    {
+        return false;
+    }
+    if !config.account_required.is_empty()
+        && !config.account_required.iter().all(|key| keys.contains(key))
+    {
+        return false;
+    }
+    true
+}
+
 #[derive(Debug, Deserialize)]
 struct WebsocketSubscriptionAck {
     #[serde(default)]
@@ -607,6 +880,31 @@ struct WebsocketEncodedTransaction<'a>(
     #[serde(borrow)] Cow<'a, str>,
     #[serde(borrow)] Cow<'a, str>,
 );
+
+#[derive(Debug, Deserialize)]
+struct RpcJsonResponse<T> {
+    result: Option<T>,
+    error: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcBlockResponse {
+    #[serde(default)]
+    transactions: Vec<RpcBlockTransaction>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcBlockTransaction {
+    transaction: (String, String),
+    #[serde(default)]
+    meta: Option<RpcTransactionMeta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcTransactionMeta {
+    #[serde(default)]
+    err: Option<Value>,
+}
 
 #[cfg(test)]
 mod tests {
@@ -771,6 +1069,33 @@ mod tests {
         assert_eq!(event.kind, TxKind::NonVote);
     }
 
+    #[test]
+    fn websocket_transaction_notification_tracks_commitment_watermarks() {
+        let payload = sample_notification_payload();
+        let mut frame_bytes = payload;
+        let mut tx_bytes = Vec::new();
+        let mut watermarks = ProviderCommitmentWatermarks::default();
+        let event = parse_transaction_notification(
+            &mut frame_bytes,
+            &mut tx_bytes,
+            WebsocketTransactionCommitment::Confirmed,
+            &mut watermarks,
+        )
+        .expect("notification should parse")
+        .expect("serialized event");
+        assert_eq!(event.confirmed_slot, Some(55));
+        assert_eq!(event.finalized_slot, None);
+    }
+
+    #[test]
+    fn websocket_http_endpoint_derives_from_websocket_scheme() {
+        let config = WebsocketTransactionConfig::new("wss://example.invalid/?api-key=1");
+        assert_eq!(
+            websocket_http_endpoint(&config).as_deref(),
+            Some("https://example.invalid/?api-key=1")
+        );
+    }
+
     #[tokio::test]
     async fn websocket_source_reconnects_and_delivers_after_disconnect() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
@@ -860,12 +1185,14 @@ mod tests {
         let optimized_started = Instant::now();
         let mut frame_bytes = Vec::new();
         let mut tx_bytes = Vec::new();
+        let mut watermarks = ProviderCommitmentWatermarks::default();
         for _ in 0..iterations {
             let frame = frame_bytes_mut(&mut frame_bytes, &payload);
             let event = parse_transaction_notification(
                 frame,
                 &mut tx_bytes,
                 WebsocketTransactionCommitment::Confirmed,
+                &mut watermarks,
             )
             .expect("optimized parse")
             .expect("optimized event");
@@ -907,12 +1234,14 @@ mod tests {
         let payload = sample_notification_payload();
         let mut frame_bytes = Vec::new();
         let mut tx_bytes = Vec::new();
+        let mut watermarks = ProviderCommitmentWatermarks::default();
         for _ in 0..iterations {
             let frame = frame_bytes_mut(&mut frame_bytes, &payload);
             let event = parse_transaction_notification(
                 frame,
                 &mut tx_bytes,
                 WebsocketTransactionCommitment::Confirmed,
+                &mut watermarks,
             )
             .expect("optimized parse")
             .expect("optimized event");
