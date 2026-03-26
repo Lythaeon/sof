@@ -38,6 +38,8 @@ struct RuntimeObservabilityState {
     live: AtomicBool,
     ready: AtomicBool,
     provider_sources: RwLock<HashMap<&'static str, ProviderSourceHealthEvent>>,
+    provider_capability_mode: RwLock<Option<&'static str>>,
+    provider_capability_unsupported_hooks: RwLock<Vec<String>>,
 }
 
 impl RuntimeObservabilityHandle {
@@ -64,6 +66,22 @@ impl RuntimeObservabilityHandle {
         self.inner.ready.store(all_healthy, Ordering::Relaxed);
     }
 
+    pub(crate) fn observe_provider_capability_warning(
+        &self,
+        mode: &'static str,
+        unsupported_hooks: &[String],
+    ) {
+        if let Ok(mut capability_mode) = self.inner.provider_capability_mode.write() {
+            *capability_mode = Some(mode);
+        }
+        if let Ok(mut hooks) = self.inner.provider_capability_unsupported_hooks.write() {
+            hooks.clear();
+            hooks.extend(unsupported_hooks.iter().cloned());
+            hooks.sort();
+            hooks.dedup();
+        }
+    }
+
     fn mark_stopped(&self) {
         self.inner.ready.store(false, Ordering::Relaxed);
         self.inner.live.store(false, Ordering::Relaxed);
@@ -75,10 +93,23 @@ impl RuntimeObservabilityHandle {
             |sources| sources.values().cloned().collect(),
         );
         provider_sources.sort_by_key(|event| (event.source.as_str(), event.reason.as_str()));
+        let provider_capability_mode = self
+            .inner
+            .provider_capability_mode
+            .read()
+            .ok()
+            .and_then(|mode| *mode);
+        let provider_capability_unsupported_hooks = self
+            .inner
+            .provider_capability_unsupported_hooks
+            .read()
+            .map_or_else(|_error| Vec::new(), |hooks| hooks.clone());
         RuntimeObservabilitySnapshot {
             live: self.inner.live.load(Ordering::Relaxed),
             ready: self.inner.ready.load(Ordering::Relaxed),
             provider_sources,
+            provider_capability_mode,
+            provider_capability_unsupported_hooks,
         }
     }
 }
@@ -88,6 +119,8 @@ struct RuntimeObservabilitySnapshot {
     live: bool,
     ready: bool,
     provider_sources: Vec<ProviderSourceHealthEvent>,
+    provider_capability_mode: Option<&'static str>,
+    provider_capability_unsupported_hooks: Vec<String>,
 }
 
 pub(crate) struct RuntimeObservabilityService {
@@ -312,6 +345,34 @@ fn render_metrics(
             1_u8,
             Some(&labels),
         );
+    }
+    append_metric_family(
+        &mut buffer,
+        "sof_provider_capability_degraded",
+        "Provider runtime started with unsupported requested hooks under warn policy.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_provider_capability_degraded",
+        u8::from(!state.provider_capability_unsupported_hooks.is_empty()),
+        None,
+    );
+    if let Some(mode) = state.provider_capability_mode {
+        append_metric_family(
+            &mut buffer,
+            "sof_provider_capability_unsupported_hook",
+            "Unsupported requested hook or derived-state feed tolerated under provider warn policy.",
+            PrometheusMetricType::Gauge,
+        );
+        for hook in &state.provider_capability_unsupported_hooks {
+            append_metric_value(
+                &mut buffer,
+                "sof_provider_capability_unsupported_hook",
+                1_u8,
+                Some(&[("mode", mode), ("hook", hook.as_str())]),
+            );
+        }
     }
 
     let snapshot = runtime_metrics::snapshot();
@@ -2543,6 +2604,29 @@ mod tests {
         assert!(metrics.contains("sof_provider_sources_unhealthy 0"));
         assert!(metrics.contains(
             "sof_provider_source_status{source=\"yellowstone_grpc\",status=\"reconnecting\",reason=\"upstream_protocol_failure\"} 1"
+        ));
+    }
+
+    #[test]
+    fn metrics_include_provider_capability_warning_state() {
+        let handle = RuntimeObservabilityHandle::default();
+        handle.mark_live();
+        handle.observe_provider_capability_warning(
+            "generic_provider",
+            &[String::from("on_dataset"), String::from("on_raw_packet")],
+        );
+        let metrics = render_metrics(
+            &handle,
+            &RuntimeExtensionHost::builder().build(),
+            &DerivedStateHost::builder().build(),
+        );
+
+        assert!(metrics.contains("sof_provider_capability_degraded 1"));
+        assert!(metrics.contains(
+            "sof_provider_capability_unsupported_hook{mode=\"generic_provider\",hook=\"on_dataset\"} 1"
+        ));
+        assert!(metrics.contains(
+            "sof_provider_capability_unsupported_hook{mode=\"generic_provider\",hook=\"on_raw_packet\"} 1"
         ));
     }
 

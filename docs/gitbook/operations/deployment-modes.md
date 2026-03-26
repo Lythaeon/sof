@@ -70,8 +70,19 @@ SOF exposes this category through `ProviderStreamMode`. In that mode:
   instead of a clean stop
   - those source states are also exposed via the runtime observability endpoint
     so reconnecting/unhealthy providers are visible as metrics
+  - provider readiness now waits for actual built-in provider health, or for
+    real generic-provider ingress progress, instead of flipping ready at
+    runtime startup
   - generic provider replay dedupe also covers `TransactionLog` and
     `TransactionViewBatch` updates, not only transaction/control-plane events
+- `ProviderStreamMode::Generic` can be used for finite replay/batch producers
+  too, but that is explicit:
+  - set `SOF_PROVIDER_STREAM_ALLOW_EOF=true` if bounded generic ingress should
+    terminate cleanly instead of being treated as a failed live stream
+- generic provider capability warnings are persistent runtime state now, not
+  only one startup log line
+  - under `SOF_PROVIDER_STREAM_CAPABILITY_POLICY=warn`, unsupported requested
+    hooks are exported through runtime observability metrics
 
 That means deployment mode is not only about network topology. It is also about how much of the
 low-level substrate SOF is owning for the application:

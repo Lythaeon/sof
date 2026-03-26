@@ -160,6 +160,15 @@ pub enum ProviderStreamCapabilityPolicy {
     Strict,
 }
 
+#[derive(Debug, Default)]
+enum ProviderStreamCapabilityCheck {
+    #[default]
+    Supported,
+    Warn {
+        unsupported_hooks: Vec<String>,
+    },
+}
+
 impl ProviderStreamCapabilityPolicy {
     /// Returns the env-string representation used by `SOF_PROVIDER_STREAM_CAPABILITY_POLICY`.
     #[must_use]
@@ -176,6 +185,13 @@ impl ProviderStreamCapabilityPolicy {
             _ => Self::Warn,
         }
     }
+}
+
+fn provider_stream_allow_eof_from_runtime_env() -> bool {
+    matches!(
+        crate::runtime_env::read_env_var("SOF_PROVIDER_STREAM_ALLOW_EOF").as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
 }
 
 /// Typed replay retention configuration for derived-state consumers.
@@ -693,6 +709,15 @@ impl RuntimeSetup {
         policy: ProviderStreamCapabilityPolicy,
     ) -> Self {
         self.with_env("SOF_PROVIDER_STREAM_CAPABILITY_POLICY", policy.as_str())
+    }
+
+    /// Sets `SOF_PROVIDER_STREAM_ALLOW_EOF`.
+    ///
+    /// When enabled, `ProviderStreamMode::Generic` may close its ingress queue
+    /// cleanly after emitting a bounded stream.
+    #[must_use]
+    pub fn with_provider_stream_allow_eof(self, allow_eof: bool) -> Self {
+        self.with_env("SOF_PROVIDER_STREAM_ALLOW_EOF", allow_eof.to_string())
     }
 
     /// Sets `SOF_VERIFY_STRICT`.
@@ -1611,7 +1636,8 @@ async fn run_provider_stream_runtime(
     mode: ProviderStreamMode,
     mut provider_stream_rx: ProviderStreamReceiver,
 ) -> Result<(), RuntimeError> {
-    enforce_provider_stream_capability_policy(mode, &plugin_host, &derived_state_host)?;
+    let capability_check =
+        enforce_provider_stream_capability_policy(mode, &plugin_host, &derived_state_host)?;
     let observability = if let Some(bind_addr) = read_observability_bind_addr() {
         let service = RuntimeObservabilityService::start(
             bind_addr,
@@ -1636,6 +1662,11 @@ async fn run_provider_stream_runtime(
         .as_ref()
         .map(RuntimeObservabilityService::handle)
         .cloned();
+    if let (Some(handle), ProviderStreamCapabilityCheck::Warn { unsupported_hooks }) =
+        (observability_handle.as_ref(), &capability_check)
+    {
+        handle.observe_provider_capability_warning(mode.as_str(), unsupported_hooks);
+    }
     plugin_host
         .startup()
         .await
@@ -1651,14 +1682,14 @@ async fn run_provider_stream_runtime(
         );
     }
     derived_state_host.initialize();
-    if let Some(handle) = observability_handle.as_ref() {
-        handle.mark_ready();
-    }
     tracing::info!(mode = mode.as_str(), "starting SOF provider-stream runtime");
 
     let mut shutdown_signal = shutdown_signal;
     let mut replay_dedupe = ProviderReplayDedupe::new(PROVIDER_REPLAY_DEDUPE_CAPACITY);
     let mut provider_health = ProviderStreamHealth::default();
+    let allow_eof =
+        mode == ProviderStreamMode::Generic && provider_stream_allow_eof_from_runtime_env();
+    let mut generic_progress_ready = false;
     let result = loop {
         tokio::select! {
             biased;
@@ -1673,6 +1704,13 @@ async fn run_provider_stream_runtime(
             }
             update = provider_stream_rx.recv() => {
                 let Some(update) = update else {
+                    if allow_eof {
+                        tracing::info!(
+                            mode = mode.as_str(),
+                            "SOF provider-stream runtime reached configured generic EOF"
+                        );
+                        break Ok(());
+                    }
                     let error = provider_health.closed_error(mode);
                     tracing::error!(mode = mode.as_str(), error = %error, "SOF provider-stream runtime stopped after provider ingress closed unexpectedly");
                     break Err(RuntimeError::ProviderStream(error));
@@ -1683,6 +1721,15 @@ async fn run_provider_stream_runtime(
                         handle.observe_provider_source_health(event);
                     }
                     continue;
+                }
+                if mode == ProviderStreamMode::Generic
+                    && !generic_progress_ready
+                    && !provider_health.has_sources()
+                {
+                    if let Some(handle) = observability_handle.as_ref() {
+                        handle.mark_ready();
+                    }
+                    generic_progress_ready = true;
                 }
                 if replay_dedupe.observe(&update) {
                     continue;
@@ -1757,6 +1804,10 @@ impl ProviderStreamHealth {
             .collect::<Vec<_>>();
         degraded.sort_by_key(|event| event.source.as_str());
         degraded
+    }
+
+    fn has_sources(&self) -> bool {
+        !self.sources.is_empty()
     }
 
     fn closed_error(&self, mode: ProviderStreamMode) -> ProviderStreamRuntimeError {
@@ -2190,10 +2241,10 @@ fn enforce_provider_stream_capability_policy(
     mode: ProviderStreamMode,
     plugin_host: &PluginHost,
     derived_state_host: &DerivedStateHost,
-) -> Result<(), RuntimeError> {
+) -> Result<ProviderStreamCapabilityCheck, RuntimeError> {
     let unsupported = provider_stream_unsupported_hooks(mode, plugin_host, derived_state_host);
     if unsupported.is_empty() {
-        return Ok(());
+        return Ok(ProviderStreamCapabilityCheck::Supported);
     }
     if mode != ProviderStreamMode::Generic {
         return Err(ProviderStreamRuntimeError::BuiltInUnsupportedHooks {
@@ -2204,12 +2255,16 @@ fn enforce_provider_stream_capability_policy(
     }
     match ProviderStreamCapabilityPolicy::from_runtime_env() {
         ProviderStreamCapabilityPolicy::Warn => {
+            let unsupported_hooks = unsupported
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>();
             tracing::warn!(
                 mode = mode.as_str(),
-                unsupported_hooks = unsupported.join(","),
+                unsupported_hooks = unsupported_hooks.join(","),
                 "provider-stream mode will not emit some requested plugin hooks"
             );
-            Ok(())
+            Ok(ProviderStreamCapabilityCheck::Warn { unsupported_hooks })
         }
         ProviderStreamCapabilityPolicy::Strict => {
             Err(ProviderStreamRuntimeError::UnsupportedHooks {
@@ -3427,6 +3482,18 @@ mod tests {
     }
 
     #[test]
+    fn typed_provider_stream_allow_eof_uses_expected_strings() {
+        let setup = RuntimeSetup::new().with_provider_stream_allow_eof(true);
+        assert_eq!(
+            setup.env_overrides.last(),
+            Some(&(
+                String::from("SOF_PROVIDER_STREAM_ALLOW_EOF"),
+                String::from("true"),
+            ))
+        );
+    }
+
+    #[test]
     fn provider_stream_warn_policy_allows_unsupported_hooks() {
         crate::runtime_env::set_runtime_env_overrides([(
             String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
@@ -3926,6 +3993,36 @@ mod tests {
             }
             other => panic!("expected degraded provider closure failure, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn provider_stream_runtime_allows_generic_eof_when_configured() {
+        crate::runtime_env::set_runtime_env_overrides([(
+            String::from("SOF_PROVIDER_STREAM_ALLOW_EOF"),
+            String::from("true"),
+        )]);
+        let plugin_host = PluginHost::builder()
+            .add_plugin(TransactionOnlyPlugin)
+            .build();
+        let extension_host = RuntimeExtensionHost::builder().build();
+        let (tx, rx) = crate::provider_stream::create_provider_stream_queue(1);
+        drop(tx);
+
+        let result = run_provider_stream_runtime(
+            plugin_host,
+            extension_host,
+            DerivedStateHost::builder().build(),
+            None,
+            ProviderStreamMode::Generic,
+            rx,
+        )
+        .await;
+        crate::runtime_env::clear_runtime_env_overrides();
+
+        assert!(
+            result.is_ok(),
+            "expected configured generic EOF to stop cleanly"
+        );
     }
 
     #[test]

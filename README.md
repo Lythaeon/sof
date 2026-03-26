@@ -101,6 +101,8 @@ Built-in durability behavior:
   than a clean stop
   - provider-source health is exported through the runtime observability
     endpoint too, so reconnecting/unhealthy sources are not log-only anymore
+  - provider `/readyz` does not flip ready until a built-in source is actually
+    healthy, or until a generic producer has emitted real ingress progress
   - generic provider replay dedupe also covers transaction-log and
     transaction-view-batch updates now, not just transaction/control-plane
     events
@@ -115,6 +117,14 @@ for hooks they do not emit. `ProviderStreamMode::Generic` is the flexible mode:
 it can accept richer control-plane updates from a custom producer, and
 `SOF_PROVIDER_STREAM_CAPABILITY_POLICY` controls whether unsupported requests
 warn or fail there.
+
+When generic mode runs under `warn`, SOF now keeps that semantic degradation
+visible through runtime observability metrics instead of only logging once at
+startup.
+
+If a generic producer is intentionally finite rather than live, set
+`SOF_PROVIDER_STREAM_ALLOW_EOF=true` so bounded replay/batch producers can end
+cleanly instead of being treated as an unexpected live-ingress failure.
 
 The same capability checks apply to derived-state consumers, not just plugins.
 
