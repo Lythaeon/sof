@@ -287,32 +287,31 @@ impl YellowstoneGrpcConfig {
     }
 
     const fn replay_from_slot(&self, tracked_slot: u64) -> Option<u64> {
-        let base_slot = match self.replay_mode {
+        match self.replay_mode {
             ProviderReplayMode::Live => return None,
             ProviderReplayMode::Resume => {
                 if tracked_slot == 0 {
                     return None;
                 }
-                tracked_slot
+                Some(match self.commitment {
+                    YellowstoneGrpcCommitment::Processed => tracked_slot.saturating_sub(31),
+                    YellowstoneGrpcCommitment::Confirmed | YellowstoneGrpcCommitment::Finalized => {
+                        tracked_slot
+                    }
+                })
             }
             ProviderReplayMode::FromSlot(slot) => {
                 if tracked_slot == 0 {
-                    slot
+                    Some(slot)
                 } else {
-                    if tracked_slot >= slot {
-                        tracked_slot
-                    } else {
-                        slot
-                    }
+                    Some(match self.commitment {
+                        YellowstoneGrpcCommitment::Processed => tracked_slot.saturating_sub(31),
+                        YellowstoneGrpcCommitment::Confirmed
+                        | YellowstoneGrpcCommitment::Finalized => tracked_slot,
+                    })
                 }
             }
-        };
-        Some(match self.commitment {
-            YellowstoneGrpcCommitment::Processed => base_slot.saturating_sub(31),
-            YellowstoneGrpcCommitment::Confirmed | YellowstoneGrpcCommitment::Finalized => {
-                base_slot
-            }
-        })
+        }
     }
 }
 
@@ -375,11 +374,13 @@ pub async fn spawn_yellowstone_grpc_transaction_source(
         let mut tracked_slot = 0_u64;
         let mut watermarks = ProviderCommitmentWatermarks::default();
         loop {
+            let mut session_established = false;
             match run_yellowstone_transaction_connection(
                 &config,
                 &sender,
                 &mut tracked_slot,
                 &mut watermarks,
+                &mut session_established,
             )
             .await
             {
@@ -400,7 +401,11 @@ pub async fn spawn_yellowstone_grpc_transaction_source(
                     );
                 }
             }
-            attempts = attempts.saturating_add(1);
+            if session_established {
+                attempts = 0;
+            } else {
+                attempts = attempts.saturating_add(1);
+            }
             if let Some(max_attempts) = config.max_reconnect_attempts
                 && attempts >= max_attempts
             {
@@ -418,8 +423,10 @@ async fn run_yellowstone_transaction_connection(
     sender: &ProviderStreamSender,
     tracked_slot: &mut u64,
     watermarks: &mut ProviderCommitmentWatermarks,
+    session_established: &mut bool,
 ) -> Result<(), YellowstoneGrpcError> {
     let commitment = config.commitment.as_tx_commitment();
+    *session_established = false;
     let mut builder = GeyserGrpcClient::build_from_shared(config.endpoint.clone())?
         .x_token(config.x_token.clone())?
         .max_decoding_message_size(config.max_decoding_message_size);
@@ -430,6 +437,7 @@ async fn run_yellowstone_transaction_connection(
     let (mut subscribe_tx, mut stream) = client
         .subscribe_with_request(Some(config.subscribe_request_with_state(*tracked_slot)))
         .await?;
+    *session_established = true;
     let mut ping = config.ping_interval.map(tokio::time::interval);
     let mut last_progress = Instant::now();
     loop {
@@ -519,7 +527,10 @@ async fn preflight_yellowstone_connection(
     if let Some(timeout) = config.connect_timeout {
         builder = builder.connect_timeout(timeout);
     }
-    let _client = builder.connect().await?;
+    let mut client = builder.connect().await?;
+    let _subscription = client
+        .subscribe_with_request(Some(config.subscribe_request()))
+        .await?;
     Ok(())
 }
 
@@ -708,7 +719,16 @@ mod tests {
             .with_commitment(YellowstoneGrpcCommitment::Processed)
             .subscribe_request_with_state(0);
         assert!(request.slots.contains_key(INTERNAL_SLOT_FILTER));
-        assert_eq!(request.from_slot, Some(169));
+        assert_eq!(request.from_slot, Some(200));
+    }
+
+    #[test]
+    fn yellowstone_from_slot_reconnect_resumes_from_tracked_slot() {
+        let request = YellowstoneGrpcConfig::new("http://127.0.0.1:10000")
+            .with_replay_mode(ProviderReplayMode::FromSlot(200))
+            .with_commitment(YellowstoneGrpcCommitment::Processed)
+            .subscribe_request_with_state(250);
+        assert_eq!(request.from_slot, Some(219));
     }
 
     #[test]

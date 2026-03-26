@@ -341,11 +341,13 @@ pub fn spawn_websocket_transaction_source(
         let mut last_seen_slot = None;
         let mut watermarks = ProviderCommitmentWatermarks::default();
         loop {
+            let mut session_established = false;
             match run_websocket_transaction_connection(
                 &config,
                 &sender,
                 &mut last_seen_slot,
                 &mut watermarks,
+                &mut session_established,
             )
             .await
             {
@@ -362,7 +364,11 @@ pub fn spawn_websocket_transaction_source(
                     tracing::warn!(%error, endpoint = config.endpoint(), "provider stream websocket session ended; reconnecting");
                 }
             }
-            attempts = attempts.saturating_add(1);
+            if session_established {
+                attempts = 0;
+            } else {
+                attempts = attempts.saturating_add(1);
+            }
             if let Some(max_attempts) = config.max_reconnect_attempts
                 && attempts >= max_attempts
             {
@@ -380,7 +386,9 @@ async fn run_websocket_transaction_connection(
     sender: &ProviderStreamSender,
     last_seen_slot: &mut Option<u64>,
     watermarks: &mut ProviderCommitmentWatermarks,
+    session_established: &mut bool,
 ) -> Result<(), WebsocketTransactionError> {
+    *session_established = false;
     let (stream, _response) = connect_async(config.endpoint()).await?;
     let (mut write, mut read) = stream.split();
 
@@ -391,6 +399,7 @@ async fn run_websocket_transaction_connection(
         .await?;
 
     wait_for_subscription_ack(&mut read).await?;
+    *session_established = true;
     if config.replay_on_reconnect && last_seen_slot.is_some() {
         replay_websocket_gap(config, sender, last_seen_slot, watermarks).await?;
     }
@@ -684,7 +693,16 @@ async fn replay_websocket_gap(
                 .as_ref()
                 .and_then(|meta| meta.err.as_ref())
                 .is_some();
-            if !websocket_transaction_matches_filter(config, &tx, kind, failed) {
+            if !websocket_transaction_matches_filter(
+                config,
+                &tx,
+                transaction
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.loaded_addresses.as_ref()),
+                kind,
+                failed,
+            ) {
                 continue;
             }
             watermarks.observe_transaction_commitment(slot, config.commitment.as_tx_commitment());
@@ -796,6 +814,7 @@ async fn rpc_get_block(
 fn websocket_transaction_matches_filter(
     config: &WebsocketTransactionConfig,
     tx: &VersionedTransaction,
+    loaded_addresses: Option<&RpcLoadedAddresses>,
     kind: crate::event::TxKind,
     failed: bool,
 ) -> bool {
@@ -815,20 +834,17 @@ fn websocket_transaction_matches_filter(
     {
         return false;
     }
-    let keys = tx.message.static_account_keys();
-    if !config.account_include.is_empty()
-        && !config.account_include.iter().any(|key| keys.contains(key))
-    {
+    let key_present = |key: &Pubkey| {
+        tx.message.static_account_keys().contains(key)
+            || loaded_addresses.is_some_and(|loaded| loaded.contains(key))
+    };
+    if !config.account_include.is_empty() && !config.account_include.iter().any(key_present) {
         return false;
     }
-    if !config.account_exclude.is_empty()
-        && config.account_exclude.iter().any(|key| keys.contains(key))
-    {
+    if !config.account_exclude.is_empty() && config.account_exclude.iter().any(key_present) {
         return false;
     }
-    if !config.account_required.is_empty()
-        && !config.account_required.iter().all(|key| keys.contains(key))
-    {
+    if !config.account_required.is_empty() && !config.account_required.iter().all(key_present) {
         return false;
     }
     true
@@ -904,6 +920,24 @@ struct RpcBlockTransaction {
 struct RpcTransactionMeta {
     #[serde(default)]
     err: Option<Value>,
+    #[serde(default, rename = "loadedAddresses")]
+    loaded_addresses: Option<RpcLoadedAddresses>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcLoadedAddresses {
+    #[serde(default)]
+    writable: Vec<String>,
+    #[serde(default)]
+    readonly: Vec<String>,
+}
+
+impl RpcLoadedAddresses {
+    fn contains(&self, key: &Pubkey) -> bool {
+        let target = key.to_string();
+        self.writable.iter().any(|candidate| candidate == &target)
+            || self.readonly.iter().any(|candidate| candidate == &target)
+    }
 }
 
 #[cfg(test)]
@@ -1096,6 +1130,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn websocket_backfill_filter_uses_loaded_addresses() {
+        let signer = Keypair::new();
+        let message = Message::new(&[], Some(&signer.pubkey()));
+        let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&signer])
+            .expect("tx");
+        let loaded_key = Pubkey::new_unique();
+        let config = WebsocketTransactionConfig::new("wss://example.invalid")
+            .with_account_include([loaded_key]);
+        let loaded_addresses = RpcLoadedAddresses {
+            writable: vec![loaded_key.to_string()],
+            readonly: Vec::new(),
+        };
+
+        assert!(websocket_transaction_matches_filter(
+            &config,
+            &tx,
+            Some(&loaded_addresses),
+            TxKind::NonVote,
+            false,
+        ));
+    }
+
     #[tokio::test]
     async fn websocket_source_reconnects_and_delivers_after_disconnect() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
@@ -1140,6 +1197,7 @@ mod tests {
 
         let (tx, mut rx) = create_provider_stream_queue(8);
         let config = WebsocketTransactionConfig::new(format!("ws://{addr}"))
+            .with_max_reconnect_attempts(1)
             .with_ping_interval(Duration::from_millis(250))
             .with_reconnect_delay(Duration::from_millis(10));
         let handle = spawn_websocket_transaction_source(&config, tx);
