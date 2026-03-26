@@ -74,6 +74,8 @@ pub struct YellowstoneGrpcConfig {
     account_required: Vec<Pubkey>,
     max_decoding_message_size: usize,
     connect_timeout: Option<Duration>,
+    reconnect_delay: Duration,
+    max_reconnect_attempts: Option<u32>,
 }
 
 impl YellowstoneGrpcConfig {
@@ -101,6 +103,8 @@ impl YellowstoneGrpcConfig {
             account_required: Vec::new(),
             max_decoding_message_size: 64 * 1024 * 1024,
             connect_timeout: Some(Duration::from_secs(10)),
+            reconnect_delay: Duration::from_secs(1),
+            max_reconnect_attempts: None,
         }
     }
 
@@ -189,6 +193,20 @@ impl YellowstoneGrpcConfig {
         self
     }
 
+    /// Sets the reconnect backoff used after stream failures.
+    #[must_use]
+    pub const fn with_reconnect_delay(mut self, delay: Duration) -> Self {
+        self.reconnect_delay = delay;
+        self
+    }
+
+    /// Sets the maximum reconnect attempts. `None` keeps retrying forever.
+    #[must_use]
+    pub const fn with_max_reconnect_attempts(mut self, attempts: u32) -> Self {
+        self.max_reconnect_attempts = Some(attempts);
+        self
+    }
+
     pub(crate) fn subscribe_request(&self) -> SubscribeRequest {
         let filter = SubscribeRequestFilterTransactions {
             vote: self.vote,
@@ -233,6 +251,9 @@ pub enum YellowstoneGrpcError {
     /// Provider update could not be converted into a SOF event.
     #[error("yellowstone transaction conversion failed: {0}")]
     Convert(&'static str),
+    /// Yellowstone protocol/runtime failure.
+    #[error("yellowstone protocol error: {0}")]
+    Protocol(String),
     /// Provider-stream queue is closed.
     #[error("provider-stream queue closed")]
     QueueClosed,
@@ -268,6 +289,46 @@ pub async fn spawn_yellowstone_grpc_transaction_source(
     config: YellowstoneGrpcConfig,
     sender: ProviderStreamSender,
 ) -> Result<JoinHandle<Result<(), YellowstoneGrpcError>>, YellowstoneGrpcError> {
+    preflight_yellowstone_connection(&config).await?;
+    Ok(tokio::spawn(async move {
+        let mut attempts = 0_u32;
+        loop {
+            match run_yellowstone_transaction_connection(&config, &sender).await {
+                Ok(()) => {
+                    tracing::warn!(
+                        endpoint = config.endpoint(),
+                        "provider stream yellowstone session ended unexpectedly; reconnecting"
+                    );
+                }
+                Err(YellowstoneGrpcError::QueueClosed) => {
+                    return Err(YellowstoneGrpcError::QueueClosed);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        endpoint = config.endpoint(),
+                        "provider stream yellowstone session ended; reconnecting"
+                    );
+                }
+            }
+            attempts = attempts.saturating_add(1);
+            if let Some(max_attempts) = config.max_reconnect_attempts
+                && attempts >= max_attempts
+            {
+                return Err(YellowstoneGrpcError::Protocol(format!(
+                    "exhausted yellowstone reconnect attempts after {attempts} failures"
+                )));
+            }
+            tokio::time::sleep(config.reconnect_delay).await;
+        }
+    }))
+}
+
+async fn run_yellowstone_transaction_connection(
+    config: &YellowstoneGrpcConfig,
+    sender: &ProviderStreamSender,
+) -> Result<(), YellowstoneGrpcError> {
+    let commitment = config.commitment.as_tx_commitment();
     let mut builder = GeyserGrpcClient::build_from_shared(config.endpoint.clone())?
         .x_token(config.x_token.clone())?
         .max_decoding_message_size(config.max_decoding_message_size);
@@ -275,38 +336,52 @@ pub async fn spawn_yellowstone_grpc_transaction_source(
         builder = builder.connect_timeout(timeout);
     }
     let mut client = builder.connect().await?;
-    let commitment = config.commitment.as_tx_commitment();
-    let request = config.subscribe_request();
-    let (mut subscribe_tx, mut stream) = client.subscribe_with_request(Some(request)).await?;
-    Ok(tokio::spawn(async move {
-        while let Some(update) = stream.next().await {
-            let update = update?;
-            match update.update_oneof {
-                Some(UpdateOneof::Transaction(tx_update)) => {
-                    let event = transaction_event_from_update(
-                        tx_update.slot,
-                        tx_update.transaction,
-                        commitment,
-                    )?;
-                    sender
-                        .send(ProviderStreamUpdate::Transaction(event))
-                        .await
-                        .map_err(|_error| YellowstoneGrpcError::QueueClosed)?;
-                }
-                Some(UpdateOneof::Ping(_)) => {
-                    subscribe_tx
-                        .send(SubscribeRequest {
-                            ping: Some(SubscribeRequestPing { id: 1 }),
-                            ..SubscribeRequest::default()
-                        })
-                        .await
-                        .map_err(GeyserGrpcClientError::SubscribeSendError)?;
-                }
-                _ => {}
+    let (mut subscribe_tx, mut stream) = client
+        .subscribe_with_request(Some(config.subscribe_request()))
+        .await?;
+    while let Some(update) = stream.next().await {
+        let update = update?;
+        match update.update_oneof {
+            Some(UpdateOneof::Transaction(tx_update)) => {
+                let event = transaction_event_from_update(
+                    tx_update.slot,
+                    tx_update.transaction,
+                    commitment,
+                )?;
+                sender
+                    .send(ProviderStreamUpdate::Transaction(event))
+                    .await
+                    .map_err(|_error| YellowstoneGrpcError::QueueClosed)?;
             }
+            Some(UpdateOneof::Ping(_)) => {
+                subscribe_tx
+                    .send(SubscribeRequest {
+                        ping: Some(SubscribeRequestPing { id: 1 }),
+                        ..SubscribeRequest::default()
+                    })
+                    .await
+                    .map_err(GeyserGrpcClientError::SubscribeSendError)?;
+            }
+            _ => {}
         }
-        Ok(())
-    }))
+    }
+    Ok(())
+}
+
+async fn preflight_yellowstone_connection(
+    config: &YellowstoneGrpcConfig,
+) -> Result<(), YellowstoneGrpcError> {
+    let mut builder = GeyserGrpcClient::build_from_shared(config.endpoint.clone())?
+        .x_token(config.x_token.clone())?
+        .max_decoding_message_size(config.max_decoding_message_size);
+    if let Some(timeout) = config.connect_timeout {
+        builder = builder.connect_timeout(timeout);
+    }
+    let mut client = builder.connect().await?;
+    let (_subscribe_tx, _stream) = client
+        .subscribe_with_request(Some(config.subscribe_request()))
+        .await?;
+    Ok(())
 }
 
 fn transaction_event_from_update(
