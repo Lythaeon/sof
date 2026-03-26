@@ -14,8 +14,18 @@ use helius_laserstream::{
     ChannelOptions, LaserstreamConfig as ClientConfig, LaserstreamError as ClientError, grpc,
     subscribe,
 };
-use laserstream_core_proto::convert_from::create_tx_versioned;
-use laserstream_core_proto::prelude::Transaction as LaserStreamTransaction;
+use laserstream_core_proto::prelude::{
+    CompiledInstruction as ProtoCompiledInstruction, Message as ProtoMessage,
+    MessageAddressTableLookup as ProtoMessageAddressTableLookup,
+    MessageHeader as ProtoMessageHeader, SubscribeUpdateTransactionInfo,
+    Transaction as LaserStreamTransaction,
+};
+use solana_hash::Hash;
+use solana_message::{
+    Message, MessageHeader, VersionedMessage,
+    compiled_instruction::CompiledInstruction,
+    v0::{Message as MessageV0, MessageAddressTableLookup},
+};
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
@@ -349,6 +359,13 @@ fn transaction_event_from_update(
     let transaction =
         transaction.ok_or(LaserStreamError::Convert("missing transaction payload"))?;
     let is_vote = transaction.is_vote;
+    let signature = if is_vote {
+        Signature::try_from(transaction.signature.as_slice())
+            .map(Some)
+            .map_err(|_error| LaserStreamError::Convert("invalid signature"))?
+    } else {
+        None
+    };
     let tx = convert_transaction(
         transaction
             .transaction
@@ -359,7 +376,7 @@ fn transaction_event_from_update(
         commitment_status,
         confirmed_slot: None,
         finalized_slot: None,
-        signature: tx.signatures.first().copied(),
+        signature: signature.or_else(|| tx.signatures.first().copied()),
         kind: if is_vote {
             TxKind::VoteOnly
         } else {
@@ -369,22 +386,93 @@ fn transaction_event_from_update(
     })
 }
 
+#[inline]
 fn convert_transaction(
     tx: LaserStreamTransaction,
 ) -> Result<VersionedTransaction, LaserStreamError> {
-    create_tx_versioned(tx).map_err(LaserStreamError::Convert)
+    let mut signatures = Vec::with_capacity(tx.signatures.len());
+    for signature in tx.signatures {
+        signatures.push(Signature::try_from(signature.as_slice()).map_err(|_error| {
+            LaserStreamError::Convert("failed to parse transaction signature")
+        })?);
+    }
+    let message = tx
+        .message
+        .ok_or(LaserStreamError::Convert("missing transaction message"))?;
+    let header = message
+        .header
+        .ok_or(LaserStreamError::Convert("missing message header"))?;
+    let header = MessageHeader {
+        num_required_signatures: u8::try_from(header.num_required_signatures)
+            .map_err(|_error| LaserStreamError::Convert("invalid num_required_signatures"))?,
+        num_readonly_signed_accounts: u8::try_from(header.num_readonly_signed_accounts)
+            .map_err(|_error| LaserStreamError::Convert("invalid num_readonly_signed_accounts"))?,
+        num_readonly_unsigned_accounts: u8::try_from(header.num_readonly_unsigned_accounts)
+            .map_err(|_error| {
+                LaserStreamError::Convert("invalid num_readonly_unsigned_accounts")
+            })?,
+    };
+
+    let recent_blockhash = <[u8; 32]>::try_from(message.recent_blockhash.as_slice())
+        .map(Hash::new_from_array)
+        .map_err(|_error| LaserStreamError::Convert("invalid recent blockhash"))?;
+    let mut account_keys = Vec::with_capacity(message.account_keys.len());
+    for key in message.account_keys {
+        account_keys.push(
+            Pubkey::try_from(key.as_slice())
+                .map_err(|_error| LaserStreamError::Convert("invalid account key"))?,
+        );
+    }
+
+    let mut instructions = Vec::with_capacity(message.instructions.len());
+    for instruction in message.instructions {
+        instructions.push(CompiledInstruction {
+            program_id_index: u8::try_from(instruction.program_id_index).map_err(|_error| {
+                LaserStreamError::Convert("invalid compiled instruction program id index")
+            })?,
+            accounts: instruction.accounts,
+            data: instruction.data,
+        });
+    }
+
+    let message = if message.versioned {
+        let mut address_table_lookups = Vec::with_capacity(message.address_table_lookups.len());
+        for lookup in message.address_table_lookups {
+            address_table_lookups.push(MessageAddressTableLookup {
+                account_key: Pubkey::try_from(lookup.account_key.as_slice()).map_err(|_error| {
+                    LaserStreamError::Convert("invalid address table account key")
+                })?,
+                writable_indexes: lookup.writable_indexes,
+                readonly_indexes: lookup.readonly_indexes,
+            });
+        }
+
+        VersionedMessage::V0(MessageV0 {
+            header,
+            account_keys,
+            recent_blockhash,
+            instructions,
+            address_table_lookups,
+        })
+    } else {
+        VersionedMessage::Legacy(Message {
+            header,
+            account_keys,
+            recent_blockhash,
+            instructions,
+        })
+    };
+
+    Ok(VersionedTransaction {
+        signatures,
+        message,
+    })
 }
 
 #[cfg(all(test, feature = "provider-grpc"))]
 mod tests {
     use super::*;
     use crate::provider_stream::yellowstone::{YellowstoneGrpcCommitment, YellowstoneGrpcConfig};
-    use laserstream_core_proto::prelude::{
-        CompiledInstruction as ProtoCompiledInstruction, Message as ProtoMessage,
-        MessageAddressTableLookup as ProtoMessageAddressTableLookup,
-        MessageHeader as ProtoMessageHeader, SubscribeUpdateTransactionInfo,
-        Transaction as ProtoTransaction,
-    };
     use solana_instruction::Instruction;
     use solana_keypair::Keypair;
     use solana_message::{Message, VersionedMessage};
@@ -468,7 +556,7 @@ mod tests {
         VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&signer]).expect("tx")
     }
 
-    fn proto_transaction_from_versioned(tx: &VersionedTransaction) -> ProtoTransaction {
+    fn proto_transaction_from_versioned(tx: &VersionedTransaction) -> LaserStreamTransaction {
         let message = match &tx.message {
             VersionedMessage::Legacy(message) => ProtoMessage {
                 header: Some(ProtoMessageHeader {
@@ -535,7 +623,7 @@ mod tests {
                     .collect(),
             },
         };
-        ProtoTransaction {
+        LaserStreamTransaction {
             signatures: tx
                 .signatures
                 .iter()
@@ -545,9 +633,9 @@ mod tests {
         }
     }
 
-    fn sample_update() -> SubscribeUpdateTransactionInfo {
+    fn sample_update() -> grpc::SubscribeUpdateTransactionInfo {
         let tx = sample_transaction();
-        SubscribeUpdateTransactionInfo {
+        grpc::SubscribeUpdateTransactionInfo {
             signature: tx.signatures.first().expect("signature").as_ref().to_vec(),
             is_vote: false,
             transaction: Some(proto_transaction_from_versioned(&tx)),
@@ -556,9 +644,9 @@ mod tests {
         }
     }
 
-    fn sample_vote_update() -> SubscribeUpdateTransactionInfo {
+    fn sample_vote_update() -> grpc::SubscribeUpdateTransactionInfo {
         let tx = sample_vote_transaction();
-        SubscribeUpdateTransactionInfo {
+        grpc::SubscribeUpdateTransactionInfo {
             signature: tx.signatures.first().expect("signature").as_ref().to_vec(),
             is_vote: true,
             transaction: Some(proto_transaction_from_versioned(&tx)),
@@ -591,6 +679,145 @@ mod tests {
             kind: classify_provider_transaction_kind(&tx),
             tx: Arc::new(tx),
         })
+    }
+
+    fn convert_transaction_sdk_baseline(
+        tx: LaserStreamTransaction,
+    ) -> Result<VersionedTransaction, LaserStreamError> {
+        let mut signatures = Vec::with_capacity(tx.signatures.len());
+        for signature in tx.signatures {
+            signatures.push(Signature::try_from(signature.as_slice()).map_err(|_error| {
+                LaserStreamError::Convert("failed to parse transaction signature")
+            })?);
+        }
+
+        let message = tx
+            .message
+            .ok_or(LaserStreamError::Convert("missing transaction message"))?;
+        let header = message
+            .header
+            .ok_or(LaserStreamError::Convert("missing message header"))?;
+        let header = MessageHeader {
+            num_required_signatures: header
+                .num_required_signatures
+                .try_into()
+                .map_err(|_error| LaserStreamError::Convert("invalid num_required_signatures"))?,
+            num_readonly_signed_accounts: header.num_readonly_signed_accounts.try_into().map_err(
+                |_error| LaserStreamError::Convert("invalid num_readonly_signed_accounts"),
+            )?,
+            num_readonly_unsigned_accounts: header
+                .num_readonly_unsigned_accounts
+                .try_into()
+                .map_err(|_error| {
+                    LaserStreamError::Convert("invalid num_readonly_unsigned_accounts")
+                })?,
+        };
+
+        if message.recent_blockhash.len() != 32 {
+            return Err(LaserStreamError::Convert("invalid recent blockhash"));
+        }
+
+        let recent_blockhash = Hash::new_from_array(
+            <[u8; 32]>::try_from(message.recent_blockhash.as_slice())
+                .map_err(|_error| LaserStreamError::Convert("invalid recent blockhash"))?,
+        );
+
+        let account_keys = {
+            let mut keys = Vec::with_capacity(message.account_keys.len());
+            for key in message.account_keys {
+                keys.push(
+                    Pubkey::try_from(key.as_slice())
+                        .map_err(|_error| LaserStreamError::Convert("invalid account key"))?,
+                );
+            }
+            keys
+        };
+
+        let instructions = {
+            let mut compiled = Vec::with_capacity(message.instructions.len());
+            for instruction in message.instructions {
+                compiled.push(CompiledInstruction {
+                    program_id_index: instruction.program_id_index.try_into().map_err(
+                        |_error| {
+                            LaserStreamError::Convert(
+                                "invalid compiled instruction program id index",
+                            )
+                        },
+                    )?,
+                    accounts: instruction.accounts,
+                    data: instruction.data,
+                });
+            }
+            compiled
+        };
+
+        let message = if message.versioned {
+            let mut address_table_lookups = Vec::with_capacity(message.address_table_lookups.len());
+            for lookup in message.address_table_lookups {
+                address_table_lookups.push(MessageAddressTableLookup {
+                    account_key: Pubkey::try_from(lookup.account_key.as_slice()).map_err(
+                        |_error| LaserStreamError::Convert("invalid address table account key"),
+                    )?,
+                    writable_indexes: lookup.writable_indexes,
+                    readonly_indexes: lookup.readonly_indexes,
+                });
+            }
+            VersionedMessage::V0(MessageV0 {
+                header,
+                account_keys,
+                recent_blockhash,
+                instructions,
+                address_table_lookups,
+            })
+        } else {
+            VersionedMessage::Legacy(Message {
+                header,
+                account_keys,
+                recent_blockhash,
+                instructions,
+            })
+        };
+
+        Ok(VersionedTransaction {
+            signatures,
+            message,
+        })
+    }
+
+    #[test]
+    fn laserstream_local_conversion_matches_sdk_baseline() {
+        let tx = proto_transaction_from_versioned(&sample_transaction());
+        let local = convert_transaction(tx.clone()).expect("local tx");
+        let baseline = convert_transaction_sdk_baseline(tx).expect("baseline tx");
+        assert_eq!(local, baseline);
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for local-vs-sdk-like LaserStream tx conversion"]
+    fn laserstream_local_conversion_profile_fixture() {
+        let iterations = profile_iterations(200_000);
+        let tx = proto_transaction_from_versioned(&sample_transaction());
+
+        let baseline_started = Instant::now();
+        for _ in 0..iterations {
+            let tx = convert_transaction_sdk_baseline(tx.clone()).expect("baseline tx");
+            std::hint::black_box(tx);
+        }
+        let baseline_elapsed = baseline_started.elapsed();
+
+        let optimized_started = Instant::now();
+        for _ in 0..iterations {
+            let tx = convert_transaction(tx.clone()).expect("optimized tx");
+            std::hint::black_box(tx);
+        }
+        let optimized_elapsed = optimized_started.elapsed();
+
+        eprintln!(
+            "laserstream_local_conversion_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            iterations,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
+        );
     }
 
     #[test]
