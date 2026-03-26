@@ -39,6 +39,18 @@ Implemented provider-stream adapters today:
 
 - Yellowstone gRPC
 - LaserStream gRPC
+- websocket `transactionSubscribe`
+
+Built-in hook surface by provider mode:
+
+- Yellowstone gRPC: `on_transaction`
+- LaserStream gRPC: `on_transaction`
+- websocket `transactionSubscribe`: `on_transaction`
+
+That also means SOF's internal transaction classifier hooks such as
+`transaction_prefilter`, `accepts_transaction_ref`, and `transaction_interest_ref`
+apply to all three built-in provider transaction adapters because they all
+materialize full transactions before dispatch.
 
 The intended positioning is straightforward:
 

@@ -15,7 +15,7 @@ use std::{
 use crate::event::TxKind;
 use crate::framework::{
     PluginConfig, PluginContext, PluginSetupError, TransactionDispatchMode, TransactionEventRef,
-    TransactionInterest, TransactionPrefilter, TxCommitmentStatus,
+    TransactionInterest, TransactionLogEvent, TransactionPrefilter, TxCommitmentStatus,
 };
 
 #[derive(Clone, Copy)]
@@ -54,6 +54,30 @@ fn builder_registers_multiple_plugins_from_iterator() {
         .with_plugin(PluginB)
         .build();
     assert_eq!(host.len(), 3);
+}
+
+#[test]
+fn builder_tracks_transaction_log_interest() {
+    struct TransactionLogPlugin;
+
+    #[async_trait]
+    impl ObserverPlugin for TransactionLogPlugin {
+        fn config(&self) -> PluginConfig {
+            PluginConfig {
+                transaction_log: true,
+                ..PluginConfig::new()
+            }
+        }
+
+        fn accepts_transaction_log(&self, _event: &TransactionLogEvent) -> bool {
+            true
+        }
+    }
+
+    let host = PluginHostBuilder::new()
+        .add_plugin(TransactionLogPlugin)
+        .build();
+    assert!(host.wants_transaction_log());
 }
 
 #[derive(Clone, Copy)]

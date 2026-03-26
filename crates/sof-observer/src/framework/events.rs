@@ -2,6 +2,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use agave_transaction_view::transaction_view::SanitizedTransactionView;
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
@@ -77,6 +78,36 @@ pub struct TransactionEvent {
     pub tx: Arc<VersionedTransaction>,
     /// SOF transaction kind classification.
     pub kind: TxKind,
+}
+
+#[derive(Debug, Clone)]
+/// Runtime event emitted for one provider-stream websocket log notification.
+///
+/// This is intended for `logsSubscribe`-style feeds that can surface signatures
+/// and log lines quickly but do not provide a full decoded transaction object.
+///
+/// # Examples
+///
+/// ```rust
+/// use sof::framework::TransactionLogEvent;
+///
+/// fn signature(event: &TransactionLogEvent) -> solana_signature::Signature {
+///     event.signature
+/// }
+/// ```
+pub struct TransactionLogEvent {
+    /// Slot context attached to the websocket log notification.
+    pub slot: u64,
+    /// Commitment status configured for the upstream websocket subscription.
+    pub commitment_status: TxCommitmentStatus,
+    /// Transaction signature carried by the log notification.
+    pub signature: Signature,
+    /// Transaction error payload when the upstream feed included one.
+    pub err: Option<JsonValue>,
+    /// Program/runtime log lines attached to the transaction.
+    pub logs: Arc<[String]>,
+    /// Matching pubkey for one `mentions`-style subscription when present.
+    pub matched_filter: Option<Pubkey>,
 }
 
 #[derive(Debug, Clone)]

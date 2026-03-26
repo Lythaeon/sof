@@ -39,6 +39,18 @@ Implemented provider-stream adapters:
 
 - Yellowstone gRPC
 - LaserStream gRPC
+- websocket `transactionSubscribe`
+
+Built-in hook surface by provider mode:
+
+- Yellowstone gRPC: `on_transaction`
+- LaserStream gRPC: `on_transaction`
+- websocket `transactionSubscribe`: `on_transaction`
+
+SOF's internal transaction classifier hooks, including `transaction_prefilter`,
+`accepts_transaction_ref`, and `transaction_interest_ref`, work on the
+Yellowstone, LaserStream, and websocket transaction adapters because all three
+feed full transactions into `on_transaction`.
 
 That tradeoff should be explicit: public gossip is the independent baseline, trusted raw shred
 distribution is the fast path, and processed provider streams are a different observer model.
@@ -82,6 +94,13 @@ For Yellowstone gRPC, see
 [`examples/provider_stream_yellowstone_grpc.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/provider_stream_yellowstone_grpc.rs).
 For LaserStream, see
 [`examples/provider_stream_laserstream.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/provider_stream_laserstream.rs).
+For websocket `transactionSubscribe`, see
+[`examples/provider_stream_websocket_transaction.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/provider_stream_websocket_transaction.rs).
+
+Build flags:
+
+- Yellowstone gRPC and LaserStream gRPC: `provider-grpc`
+- websocket `transactionSubscribe`: `provider-websocket`
 
 ## At a Glance
 

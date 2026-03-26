@@ -5,6 +5,15 @@
 //! These updates bypass SOF's packet, shred, FEC, and reconstruction stages and
 //! enter directly at the plugin/derived-state transaction layer.
 //!
+//! Built-in mode capability summary:
+//!
+//! - `YellowstoneGrpc`: built-in adapter emits `on_transaction`
+//! - `LaserStream`: built-in adapter emits `on_transaction`
+//! - `WebsocketTransaction`: built-in adapter emits `on_transaction`
+//!
+//! Generic provider producers may still enqueue `TransactionViewBatch`,
+//! `RecentBlockhash`, `SlotStatus`, or `ClusterTopology` updates directly.
+//!
 //! # Feed Provider Transactions Into SOF
 //!
 //! ```no_run
@@ -54,7 +63,7 @@ use tokio::sync::mpsc;
 
 use crate::framework::{
     ClusterTopologyEvent, ObservedRecentBlockhashEvent, SlotStatusEvent, TransactionEvent,
-    TransactionViewBatchEvent,
+    TransactionLogEvent, TransactionViewBatchEvent,
 };
 
 /// Default queue capacity for processed provider-stream ingress.
@@ -64,9 +73,18 @@ pub const DEFAULT_PROVIDER_STREAM_QUEUE_CAPACITY: usize = 8_192;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderStreamMode {
     /// Yellowstone gRPC / Geyser-style processed transaction feeds.
+    ///
+    /// Built-in adapter hook surface today: `on_transaction`.
     YellowstoneGrpc,
     /// LaserStream-style processed transaction feeds.
+    ///
+    /// Built-in adapter hook surface today: `on_transaction`.
     LaserStream,
+    #[cfg(feature = "provider-websocket")]
+    /// Websocket `transactionSubscribe` processed transaction feeds.
+    ///
+    /// Built-in adapter hook surface today: `on_transaction`.
+    WebsocketTransaction,
 }
 
 impl ProviderStreamMode {
@@ -76,6 +94,8 @@ impl ProviderStreamMode {
         match self {
             Self::YellowstoneGrpc => "yellowstone_grpc",
             Self::LaserStream => "laserstream",
+            #[cfg(feature = "provider-websocket")]
+            Self::WebsocketTransaction => "websocket_transaction",
         }
     }
 }
@@ -85,6 +105,8 @@ impl ProviderStreamMode {
 pub enum ProviderStreamUpdate {
     /// One provider transaction mapped onto SOF's transaction hook surface.
     Transaction(TransactionEvent),
+    /// One provider/websocket transaction-log notification.
+    TransactionLog(TransactionLogEvent),
     /// One provider transaction-view batch mapped onto SOF's view-batch surface.
     TransactionViewBatch(TransactionViewBatchEvent),
     /// One provider recent-blockhash observation.
@@ -98,6 +120,12 @@ pub enum ProviderStreamUpdate {
 impl From<TransactionEvent> for ProviderStreamUpdate {
     fn from(event: TransactionEvent) -> Self {
         Self::Transaction(event)
+    }
+}
+
+impl From<TransactionLogEvent> for ProviderStreamUpdate {
+    fn from(event: TransactionLogEvent) -> Self {
+        Self::TransactionLog(event)
     }
 }
 
@@ -146,10 +174,14 @@ pub fn create_provider_stream_queue(
     mpsc::channel(capacity.max(1))
 }
 
-#[cfg(feature = "yellowstone-grpc")]
+#[cfg(feature = "provider-grpc")]
 /// Yellowstone gRPC adapter helpers.
 pub mod yellowstone;
 
-#[cfg(feature = "laserstream")]
+#[cfg(feature = "provider-grpc")]
 /// Helius LaserStream adapter helpers.
 pub mod laserstream;
+
+#[cfg(feature = "provider-websocket")]
+/// Websocket `transactionSubscribe` adapter helpers.
+pub mod websocket;

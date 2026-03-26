@@ -21,8 +21,15 @@ workspace = true
 default = []
 gossip-bootstrap = ["dep:solana-gossip"]
 kernel-bypass = ["dep:xdp"]
-yellowstone-grpc = ["dep:yellowstone-grpc-client", "dep:yellowstone-grpc-proto"]
-laserstream = ["dep:helius-laserstream", "dep:laserstream-core-proto"]
+provider-grpc = [
+    "dep:yellowstone-grpc-client",
+    "dep:yellowstone-grpc-proto",
+    "dep:helius-laserstream",
+    "dep:laserstream-core-proto",
+]
+yellowstone-grpc = ["provider-grpc"]
+laserstream = ["provider-grpc"]
+provider-websocket = []
 
 [dependencies]
 agave-transaction-view = { version = "3.1.8", features = ["agave-unstable-api"] }
@@ -54,6 +61,7 @@ socket2 = "0.5"
 bincode = "1.3.3"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
+base64 = "0.22"
 libc = "0.2"
 rand = "0.8.5"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -135,12 +143,17 @@ path = "examples/af_xdp_kernel_bypass_ingress_metrics.rs"
 [[example]]
 name = "provider_stream_yellowstone_grpc"
 path = "examples/provider_stream_yellowstone_grpc.rs"
-required-features = ["yellowstone-grpc"]
+required-features = ["provider-grpc"]
 
 [[example]]
 name = "provider_stream_laserstream"
 path = "examples/provider_stream_laserstream.rs"
-required-features = ["laserstream"]
+required-features = ["provider-grpc"]
+
+[[example]]
+name = "provider_stream_websocket_transaction"
+path = "examples/provider_stream_websocket_transaction.rs"
+required-features = ["provider-websocket"]
 
 [[bin]]
 name = "gossip_protocol_profile"

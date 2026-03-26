@@ -34,7 +34,7 @@ pub use events::{
     ControlPlaneSource, DatasetEvent, LeaderScheduleEntry, LeaderScheduleEvent,
     ObservedRecentBlockhashEvent, RawPacketEvent, ReorgEvent, SerializedTransactionRange,
     ShredEvent, SlotStatusEvent, TransactionBatchEvent, TransactionEvent, TransactionEventRef,
-    TransactionViewBatchEvent,
+    TransactionLogEvent, TransactionViewBatchEvent,
 };
 pub use extension::{
     ExtensionCapability, ExtensionContext, ExtensionManifest, ExtensionResourceSpec,

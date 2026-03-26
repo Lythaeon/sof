@@ -1513,6 +1513,7 @@ async fn run_provider_stream_runtime(
         .startup()
         .await
         .map_err(|error| RuntimeError::Runloop(error.to_string()))?;
+    log_provider_stream_capability_warnings(mode, &plugin_host);
     derived_state_host.initialize();
     tracing::info!(mode = mode.as_str(), "starting SOF provider-stream runtime");
 
@@ -1559,6 +1560,9 @@ fn dispatch_provider_stream_update(
             derived_state_host.on_transaction(tx_index, event.clone());
             plugin_host.on_transaction(event);
         }
+        ProviderStreamUpdate::TransactionLog(event) => {
+            plugin_host.on_transaction_log(event);
+        }
         ProviderStreamUpdate::TransactionViewBatch(event) => {
             plugin_host.on_transaction_view_batch(event, Instant::now());
         }
@@ -1574,6 +1578,75 @@ fn dispatch_provider_stream_update(
             derived_state_host.on_cluster_topology(event.clone());
             plugin_host.on_cluster_topology(event);
         }
+    }
+}
+
+fn log_provider_stream_capability_warnings(mode: ProviderStreamMode, plugin_host: &PluginHost) {
+    let mut unsupported = Vec::new();
+    if plugin_host.wants_raw_packet() {
+        unsupported.push("on_raw_packet");
+    }
+    if plugin_host.wants_shred() {
+        unsupported.push("on_shred");
+    }
+    if plugin_host.wants_dataset() {
+        unsupported.push("on_dataset");
+    }
+    if plugin_host.wants_account_touch() {
+        unsupported.push("on_account_touch");
+    }
+    if plugin_host.wants_reorg() {
+        unsupported.push("on_reorg");
+    }
+    if plugin_host.wants_leader_schedule() {
+        unsupported.push("on_leader_schedule");
+    }
+    if plugin_host.wants_transaction_batch() {
+        unsupported.push("on_transaction_batch");
+    }
+    match mode {
+        ProviderStreamMode::YellowstoneGrpc | ProviderStreamMode::LaserStream => {
+            if plugin_host.wants_transaction_log() {
+                unsupported.push("on_transaction_log");
+            }
+            if plugin_host.wants_transaction_view_batch() {
+                unsupported.push("on_transaction_view_batch");
+            }
+            if plugin_host.wants_recent_blockhash() {
+                unsupported.push("on_recent_blockhash");
+            }
+            if plugin_host.wants_slot_status() {
+                unsupported.push("on_slot_status");
+            }
+            if plugin_host.wants_cluster_topology() {
+                unsupported.push("on_cluster_topology");
+            }
+        }
+        #[cfg(feature = "provider-websocket")]
+        ProviderStreamMode::WebsocketTransaction => {
+            if plugin_host.wants_transaction_log() {
+                unsupported.push("on_transaction_log");
+            }
+            if plugin_host.wants_transaction_view_batch() {
+                unsupported.push("on_transaction_view_batch");
+            }
+            if plugin_host.wants_recent_blockhash() {
+                unsupported.push("on_recent_blockhash");
+            }
+            if plugin_host.wants_slot_status() {
+                unsupported.push("on_slot_status");
+            }
+            if plugin_host.wants_cluster_topology() {
+                unsupported.push("on_cluster_topology");
+            }
+        }
+    }
+    if !unsupported.is_empty() {
+        tracing::warn!(
+            mode = mode.as_str(),
+            unsupported_hooks = unsupported.join(","),
+            "provider-stream mode will not emit some requested plugin hooks"
+        );
     }
 }
 

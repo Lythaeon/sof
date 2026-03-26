@@ -231,6 +231,10 @@ impl PluginHostBuilder {
             collect_hook_plugins(&plugins, &plugin_subscriptions, |subscription| {
                 subscription.transaction
             });
+        let transaction_log_plugins =
+            collect_hook_plugins(&plugins, &plugin_subscriptions, |subscription| {
+                subscription.transaction_log
+            });
         let transaction_batch_plugins =
             collect_hook_plugins(&plugins, &plugin_subscriptions, |subscription| {
                 subscription.transaction_batch
@@ -297,6 +301,7 @@ impl PluginHostBuilder {
             shred: !shred_plugins.is_empty(),
             dataset: !dataset_plugins.is_empty(),
             transaction: !transaction_plugins.is_empty(),
+            transaction_log: !transaction_log_plugins.is_empty(),
             inline_transaction: plugin_subscriptions
                 .iter()
                 .any(|subscription| subscription.inline_transaction),
@@ -320,6 +325,7 @@ impl PluginHostBuilder {
                 raw_packet: raw_packet_plugins,
                 shred: shred_plugins,
                 dataset: dataset_plugins,
+                transaction_log: transaction_log_plugins.clone(),
                 transaction_batch: transaction_batch_plugins.clone(),
                 transaction_view_batch: transaction_view_batch_plugins.clone(),
                 account_touch: account_touch_plugins.clone(),
@@ -342,6 +348,7 @@ impl PluginHostBuilder {
         PluginHost {
             plugins,
             transaction_plugins,
+            transaction_log_plugins,
             transaction_plugin_inline_preferences,
             transaction_plugin_prefilters,
             transaction_batch_plugins,

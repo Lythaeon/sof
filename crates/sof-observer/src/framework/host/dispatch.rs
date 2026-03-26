@@ -60,6 +60,8 @@ pub(super) enum PluginHookKind {
     Dataset,
     /// Accepted transaction callbacks.
     Transaction,
+    /// Transaction-log callbacks.
+    TransactionLog,
     /// Completed-dataset transaction-batch callbacks.
     TransactionBatch,
     /// Completed-dataset transaction-view-batch callbacks.
@@ -86,6 +88,7 @@ impl PluginHookKind {
             Self::Shred => "on_shred",
             Self::Dataset => "on_dataset",
             Self::Transaction => "on_transaction",
+            Self::TransactionLog => "on_transaction_log",
             Self::TransactionBatch => "on_transaction_batch",
             Self::TransactionViewBatch => "on_transaction_view_batch",
             Self::AccountTouch => "on_account_touch",
@@ -126,6 +129,8 @@ pub(super) struct PluginDispatchTargets {
     pub(super) shred: Arc<[Arc<dyn ObserverPlugin>]>,
     /// Plugins interested in dataset callbacks.
     pub(super) dataset: Arc<[Arc<dyn ObserverPlugin>]>,
+    /// Plugins interested in transaction-log callbacks.
+    pub(super) transaction_log: Arc<[Arc<dyn ObserverPlugin>]>,
     /// Plugins interested in transaction-batch callbacks.
     pub(super) transaction_batch: Arc<[Arc<dyn ObserverPlugin>]>,
     /// Plugins interested in transaction-view-batch callbacks.
@@ -150,6 +155,7 @@ impl PluginDispatchTargets {
         self.raw_packet.is_empty()
             && self.shred.is_empty()
             && self.dataset.is_empty()
+            && self.transaction_log.is_empty()
             && self.transaction_batch.is_empty()
             && self.transaction_view_batch.is_empty()
             && self.account_touch.is_empty()
@@ -167,6 +173,7 @@ impl PluginDispatchTargets {
             PluginHookKind::Shred => &self.shred,
             PluginHookKind::Dataset => &self.dataset,
             PluginHookKind::Transaction => &[],
+            PluginHookKind::TransactionLog => &self.transaction_log,
             PluginHookKind::TransactionBatch => &[],
             PluginHookKind::TransactionViewBatch => &[],
             PluginHookKind::AccountTouch => &self.account_touch,
@@ -868,6 +875,8 @@ pub(super) enum PluginDispatchEvent {
     Shred(ShredEvent),
     /// Reassembled dataset callback payload.
     Dataset(DatasetEvent),
+    /// Provider/websocket transaction-log callback payload targeted to a subset of plugins.
+    SelectedTransactionLog(SelectedTransactionLogDispatch),
     /// Completed-dataset transaction-batch callback payload.
     TransactionBatch(AcceptedTransactionBatchDispatch),
     /// Completed-dataset transaction-view-batch callback payload.
@@ -895,6 +904,7 @@ impl PluginDispatchEvent {
             Self::RawPacket(_) => PluginHookKind::RawPacket,
             Self::Shred(_) => PluginHookKind::Shred,
             Self::Dataset(_) => PluginHookKind::Dataset,
+            Self::SelectedTransactionLog(_) => PluginHookKind::TransactionLog,
             Self::TransactionBatch(_) => PluginHookKind::TransactionBatch,
             Self::TransactionViewBatch(_) => PluginHookKind::TransactionViewBatch,
             Self::AccountTouch(_) => PluginHookKind::AccountTouch,
@@ -924,6 +934,48 @@ pub(super) enum SelectedAccountTouchDispatch {
         /// Shared event payload for the selected plugin batch.
         event: Arc<AccountTouchEvent>,
     },
+}
+
+/// One selected transaction-log callback fan-out unit.
+pub(super) enum SelectedTransactionLogDispatch {
+    /// One interested plugin receives the event directly.
+    Single {
+        /// Selected plugin callback target.
+        plugin: Arc<dyn ObserverPlugin>,
+        /// Event payload for the selected plugin.
+        event: crate::framework::TransactionLogEvent,
+    },
+    /// Multiple interested plugins share the same event payload.
+    Multi {
+        /// Selected plugin callback targets.
+        plugins: SmallVec<[Arc<dyn ObserverPlugin>; 4]>,
+        /// Shared event payload.
+        event: Arc<crate::framework::TransactionLogEvent>,
+    },
+}
+
+impl SelectedTransactionLogDispatch {
+    pub(super) fn from_plugins(
+        plugins: &[Arc<dyn ObserverPlugin>],
+        event: crate::framework::TransactionLogEvent,
+    ) -> Option<Self> {
+        let interested: SmallVec<[Arc<dyn ObserverPlugin>; 4]> = plugins
+            .iter()
+            .filter(|plugin| plugin.accepts_transaction_log(&event))
+            .cloned()
+            .collect();
+        match interested.len() {
+            0 => None,
+            1 => Some(Self::Single {
+                plugin: interested.into_iter().next()?,
+                event,
+            }),
+            _ => Some(Self::Multi {
+                plugins: interested,
+                event: Arc::new(event),
+            }),
+        }
+    }
 }
 
 /// Preclassified account-touch routing target.
@@ -1514,6 +1566,9 @@ async fn dispatch_event(
             )
             .await
         }
+        PluginDispatchEvent::SelectedTransactionLog(event) => {
+            dispatch_selected_transaction_log_event(event, dispatch_mode).await
+        }
         PluginDispatchEvent::TransactionBatch(event) => {
             dispatch_transaction_batch_event(event, dispatch_mode).await
         }
@@ -1782,6 +1837,29 @@ async fn dispatch_selected_account_touch_event(
                 dispatch_mode,
                 |plugin, hook_event| async move {
                     plugin.on_account_touch(hook_event.as_ref()).await;
+                },
+            )
+            .await;
+        }
+    }
+}
+
+async fn dispatch_selected_transaction_log_event(
+    event: SelectedTransactionLogDispatch,
+    dispatch_mode: PluginDispatchMode,
+) {
+    match event {
+        SelectedTransactionLogDispatch::Single { plugin, event } => {
+            plugin.on_transaction_log(&event).await;
+        }
+        SelectedTransactionLogDispatch::Multi { plugins, event } => {
+            dispatch_hook_event(
+                &plugins,
+                PluginHookKind::TransactionLog,
+                event,
+                dispatch_mode,
+                |plugin, hook_event| async move {
+                    plugin.on_transaction_log(hook_event.as_ref()).await;
                 },
             )
             .await;

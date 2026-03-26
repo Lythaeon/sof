@@ -13,7 +13,7 @@ use crate::framework::events::{
     AccountTouchEvent, AccountTouchEventRef, ClusterTopologyEvent, DatasetEvent,
     LeaderScheduleEvent, ObservedRecentBlockhashEvent, RawPacketEvent, ReorgEvent, ShredEvent,
     SlotStatusEvent, TransactionBatchEvent, TransactionEvent, TransactionEventRef,
-    TransactionViewBatchEvent,
+    TransactionLogEvent, TransactionViewBatchEvent,
 };
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -336,6 +336,8 @@ pub struct PluginConfig {
     pub dataset: bool,
     /// Enables `on_transaction`.
     pub transaction: bool,
+    /// Enables `on_transaction_log`.
+    pub transaction_log: bool,
     /// Requested delivery path for `on_transaction`.
     pub transaction_dispatch_mode: TransactionDispatchMode,
     /// Enables `on_transaction_batch`.
@@ -663,6 +665,15 @@ pub trait ObserverPlugin: Send + Sync + 'static {
     /// transaction delivery receive this hook from the completed-dataset boundary even when
     /// other dataset consumers still continue on the dataset-worker path.
     async fn on_transaction(&self, _event: &TransactionEvent) {}
+
+    /// Called for one websocket/provider log notification that does not carry a
+    /// full decoded transaction object.
+    async fn on_transaction_log(&self, _event: &TransactionLogEvent) {}
+
+    /// Returns true when this plugin wants a specific transaction-log callback.
+    fn accepts_transaction_log(&self, _event: &TransactionLogEvent) -> bool {
+        true
+    }
 
     /// Called once per completed dataset with all decoded transactions in dataset order.
     ///

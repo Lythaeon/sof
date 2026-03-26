@@ -3,8 +3,8 @@
 use super::dispatch::{
     ClassifiedAccountTouchDispatch, ClassifiedTransactionBatchDispatch,
     ClassifiedTransactionDispatch, ClassifiedTransactionViewBatchDispatch, PluginDispatchEvent,
-    PluginDispatcher, SelectedAccountTouchDispatch, TransactionDispatchPriority,
-    TransactionPluginDispatcher,
+    PluginDispatcher, SelectedAccountTouchDispatch, SelectedTransactionLogDispatch,
+    TransactionDispatchPriority, TransactionPluginDispatcher,
 };
 use super::state::{ObservedRecentBlockhashState, ObservedTpuLeaderState};
 
@@ -88,6 +88,8 @@ pub struct PluginHost {
     pub(super) plugins: Arc<[Arc<dyn ObserverPlugin>]>,
     /// Plugins interested in transaction callbacks.
     pub(super) transaction_plugins: Arc<[Arc<dyn ObserverPlugin>]>,
+    /// Plugins interested in transaction-log callbacks.
+    pub(super) transaction_log_plugins: Arc<[Arc<dyn ObserverPlugin>]>,
     /// Per-transaction-plugin inline delivery preference in registration order.
     pub(super) transaction_plugin_inline_preferences: Arc<[bool]>,
     /// Optional compiled transaction prefilters in registration order.
@@ -121,6 +123,7 @@ impl Default for PluginHost {
         Self {
             plugins: Arc::from(Vec::<Arc<dyn ObserverPlugin>>::new()),
             transaction_plugins: Arc::from(Vec::<Arc<dyn ObserverPlugin>>::new()),
+            transaction_log_plugins: Arc::from(Vec::<Arc<dyn ObserverPlugin>>::new()),
             transaction_plugin_inline_preferences: Arc::from(Vec::<bool>::new()),
             transaction_plugin_prefilters: Arc::from(Vec::<
                 Option<crate::framework::TransactionPrefilter>,
@@ -169,6 +172,12 @@ impl PluginHost {
     #[must_use]
     pub const fn wants_transaction(&self) -> bool {
         self.subscriptions.transaction
+    }
+
+    /// Returns true when at least one plugin wants transaction-log callbacks.
+    #[must_use]
+    pub const fn wants_transaction_log(&self) -> bool {
+        self.subscriptions.transaction_log
     }
 
     /// Returns true when at least one plugin requested inline transaction dispatch.
@@ -612,6 +621,21 @@ impl PluginHost {
             && let Some(dispatcher) = &self.dispatcher
         {
             dispatcher.dispatch(PluginDispatchEvent::Dataset(event));
+        }
+    }
+
+    /// Enqueues provider/websocket transaction-log hook to registered plugins.
+    pub fn on_transaction_log(&self, event: crate::framework::TransactionLogEvent) {
+        if !self.subscriptions.transaction_log {
+            return;
+        }
+        let Some(dispatcher) = &self.dispatcher else {
+            return;
+        };
+        if let Some(dispatch) =
+            SelectedTransactionLogDispatch::from_plugins(&self.transaction_log_plugins, event)
+        {
+            dispatcher.dispatch(PluginDispatchEvent::SelectedTransactionLog(dispatch));
         }
     }
 

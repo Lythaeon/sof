@@ -137,6 +137,8 @@ struct PluginHookSubscriptions {
     dataset: bool,
     /// At least one plugin wants transaction callbacks.
     transaction: bool,
+    /// At least one plugin wants transaction-log callbacks.
+    transaction_log: bool,
     /// At least one plugin requested inline transaction dispatch.
     inline_transaction: bool,
     /// At least one plugin wants transaction batch callbacks.
@@ -168,6 +170,7 @@ impl From<&PluginConfig> for PluginHookSubscriptions {
             shred: config.shred,
             dataset: config.dataset,
             transaction: config.transaction,
+            transaction_log: config.transaction_log,
             inline_transaction: config.transaction
                 && matches!(
                     config.transaction_dispatch_mode,

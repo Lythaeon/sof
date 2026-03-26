@@ -5332,6 +5332,7 @@ dependencies = [
  "agave-transaction-view",
  "arcshift",
  "async-trait",
+ "base64 0.22.1",
  "bincode",
  "core_affinity",
  "criterion",

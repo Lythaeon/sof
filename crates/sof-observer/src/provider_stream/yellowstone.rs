@@ -188,7 +188,7 @@ impl YellowstoneGrpcConfig {
         self
     }
 
-    fn subscribe_request(&self) -> SubscribeRequest {
+    pub(crate) fn subscribe_request(&self) -> SubscribeRequest {
         let filter = SubscribeRequestFilterTransactions {
             vote: self.vote,
             failed: self.failed,

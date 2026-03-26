@@ -1,6 +1,11 @@
 #![allow(clippy::missing_docs_in_private_items)]
 
 //! Helius LaserStream adapters for SOF processed provider-stream ingress.
+//!
+//! LaserStream uses the Yellowstone-compatible gRPC subscription model. SOF's
+//! built-in adapter intentionally stays on the shared transaction subscription
+//! surface: commitment, signature, vote/failed flags, and account
+//! include/exclude/required filters.
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -215,7 +220,7 @@ impl LaserStreamConfig {
         self
     }
 
-    fn subscribe_request(&self) -> grpc::SubscribeRequest {
+    pub(crate) fn subscribe_request(&self) -> grpc::SubscribeRequest {
         let filter = grpc::SubscribeRequestFilterTransactions {
             vote: self.vote,
             failed: self.failed,
@@ -388,5 +393,58 @@ fn classify_tx_kind(tx: &VersionedTransaction) -> TxKind {
         TxKind::Mixed
     } else {
         TxKind::NonVote
+    }
+}
+
+#[cfg(all(test, feature = "provider-grpc"))]
+mod tests {
+    use super::*;
+    use crate::provider_stream::yellowstone::{YellowstoneGrpcCommitment, YellowstoneGrpcConfig};
+
+    #[test]
+    fn transaction_filter_shape_matches_yellowstone_config() {
+        let signature = Signature::from([7_u8; 64]);
+        let include = [Pubkey::new_unique(), Pubkey::new_unique()];
+        let exclude = [Pubkey::new_unique()];
+        let required = [Pubkey::new_unique()];
+
+        let laser = LaserStreamConfig::new("https://laserstream.example", "token")
+            .with_commitment(LaserStreamCommitment::Confirmed)
+            .with_vote(true)
+            .with_failed(true)
+            .with_signature(signature)
+            .with_account_include(include)
+            .with_account_exclude(exclude)
+            .with_account_required(required)
+            .subscribe_request();
+        let yellowstone = YellowstoneGrpcConfig::new("http://127.0.0.1:10000")
+            .with_commitment(YellowstoneGrpcCommitment::Confirmed)
+            .with_vote(true)
+            .with_failed(true)
+            .with_signature(signature)
+            .with_account_include(include)
+            .with_account_exclude(exclude)
+            .with_account_required(required)
+            .subscribe_request();
+
+        let laser_filter = laser.transactions.get("sof").expect("laser filter");
+        let yellowstone_filter = yellowstone.transactions.get("sof").expect("ys filter");
+
+        assert_eq!(laser.commitment, yellowstone.commitment);
+        assert_eq!(laser_filter.vote, yellowstone_filter.vote);
+        assert_eq!(laser_filter.failed, yellowstone_filter.failed);
+        assert_eq!(laser_filter.signature, yellowstone_filter.signature);
+        assert_eq!(
+            laser_filter.account_include,
+            yellowstone_filter.account_include
+        );
+        assert_eq!(
+            laser_filter.account_exclude,
+            yellowstone_filter.account_exclude
+        );
+        assert_eq!(
+            laser_filter.account_required,
+            yellowstone_filter.account_required
+        );
     }
 }
