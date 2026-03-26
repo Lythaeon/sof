@@ -206,6 +206,7 @@ This repository contains three main crates:
 - `sof-tx`
   - the transaction SDK
   - building, signing, and submitting Solana transactions
+  - works standalone for RPC, Jito, and signed-byte flows
   - integrates with SOF control-plane/runtime adapters
 - `sof-gossip-tuning`
   - typed tuning presets for SOF gossip and ingest deployment

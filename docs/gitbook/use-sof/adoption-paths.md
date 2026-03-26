@@ -19,9 +19,11 @@ Start with [`sof`](../crates/sof.md) when the service needs:
 Start with [`sof-tx`](../crates/sof-tx.md) when the service needs:
 
 - a transaction builder
-- direct leader routing
-- hybrid direct plus RPC submission
+- RPC-backed submission
 - Jito integration
+- signed-byte submission
+- optional direct leader routing or hybrid direct plus RPC submission once local routing is
+  available
 
 Important boundary:
 
@@ -38,7 +40,7 @@ state for submission decisions.
 That is the normal pairing for services that:
 
 - derive leader, topology, slot, and recent blockhash state from live traffic
-- want low-latency direct sends
+- want low-latency direct sends or hybrid routing decisions
 - need flow-safety checks before submitting
 
 How they fit together:

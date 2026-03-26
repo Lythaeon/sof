@@ -66,7 +66,8 @@ Start here: [Maintain SOF](maintainers/README.md)
 - `sof`: the packaged observer/runtime for shred ingest, relay, repair, verification, dataset
   reconstruction, plugin hooks, and runtime extensions
 - `sof-tx`: the transaction SDK for building, signing, and submitting Solana transactions through
-  RPC, direct leader routing, Jito, or hybrid fallback using provider-supplied control-plane inputs
+  RPC, Jito, signed-byte flows, or optional direct and hybrid routing when a control-plane source
+  is available
 - `sof-gossip-tuning`: typed tuning profiles for hosts embedding `sof`
 - `sof-solana-gossip`: the vendored gossip backend used by the optional `gossip-bootstrap` path
 

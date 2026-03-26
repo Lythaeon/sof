@@ -48,7 +48,9 @@ Use this when:
 You will usually start with:
 
 - RPC transport first
-- `Hybrid` once direct routing inputs are proven trustworthy
+- Jito if block-engine submission is already part of the product
+- `submit_signed(...)` if signing already happens elsewhere
+- `Hybrid` only once direct routing inputs are proven trustworthy
 
 Implementation shape:
 

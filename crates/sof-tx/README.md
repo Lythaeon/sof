@@ -13,6 +13,12 @@ It provides:
   - `Hybrid` (direct first, RPC fallback)
 - routing policy and signature-level dedupe
 
+It works both as:
+
+- a standalone transaction SDK for RPC-backed, Jito-backed, or signed-byte submit flows, and
+- a lower-latency execution SDK when paired with `sof` or another local control-plane source for
+  direct or hybrid routing
+
 Together with `sof`, this is intended for low-latency execution services that want locally
 sourced control-plane state and predictable submit behavior, not just a generic wallet helper.
 
@@ -107,6 +113,12 @@ let mut signed_only_client = TxSubmitClient::builder()
 
 The builder gives you the product-level paths first. Drop down to the provider APIs only when you
 need custom control-plane wiring.
+
+For most services, the practical order is:
+
+- start with `RpcOnly`, `JitoOnly`, or `submit_signed(...)`
+- add direct or hybrid only when you have a trustworthy local routing source and a measured reason
+  to use it
 
 ## Core Types
 
@@ -203,8 +215,9 @@ guard decisions.
 For services that do not want to maintain a parallel checkpoint file format, use the adapter
 persistence helper backed by SOF's generic `DerivedStateCheckpointStore`.
 
-Direct submit needs TPU endpoints for scheduled leaders. The adapter gets these from
-`on_cluster_topology` events, or you can inject them manually with:
+Direct submit needs TPU endpoints for scheduled leaders. That requirement applies only to
+`DirectOnly` and the direct leg of `Hybrid`. The adapter gets those from `on_cluster_topology`
+events, or you can inject them manually with:
 
 - `set_leader_tpu_addr(pubkey, tpu_addr)`
 - `remove_leader_tpu_addr(pubkey)`
