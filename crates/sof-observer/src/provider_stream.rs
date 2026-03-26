@@ -53,7 +53,7 @@
 //! .await?;
 //!
 //! ObserverRuntime::new()
-//!     .with_provider_stream_ingress(ProviderStreamMode::YellowstoneGrpc, rx)
+//!     .with_provider_stream_ingress(ProviderStreamMode::Generic, rx)
 //!     .run_until(async {})
 //!     .await?;
 //! # Ok(())

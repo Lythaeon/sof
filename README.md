@@ -1,311 +1,292 @@
 # SOF
 
-SOF is a Solana-focused Rust workspace for low-latency data ingest and transaction execution.
+SOF is a runtime foundation for building low-latency Solana services.
 
-It is built more like financial systems infrastructure than a typical crypto framework:
-bounded pipelines, local control-plane state, restart-safe derived-state feeds, and execution
-paths designed for services that care about latency, replay, and operational discipline.
+It gives you a reusable ingest, reconstruction, control-plane, and plugin/dispatch layer so you do not have to rebuild Solana-facing infrastructure from scratch for every project.
 
-SOF removes external API and service-layer overhead. It does not remove the upstream visibility
-problem by itself. End-to-end latency still depends first on how quickly your host sees shreds.
-If you want SOF to be meaningfully faster than RPC-first or provider-stream architectures, give it
-the earliest ingress you can:
+This repository is for teams that want to build things like:
 
-- direct low-latency access to validators or other useful peers
-- or an external shred propagation network feeding the host
+- low-latency transaction observers
+- market data and execution services
+- strategy engines
+- local control-plane and leader-aware routing services
+- restart-safe Solana state consumers
 
-That is when SOF's lower-overhead local ingest, parsing, control-plane derivation, and in-process
-consumer model matter most: the data reaches your application on the same system without another
-heavy external dependency in the hot path.
+## What SOF Actually Is
 
-## Why Build On SOF Instead Of Starting From Scratch
+SOF is not just a collection of hooks.
 
-Most Solana teams do not want to spend their engineering budget rebuilding the same low-level
-runtime machinery for every new service.
+It is a packaged runtime substrate for Solana applications:
 
-The hard part is usually not the business logic. It is everything underneath it:
+- raw-shred ingest and reconstruction
+- processed provider-stream ingest
+- local transaction classification and dispatch
+- replay-aware derived state
+- runtime health, readiness, and degradation handling
+- transaction submission and execution adapters
 
-- provider-specific ingest and reconnect behavior
-- packet parsing, duplicate suppression, verification, and reconstruction
-- reducing instructions, copies, allocator churn, and cache misses in the hot path
-- keeping hooks and filters consistent across raw-shred and provider-stream modes
-- bounded degradation, health/readiness signals, restart behavior, and runtime observability
+The goal is simple: application code should focus on the Solana logic you care about, while SOF owns the hard low-level work underneath it.
 
-SOF exists to absorb that cost once and make it reusable.
+## Why Build On SOF
 
-That means a Solana team can build on a runtime already optimized for:
+Most Solana teams do not fail on business logic first. They burn time on the substrate:
 
-- fewer unnecessary instructions in hot paths
+- reconnect logic
+- replay gaps
+- duplicate suppression
+- packet parsing and reconstruction
+- provider-specific glue
+- queue sizing and multicore fanout
+- correctness boundaries under partial failure
+- latency regressions from copies, allocations, and cache churn
+
+SOF absorbs that work once and exposes a stable runtime surface.
+
+That gives you:
+
+- one runtime model across raw shreds and processed provider streams
+- lower-copy, lower-churn hot paths that are already tuned
+- explicit trust modes instead of silent verification shortcuts
+- bounded degradation, health signals, and typed error surfaces
+- replay-aware downstream behavior for stateful consumers
+- a cleaner foundation for building Solana services repeatedly
+
+## Why SOF Can Be Better Than Rebuilding It Yourself
+
+SOF is useful because it already spent the engineering effort on the details most projects eventually trip over:
+
+- fewer avoidable instructions in hot paths
 - fewer avoidable allocations and copies
-- shared or borrowed data where it is safe to do so
-- SIMD-friendly parsing where it actually helps
-- consistent hook semantics across multiple ingress/provider modes
-- correctness boundaries such as semantic dedupe, explicit verification posture, and replay-safe
-  downstream behavior
+- borrowed/shared data where the runtime can safely keep it borrowed/shared
+- SIMD-based parsing where it is a real win
+- replay dedupe and semantic duplicate suppression
+- provider reconnect, replay, watchdog, and startup validation behavior
+- typed health, readiness, and degradation reporting
+- a consistent transaction/plugin model across multiple ingress families
 
-The practical value is simple: application developers can focus on their Solana program or service
-logic while SOF owns the low-level ingest/runtime discipline.
+If you build your own Solana runtime stack from scratch for every service, you end up paying that optimization and correctness tax every time.
 
-SOF also treats robustness and accuracy as first-class runtime concerns. Duplicate/conflict
-suppression, verification posture, replayable derived state, and bounded runtime behavior are part
-of the framework itself instead of ad hoc application glue.
+## The Main Idea
 
-## Trust And Ingress Modes
+SOF separates **how data enters the system** from **how your application consumes it**.
 
-SOF has two explicit raw-shred trust modes:
+You can feed SOF from:
 
-- `public_untrusted`: public gossip or other public peers, verification on by default, highest
-  independence, highest observer-side CPU cost
-- `trusted_raw_shred_provider`: raw shred distribution from a provider you explicitly trust,
-  verification off by default, earlier ingress and lower observer-side CPU cost
+- public gossip or direct peers
+- a trusted raw shred provider
+- Yellowstone gRPC
+- LaserStream
+- websocket `transactionSubscribe`
+- a custom processed provider producer
 
-`processed_provider_stream` products such as Yellowstone gRPC, LaserStream, or websocket feeds are
-useful, but they are a different ingest category. They are not `SOF_SHRED_TRUST_MODE` values
-because they do not hand SOF raw shreds.
+And still keep the same local runtime/plugin surface where the semantics line up.
 
-SOF exposes that ingest family explicitly through `ProviderStreamMode`. Use it when you want
-Yellowstone/LaserStream-style provider feeds to enter the SOF plugin runtime directly without
-pretending they are raw shreds.
+## When SOF Is Fastest
 
-Implemented provider-stream adapters today:
+SOF removes downstream runtime overhead. It does not magically create upstream visibility.
+
+If you want the lowest end-to-end latency, the main variable is still how early your host sees the data.
+
+SOF gets the most leverage when it sits behind:
+
+- direct useful peers
+- validator-adjacent raw shred access
+- a trusted private shred propagation network
+
+That is where SOF's local ingest, parsing, classification, and in-process dispatch matter most.
+
+## Ingest Modes
+
+### 1. Raw Shreds
+
+Use SOF as a shred-native observer/runtime.
+
+Raw shred trust modes:
+
+- `public_untrusted`
+  - verification on by default
+  - highest independence
+  - highest observer-side CPU cost
+- `trusted_raw_shred_provider`
+  - verification off by default
+  - meant for trusted private shred feeds
+  - lower observer-side CPU cost
+
+Trusted raw-shred mode still uses the normal SOF downstream path after admission:
+
+1. packet parse/classification
+2. optional FEC recovery
+3. dataset and transaction reconstruction
+4. plugin and extension dispatch
+
+### 2. Built-In Processed Provider Streams
+
+Use SOF as a processed transaction/runtime surface instead of a raw-shred observer.
+
+Built-in adapters today:
 
 - Yellowstone gRPC
 - LaserStream gRPC
 - websocket `transactionSubscribe`
 
-Built-in hook surface by provider mode:
+Built-in processed providers are intentionally transaction-first:
 
-- Yellowstone gRPC: `on_transaction`
-- LaserStream gRPC: `on_transaction`
-- websocket `transactionSubscribe`: `on_transaction`
-- built-in processed providers do not expose standalone control-plane hooks such
-  as `on_recent_blockhash`, `on_slot_status`, `on_cluster_topology`,
-  `on_leader_schedule`, or `on_reorg`
+- they emit `on_transaction`
+- they do not expose standalone built-in control-plane hooks like `on_leader_schedule` or `on_reorg`
 
-Built-in durability behavior:
+Durability model:
 
-- Yellowstone gRPC: explicit replay modes
-  - `Live`: start at stream head
-  - `Resume` (default): start live, resume from tracked slot after reconnect
-  - `FromSlot(n)`: start from slot `n`, then continue with tracked resume behavior
-- LaserStream gRPC: same explicit replay modes on top of the provider SDK replay path
-- websocket `transactionSubscribe`: reconnects durably only when SOF can use the matching HTTP RPC
-  endpoint for best-effort gap backfill
-  - if websocket replay is enabled, SOF now fails startup unless that HTTP endpoint is explicit or
-    derivable from the websocket URL
-  - this is still bounded by provider semantics: `transactionSubscribe` has no native replay cursor
-  - SOF can backfill recent slots and dedupe replayed txs safely, but it cannot guarantee stronger
-    recovery than the websocket provider plus HTTP RPC can expose
-- built-in provider adapters emit explicit source health transitions into SOF,
-  and unexpected provider ingress closure is treated as a runtime failure rather
-  than a clean stop
-  - provider-source health is exported through the runtime observability
-    endpoint too, so reconnecting/unhealthy sources are not log-only anymore
-  - provider `/readyz` does not flip ready until a built-in source is actually
-    healthy, or until a generic producer has emitted real ingress progress
-  - generic provider replay dedupe also covers transaction-log and
-    transaction-view-batch updates now, not just transaction/control-plane
-    events
+- Yellowstone and LaserStream support explicit replay modes
+  - `Live`
+  - `Resume`
+  - `FromSlot(n)`
+- websocket uses reconnect plus best-effort HTTP gap backfill
+  - it has no native replay cursor
+  - SOF cannot make it stronger than the provider actually is
 
-Provider config defaults are inclusive:
+### 3. Generic Provider Mode
 
-- vote transactions are included unless you explicitly set a vote filter
-- failed transactions are included unless you explicitly set a failed filter
+Use `ProviderStreamMode::Generic` when your application already has a custom producer and wants to feed SOF directly.
 
-Built-in processed provider modes are fixed-surface and fail fast when you ask
-for hooks they do not emit. `ProviderStreamMode::Generic` is the flexible mode:
-it can accept richer control-plane updates from a custom producer, and
-`SOF_PROVIDER_STREAM_CAPABILITY_POLICY` controls whether unsupported requests
-warn or fail there.
+This is the flexible processed-provider mode:
 
-When generic mode runs under `warn`, SOF now keeps that semantic degradation
-visible through runtime observability metrics instead of only logging once at
-startup.
+- custom producers can send richer control-plane updates
+- generic mode can power `sof-tx` adapters if it provides the full control-plane surface
+- capability mismatch can either warn or fail
 
-If a generic producer is intentionally finite rather than live, set
-`SOF_PROVIDER_STREAM_ALLOW_EOF=true` so bounded replay/batch producers can end
-cleanly instead of being treated as an unexpected live-ingress failure.
+Useful knobs:
 
-The same capability checks apply to derived-state consumers, not just plugins.
+- `SOF_PROVIDER_STREAM_CAPABILITY_POLICY=warn|strict`
+- `SOF_PROVIDER_STREAM_ALLOW_EOF=true` for bounded replay/batch producers
 
-That also means SOF's internal transaction classifier hooks such as
-`transaction_prefilter`, `accepts_transaction_ref`, and `transaction_interest_ref`
-apply to all three built-in provider transaction adapters because they all
-materialize full transactions before dispatch.
+## What SOF Does For Reliability And Accuracy
 
-The intended positioning is straightforward:
+SOF treats reliability and accuracy as runtime concerns, not afterthoughts.
 
-- use public gossip/direct peers when you want independence and are willing to own the whole stack
-- use a trusted raw shred network when you want SOF's fastest practical raw-shred path
-- use processed provider streams when you do not need the raw-shred SOF model
+That includes:
 
-The trust tradeoff should be explicit: a trusted raw shred provider replaces some local
-verification and public-edge independence with upstream trust in exchange for earlier ingress and
-much lower CPU waste than public multi-source gossip. See
-[`docs/gitbook/operations/deployment-modes.md`](docs/gitbook/operations/deployment-modes.md) for
-the full deployment matrix.
+- explicit verification posture
+- replay dedupe
+- semantic duplicate/conflict suppression
+- typed provider health
+- runtime readiness and degraded-state reporting
+- startup validation for built-in provider adapters
+- replay-aware derived-state feeds
+- fail-fast capability checks where semantics cannot be met
 
-For gossip-based analysis workflows, SOF can also pin runtime selection to the configured
-entrypoint set with `SOF_GOSSIP_ENTRYPOINT_PINNED=true`. In that mode, runtime switching stays
-inside the user-supplied entrypoints instead of expanding to discovered peer candidates.
+The rule is: if a mode cannot honestly provide a surface, SOF should either make that limitation explicit or reject the configuration.
 
-In trusted raw shred mode, SOF still runs its normal downstream observer path after packets are
-admitted: parse, FEC/reassembly, dataset reconstruction, and plugin dispatch. The default change
-is the verification posture, not a separate plugin/runtime surface.
+## The Workspace
 
-It is split into three user-facing crates:
+This repository contains three main crates:
 
-- `sof`: observer/runtime crate for shred ingest, relay/cache, dataset reconstruction, plugin and runtime-extension events, fork/reorg tracking, and local commitment tagging without RPC dependency
-- `sof-tx`: transaction SDK for building, signing, and submitting Solana transactions through RPC, direct leader routing, hybrid fallback, and optional kernel-bypass transports
-- `sof-gossip-tuning`: typed gossip and ingest tuning presets for hosts embedding `sof`
+- `sof`
+  - the observer/runtime crate
+  - raw-shred ingest, provider-stream ingest, derived state, plugins, extensions, runtime operations
+- `sof-tx`
+  - the transaction SDK
+  - building, signing, and submitting Solana transactions
+  - integrates with SOF control-plane/runtime adapters
+- `sof-gossip-tuning`
+  - typed tuning presets for SOF gossip and ingest deployment
 
-## Highlights
+## What You Can Build With It
 
-- Multi-core packet ingest, FEC recovery, and dataset reconstruction
-- Provider adapters and hook paths optimized once at the framework level instead of per app
-- Bundled gossip backend tuning for queue depths, worker counts, CPU pinning, and small-batch serial fallbacks
-- Local market-facing control-plane signals for leader, topology, blockhash, replay, and fork state
-- Local `processed` / `confirmed` / `finalized` transaction tagging
-- Semantic shred dedupe that suppresses duplicate or conflicting downstream event emission
-- Plugin hooks and runtime extensions for downstream logic
-- Lower-copy hot paths through shared dataset payload fragments and borrowed transaction classification
-- Provider-stream parsing optimized for lower copy / lower churn paths where possible
-- Replayable derived-state feed for restart-safe stateful services
-- First-class `sof-tx` adapters for raw-shred/gossip runtimes, and for
-  `ProviderStreamMode::Generic` when a custom producer supplies the full
-  control-plane feed
-- Flow-safety policy evaluation for stale or degraded tx-control-plane state
-- Optional gossip bootstrap and external kernel-bypass ingress
-- Transaction submission with RPC, direct, hybrid, and kernel-bypass paths
-- Typed gossip and ingest tuning presets for embedded SOF hosts
-
-## Repository Layout
-
-- `crates/sof-observer`: published as `sof`
-- `crates/sof-tx`: published as `sof-tx`
-- `crates/sof-gossip-tuning`: typed host tuning presets for gossip bootstrap and ingest
-- `docs/architecture`: ADRs, ARDs, and framework/runtime contracts
-- `docs/operations`: deployment and tuning docs
-- `scripts`: local tooling and helper scripts
-
-## Requirements
-
-- Rust stable
-- `cargo-make` for the full contributor gate
-
-Install `cargo-make` if needed:
-
-```bash
-cargo install cargo-make
-```
-
-## Install
-
-Observer/runtime crate:
-
-```bash
-cargo add sof
-```
-
-Transaction SDK:
-
-```bash
-cargo add sof-tx
-```
-
-Typed host tuning presets:
-
-```bash
-cargo add sof-gossip-tuning
-```
-
-Feature examples:
-
-```toml
-sof = { version = "0.12.0", features = ["gossip-bootstrap"] }
-sof-tx = { version = "0.12.0", features = ["sof-adapters"] }
-```
-
-Kernel-bypass integrations:
-
-- `sof` supports external ingress APIs through `--features kernel-bypass`
-- `sof-tx` supports custom direct transport adapters through `--features kernel-bypass`
-- `sof-solana-gossip` defaults to the lightweight in-memory duplicate/conflict path; pass `--features solana-ledger` only if you explicitly want the heavier ledger/RocksDB duplicate-shred tooling
-
-## Duplicate Shred Policy
-
-SOF is optimized by default for low-latency observer and execution workloads, not validator-style
-duplicate-shred durability.
-
-- Default behavior: SOF keeps duplicate/conflict suppression in memory and enforces a semantic
-  shred uniqueness contract before downstream dataset, transaction, and account-touch emission.
-- Opt-in durability: if you embed the vendored `sof-solana-gossip` crate directly and need the
-  heavier validator-style duplicate-shred tooling, build it with `--features solana-ledger`.
-- Tradeoff: the default path is lower latency and avoids RocksDB/native storage overhead; the
-  ledger-backed path is heavier but keeps the older durable duplicate-shred machinery available.
+- passive or active Solana observers
+- local execution engines
+- “observe and submit” services
+- market data systems
+- strategy backends
+- replay-safe stateful services
+- validator-adjacent data services
 
 ## Quick Start
 
-Run the observer runtime example:
+Install the crates you need:
+
+```bash
+cargo add sof
+cargo add sof-tx
+cargo add sof-gossip-tuning
+```
+
+Useful feature sets:
+
+```toml
+sof = { version = "0.12.0", features = ["gossip-bootstrap"] }
+sof = { version = "0.12.0", features = ["provider-grpc"] }
+sof = { version = "0.12.0", features = ["provider-websocket"] }
+sof-tx = { version = "0.12.0", features = ["sof-adapters"] }
+```
+
+Run the basic observer example:
 
 ```bash
 cargo run --release -p sof --example observer_runtime
 ```
 
-Run the observer with gossip bootstrap:
+Run with gossip bootstrap:
 
 ```bash
 cargo run --release -p sof --example observer_runtime --features gossip-bootstrap
 ```
 
-Run the transaction SDK tests:
+Provider examples:
+
+- Yellowstone: `crates/sof-observer/examples/provider_stream_yellowstone_grpc.rs`
+- LaserStream: `crates/sof-observer/examples/provider_stream_laserstream.rs`
+- websocket: `crates/sof-observer/examples/provider_stream_websocket_transaction.rs`
+- trusted raw shred provider: `crates/sof-observer/examples/trusted_raw_shred_provider.rs`
+
+## A Practical Mental Model
+
+Use SOF when you want:
+
+- one optimized runtime foundation
+- one plugin/consumer model
+- explicit correctness and trust boundaries
+- less time spent rebuilding Solana-specific infrastructure
+
+Do not use SOF only because you want a thin wrapper around a provider API.
+
+The value is in the runtime substrate:
+
+- ingest
+- dispatch
+- replay
+- control-plane state
+- error handling
+- health
+- performance work you do not want to reimplement per application
+
+## Documentation
+
+- crate docs: [`crates/sof-observer/README.md`](crates/sof-observer/README.md)
+- transaction SDK: [`crates/sof-tx/README.md`](crates/sof-tx/README.md)
+- deployment model: [`docs/gitbook/operations/deployment-modes.md`](docs/gitbook/operations/deployment-modes.md)
+- why SOF exists: [`docs/gitbook/use-sof/why-sof-exists.md`](docs/gitbook/use-sof/why-sof-exists.md)
+- comparison docs: [`docs/gitbook/use-sof/sof-compared.md`](docs/gitbook/use-sof/sof-compared.md)
+
+## Repository Layout
+
+- `crates/sof-observer`
+- `crates/sof-tx`
+- `crates/sof-gossip-tuning`
+- `docs/`
+- `scripts/`
+
+## Contributor Gate
+
+SOF uses `cargo-make` for the main contributor gate.
+
+Install it if needed:
 
 ```bash
-cargo test -p sof-tx
+cargo install cargo-make
 ```
 
-Run the derived-state service example:
-
-```bash
-cargo run --release -p sof --example derived_state_slot_mirror
-```
-
-Run the full contributor gate:
+Run the gate:
 
 ```bash
 cargo make ci
 ```
-
-## Basic Setup Guides
-
-- Observer/runtime setup: `crates/sof-observer/README.md`
-- Transaction SDK setup: `crates/sof-tx/README.md`
-- Typed gossip tuning setup: `crates/sof-gossip-tuning/README.md`
-- Docs entry point: `docs/README.md`
-- Contribution guide: `CONTRIBUTING.md`
-
-## Operational Notes
-
-`sof` is not observer-only in gossip mode. By default it can also relay shreds and serve bounded repair responses.
-
-To keep ingest/processing but reduce outward network activity:
-
-- `SOF_UDP_RELAY_ENABLED=false`
-- `SOF_REPAIR_ENABLED=false`
-
-## Documentation
-
-- GitBook-compatible docs site: `docs/gitbook/README.md`
-- Docs home: `docs/README.md`
-- Architecture index: `docs/architecture/README.md`
-- Operations index: `docs/operations/README.md`
-- Runtime bootstrap modes: `docs/architecture/runtime-bootstrap-modes.md`
-- Plugin hook model: `docs/architecture/framework-plugin-hooks.md`
-- Runtime extension model: `docs/architecture/runtime-extension-hooks.md`
-- Derived-state feed contract: `docs/architecture/derived-state-feed-contract.md`
-- Transaction SDK ADR: `docs/architecture/adr/0006-transaction-sdk-and-dual-submit-routing.md`
-
-## CI and Release
-
-- CI workflow: `.github/workflows/ci.yml`
-- Release workflow: `.github/workflows/release-crates.yml`

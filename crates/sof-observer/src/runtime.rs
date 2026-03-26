@@ -1704,7 +1704,7 @@ async fn run_provider_stream_runtime(
             }
             update = provider_stream_rx.recv() => {
                 let Some(update) = update else {
-                    if allow_eof {
+                    if allow_eof && provider_health.degraded_sources().is_empty() {
                         tracing::info!(
                             mode = mode.as_str(),
                             "SOF provider-stream runtime reached configured generic EOF"
@@ -4023,6 +4023,54 @@ mod tests {
             result.is_ok(),
             "expected configured generic EOF to stop cleanly"
         );
+    }
+
+    #[tokio::test]
+    async fn provider_stream_runtime_rejects_generic_eof_after_degraded_health() {
+        crate::runtime_env::set_runtime_env_overrides([(
+            String::from("SOF_PROVIDER_STREAM_ALLOW_EOF"),
+            String::from("true"),
+        )]);
+        let plugin_host = PluginHost::builder()
+            .add_plugin(TransactionOnlyPlugin)
+            .build();
+        let extension_host = RuntimeExtensionHost::builder().build();
+        let (tx, rx) = crate::provider_stream::create_provider_stream_queue(4);
+        tx.send(
+            crate::provider_stream::ProviderSourceHealthEvent {
+                source: crate::provider_stream::ProviderSourceId::Generic("generic_source"),
+                status: crate::provider_stream::ProviderSourceHealthStatus::Reconnecting,
+                reason: crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
+                message: "upstream stalled".to_owned(),
+            }
+            .into(),
+        )
+        .await
+        .expect("health sent");
+        drop(tx);
+
+        let result = run_provider_stream_runtime(
+            plugin_host,
+            extension_host,
+            DerivedStateHost::builder().build(),
+            None,
+            ProviderStreamMode::Generic,
+            rx,
+        )
+        .await;
+        crate::runtime_env::clear_runtime_env_overrides();
+
+        match result {
+            Err(RuntimeError::ProviderStream(ProviderStreamRuntimeError::IngressClosed {
+                mode,
+                degraded_sources,
+            })) => {
+                assert_eq!(mode, ProviderStreamMode::Generic);
+                assert_eq!(degraded_sources.len(), 1);
+                assert_eq!(degraded_sources[0].source.as_str(), "generic_source");
+            }
+            other => panic!("expected degraded generic EOF failure, got {other:?}"),
+        }
     }
 
     #[test]
