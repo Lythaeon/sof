@@ -53,6 +53,14 @@ The equivalent env knob is:
 SOF_SHRED_TRUST_MODE=trusted_raw_shred_provider
 ```
 
+If you need to analyze only a specific gossip peer set, pin runtime switching to the configured
+entrypoints:
+
+```bash
+SOF_GOSSIP_ENTRYPOINT=1.2.3.4:8001,5.6.7.8:8001
+SOF_GOSSIP_ENTRYPOINT_PINNED=true
+```
+
 Trusted raw shred ingress still runs through the normal SOF pipeline after admission:
 
 - parse and classify raw packets

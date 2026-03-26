@@ -234,6 +234,15 @@ impl RuntimeSetup {
         self.with_env("SOF_GOSSIP_ENTRYPOINT", serialized)
     }
 
+    /// Sets `SOF_GOSSIP_ENTRYPOINT_PINNED`.
+    ///
+    /// When enabled, runtime switching stays inside the configured entrypoint
+    /// list instead of expanding to discovered gossip peers.
+    #[must_use]
+    pub fn with_gossip_entrypoint_pinned(self, pinned: bool) -> Self {
+        self.with_env("SOF_GOSSIP_ENTRYPOINT_PINNED", pinned.to_string())
+    }
+
     /// Sets `SOF_GOSSIP_VALIDATORS` from a list of validator identity pubkeys.
     #[must_use]
     pub fn with_gossip_validators<I, S>(self, gossip_validators: I) -> Self

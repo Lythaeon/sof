@@ -171,6 +171,34 @@ mod tests {
         assert_eq!(bias.rank_for_entrypoint("2.2.2.2:8001"), Some(1));
         assert_eq!(bias.rank_for_entrypoint("3.3.3.3:8001"), None);
     }
+
+    #[test]
+    fn pinned_entrypoints_do_not_expand_runtime_switch_pool() {
+        // Test-local env mutation is scoped to this case and restored below.
+        unsafe { std::env::set_var("SOF_GOSSIP_ENTRYPOINT_PINNED", "true") };
+        let (_tx, tx_event_rx) = mpsc::channel(1);
+        let runtime = ReceiverRuntime {
+            static_receiver_handles: Vec::new(),
+            gossip_receiver_handles: Vec::new(),
+            gossip_ingest_telemetry: None,
+            gossip_runtime: None,
+            gossip_identity: Arc::new(Keypair::new()),
+            active_gossip_entrypoint: None,
+            gossip_runtime_primary_port_range: None,
+            gossip_runtime_secondary_port_range: None,
+            gossip_runtime_active_port_range: None,
+            repair_client: None,
+            tx_event_rx,
+        };
+        let candidates = collect_runtime_switch_entrypoints(
+            &runtime,
+            &["127.0.0.1:8001".to_owned(), "127.0.0.1:8001".to_owned()],
+            32,
+        );
+        // Restore the test-local env override before asserting.
+        unsafe { std::env::remove_var("SOF_GOSSIP_ENTRYPOINT_PINNED") };
+        assert_eq!(candidates, vec!["127.0.0.1:8001".to_owned()]);
+    }
 }
 
 #[cfg(feature = "gossip-bootstrap")]
@@ -209,6 +237,9 @@ pub(super) fn collect_runtime_switch_entrypoints(
     peer_candidates: usize,
 ) -> Vec<String> {
     let mut candidates = expand_gossip_entrypoints(configured_entrypoints);
+    if read_gossip_entrypoint_pinned() {
+        return candidates;
+    }
     let mut seen: HashSet<String> = candidates.iter().cloned().collect();
     let Some(gossip_runtime) = runtime.gossip_runtime.as_ref() else {
         return candidates;

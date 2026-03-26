@@ -47,6 +47,10 @@ much lower CPU waste than public multi-source gossip. See
 [`docs/gitbook/operations/deployment-modes.md`](docs/gitbook/operations/deployment-modes.md) for
 the full deployment matrix.
 
+For gossip-based analysis workflows, SOF can also pin runtime selection to the configured
+entrypoint set with `SOF_GOSSIP_ENTRYPOINT_PINNED=true`. In that mode, runtime switching stays
+inside the user-supplied entrypoints instead of expanding to discovered peer candidates.
+
 In trusted raw shred mode, SOF still runs its normal downstream observer path after packets are
 admitted: parse, FEC/reassembly, dataset reconstruction, and plugin dispatch. The default change
 is the verification posture, not a separate plugin/runtime surface.

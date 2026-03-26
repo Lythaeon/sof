@@ -224,6 +224,11 @@ pub fn read_gossip_runtime_switch_enabled() -> bool {
 }
 
 #[cfg(feature = "gossip-bootstrap")]
+pub fn read_gossip_entrypoint_pinned() -> bool {
+    read_bool_env("SOF_GOSSIP_ENTRYPOINT_PINNED", false)
+}
+
+#[cfg(feature = "gossip-bootstrap")]
 pub fn read_gossip_bootstrap_only() -> bool {
     read_bool_env("SOF_GOSSIP_BOOTSTRAP_ONLY", false)
 }

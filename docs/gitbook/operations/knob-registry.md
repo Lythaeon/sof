@@ -132,6 +132,12 @@ SOF's runtime-owned observability endpoint exposes low-cardinality operational m
 | `SOF_SHRED_DEDUP_CAPACITY` | `262144` | all builds | Capacity of the semantic shred dedupe cache. |
 | `SOF_SHRED_DEDUP_TTL_MS` | `250` | all builds | Base eviction TTL for dedupe entries. |
 
+## Gossip Selection
+
+| Knob | Default | Scope | Meaning |
+| --- | --- | --- | --- |
+| `SOF_GOSSIP_ENTRYPOINT_PINNED` | `false` | `gossip-bootstrap` | Keep gossip runtime switching inside the configured `SOF_GOSSIP_ENTRYPOINT` set instead of expanding to discovered peer candidates. Useful for topology experiments, malicious-node analysis, and repeatable peer-set studies. |
+
 ## Relay And Traffic Shaping
 
 | Knob | Default | Scope | Meaning |
