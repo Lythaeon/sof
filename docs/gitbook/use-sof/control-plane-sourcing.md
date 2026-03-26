@@ -59,6 +59,8 @@ Tradeoff:
 
 - best local freshness
 - adapter state is process-local unless you add your own persistence
+- complete today with raw-shred/gossip SOF runtimes; built-in processed provider
+  adapters are not yet a full `sof-tx` control-plane source by themselves
 
 ### 4. Replayable SOF-derived control plane
 
@@ -79,6 +81,8 @@ Tradeoff:
 
 - strongest restart posture
 - more moving parts and more integration work
+- assumes a runtime that emits the full control-plane feed, not only
+  transaction-first provider updates
 
 ## Recommended Starting Point
 

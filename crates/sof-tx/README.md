@@ -192,6 +192,10 @@ For restart-safe services built on SOF derived-state, use `DerivedStateTxProvide
 It consumes the replayable derived-state feed, supports checkpoint persistence, and exposes the
 same `evaluate_flow_safety(...)` helper for control-plane freshness checks.
 
+Those SOF adapter paths are complete today with raw-shred or gossip-backed observer runtimes.
+Built-in processed provider adapters such as Yellowstone, LaserStream, and websocket are
+transaction-first today and do not, by themselves, provide the full `sof-tx` control-plane feed.
+
 The observer-side feed now also emits canonical control-plane quality snapshots, so services can
 source freshness and confidence metadata from `sof` first and keep `sof-tx` focused on send-time
 guard decisions.

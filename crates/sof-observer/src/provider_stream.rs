@@ -12,7 +12,8 @@
 //! - `WebsocketTransaction`: built-in adapter emits `on_transaction`
 //!
 //! Generic provider producers may still enqueue `TransactionViewBatch`,
-//! `RecentBlockhash`, `SlotStatus`, or `ClusterTopology` updates directly.
+//! `RecentBlockhash`, `SlotStatus`, `ClusterTopology`, `LeaderSchedule`, or
+//! `Reorg` updates directly.
 //!
 //! # Feed Provider Transactions Into SOF
 //!
@@ -64,8 +65,8 @@ use tokio::sync::mpsc;
 use crate::event::TxCommitmentStatus;
 use crate::event::TxKind;
 use crate::framework::{
-    ClusterTopologyEvent, ObservedRecentBlockhashEvent, SlotStatusEvent, TransactionEvent,
-    TransactionLogEvent, TransactionViewBatchEvent,
+    ClusterTopologyEvent, LeaderScheduleEvent, ObservedRecentBlockhashEvent, ReorgEvent,
+    SlotStatusEvent, TransactionEvent, TransactionLogEvent, TransactionViewBatchEvent,
 };
 use agave_transaction_view::{
     transaction_data::TransactionData, transaction_view::SanitizedTransactionView,
@@ -80,6 +81,11 @@ pub const DEFAULT_PROVIDER_STREAM_QUEUE_CAPACITY: usize = 8_192;
 /// Identifies the processed provider family driving SOF's direct plugin ingress.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderStreamMode {
+    /// Generic custom provider-stream ingress supplied by the embedding application.
+    ///
+    /// This mode is for producers that push `ProviderStreamUpdate` items directly
+    /// and may supply a richer control-plane surface than the built-in adapters.
+    Generic,
     /// Yellowstone gRPC / Geyser-style processed transaction feeds.
     ///
     /// Built-in adapter hook surface today: `on_transaction`.
@@ -100,6 +106,7 @@ impl ProviderStreamMode {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Generic => "generic_provider",
             Self::YellowstoneGrpc => "yellowstone_grpc",
             Self::LaserStream => "laserstream",
             #[cfg(feature = "provider-websocket")]
@@ -152,6 +159,10 @@ pub enum ProviderStreamUpdate {
     SlotStatus(SlotStatusEvent),
     /// One provider cluster-topology update.
     ClusterTopology(ClusterTopologyEvent),
+    /// One provider leader-schedule update.
+    LeaderSchedule(LeaderScheduleEvent),
+    /// One provider reorg/fork update.
+    Reorg(ReorgEvent),
 }
 
 impl From<TransactionEvent> for ProviderStreamUpdate {
@@ -196,6 +207,18 @@ impl From<ClusterTopologyEvent> for ProviderStreamUpdate {
     }
 }
 
+impl From<LeaderScheduleEvent> for ProviderStreamUpdate {
+    fn from(event: LeaderScheduleEvent) -> Self {
+        Self::LeaderSchedule(event)
+    }
+}
+
+impl From<ReorgEvent> for ProviderStreamUpdate {
+    fn from(event: ReorgEvent) -> Self {
+        Self::Reorg(event)
+    }
+}
+
 /// Sender type for processed provider-stream ingress.
 pub type ProviderStreamSender = mpsc::Sender<ProviderStreamUpdate>;
 /// Receiver type for processed provider-stream ingress.
@@ -218,12 +241,14 @@ pub struct SerializedTransactionEvent {
     pub bytes: Box<[u8]>,
 }
 
+#[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ProviderCommitmentWatermarks {
     pub(crate) confirmed_slot: Option<u64>,
     pub(crate) finalized_slot: Option<u64>,
 }
 
+#[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
 impl ProviderCommitmentWatermarks {
     #[inline]
     pub(crate) fn observe_transaction_commitment(

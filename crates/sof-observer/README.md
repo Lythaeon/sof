@@ -97,8 +97,8 @@ Provider config defaults are inclusive:
 `SOF_PROVIDER_STREAM_CAPABILITY_POLICY=strict` only rejects hooks that provider
 runtime cannot ever emit, such as `on_raw_packet` or `on_shred`. It does not
 reject generic provider updates like `on_recent_blockhash`, `on_slot_status`,
-or `on_cluster_topology` when a custom producer pushes those updates into the
-provider queue.
+`on_cluster_topology`, `on_leader_schedule`, or `on_reorg` when a custom
+producer pushes those updates into the provider queue.
 
 The same strict check now applies to derived-state consumers. If a provider
 mode cannot satisfy a requested derived-state feed, SOF fails startup instead
@@ -108,6 +108,11 @@ SOF's internal transaction classifier hooks, including `transaction_prefilter`,
 `accepts_transaction_ref`, and `transaction_interest_ref`, work on the
 Yellowstone, LaserStream, and websocket transaction adapters because all three
 feed full transactions into `on_transaction`.
+
+`sof-tx` is a different case: the existing SOF adapters are complete today on
+raw-shred/gossip runtimes, or on `ProviderStreamMode::Generic` when the custom
+producer also supplies the full control-plane feed. Built-in Yellowstone,
+LaserStream, and websocket adapters remain transaction-first today.
 
 That tradeoff should be explicit: public gossip is the independent baseline, trusted raw shred
 distribution is the fast path, and processed provider streams are a different observer model.

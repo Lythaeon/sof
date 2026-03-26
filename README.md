@@ -101,8 +101,9 @@ Provider config defaults are inclusive:
 
 Provider runtime capability policy applies only to hooks that are impossible in
 provider-stream mode. It does not reject generic provider updates such as
-`on_recent_blockhash`, `on_slot_status`, or `on_cluster_topology` when a custom
-producer pushes those updates into the provider queue.
+`on_recent_blockhash`, `on_slot_status`, `on_cluster_topology`,
+`on_leader_schedule`, or `on_reorg` when a custom producer pushes those updates
+into the provider queue.
 
 Strict capability checks also cover derived-state consumers, not just plugins.
 If a provider mode cannot emit a requested derived-state feed such as account
@@ -152,7 +153,9 @@ It is split into three user-facing crates:
 - Lower-copy hot paths through shared dataset payload fragments and borrowed transaction classification
 - Provider-stream parsing optimized for lower copy / lower churn paths where possible
 - Replayable derived-state feed for restart-safe stateful services
-- First-class `sof-tx` adapters for live plugin and replayable derived-state control-plane inputs
+- First-class `sof-tx` adapters for raw-shred/gossip runtimes, and for
+  `ProviderStreamMode::Generic` when a custom producer supplies the full
+  control-plane feed
 - Flow-safety policy evaluation for stale or degraded tx-control-plane state
 - Optional gossip bootstrap and external kernel-bypass ingress
 - Transaction submission with RPC, direct, hybrid, and kernel-bypass paths

@@ -1744,6 +1744,22 @@ fn dispatch_provider_stream_update(
                 plugin_host.on_cluster_topology(event);
             }
         }
+        ProviderStreamUpdate::LeaderSchedule(event) => {
+            if !derived_state_host.is_empty() {
+                derived_state_host.on_leader_schedule(event.clone());
+            }
+            if plugin_host.wants_leader_schedule() {
+                plugin_host.on_leader_schedule(event);
+            }
+        }
+        ProviderStreamUpdate::Reorg(event) => {
+            if !derived_state_host.is_empty() {
+                derived_state_host.on_reorg(event.clone());
+            }
+            if plugin_host.wants_reorg() {
+                plugin_host.on_reorg(event);
+            }
+        }
     }
 }
 
@@ -1858,20 +1874,11 @@ fn provider_stream_unsupported_hooks(
     if plugin_host.wants_account_touch() {
         unsupported.push("on_account_touch");
     }
-    if plugin_host.wants_reorg() {
-        unsupported.push("on_reorg");
-    }
-    if plugin_host.wants_leader_schedule() {
-        unsupported.push("on_leader_schedule");
-    }
     if plugin_host.wants_transaction_batch() {
         unsupported.push("on_transaction_batch");
     }
     if derived_state_host.wants_account_touch_observed() {
         unsupported.push("derived_state.account_touch_observed");
-    }
-    if derived_state_host.wants_control_plane_observed() {
-        unsupported.push("derived_state.control_plane_observed");
     }
     unsupported
 }
@@ -1881,6 +1888,17 @@ fn enforce_provider_stream_capability_policy(
     plugin_host: &PluginHost,
     derived_state_host: &DerivedStateHost,
 ) -> Result<(), RuntimeError> {
+    let plugin_names = plugin_host.plugin_names();
+    let consumer_names = derived_state_host.consumer_names();
+    if mode != ProviderStreamMode::Generic
+        && (plugin_names.contains(&"sof-tx-provider-adapter")
+            || consumer_names.contains(&"sof-tx-derived-state-provider-adapter"))
+    {
+        return Err(RuntimeError::Runloop(format!(
+            "provider-stream mode {} uses a built-in transaction-first adapter; sof-tx adapters require raw-shred/gossip mode or ProviderStreamMode::Generic with a custom producer that supplies the full control-plane feed",
+            mode.as_str(),
+        )));
+    }
     let unsupported = provider_stream_unsupported_hooks(mode, plugin_host, derived_state_host);
     if unsupported.is_empty() {
         return Ok(());
@@ -2348,6 +2366,8 @@ mod tests {
     }
     struct AccountTouchDerivedStateConsumer;
     struct ControlPlaneDerivedStateConsumer;
+    struct SofTxAdapterLikePlugin;
+    struct SofTxDerivedStateAdapterLikeConsumer;
 
     #[async_trait]
     impl ObserverPlugin for RawPacketPlugin {
@@ -2503,6 +2523,58 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl ObserverPlugin for SofTxAdapterLikePlugin {
+        fn name(&self) -> &'static str {
+            "sof-tx-provider-adapter"
+        }
+
+        fn config(&self) -> PluginConfig {
+            PluginConfig::new()
+                .with_recent_blockhash()
+                .with_cluster_topology()
+                .with_leader_schedule()
+        }
+    }
+
+    impl DerivedStateConsumer for SofTxDerivedStateAdapterLikeConsumer {
+        fn name(&self) -> &'static str {
+            "sof-tx-derived-state-provider-adapter"
+        }
+
+        fn state_version(&self) -> u32 {
+            1
+        }
+
+        fn extension_version(&self) -> &'static str {
+            "1"
+        }
+
+        fn load_checkpoint(
+            &mut self,
+        ) -> Result<Option<DerivedStateCheckpoint>, DerivedStateConsumerFault> {
+            Ok(None)
+        }
+
+        fn config(&self) -> DerivedStateConsumerConfig {
+            DerivedStateConsumerConfig::new().with_account_touch_observed()
+        }
+
+        fn apply(
+            &mut self,
+            _envelope: &DerivedStateFeedEnvelope,
+        ) -> Result<(), DerivedStateConsumerFault> {
+            Ok(())
+        }
+
+        fn flush_checkpoint(
+            &mut self,
+            _checkpoint: DerivedStateCheckpoint,
+        ) -> Result<(), DerivedStateConsumerFault> {
+            Ok(())
+        }
+    }
+
     fn dispatch_provider_stream_update_baseline(
         plugin_host: &PluginHost,
         derived_state_host: &DerivedStateHost,
@@ -2537,6 +2609,14 @@ mod tests {
             ProviderStreamUpdate::ClusterTopology(event) => {
                 derived_state_host.on_cluster_topology(event.clone());
                 plugin_host.on_cluster_topology(event);
+            }
+            ProviderStreamUpdate::LeaderSchedule(event) => {
+                derived_state_host.on_leader_schedule(event.clone());
+                plugin_host.on_leader_schedule(event);
+            }
+            ProviderStreamUpdate::Reorg(event) => {
+                derived_state_host.on_reorg(event.clone());
+                plugin_host.on_reorg(event);
             }
         }
     }
@@ -3054,10 +3134,106 @@ mod tests {
         match result {
             Err(RuntimeError::Runloop(message)) => {
                 assert!(message.contains("derived_state.account_touch_observed"));
-                assert!(message.contains("derived_state.control_plane_observed"));
+                assert!(!message.contains("derived_state.control_plane_observed"));
             }
             other => panic!("expected strict provider capability failure, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn provider_stream_strict_policy_allows_generic_leader_schedule_reorg_and_control_plane() {
+        crate::runtime_env::set_runtime_env_overrides([(
+            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+            String::from("strict"),
+        )]);
+        struct LeaderScheduleReorgPlugin;
+
+        #[async_trait]
+        impl ObserverPlugin for LeaderScheduleReorgPlugin {
+            fn name(&self) -> &'static str {
+                "leader-schedule-reorg-plugin"
+            }
+
+            fn config(&self) -> PluginConfig {
+                PluginConfig::new().with_leader_schedule().with_reorg()
+            }
+        }
+
+        let plugin_host = PluginHost::builder()
+            .add_plugin(LeaderScheduleReorgPlugin)
+            .build();
+        let derived_state_host = DerivedStateHost::builder()
+            .add_consumer(ControlPlaneDerivedStateConsumer)
+            .build();
+        let result = enforce_provider_stream_capability_policy(
+            ProviderStreamMode::Generic,
+            &plugin_host,
+            &derived_state_host,
+        );
+        crate::runtime_env::clear_runtime_env_overrides();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn provider_stream_rejects_sof_tx_live_adapter_even_under_warn() {
+        crate::runtime_env::set_runtime_env_overrides([(
+            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+            String::from("warn"),
+        )]);
+        let plugin_host = PluginHost::builder()
+            .add_plugin(SofTxAdapterLikePlugin)
+            .build();
+        let derived_state_host = DerivedStateHost::builder().build();
+        let result = enforce_provider_stream_capability_policy(
+            ProviderStreamMode::YellowstoneGrpc,
+            &plugin_host,
+            &derived_state_host,
+        );
+        crate::runtime_env::clear_runtime_env_overrides();
+        match result {
+            Err(RuntimeError::Runloop(message)) => {
+                assert!(message.contains("ProviderStreamMode::Generic"));
+            }
+            other => panic!("expected sof-tx live adapter failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_stream_rejects_sof_tx_replay_adapter_even_under_warn() {
+        crate::runtime_env::set_runtime_env_overrides([(
+            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+            String::from("warn"),
+        )]);
+        let plugin_host = PluginHost::builder().build();
+        let derived_state_host = DerivedStateHost::builder()
+            .add_consumer(SofTxDerivedStateAdapterLikeConsumer)
+            .build();
+        let result = enforce_provider_stream_capability_policy(
+            ProviderStreamMode::YellowstoneGrpc,
+            &plugin_host,
+            &derived_state_host,
+        );
+        crate::runtime_env::clear_runtime_env_overrides();
+        match result {
+            Err(RuntimeError::Runloop(message)) => {
+                assert!(message.contains("ProviderStreamMode::Generic"));
+            }
+            other => panic!("expected sof-tx replay adapter failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_stream_allows_sof_tx_live_adapter_on_generic_mode() {
+        let plugin_host = PluginHost::builder()
+            .add_plugin(SofTxAdapterLikePlugin)
+            .build();
+        let derived_state_host = DerivedStateHost::builder().build();
+        let result = enforce_provider_stream_capability_policy(
+            ProviderStreamMode::Generic,
+            &plugin_host,
+            &derived_state_host,
+        );
+        assert!(result.is_ok());
     }
 
     #[test]

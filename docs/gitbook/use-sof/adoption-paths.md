@@ -49,6 +49,10 @@ How they fit together:
   traits
 - `sof-tx` then uses that state to decide whether direct or hybrid submission is safe
 
+That adapter path is complete today in raw-shred and gossip-backed SOF runtimes. Built-in
+processed provider adapters are transaction-first and do not yet provide a complete built-in
+`sof-tx` control-plane surface by themselves.
+
 ### I need repeatable host tuning profiles
 
 Add [`sof-gossip-tuning`](../crates/sof-gossip-tuning.md) when you want typed host presets
