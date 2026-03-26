@@ -23,7 +23,7 @@ use yellowstone_grpc_proto::prelude::{
 };
 
 use crate::{
-    event::TxCommitmentStatus,
+    event::{TxCommitmentStatus, TxKind},
     framework::TransactionEvent,
     provider_stream::{
         ProviderStreamSender, ProviderStreamUpdate, classify_provider_transaction_kind,
@@ -316,9 +316,7 @@ fn transaction_event_from_update(
 ) -> Result<TransactionEvent, YellowstoneGrpcError> {
     let transaction =
         transaction.ok_or(YellowstoneGrpcError::Convert("missing transaction payload"))?;
-    let signature = Signature::try_from(transaction.signature.as_slice())
-        .map(Some)
-        .map_err(|_error| YellowstoneGrpcError::Convert("invalid signature"))?;
+    let is_vote = transaction.is_vote;
     let tx = convert_transaction(
         transaction
             .transaction
@@ -331,8 +329,12 @@ fn transaction_event_from_update(
         commitment_status,
         confirmed_slot: None,
         finalized_slot: None,
-        signature,
-        kind: classify_provider_transaction_kind(&tx),
+        signature: tx.signatures.first().copied(),
+        kind: if is_vote {
+            TxKind::VoteOnly
+        } else {
+            classify_provider_transaction_kind(&tx)
+        },
         tx: std::sync::Arc::new(tx),
     })
 }
@@ -428,5 +430,410 @@ fn convert_message(
             recent_blockhash,
             instructions,
         }))
+    }
+}
+
+#[cfg(all(test, feature = "provider-grpc"))]
+mod tests {
+    use super::*;
+    use crate::event::TxKind;
+    use solana_instruction::Instruction;
+    use solana_keypair::Keypair;
+    use solana_message::{Message as SolanaMessage, VersionedMessage};
+    use solana_sdk_ids::system_program;
+    use solana_sdk_ids::{compute_budget, vote};
+    use solana_signer::Signer;
+    use std::time::Instant;
+    use yellowstone_grpc_proto::prelude::{
+        CompiledInstruction as ProtoCompiledInstruction, Message as ProtoMessage,
+        MessageAddressTableLookup as ProtoMessageAddressTableLookup,
+        MessageHeader as ProtoMessageHeader, SubscribeUpdateTransactionInfo, Transaction,
+    };
+
+    fn profile_iterations(default: usize) -> usize {
+        std::env::var("SOF_PROFILE_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default)
+    }
+
+    fn sample_transaction() -> VersionedTransaction {
+        let signer = Keypair::new();
+        let instructions = [
+            Instruction::new_with_bytes(vote::id(), &[], vec![]),
+            Instruction::new_with_bytes(system_program::id(), &[], vec![]),
+            Instruction::new_with_bytes(compute_budget::id(), &[], vec![]),
+        ];
+        let message = SolanaMessage::new(&instructions, Some(&signer.pubkey()));
+        VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&signer]).expect("tx")
+    }
+
+    fn sample_vote_transaction() -> VersionedTransaction {
+        let signer = Keypair::new();
+        let instructions = [
+            Instruction::new_with_bytes(vote::id(), &[], vec![]),
+            Instruction::new_with_bytes(compute_budget::id(), &[], vec![]),
+        ];
+        let message = SolanaMessage::new(&instructions, Some(&signer.pubkey()));
+        VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&signer]).expect("tx")
+    }
+
+    fn proto_transaction_from_versioned(tx: &VersionedTransaction) -> Transaction {
+        let message = match &tx.message {
+            VersionedMessage::Legacy(message) => ProtoMessage {
+                header: Some(ProtoMessageHeader {
+                    num_required_signatures: u32::from(message.header.num_required_signatures),
+                    num_readonly_signed_accounts: u32::from(
+                        message.header.num_readonly_signed_accounts,
+                    ),
+                    num_readonly_unsigned_accounts: u32::from(
+                        message.header.num_readonly_unsigned_accounts,
+                    ),
+                }),
+                account_keys: message
+                    .account_keys
+                    .iter()
+                    .map(|key| key.to_bytes().to_vec())
+                    .collect(),
+                recent_blockhash: message.recent_blockhash.to_bytes().to_vec(),
+                instructions: message
+                    .instructions
+                    .iter()
+                    .map(|instruction| ProtoCompiledInstruction {
+                        program_id_index: u32::from(instruction.program_id_index),
+                        accounts: instruction.accounts.clone(),
+                        data: instruction.data.clone(),
+                    })
+                    .collect(),
+                versioned: false,
+                address_table_lookups: Vec::new(),
+            },
+            VersionedMessage::V0(message) => ProtoMessage {
+                header: Some(ProtoMessageHeader {
+                    num_required_signatures: u32::from(message.header.num_required_signatures),
+                    num_readonly_signed_accounts: u32::from(
+                        message.header.num_readonly_signed_accounts,
+                    ),
+                    num_readonly_unsigned_accounts: u32::from(
+                        message.header.num_readonly_unsigned_accounts,
+                    ),
+                }),
+                account_keys: message
+                    .account_keys
+                    .iter()
+                    .map(|key| key.to_bytes().to_vec())
+                    .collect(),
+                recent_blockhash: message.recent_blockhash.to_bytes().to_vec(),
+                instructions: message
+                    .instructions
+                    .iter()
+                    .map(|instruction| ProtoCompiledInstruction {
+                        program_id_index: u32::from(instruction.program_id_index),
+                        accounts: instruction.accounts.clone(),
+                        data: instruction.data.clone(),
+                    })
+                    .collect(),
+                versioned: true,
+                address_table_lookups: message
+                    .address_table_lookups
+                    .iter()
+                    .map(|lookup| ProtoMessageAddressTableLookup {
+                        account_key: lookup.account_key.to_bytes().to_vec(),
+                        writable_indexes: lookup.writable_indexes.clone(),
+                        readonly_indexes: lookup.readonly_indexes.clone(),
+                    })
+                    .collect(),
+            },
+        };
+        Transaction {
+            signatures: tx
+                .signatures
+                .iter()
+                .map(|sig| sig.as_ref().to_vec())
+                .collect(),
+            message: Some(message),
+        }
+    }
+
+    fn sample_update() -> SubscribeUpdateTransactionInfo {
+        let tx = sample_transaction();
+        SubscribeUpdateTransactionInfo {
+            signature: tx.signatures.first().expect("signature").as_ref().to_vec(),
+            is_vote: false,
+            transaction: Some(proto_transaction_from_versioned(&tx)),
+            meta: None,
+            index: 0,
+        }
+    }
+
+    fn sample_vote_update() -> SubscribeUpdateTransactionInfo {
+        let tx = sample_vote_transaction();
+        SubscribeUpdateTransactionInfo {
+            signature: tx.signatures.first().expect("signature").as_ref().to_vec(),
+            is_vote: true,
+            transaction: Some(proto_transaction_from_versioned(&tx)),
+            meta: None,
+            index: 0,
+        }
+    }
+
+    fn transaction_event_from_update_baseline(
+        slot: u64,
+        transaction: Option<SubscribeUpdateTransactionInfo>,
+        commitment_status: TxCommitmentStatus,
+    ) -> Result<TransactionEvent, YellowstoneGrpcError> {
+        let transaction =
+            transaction.ok_or(YellowstoneGrpcError::Convert("missing transaction payload"))?;
+        let signature = Signature::try_from(transaction.signature.as_slice())
+            .map(Some)
+            .map_err(|_error| YellowstoneGrpcError::Convert("invalid signature"))?;
+        let tx = {
+            let tx = transaction
+                .transaction
+                .ok_or(YellowstoneGrpcError::Convert(
+                    "missing versioned transaction",
+                ))?;
+            let signatures = tx
+                .signatures
+                .into_iter()
+                .map(|signature| {
+                    Signature::try_from(signature.as_slice()).map_err(|_error| {
+                        YellowstoneGrpcError::Convert("failed to parse transaction signature")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let message = {
+                let message = tx
+                    .message
+                    .ok_or(YellowstoneGrpcError::Convert("missing transaction message"))?;
+                let header = message
+                    .header
+                    .ok_or(YellowstoneGrpcError::Convert("missing message header"))?;
+                let header = MessageHeader {
+                    num_required_signatures: u8::try_from(header.num_required_signatures).map_err(
+                        |_error| YellowstoneGrpcError::Convert("invalid num_required_signatures"),
+                    )?,
+                    num_readonly_signed_accounts: u8::try_from(header.num_readonly_signed_accounts)
+                        .map_err(|_error| {
+                            YellowstoneGrpcError::Convert("invalid num_readonly_signed_accounts")
+                        })?,
+                    num_readonly_unsigned_accounts: u8::try_from(
+                        header.num_readonly_unsigned_accounts,
+                    )
+                    .map_err(|_error| {
+                        YellowstoneGrpcError::Convert("invalid num_readonly_unsigned_accounts")
+                    })?,
+                };
+                let account_keys = message
+                    .account_keys
+                    .into_iter()
+                    .map(|key| {
+                        Pubkey::try_from(key.as_slice())
+                            .map_err(|_error| YellowstoneGrpcError::Convert("invalid account key"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let recent_blockhash = <[u8; 32]>::try_from(message.recent_blockhash.as_slice())
+                    .map(Hash::new_from_array)
+                    .map_err(|_error| YellowstoneGrpcError::Convert("invalid recent blockhash"))?;
+                let instructions = message
+                    .instructions
+                    .into_iter()
+                    .map(|instruction| {
+                        Ok(CompiledInstruction {
+                            program_id_index: u8::try_from(instruction.program_id_index).map_err(
+                                |_error| {
+                                    YellowstoneGrpcError::Convert(
+                                        "invalid compiled instruction program id index",
+                                    )
+                                },
+                            )?,
+                            accounts: instruction.accounts,
+                            data: instruction.data,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, YellowstoneGrpcError>>()?;
+                if message.versioned {
+                    let address_table_lookups = message
+                        .address_table_lookups
+                        .into_iter()
+                        .map(|lookup| {
+                            Ok(MessageAddressTableLookup {
+                                account_key: Pubkey::try_from(lookup.account_key.as_slice())
+                                    .map_err(|_error| {
+                                        YellowstoneGrpcError::Convert(
+                                            "invalid address table account key",
+                                        )
+                                    })?,
+                                writable_indexes: lookup.writable_indexes,
+                                readonly_indexes: lookup.readonly_indexes,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, YellowstoneGrpcError>>()?;
+                    VersionedMessage::V0(MessageV0 {
+                        header,
+                        account_keys,
+                        recent_blockhash,
+                        instructions,
+                        address_table_lookups,
+                    })
+                } else {
+                    VersionedMessage::Legacy(Message {
+                        header,
+                        account_keys,
+                        recent_blockhash,
+                        instructions,
+                    })
+                }
+            };
+            VersionedTransaction {
+                signatures,
+                message,
+            }
+        };
+        Ok(TransactionEvent {
+            slot,
+            commitment_status,
+            confirmed_slot: None,
+            finalized_slot: None,
+            signature,
+            kind: classify_provider_transaction_kind(&tx),
+            tx: std::sync::Arc::new(tx),
+        })
+    }
+
+    #[test]
+    fn yellowstone_transaction_event_from_update_decodes_transaction() {
+        let event =
+            transaction_event_from_update(55, Some(sample_update()), TxCommitmentStatus::Confirmed)
+                .expect("event");
+        assert_eq!(event.slot, 55);
+        assert_eq!(event.kind, TxKind::Mixed);
+        assert!(event.signature.is_some());
+    }
+
+    #[test]
+    fn yellowstone_transaction_event_from_update_shortcuts_vote_only() {
+        let event = transaction_event_from_update(
+            56,
+            Some(sample_vote_update()),
+            TxCommitmentStatus::Confirmed,
+        )
+        .expect("event");
+        assert_eq!(event.slot, 56);
+        assert_eq!(event.kind, TxKind::VoteOnly);
+        assert!(event.signature.is_some());
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for Yellowstone provider transaction conversion A/B"]
+    fn yellowstone_transaction_conversion_profile_fixture() {
+        let iterations = profile_iterations(200_000);
+
+        let update = sample_update();
+
+        let baseline_started = Instant::now();
+        for _ in 0..iterations {
+            let event = transaction_event_from_update_baseline(
+                55,
+                Some(update.clone()),
+                TxCommitmentStatus::Processed,
+            )
+            .expect("baseline event");
+            std::hint::black_box(event);
+        }
+        let baseline_elapsed = baseline_started.elapsed();
+
+        let optimized_started = Instant::now();
+        for _ in 0..iterations {
+            let event = transaction_event_from_update(
+                55,
+                Some(update.clone()),
+                TxCommitmentStatus::Processed,
+            )
+            .expect("optimized event");
+            std::hint::black_box(event);
+        }
+        let optimized_elapsed = optimized_started.elapsed();
+
+        eprintln!(
+            "yellowstone_transaction_conversion_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            iterations,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
+        );
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for baseline Yellowstone transaction conversion"]
+    fn yellowstone_transaction_conversion_baseline_profile_fixture() {
+        let iterations = profile_iterations(200_000);
+
+        let update = sample_update();
+        for _ in 0..iterations {
+            let event = transaction_event_from_update_baseline(
+                55,
+                Some(update.clone()),
+                TxCommitmentStatus::Processed,
+            )
+            .expect("baseline event");
+            std::hint::black_box(event);
+        }
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for optimized Yellowstone transaction conversion"]
+    fn yellowstone_transaction_conversion_optimized_profile_fixture() {
+        let iterations = profile_iterations(200_000);
+
+        let update = sample_update();
+        for _ in 0..iterations {
+            let event = transaction_event_from_update(
+                55,
+                Some(update.clone()),
+                TxCommitmentStatus::Processed,
+            )
+            .expect("optimized event");
+            std::hint::black_box(event);
+        }
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for Yellowstone vote-only conversion A/B"]
+    fn yellowstone_vote_only_conversion_profile_fixture() {
+        let iterations = profile_iterations(200_000);
+
+        let update = sample_vote_update();
+
+        let baseline_started = Instant::now();
+        for _ in 0..iterations {
+            let event = transaction_event_from_update_baseline(
+                56,
+                Some(update.clone()),
+                TxCommitmentStatus::Processed,
+            )
+            .expect("baseline event");
+            std::hint::black_box(event);
+        }
+        let baseline_elapsed = baseline_started.elapsed();
+
+        let optimized_started = Instant::now();
+        for _ in 0..iterations {
+            let event = transaction_event_from_update(
+                56,
+                Some(update.clone()),
+                TxCommitmentStatus::Processed,
+            )
+            .expect("optimized event");
+            std::hint::black_box(event);
+        }
+        let optimized_elapsed = optimized_started.elapsed();
+
+        eprintln!(
+            "yellowstone_vote_only_conversion_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            iterations,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
+        );
     }
 }

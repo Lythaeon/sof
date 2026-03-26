@@ -23,7 +23,7 @@ use thiserror::Error;
 use tokio::task::JoinHandle;
 
 use crate::{
-    event::TxCommitmentStatus,
+    event::{TxCommitmentStatus, TxKind},
     framework::TransactionEvent,
     provider_stream::{
         ProviderStreamSender, ProviderStreamUpdate, classify_provider_transaction_kind,
@@ -348,9 +348,7 @@ fn transaction_event_from_update(
 ) -> Result<TransactionEvent, LaserStreamError> {
     let transaction =
         transaction.ok_or(LaserStreamError::Convert("missing transaction payload"))?;
-    let signature = Signature::try_from(transaction.signature.as_slice())
-        .map(Some)
-        .map_err(|_error| LaserStreamError::Convert("invalid signature"))?;
+    let is_vote = transaction.is_vote;
     let tx = convert_transaction(
         transaction
             .transaction
@@ -361,8 +359,12 @@ fn transaction_event_from_update(
         commitment_status,
         confirmed_slot: None,
         finalized_slot: None,
-        signature,
-        kind: classify_provider_transaction_kind(&tx),
+        signature: tx.signatures.first().copied(),
+        kind: if is_vote {
+            TxKind::VoteOnly
+        } else {
+            classify_provider_transaction_kind(&tx)
+        },
         tx: Arc::new(tx),
     })
 }
@@ -377,6 +379,26 @@ fn convert_transaction(
 mod tests {
     use super::*;
     use crate::provider_stream::yellowstone::{YellowstoneGrpcCommitment, YellowstoneGrpcConfig};
+    use laserstream_core_proto::prelude::{
+        CompiledInstruction as ProtoCompiledInstruction, Message as ProtoMessage,
+        MessageAddressTableLookup as ProtoMessageAddressTableLookup,
+        MessageHeader as ProtoMessageHeader, SubscribeUpdateTransactionInfo,
+        Transaction as ProtoTransaction,
+    };
+    use solana_instruction::Instruction;
+    use solana_keypair::Keypair;
+    use solana_message::{Message, VersionedMessage};
+    use solana_sdk_ids::{compute_budget, system_program, vote};
+    use solana_signer::Signer;
+    use std::time::Instant;
+
+    fn profile_iterations(default: usize) -> usize {
+        std::env::var("SOF_PROFILE_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default)
+    }
 
     #[test]
     fn transaction_filter_shape_matches_yellowstone_config() {
@@ -422,6 +444,287 @@ mod tests {
         assert_eq!(
             laser_filter.account_required,
             yellowstone_filter.account_required
+        );
+    }
+
+    fn sample_transaction() -> VersionedTransaction {
+        let signer = Keypair::new();
+        let instructions = [
+            Instruction::new_with_bytes(vote::id(), &[], vec![]),
+            Instruction::new_with_bytes(system_program::id(), &[], vec![]),
+            Instruction::new_with_bytes(compute_budget::id(), &[], vec![]),
+        ];
+        let message = Message::new(&instructions, Some(&signer.pubkey()));
+        VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&signer]).expect("tx")
+    }
+
+    fn sample_vote_transaction() -> VersionedTransaction {
+        let signer = Keypair::new();
+        let instructions = [
+            Instruction::new_with_bytes(vote::id(), &[], vec![]),
+            Instruction::new_with_bytes(compute_budget::id(), &[], vec![]),
+        ];
+        let message = Message::new(&instructions, Some(&signer.pubkey()));
+        VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&signer]).expect("tx")
+    }
+
+    fn proto_transaction_from_versioned(tx: &VersionedTransaction) -> ProtoTransaction {
+        let message = match &tx.message {
+            VersionedMessage::Legacy(message) => ProtoMessage {
+                header: Some(ProtoMessageHeader {
+                    num_required_signatures: u32::from(message.header.num_required_signatures),
+                    num_readonly_signed_accounts: u32::from(
+                        message.header.num_readonly_signed_accounts,
+                    ),
+                    num_readonly_unsigned_accounts: u32::from(
+                        message.header.num_readonly_unsigned_accounts,
+                    ),
+                }),
+                account_keys: message
+                    .account_keys
+                    .iter()
+                    .map(|key| key.to_bytes().to_vec())
+                    .collect(),
+                recent_blockhash: message.recent_blockhash.to_bytes().to_vec(),
+                instructions: message
+                    .instructions
+                    .iter()
+                    .map(|instruction| ProtoCompiledInstruction {
+                        program_id_index: u32::from(instruction.program_id_index),
+                        accounts: instruction.accounts.clone(),
+                        data: instruction.data.clone(),
+                    })
+                    .collect(),
+                versioned: false,
+                address_table_lookups: Vec::new(),
+            },
+            VersionedMessage::V0(message) => ProtoMessage {
+                header: Some(ProtoMessageHeader {
+                    num_required_signatures: u32::from(message.header.num_required_signatures),
+                    num_readonly_signed_accounts: u32::from(
+                        message.header.num_readonly_signed_accounts,
+                    ),
+                    num_readonly_unsigned_accounts: u32::from(
+                        message.header.num_readonly_unsigned_accounts,
+                    ),
+                }),
+                account_keys: message
+                    .account_keys
+                    .iter()
+                    .map(|key| key.to_bytes().to_vec())
+                    .collect(),
+                recent_blockhash: message.recent_blockhash.to_bytes().to_vec(),
+                instructions: message
+                    .instructions
+                    .iter()
+                    .map(|instruction| ProtoCompiledInstruction {
+                        program_id_index: u32::from(instruction.program_id_index),
+                        accounts: instruction.accounts.clone(),
+                        data: instruction.data.clone(),
+                    })
+                    .collect(),
+                versioned: true,
+                address_table_lookups: message
+                    .address_table_lookups
+                    .iter()
+                    .map(|lookup| ProtoMessageAddressTableLookup {
+                        account_key: lookup.account_key.to_bytes().to_vec(),
+                        writable_indexes: lookup.writable_indexes.clone(),
+                        readonly_indexes: lookup.readonly_indexes.clone(),
+                    })
+                    .collect(),
+            },
+        };
+        ProtoTransaction {
+            signatures: tx
+                .signatures
+                .iter()
+                .map(|sig| sig.as_ref().to_vec())
+                .collect(),
+            message: Some(message),
+        }
+    }
+
+    fn sample_update() -> SubscribeUpdateTransactionInfo {
+        let tx = sample_transaction();
+        SubscribeUpdateTransactionInfo {
+            signature: tx.signatures.first().expect("signature").as_ref().to_vec(),
+            is_vote: false,
+            transaction: Some(proto_transaction_from_versioned(&tx)),
+            meta: None,
+            index: 0,
+        }
+    }
+
+    fn sample_vote_update() -> SubscribeUpdateTransactionInfo {
+        let tx = sample_vote_transaction();
+        SubscribeUpdateTransactionInfo {
+            signature: tx.signatures.first().expect("signature").as_ref().to_vec(),
+            is_vote: true,
+            transaction: Some(proto_transaction_from_versioned(&tx)),
+            meta: None,
+            index: 0,
+        }
+    }
+
+    fn transaction_event_from_update_baseline(
+        slot: u64,
+        transaction: Option<SubscribeUpdateTransactionInfo>,
+        commitment_status: TxCommitmentStatus,
+    ) -> Result<TransactionEvent, LaserStreamError> {
+        let transaction =
+            transaction.ok_or(LaserStreamError::Convert("missing transaction payload"))?;
+        let signature = Signature::try_from(transaction.signature.as_slice())
+            .map(Some)
+            .map_err(|_error| LaserStreamError::Convert("invalid signature"))?;
+        let tx = convert_transaction(
+            transaction
+                .transaction
+                .ok_or(LaserStreamError::Convert("missing versioned transaction"))?,
+        )?;
+        Ok(TransactionEvent {
+            slot,
+            commitment_status,
+            confirmed_slot: None,
+            finalized_slot: None,
+            signature,
+            kind: classify_provider_transaction_kind(&tx),
+            tx: Arc::new(tx),
+        })
+    }
+
+    #[test]
+    fn laserstream_transaction_event_from_update_decodes_transaction() {
+        let event =
+            transaction_event_from_update(77, Some(sample_update()), TxCommitmentStatus::Confirmed)
+                .expect("event");
+        assert_eq!(event.slot, 77);
+        assert_eq!(event.kind, crate::event::TxKind::Mixed);
+        assert!(event.signature.is_some());
+    }
+
+    #[test]
+    fn laserstream_transaction_event_from_update_shortcuts_vote_only() {
+        let event = transaction_event_from_update(
+            78,
+            Some(sample_vote_update()),
+            TxCommitmentStatus::Confirmed,
+        )
+        .expect("event");
+        assert_eq!(event.slot, 78);
+        assert_eq!(event.kind, crate::event::TxKind::VoteOnly);
+        assert!(event.signature.is_some());
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for LaserStream provider transaction conversion A/B"]
+    fn laserstream_transaction_conversion_profile_fixture() {
+        let iterations = profile_iterations(200_000);
+
+        let update = sample_update();
+
+        let baseline_started = Instant::now();
+        for _ in 0..iterations {
+            let event = transaction_event_from_update_baseline(
+                77,
+                Some(update.clone()),
+                TxCommitmentStatus::Processed,
+            )
+            .expect("baseline event");
+            std::hint::black_box(event);
+        }
+        let baseline_elapsed = baseline_started.elapsed();
+
+        let optimized_started = Instant::now();
+        for _ in 0..iterations {
+            let event = transaction_event_from_update(
+                77,
+                Some(update.clone()),
+                TxCommitmentStatus::Processed,
+            )
+            .expect("optimized event");
+            std::hint::black_box(event);
+        }
+        let optimized_elapsed = optimized_started.elapsed();
+
+        eprintln!(
+            "laserstream_transaction_conversion_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            iterations,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
+        );
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for baseline LaserStream transaction conversion"]
+    fn laserstream_transaction_conversion_baseline_profile_fixture() {
+        let iterations = profile_iterations(200_000);
+
+        let update = sample_update();
+        for _ in 0..iterations {
+            let event = transaction_event_from_update_baseline(
+                77,
+                Some(update.clone()),
+                TxCommitmentStatus::Processed,
+            )
+            .expect("baseline event");
+            std::hint::black_box(event);
+        }
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for optimized LaserStream transaction conversion"]
+    fn laserstream_transaction_conversion_optimized_profile_fixture() {
+        let iterations = profile_iterations(200_000);
+
+        let update = sample_update();
+        for _ in 0..iterations {
+            let event = transaction_event_from_update(
+                77,
+                Some(update.clone()),
+                TxCommitmentStatus::Processed,
+            )
+            .expect("optimized event");
+            std::hint::black_box(event);
+        }
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for LaserStream vote-only conversion A/B"]
+    fn laserstream_vote_only_conversion_profile_fixture() {
+        let iterations = profile_iterations(200_000);
+
+        let update = sample_vote_update();
+
+        let baseline_started = Instant::now();
+        for _ in 0..iterations {
+            let event = transaction_event_from_update_baseline(
+                78,
+                Some(update.clone()),
+                TxCommitmentStatus::Processed,
+            )
+            .expect("baseline event");
+            std::hint::black_box(event);
+        }
+        let baseline_elapsed = baseline_started.elapsed();
+
+        let optimized_started = Instant::now();
+        for _ in 0..iterations {
+            let event = transaction_event_from_update(
+                78,
+                Some(update.clone()),
+                TxCommitmentStatus::Processed,
+            )
+            .expect("optimized event");
+            std::hint::black_box(event);
+        }
+        let optimized_elapsed = optimized_started.elapsed();
+
+        eprintln!(
+            "laserstream_vote_only_conversion_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            iterations,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
         );
     }
 }

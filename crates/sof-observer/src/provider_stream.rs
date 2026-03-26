@@ -190,10 +190,16 @@ pub(crate) fn classify_provider_transaction_kind(tx: &VersionedTransaction) -> T
         if let Some(program_id) = keys.get(usize::from(instruction.program_id_index)) {
             if *program_id == vote::id() {
                 has_vote = true;
+                if has_non_vote_non_budget {
+                    return TxKind::Mixed;
+                }
                 continue;
             }
             if *program_id != compute_budget::id() {
                 has_non_vote_non_budget = true;
+                if has_vote {
+                    return TxKind::Mixed;
+                }
             }
         }
     }
@@ -217,3 +223,121 @@ pub mod laserstream;
 #[cfg(feature = "provider-websocket")]
 /// Websocket `transactionSubscribe` adapter helpers.
 pub mod websocket;
+
+#[cfg(all(test, any(feature = "provider-grpc", feature = "provider-websocket")))]
+mod tests {
+    use super::*;
+    use solana_instruction::Instruction;
+    use solana_keypair::Keypair;
+    use solana_message::{Message, VersionedMessage};
+    use solana_sdk_ids::system_program;
+    use solana_signer::Signer;
+    use std::time::Instant;
+
+    fn profile_iterations(default: usize) -> usize {
+        std::env::var("SOF_PROFILE_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default)
+    }
+
+    fn sample_mixed_transaction() -> VersionedTransaction {
+        let signer = Keypair::new();
+        let mut instructions = Vec::with_capacity(34);
+        instructions.push(Instruction::new_with_bytes(vote::id(), &[], vec![]));
+        instructions.push(Instruction::new_with_bytes(
+            system_program::id(),
+            &[],
+            vec![],
+        ));
+        for _ in 0..32 {
+            instructions.push(Instruction::new_with_bytes(
+                compute_budget::id(),
+                &[],
+                vec![],
+            ));
+        }
+        let message = Message::new(&instructions, Some(&signer.pubkey()));
+        VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&signer]).expect("tx")
+    }
+
+    fn classify_provider_transaction_kind_baseline(tx: &VersionedTransaction) -> TxKind {
+        let mut has_vote = false;
+        let mut has_non_vote_non_budget = false;
+        let keys = tx.message.static_account_keys();
+        for instruction in tx.message.instructions() {
+            if let Some(program_id) = keys.get(usize::from(instruction.program_id_index)) {
+                if *program_id == vote::id() {
+                    has_vote = true;
+                    continue;
+                }
+                if *program_id != compute_budget::id() {
+                    has_non_vote_non_budget = true;
+                }
+            }
+        }
+        if has_vote && !has_non_vote_non_budget {
+            TxKind::VoteOnly
+        } else if has_vote {
+            TxKind::Mixed
+        } else {
+            TxKind::NonVote
+        }
+    }
+
+    #[test]
+    fn classify_provider_transaction_kind_detects_mixed() {
+        let tx = sample_mixed_transaction();
+        assert_eq!(classify_provider_transaction_kind(&tx), TxKind::Mixed);
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for provider transaction kind classification A/B"]
+    fn provider_transaction_kind_profile_fixture() {
+        let iterations = profile_iterations(1_000_000);
+
+        let tx = sample_mixed_transaction();
+
+        let baseline_started = Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(classify_provider_transaction_kind_baseline(&tx));
+        }
+        let baseline_elapsed = baseline_started.elapsed();
+
+        let optimized_started = Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(classify_provider_transaction_kind(&tx));
+        }
+        let optimized_elapsed = optimized_started.elapsed();
+
+        eprintln!(
+            "provider_transaction_kind_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            iterations,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
+        );
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for baseline provider tx kind classification"]
+    fn provider_transaction_kind_baseline_profile_fixture() {
+        let iterations = profile_iterations(1_000_000);
+
+        let tx = sample_mixed_transaction();
+        for _ in 0..iterations {
+            std::hint::black_box(classify_provider_transaction_kind_baseline(&tx));
+        }
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for optimized provider tx kind classification"]
+    fn provider_transaction_kind_optimized_profile_fixture() {
+        let iterations = profile_iterations(1_000_000);
+
+        let tx = sample_mixed_transaction();
+        for _ in 0..iterations {
+            std::hint::black_box(classify_provider_transaction_kind(&tx));
+        }
+    }
+}

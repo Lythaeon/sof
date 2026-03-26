@@ -575,6 +575,14 @@ mod tests {
     use solana_signer::Signer;
     use std::time::Instant;
 
+    fn profile_iterations(default: usize) -> usize {
+        std::env::var("SOF_PROFILE_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default)
+    }
+
     fn sample_notification_payload() -> Vec<u8> {
         let signer = Keypair::new();
         let message = Message::new(&[], Some(&signer.pubkey()));
@@ -765,12 +773,12 @@ mod tests {
     #[test]
     #[ignore = "profiling fixture for websocket transaction parsing A/B"]
     fn websocket_transaction_parse_profile_fixture() {
-        const ITERATIONS: usize = 200_000;
+        let iterations = profile_iterations(200_000);
 
         let payload = sample_notification_payload();
 
         let baseline_started = Instant::now();
-        for _ in 0..ITERATIONS {
+        for _ in 0..iterations {
             let mut frame = payload.clone();
             let event = parse_transaction_notification_baseline(
                 &mut frame,
@@ -785,7 +793,7 @@ mod tests {
         let optimized_started = Instant::now();
         let mut frame_bytes = Vec::new();
         let mut tx_bytes = Vec::new();
-        for _ in 0..ITERATIONS {
+        for _ in 0..iterations {
             let frame = frame_bytes_mut(&mut frame_bytes, &payload);
             let event = parse_transaction_notification(
                 frame,
@@ -800,7 +808,7 @@ mod tests {
 
         eprintln!(
             "websocket_transaction_parse_profile_fixture iterations={} baseline_us={} optimized_us={}",
-            ITERATIONS,
+            iterations,
             baseline_elapsed.as_micros(),
             optimized_elapsed.as_micros(),
         );
@@ -809,10 +817,10 @@ mod tests {
     #[test]
     #[ignore = "profiling fixture for baseline websocket transaction parsing"]
     fn websocket_transaction_parse_baseline_profile_fixture() {
-        const ITERATIONS: usize = 200_000;
+        let iterations = profile_iterations(200_000);
 
         let payload = sample_notification_payload();
-        for _ in 0..ITERATIONS {
+        for _ in 0..iterations {
             let mut frame = payload.clone();
             let event = parse_transaction_notification_baseline(
                 &mut frame,
@@ -827,12 +835,12 @@ mod tests {
     #[test]
     #[ignore = "profiling fixture for optimized websocket transaction parsing"]
     fn websocket_transaction_parse_optimized_profile_fixture() {
-        const ITERATIONS: usize = 200_000;
+        let iterations = profile_iterations(200_000);
 
         let payload = sample_notification_payload();
         let mut frame_bytes = Vec::new();
         let mut tx_bytes = Vec::new();
-        for _ in 0..ITERATIONS {
+        for _ in 0..iterations {
             let frame = frame_bytes_mut(&mut frame_bytes, &payload);
             let event = parse_transaction_notification(
                 frame,
