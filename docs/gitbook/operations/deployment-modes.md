@@ -56,12 +56,12 @@ SOF exposes this category through `ProviderStreamMode`. In that mode:
     - SOF can replay recent slots and dedupe the recovered transactions, but it
       cannot promise stronger durability than the websocket provider plus HTTP
       RPC backfill path can expose
-- strict provider capability policy only rejects hooks that provider runtime can
-  never emit; it does not reject generic provider updates such as recent
-  blockhash, slot status, or cluster topology when your producer supplies them
-- strict capability checks also apply to derived-state consumers, so provider
-  mode fails fast instead of running with unsupported derived-state
-  subscriptions
+- built-in processed provider modes are fixed-surface and fail fast when you
+  request hooks they do not emit
+- `ProviderStreamMode::Generic` is the flexible mode for custom producers; there
+  `SOF_PROVIDER_STREAM_CAPABILITY_POLICY` controls whether unsupported requests
+  warn or fail
+- the same capability checks apply to derived-state consumers, not just plugins
 
 That means deployment mode is not only about network topology. It is also about how much of the
 low-level substrate SOF is owning for the application:

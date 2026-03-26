@@ -1,8 +1,9 @@
 #![allow(clippy::missing_docs_in_private_items)]
 
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashSet, VecDeque, hash_map::DefaultHasher},
     future::Future,
+    hash::{Hash, Hasher},
     net::SocketAddr,
     path::PathBuf,
     pin::Pin,
@@ -1598,12 +1599,27 @@ async fn run_provider_stream_runtime(
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct ProviderReplayDedupeKey {
-    slot: u64,
-    signature: Signature,
-    commitment_status: u8,
-    confirmed_slot: Option<u64>,
-    finalized_slot: Option<u64>,
+enum ProviderReplayDedupeKey {
+    Transaction {
+        slot: u64,
+        signature: Signature,
+        commitment_status: u8,
+        confirmed_slot: Option<u64>,
+        finalized_slot: Option<u64>,
+    },
+    ControlPlane {
+        slot: u64,
+        kind: u8,
+        fingerprint: u64,
+    },
+}
+
+impl ProviderReplayDedupeKey {
+    const fn slot(self) -> u64 {
+        match self {
+            Self::Transaction { slot, .. } | Self::ControlPlane { slot, .. } => slot,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1628,7 +1644,7 @@ impl ProviderReplayDedupe {
         let Some(key) = provider_replay_dedupe_key(update) else {
             return false;
         };
-        self.max_slot_seen = self.max_slot_seen.max(key.slot);
+        self.max_slot_seen = self.max_slot_seen.max(key.slot());
         if self.seen.contains(&key) {
             return true;
         }
@@ -1643,7 +1659,7 @@ impl ProviderReplayDedupe {
             .max_slot_seen
             .saturating_sub(PROVIDER_REPLAY_DEDUPE_SLOT_WINDOW);
         while let Some(oldest) = self.order.front().copied() {
-            if self.order.len() <= self.capacity && oldest.slot >= min_slot {
+            if self.order.len() <= self.capacity && oldest.slot() >= min_slot {
                 break;
             }
             let _ = self.order.pop_front();
@@ -1657,7 +1673,7 @@ fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderR
         ProviderStreamUpdate::Transaction(event) => event
             .signature
             .or_else(|| event.tx.signatures.first().copied())
-            .map(|signature| ProviderReplayDedupeKey {
+            .map(|signature| ProviderReplayDedupeKey::Transaction {
                 slot: event.slot,
                 signature,
                 commitment_status: provider_replay_commitment_key(event.commitment_status),
@@ -1665,16 +1681,55 @@ fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderR
                 finalized_slot: event.finalized_slot,
             }),
         ProviderStreamUpdate::SerializedTransaction(event) => {
-            event.signature.map(|signature| ProviderReplayDedupeKey {
+            event
+                .signature
+                .map(|signature| ProviderReplayDedupeKey::Transaction {
+                    slot: event.slot,
+                    signature,
+                    commitment_status: provider_replay_commitment_key(event.commitment_status),
+                    confirmed_slot: event.confirmed_slot,
+                    finalized_slot: event.finalized_slot,
+                })
+        }
+        ProviderStreamUpdate::RecentBlockhash(event) => {
+            Some(ProviderReplayDedupeKey::ControlPlane {
                 slot: event.slot,
-                signature,
-                commitment_status: provider_replay_commitment_key(event.commitment_status),
-                confirmed_slot: event.confirmed_slot,
-                finalized_slot: event.finalized_slot,
+                kind: 1,
+                fingerprint: provider_replay_fingerprint(event),
             })
         }
+        ProviderStreamUpdate::SlotStatus(event) => Some(ProviderReplayDedupeKey::ControlPlane {
+            slot: event.slot,
+            kind: 2,
+            fingerprint: provider_replay_fingerprint(event),
+        }),
+        ProviderStreamUpdate::ClusterTopology(event) => {
+            Some(ProviderReplayDedupeKey::ControlPlane {
+                slot: event.slot.unwrap_or_default(),
+                kind: 3,
+                fingerprint: provider_replay_fingerprint(event),
+            })
+        }
+        ProviderStreamUpdate::LeaderSchedule(event) => {
+            Some(ProviderReplayDedupeKey::ControlPlane {
+                slot: event.slot.unwrap_or_default(),
+                kind: 4,
+                fingerprint: provider_replay_fingerprint(event),
+            })
+        }
+        ProviderStreamUpdate::Reorg(event) => Some(ProviderReplayDedupeKey::ControlPlane {
+            slot: event.new_tip,
+            kind: 5,
+            fingerprint: provider_replay_fingerprint(event),
+        }),
         _ => None,
     }
+}
+
+fn provider_replay_fingerprint<T: Hash>(value: &T) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
 }
 
 const fn provider_replay_commitment_key(commitment_status: crate::event::TxCommitmentStatus) -> u8 {
@@ -1860,7 +1915,6 @@ fn provider_stream_unsupported_hooks(
     plugin_host: &PluginHost,
     derived_state_host: &DerivedStateHost,
 ) -> Vec<&'static str> {
-    let _ = mode;
     let mut unsupported = Vec::new();
     if plugin_host.wants_raw_packet() {
         unsupported.push("on_raw_packet");
@@ -1877,8 +1931,31 @@ fn provider_stream_unsupported_hooks(
     if plugin_host.wants_transaction_batch() {
         unsupported.push("on_transaction_batch");
     }
+    if mode != ProviderStreamMode::Generic {
+        if plugin_host.wants_transaction_log() {
+            unsupported.push("on_transaction_log");
+        }
+        if plugin_host.wants_transaction_view_batch() {
+            unsupported.push("on_transaction_view_batch");
+        }
+        if plugin_host.wants_slot_status() {
+            unsupported.push("on_slot_status");
+        }
+        if plugin_host.wants_cluster_topology() {
+            unsupported.push("on_cluster_topology");
+        }
+        if plugin_host.wants_leader_schedule() {
+            unsupported.push("on_leader_schedule");
+        }
+        if plugin_host.wants_reorg() {
+            unsupported.push("on_reorg");
+        }
+    }
     if derived_state_host.wants_account_touch_observed() {
         unsupported.push("derived_state.account_touch_observed");
+    }
+    if mode != ProviderStreamMode::Generic && derived_state_host.wants_control_plane_observed() {
+        unsupported.push("derived_state.control_plane_observed");
     }
     unsupported
 }
@@ -1888,20 +1965,16 @@ fn enforce_provider_stream_capability_policy(
     plugin_host: &PluginHost,
     derived_state_host: &DerivedStateHost,
 ) -> Result<(), RuntimeError> {
-    let plugin_names = plugin_host.plugin_names();
-    let consumer_names = derived_state_host.consumer_names();
-    if mode != ProviderStreamMode::Generic
-        && (plugin_names.contains(&"sof-tx-provider-adapter")
-            || consumer_names.contains(&"sof-tx-derived-state-provider-adapter"))
-    {
-        return Err(RuntimeError::Runloop(format!(
-            "provider-stream mode {} uses a built-in transaction-first adapter; sof-tx adapters require raw-shred/gossip mode or ProviderStreamMode::Generic with a custom producer that supplies the full control-plane feed",
-            mode.as_str(),
-        )));
-    }
     let unsupported = provider_stream_unsupported_hooks(mode, plugin_host, derived_state_host);
     if unsupported.is_empty() {
         return Ok(());
+    }
+    if mode != ProviderStreamMode::Generic {
+        return Err(RuntimeError::Runloop(format!(
+            "built-in provider-stream mode {} does not support requested hooks: {}; use raw-shred/gossip mode or ProviderStreamMode::Generic with a custom producer for richer control-plane surfaces",
+            mode.as_str(),
+            unsupported.join(", ")
+        )));
     }
     match ProviderStreamCapabilityPolicy::from_runtime_env() {
         ProviderStreamCapabilityPolicy::Warn => {
@@ -2557,7 +2630,7 @@ mod tests {
         }
 
         fn config(&self) -> DerivedStateConsumerConfig {
-            DerivedStateConsumerConfig::new().with_account_touch_observed()
+            DerivedStateConsumerConfig::new().with_control_plane_observed()
         }
 
         fn apply(
@@ -2758,6 +2831,14 @@ mod tests {
             }
             other => other,
         }
+    }
+
+    fn sample_provider_recent_blockhash_update(slot: u64) -> ProviderStreamUpdate {
+        ProviderStreamUpdate::RecentBlockhash(crate::framework::ObservedRecentBlockhashEvent {
+            slot,
+            recent_blockhash: [slot as u8; 32],
+            dataset_tx_count: 1,
+        })
     }
 
     #[test]
@@ -3063,7 +3144,7 @@ mod tests {
         let plugin_host = PluginHost::builder().add_plugin(RawPacketPlugin).build();
         let derived_state_host = DerivedStateHost::builder().build();
         let result = enforce_provider_stream_capability_policy(
-            ProviderStreamMode::YellowstoneGrpc,
+            ProviderStreamMode::Generic,
             &plugin_host,
             &derived_state_host,
         );
@@ -3141,6 +3222,50 @@ mod tests {
     }
 
     #[test]
+    fn built_in_provider_modes_reject_control_plane_hooks_even_under_warn() {
+        crate::runtime_env::set_runtime_env_overrides([(
+            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+            String::from("warn"),
+        )]);
+        struct ControlPlanePlugin;
+
+        #[async_trait]
+        impl ObserverPlugin for ControlPlanePlugin {
+            fn name(&self) -> &'static str {
+                "control-plane-plugin"
+            }
+
+            fn config(&self) -> PluginConfig {
+                PluginConfig::new()
+                    .with_cluster_topology()
+                    .with_leader_schedule()
+                    .with_reorg()
+            }
+        }
+
+        let plugin_host = PluginHost::builder().add_plugin(ControlPlanePlugin).build();
+        let derived_state_host = DerivedStateHost::builder()
+            .add_consumer(ControlPlaneDerivedStateConsumer)
+            .build();
+        let result = enforce_provider_stream_capability_policy(
+            ProviderStreamMode::YellowstoneGrpc,
+            &plugin_host,
+            &derived_state_host,
+        );
+        crate::runtime_env::clear_runtime_env_overrides();
+        match result {
+            Err(RuntimeError::Runloop(message)) => {
+                assert!(message.contains("built-in provider-stream mode"));
+                assert!(message.contains("on_cluster_topology"));
+                assert!(message.contains("on_leader_schedule"));
+                assert!(message.contains("on_reorg"));
+                assert!(message.contains("derived_state.control_plane_observed"));
+            }
+            other => panic!("expected built-in provider capability failure, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn provider_stream_strict_policy_allows_generic_leader_schedule_reorg_and_control_plane() {
         crate::runtime_env::set_runtime_env_overrides([(
             String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
@@ -3192,7 +3317,9 @@ mod tests {
         crate::runtime_env::clear_runtime_env_overrides();
         match result {
             Err(RuntimeError::Runloop(message)) => {
-                assert!(message.contains("ProviderStreamMode::Generic"));
+                assert!(message.contains("built-in provider-stream mode"));
+                assert!(message.contains("on_cluster_topology"));
+                assert!(message.contains("on_leader_schedule"));
             }
             other => panic!("expected sof-tx live adapter failure, got {other:?}"),
         }
@@ -3216,7 +3343,8 @@ mod tests {
         crate::runtime_env::clear_runtime_env_overrides();
         match result {
             Err(RuntimeError::Runloop(message)) => {
-                assert!(message.contains("ProviderStreamMode::Generic"));
+                assert!(message.contains("built-in provider-stream mode"));
+                assert!(message.contains("derived_state.control_plane_observed"));
             }
             other => panic!("expected sof-tx replay adapter failure, got {other:?}"),
         }
@@ -3228,6 +3356,20 @@ mod tests {
             .add_plugin(SofTxAdapterLikePlugin)
             .build();
         let derived_state_host = DerivedStateHost::builder().build();
+        let result = enforce_provider_stream_capability_policy(
+            ProviderStreamMode::Generic,
+            &plugin_host,
+            &derived_state_host,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn provider_stream_allows_sof_tx_replay_adapter_on_generic_mode() {
+        let plugin_host = PluginHost::builder().build();
+        let derived_state_host = DerivedStateHost::builder()
+            .add_consumer(SofTxDerivedStateAdapterLikeConsumer)
+            .build();
         let result = enforce_provider_stream_capability_policy(
             ProviderStreamMode::Generic,
             &plugin_host,
@@ -3283,6 +3425,15 @@ mod tests {
         assert!(!dedupe.observe(&old));
         assert!(!dedupe.observe(&new));
         assert!(!dedupe.observe(&old));
+    }
+
+    #[test]
+    fn provider_replay_dedupe_skips_duplicate_control_plane_updates() {
+        let update = sample_provider_recent_blockhash_update(42);
+        let mut dedupe = ProviderReplayDedupe::new(8);
+
+        assert!(!dedupe.observe(&update));
+        assert!(dedupe.observe(&update));
     }
 
     #[tokio::test]

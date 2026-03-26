@@ -99,16 +99,13 @@ Provider config defaults are inclusive:
 - vote transactions are included unless you explicitly set a vote filter
 - failed transactions are included unless you explicitly set a failed filter
 
-Provider runtime capability policy applies only to hooks that are impossible in
-provider-stream mode. It does not reject generic provider updates such as
-`on_recent_blockhash`, `on_slot_status`, `on_cluster_topology`,
-`on_leader_schedule`, or `on_reorg` when a custom producer pushes those updates
-into the provider queue.
+Built-in processed provider modes are fixed-surface and fail fast when you ask
+for hooks they do not emit. `ProviderStreamMode::Generic` is the flexible mode:
+it can accept richer control-plane updates from a custom producer, and
+`SOF_PROVIDER_STREAM_CAPABILITY_POLICY` controls whether unsupported requests
+warn or fail there.
 
-Strict capability checks also cover derived-state consumers, not just plugins.
-If a provider mode cannot emit a requested derived-state feed such as account
-touch or control-plane observation, SOF now fails fast instead of starting with
-an unsatisfied subscription.
+The same capability checks apply to derived-state consumers, not just plugins.
 
 That also means SOF's internal transaction classifier hooks such as
 `transaction_prefilter`, `accepts_transaction_ref`, and `transaction_interest_ref`

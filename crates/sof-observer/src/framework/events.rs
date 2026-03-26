@@ -358,7 +358,7 @@ pub struct AccountTouchEventRef<'event> {
     pub lookup_table_account_key_count: usize,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 /// Runtime event emitted when local canonical classification for one slot changes.
 pub struct SlotStatusEvent {
     /// Slot number whose status changed.
@@ -377,7 +377,7 @@ pub struct SlotStatusEvent {
     pub finalized_slot: Option<u64>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 /// Runtime event emitted when local canonical tip switches to a different fork branch.
 pub struct ReorgEvent {
     /// Previous local canonical tip slot.
@@ -396,7 +396,7 @@ pub struct ReorgEvent {
     pub finalized_slot: Option<u64>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 /// Runtime event emitted when a newer observed recent blockhash is detected.
 pub struct ObservedRecentBlockhashEvent {
     /// Slot where this recent blockhash was observed.
@@ -407,7 +407,7 @@ pub struct ObservedRecentBlockhashEvent {
     pub dataset_tx_count: u64,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
 /// Topology/leader event source.
 pub enum ControlPlaneSource {
     /// Data gathered from gossip-bootstrap runtime state.
@@ -416,7 +416,7 @@ pub enum ControlPlaneSource {
     Direct,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 /// One known cluster node and its key advertised endpoints.
 pub struct ClusterNodeInfo {
     /// Node identity.
@@ -443,7 +443,7 @@ pub struct ClusterNodeInfo {
     pub rpc: Option<SocketAddr>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 /// Low-frequency cluster topology update with diff + optional periodic snapshot.
 pub struct ClusterTopologyEvent {
     /// Event source mode.
@@ -468,7 +468,7 @@ pub struct ClusterTopologyEvent {
     pub snapshot_nodes: Vec<ClusterNodeInfo>,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
 /// One leader assignment for a slot.
 pub struct LeaderScheduleEntry {
     /// Slot number.
@@ -477,7 +477,7 @@ pub struct LeaderScheduleEntry {
     pub leader: Pubkey,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 /// Event-driven leader-schedule update with diff payloads.
 pub struct LeaderScheduleEvent {
     /// Event source mode.
