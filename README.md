@@ -87,7 +87,9 @@ Built-in durability behavior:
   - `FromSlot(n)`: start from slot `n`, then continue with tracked resume behavior
 - LaserStream gRPC: same explicit replay modes on top of the provider SDK replay path
 - websocket `transactionSubscribe`: reconnects durably only when SOF can use the matching HTTP RPC
-  endpoint for best-effort gap backfill; without that endpoint, reconnects are live-only
+  endpoint for best-effort gap backfill
+  - if websocket replay is enabled, SOF now fails startup unless that HTTP endpoint is explicit or
+    derivable from the websocket URL
   - this is still bounded by provider semantics: `transactionSubscribe` has no native replay cursor
   - SOF can backfill recent slots and dedupe replayed txs safely, but it cannot guarantee stronger
     recovery than the websocket provider plus HTTP RPC can expose
@@ -101,6 +103,11 @@ Provider runtime capability policy applies only to hooks that are impossible in
 provider-stream mode. It does not reject generic provider updates such as
 `on_recent_blockhash`, `on_slot_status`, or `on_cluster_topology` when a custom
 producer pushes those updates into the provider queue.
+
+Strict capability checks also cover derived-state consumers, not just plugins.
+If a provider mode cannot emit a requested derived-state feed such as account
+touch or control-plane observation, SOF now fails fast instead of starting with
+an unsatisfied subscription.
 
 That also means SOF's internal transaction classifier hooks such as
 `transaction_prefilter`, `accepts_transaction_ref`, and `transaction_interest_ref`

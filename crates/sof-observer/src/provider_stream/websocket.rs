@@ -661,11 +661,10 @@ async fn replay_websocket_gap(
         return Ok(());
     };
     let Some(http_endpoint) = websocket_http_endpoint(config) else {
-        tracing::warn!(
-            endpoint = config.endpoint(),
-            "websocket reconnect backfill is enabled but no HTTP RPC endpoint is available"
-        );
-        return Ok(());
+        return Err(WebsocketTransactionError::Protocol(
+            "websocket replay requires an explicit HTTP RPC endpoint or a derivable http(s) endpoint"
+                .to_owned(),
+        ));
     };
 
     let client = reqwest::Client::new();
@@ -729,6 +728,12 @@ async fn replay_websocket_gap(
 async fn preflight_websocket_connection(
     config: &WebsocketTransactionConfig,
 ) -> Result<(), WebsocketTransactionError> {
+    if config.replay_on_reconnect && websocket_http_endpoint(config).is_none() {
+        return Err(WebsocketTransactionError::Protocol(
+            "websocket replay requires an explicit HTTP RPC endpoint or a derivable http(s) endpoint"
+                .to_owned(),
+        ));
+    }
     let (stream, _response) = connect_async(config.endpoint()).await?;
     let (mut write, mut read) = stream.split();
     write
@@ -1266,6 +1271,18 @@ mod tests {
         .await
         .expect_err("dead endpoint should fail during preflight");
         assert!(error.to_string().contains("IO error") || error.to_string().contains("Connection"));
+    }
+
+    #[tokio::test]
+    async fn websocket_spawn_fails_fast_without_replay_http_endpoint() {
+        let (tx, _rx) = create_provider_stream_queue(1);
+        let error = spawn_websocket_transaction_source(
+            &WebsocketTransactionConfig::new("http://example.invalid"),
+            tx,
+        )
+        .await
+        .expect_err("missing replay http endpoint should fail during preflight");
+        assert!(error.to_string().contains("websocket replay requires"));
     }
 
     #[test]

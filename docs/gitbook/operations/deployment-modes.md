@@ -49,6 +49,8 @@ SOF exposes this category through `ProviderStreamMode`. In that mode:
     internal slot-watermark tracking
   - websocket `transactionSubscribe` uses a stall watchdog and best-effort HTTP
     gap backfill when a matching HTTP endpoint is available
+    - if replay is enabled, SOF fails startup unless that HTTP endpoint is
+      explicit or derivable from the websocket URL
     - it is still a best-effort mode because `transactionSubscribe` has no
       provider-native replay cursor
     - SOF can replay recent slots and dedupe the recovered transactions, but it
@@ -57,6 +59,9 @@ SOF exposes this category through `ProviderStreamMode`. In that mode:
 - strict provider capability policy only rejects hooks that provider runtime can
   never emit; it does not reject generic provider updates such as recent
   blockhash, slot status, or cluster topology when your producer supplies them
+- strict capability checks also apply to derived-state consumers, so provider
+  mode fails fast instead of running with unsupported derived-state
+  subscriptions
 
 That means deployment mode is not only about network topology. It is also about how much of the
 low-level substrate SOF is owning for the application:

@@ -27,6 +27,7 @@ use thiserror::Error;
 
 type ShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 const PROVIDER_REPLAY_DEDUPE_CAPACITY: usize = 65_536;
+const PROVIDER_REPLAY_DEDUPE_SLOT_WINDOW: u64 = 4_096;
 
 /// Public runtime error surface for packaged SOF entrypoints.
 #[derive(Debug, Error)]
@@ -1549,7 +1550,7 @@ async fn run_provider_stream_runtime(
     mode: ProviderStreamMode,
     mut provider_stream_rx: ProviderStreamReceiver,
 ) -> Result<(), RuntimeError> {
-    enforce_provider_stream_capability_policy(mode, &plugin_host)?;
+    enforce_provider_stream_capability_policy(mode, &plugin_host, &derived_state_host)?;
     plugin_host
         .startup()
         .await
@@ -1610,6 +1611,7 @@ struct ProviderReplayDedupe {
     seen: HashSet<ProviderReplayDedupeKey>,
     order: VecDeque<ProviderReplayDedupeKey>,
     capacity: usize,
+    max_slot_seen: u64,
 }
 
 impl ProviderReplayDedupe {
@@ -1618,6 +1620,7 @@ impl ProviderReplayDedupe {
             seen: HashSet::with_capacity(capacity),
             order: VecDeque::with_capacity(capacity),
             capacity: capacity.max(1),
+            max_slot_seen: 0,
         }
     }
 
@@ -1625,17 +1628,27 @@ impl ProviderReplayDedupe {
         let Some(key) = provider_replay_dedupe_key(update) else {
             return false;
         };
+        self.max_slot_seen = self.max_slot_seen.max(key.slot);
         if self.seen.contains(&key) {
             return true;
         }
         self.seen.insert(key);
         self.order.push_back(key);
-        if self.order.len() > self.capacity
-            && let Some(oldest) = self.order.pop_front()
-        {
+        self.evict();
+        false
+    }
+
+    fn evict(&mut self) {
+        let min_slot = self
+            .max_slot_seen
+            .saturating_sub(PROVIDER_REPLAY_DEDUPE_SLOT_WINDOW);
+        while let Some(oldest) = self.order.front().copied() {
+            if self.order.len() <= self.capacity && oldest.slot >= min_slot {
+                break;
+            }
+            let _ = self.order.pop_front();
             self.seen.remove(&oldest);
         }
-        false
     }
 }
 
@@ -1829,6 +1842,7 @@ fn dispatch_provider_stream_serialized_transaction(
 fn provider_stream_unsupported_hooks(
     mode: ProviderStreamMode,
     plugin_host: &PluginHost,
+    derived_state_host: &DerivedStateHost,
 ) -> Vec<&'static str> {
     let _ = mode;
     let mut unsupported = Vec::new();
@@ -1853,14 +1867,21 @@ fn provider_stream_unsupported_hooks(
     if plugin_host.wants_transaction_batch() {
         unsupported.push("on_transaction_batch");
     }
+    if derived_state_host.wants_account_touch_observed() {
+        unsupported.push("derived_state.account_touch_observed");
+    }
+    if derived_state_host.wants_control_plane_observed() {
+        unsupported.push("derived_state.control_plane_observed");
+    }
     unsupported
 }
 
 fn enforce_provider_stream_capability_policy(
     mode: ProviderStreamMode,
     plugin_host: &PluginHost,
+    derived_state_host: &DerivedStateHost,
 ) -> Result<(), RuntimeError> {
-    let unsupported = provider_stream_unsupported_hooks(mode, plugin_host);
+    let unsupported = provider_stream_unsupported_hooks(mode, plugin_host, derived_state_host);
     if unsupported.is_empty() {
         return Ok(());
     }
@@ -2275,6 +2296,8 @@ mod tests {
 
     use super::*;
     use crate::framework::{
+        DerivedStateCheckpoint, DerivedStateConsumer, DerivedStateConsumerConfig,
+        DerivedStateConsumerContext, DerivedStateConsumerFault, DerivedStateFeedEnvelope,
         ExtensionContext, ExtensionManifest, ObserverPlugin, PluginConfig, PluginContext,
         RawPacketEvent, RuntimeExtension, TransactionInterest, TransactionPrefilter,
     };
@@ -2323,6 +2346,8 @@ mod tests {
     struct StartupCounterExtension {
         counter: Arc<AtomicUsize>,
     }
+    struct AccountTouchDerivedStateConsumer;
+    struct ControlPlaneDerivedStateConsumer;
 
     #[async_trait]
     impl ObserverPlugin for RawPacketPlugin {
@@ -2383,6 +2408,98 @@ mod tests {
         ) -> Result<ExtensionManifest, crate::framework::extension::ExtensionSetupError> {
             self.counter.fetch_add(1, Ordering::Relaxed);
             Ok(ExtensionManifest::default())
+        }
+    }
+
+    impl DerivedStateConsumer for AccountTouchDerivedStateConsumer {
+        fn name(&self) -> &'static str {
+            "account-touch-derived-state"
+        }
+
+        fn state_version(&self) -> u32 {
+            1
+        }
+
+        fn extension_version(&self) -> &'static str {
+            "1"
+        }
+
+        fn load_checkpoint(
+            &mut self,
+        ) -> Result<Option<DerivedStateCheckpoint>, DerivedStateConsumerFault> {
+            Ok(None)
+        }
+
+        fn config(&self) -> DerivedStateConsumerConfig {
+            DerivedStateConsumerConfig::new().with_account_touch_observed()
+        }
+
+        fn setup(
+            &mut self,
+            _ctx: DerivedStateConsumerContext,
+        ) -> Result<(), crate::framework::DerivedStateConsumerSetupError> {
+            Ok(())
+        }
+
+        fn apply(
+            &mut self,
+            _envelope: &DerivedStateFeedEnvelope,
+        ) -> Result<(), DerivedStateConsumerFault> {
+            Ok(())
+        }
+
+        fn flush_checkpoint(
+            &mut self,
+            checkpoint: DerivedStateCheckpoint,
+        ) -> Result<(), DerivedStateConsumerFault> {
+            let _ = checkpoint;
+            Ok(())
+        }
+    }
+
+    impl DerivedStateConsumer for ControlPlaneDerivedStateConsumer {
+        fn name(&self) -> &'static str {
+            "control-plane-derived-state"
+        }
+
+        fn state_version(&self) -> u32 {
+            1
+        }
+
+        fn extension_version(&self) -> &'static str {
+            "1"
+        }
+
+        fn load_checkpoint(
+            &mut self,
+        ) -> Result<Option<DerivedStateCheckpoint>, DerivedStateConsumerFault> {
+            Ok(None)
+        }
+
+        fn config(&self) -> DerivedStateConsumerConfig {
+            DerivedStateConsumerConfig::new().with_control_plane_observed()
+        }
+
+        fn setup(
+            &mut self,
+            _ctx: DerivedStateConsumerContext,
+        ) -> Result<(), crate::framework::DerivedStateConsumerSetupError> {
+            Ok(())
+        }
+
+        fn apply(
+            &mut self,
+            _envelope: &DerivedStateFeedEnvelope,
+        ) -> Result<(), DerivedStateConsumerFault> {
+            Ok(())
+        }
+
+        fn flush_checkpoint(
+            &mut self,
+            checkpoint: DerivedStateCheckpoint,
+        ) -> Result<(), DerivedStateConsumerFault> {
+            let _ = checkpoint;
+            Ok(())
         }
     }
 
@@ -2547,6 +2664,17 @@ mod tests {
                 event.commitment_status = crate::event::TxCommitmentStatus::Confirmed;
                 event.confirmed_slot = Some(event.slot);
                 ProviderStreamUpdate::SerializedTransaction(event)
+            }
+            other => other,
+        }
+    }
+
+    fn sample_provider_transaction_update_at(slot: u64) -> ProviderStreamUpdate {
+        match sample_provider_transaction_update() {
+            ProviderStreamUpdate::Transaction(mut event) => {
+                event.slot = slot;
+                event.signature = Some(Signature::from([slot as u8; 64]));
+                ProviderStreamUpdate::Transaction(event)
             }
             other => other,
         }
@@ -2853,9 +2981,11 @@ mod tests {
             String::from("warn"),
         )]);
         let plugin_host = PluginHost::builder().add_plugin(RawPacketPlugin).build();
+        let derived_state_host = DerivedStateHost::builder().build();
         let result = enforce_provider_stream_capability_policy(
             ProviderStreamMode::YellowstoneGrpc,
             &plugin_host,
+            &derived_state_host,
         );
         crate::runtime_env::clear_runtime_env_overrides();
         assert!(result.is_ok());
@@ -2868,9 +2998,11 @@ mod tests {
             String::from("strict"),
         )]);
         let plugin_host = PluginHost::builder().add_plugin(RawPacketPlugin).build();
+        let derived_state_host = DerivedStateHost::builder().build();
         let result = enforce_provider_stream_capability_policy(
             ProviderStreamMode::YellowstoneGrpc,
             &plugin_host,
+            &derived_state_host,
         );
         crate::runtime_env::clear_runtime_env_overrides();
         match result {
@@ -2892,12 +3024,40 @@ mod tests {
             .add_plugin(TransactionOnlyPlugin)
             .add_plugin(RecentBlockhashPlugin)
             .build();
+        let derived_state_host = DerivedStateHost::builder().build();
         let result = enforce_provider_stream_capability_policy(
             ProviderStreamMode::YellowstoneGrpc,
             &plugin_host,
+            &derived_state_host,
         );
         crate::runtime_env::clear_runtime_env_overrides();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn provider_stream_strict_policy_rejects_unsupported_derived_state_subscriptions() {
+        crate::runtime_env::set_runtime_env_overrides([(
+            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+            String::from("strict"),
+        )]);
+        let plugin_host = PluginHost::builder().build();
+        let derived_state_host = DerivedStateHost::builder()
+            .add_consumer(AccountTouchDerivedStateConsumer)
+            .add_consumer(ControlPlaneDerivedStateConsumer)
+            .build();
+        let result = enforce_provider_stream_capability_policy(
+            ProviderStreamMode::YellowstoneGrpc,
+            &plugin_host,
+            &derived_state_host,
+        );
+        crate::runtime_env::clear_runtime_env_overrides();
+        match result {
+            Err(RuntimeError::Runloop(message)) => {
+                assert!(message.contains("derived_state.account_touch_observed"));
+                assert!(message.contains("derived_state.control_plane_observed"));
+            }
+            other => panic!("expected strict provider capability failure, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2936,6 +3096,17 @@ mod tests {
 
         assert!(!dedupe.observe(&initial));
         assert!(!dedupe.observe(&progressed));
+    }
+
+    #[test]
+    fn provider_replay_dedupe_evicts_slots_outside_window() {
+        let old = sample_provider_transaction_update_at(1);
+        let new = sample_provider_transaction_update_at(PROVIDER_REPLAY_DEDUPE_SLOT_WINDOW + 2);
+        let mut dedupe = ProviderReplayDedupe::new(8);
+
+        assert!(!dedupe.observe(&old));
+        assert!(!dedupe.observe(&new));
+        assert!(!dedupe.observe(&old));
     }
 
     #[tokio::test]

@@ -82,7 +82,9 @@ Built-in durability behavior:
   - `FromSlot(n)`: start from slot `n`, then continue with tracked resume behavior
 - LaserStream gRPC: same explicit replay modes on top of SDK replay and slot-watermark tracking
 - websocket `transactionSubscribe`: uses a stall watchdog and best-effort HTTP RPC gap backfill on
-  reconnect when SOF has a matching HTTP endpoint; otherwise reconnects are live-only
+  reconnect when SOF has a matching HTTP endpoint
+  - if replay is enabled, startup now fails unless that HTTP endpoint is explicit or derivable from
+    the websocket URL
   - this remains best-effort because `transactionSubscribe` itself has no replay cursor
   - SOF can fill recent slot gaps and suppress replay duplicates, but it cannot promise stronger
     durability than the websocket provider plus HTTP RPC backfill path can actually provide
@@ -97,6 +99,10 @@ runtime cannot ever emit, such as `on_raw_packet` or `on_shred`. It does not
 reject generic provider updates like `on_recent_blockhash`, `on_slot_status`,
 or `on_cluster_topology` when a custom producer pushes those updates into the
 provider queue.
+
+The same strict check now applies to derived-state consumers. If a provider
+mode cannot satisfy a requested derived-state feed, SOF fails startup instead
+of running with a silent capability gap.
 
 SOF's internal transaction classifier hooks, including `transaction_prefilter`,
 `accepts_transaction_ref`, and `transaction_interest_ref`, work on the
