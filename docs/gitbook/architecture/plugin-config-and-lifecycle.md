@@ -36,6 +36,9 @@ Transaction-family hooks support both threshold and exact commitment selection:
 - `.at_commitment(TxCommitmentStatus::Confirmed)`
 - `.only_at_commitment(TxCommitmentStatus::Finalized)`
 
+If you do not set either selector, the default is
+`.at_commitment(TxCommitmentStatus::Processed)`.
+
 When many flags are enabled, raw struct syntax is also fine:
 
 ```rust

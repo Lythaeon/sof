@@ -145,6 +145,10 @@ let exact = PluginConfig::new()
     .only_at_commitment(TxCommitmentStatus::Finalized);
 ```
 
+If neither selector is set, SOF defaults to
+`at_commitment(TxCommitmentStatus::Processed)`, so transaction-family hooks see
+all commitment levels.
+
 `sof-tx` is a different case: the existing SOF adapters are complete today on
 raw-shred/gossip runtimes, or on `ProviderStreamMode::Generic` when the custom
 producer also supplies the full control-plane feed. Built-in Yellowstone,

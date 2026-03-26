@@ -455,6 +455,10 @@ impl PluginConfig {
     /// - `on_transaction_log`
     /// - `on_transaction_batch`
     /// - `on_transaction_view_batch`
+    ///
+    /// If you do not call [`Self::at_commitment`] or
+    /// [`Self::only_at_commitment`], the default is
+    /// `AtLeast(TxCommitmentStatus::Processed)`.
     #[must_use]
     pub const fn at_commitment(mut self, commitment: crate::event::TxCommitmentStatus) -> Self {
         self.transaction_commitment = TransactionCommitmentSelector::AtLeast(commitment);

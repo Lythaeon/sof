@@ -72,6 +72,7 @@ async fn main() -> Result<(), sof::runtime::RuntimeError> {
 
 Use `.at_commitment(...)` when the service should ignore lower-confidence traffic,
 or `.only_at_commitment(...)` when it should react only to one exact commitment.
+If you do not set either one, SOF defaults to processed-or-better delivery.
 
 This is the right first service because it proves all of the important boundaries:
 

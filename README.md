@@ -92,6 +92,10 @@ let config = PluginConfig::new()
     .at_commitment(TxCommitmentStatus::Confirmed);
 ```
 
+If you do not set either selector, SOF defaults to
+`at_commitment(TxCommitmentStatus::Processed)`, which means transaction-family
+hooks receive `processed`, `confirmed`, and `finalized` events.
+
 ## When SOF Is Fastest
 
 SOF removes downstream runtime overhead. It does not magically create upstream visibility.
