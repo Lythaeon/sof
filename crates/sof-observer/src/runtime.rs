@@ -1551,32 +1551,54 @@ fn dispatch_provider_stream_update(
 ) {
     match update {
         ProviderStreamUpdate::Transaction(event) => {
-            plugin_host.on_recent_blockhash(crate::framework::ObservedRecentBlockhashEvent {
-                slot: event.slot,
-                recent_blockhash: event.tx.message.recent_blockhash().to_bytes(),
-                dataset_tx_count: 1,
-            });
-            let tx_index = derived_state_host.reserve_slot_tx_indexes(event.slot, 1);
-            derived_state_host.on_transaction(tx_index, event.clone());
-            plugin_host.on_transaction(event);
+            if plugin_host.wants_recent_blockhash() {
+                plugin_host.on_recent_blockhash(crate::framework::ObservedRecentBlockhashEvent {
+                    slot: event.slot,
+                    recent_blockhash: event.tx.message.recent_blockhash().to_bytes(),
+                    dataset_tx_count: 1,
+                });
+            }
+            if derived_state_host.wants_transaction_applied() {
+                let tx_index = derived_state_host.reserve_slot_tx_indexes(event.slot, 1);
+                derived_state_host.on_transaction(tx_index, event.clone());
+            }
+            if plugin_host.wants_transaction() {
+                plugin_host.on_transaction(event);
+            }
         }
         ProviderStreamUpdate::TransactionLog(event) => {
-            plugin_host.on_transaction_log(event);
+            if plugin_host.wants_transaction_log() {
+                plugin_host.on_transaction_log(event);
+            }
         }
         ProviderStreamUpdate::TransactionViewBatch(event) => {
-            plugin_host.on_transaction_view_batch(event, Instant::now());
+            if plugin_host.wants_transaction_view_batch() {
+                plugin_host.on_transaction_view_batch(event, Instant::now());
+            }
         }
         ProviderStreamUpdate::RecentBlockhash(event) => {
-            derived_state_host.on_recent_blockhash(event.clone());
-            plugin_host.on_recent_blockhash(event);
+            if !derived_state_host.is_empty() {
+                derived_state_host.on_recent_blockhash(event.clone());
+            }
+            if plugin_host.wants_recent_blockhash() {
+                plugin_host.on_recent_blockhash(event);
+            }
         }
         ProviderStreamUpdate::SlotStatus(event) => {
-            derived_state_host.on_slot_status(event);
-            plugin_host.on_slot_status(event);
+            if !derived_state_host.is_empty() {
+                derived_state_host.on_slot_status(event.clone());
+            }
+            if plugin_host.wants_slot_status() {
+                plugin_host.on_slot_status(event);
+            }
         }
         ProviderStreamUpdate::ClusterTopology(event) => {
-            derived_state_host.on_cluster_topology(event.clone());
-            plugin_host.on_cluster_topology(event);
+            if !derived_state_host.is_empty() {
+                derived_state_host.on_cluster_topology(event.clone());
+            }
+            if plugin_host.wants_cluster_topology() {
+                plugin_host.on_cluster_topology(event);
+            }
         }
     }
 }
@@ -2033,10 +2055,75 @@ pub async fn run_async_with_hosts_and_setup(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
     use super::*;
     use sof_gossip_tuning::{GossipTuningProfile, HostProfilePreset, IngestQueueMode};
+    use solana_keypair::Keypair;
+    use solana_message::{Message, VersionedMessage};
+    use solana_signer::Signer;
+    use solana_transaction::versioned::VersionedTransaction;
+
+    fn profile_iterations(default: usize) -> usize {
+        std::env::var("SOF_PROFILE_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default)
+    }
+
+    fn sample_provider_transaction_update() -> ProviderStreamUpdate {
+        let signer = Keypair::new();
+        let message = Message::new(&[], Some(&signer.pubkey()));
+        let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&signer])
+            .expect("tx");
+        ProviderStreamUpdate::Transaction(crate::framework::TransactionEvent {
+            slot: 1,
+            commitment_status: crate::event::TxCommitmentStatus::Processed,
+            confirmed_slot: None,
+            finalized_slot: None,
+            signature: tx.signatures.first().copied(),
+            kind: crate::event::TxKind::NonVote,
+            tx: Arc::new(tx),
+        })
+    }
+
+    fn dispatch_provider_stream_update_baseline(
+        plugin_host: &PluginHost,
+        derived_state_host: &DerivedStateHost,
+        update: ProviderStreamUpdate,
+    ) {
+        match update {
+            ProviderStreamUpdate::Transaction(event) => {
+                plugin_host.on_recent_blockhash(crate::framework::ObservedRecentBlockhashEvent {
+                    slot: event.slot,
+                    recent_blockhash: event.tx.message.recent_blockhash().to_bytes(),
+                    dataset_tx_count: 1,
+                });
+                let tx_index = derived_state_host.reserve_slot_tx_indexes(event.slot, 1);
+                derived_state_host.on_transaction(tx_index, event.clone());
+                plugin_host.on_transaction(event);
+            }
+            ProviderStreamUpdate::TransactionLog(event) => {
+                plugin_host.on_transaction_log(event);
+            }
+            ProviderStreamUpdate::TransactionViewBatch(event) => {
+                plugin_host.on_transaction_view_batch(event, Instant::now());
+            }
+            ProviderStreamUpdate::RecentBlockhash(event) => {
+                derived_state_host.on_recent_blockhash(event.clone());
+                plugin_host.on_recent_blockhash(event);
+            }
+            ProviderStreamUpdate::SlotStatus(event) => {
+                derived_state_host.on_slot_status(event.clone());
+                plugin_host.on_slot_status(event);
+            }
+            ProviderStreamUpdate::ClusterTopology(event) => {
+                derived_state_host.on_cluster_topology(event.clone());
+                plugin_host.on_cluster_topology(event);
+            }
+        }
+    }
 
     #[test]
     fn typed_derived_state_config_serializes_into_env_overrides() {
@@ -2316,6 +2403,38 @@ mod tests {
                 String::from("SOF_SHRED_TRUST_MODE"),
                 String::from("trusted_raw_shred_provider"),
             ))
+        );
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for provider-stream dispatch A/B"]
+    fn provider_stream_transaction_dispatch_profile_fixture() {
+        let iterations = profile_iterations(500_000);
+        let plugin_host = PluginHost::builder().build();
+        let derived_state_host = DerivedStateHost::builder().build();
+        let update = sample_provider_transaction_update();
+
+        let baseline_started = Instant::now();
+        for _ in 0..iterations {
+            dispatch_provider_stream_update_baseline(
+                &plugin_host,
+                &derived_state_host,
+                update.clone(),
+            );
+        }
+        let baseline_elapsed = baseline_started.elapsed();
+
+        let optimized_started = Instant::now();
+        for _ in 0..iterations {
+            dispatch_provider_stream_update(&plugin_host, &derived_state_host, update.clone());
+        }
+        let optimized_elapsed = optimized_started.elapsed();
+
+        eprintln!(
+            "provider_stream_transaction_dispatch_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            iterations,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
         );
     }
 }
