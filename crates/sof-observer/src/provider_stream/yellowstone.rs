@@ -392,6 +392,13 @@ fn transaction_event_from_update(
     let transaction =
         transaction.ok_or(YellowstoneGrpcError::Convert("missing transaction payload"))?;
     let is_vote = transaction.is_vote;
+    let signature = if is_vote {
+        Signature::try_from(transaction.signature.as_slice())
+            .map(Some)
+            .map_err(|_error| YellowstoneGrpcError::Convert("invalid signature"))?
+    } else {
+        None
+    };
     let tx = convert_transaction(
         transaction
             .transaction
@@ -404,7 +411,7 @@ fn transaction_event_from_update(
         commitment_status,
         confirmed_slot: None,
         finalized_slot: None,
-        signature: tx.signatures.first().copied(),
+        signature: signature.or_else(|| tx.signatures.first().copied()),
         kind: if is_vote {
             TxKind::VoteOnly
         } else {
@@ -414,18 +421,16 @@ fn transaction_event_from_update(
     })
 }
 
+#[inline]
 fn convert_transaction(
     tx: yellowstone_grpc_proto::prelude::Transaction,
 ) -> Result<VersionedTransaction, YellowstoneGrpcError> {
-    let signatures = tx
-        .signatures
-        .into_iter()
-        .map(|signature| {
-            Signature::try_from(signature.as_slice()).map_err(|_error| {
-                YellowstoneGrpcError::Convert("failed to parse transaction signature")
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut signatures = Vec::with_capacity(tx.signatures.len());
+    for signature in tx.signatures {
+        signatures.push(Signature::try_from(signature.as_slice()).map_err(|_error| {
+            YellowstoneGrpcError::Convert("failed to parse transaction signature")
+        })?);
+    }
     let message = convert_message(
         tx.message
             .ok_or(YellowstoneGrpcError::Convert("missing transaction message"))?,
@@ -436,6 +441,7 @@ fn convert_transaction(
     })
 }
 
+#[inline]
 fn convert_message(
     message: yellowstone_grpc_proto::prelude::Message,
 ) -> Result<VersionedMessage, YellowstoneGrpcError> {
@@ -453,44 +459,37 @@ fn convert_message(
                 YellowstoneGrpcError::Convert("invalid num_readonly_unsigned_accounts")
             })?,
     };
-    let account_keys = message
-        .account_keys
-        .into_iter()
-        .map(|key| {
+    let mut account_keys = Vec::with_capacity(message.account_keys.len());
+    for key in message.account_keys {
+        account_keys.push(
             Pubkey::try_from(key.as_slice())
-                .map_err(|_error| YellowstoneGrpcError::Convert("invalid account key"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+                .map_err(|_error| YellowstoneGrpcError::Convert("invalid account key"))?,
+        );
+    }
     let recent_blockhash = <[u8; 32]>::try_from(message.recent_blockhash.as_slice())
         .map(Hash::new_from_array)
         .map_err(|_error| YellowstoneGrpcError::Convert("invalid recent blockhash"))?;
-    let instructions = message
-        .instructions
-        .into_iter()
-        .map(|instruction| {
-            Ok(CompiledInstruction {
-                program_id_index: u8::try_from(instruction.program_id_index).map_err(|_error| {
-                    YellowstoneGrpcError::Convert("invalid compiled instruction program id index")
-                })?,
-                accounts: instruction.accounts,
-                data: instruction.data,
-            })
-        })
-        .collect::<Result<Vec<_>, YellowstoneGrpcError>>()?;
+    let mut instructions = Vec::with_capacity(message.instructions.len());
+    for instruction in message.instructions {
+        instructions.push(CompiledInstruction {
+            program_id_index: u8::try_from(instruction.program_id_index).map_err(|_error| {
+                YellowstoneGrpcError::Convert("invalid compiled instruction program id index")
+            })?,
+            accounts: instruction.accounts,
+            data: instruction.data,
+        });
+    }
     if message.versioned {
-        let address_table_lookups = message
-            .address_table_lookups
-            .into_iter()
-            .map(|lookup| {
-                Ok(MessageAddressTableLookup {
-                    account_key: Pubkey::try_from(lookup.account_key.as_slice()).map_err(
-                        |_error| YellowstoneGrpcError::Convert("invalid address table account key"),
-                    )?,
-                    writable_indexes: lookup.writable_indexes,
-                    readonly_indexes: lookup.readonly_indexes,
-                })
-            })
-            .collect::<Result<Vec<_>, YellowstoneGrpcError>>()?;
+        let mut address_table_lookups = Vec::with_capacity(message.address_table_lookups.len());
+        for lookup in message.address_table_lookups {
+            address_table_lookups.push(MessageAddressTableLookup {
+                account_key: Pubkey::try_from(lookup.account_key.as_slice()).map_err(|_error| {
+                    YellowstoneGrpcError::Convert("invalid address table account key")
+                })?,
+                writable_indexes: lookup.writable_indexes,
+                readonly_indexes: lookup.readonly_indexes,
+            });
+        }
         Ok(VersionedMessage::V0(MessageV0 {
             header,
             account_keys,
