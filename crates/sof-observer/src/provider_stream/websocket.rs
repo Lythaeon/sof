@@ -335,6 +335,7 @@ async fn run_websocket_transaction_connection(
 
     wait_for_subscription_ack(&mut read).await?;
     let mut ping = config.ping_interval.map(tokio::time::interval);
+    let mut scratch = WebsocketParseScratch::default();
 
     loop {
         tokio::select! {
@@ -354,9 +355,12 @@ async fn run_websocket_transaction_connection(
                 let frame = frame?;
                 match frame {
                     WsMessage::Text(text) => {
-                        let mut bytes = text.as_str().as_bytes().to_vec();
                         if let Some(event) =
-                            parse_transaction_notification(&mut bytes, config.commitment)?
+                            parse_transaction_notification(
+                                frame_bytes_mut(&mut scratch.frame_bytes, text.as_str().as_bytes()),
+                                &mut scratch.tx_bytes,
+                                config.commitment,
+                            )?
                         {
                             sender
                                 .send(ProviderStreamUpdate::Transaction(event))
@@ -365,9 +369,12 @@ async fn run_websocket_transaction_connection(
                         }
                     }
                     WsMessage::Binary(bytes) => {
-                        let mut bytes = bytes.to_vec();
                         if let Some(event) =
-                            parse_transaction_notification(&mut bytes, config.commitment)?
+                            parse_transaction_notification(
+                                frame_bytes_mut(&mut scratch.frame_bytes, bytes.as_ref()),
+                                &mut scratch.tx_bytes,
+                                config.commitment,
+                            )?
                         {
                             sender
                                 .send(ProviderStreamUpdate::Transaction(event))
@@ -397,6 +404,7 @@ where
         + Unpin,
 {
     let ack_timeout = Duration::from_secs(10);
+    let mut frame_bytes = Vec::new();
     tokio::time::timeout(ack_timeout, async {
         loop {
             let Some(frame) = read.next().await else {
@@ -407,14 +415,16 @@ where
             let frame = frame?;
             match frame {
                 WsMessage::Text(text) => {
-                    let mut bytes = text.as_str().as_bytes().to_vec();
-                    if handle_subscription_text(&mut bytes)? {
+                    if handle_subscription_text(frame_bytes_mut(
+                        &mut frame_bytes,
+                        text.as_str().as_bytes(),
+                    ))? {
                         return Ok(());
                     }
                 }
                 WsMessage::Binary(bytes) => {
-                    let mut bytes = bytes.to_vec();
-                    if handle_subscription_text(&mut bytes)? {
+                    if handle_subscription_text(frame_bytes_mut(&mut frame_bytes, bytes.as_ref()))?
+                    {
                         return Ok(());
                     }
                 }
@@ -450,6 +460,7 @@ fn handle_subscription_text(bytes: &mut [u8]) -> Result<bool, WebsocketTransacti
 
 fn parse_transaction_notification(
     bytes: &mut [u8],
+    tx_bytes: &mut Vec<u8>,
     commitment_status: WebsocketTransactionCommitment,
 ) -> Result<Option<TransactionEvent>, WebsocketTransactionError> {
     let value: WebsocketTransactionEnvelopeMessage = simd_from_slice(bytes).map_err(|error| {
@@ -468,12 +479,13 @@ fn parse_transaction_notification(
             "unsupported websocket transaction encoding",
         ));
     }
-    let tx_bytes = STANDARD
-        .decode(notification.transaction.transaction.0)
+    tx_bytes.clear();
+    STANDARD
+        .decode_vec(notification.transaction.transaction.0, tx_bytes)
         .map_err(|_error| {
             WebsocketTransactionError::Convert("invalid base64 transaction payload")
         })?;
-    let tx = bincode::deserialize::<VersionedTransaction>(&tx_bytes).map_err(|_error| {
+    let tx = bincode::deserialize::<VersionedTransaction>(tx_bytes).map_err(|_error| {
         WebsocketTransactionError::Convert("failed to deserialize transaction")
     })?;
     let signature = notification
@@ -491,6 +503,18 @@ fn parse_transaction_notification(
         kind: classify_provider_transaction_kind(&tx),
         tx: Arc::new(tx),
     }))
+}
+
+#[derive(Default)]
+struct WebsocketParseScratch {
+    frame_bytes: Vec<u8>,
+    tx_bytes: Vec<u8>,
+}
+
+fn frame_bytes_mut<'a>(buffer: &'a mut Vec<u8>, bytes: &[u8]) -> &'a mut [u8] {
+    buffer.clear();
+    buffer.extend_from_slice(bytes);
+    buffer.as_mut_slice()
 }
 
 #[derive(Debug, Deserialize)]
@@ -653,10 +677,14 @@ mod tests {
         });
 
         let mut payload = payload.to_string().into_bytes();
-        let event =
-            parse_transaction_notification(&mut payload, WebsocketTransactionCommitment::Confirmed)
-                .expect("notification should parse")
-                .expect("transaction event");
+        let mut tx_bytes = Vec::new();
+        let event = parse_transaction_notification(
+            &mut payload,
+            &mut tx_bytes,
+            WebsocketTransactionCommitment::Confirmed,
+        )
+        .expect("notification should parse")
+        .expect("transaction event");
 
         assert_eq!(event.slot, 55);
         assert_eq!(event.signature, Some(signature));
