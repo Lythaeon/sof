@@ -27,10 +27,29 @@ Traffic enters through one of three sources:
 - gossip bootstrap path
 - external kernel-bypass ingress queue
 
+Processed provider mode is a fourth ingest family at the runtime boundary:
+
+- Yellowstone gRPC
+- LaserStream gRPC
+- websocket `transactionSubscribe`
+- `ProviderStreamMode::Generic` for custom producers
+
+Those providers enter SOF after the packet/shred stages. They feed
+transaction, transaction-view, and supported control-plane updates directly into
+the runtime.
+
 ### Parse and verify
 
-SOF parses raw packets into shreds and can optionally perform shred verification. Verification is
-off by default because it is an explicit CPU tradeoff.
+SOF parses raw packets into shreds and can optionally perform shred
+verification.
+
+Verification defaults depend on trust posture:
+
+- `public_untrusted`: verification on by default
+- `trusted_raw_shred_provider`: verification off by default unless you override
+  it explicitly
+- processed provider mode: no raw shred verification stage, because packets and
+  shreds are not entering SOF there
 
 ### Dedupe and conflict suppression
 

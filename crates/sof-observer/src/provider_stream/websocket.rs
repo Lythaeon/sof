@@ -17,8 +17,11 @@ use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 use thiserror::Error;
+use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMessage};
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, connect_async, tungstenite::protocol::Message as WsMessage,
+};
 
 use crate::{
     event::TxCommitmentStatus,
@@ -312,6 +315,8 @@ pub enum WebsocketTransactionError {
     QueueClosed,
 }
 
+type WebsocketProviderStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
 /// Spawns one websocket `transactionSubscribe` source into a SOF provider-stream queue.
 ///
 /// # Examples
@@ -340,42 +345,60 @@ pub async fn spawn_websocket_transaction_source(
     sender: ProviderStreamSender,
 ) -> Result<JoinHandle<Result<(), WebsocketTransactionError>>, WebsocketTransactionError> {
     let config = config.clone();
-    preflight_websocket_connection(&config).await?;
+    let first_session = establish_websocket_transaction_session(&config).await?;
     Ok(tokio::spawn(async move {
         let mut attempts = 0_u32;
         let mut last_seen_slot = None;
         let mut watermarks = ProviderCommitmentWatermarks::default();
+        let mut first_session = Some(first_session);
         loop {
             let mut session_established = false;
-            match run_websocket_transaction_connection(
-                &config,
-                &sender,
-                &mut last_seen_slot,
-                &mut watermarks,
-                &mut session_established,
-            )
-            .await
-            {
-                Ok(()) => {
-                    let detail = "websocket transaction stream ended unexpectedly".to_owned();
-                    tracing::warn!(
-                        detail,
-                        endpoint = config.endpoint(),
-                        "provider stream websocket session ended; reconnecting"
-                    );
-                    send_provider_health(
-                        &sender,
-                        ProviderSourceHealthStatus::Reconnecting,
-                        ProviderSourceHealthReason::UpstreamStreamClosedUnexpectedly,
-                        detail,
-                    )
-                    .await?;
-                }
-                Err(WebsocketTransactionError::QueueClosed) => {
-                    return Err(WebsocketTransactionError::QueueClosed);
-                }
+            let session = match first_session.take() {
+                Some(session) => Ok(session),
+                None => establish_websocket_transaction_session(&config).await,
+            };
+            match session {
+                Ok(session) => match run_websocket_transaction_connection(
+                    &config,
+                    &sender,
+                    &mut last_seen_slot,
+                    &mut watermarks,
+                    &mut session_established,
+                    session,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        let detail = "websocket transaction stream ended unexpectedly".to_owned();
+                        tracing::warn!(
+                            detail,
+                            endpoint = config.endpoint(),
+                            "provider stream websocket session ended; reconnecting"
+                        );
+                        send_provider_health(
+                            &sender,
+                            ProviderSourceHealthStatus::Reconnecting,
+                            ProviderSourceHealthReason::UpstreamStreamClosedUnexpectedly,
+                            detail,
+                        )
+                        .await?;
+                    }
+                    Err(WebsocketTransactionError::QueueClosed) => {
+                        return Err(WebsocketTransactionError::QueueClosed);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, endpoint = config.endpoint(), "provider stream websocket session ended; reconnecting");
+                        send_provider_health(
+                            &sender,
+                            ProviderSourceHealthStatus::Reconnecting,
+                            websocket_health_reason(&error),
+                            error.to_string(),
+                        )
+                        .await?;
+                    }
+                },
                 Err(error) => {
-                    tracing::warn!(%error, endpoint = config.endpoint(), "provider stream websocket session ended; reconnecting");
+                    tracing::warn!(%error, endpoint = config.endpoint(), "provider stream websocket connect/subscribe failed; reconnecting");
                     send_provider_health(
                         &sender,
                         ProviderSourceHealthStatus::Reconnecting,
@@ -415,18 +438,10 @@ async fn run_websocket_transaction_connection(
     last_seen_slot: &mut Option<u64>,
     watermarks: &mut ProviderCommitmentWatermarks,
     session_established: &mut bool,
+    stream: WebsocketProviderStream,
 ) -> Result<(), WebsocketTransactionError> {
     *session_established = false;
-    let (stream, _response) = connect_async(config.endpoint()).await?;
     let (mut write, mut read) = stream.split();
-
-    write
-        .send(WsMessage::Text(
-            config.subscribe_request().to_string().into(),
-        ))
-        .await?;
-
-    wait_for_subscription_ack(&mut read).await?;
     *session_established = true;
     send_provider_health(
         sender,
@@ -788,25 +803,23 @@ async fn replay_websocket_gap(
     Ok(())
 }
 
-async fn preflight_websocket_connection(
+async fn establish_websocket_transaction_session(
     config: &WebsocketTransactionConfig,
-) -> Result<(), WebsocketTransactionError> {
+) -> Result<WebsocketProviderStream, WebsocketTransactionError> {
     if config.replay_on_reconnect && websocket_http_endpoint(config).is_none() {
         return Err(WebsocketTransactionError::Protocol(
             "websocket replay requires an explicit HTTP RPC endpoint or a derivable http(s) endpoint"
                 .to_owned(),
         ));
     }
-    let (stream, _response) = connect_async(config.endpoint()).await?;
-    let (mut write, mut read) = stream.split();
-    write
+    let (mut stream, _response) = connect_async(config.endpoint()).await?;
+    stream
         .send(WsMessage::Text(
             config.subscribe_request().to_string().into(),
         ))
         .await?;
-    wait_for_subscription_ack(&mut read).await?;
-    write.close().await.ok();
-    Ok(())
+    wait_for_subscription_ack(&mut stream).await?;
+    Ok(stream)
 }
 
 fn websocket_replay_start_slot(previous_slot: u64, head: u64, replay_max_slots: u64) -> u64 {
@@ -1249,6 +1262,83 @@ mod tests {
             TxKind::NonVote,
             false,
         ));
+    }
+
+    #[tokio::test]
+    async fn websocket_source_uses_first_acknowledged_session_as_live_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+        let payload = sample_notification_payload();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = accept_async(stream).await.expect("websocket handshake");
+            let subscribe = ws
+                .next()
+                .await
+                .expect("subscribe frame")
+                .expect("subscribe message");
+            match subscribe {
+                WsMessage::Text(text) => {
+                    assert!(text.contains("transactionSubscribe"));
+                }
+                other @ WsMessage::Binary(_)
+                | other @ WsMessage::Ping(_)
+                | other @ WsMessage::Pong(_)
+                | other @ WsMessage::Close(_)
+                | other @ WsMessage::Frame(_) => {
+                    panic!("expected subscribe text frame, got {other:?}");
+                }
+            }
+            ws.send(WsMessage::Text(
+                String::from(r#"{"jsonrpc":"2.0","id":1,"result":42}"#).into(),
+            ))
+            .await
+            .expect("ack");
+            ws.send(WsMessage::Text(
+                String::from_utf8(payload)
+                    .expect("notification utf8")
+                    .into(),
+            ))
+            .await
+            .expect("notification");
+            ws.close(None).await.expect("close");
+        });
+
+        let (tx, mut rx) = create_provider_stream_queue(8);
+        let config = WebsocketTransactionConfig::new(format!("ws://{addr}"))
+            .with_max_reconnect_attempts(1)
+            .with_reconnect_delay(Duration::from_millis(10));
+        let handle = spawn_websocket_transaction_source(&config, tx)
+            .await
+            .expect("spawn websocket source");
+
+        let event = loop {
+            let update = timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("provider update timeout")
+                .expect("provider update");
+            match update {
+                ProviderStreamUpdate::SerializedTransaction(event) => break event,
+                ProviderStreamUpdate::Health(_) => continue,
+                other @ ProviderStreamUpdate::Transaction(_)
+                | other @ ProviderStreamUpdate::TransactionLog(_)
+                | other @ ProviderStreamUpdate::TransactionViewBatch(_)
+                | other @ ProviderStreamUpdate::RecentBlockhash(_)
+                | other @ ProviderStreamUpdate::SlotStatus(_)
+                | other @ ProviderStreamUpdate::ClusterTopology(_)
+                | other @ ProviderStreamUpdate::LeaderSchedule(_)
+                | other @ ProviderStreamUpdate::Reorg(_) => {
+                    panic!("expected transaction update, got {other:?}");
+                }
+            }
+        };
+        assert_eq!(event.slot, 55);
+        assert!(event.signature.is_some());
+
+        handle.abort();
+        handle.await.ok();
+        server.await.expect("server task");
     }
 
     #[tokio::test]

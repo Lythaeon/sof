@@ -84,7 +84,11 @@ Built-in durability behavior:
   - `Live`: start at stream head
   - `Resume` (default): start live, resume from tracked slot after reconnect
   - `FromSlot(n)`: start from slot `n`, then continue with tracked resume behavior
+  - built-in Yellowstone startup now owns the first acknowledged session as the
+    live session; it does not open a throwaway preflight subscription first
 - LaserStream gRPC: same explicit replay modes on top of SDK replay and slot-watermark tracking
+  - built-in LaserStream startup now keeps the first successful subscribe as
+    the live stream too, instead of dropping an initial preflight session
 - websocket `transactionSubscribe`: uses a stall watchdog and best-effort HTTP RPC gap backfill on
   reconnect when SOF has a matching HTTP endpoint
   - if replay is enabled, startup now fails unless that HTTP endpoint is explicit or derivable from
@@ -92,6 +96,8 @@ Built-in durability behavior:
   - this remains best-effort because `transactionSubscribe` itself has no replay cursor
   - SOF can fill recent slot gaps and suppress replay duplicates, but it cannot promise stronger
     durability than the websocket provider plus HTTP RPC backfill path can actually provide
+  - built-in websocket startup also promotes the first acknowledged session to
+    the live stream, so there is no extra preflight handoff gap
 - built-in provider adapters emit explicit source health transitions into SOF,
   and unexpected provider ingress closure is treated as a runtime failure rather
   than a clean stop

@@ -22,7 +22,8 @@ use tokio::task::JoinHandle;
 use yellowstone_grpc_client::{GeyserGrpcBuilderError, GeyserGrpcClient, GeyserGrpcClientError};
 use yellowstone_grpc_proto::prelude::{
     CommitmentLevel, SlotStatus, SubscribeRequest, SubscribeRequestFilterSlots,
-    SubscribeRequestFilterTransactions, SubscribeRequestPing, subscribe_update::UpdateOneof,
+    SubscribeRequestFilterTransactions, SubscribeRequestPing, SubscribeUpdate,
+    subscribe_update::UpdateOneof,
 };
 
 use crate::{
@@ -244,6 +245,7 @@ impl YellowstoneGrpcConfig {
         self
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn subscribe_request(&self) -> SubscribeRequest {
         self.subscribe_request_with_state(0)
     }
@@ -339,6 +341,17 @@ pub enum YellowstoneGrpcError {
     QueueClosed,
 }
 
+type YellowstoneSubscribeSink = std::pin::Pin<
+    Box<dyn futures_util::Sink<SubscribeRequest, Error = futures_channel::mpsc::SendError> + Send>,
+>;
+type YellowstoneUpdateStream = std::pin::Pin<
+    Box<
+        dyn futures_util::Stream<
+                Item = Result<SubscribeUpdate, yellowstone_grpc_proto::tonic::Status>,
+            > + Send,
+    >,
+>;
+
 /// Spawns one Yellowstone gRPC transaction forwarder into a SOF provider-stream queue.
 ///
 /// # Examples
@@ -369,45 +382,68 @@ pub async fn spawn_yellowstone_grpc_transaction_source(
     config: YellowstoneGrpcConfig,
     sender: ProviderStreamSender,
 ) -> Result<JoinHandle<Result<(), YellowstoneGrpcError>>, YellowstoneGrpcError> {
-    preflight_yellowstone_connection(&config).await?;
+    let first_session = establish_yellowstone_transaction_session(&config, 0).await?;
     Ok(tokio::spawn(async move {
         let mut attempts = 0_u32;
         let mut tracked_slot = 0_u64;
         let mut watermarks = ProviderCommitmentWatermarks::default();
+        let mut first_session = Some(first_session);
         loop {
             let mut session_established = false;
-            match run_yellowstone_transaction_connection(
-                &config,
-                &sender,
-                &mut tracked_slot,
-                &mut watermarks,
-                &mut session_established,
-            )
-            .await
-            {
-                Ok(()) => {
-                    let detail = "yellowstone stream ended unexpectedly".to_owned();
-                    tracing::warn!(
-                        endpoint = config.endpoint(),
-                        detail,
-                        "provider stream yellowstone session ended unexpectedly; reconnecting"
-                    );
-                    send_provider_health(
-                        &sender,
-                        ProviderSourceHealthStatus::Reconnecting,
-                        ProviderSourceHealthReason::UpstreamStreamClosedUnexpectedly,
-                        detail,
-                    )
-                    .await?;
-                }
-                Err(YellowstoneGrpcError::QueueClosed) => {
-                    return Err(YellowstoneGrpcError::QueueClosed);
-                }
+            let session = match first_session.take() {
+                Some(session) => Ok(session),
+                None => establish_yellowstone_transaction_session(&config, tracked_slot).await,
+            };
+            match session {
+                Ok((subscribe_tx, stream)) => match run_yellowstone_transaction_connection(
+                    &config,
+                    &sender,
+                    &mut tracked_slot,
+                    &mut watermarks,
+                    &mut session_established,
+                    subscribe_tx,
+                    stream,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        let detail = "yellowstone stream ended unexpectedly".to_owned();
+                        tracing::warn!(
+                            endpoint = config.endpoint(),
+                            detail,
+                            "provider stream yellowstone session ended unexpectedly; reconnecting"
+                        );
+                        send_provider_health(
+                            &sender,
+                            ProviderSourceHealthStatus::Reconnecting,
+                            ProviderSourceHealthReason::UpstreamStreamClosedUnexpectedly,
+                            detail,
+                        )
+                        .await?;
+                    }
+                    Err(YellowstoneGrpcError::QueueClosed) => {
+                        return Err(YellowstoneGrpcError::QueueClosed);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            endpoint = config.endpoint(),
+                            "provider stream yellowstone session ended; reconnecting"
+                        );
+                        send_provider_health(
+                            &sender,
+                            ProviderSourceHealthStatus::Reconnecting,
+                            yellowstone_health_reason(&error),
+                            error.to_string(),
+                        )
+                        .await?;
+                    }
+                },
                 Err(error) => {
                     tracing::warn!(
                         %error,
                         endpoint = config.endpoint(),
-                        "provider stream yellowstone session ended; reconnecting"
+                        "provider stream yellowstone connect/subscribe failed; reconnecting"
                     );
                     send_provider_health(
                         &sender,
@@ -448,19 +484,11 @@ async fn run_yellowstone_transaction_connection(
     tracked_slot: &mut u64,
     watermarks: &mut ProviderCommitmentWatermarks,
     session_established: &mut bool,
+    mut subscribe_tx: YellowstoneSubscribeSink,
+    mut stream: YellowstoneUpdateStream,
 ) -> Result<(), YellowstoneGrpcError> {
     let commitment = config.commitment.as_tx_commitment();
     *session_established = false;
-    let mut builder = GeyserGrpcClient::build_from_shared(config.endpoint.clone())?
-        .x_token(config.x_token.clone())?
-        .max_decoding_message_size(config.max_decoding_message_size);
-    if let Some(timeout) = config.connect_timeout {
-        builder = builder.connect_timeout(timeout);
-    }
-    let mut client = builder.connect().await?;
-    let (mut subscribe_tx, mut stream) = client
-        .subscribe_with_request(Some(config.subscribe_request_with_state(*tracked_slot)))
-        .await?;
     *session_established = true;
     send_provider_health(
         sender,
@@ -550,6 +578,23 @@ async fn run_yellowstone_transaction_connection(
     }
 }
 
+async fn establish_yellowstone_transaction_session(
+    config: &YellowstoneGrpcConfig,
+    tracked_slot: u64,
+) -> Result<(YellowstoneSubscribeSink, YellowstoneUpdateStream), YellowstoneGrpcError> {
+    let mut builder = GeyserGrpcClient::build_from_shared(config.endpoint.clone())?
+        .x_token(config.x_token.clone())?
+        .max_decoding_message_size(config.max_decoding_message_size);
+    if let Some(timeout) = config.connect_timeout {
+        builder = builder.connect_timeout(timeout);
+    }
+    let mut client = builder.connect().await?;
+    let (subscribe_tx, stream) = client
+        .subscribe_with_request(Some(config.subscribe_request_with_state(tracked_slot)))
+        .await?;
+    Ok((Box::pin(subscribe_tx), Box::pin(stream)))
+}
+
 async fn send_provider_health(
     sender: &ProviderStreamSender,
     status: ProviderSourceHealthStatus,
@@ -577,22 +622,6 @@ const fn yellowstone_health_reason(error: &YellowstoneGrpcError) -> ProviderSour
         }
         YellowstoneGrpcError::QueueClosed => ProviderSourceHealthReason::UpstreamProtocolFailure,
     }
-}
-
-async fn preflight_yellowstone_connection(
-    config: &YellowstoneGrpcConfig,
-) -> Result<(), YellowstoneGrpcError> {
-    let mut builder = GeyserGrpcClient::build_from_shared(config.endpoint.clone())?
-        .x_token(config.x_token.clone())?
-        .max_decoding_message_size(config.max_decoding_message_size);
-    if let Some(timeout) = config.connect_timeout {
-        builder = builder.connect_timeout(timeout);
-    }
-    let mut client = builder.connect().await?;
-    let _subscription = client
-        .subscribe_with_request(Some(config.subscribe_request()))
-        .await?;
-    Ok(())
 }
 
 fn transaction_event_from_update(

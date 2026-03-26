@@ -155,9 +155,14 @@ Durability model:
   - `Live`
   - `Resume`
   - `FromSlot(n)`
+  - built-in gRPC adapters fail fast before startup completes and keep the
+    first acknowledged session as the live session instead of burning a
+    throwaway subscribe/unsubscribe cycle first
 - websocket uses reconnect plus best-effort HTTP gap backfill
   - it has no native replay cursor
   - SOF cannot make it stronger than the provider actually is
+  - built-in websocket mode also keeps the first acknowledged session as the
+    live session, so startup does not create an extra blind handoff window
 
 ### 3. Generic Provider Mode
 

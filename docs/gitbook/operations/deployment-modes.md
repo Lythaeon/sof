@@ -45,8 +45,13 @@ SOF exposes this category through `ProviderStreamMode`. In that mode:
     - `Live`: start at the current stream head
     - `Resume` (default): start live, then resume from tracked slot after reconnect
     - `FromSlot(n)`: begin from one explicit slot before switching to tracked resume behavior
+    - built-in Yellowstone startup keeps the first acknowledged subscription as
+      the live session instead of opening and dropping a separate preflight
+      session first
   - LaserStream exposes the same replay modes on top of SDK replay and
     internal slot-watermark tracking
+    - built-in LaserStream startup now follows the same first-session
+      ownership model
   - websocket `transactionSubscribe` uses a stall watchdog and best-effort HTTP
     gap backfill when a matching HTTP endpoint is available
     - if replay is enabled, SOF fails startup unless that HTTP endpoint is
@@ -56,6 +61,8 @@ SOF exposes this category through `ProviderStreamMode`. In that mode:
     - SOF can replay recent slots and dedupe the recovered transactions, but it
       cannot promise stronger durability than the websocket provider plus HTTP
       RPC backfill path can expose
+    - built-in websocket startup also keeps the first acknowledged session as
+      the live stream, so startup does not create a throwaway subscribe window
 - built-in processed provider modes are fixed-surface and fail fast when you
   request hooks they do not emit
 - built-in processed provider adapters are transaction-first only

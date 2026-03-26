@@ -17,7 +17,6 @@ use futures_channel::mpsc as futures_mpsc;
 use futures_util::{SinkExt, StreamExt};
 use helius_laserstream::{
     ChannelOptions, LaserstreamConfig as ClientConfig, LaserstreamError as ClientError, grpc,
-    subscribe,
 };
 use laserstream_core_client::{ClientTlsConfig, Interceptor};
 use laserstream_core_proto::prelude::Transaction as LaserStreamTransaction;
@@ -365,6 +364,17 @@ pub enum LaserStreamError {
     QueueClosed,
 }
 
+type LaserStreamSubscribeSink = std::pin::Pin<
+    Box<dyn futures_util::Sink<grpc::SubscribeRequest, Error = futures_mpsc::SendError> + Send>,
+>;
+type LaserStreamUpdateStream = std::pin::Pin<
+    Box<
+        dyn futures_util::Stream<
+                Item = Result<grpc::SubscribeUpdate, yellowstone_grpc_proto::tonic::Status>,
+            > + Send,
+    >,
+>;
+
 /// Spawns one LaserStream transaction forwarder into a SOF provider-stream queue.
 ///
 /// # Examples
@@ -393,45 +403,75 @@ pub async fn spawn_laserstream_transaction_source(
     config: LaserStreamConfig,
     sender: ProviderStreamSender,
 ) -> Result<JoinHandle<Result<(), LaserStreamError>>, LaserStreamError> {
-    preflight_laserstream_connection(&config).await?;
+    let first_session =
+        connect_and_subscribe_once(&config, config.subscribe_request_with_state(0)).await?;
     Ok(tokio::spawn(async move {
         let mut attempts = 0_u32;
         let mut tracked_slot = 0_u64;
         let mut watermarks = ProviderCommitmentWatermarks::default();
+        let mut first_session = Some(first_session);
         loop {
             let mut session_established = false;
-            match run_laserstream_transaction_connection(
-                &config,
-                &sender,
-                &mut tracked_slot,
-                &mut watermarks,
-                &mut session_established,
-            )
-            .await
-            {
-                Ok(()) => {
-                    let detail = "laserstream stream ended unexpectedly".to_owned();
-                    tracing::warn!(
-                        endpoint = config.endpoint(),
-                        detail,
-                        "provider stream laserstream session ended unexpectedly; reconnecting"
-                    );
-                    send_provider_health(
-                        &sender,
-                        ProviderSourceHealthStatus::Reconnecting,
-                        ProviderSourceHealthReason::UpstreamStreamClosedUnexpectedly,
-                        detail,
+            let session = match first_session.take() {
+                Some(session) => Ok(session),
+                None => {
+                    connect_and_subscribe_once(
+                        &config,
+                        config.subscribe_request_with_state(tracked_slot),
                     )
-                    .await?;
+                    .await
                 }
-                Err(LaserStreamError::QueueClosed) => {
-                    return Err(LaserStreamError::QueueClosed);
-                }
+            };
+            match session {
+                Ok((subscribe_tx, stream)) => match run_laserstream_transaction_connection(
+                    &config,
+                    &sender,
+                    &mut tracked_slot,
+                    &mut watermarks,
+                    &mut session_established,
+                    subscribe_tx,
+                    stream,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        let detail = "laserstream stream ended unexpectedly".to_owned();
+                        tracing::warn!(
+                            endpoint = config.endpoint(),
+                            detail,
+                            "provider stream laserstream session ended unexpectedly; reconnecting"
+                        );
+                        send_provider_health(
+                            &sender,
+                            ProviderSourceHealthStatus::Reconnecting,
+                            ProviderSourceHealthReason::UpstreamStreamClosedUnexpectedly,
+                            detail,
+                        )
+                        .await?;
+                    }
+                    Err(LaserStreamError::QueueClosed) => {
+                        return Err(LaserStreamError::QueueClosed);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            endpoint = config.endpoint(),
+                            "provider stream laserstream session ended; reconnecting"
+                        );
+                        send_provider_health(
+                            &sender,
+                            ProviderSourceHealthStatus::Reconnecting,
+                            laserstream_health_reason(&error),
+                            error.to_string(),
+                        )
+                        .await?;
+                    }
+                },
                 Err(error) => {
                     tracing::warn!(
                         %error,
                         endpoint = config.endpoint(),
-                        "provider stream laserstream session ended; reconnecting"
+                        "provider stream laserstream connect/subscribe failed; reconnecting"
                     );
                     send_provider_health(
                         &sender,
@@ -472,12 +512,11 @@ async fn run_laserstream_transaction_connection(
     tracked_slot: &mut u64,
     watermarks: &mut ProviderCommitmentWatermarks,
     session_established: &mut bool,
+    _subscribe_tx: LaserStreamSubscribeSink,
+    mut stream: LaserStreamUpdateStream,
 ) -> Result<(), LaserStreamError> {
     *session_established = false;
     let commitment = config.commitment.as_tx_commitment();
-    let request = config.subscribe_request_with_state(*tracked_slot);
-    let (stream, _handle) = subscribe(config.client_config(), request);
-    tokio::pin!(stream);
     *session_established = true;
     send_provider_health(
         sender,
@@ -505,7 +544,8 @@ async fn run_laserstream_transaction_connection(
                 let Some(update) = maybe_update else {
                     return Ok(());
                 };
-                let update = update?;
+                let update = update
+                    .map_err(|error| LaserStreamError::Protocol(format!("laserstream stream status: {error}")))?;
                 last_progress = Instant::now();
                 match update.update_oneof {
                     Some(grpc::subscribe_update::UpdateOneof::Slot(slot_update)) => {
@@ -574,14 +614,6 @@ const fn laserstream_health_reason(error: &LaserStreamError) -> ProviderSourceHe
     }
 }
 
-async fn preflight_laserstream_connection(
-    config: &LaserStreamConfig,
-) -> Result<(), LaserStreamError> {
-    let request = config.subscribe_request_with_state(0);
-    let _subscription = connect_and_subscribe_once(config, request).await?;
-    Ok(())
-}
-
 #[derive(Clone)]
 struct SofLaserStreamInterceptor {
     x_token: Option<laserstream_core_proto::tonic::metadata::AsciiMetadataValue>,
@@ -623,13 +655,7 @@ impl Interceptor for SofLaserStreamInterceptor {
 async fn connect_and_subscribe_once(
     config: &LaserStreamConfig,
     request: grpc::SubscribeRequest,
-) -> Result<
-    (
-        impl futures_util::Sink<grpc::SubscribeRequest, Error = futures_mpsc::SendError> + Send,
-        impl futures_util::Stream<Item = Result<grpc::SubscribeUpdate, Status>> + Send,
-    ),
-    LaserStreamError,
-> {
+) -> Result<(LaserStreamSubscribeSink, LaserStreamUpdateStream), LaserStreamError> {
     let options = config.client_config().channel_options;
     let interceptor = SofLaserStreamInterceptor::new(&config.api_key)
         .map_err(|error| LaserStreamError::Protocol(error.to_string()))?;
@@ -700,7 +726,7 @@ async fn connect_and_subscribe_once(
         .await
         .map_err(|error| LaserStreamError::Protocol(format!("subscription failed: {error}")))?;
 
-    Ok((subscribe_tx, response.into_inner()))
+    Ok((Box::pin(subscribe_tx), Box::pin(response.into_inner())))
 }
 
 fn transaction_event_from_update(
