@@ -455,7 +455,8 @@ async fn run_websocket_transaction_connection(
             }
             () = async {
                 if let Some(timeout) = config.stall_timeout {
-                    tokio::time::sleep_until(last_progress + timeout).await;
+                    let deadline = last_progress.checked_add(timeout).unwrap_or(last_progress);
+                    tokio::time::sleep_until(deadline).await;
                 } else {
                     std::future::pending::<()>().await;
                 }
@@ -707,7 +708,7 @@ struct WebsocketParseScratch {
     tx_bytes: Vec<u8>,
 }
 
-fn frame_bytes_mut<'a>(buffer: &'a mut Vec<u8>, bytes: &[u8]) -> &'a mut [u8] {
+fn frame_bytes_mut<'buffer>(buffer: &'buffer mut Vec<u8>, bytes: &[u8]) -> &'buffer mut [u8] {
     buffer.clear();
     buffer.extend_from_slice(bytes);
     buffer.as_mut_slice()
@@ -804,7 +805,7 @@ async fn preflight_websocket_connection(
         ))
         .await?;
     wait_for_subscription_ack(&mut read).await?;
-    let _ = write.close().await;
+    write.close().await.ok();
     Ok(())
 }
 
@@ -952,40 +953,40 @@ struct WebsocketSubscriptionAck {
 }
 
 #[derive(Debug, Deserialize)]
-struct WebsocketTransactionEnvelopeMessage<'a> {
+struct WebsocketTransactionEnvelopeMessage<'input> {
     #[serde(default)]
     error: Option<Value>,
     #[serde(default)]
     #[serde(borrow)]
-    params: Option<WebsocketTransactionParams<'a>>,
+    params: Option<WebsocketTransactionParams<'input>>,
 }
 
 #[derive(Debug, Deserialize)]
-struct WebsocketTransactionParams<'a> {
+struct WebsocketTransactionParams<'input> {
     #[serde(borrow)]
-    result: WebsocketTransactionNotification<'a>,
+    result: WebsocketTransactionNotification<'input>,
 }
 
 #[derive(Debug, Deserialize)]
-struct WebsocketTransactionNotification<'a> {
+struct WebsocketTransactionNotification<'input> {
     slot: u64,
     #[serde(default)]
     #[serde(borrow)]
-    signature: Option<Cow<'a, str>>,
+    signature: Option<Cow<'input, str>>,
     #[serde(borrow)]
-    transaction: WebsocketTransactionEnvelope<'a>,
+    transaction: WebsocketTransactionEnvelope<'input>,
 }
 
 #[derive(Debug, Deserialize)]
-struct WebsocketTransactionEnvelope<'a> {
+struct WebsocketTransactionEnvelope<'input> {
     #[serde(borrow)]
-    transaction: WebsocketEncodedTransaction<'a>,
+    transaction: WebsocketEncodedTransaction<'input>,
 }
 
 #[derive(Debug, Deserialize)]
-struct WebsocketEncodedTransaction<'a>(
-    #[serde(borrow)] Cow<'a, str>,
-    #[serde(borrow)] Cow<'a, str>,
+struct WebsocketEncodedTransaction<'input>(
+    #[serde(borrow)] Cow<'input, str>,
+    #[serde(borrow)] Cow<'input, str>,
 );
 
 #[derive(Debug, Deserialize)]
@@ -1269,7 +1270,13 @@ mod tests {
                     WsMessage::Text(text) => {
                         assert!(text.contains("transactionSubscribe"));
                     }
-                    other => panic!("expected subscribe text frame, got {other:?}"),
+                    other @ WsMessage::Binary(_)
+                    | other @ WsMessage::Ping(_)
+                    | other @ WsMessage::Pong(_)
+                    | other @ WsMessage::Close(_)
+                    | other @ WsMessage::Frame(_) => {
+                        panic!("expected subscribe text frame, got {other:?}");
+                    }
                 }
                 ws.send(WsMessage::Text(
                     String::from(r#"{"jsonrpc":"2.0","id":1,"result":42}"#).into(),
@@ -1317,7 +1324,16 @@ mod tests {
                     continue;
                 }
                 ProviderStreamUpdate::SerializedTransaction(event) => break event,
-                other => panic!("expected transaction update, got {other:?}"),
+                other @ ProviderStreamUpdate::Transaction(_)
+                | other @ ProviderStreamUpdate::TransactionLog(_)
+                | other @ ProviderStreamUpdate::TransactionViewBatch(_)
+                | other @ ProviderStreamUpdate::RecentBlockhash(_)
+                | other @ ProviderStreamUpdate::SlotStatus(_)
+                | other @ ProviderStreamUpdate::ClusterTopology(_)
+                | other @ ProviderStreamUpdate::LeaderSchedule(_)
+                | other @ ProviderStreamUpdate::Reorg(_) => {
+                    panic!("expected transaction update, got {other:?}");
+                }
             }
         };
         assert!(saw_health);
@@ -1326,7 +1342,7 @@ mod tests {
         assert!(!event.bytes.is_empty());
 
         handle.abort();
-        let _ = handle.await;
+        handle.await.ok();
         server.await.expect("server task");
     }
 

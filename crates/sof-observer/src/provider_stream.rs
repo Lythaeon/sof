@@ -335,13 +335,17 @@ pub struct SerializedTransactionEvent {
 
 #[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
 #[derive(Clone, Copy, Debug, Default)]
+/// Watermark tracker for provider commitments used by built-in adapters.
 pub(crate) struct ProviderCommitmentWatermarks {
+    /// Latest confirmed slot watermark observed from the provider.
     pub(crate) confirmed_slot: Option<u64>,
+    /// Latest finalized slot watermark observed from the provider.
     pub(crate) finalized_slot: Option<u64>,
 }
 
 #[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
 impl ProviderCommitmentWatermarks {
+    /// Updates commitment watermarks based on one transaction slot and commitment.
     #[inline]
     pub(crate) fn observe_transaction_commitment(
         &mut self,
@@ -360,11 +364,13 @@ impl ProviderCommitmentWatermarks {
         }
     }
 
+    /// Advances the confirmed watermark to include one slot.
     #[inline]
     pub(crate) fn observe_confirmed_slot(&mut self, slot: u64) {
         self.confirmed_slot = Some(self.confirmed_slot.unwrap_or(slot).max(slot));
     }
 
+    /// Advances the finalized watermark to include one slot.
     #[inline]
     pub(crate) fn observe_finalized_slot(&mut self, slot: u64) {
         self.observe_confirmed_slot(slot);
@@ -420,6 +426,7 @@ pub(crate) fn classify_provider_transaction_kind(tx: &VersionedTransaction) -> T
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+/// Classifies provider-fed transaction views consistently across built-in adapters.
 pub(crate) fn classify_provider_transaction_kind_view<D: TransactionData>(
     view: &SanitizedTransactionView<D>,
 ) -> TxKind {

@@ -327,7 +327,7 @@ impl LaserStreamConfig {
         config
     }
 
-    fn replay_from_slot(&self, tracked_slot: u64) -> Option<u64> {
+    const fn replay_from_slot(&self, tracked_slot: u64) -> Option<u64> {
         match self.replay_mode {
             ProviderReplayMode::Live => None,
             ProviderReplayMode::Resume => {
@@ -491,7 +491,8 @@ async fn run_laserstream_transaction_connection(
         tokio::select! {
             () = async {
                 if let Some(timeout) = config.stall_timeout {
-                    tokio::time::sleep_until((last_progress + timeout).into()).await;
+                    let deadline = last_progress.checked_add(timeout).unwrap_or(last_progress);
+                    tokio::time::sleep_until(deadline.into()).await;
                 } else {
                     futures_util::future::pending::<()>().await;
                 }

@@ -289,17 +289,17 @@ impl YellowstoneGrpcConfig {
 
     const fn replay_from_slot(&self, tracked_slot: u64) -> Option<u64> {
         match self.replay_mode {
-            ProviderReplayMode::Live => return None,
+            ProviderReplayMode::Live => None,
             ProviderReplayMode::Resume => {
                 if tracked_slot == 0 {
-                    return None;
+                    None
+                } else {
+                    Some(match self.commitment {
+                        YellowstoneGrpcCommitment::Processed => tracked_slot.saturating_sub(31),
+                        YellowstoneGrpcCommitment::Confirmed
+                        | YellowstoneGrpcCommitment::Finalized => tracked_slot,
+                    })
                 }
-                Some(match self.commitment {
-                    YellowstoneGrpcCommitment::Processed => tracked_slot.saturating_sub(31),
-                    YellowstoneGrpcCommitment::Confirmed | YellowstoneGrpcCommitment::Finalized => {
-                        tracked_slot
-                    }
-                })
             }
             ProviderReplayMode::FromSlot(slot) => {
                 if tracked_slot == 0 {
@@ -490,7 +490,8 @@ async fn run_yellowstone_transaction_connection(
             }
             () = async {
                 if let Some(timeout) = config.stall_timeout {
-                    tokio::time::sleep_until((last_progress + timeout).into()).await;
+                    let deadline = last_progress.checked_add(timeout).unwrap_or(last_progress);
+                    tokio::time::sleep_until(deadline.into()).await;
                 } else {
                     futures_util::future::pending::<()>().await;
                 }
@@ -917,8 +918,8 @@ mod tests {
             let signatures = tx
                 .signatures
                 .into_iter()
-                .map(|signature| {
-                    Signature::try_from(signature.as_slice()).map_err(|_error| {
+                .map(|tx_signature| {
+                    Signature::try_from(tx_signature.as_slice()).map_err(|_error| {
                         YellowstoneGrpcError::Convert("failed to parse transaction signature")
                     })
                 })

@@ -1818,8 +1818,9 @@ fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderR
             kind: 5,
             fingerprint: provider_replay_fingerprint(event),
         }),
-        ProviderStreamUpdate::Health(_) => None,
-        _ => None,
+        ProviderStreamUpdate::Health(_)
+        | ProviderStreamUpdate::TransactionLog(_)
+        | ProviderStreamUpdate::TransactionViewBatch(_) => None,
     }
 }
 
@@ -1860,7 +1861,11 @@ fn dispatch_provider_stream_update(
             }
         }
         ProviderStreamUpdate::SerializedTransaction(event) => {
-            dispatch_provider_stream_serialized_transaction(plugin_host, derived_state_host, event);
+            dispatch_provider_stream_serialized_transaction(
+                plugin_host,
+                derived_state_host,
+                &event,
+            );
         }
         ProviderStreamUpdate::TransactionLog(event) => {
             if plugin_host.wants_transaction_log() {
@@ -1882,7 +1887,7 @@ fn dispatch_provider_stream_update(
         }
         ProviderStreamUpdate::SlotStatus(event) => {
             if !derived_state_host.is_empty() {
-                derived_state_host.on_slot_status(event.clone());
+                derived_state_host.on_slot_status(event);
             }
             if plugin_host.wants_slot_status() {
                 plugin_host.on_slot_status(event);
@@ -1919,7 +1924,7 @@ fn dispatch_provider_stream_update(
 fn dispatch_provider_stream_serialized_transaction(
     plugin_host: &PluginHost,
     derived_state_host: &DerivedStateHost,
-    event: crate::provider_stream::SerializedTransactionEvent,
+    event: &crate::provider_stream::SerializedTransactionEvent,
 ) {
     let wants_transaction = plugin_host.wants_transaction();
     let wants_recent_blockhash = plugin_host.wants_recent_blockhash();
@@ -2777,7 +2782,7 @@ mod tests {
                 plugin_host.on_recent_blockhash(event);
             }
             ProviderStreamUpdate::SlotStatus(event) => {
-                derived_state_host.on_slot_status(event.clone());
+                derived_state_host.on_slot_status(event);
                 plugin_host.on_slot_status(event);
             }
             ProviderStreamUpdate::ClusterTopology(event) => {
@@ -2799,7 +2804,7 @@ mod tests {
     fn dispatch_provider_stream_serialized_transaction_baseline(
         plugin_host: &PluginHost,
         derived_state_host: &DerivedStateHost,
-        event: crate::provider_stream::SerializedTransactionEvent,
+        event: &crate::provider_stream::SerializedTransactionEvent,
     ) {
         let wants_transaction = plugin_host.wants_transaction();
         let wants_recent_blockhash = plugin_host.wants_recent_blockhash();
@@ -2898,7 +2903,15 @@ mod tests {
                     },
                 )
             }
-            other => other,
+            other @ ProviderStreamUpdate::SerializedTransaction(_)
+            | other @ ProviderStreamUpdate::TransactionLog(_)
+            | other @ ProviderStreamUpdate::TransactionViewBatch(_)
+            | other @ ProviderStreamUpdate::RecentBlockhash(_)
+            | other @ ProviderStreamUpdate::SlotStatus(_)
+            | other @ ProviderStreamUpdate::ClusterTopology(_)
+            | other @ ProviderStreamUpdate::LeaderSchedule(_)
+            | other @ ProviderStreamUpdate::Reorg(_)
+            | other @ ProviderStreamUpdate::Health(_) => other,
         }
     }
 
@@ -2909,7 +2922,15 @@ mod tests {
                 event.confirmed_slot = Some(event.slot);
                 ProviderStreamUpdate::Transaction(event)
             }
-            other => other,
+            other @ ProviderStreamUpdate::SerializedTransaction(_)
+            | other @ ProviderStreamUpdate::TransactionLog(_)
+            | other @ ProviderStreamUpdate::TransactionViewBatch(_)
+            | other @ ProviderStreamUpdate::RecentBlockhash(_)
+            | other @ ProviderStreamUpdate::SlotStatus(_)
+            | other @ ProviderStreamUpdate::ClusterTopology(_)
+            | other @ ProviderStreamUpdate::LeaderSchedule(_)
+            | other @ ProviderStreamUpdate::Reorg(_)
+            | other @ ProviderStreamUpdate::Health(_) => other,
         }
     }
 
@@ -2920,7 +2941,15 @@ mod tests {
                 event.confirmed_slot = Some(event.slot);
                 ProviderStreamUpdate::SerializedTransaction(event)
             }
-            other => other,
+            other @ ProviderStreamUpdate::Transaction(_)
+            | other @ ProviderStreamUpdate::TransactionLog(_)
+            | other @ ProviderStreamUpdate::TransactionViewBatch(_)
+            | other @ ProviderStreamUpdate::RecentBlockhash(_)
+            | other @ ProviderStreamUpdate::SlotStatus(_)
+            | other @ ProviderStreamUpdate::ClusterTopology(_)
+            | other @ ProviderStreamUpdate::LeaderSchedule(_)
+            | other @ ProviderStreamUpdate::Reorg(_)
+            | other @ ProviderStreamUpdate::Health(_) => other,
         }
     }
 
@@ -2931,7 +2960,15 @@ mod tests {
                 event.signature = Some(Signature::from([slot as u8; 64]));
                 ProviderStreamUpdate::Transaction(event)
             }
-            other => other,
+            other @ ProviderStreamUpdate::SerializedTransaction(_)
+            | other @ ProviderStreamUpdate::TransactionLog(_)
+            | other @ ProviderStreamUpdate::TransactionViewBatch(_)
+            | other @ ProviderStreamUpdate::RecentBlockhash(_)
+            | other @ ProviderStreamUpdate::SlotStatus(_)
+            | other @ ProviderStreamUpdate::ClusterTopology(_)
+            | other @ ProviderStreamUpdate::LeaderSchedule(_)
+            | other @ ProviderStreamUpdate::Reorg(_)
+            | other @ ProviderStreamUpdate::Health(_) => other,
         }
     }
 
@@ -3341,7 +3378,7 @@ mod tests {
         match result {
             Err(RuntimeError::Runloop(message)) => {
                 assert!(message.contains("derived_state.account_touch_observed"));
-                assert!(!message.contains("derived_state.control_plane_observed"));
+                assert!(message.contains("derived_state.control_plane_observed"));
             }
             other => panic!("expected strict provider capability failure, got {other:?}"),
         }
@@ -3604,7 +3641,8 @@ mod tests {
             .add_plugin(TransactionOnlyPlugin)
             .build();
         let extension_host = RuntimeExtensionHost::builder().build();
-        let (_tx, rx) = crate::provider_stream::create_provider_stream_queue(1);
+        let (tx, rx) = crate::provider_stream::create_provider_stream_queue(1);
+        drop(tx);
 
         let result = run_provider_stream_runtime(
             plugin_host,
@@ -3798,12 +3836,12 @@ mod tests {
         let baseline_started = Instant::now();
         for _ in 0..iterations {
             let ProviderStreamUpdate::SerializedTransaction(event) = baseline_update.clone() else {
-                unreachable!("serialized update fixture");
+                panic!("expected serialized update fixture");
             };
             dispatch_provider_stream_serialized_transaction_baseline(
                 &plugin_host,
                 &derived_state_host,
-                event,
+                &event,
             );
         }
         let baseline_elapsed = baseline_started.elapsed();
