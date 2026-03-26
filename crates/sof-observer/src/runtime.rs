@@ -77,6 +77,33 @@ impl ShredTrustMode {
     }
 }
 
+/// Startup policy for provider-stream modes when plugins request unsupported hooks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderStreamCapabilityPolicy {
+    /// Log a warning and continue startup.
+    Warn,
+    /// Fail startup when any registered plugin requests an unsupported hook.
+    Strict,
+}
+
+impl ProviderStreamCapabilityPolicy {
+    /// Returns the env-string representation used by `SOF_PROVIDER_STREAM_CAPABILITY_POLICY`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Warn => "warn",
+            Self::Strict => "strict",
+        }
+    }
+
+    fn from_runtime_env() -> Self {
+        match crate::runtime_env::read_env_var("SOF_PROVIDER_STREAM_CAPABILITY_POLICY").as_deref() {
+            Some("strict") => Self::Strict,
+            _ => Self::Warn,
+        }
+    }
+}
+
 /// Typed replay retention configuration for derived-state consumers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DerivedStateReplayConfig {
@@ -583,6 +610,15 @@ impl RuntimeSetup {
     #[must_use]
     pub fn with_shred_trust_mode(self, mode: ShredTrustMode) -> Self {
         self.with_env("SOF_SHRED_TRUST_MODE", mode.as_str())
+    }
+
+    /// Sets `SOF_PROVIDER_STREAM_CAPABILITY_POLICY`.
+    #[must_use]
+    pub fn with_provider_stream_capability_policy(
+        self,
+        policy: ProviderStreamCapabilityPolicy,
+    ) -> Self {
+        self.with_env("SOF_PROVIDER_STREAM_CAPABILITY_POLICY", policy.as_str())
     }
 
     /// Sets `SOF_VERIFY_STRICT`.
@@ -1513,7 +1549,7 @@ async fn run_provider_stream_runtime(
         .startup()
         .await
         .map_err(|error| RuntimeError::Runloop(error.to_string()))?;
-    log_provider_stream_capability_warnings(mode, &plugin_host);
+    enforce_provider_stream_capability_policy(mode, &plugin_host)?;
     derived_state_host.initialize();
     tracing::info!(mode = mode.as_str(), "starting SOF provider-stream runtime");
 
@@ -1603,7 +1639,10 @@ fn dispatch_provider_stream_update(
     }
 }
 
-fn log_provider_stream_capability_warnings(mode: ProviderStreamMode, plugin_host: &PluginHost) {
+fn provider_stream_unsupported_hooks(
+    mode: ProviderStreamMode,
+    plugin_host: &PluginHost,
+) -> Vec<&'static str> {
     let mut unsupported = Vec::new();
     if plugin_host.wants_raw_packet() {
         unsupported.push("on_raw_packet");
@@ -1663,12 +1702,31 @@ fn log_provider_stream_capability_warnings(mode: ProviderStreamMode, plugin_host
             }
         }
     }
-    if !unsupported.is_empty() {
-        tracing::warn!(
-            mode = mode.as_str(),
-            unsupported_hooks = unsupported.join(","),
-            "provider-stream mode will not emit some requested plugin hooks"
-        );
+    unsupported
+}
+
+fn enforce_provider_stream_capability_policy(
+    mode: ProviderStreamMode,
+    plugin_host: &PluginHost,
+) -> Result<(), RuntimeError> {
+    let unsupported = provider_stream_unsupported_hooks(mode, plugin_host);
+    if unsupported.is_empty() {
+        return Ok(());
+    }
+    match ProviderStreamCapabilityPolicy::from_runtime_env() {
+        ProviderStreamCapabilityPolicy::Warn => {
+            tracing::warn!(
+                mode = mode.as_str(),
+                unsupported_hooks = unsupported.join(","),
+                "provider-stream mode will not emit some requested plugin hooks"
+            );
+            Ok(())
+        }
+        ProviderStreamCapabilityPolicy::Strict => Err(RuntimeError::Runloop(format!(
+            "provider-stream mode {} does not support requested hooks: {}",
+            mode.as_str(),
+            unsupported.join(",")
+        ))),
     }
 }
 
@@ -2058,6 +2116,8 @@ mod tests {
     use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
     use super::*;
+    use crate::framework::{ObserverPlugin, PluginConfig, RawPacketEvent};
+    use async_trait::async_trait;
     use sof_gossip_tuning::{GossipTuningProfile, HostProfilePreset, IngestQueueMode};
     use solana_keypair::Keypair;
     use solana_message::{Message, VersionedMessage};
@@ -2086,6 +2146,17 @@ mod tests {
             kind: crate::event::TxKind::NonVote,
             tx: Arc::new(tx),
         })
+    }
+
+    struct RawPacketPlugin;
+
+    #[async_trait]
+    impl ObserverPlugin for RawPacketPlugin {
+        fn config(&self) -> PluginConfig {
+            PluginConfig::new().with_raw_packet()
+        }
+
+        async fn on_raw_packet(&self, _event: RawPacketEvent) {}
     }
 
     fn dispatch_provider_stream_update_baseline(
@@ -2404,6 +2475,55 @@ mod tests {
                 String::from("trusted_raw_shred_provider"),
             ))
         );
+    }
+
+    #[test]
+    fn typed_provider_stream_capability_policy_uses_expected_strings() {
+        let setup = RuntimeSetup::new()
+            .with_provider_stream_capability_policy(ProviderStreamCapabilityPolicy::Strict);
+        assert_eq!(
+            setup.env_overrides.last(),
+            Some(&(
+                String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+                String::from("strict"),
+            ))
+        );
+    }
+
+    #[test]
+    fn provider_stream_warn_policy_allows_unsupported_hooks() {
+        crate::runtime_env::set_runtime_env_overrides([(
+            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+            String::from("warn"),
+        )]);
+        let plugin_host = PluginHost::builder().add_plugin(RawPacketPlugin).build();
+        let result = enforce_provider_stream_capability_policy(
+            ProviderStreamMode::YellowstoneGrpc,
+            &plugin_host,
+        );
+        crate::runtime_env::clear_runtime_env_overrides();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn provider_stream_strict_policy_rejects_unsupported_hooks() {
+        crate::runtime_env::set_runtime_env_overrides([(
+            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+            String::from("strict"),
+        )]);
+        let plugin_host = PluginHost::builder().add_plugin(RawPacketPlugin).build();
+        let result = enforce_provider_stream_capability_policy(
+            ProviderStreamMode::YellowstoneGrpc,
+            &plugin_host,
+        );
+        crate::runtime_env::clear_runtime_env_overrides();
+        match result {
+            Err(RuntimeError::Runloop(message)) => {
+                assert!(message.contains("yellowstone_grpc"));
+                assert!(message.contains("on_raw_packet"));
+            }
+            other => panic!("expected strict provider capability failure, got {other:?}"),
+        }
     }
 
     #[test]

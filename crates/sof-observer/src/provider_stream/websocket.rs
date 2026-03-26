@@ -563,17 +563,23 @@ struct WebsocketEncodedTransaction<'a>(
     #[serde(borrow)] Cow<'a, str>,
 );
 
-#[cfg(all(test, feature = "provider-grpc"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::event::TxKind;
-    use crate::provider_stream::yellowstone::{YellowstoneGrpcCommitment, YellowstoneGrpcConfig};
+    use crate::provider_stream::create_provider_stream_queue;
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use serde_json::json;
     use solana_keypair::Keypair;
     use solana_message::{Message, VersionedMessage};
     use solana_signer::Signer;
     use std::time::Instant;
+    use tokio::net::TcpListener;
+    use tokio::time::{Duration, timeout};
+    use tokio_tungstenite::{accept_async, tungstenite::protocol::Message as WsMessage};
+
+    #[cfg(feature = "provider-grpc")]
+    use crate::provider_stream::yellowstone::{YellowstoneGrpcCommitment, YellowstoneGrpcConfig};
 
     fn profile_iterations(default: usize) -> usize {
         std::env::var("SOF_PROFILE_ITERATIONS")
@@ -652,6 +658,7 @@ mod tests {
         }))
     }
 
+    #[cfg(feature = "provider-grpc")]
     #[test]
     fn websocket_filter_shape_matches_yellowstone_config() {
         let signature = Signature::from([7_u8; 64]);
@@ -768,6 +775,72 @@ mod tests {
         assert_eq!(event.signature, Some(signature));
         assert_eq!(event.commitment_status, TxCommitmentStatus::Confirmed);
         assert_eq!(event.kind, TxKind::NonVote);
+    }
+
+    #[tokio::test]
+    async fn websocket_source_reconnects_and_delivers_after_disconnect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+        let payload = sample_notification_payload();
+
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let mut ws = accept_async(stream).await.expect("websocket handshake");
+                let subscribe = ws
+                    .next()
+                    .await
+                    .expect("subscribe frame")
+                    .expect("subscribe message");
+                match subscribe {
+                    WsMessage::Text(text) => {
+                        assert!(text.contains("transactionSubscribe"));
+                    }
+                    other => panic!("expected subscribe text frame, got {other:?}"),
+                }
+                ws.send(WsMessage::Text(
+                    String::from(r#"{"jsonrpc":"2.0","id":1,"result":42}"#).into(),
+                ))
+                .await
+                .expect("ack");
+                if attempt == 0 {
+                    ws.close(None).await.expect("close first session");
+                    continue;
+                }
+                ws.send(WsMessage::Text(
+                    String::from_utf8(payload.clone())
+                        .expect("notification utf8")
+                        .into(),
+                ))
+                .await
+                .expect("notification");
+                ws.close(None).await.expect("close second session");
+                break;
+            }
+        });
+
+        let (tx, mut rx) = create_provider_stream_queue(8);
+        let config = WebsocketTransactionConfig::new(format!("ws://{addr}"))
+            .with_ping_interval(Duration::from_millis(250))
+            .with_reconnect_delay(Duration::from_millis(10));
+        let handle = spawn_websocket_transaction_source(&config, tx);
+
+        let update = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("provider update timeout")
+            .expect("provider update");
+        match update {
+            ProviderStreamUpdate::Transaction(event) => {
+                assert_eq!(event.slot, 55);
+                assert_eq!(event.kind, TxKind::NonVote);
+                assert!(event.signature.is_some());
+            }
+            other => panic!("expected transaction update, got {other:?}"),
+        }
+
+        handle.abort();
+        let _ = handle.await;
+        server.await.expect("server task");
     }
 
     #[test]
