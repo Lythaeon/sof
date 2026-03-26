@@ -91,12 +91,10 @@ async fn main() -> Result<(), RuntimeError> {
         let producer_task = tokio::task::spawn_blocking(move || {
             af_xdp_ingress::run_af_xdp_producer_until(&tx, &config, producer_stop)
         });
-        let (producer_done_tx, producer_done_rx) = tokio::sync::oneshot::channel::<()>();
         let producer_wait_task = tokio::spawn(async move {
             let result = producer_task.await.map_err(|error| {
                 RuntimeError::Runloop(format!("AF_XDP producer task join failed: {error}"))
             })?;
-            let _ = producer_done_tx.send(());
             result
                 .map_err(|error| RuntimeError::Runloop(format!("AF_XDP producer failed: {error}")))
         });
@@ -105,12 +103,7 @@ async fn main() -> Result<(), RuntimeError> {
             .with_plugin_host(host)
             .with_setup(setup)
             .with_kernel_bypass_ingress(rx)
-            .run_until(async move {
-                tokio::select! {
-                    _ = wait_for_example_termination_signal() => {}
-                    _ = producer_done_rx => {}
-                }
-            })
+            .run_until_termination_signal()
             .await;
 
         stop.store(true, Ordering::Relaxed);
@@ -132,40 +125,4 @@ async fn main() -> Result<(), RuntimeError> {
         .with_setup(setup)
         .run_until_termination_signal()
         .await
-}
-
-#[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
-async fn wait_for_example_termination_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-
-        let mut sigterm = match signal(SignalKind::terminate()) {
-            Ok(signal) => signal,
-            Err(error) => {
-                tracing::warn!(%error, "failed to register SIGTERM handler; falling back to ctrl-c");
-                let _ = tokio::signal::ctrl_c().await;
-                return;
-            }
-        };
-        let mut sigint = match signal(SignalKind::interrupt()) {
-            Ok(signal) => signal,
-            Err(error) => {
-                tracing::warn!(%error, "failed to register SIGINT handler; falling back to ctrl-c");
-                let _ = tokio::signal::ctrl_c().await;
-                return;
-            }
-        };
-        tokio::select! {
-            _ = sigterm.recv() => {}
-            _ = sigint.recv() => {}
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            tracing::warn!(%error, "failed to wait for Ctrl-C shutdown signal");
-        }
-    }
 }
