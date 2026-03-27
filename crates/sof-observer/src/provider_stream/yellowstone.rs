@@ -5,6 +5,7 @@
 use std::{
     collections::HashMap,
     str::FromStr,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -19,6 +20,7 @@ use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 use thiserror::Error;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 use yellowstone_grpc_client::{GeyserGrpcBuilderError, GeyserGrpcClient, GeyserGrpcClientError};
 use yellowstone_grpc_proto::prelude::{
@@ -38,8 +40,8 @@ use crate::{
         ProviderCommitmentWatermarks, ProviderReplayMode, ProviderSourceHealthEvent,
         ProviderSourceHealthReason, ProviderSourceHealthStatus, ProviderSourceId,
         ProviderSourceIdentity, ProviderSourceIdentityRegistrationError, ProviderSourceReadiness,
-        ProviderStreamFanIn, ProviderStreamMode, ProviderStreamSender, ProviderStreamUpdate,
-        classify_provider_transaction_kind,
+        ProviderSourceReservation, ProviderStreamFanIn, ProviderStreamMode, ProviderStreamSender,
+        ProviderStreamUpdate, classify_provider_transaction_kind,
     },
 };
 
@@ -899,11 +901,49 @@ pub async fn spawn_yellowstone_grpc_source(
     config: YellowstoneGrpcConfig,
     sender: ProviderStreamSender,
 ) -> Result<JoinHandle<Result<(), YellowstoneGrpcError>>, YellowstoneGrpcError> {
+    spawn_yellowstone_grpc_source_inner(config, sender, None).await
+}
+
+#[deprecated(note = "use spawn_yellowstone_grpc_source")]
+/// Deprecated compatibility shim for [`spawn_yellowstone_grpc_source`].
+///
+/// # Errors
+///
+/// Returns the same startup validation or bootstrap error as
+/// [`spawn_yellowstone_grpc_source`].
+pub async fn spawn_yellowstone_grpc_transaction_source(
+    config: YellowstoneGrpcConfig,
+    sender: ProviderStreamSender,
+) -> Result<JoinHandle<Result<(), YellowstoneGrpcError>>, YellowstoneGrpcError> {
+    spawn_yellowstone_grpc_source(config, sender).await
+}
+
+async fn spawn_yellowstone_grpc_source_inner(
+    config: YellowstoneGrpcConfig,
+    sender: ProviderStreamSender,
+    reservation: Option<Arc<ProviderSourceReservation>>,
+) -> Result<JoinHandle<Result<(), YellowstoneGrpcError>>, YellowstoneGrpcError> {
     config.validate()?;
     let source = ProviderSourceIdentity::generated(config.source_id(), config.source_instance());
     register_yellowstone_primary_initial_health(&source, config.readiness(), &sender);
-    let first_session = establish_yellowstone_session(&config, 0).await?;
+    let first_session = match establish_yellowstone_session(&config, 0).await {
+        Ok(session) => session,
+        Err(error) => {
+            publish_yellowstone_health_nonblocking(
+                &sender,
+                &ProviderSourceHealthEvent {
+                    source,
+                    readiness: config.readiness(),
+                    status: ProviderSourceHealthStatus::Removed,
+                    reason: yellowstone_health_reason(&error),
+                    message: error.to_string(),
+                },
+            );
+            return Err(error);
+        }
+    };
     Ok(tokio::spawn(async move {
+        let _reservation = reservation;
         let mut attempts = 0_u32;
         let mut tracked_slot = 0_u64;
         let mut watermarks = ProviderCommitmentWatermarks::default();
@@ -1023,13 +1063,37 @@ pub async fn spawn_yellowstone_grpc_slot_source(
     config: YellowstoneGrpcSlotsConfig,
     sender: ProviderStreamSender,
 ) -> Result<JoinHandle<Result<(), YellowstoneGrpcError>>, YellowstoneGrpcError> {
+    spawn_yellowstone_grpc_slot_source_inner(config, sender, None).await
+}
+
+async fn spawn_yellowstone_grpc_slot_source_inner(
+    config: YellowstoneGrpcSlotsConfig,
+    sender: ProviderStreamSender,
+    reservation: Option<Arc<ProviderSourceReservation>>,
+) -> Result<JoinHandle<Result<(), YellowstoneGrpcError>>, YellowstoneGrpcError> {
     let source = ProviderSourceIdentity::generated(
         ProviderSourceId::YellowstoneGrpcSlots,
         config.source_instance(),
     );
     register_yellowstone_slot_initial_health(&source, config.readiness(), &sender);
-    let first_session = establish_yellowstone_slot_session(&config, 0).await?;
+    let first_session = match establish_yellowstone_slot_session(&config, 0).await {
+        Ok(session) => session,
+        Err(error) => {
+            publish_yellowstone_slot_health_nonblocking(
+                &sender,
+                &ProviderSourceHealthEvent {
+                    source,
+                    readiness: config.readiness(),
+                    status: ProviderSourceHealthStatus::Removed,
+                    reason: yellowstone_health_reason(&error),
+                    message: error.to_string(),
+                },
+            );
+            return Err(error);
+        }
+    };
     Ok(tokio::spawn(async move {
+        let _reservation = reservation;
         let mut attempts = 0_u32;
         let mut tracked_slot = 0_u64;
         let mut watermarks = ProviderCommitmentWatermarks::default();
@@ -1462,20 +1526,66 @@ fn register_yellowstone_primary_initial_health(
     readiness: ProviderSourceReadiness,
     sender: &ProviderStreamSender,
 ) {
-    let sender = sender.clone();
-    let event = ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
-        source: source.clone(),
-        readiness,
-        status: ProviderSourceHealthStatus::Reconnecting,
-        reason: ProviderSourceHealthReason::InitialConnectPending,
-        message: format!(
-            "waiting for first yellowstone {} session ack",
-            source.kind_str().trim_start_matches("yellowstone_grpc_")
-        ),
-    });
-    tokio::spawn(async move {
-        drop(sender.send(event).await);
-    });
+    publish_yellowstone_health_nonblocking(
+        sender,
+        &ProviderSourceHealthEvent {
+            source: source.clone(),
+            readiness,
+            status: ProviderSourceHealthStatus::Reconnecting,
+            reason: ProviderSourceHealthReason::InitialConnectPending,
+            message: format!(
+                "waiting for first yellowstone {} session ack",
+                source.kind_str().trim_start_matches("yellowstone_grpc_")
+            ),
+        },
+    );
+}
+
+fn publish_yellowstone_health_nonblocking(
+    sender: &ProviderStreamSender,
+    event: &ProviderSourceHealthEvent,
+) {
+    match sender.try_send(ProviderStreamUpdate::Health(event.clone())) {
+        Ok(()) | Err(TrySendError::Closed(_)) => {}
+        Err(TrySendError::Full(update)) => {
+            let sender = sender.clone();
+            tokio::spawn(async move {
+                drop(sender.send(update).await);
+            });
+        }
+    }
+}
+
+fn register_yellowstone_slot_initial_health(
+    source: &ProviderSourceIdentity,
+    readiness: ProviderSourceReadiness,
+    sender: &ProviderStreamSender,
+) {
+    publish_yellowstone_slot_health_nonblocking(
+        sender,
+        &ProviderSourceHealthEvent {
+            source: source.clone(),
+            readiness,
+            status: ProviderSourceHealthStatus::Reconnecting,
+            reason: ProviderSourceHealthReason::InitialConnectPending,
+            message: "waiting for first yellowstone slot session ack".to_owned(),
+        },
+    );
+}
+
+fn publish_yellowstone_slot_health_nonblocking(
+    sender: &ProviderStreamSender,
+    event: &ProviderSourceHealthEvent,
+) {
+    match sender.try_send(ProviderStreamUpdate::Health(event.clone())) {
+        Ok(()) | Err(TrySendError::Closed(_)) => {}
+        Err(TrySendError::Full(update)) => {
+            let sender = sender.clone();
+            tokio::spawn(async move {
+                drop(sender.send(update).await);
+            });
+        }
+    }
 }
 
 async fn send_provider_slot_health(
@@ -1496,24 +1606,6 @@ async fn send_provider_slot_health(
         }))
         .await
         .map_err(|_error| YellowstoneGrpcError::QueueClosed)
-}
-
-fn register_yellowstone_slot_initial_health(
-    source: &ProviderSourceIdentity,
-    readiness: ProviderSourceReadiness,
-    sender: &ProviderStreamSender,
-) {
-    let sender = sender.clone();
-    let event = ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
-        source: source.clone(),
-        readiness,
-        status: ProviderSourceHealthStatus::Reconnecting,
-        reason: ProviderSourceHealthReason::InitialConnectPending,
-        message: "waiting for first yellowstone slot session ack".to_owned(),
-    });
-    tokio::spawn(async move {
-        drop(sender.send(event).await);
-    });
 }
 
 const fn yellowstone_health_reason(error: &YellowstoneGrpcError) -> ProviderSourceHealthReason {
@@ -1716,19 +1808,25 @@ impl ProviderStreamFanIn {
         &self,
         config: YellowstoneGrpcConfig,
     ) -> Result<JoinHandle<Result<(), YellowstoneGrpcError>>, YellowstoneGrpcError> {
-        let reserved_source = config.source_identity();
-        if let Some(source) = reserved_source.as_ref() {
-            self.reserve_source_identity(source.clone())?;
-        }
-        match spawn_yellowstone_grpc_source(config, self.sender()).await {
-            Ok(handle) => Ok(handle),
-            Err(error) => {
-                if let Some(source) = reserved_source.as_ref() {
-                    self.release_source_identity(source);
-                }
-                Err(error)
-            }
-        }
+        let reservation = match config.source_identity() {
+            Some(source) => Some(Arc::new(self.reserve_source_identity(source)?)),
+            None => None,
+        };
+        spawn_yellowstone_grpc_source_inner(config, self.sender(), reservation).await
+    }
+
+    #[deprecated(note = "use spawn_yellowstone_grpc_source")]
+    /// Deprecated compatibility shim for [`ProviderStreamFanIn::spawn_yellowstone_grpc_source`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same source-registration or startup error as
+    /// [`ProviderStreamFanIn::spawn_yellowstone_grpc_source`].
+    pub async fn spawn_yellowstone_grpc_transaction_source(
+        &self,
+        config: YellowstoneGrpcConfig,
+    ) -> Result<JoinHandle<Result<(), YellowstoneGrpcError>>, YellowstoneGrpcError> {
+        self.spawn_yellowstone_grpc_source(config).await
     }
 
     /// Spawns one Yellowstone gRPC slot source into this fan-in.
@@ -1740,19 +1838,11 @@ impl ProviderStreamFanIn {
         &self,
         config: YellowstoneGrpcSlotsConfig,
     ) -> Result<JoinHandle<Result<(), YellowstoneGrpcError>>, YellowstoneGrpcError> {
-        let reserved_source = config.source_identity();
-        if let Some(source) = reserved_source.as_ref() {
-            self.reserve_source_identity(source.clone())?;
-        }
-        match spawn_yellowstone_grpc_slot_source(config, self.sender()).await {
-            Ok(handle) => Ok(handle),
-            Err(error) => {
-                if let Some(source) = reserved_source.as_ref() {
-                    self.release_source_identity(source);
-                }
-                Err(error)
-            }
-        }
+        let reservation = match config.source_identity() {
+            Some(source) => Some(Arc::new(self.reserve_source_identity(source)?)),
+            None => None,
+        };
+        spawn_yellowstone_grpc_slot_source_inner(config, self.sender(), reservation).await
     }
 }
 

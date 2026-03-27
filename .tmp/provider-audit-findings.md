@@ -58,3 +58,9 @@ Follow-up findings after the readiness/readiness-class pass:
 - 2026-03-27 follow-up: fixed stale GitBook wording that still described built-in processed providers as transaction-first; clarified that built-ins now cover typed transaction, transaction-status, account, block-meta, log, and slot feeds where supported, while `ProviderStreamMode::Generic` remains the path for custom typed producers, multi-source fan-in, and richer control-plane feeds.
 
 - 2026-03-27 follow-up: built-in source registration still happened after first session bootstrap, fan-in still allowed duplicate full source identities, and built-in spawn API names remained transaction-only even though config-selected streams now include accounts, block-meta, transaction-status, logs, and slots.
+
+- 2026-03-28 follow-up: startup-failure ghost health still needed an explicit
+  source-lifecycle cleanup, fan-in reservations needed to stay owned until
+  source/task shutdown for both built-in and generic sender paths, and the old
+  public spawn names needed compatibility shims instead of a silent semver
+  break.

@@ -3,9 +3,8 @@
 //! Helius LaserStream adapters for SOF processed provider-stream ingress.
 //!
 //! LaserStream uses the Yellowstone-compatible gRPC subscription model. SOF's
-//! built-in adapter intentionally stays on the shared transaction subscription
-//! surface: commitment, signature, vote/failed flags, and account
-//! include/exclude/required filters.
+//! built-in adapter exposes transaction, transaction-status, account-update,
+//! block-meta, and slot feeds through the same typed provider-stream surface.
 
 use std::{
     collections::HashMap,
@@ -35,6 +34,7 @@ use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 use thiserror::Error;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 
 use crate::{
@@ -47,8 +47,8 @@ use crate::{
         ProviderCommitmentWatermarks, ProviderReplayMode, ProviderSourceHealthEvent,
         ProviderSourceHealthReason, ProviderSourceHealthStatus, ProviderSourceId,
         ProviderSourceIdentity, ProviderSourceIdentityRegistrationError, ProviderSourceReadiness,
-        ProviderStreamFanIn, ProviderStreamMode, ProviderStreamSender, ProviderStreamUpdate,
-        classify_provider_transaction_kind,
+        ProviderSourceReservation, ProviderStreamFanIn, ProviderStreamMode, ProviderStreamSender,
+        ProviderStreamUpdate, classify_provider_transaction_kind,
     },
 };
 
@@ -961,12 +961,50 @@ pub async fn spawn_laserstream_source(
     config: LaserStreamConfig,
     sender: ProviderStreamSender,
 ) -> Result<JoinHandle<Result<(), LaserStreamError>>, LaserStreamError> {
+    spawn_laserstream_source_inner(config, sender, None).await
+}
+
+#[deprecated(note = "use spawn_laserstream_source")]
+/// Deprecated compatibility shim for [`spawn_laserstream_source`].
+///
+/// # Errors
+///
+/// Returns the same startup validation or bootstrap error as
+/// [`spawn_laserstream_source`].
+pub async fn spawn_laserstream_transaction_source(
+    config: LaserStreamConfig,
+    sender: ProviderStreamSender,
+) -> Result<JoinHandle<Result<(), LaserStreamError>>, LaserStreamError> {
+    spawn_laserstream_source(config, sender).await
+}
+
+async fn spawn_laserstream_source_inner(
+    config: LaserStreamConfig,
+    sender: ProviderStreamSender,
+    reservation: Option<Arc<ProviderSourceReservation>>,
+) -> Result<JoinHandle<Result<(), LaserStreamError>>, LaserStreamError> {
     config.validate()?;
     let source = ProviderSourceIdentity::generated(config.source_id(), config.source_instance());
     register_laserstream_primary_initial_health(&source, config.readiness(), &sender);
     let first_session =
-        connect_and_subscribe_once(&config, config.subscribe_request_with_state(0)).await?;
+        match connect_and_subscribe_once(&config, config.subscribe_request_with_state(0)).await {
+            Ok(session) => session,
+            Err(error) => {
+                publish_laserstream_health_nonblocking(
+                    &sender,
+                    &ProviderSourceHealthEvent {
+                        source,
+                        readiness: config.readiness(),
+                        status: ProviderSourceHealthStatus::Removed,
+                        reason: laserstream_health_reason(&error),
+                        message: error.to_string(),
+                    },
+                );
+                return Err(error);
+            }
+        };
     Ok(tokio::spawn(async move {
+        let _reservation = reservation;
         let mut attempts = 0_u32;
         let mut tracked_slot = 0_u64;
         let mut watermarks = ProviderCommitmentWatermarks::default();
@@ -1090,14 +1128,40 @@ pub async fn spawn_laserstream_slot_source(
     config: LaserStreamSlotsConfig,
     sender: ProviderStreamSender,
 ) -> Result<JoinHandle<Result<(), LaserStreamError>>, LaserStreamError> {
+    spawn_laserstream_slot_source_inner(config, sender, None).await
+}
+
+async fn spawn_laserstream_slot_source_inner(
+    config: LaserStreamSlotsConfig,
+    sender: ProviderStreamSender,
+    reservation: Option<Arc<ProviderSourceReservation>>,
+) -> Result<JoinHandle<Result<(), LaserStreamError>>, LaserStreamError> {
     let source = ProviderSourceIdentity::generated(
         ProviderSourceId::LaserStreamSlots,
         config.source_instance(),
     );
     register_laserstream_slot_initial_health(&source, config.readiness(), &sender);
     let first_session =
-        connect_and_subscribe_slots_once(&config, config.subscribe_request_with_state(0)).await?;
+        match connect_and_subscribe_slots_once(&config, config.subscribe_request_with_state(0))
+            .await
+        {
+            Ok(session) => session,
+            Err(error) => {
+                publish_laserstream_slot_health_nonblocking(
+                    &sender,
+                    &ProviderSourceHealthEvent {
+                        source,
+                        readiness: config.readiness(),
+                        status: ProviderSourceHealthStatus::Removed,
+                        reason: laserstream_health_reason(&error),
+                        message: error.to_string(),
+                    },
+                );
+                return Err(error);
+            }
+        };
     Ok(tokio::spawn(async move {
+        let _reservation = reservation;
         let mut attempts = 0_u32;
         let mut tracked_slot = 0_u64;
         let mut watermarks = ProviderCommitmentWatermarks::default();
@@ -1453,20 +1517,34 @@ fn register_laserstream_primary_initial_health(
     readiness: ProviderSourceReadiness,
     sender: &ProviderStreamSender,
 ) {
-    let sender = sender.clone();
-    let event = ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
-        source: source.clone(),
-        readiness,
-        status: ProviderSourceHealthStatus::Reconnecting,
-        reason: ProviderSourceHealthReason::InitialConnectPending,
-        message: format!(
-            "waiting for first laserstream {} session ack",
-            source.kind_str().trim_start_matches("laserstream_")
-        ),
-    });
-    tokio::spawn(async move {
-        drop(sender.send(event).await);
-    });
+    publish_laserstream_health_nonblocking(
+        sender,
+        &ProviderSourceHealthEvent {
+            source: source.clone(),
+            readiness,
+            status: ProviderSourceHealthStatus::Reconnecting,
+            reason: ProviderSourceHealthReason::InitialConnectPending,
+            message: format!(
+                "waiting for first laserstream {} session ack",
+                source.kind_str().trim_start_matches("laserstream_")
+            ),
+        },
+    );
+}
+
+fn publish_laserstream_health_nonblocking(
+    sender: &ProviderStreamSender,
+    event: &ProviderSourceHealthEvent,
+) {
+    match sender.try_send(ProviderStreamUpdate::Health(event.clone())) {
+        Ok(()) | Err(TrySendError::Closed(_)) => {}
+        Err(TrySendError::Full(update)) => {
+            let sender = sender.clone();
+            tokio::spawn(async move {
+                drop(sender.send(update).await);
+            });
+        }
+    }
 }
 
 async fn send_provider_slot_health(
@@ -1494,17 +1572,31 @@ fn register_laserstream_slot_initial_health(
     readiness: ProviderSourceReadiness,
     sender: &ProviderStreamSender,
 ) {
-    let sender = sender.clone();
-    let event = ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
-        source: source.clone(),
-        readiness,
-        status: ProviderSourceHealthStatus::Reconnecting,
-        reason: ProviderSourceHealthReason::InitialConnectPending,
-        message: "waiting for first laserstream slot session ack".to_owned(),
-    });
-    tokio::spawn(async move {
-        drop(sender.send(event).await);
-    });
+    publish_laserstream_slot_health_nonblocking(
+        sender,
+        &ProviderSourceHealthEvent {
+            source: source.clone(),
+            readiness,
+            status: ProviderSourceHealthStatus::Reconnecting,
+            reason: ProviderSourceHealthReason::InitialConnectPending,
+            message: "waiting for first laserstream slot session ack".to_owned(),
+        },
+    );
+}
+
+fn publish_laserstream_slot_health_nonblocking(
+    sender: &ProviderStreamSender,
+    event: &ProviderSourceHealthEvent,
+) {
+    match sender.try_send(ProviderStreamUpdate::Health(event.clone())) {
+        Ok(()) | Err(TrySendError::Closed(_)) => {}
+        Err(TrySendError::Full(update)) => {
+            let sender = sender.clone();
+            tokio::spawn(async move {
+                drop(sender.send(update).await);
+            });
+        }
+    }
 }
 
 const fn laserstream_health_reason(error: &LaserStreamError) -> ProviderSourceHealthReason {
@@ -1918,19 +2010,25 @@ impl ProviderStreamFanIn {
         &self,
         config: LaserStreamConfig,
     ) -> Result<JoinHandle<Result<(), LaserStreamError>>, LaserStreamError> {
-        let reserved_source = config.source_identity();
-        if let Some(source) = reserved_source.as_ref() {
-            self.reserve_source_identity(source.clone())?;
-        }
-        match spawn_laserstream_source(config, self.sender()).await {
-            Ok(handle) => Ok(handle),
-            Err(error) => {
-                if let Some(source) = reserved_source.as_ref() {
-                    self.release_source_identity(source);
-                }
-                Err(error)
-            }
-        }
+        let reservation = match config.source_identity() {
+            Some(source) => Some(Arc::new(self.reserve_source_identity(source)?)),
+            None => None,
+        };
+        spawn_laserstream_source_inner(config, self.sender(), reservation).await
+    }
+
+    #[deprecated(note = "use spawn_laserstream_source")]
+    /// Deprecated compatibility shim for [`ProviderStreamFanIn::spawn_laserstream_source`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same source-registration or startup error as
+    /// [`ProviderStreamFanIn::spawn_laserstream_source`].
+    pub async fn spawn_laserstream_transaction_source(
+        &self,
+        config: LaserStreamConfig,
+    ) -> Result<JoinHandle<Result<(), LaserStreamError>>, LaserStreamError> {
+        self.spawn_laserstream_source(config).await
     }
 
     /// Spawns one LaserStream slot source into this fan-in.
@@ -1942,19 +2040,11 @@ impl ProviderStreamFanIn {
         &self,
         config: LaserStreamSlotsConfig,
     ) -> Result<JoinHandle<Result<(), LaserStreamError>>, LaserStreamError> {
-        let reserved_source = config.source_identity();
-        if let Some(source) = reserved_source.as_ref() {
-            self.reserve_source_identity(source.clone())?;
-        }
-        match spawn_laserstream_slot_source(config, self.sender()).await {
-            Ok(handle) => Ok(handle),
-            Err(error) => {
-                if let Some(source) = reserved_source.as_ref() {
-                    self.release_source_identity(source);
-                }
-                Err(error)
-            }
-        }
+        let reservation = match config.source_identity() {
+            Some(source) => Some(Arc::new(self.reserve_source_identity(source)?)),
+            None => None,
+        };
+        spawn_laserstream_slot_source_inner(config, self.sender(), reservation).await
     }
 }
 

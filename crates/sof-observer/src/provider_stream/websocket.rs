@@ -20,6 +20,7 @@ use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 use thiserror::Error;
 use tokio::net::TcpStream;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async, tungstenite::protocol::Message as WsMessage,
@@ -31,9 +32,9 @@ use crate::{
     provider_stream::{
         ProviderCommitmentWatermarks, ProviderSourceHealthEvent, ProviderSourceHealthReason,
         ProviderSourceHealthStatus, ProviderSourceId, ProviderSourceIdentity,
-        ProviderSourceIdentityRegistrationError, ProviderSourceReadiness, ProviderStreamFanIn,
-        ProviderStreamMode, ProviderStreamSender, ProviderStreamUpdate, SerializedTransactionEvent,
-        classify_provider_transaction_kind,
+        ProviderSourceIdentityRegistrationError, ProviderSourceReadiness,
+        ProviderSourceReservation, ProviderStreamFanIn, ProviderStreamMode, ProviderStreamSender,
+        ProviderStreamUpdate, SerializedTransactionEvent, classify_provider_transaction_kind,
     },
 };
 
@@ -882,12 +883,50 @@ pub async fn spawn_websocket_source(
     config: &WebsocketTransactionConfig,
     sender: ProviderStreamSender,
 ) -> Result<JoinHandle<Result<(), WebsocketTransactionError>>, WebsocketTransactionError> {
+    spawn_websocket_source_inner(config, sender, None).await
+}
+
+#[deprecated(note = "use spawn_websocket_source")]
+/// Deprecated compatibility shim for [`spawn_websocket_source`].
+///
+/// # Errors
+///
+/// Returns the same startup validation or bootstrap error as
+/// [`spawn_websocket_source`].
+pub async fn spawn_websocket_transaction_source(
+    config: &WebsocketTransactionConfig,
+    sender: ProviderStreamSender,
+) -> Result<JoinHandle<Result<(), WebsocketTransactionError>>, WebsocketTransactionError> {
+    spawn_websocket_source(config, sender).await
+}
+
+async fn spawn_websocket_source_inner(
+    config: &WebsocketTransactionConfig,
+    sender: ProviderStreamSender,
+    reservation: Option<Arc<ProviderSourceReservation>>,
+) -> Result<JoinHandle<Result<(), WebsocketTransactionError>>, WebsocketTransactionError> {
     config.validate()?;
     let config = config.clone();
     let source = ProviderSourceIdentity::generated(config.source_id(), config.source_instance());
     register_websocket_initial_health(&source, config.readiness(), &sender);
-    let first_session = establish_websocket_primary_session(&config).await?;
+    let first_session = match establish_websocket_primary_session(&config).await {
+        Ok(session) => session,
+        Err(error) => {
+            publish_websocket_health_nonblocking(
+                &sender,
+                &ProviderSourceHealthEvent {
+                    source,
+                    readiness: config.readiness(),
+                    status: ProviderSourceHealthStatus::Removed,
+                    reason: websocket_health_reason(&error),
+                    message: error.to_string(),
+                },
+            );
+            return Err(error);
+        }
+    };
     Ok(tokio::spawn(async move {
+        let _reservation = reservation;
         let mut attempts = 0_u32;
         let mut last_seen_slot = None;
         let mut watermarks = ProviderCommitmentWatermarks::default();
@@ -991,14 +1030,38 @@ pub async fn spawn_websocket_logs_source(
     config: &WebsocketLogsConfig,
     sender: ProviderStreamSender,
 ) -> Result<JoinHandle<Result<(), WebsocketLogsError>>, WebsocketLogsError> {
+    spawn_websocket_logs_source_inner(config, sender, None).await
+}
+
+async fn spawn_websocket_logs_source_inner(
+    config: &WebsocketLogsConfig,
+    sender: ProviderStreamSender,
+    reservation: Option<Arc<ProviderSourceReservation>>,
+) -> Result<JoinHandle<Result<(), WebsocketLogsError>>, WebsocketLogsError> {
     let config = config.clone();
     let source = ProviderSourceIdentity::generated(
         ProviderSourceId::WebsocketLogs,
         config.source_instance(),
     );
     register_websocket_logs_initial_health(&source, config.readiness(), &sender);
-    let first_session = establish_websocket_logs_session(&config).await?;
+    let first_session = match establish_websocket_logs_session(&config).await {
+        Ok(session) => session,
+        Err(error) => {
+            publish_websocket_logs_health_nonblocking(
+                &sender,
+                &ProviderSourceHealthEvent {
+                    source,
+                    readiness: config.readiness(),
+                    status: ProviderSourceHealthStatus::Removed,
+                    reason: websocket_logs_health_reason(&error),
+                    message: error.to_string(),
+                },
+            );
+            return Err(error);
+        }
+    };
     Ok(tokio::spawn(async move {
+        let _reservation = reservation;
         let mut attempts = 0_u32;
         let mut first_session = Some(first_session);
         loop {
@@ -1233,20 +1296,66 @@ fn register_websocket_initial_health(
     readiness: ProviderSourceReadiness,
     sender: &ProviderStreamSender,
 ) {
-    let sender = sender.clone();
-    let event = ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
-        source: source.clone(),
-        readiness,
-        status: ProviderSourceHealthStatus::Reconnecting,
-        reason: ProviderSourceHealthReason::InitialConnectPending,
-        message: format!(
-            "waiting for first websocket {} session ack",
-            source.kind_str().trim_start_matches("websocket_")
-        ),
-    });
-    tokio::spawn(async move {
-        drop(sender.send(event).await);
-    });
+    publish_websocket_health_nonblocking(
+        sender,
+        &ProviderSourceHealthEvent {
+            source: source.clone(),
+            readiness,
+            status: ProviderSourceHealthStatus::Reconnecting,
+            reason: ProviderSourceHealthReason::InitialConnectPending,
+            message: format!(
+                "waiting for first websocket {} session ack",
+                source.kind_str().trim_start_matches("websocket_")
+            ),
+        },
+    );
+}
+
+fn publish_websocket_health_nonblocking(
+    sender: &ProviderStreamSender,
+    event: &ProviderSourceHealthEvent,
+) {
+    match sender.try_send(ProviderStreamUpdate::Health(event.clone())) {
+        Ok(()) | Err(TrySendError::Closed(_)) => {}
+        Err(TrySendError::Full(update)) => {
+            let sender = sender.clone();
+            tokio::spawn(async move {
+                drop(sender.send(update).await);
+            });
+        }
+    }
+}
+
+fn register_websocket_logs_initial_health(
+    source: &ProviderSourceIdentity,
+    readiness: ProviderSourceReadiness,
+    sender: &ProviderStreamSender,
+) {
+    publish_websocket_logs_health_nonblocking(
+        sender,
+        &ProviderSourceHealthEvent {
+            source: source.clone(),
+            readiness,
+            status: ProviderSourceHealthStatus::Reconnecting,
+            reason: ProviderSourceHealthReason::InitialConnectPending,
+            message: "waiting for first websocket logs session ack".to_owned(),
+        },
+    );
+}
+
+fn publish_websocket_logs_health_nonblocking(
+    sender: &ProviderStreamSender,
+    event: &ProviderSourceHealthEvent,
+) {
+    match sender.try_send(ProviderStreamUpdate::Health(event.clone())) {
+        Ok(()) | Err(TrySendError::Closed(_)) => {}
+        Err(TrySendError::Full(update)) => {
+            let sender = sender.clone();
+            tokio::spawn(async move {
+                drop(sender.send(update).await);
+            });
+        }
+    }
 }
 
 async fn send_provider_logs_health(
@@ -1267,24 +1376,6 @@ async fn send_provider_logs_health(
         }))
         .await
         .map_err(|_error| WebsocketLogsError::QueueClosed)
-}
-
-fn register_websocket_logs_initial_health(
-    source: &ProviderSourceIdentity,
-    readiness: ProviderSourceReadiness,
-    sender: &ProviderStreamSender,
-) {
-    let sender = sender.clone();
-    let event = ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
-        source: source.clone(),
-        readiness,
-        status: ProviderSourceHealthStatus::Reconnecting,
-        reason: ProviderSourceHealthReason::InitialConnectPending,
-        message: "waiting for first websocket logs session ack".to_owned(),
-    });
-    tokio::spawn(async move {
-        drop(sender.send(event).await);
-    });
 }
 
 const fn websocket_health_reason(error: &WebsocketTransactionError) -> ProviderSourceHealthReason {
@@ -2226,19 +2317,25 @@ impl ProviderStreamFanIn {
         &self,
         config: &WebsocketTransactionConfig,
     ) -> Result<JoinHandle<Result<(), WebsocketTransactionError>>, WebsocketTransactionError> {
-        let reserved_source = config.source_identity();
-        if let Some(source) = reserved_source.as_ref() {
-            self.reserve_source_identity(source.clone())?;
-        }
-        match spawn_websocket_source(config, self.sender()).await {
-            Ok(handle) => Ok(handle),
-            Err(error) => {
-                if let Some(source) = reserved_source.as_ref() {
-                    self.release_source_identity(source);
-                }
-                Err(error)
-            }
-        }
+        let reservation = match config.source_identity() {
+            Some(source) => Some(Arc::new(self.reserve_source_identity(source)?)),
+            None => None,
+        };
+        spawn_websocket_source_inner(config, self.sender(), reservation).await
+    }
+
+    #[deprecated(note = "use spawn_websocket_source")]
+    /// Deprecated compatibility shim for [`ProviderStreamFanIn::spawn_websocket_source`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same source-registration or startup error as
+    /// [`ProviderStreamFanIn::spawn_websocket_source`].
+    pub async fn spawn_websocket_transaction_source(
+        &self,
+        config: &WebsocketTransactionConfig,
+    ) -> Result<JoinHandle<Result<(), WebsocketTransactionError>>, WebsocketTransactionError> {
+        self.spawn_websocket_source(config).await
     }
 
     /// Spawns one websocket `logsSubscribe` source into this fan-in.
@@ -2250,19 +2347,11 @@ impl ProviderStreamFanIn {
         &self,
         config: &WebsocketLogsConfig,
     ) -> Result<JoinHandle<Result<(), WebsocketLogsError>>, WebsocketLogsError> {
-        let reserved_source = config.source_identity();
-        if let Some(source) = reserved_source.as_ref() {
-            self.reserve_source_identity(source.clone())?;
-        }
-        match spawn_websocket_logs_source(config, self.sender()).await {
-            Ok(handle) => Ok(handle),
-            Err(error) => {
-                if let Some(source) = reserved_source.as_ref() {
-                    self.release_source_identity(source);
-                }
-                Err(error)
-            }
-        }
+        let reservation = match config.source_identity() {
+            Some(source) => Some(Arc::new(self.reserve_source_identity(source)?)),
+            None => None,
+        };
+        spawn_websocket_logs_source_inner(config, self.sender(), reservation).await
     }
 }
 
@@ -3584,12 +3673,34 @@ mod tests {
         let addr = listener.local_addr().expect("local addr");
         drop(listener);
 
-        let (tx, _rx) = create_provider_stream_queue(1);
+        let (tx, mut rx) = create_provider_stream_queue(4);
         let error =
             spawn_websocket_source(&WebsocketTransactionConfig::new(format!("ws://{addr}")), tx)
                 .await
                 .expect_err("dead endpoint should fail during preflight");
         assert!(error.to_string().contains("IO error") || error.to_string().contains("Connection"));
+
+        let first = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("first provider update timeout")
+            .expect("first provider update");
+        let ProviderStreamUpdate::Health(first) = first else {
+            panic!("expected initial health update");
+        };
+        assert_eq!(first.status, ProviderSourceHealthStatus::Reconnecting);
+        assert_eq!(
+            first.reason,
+            ProviderSourceHealthReason::InitialConnectPending
+        );
+
+        let second = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("second provider update timeout")
+            .expect("second provider update");
+        let ProviderStreamUpdate::Health(second) = second else {
+            panic!("expected removal health update");
+        };
+        assert_eq!(second.status, ProviderSourceHealthStatus::Removed);
     }
 
     #[tokio::test]

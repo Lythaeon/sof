@@ -64,7 +64,11 @@ impl RuntimeObservabilityHandle {
         let Ok(mut sources) = self.inner.provider_sources.write() else {
             return;
         };
-        sources.insert(event.source.clone(), event.clone());
+        if matches!(event.status, ProviderSourceHealthStatus::Removed) {
+            sources.remove(&event.source);
+        } else {
+            sources.insert(event.source.clone(), event.clone());
+        }
         let mut required_healthy = Vec::new();
         let mut optional_healthy = false;
         for source in sources.values() {
@@ -365,6 +369,7 @@ fn render_metrics(
                     ProviderSourceHealthStatus::Healthy => "healthy",
                     ProviderSourceHealthStatus::Reconnecting => "reconnecting",
                     ProviderSourceHealthStatus::Unhealthy => "unhealthy",
+                    ProviderSourceHealthStatus::Removed => "removed",
                 },
             ),
             ("reason", event.reason.as_str()),
@@ -2895,6 +2900,42 @@ mod tests {
         assert!(metrics.contains(
             "sof_provider_source_status{source_kind=\"yellowstone_grpc_slots\",source_instance=\"yellowstone-slots\",readiness=\"optional\",status=\"reconnecting\",reason=\"upstream_protocol_failure\"} 1"
         ));
+    }
+
+    #[test]
+    fn removed_provider_sources_are_pruned_from_readiness_and_metrics() {
+        let handle = RuntimeObservabilityHandle::default();
+        handle.mark_live();
+        let source = crate::provider_stream::ProviderSourceIdentity::new(
+            crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
+            "yellowstone-primary",
+        );
+        handle.observe_provider_source_health(&ProviderSourceHealthEvent {
+            source: source.clone(),
+            readiness: ProviderSourceReadiness::Required,
+            status: ProviderSourceHealthStatus::Reconnecting,
+            reason: crate::provider_stream::ProviderSourceHealthReason::InitialConnectPending,
+            message: "pending".to_owned(),
+        });
+        handle.observe_provider_source_health(&ProviderSourceHealthEvent {
+            source,
+            readiness: ProviderSourceReadiness::Required,
+            status: ProviderSourceHealthStatus::Removed,
+            reason: crate::provider_stream::ProviderSourceHealthReason::UpstreamTransportFailure,
+            message: "startup failed".to_owned(),
+        });
+
+        let metrics = render_metrics(
+            &handle,
+            &PluginHost::builder().build(),
+            &RuntimeExtensionHost::builder().build(),
+            &DerivedStateHost::builder().build(),
+        );
+
+        assert!(metrics.contains("sof_runtime_ready 0"));
+        assert!(metrics.contains("sof_provider_sources_reconnecting 0"));
+        assert!(metrics.contains("sof_provider_sources_unhealthy 0"));
+        assert!(!metrics.contains("yellowstone-primary"));
     }
 
     #[test]

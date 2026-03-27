@@ -147,6 +147,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -567,6 +568,8 @@ pub enum ProviderSourceHealthStatus {
     Reconnecting,
     /// Source exhausted recovery and is no longer healthy.
     Unhealthy,
+    /// Source registration was withdrawn and should be removed from tracking.
+    Removed,
 }
 
 /// Readiness class for one provider source observed by SOF.
@@ -636,6 +639,52 @@ pub type ProviderSourceRef = Arc<ProviderSourceIdentity>;
 #[error("provider fan-in already contains source identity {0}")]
 pub struct ProviderSourceIdentityRegistrationError(pub ProviderSourceIdentity);
 
+/// One reserved source identity held for the lifetime of one producer.
+#[derive(Debug)]
+pub(crate) struct ProviderSourceReservation {
+    /// Fan-in that owns the reserved identity set.
+    fan_in: ProviderStreamFanIn,
+    /// Stable source identity held until the reservation is dropped.
+    source: ProviderSourceIdentity,
+}
+
+impl Drop for ProviderSourceReservation {
+    fn drop(&mut self) {
+        self.fan_in.release_source_identity(&self.source);
+    }
+}
+
+/// One reserved provider source identity plus a sender bound to that reservation.
+#[derive(Clone, Debug)]
+pub struct ReservedProviderStreamSender {
+    /// Sender bound to one reserved source identity.
+    sender: ProviderStreamSender,
+    /// Reservation released automatically when the last handle is dropped.
+    reservation: Arc<ProviderSourceReservation>,
+}
+
+impl ReservedProviderStreamSender {
+    /// Returns the reserved provider source identity for this sender.
+    #[must_use]
+    pub fn source(&self) -> &ProviderSourceIdentity {
+        &self.reservation.source
+    }
+
+    /// Returns a cloned raw sender for APIs that require ownership of the sender value.
+    #[must_use]
+    pub fn sender(&self) -> ProviderStreamSender {
+        self.sender.clone()
+    }
+}
+
+impl Deref for ReservedProviderStreamSender {
+    type Target = ProviderStreamSender;
+
+    fn deref(&self) -> &Self::Target {
+        &self.sender
+    }
+}
+
 /// Helper for feeding one SOF provider queue from multiple provider sources.
 #[derive(Clone, Debug)]
 pub struct ProviderStreamFanIn {
@@ -646,7 +695,7 @@ pub struct ProviderStreamFanIn {
 }
 
 impl ProviderStreamFanIn {
-    /// Reserves one stable source identity and returns a sender for that source.
+    /// Reserves one stable source identity and returns a sender bound to that reservation.
     ///
     /// # Errors
     ///
@@ -655,9 +704,12 @@ impl ProviderStreamFanIn {
     pub fn sender_for_source(
         &self,
         source: ProviderSourceIdentity,
-    ) -> Result<ProviderStreamSender, ProviderSourceIdentityRegistrationError> {
-        self.reserve_source_identity(source)?;
-        Ok(self.sender.clone())
+    ) -> Result<ReservedProviderStreamSender, ProviderSourceIdentityRegistrationError> {
+        let reservation = self.reserve_source_identity(source)?;
+        Ok(ReservedProviderStreamSender {
+            sender: self.sender.clone(),
+            reservation: Arc::new(reservation),
+        })
     }
 
     /// Returns a cloned sender for built-in helper methods after identity checks.
@@ -671,18 +723,20 @@ impl ProviderStreamFanIn {
     pub(crate) fn reserve_source_identity(
         &self,
         source: ProviderSourceIdentity,
-    ) -> Result<(), ProviderSourceIdentityRegistrationError> {
+    ) -> Result<ProviderSourceReservation, ProviderSourceIdentityRegistrationError> {
         let Ok(mut identities) = self.identities.lock() else {
             return Err(ProviderSourceIdentityRegistrationError(source));
         };
         if !identities.insert(source.clone()) {
             return Err(ProviderSourceIdentityRegistrationError(source));
         }
-        Ok(())
+        Ok(ProviderSourceReservation {
+            fan_in: self.clone(),
+            source,
+        })
     }
 
     /// Releases one previously reserved stable source identity.
-    #[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
     pub(crate) fn release_source_identity(&self, source: &ProviderSourceIdentity) {
         if let Ok(mut identities) = self.identities.lock() {
             identities.remove(source);

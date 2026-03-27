@@ -1788,6 +1788,19 @@ struct ProviderStreamHealth {
 
 impl ProviderStreamHealth {
     fn observe(&mut self, event: &ProviderSourceHealthEvent) {
+        if matches!(event.status, ProviderSourceHealthStatus::Removed) {
+            let removed = self.sources.remove(&event.source);
+            if removed.is_some() {
+                tracing::info!(
+                    source_kind = event.source.kind_str(),
+                    source_instance = event.source.instance_str(),
+                    reason = event.reason.as_str(),
+                    message = event.message.as_str(),
+                    "provider source was removed from tracking"
+                );
+            }
+            return;
+        }
         let previous = self.sources.insert(event.source.clone(), event.clone());
         if previous.as_ref() == Some(event) {
             return;
@@ -1820,6 +1833,7 @@ impl ProviderStreamHealth {
                     "provider source is unhealthy"
                 );
             }
+            ProviderSourceHealthStatus::Removed => {}
         }
     }
 
