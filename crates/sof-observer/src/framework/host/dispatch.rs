@@ -46,6 +46,7 @@ fn debug_tx_trace_signature(event: &TransactionEvent) -> Option<Signature> {
     }
     event
         .signature
+        .map(sof_types::SignatureBytes::to_solana)
         .or_else(|| event.tx.signatures.first().copied())
 }
 
@@ -738,6 +739,7 @@ impl AcceptedTransactionDispatch {
         event.slot.hash(&mut hasher);
         if let Some(signature) = event
             .signature
+            .map(sof_types::SignatureBytes::to_solana)
             .or_else(|| event.tx.signatures.first().copied())
         {
             signature.hash(&mut hasher);

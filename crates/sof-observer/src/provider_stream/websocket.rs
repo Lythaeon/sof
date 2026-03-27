@@ -25,7 +25,7 @@ use tokio_tungstenite::{
 
 use crate::{
     event::TxCommitmentStatus,
-    framework::TransactionEvent,
+    framework::{TransactionEvent, signature_bytes, signature_bytes_opt},
     provider_stream::{
         ProviderCommitmentWatermarks, ProviderSourceHealthEvent, ProviderSourceHealthReason,
         ProviderSourceHealthStatus, ProviderSourceId, ProviderStreamSender, ProviderStreamUpdate,
@@ -667,7 +667,7 @@ fn parse_transaction_notification(
         commitment_status: commitment_status.as_tx_commitment(),
         confirmed_slot: watermarks.confirmed_slot,
         finalized_slot: watermarks.finalized_slot,
-        signature,
+        signature: signature_bytes_opt(signature),
         bytes: tx_payload,
     }))
 }
@@ -711,7 +711,7 @@ fn materialize_transaction_baseline(
         commitment_status: commitment_status.as_tx_commitment(),
         confirmed_slot: None,
         finalized_slot: None,
-        signature,
+        signature: signature_bytes_opt(signature),
         kind: classify_provider_transaction_kind(&tx),
         tx: Arc::new(tx),
     }))
@@ -791,7 +791,7 @@ async fn replay_websocket_gap(
                     commitment_status: config.commitment.as_tx_commitment(),
                     confirmed_slot: watermarks.confirmed_slot,
                     finalized_slot: watermarks.finalized_slot,
-                    signature: tx.signatures.first().copied(),
+                    signature: signature_bytes_opt(tx.signatures.first().copied()),
                     kind,
                     tx: Arc::new(tx),
                 }))

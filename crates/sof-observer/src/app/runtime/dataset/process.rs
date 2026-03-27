@@ -6,8 +6,10 @@ use crate::framework::SerializedTransactionRange;
 use crate::framework::TransactionBatchEvent;
 use crate::framework::TransactionEvent;
 use crate::framework::TransactionViewBatchEvent;
+use crate::framework::arc_pubkey_bytes;
 use crate::framework::events::TransactionEventRef;
 use crate::framework::host::TransactionDispatchScope;
+use crate::framework::{signature_bytes, signature_bytes_opt};
 use agave_transaction_view::transaction_view::SanitizedTransactionView;
 use core::mem::size_of;
 use solana_hash::Hash;
@@ -729,7 +731,7 @@ fn process_completed_dataset_from_views(
         if emit_detailed_tx_events {
             let event = TxObservedEvent::Detailed {
                 slot,
-                signature: view.signatures().first().copied().unwrap_or_default(),
+                signature: signature_bytes(view.signatures().first().copied().unwrap_or_default()),
                 kind,
                 commitment_status,
             };
@@ -895,7 +897,7 @@ fn process_decoded_transaction(
         commitment_status: config.commitment_status,
         confirmed_slot: config.confirmed_slot,
         finalized_slot: config.finalized_slot,
-        signature,
+        signature: signature_bytes_opt(signature),
         account_keys: static_account_keys,
         lookup_table_account_key_count: lookup_table_account_key_count(tx_ref),
     };
@@ -915,7 +917,7 @@ fn process_decoded_transaction(
                 partition_static_account_keys(tx_ref)
             } else {
                 (
-                    Arc::from(static_account_keys),
+                    arc_pubkey_bytes(static_account_keys.iter().copied()),
                     empty_pubkey_vec(),
                     empty_pubkey_vec(),
                 )
@@ -925,7 +927,7 @@ fn process_decoded_transaction(
             commitment_status: config.commitment_status,
             confirmed_slot: config.confirmed_slot,
             finalized_slot: config.finalized_slot,
-            signature,
+            signature: signature_bytes_opt(signature),
             account_keys: static_account_keys,
             writable_account_keys,
             readonly_account_keys,
@@ -940,7 +942,7 @@ fn process_decoded_transaction(
         commitment_status: config.commitment_status,
         confirmed_slot: config.confirmed_slot,
         finalized_slot: config.finalized_slot,
-        signature,
+        signature: signature_bytes_opt(signature),
         tx: tx_ref,
         kind,
     };
@@ -965,7 +967,7 @@ fn process_decoded_transaction(
                     commitment_status: config.commitment_status,
                     confirmed_slot: config.confirmed_slot,
                     finalized_slot: config.finalized_slot,
-                    signature,
+                    signature: signature_bytes_opt(signature),
                     tx: Arc::new(match tx {
                         std::borrow::Cow::Borrowed(tx) => tx.clone(),
                         std::borrow::Cow::Owned(tx) => tx,
@@ -1067,7 +1069,7 @@ fn emit_detailed_tx_observed_event(
     }
     let event = TxObservedEvent::Detailed {
         slot,
-        signature,
+        signature: signature_bytes(signature),
         kind,
         commitment_status,
     };
@@ -1198,7 +1200,7 @@ fn process_completed_dataset_with_prefiltered_transactions(
                 commitment_status,
                 confirmed_slot,
                 finalized_slot,
-                signature,
+                signature: signature_bytes_opt(signature),
                 tx: Arc::new(tx),
                 kind,
             },
@@ -1278,7 +1280,11 @@ fn process_completed_dataset_with_prefiltered_transactions(
     Some(DatasetProcessOutcome::Decoded)
 }
 
-type PartitionedStaticAccountKeys = (Arc<[Pubkey]>, Arc<[Pubkey]>, Arc<[Pubkey]>);
+type PartitionedStaticAccountKeys = (
+    Arc<[crate::framework::PubkeyBytes]>,
+    Arc<[crate::framework::PubkeyBytes]>,
+    Arc<[crate::framework::PubkeyBytes]>,
+);
 
 fn partition_static_account_keys(tx: &VersionedTransaction) -> PartitionedStaticAccountKeys {
     let static_account_keys = tx.message.static_account_keys();
@@ -1292,14 +1298,15 @@ fn partition_static_account_keys(tx: &VersionedTransaction) -> PartitionedStatic
         }
     }
     (
-        Arc::from(static_account_keys),
-        Arc::from(writable_account_keys),
-        Arc::from(readonly_account_keys),
+        arc_pubkey_bytes(static_account_keys.iter().copied()),
+        arc_pubkey_bytes(writable_account_keys),
+        arc_pubkey_bytes(readonly_account_keys),
     )
 }
 
-fn empty_pubkey_vec() -> Arc<[Pubkey]> {
-    static EMPTY: std::sync::OnceLock<Arc<[Pubkey]>> = std::sync::OnceLock::new();
+fn empty_pubkey_vec() -> Arc<[crate::framework::PubkeyBytes]> {
+    static EMPTY: std::sync::OnceLock<Arc<[crate::framework::PubkeyBytes]>> =
+        std::sync::OnceLock::new();
     Arc::clone(EMPTY.get_or_init(|| Arc::from([])))
 }
 
@@ -1309,19 +1316,14 @@ fn lookup_table_account_key_count(tx: &VersionedTransaction) -> usize {
         .map_or(0, |lookups| lookups.len())
 }
 
-fn lookup_table_account_keys(tx: &VersionedTransaction) -> Arc<[Pubkey]> {
+fn lookup_table_account_keys(tx: &VersionedTransaction) -> Arc<[crate::framework::PubkeyBytes]> {
     let Some(lookups) = tx.message.address_table_lookups() else {
         return empty_pubkey_vec();
     };
     if lookups.is_empty() {
         return empty_pubkey_vec();
     }
-    Arc::from(
-        lookups
-            .iter()
-            .map(|lookup| lookup.account_key)
-            .collect::<Vec<_>>(),
-    )
+    arc_pubkey_bytes(lookups.iter().map(|lookup| lookup.account_key))
 }
 
 fn decode_entries_from_payload_fragments(
@@ -2632,7 +2634,9 @@ mod tests {
             active_entrypoint: Some("synthetic".to_owned()),
             total_nodes: 1,
             added_nodes: vec![ClusterNodeInfo {
-                pubkey: Pubkey::new_from_array([3_u8; 32]),
+                pubkey: crate::framework::PubkeyBytes::from_solana(Pubkey::new_from_array(
+                    [3_u8; 32],
+                )),
                 wallclock: slot,
                 shred_version: 1,
                 gossip: Some(SocketAddr::V4(SocketAddrV4::new(
@@ -2666,7 +2670,9 @@ mod tests {
             epoch: Some(0),
             added_leaders: vec![LeaderScheduleEntry {
                 slot,
-                leader: Pubkey::new_from_array([5_u8; 32]),
+                leader: crate::framework::PubkeyBytes::from_solana(Pubkey::new_from_array(
+                    [5_u8; 32],
+                )),
             }],
             removed_slots: Vec::new(),
             updated_leaders: Vec::new(),

@@ -3,8 +3,8 @@ use std::{net::SocketAddr, sync::Arc};
 use agave_transaction_view::transaction_view::SanitizedTransactionView;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use sof_types::{PubkeyBytes, SignatureBytes};
 use solana_pubkey::Pubkey;
-use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 
 use crate::{
@@ -73,7 +73,7 @@ pub struct TransactionEvent {
     /// Latest observed finalized slot watermark when event was emitted.
     pub finalized_slot: Option<u64>,
     /// Transaction signature if present.
-    pub signature: Option<Signature>,
+    pub signature: Option<SignatureBytes>,
     /// Decoded Solana transaction object.
     pub tx: Arc<VersionedTransaction>,
     /// SOF transaction kind classification.
@@ -91,7 +91,7 @@ pub struct TransactionEvent {
 /// ```rust
 /// use sof::framework::TransactionLogEvent;
 ///
-/// fn signature(event: &TransactionLogEvent) -> solana_signature::Signature {
+/// fn signature(event: &TransactionLogEvent) -> sof::SignatureBytes {
 ///     event.signature
 /// }
 /// ```
@@ -101,13 +101,13 @@ pub struct TransactionLogEvent {
     /// Commitment status configured for the upstream websocket subscription.
     pub commitment_status: TxCommitmentStatus,
     /// Transaction signature carried by the log notification.
-    pub signature: Signature,
+    pub signature: SignatureBytes,
     /// Transaction error payload when the upstream feed included one.
     pub err: Option<JsonValue>,
     /// Program/runtime log lines attached to the transaction.
     pub logs: Arc<[String]>,
     /// Matching pubkey for one `mentions`-style subscription when present.
-    pub matched_filter: Option<Pubkey>,
+    pub matched_filter: Option<PubkeyBytes>,
 }
 
 #[derive(Debug, Clone)]
@@ -293,7 +293,7 @@ pub struct TransactionEventRef<'event> {
     /// Latest observed finalized slot watermark when event was emitted.
     pub finalized_slot: Option<u64>,
     /// Transaction signature if present.
-    pub signature: Option<Signature>,
+    pub signature: Option<SignatureBytes>,
     /// Borrowed decoded Solana transaction object.
     pub tx: &'event VersionedTransaction,
     /// SOF transaction kind classification.
@@ -328,15 +328,15 @@ pub struct AccountTouchEvent {
     /// Latest observed finalized slot watermark when event was emitted.
     pub finalized_slot: Option<u64>,
     /// Transaction signature if present.
-    pub signature: Option<Signature>,
+    pub signature: Option<SignatureBytes>,
     /// All static message account keys present on the transaction.
-    pub account_keys: Arc<[Pubkey]>,
+    pub account_keys: Arc<[PubkeyBytes]>,
     /// Writable static message account keys inferred from the versioned message header.
-    pub writable_account_keys: Arc<[Pubkey]>,
+    pub writable_account_keys: Arc<[PubkeyBytes]>,
     /// Read-only static message account keys inferred from the versioned message header.
-    pub readonly_account_keys: Arc<[Pubkey]>,
+    pub readonly_account_keys: Arc<[PubkeyBytes]>,
     /// Lookup table account pubkeys referenced by the message itself.
-    pub lookup_table_account_keys: Arc<[Pubkey]>,
+    pub lookup_table_account_keys: Arc<[PubkeyBytes]>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -351,7 +351,7 @@ pub struct AccountTouchEventRef<'event> {
     /// Latest observed finalized slot watermark when event was emitted.
     pub finalized_slot: Option<u64>,
     /// Transaction signature if present.
-    pub signature: Option<Signature>,
+    pub signature: Option<SignatureBytes>,
     /// Borrowed static message account keys present on the transaction.
     pub account_keys: &'event [Pubkey],
     /// Count of lookup-table account pubkeys referenced by the message itself.
@@ -420,7 +420,7 @@ pub enum ControlPlaneSource {
 /// One known cluster node and its key advertised endpoints.
 pub struct ClusterNodeInfo {
     /// Node identity.
-    pub pubkey: Pubkey,
+    pub pubkey: PubkeyBytes,
     /// Node wallclock from gossip contact info.
     pub wallclock: u64,
     /// Node shred version.
@@ -459,7 +459,7 @@ pub struct ClusterTopologyEvent {
     /// Newly discovered nodes since previous event.
     pub added_nodes: Vec<ClusterNodeInfo>,
     /// Removed node identities since previous event.
-    pub removed_pubkeys: Vec<Pubkey>,
+    pub removed_pubkeys: Vec<PubkeyBytes>,
     /// Existing nodes whose metadata/endpoints changed.
     pub updated_nodes: Vec<ClusterNodeInfo>,
     /// Periodic full snapshot of all currently known nodes.
@@ -474,7 +474,7 @@ pub struct LeaderScheduleEntry {
     /// Slot number.
     pub slot: u64,
     /// Leader identity.
-    pub leader: Pubkey,
+    pub leader: PubkeyBytes,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -496,4 +496,42 @@ pub struct LeaderScheduleEvent {
     ///
     /// Often empty for diff-only/event-driven updates.
     pub snapshot_leaders: Vec<LeaderScheduleEntry>,
+}
+
+/// Converts one Solana signature into the public SOF-owned wrapper.
+#[must_use]
+pub(crate) fn signature_bytes(value: solana_signature::Signature) -> SignatureBytes {
+    SignatureBytes::from_solana(value)
+}
+
+/// Converts one optional Solana signature into the public SOF-owned wrapper.
+#[must_use]
+pub(crate) fn signature_bytes_opt(
+    value: Option<solana_signature::Signature>,
+) -> Option<SignatureBytes> {
+    value.map(SignatureBytes::from_solana)
+}
+
+/// Converts one Solana pubkey into the public SOF-owned wrapper.
+#[must_use]
+pub(crate) fn pubkey_bytes(value: solana_pubkey::Pubkey) -> PubkeyBytes {
+    PubkeyBytes::from_solana(value)
+}
+
+/// Converts one iterator of Solana pubkeys into the public SOF-owned wrapper vector.
+#[must_use]
+pub(crate) fn collect_pubkey_bytes<I>(iter: I) -> Vec<PubkeyBytes>
+where
+    I: IntoIterator<Item = solana_pubkey::Pubkey>,
+{
+    iter.into_iter().map(PubkeyBytes::from_solana).collect()
+}
+
+/// Converts one iterator of Solana pubkeys into the public SOF-owned wrapper arc slice.
+#[must_use]
+pub(crate) fn arc_pubkey_bytes<I>(iter: I) -> Arc<[PubkeyBytes]>
+where
+    I: IntoIterator<Item = solana_pubkey::Pubkey>,
+{
+    Arc::from(collect_pubkey_bytes(iter))
 }

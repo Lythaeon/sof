@@ -113,3 +113,17 @@ impl SignatureBytes {
         solana_signature::Signature::from(self.into_array())
     }
 }
+
+#[cfg(feature = "solana-compat")]
+impl From<solana_signature::Signature> for SignatureBytes {
+    fn from(value: solana_signature::Signature) -> Self {
+        Self::from_solana(value)
+    }
+}
+
+#[cfg(feature = "solana-compat")]
+impl From<SignatureBytes> for solana_signature::Signature {
+    fn from(value: SignatureBytes) -> Self {
+        value.to_solana()
+    }
+}

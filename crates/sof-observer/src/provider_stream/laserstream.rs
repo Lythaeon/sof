@@ -37,7 +37,7 @@ use tokio::task::JoinHandle;
 
 use crate::{
     event::{TxCommitmentStatus, TxKind},
-    framework::TransactionEvent,
+    framework::{TransactionEvent, signature_bytes_opt},
     provider_stream::{
         ProviderCommitmentWatermarks, ProviderReplayMode, ProviderSourceHealthEvent,
         ProviderSourceHealthReason, ProviderSourceHealthStatus, ProviderSourceId,
@@ -751,7 +751,7 @@ fn transaction_event_from_update(
         commitment_status,
         confirmed_slot: watermarks.confirmed_slot,
         finalized_slot: watermarks.finalized_slot,
-        signature,
+        signature: signature_bytes_opt(signature),
         kind: if is_vote {
             TxKind::VoteOnly
         } else {

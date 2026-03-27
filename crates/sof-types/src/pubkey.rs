@@ -91,3 +91,17 @@ impl PubkeyBytes {
         solana_pubkey::Pubkey::new_from_array(self.into_array())
     }
 }
+
+#[cfg(feature = "solana-compat")]
+impl From<solana_pubkey::Pubkey> for PubkeyBytes {
+    fn from(value: solana_pubkey::Pubkey) -> Self {
+        Self::from_solana(value)
+    }
+}
+
+#[cfg(feature = "solana-compat")]
+impl From<PubkeyBytes> for solana_pubkey::Pubkey {
+    fn from(value: PubkeyBytes) -> Self {
+        value.to_solana()
+    }
+}

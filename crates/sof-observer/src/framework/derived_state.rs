@@ -26,8 +26,7 @@ use crossbeam_channel as channel;
 use crossbeam_queue::ArrayQueue;
 use crossbeam_skiplist::SkipMap;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use solana_pubkey::Pubkey;
-use solana_signature::Signature;
+use sof_types::{PubkeyBytes, SignatureBytes};
 use solana_transaction::versioned::VersionedTransaction;
 use thiserror::Error;
 
@@ -385,7 +384,7 @@ pub enum DerivedStateTxOutcomeKind {
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DerivedStateTxOutcomeEvent {
     /// Transaction signature when known.
-    pub signature: Option<Signature>,
+    pub signature: Option<SignatureBytes>,
     /// Outcome classification.
     pub kind: DerivedStateTxOutcomeKind,
     /// Decision-state version used by the service when known.
@@ -404,7 +403,7 @@ pub struct TransactionAppliedEvent {
     /// Transaction position within the canonical derived-state stream for the slot.
     pub tx_index: u32,
     /// Transaction signature when present.
-    pub signature: Option<Signature>,
+    pub signature: Option<SignatureBytes>,
     /// Transaction kind classification.
     pub kind: TxKind,
     /// Decoded versioned transaction payload.
@@ -485,15 +484,15 @@ pub struct AccountTouchObservedEvent {
     /// Transaction position within the canonical derived-state stream for the slot.
     pub tx_index: u32,
     /// Transaction signature when present.
-    pub signature: Option<Signature>,
+    pub signature: Option<SignatureBytes>,
     /// All static message account keys touched by the transaction.
-    pub account_keys: Arc<[Pubkey]>,
+    pub account_keys: Arc<[PubkeyBytes]>,
     /// Writable static account keys touched by the transaction.
-    pub writable_account_keys: Arc<[Pubkey]>,
+    pub writable_account_keys: Arc<[PubkeyBytes]>,
     /// Read-only static account keys touched by the transaction.
-    pub readonly_account_keys: Arc<[Pubkey]>,
+    pub readonly_account_keys: Arc<[PubkeyBytes]>,
     /// Lookup-table account keys referenced by the transaction.
-    pub lookup_table_account_keys: Arc<[Pubkey]>,
+    pub lookup_table_account_keys: Arc<[PubkeyBytes]>,
 }
 
 impl From<(u32, AccountTouchEvent)> for AccountTouchObservedEvent {

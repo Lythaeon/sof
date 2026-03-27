@@ -10,7 +10,9 @@ use super::*;
 #[cfg(feature = "gossip-bootstrap")]
 use crate::app::runtime::bootstrap::gossip::GossipEntrypointBias;
 use crate::framework::host::TransactionDispatchScope;
-use crate::framework::{SerializedTransactionRange, TransactionEvent, events::TransactionEventRef};
+use crate::framework::{
+    SerializedTransactionRange, TransactionEvent, events::TransactionEventRef, signature_bytes_opt,
+};
 use crate::reassembly::dataset::CompletedDataSet;
 use crate::reassembly::inline::InlineContiguousDataSetSink;
 use crate::relay::CacheInsertOutcome;
@@ -4516,7 +4518,7 @@ impl PacketWorkerResultContext<'_> {
                                         commitment_status,
                                         confirmed_slot: commitment_snapshot.confirmed_slot,
                                         finalized_slot: commitment_snapshot.finalized_slot,
-                                        signature,
+                                        signature: signature_bytes_opt(signature),
                                         tx: &tx,
                                         kind,
                                     },
@@ -4558,7 +4560,7 @@ impl PacketWorkerResultContext<'_> {
                         commitment_status,
                         confirmed_slot: commitment_snapshot.confirmed_slot,
                         finalized_slot: commitment_snapshot.finalized_slot,
-                        signature: prepared_tx.signature,
+                        signature: signature_bytes_opt(prepared_tx.signature),
                         tx: prepared_tx.tx,
                         kind: prepared_tx.kind,
                     },
@@ -5358,7 +5360,8 @@ mod tests {
                                 commitment_status,
                                 confirmed_slot: commitment_snapshot.confirmed_slot,
                                 finalized_slot: commitment_snapshot.finalized_slot,
-                                signature,
+                                signature: signature
+                                    .map(crate::framework::SignatureBytes::from_solana),
                                 tx: &tx,
                                 kind,
                             },
@@ -5381,7 +5384,7 @@ mod tests {
                             commitment_status,
                             confirmed_slot: commitment_snapshot.confirmed_slot,
                             finalized_slot: commitment_snapshot.finalized_slot,
-                            signature,
+                            signature: signature.map(crate::framework::SignatureBytes::from_solana),
                             tx: Arc::new(tx),
                             kind,
                         },
@@ -5529,7 +5532,8 @@ mod tests {
                                 commitment_status,
                                 confirmed_slot: commitment_snapshot.confirmed_slot,
                                 finalized_slot: commitment_snapshot.finalized_slot,
-                                signature,
+                                signature: signature
+                                    .map(crate::framework::SignatureBytes::from_solana),
                                 tx: &tx,
                                 kind,
                             },
