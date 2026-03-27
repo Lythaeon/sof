@@ -12,7 +12,8 @@ One note matters across every comparison on this page:
 SOF is only earlier when its ingress is earlier.
 
 It removes local runtime and API-boundary overhead. It does not win the upstream visibility race by
-itself.
+itself. For the ingress/latency model behind that statement, use
+[Before You Start](../getting-started/before-you-start.md).
 
 ## Quick Comparison
 
@@ -59,14 +60,9 @@ Managed providers are a strong fit when the main goal is to consume a stream qui
 SOF is a stronger fit when the goal is to own the runtime boundary, filtering logic, and
 downstream product surface.
 
-If the main requirement is lowest latency, managed providers are not the only alternative. The
-strongest practical setups are often:
-
-- private raw shred distribution
-- direct validator-adjacent ingress
-- validator-adjacent processed feeds
-
-SOF can sit behind those too. Public gossip is not the benchmark to beat there.
+If the main requirement is lowest latency, managed providers are not the only alternative. SOF can
+also sit behind private raw distribution, validator-adjacent ingress, or validator-adjacent
+processed feeds. Public gossip is not the benchmark to beat there.
 
 ## SOF vs Self-Operated Validator With Geyser
 

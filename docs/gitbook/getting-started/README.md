@@ -10,10 +10,10 @@ Keep the product model simple:
 
 The other thing to get clear early:
 
-- public gossip is not the default "fast path"
-- private raw feeds, direct validator-adjacent ingress, and physical proximity usually win on
-  latency
+- ingress determines how early your host sees traffic
 - SOF is useful because it gives you one reusable runtime across those ingress choices
+
+Use [Before You Start](before-you-start.md) for the full latency and trust model.
 
 ## Recommended Reading Order
 

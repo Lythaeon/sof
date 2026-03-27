@@ -2,10 +2,8 @@
 
 Choose deployment mode by ingress and trust posture, not by slogans.
 
-The point of SOF is to let downstream teams reuse one runtime foundation instead of rebuilding
-provider handling, packet handling, replay, dedupe, health, and plugin surfaces per application.
-
-That does not mean every mode is equally early.
+This page is the operator-facing mode matrix. For the newcomer mental model behind it, use
+[Before You Start](../getting-started/before-you-start.md).
 
 ## Runtime Modes
 
@@ -93,6 +91,9 @@ Important behavior:
 - built-in processed providers are transaction-first
 - `ProviderStreamMode::Generic` is the flexible mode for custom producers that need richer updates
 - provider durability and replay behavior depend on the specific upstream
+
+Use [Integration Model](../architecture/integration-model.md) if you need the semantic boundary
+between built-in processed providers and `ProviderStreamMode::Generic`.
 
 ## Recommended Starting Point
 
