@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-crates=("sof-gossip-tuning" "sof-solana-gossip" "sof" "sof-tx")
+crates=("sof-types" "sof-gossip-tuning" "sof-solana-gossip" "sof" "sof-tx" "sof-solana-compat")
 package_dir="target/package"
 verify_root="$(mktemp -d)"
 cargo_home_root="$(mktemp -d)"
@@ -10,9 +10,12 @@ trap 'rm -rf "${verify_root}" "${cargo_home_root}" "${verify_cargo_home}"' EXIT
 
 cat > "${cargo_home_root}/config.toml" <<EOF
 [patch.crates-io]
+sof-types = { path = "$(pwd)/crates/sof-types" }
 sof-gossip-tuning = { path = "$(pwd)/crates/sof-gossip-tuning" }
 sof-solana-gossip = { path = "$(pwd)/crates/sof-solana-gossip" }
 sof = { path = "$(pwd)/crates/sof-observer" }
+sof-tx = { path = "$(pwd)/crates/sof-tx" }
+sof-solana-compat = { path = "$(pwd)/crates/sof-solana-compat" }
 EOF
 
 export CARGO_HOME="${cargo_home_root}"
@@ -29,6 +32,9 @@ package_crate() {
   local crate="$1"
   local verify_flag="$2"
   local allow_dirty_flag=()
+  local version
+  version="$(version_for "${crate}")"
+  rm -f "${package_dir}/${crate}-${version}.crate"
   if [[ "${VERIFY_ARCHIVES_ALLOW_DIRTY:-0}" == "1" ]]; then
     allow_dirty_flag=(--allow-dirty)
   elif [[ "${crate}" == "sof-solana-gossip" ]]; then
@@ -54,33 +60,42 @@ extract_crate() {
   tar -xzf "${archive}" -C "${verify_root}"
 }
 
+package_crate "sof-types" ""
 package_crate "sof-gossip-tuning" ""
 package_crate "sof-solana-gossip" "--no-verify"
 package_crate "sof" "--no-verify"
 package_crate "sof-tx" "--no-verify"
+package_crate "sof-solana-compat" "--no-verify"
 
 for crate in "${crates[@]}"; do
   extract_crate "${crate}"
 done
 
+sof_types_version="$(version_for "sof-types")"
 sof_gossip_tuning_version="$(version_for "sof-gossip-tuning")"
 sof_solana_gossip_version="$(version_for "sof-solana-gossip")"
 sof_version="$(version_for "sof")"
 sof_tx_version="$(version_for "sof-tx")"
+sof_solana_compat_version="$(version_for "sof-solana-compat")"
 
 cat > "${verify_root}/Cargo.toml" <<EOF
 [workspace]
 resolver = "3"
 members = [
+  "sof-types-${sof_types_version}",
   "sof-gossip-tuning-${sof_gossip_tuning_version}",
   "sof-${sof_version}",
   "sof-tx-${sof_tx_version}",
+  "sof-solana-compat-${sof_solana_compat_version}",
 ]
 
 [patch.crates-io]
+sof-types = { path = "sof-types-${sof_types_version}" }
 sof-gossip-tuning = { path = "sof-gossip-tuning-${sof_gossip_tuning_version}" }
 sof-solana-gossip = { path = "sof-solana-gossip-${sof_solana_gossip_version}" }
 sof = { path = "sof-${sof_version}" }
+sof-tx = { path = "sof-tx-${sof_tx_version}" }
+sof-solana-compat = { path = "sof-solana-compat-${sof_solana_compat_version}" }
 EOF
 
 echo "== verifying packaged workspace =="
