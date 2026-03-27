@@ -48,5 +48,4 @@ tonic = { version = "0.12", optional = true, default-features = false, features 
 arcshift = "0.4.2"
 
 [dev-dependencies]
-sof-solana-compat = { version = "0.13.1", path = "../sof-solana-compat" }
 xdp = "0.7.3"
