@@ -20,7 +20,8 @@ use crate::{
         DerivedStateConsumerRecoveryState, DerivedStateHost, PluginHost, RuntimeExtensionHost,
     },
     provider_stream::{
-        ProviderSourceHealthEvent, ProviderSourceHealthStatus, ProviderSourceIdentity,
+        ProviderSourceHealthEvent, ProviderSourceHealthStatus, ProviderSourceId,
+        ProviderSourceIdentity,
     },
     runtime_metrics,
 };
@@ -64,10 +65,15 @@ impl RuntimeObservabilityHandle {
             return;
         };
         sources.insert(event.source.clone(), event.clone());
-        let all_healthy = sources
-            .values()
-            .all(|source| matches!(source.status, ProviderSourceHealthStatus::Healthy));
-        self.inner.ready.store(all_healthy, Ordering::Relaxed);
+        let mut health_by_kind = HashMap::<ProviderSourceId, bool>::new();
+        for source in sources.values() {
+            let has_healthy = health_by_kind
+                .entry(source.source.kind.clone())
+                .or_insert(false);
+            *has_healthy |= matches!(source.status, ProviderSourceHealthStatus::Healthy);
+        }
+        let ready = !health_by_kind.is_empty() && health_by_kind.values().all(|healthy| *healthy);
+        self.inner.ready.store(ready, Ordering::Relaxed);
     }
 
     pub(crate) fn observe_provider_capability_warning(
@@ -2804,6 +2810,40 @@ mod tests {
         assert!(metrics.contains(
             "sof_provider_source_status{source_kind=\"laserstream\",source_instance=\"shared-source\",status=\"unhealthy\",reason=\"upstream_stream_closed_unexpectedly\"} 1"
         ));
+    }
+
+    #[test]
+    fn readiness_groups_redundant_sources_by_kind() {
+        let handle = RuntimeObservabilityHandle::default();
+        handle.mark_live();
+        handle.observe_provider_source_health(&ProviderSourceHealthEvent {
+            source: crate::provider_stream::ProviderSourceIdentity::new(
+                crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
+                "yellowstone-a",
+            ),
+            status: ProviderSourceHealthStatus::Reconnecting,
+            reason: crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
+            message: "yellowstone reconnecting".to_owned(),
+        });
+        handle.observe_provider_source_health(&ProviderSourceHealthEvent {
+            source: crate::provider_stream::ProviderSourceIdentity::new(
+                crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
+                "yellowstone-b",
+            ),
+            status: ProviderSourceHealthStatus::Healthy,
+            reason: crate::provider_stream::ProviderSourceHealthReason::SubscriptionAckReceived,
+            message: "yellowstone healthy".to_owned(),
+        });
+
+        let metrics = render_metrics(
+            &handle,
+            &PluginHost::builder().build(),
+            &RuntimeExtensionHost::builder().build(),
+            &DerivedStateHost::builder().build(),
+        );
+
+        assert!(metrics.contains("sof_runtime_ready 1"));
+        assert!(metrics.contains("sof_provider_sources_reconnecting 1"));
     }
 
     #[test]

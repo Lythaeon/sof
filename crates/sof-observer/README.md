@@ -147,8 +147,10 @@ Built-in runtime mode surface:
   `transactionSubscribe` feed
 
 Those fixed runtime modes remain transaction-first compatibility labels. The
-newer built-in source selectors extend the existing config objects and should be
-fed through `ProviderStreamMode::Generic` when they emit richer typed updates.
+each built-in source config exposes `runtime_mode()`, and that is the mode you
+should pass to `ObserverRuntime::with_provider_stream_ingress(...)` for a
+single built-in source. `ProviderStreamMode::Generic` is for custom typed
+producers and multi-source fan-in.
 
 Built-in source selectors:
 
@@ -212,6 +214,10 @@ Built-in durability behavior:
   - provider `/readyz` stays unready until a built-in source has actually
     reached a healthy session, or until a generic producer has emitted real
     ingress progress
+  - for multi-source provider runtimes, readiness is grouped by source kind:
+    one reconnecting backup source does not fail `/readyz` if another source of
+    the same kind is healthy, but a source kind with no healthy instance still
+    keeps the runtime unready
   - generic provider replay dedupe also covers transaction-log and
     transaction-view-batch updates now, not only transaction/control-plane
     events

@@ -9,7 +9,7 @@ use sof::{
     event::TxKind,
     framework::{ObserverPlugin, PluginConfig, PluginHost, TransactionEvent},
     provider_stream::{
-        ProviderStreamMode, create_provider_stream_queue,
+        create_provider_stream_queue,
         laserstream::{
             LaserStreamCommitment, LaserStreamConfig, spawn_laserstream_transaction_source,
         },
@@ -69,13 +69,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config = config.with_account_required(account_required);
     }
 
+    let mode = config.runtime_mode();
     let source = spawn_laserstream_transaction_source(config, provider_tx).await?;
     let host = PluginHost::builder()
         .add_plugin(LaserStreamTransactionLogger)
         .build();
     let runtime_result = ObserverRuntime::new()
         .with_plugin_host(host)
-        .with_provider_stream_ingress(ProviderStreamMode::LaserStream, provider_rx)
+        .with_provider_stream_ingress(mode, provider_rx)
         .run_until_termination_signal()
         .await;
     source.abort();

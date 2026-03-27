@@ -18,8 +18,8 @@ use crate::framework::{
     RuntimeExtensionHost, TransactionEvent,
 };
 use crate::provider_stream::{
-    ProviderSourceHealthEvent, ProviderSourceHealthStatus, ProviderSourceIdentity,
-    ProviderStreamMode, ProviderStreamReceiver, ProviderStreamUpdate,
+    ProviderSourceHealthEvent, ProviderSourceHealthStatus, ProviderSourceId,
+    ProviderSourceIdentity, ProviderStreamMode, ProviderStreamReceiver, ProviderStreamUpdate,
 };
 use agave_transaction_view::transaction_view::SanitizedTransactionView;
 use sof_gossip_tuning::{
@@ -79,7 +79,7 @@ pub enum ProviderStreamRuntimeError {
     },
     /// Built-in provider modes rejected unsupported hooks that only generic producers can satisfy.
     #[error(
-        "built-in provider-stream mode {mode} does not support requested hooks: {unsupported_hooks:?}; use raw-shred/gossip mode or ProviderStreamMode::Generic with a custom producer for richer control-plane surfaces",
+        "built-in provider-stream mode {mode} does not support requested hooks: {unsupported_hooks:?}; use the built-in config's runtime_mode() for matching built-in feeds, or ProviderStreamMode::Generic for custom or multi-source typed provider ingress",
         mode = .mode.as_str()
     )]
     BuiltInUnsupportedHooks {
@@ -87,6 +87,32 @@ pub enum ProviderStreamRuntimeError {
         mode: ProviderStreamMode,
         /// Unsupported hook or feed labels.
         unsupported_hooks: Vec<String>,
+    },
+    /// Built-in provider runtime mode received an update from a mismatched source kind.
+    #[error(
+        "built-in provider-stream mode {mode} received {update_kind} from source kind {source_kind} ({source_instance})",
+        mode = .mode.as_str()
+    )]
+    MismatchedSourceKind {
+        /// Active provider-stream mode.
+        mode: ProviderStreamMode,
+        /// Incoming provider update family.
+        update_kind: &'static str,
+        /// Actual source kind label carried by the update.
+        source_kind: String,
+        /// Actual source instance label carried by the update.
+        source_instance: String,
+    },
+    /// Built-in provider runtime mode received an update with no source identity.
+    #[error(
+        "built-in provider-stream mode {mode} received unattributed {update_kind}; built-in provider updates must carry source identity",
+        mode = .mode.as_str()
+    )]
+    UnattributedBuiltInUpdate {
+        /// Active provider-stream mode.
+        mode: ProviderStreamMode,
+        /// Incoming provider update family.
+        update_kind: &'static str,
     },
     /// Provider ingress channel closed unexpectedly.
     #[error(
@@ -1507,7 +1533,7 @@ impl ObserverRuntime {
     ///
     /// let (_tx, rx) = create_provider_stream_queue(128);
     /// let _runtime = ObserverRuntime::new()
-    ///     .with_provider_stream_ingress(ProviderStreamMode::YellowstoneGrpc, rx);
+    ///     .with_provider_stream_ingress(ProviderStreamMode::Generic, rx);
     /// ```
     #[must_use]
     pub fn with_provider_stream_ingress(
@@ -1716,6 +1742,10 @@ async fn run_provider_stream_runtime(
                     tracing::error!(mode = mode.as_str(), error = %error, "SOF provider-stream runtime stopped after provider ingress closed unexpectedly");
                     break Err(RuntimeError::ProviderStream(error));
                 };
+                if let Err(error) = validate_provider_stream_update_mode(mode, &update) {
+                    tracing::error!(mode = mode.as_str(), error = %error, "SOF provider-stream runtime received an update incompatible with the active provider mode");
+                    break Err(RuntimeError::ProviderStream(error));
+                }
                 if let ProviderStreamUpdate::Health(event) = &update {
                     provider_health.observe(event);
                     if let Some(handle) = observability_handle.as_ref() {
@@ -1824,6 +1854,104 @@ impl ProviderStreamHealth {
             mode,
             degraded_sources: self.degraded_sources(),
         }
+    }
+}
+
+fn validate_provider_stream_update_mode(
+    mode: ProviderStreamMode,
+    update: &ProviderStreamUpdate,
+) -> Result<(), ProviderStreamRuntimeError> {
+    if mode == ProviderStreamMode::Generic {
+        return Ok(());
+    }
+    let update_kind = provider_stream_update_kind(update);
+    let Some(source) = provider_stream_update_source(update) else {
+        return Err(ProviderStreamRuntimeError::UnattributedBuiltInUpdate { mode, update_kind });
+    };
+    if provider_stream_mode_accepts_source_kind(mode, &source.kind) {
+        return Ok(());
+    }
+    Err(ProviderStreamRuntimeError::MismatchedSourceKind {
+        mode,
+        update_kind,
+        source_kind: source.kind_str().to_owned(),
+        source_instance: source.instance_str().to_owned(),
+    })
+}
+
+const fn provider_stream_update_kind(update: &ProviderStreamUpdate) -> &'static str {
+    match update {
+        ProviderStreamUpdate::Transaction(_) => "transaction update",
+        ProviderStreamUpdate::SerializedTransaction(_) => "serialized transaction update",
+        ProviderStreamUpdate::TransactionLog(_) => "transaction log update",
+        ProviderStreamUpdate::TransactionStatus(_) => "transaction-status update",
+        ProviderStreamUpdate::TransactionViewBatch(_) => "transaction view-batch update",
+        ProviderStreamUpdate::AccountUpdate(_) => "account update",
+        ProviderStreamUpdate::BlockMeta(_) => "block-meta update",
+        ProviderStreamUpdate::RecentBlockhash(_) => "recent-blockhash update",
+        ProviderStreamUpdate::SlotStatus(_) => "slot-status update",
+        ProviderStreamUpdate::ClusterTopology(_) => "cluster-topology update",
+        ProviderStreamUpdate::LeaderSchedule(_) => "leader-schedule update",
+        ProviderStreamUpdate::Reorg(_) => "reorg update",
+        ProviderStreamUpdate::Health(_) => "health update",
+    }
+}
+
+fn provider_stream_update_source(update: &ProviderStreamUpdate) -> Option<&ProviderSourceIdentity> {
+    match update {
+        ProviderStreamUpdate::Transaction(event) => event.provider_source.as_deref(),
+        ProviderStreamUpdate::SerializedTransaction(event) => event.provider_source.as_deref(),
+        ProviderStreamUpdate::TransactionLog(event) => event.provider_source.as_deref(),
+        ProviderStreamUpdate::TransactionStatus(event) => event.provider_source.as_deref(),
+        ProviderStreamUpdate::TransactionViewBatch(event) => event.provider_source.as_deref(),
+        ProviderStreamUpdate::AccountUpdate(event) => event.provider_source.as_deref(),
+        ProviderStreamUpdate::BlockMeta(event) => event.provider_source.as_deref(),
+        ProviderStreamUpdate::RecentBlockhash(event) => event.provider_source.as_deref(),
+        ProviderStreamUpdate::SlotStatus(event) => event.provider_source.as_deref(),
+        ProviderStreamUpdate::ClusterTopology(event) => event.provider_source.as_deref(),
+        ProviderStreamUpdate::LeaderSchedule(event) => event.provider_source.as_deref(),
+        ProviderStreamUpdate::Reorg(event) => event.provider_source.as_deref(),
+        ProviderStreamUpdate::Health(event) => Some(&event.source),
+    }
+}
+
+const fn provider_stream_mode_accepts_source_kind(
+    mode: ProviderStreamMode,
+    source_kind: &ProviderSourceId,
+) -> bool {
+    match (mode, source_kind) {
+        (ProviderStreamMode::Generic, _) => true,
+        (ProviderStreamMode::YellowstoneGrpc, ProviderSourceId::YellowstoneGrpc) => true,
+        (
+            ProviderStreamMode::YellowstoneGrpcTransactionStatus,
+            ProviderSourceId::YellowstoneGrpcTransactionStatus,
+        ) => true,
+        (
+            ProviderStreamMode::YellowstoneGrpcAccounts,
+            ProviderSourceId::YellowstoneGrpcAccounts,
+        ) => true,
+        (
+            ProviderStreamMode::YellowstoneGrpcBlockMeta,
+            ProviderSourceId::YellowstoneGrpcBlockMeta,
+        ) => true,
+        (ProviderStreamMode::YellowstoneGrpcSlots, ProviderSourceId::YellowstoneGrpcSlots) => true,
+        (ProviderStreamMode::LaserStream, ProviderSourceId::LaserStream) => true,
+        (
+            ProviderStreamMode::LaserStreamTransactionStatus,
+            ProviderSourceId::LaserStreamTransactionStatus,
+        ) => true,
+        (ProviderStreamMode::LaserStreamAccounts, ProviderSourceId::LaserStreamAccounts) => true,
+        (ProviderStreamMode::LaserStreamBlockMeta, ProviderSourceId::LaserStreamBlockMeta) => true,
+        (ProviderStreamMode::LaserStreamSlots, ProviderSourceId::LaserStreamSlots) => true,
+        #[cfg(feature = "provider-websocket")]
+        (ProviderStreamMode::WebsocketTransaction, ProviderSourceId::WebsocketTransaction) => true,
+        #[cfg(feature = "provider-websocket")]
+        (ProviderStreamMode::WebsocketLogs, ProviderSourceId::WebsocketLogs) => true,
+        #[cfg(feature = "provider-websocket")]
+        (ProviderStreamMode::WebsocketAccount, ProviderSourceId::WebsocketAccount) => true,
+        #[cfg(feature = "provider-websocket")]
+        (ProviderStreamMode::WebsocketProgram, ProviderSourceId::WebsocketProgram) => true,
+        _ => false,
     }
 }
 
@@ -4129,6 +4257,45 @@ mod tests {
 
         assert!(!dedupe.observe(&update_a));
         assert!(!dedupe.observe(&update_b));
+    }
+
+    #[test]
+    fn built_in_provider_mode_rejects_mismatched_source_kind() {
+        let update = sample_provider_transaction_update().with_provider_source(
+            crate::provider_stream::ProviderSourceIdentity::new(
+                crate::provider_stream::ProviderSourceId::LaserStream,
+                "laserstream-1",
+            ),
+        );
+        let error =
+            validate_provider_stream_update_mode(ProviderStreamMode::YellowstoneGrpc, &update)
+                .expect_err("expected mismatched built-in source kind");
+        let ProviderStreamRuntimeError::MismatchedSourceKind {
+            mode,
+            source_kind,
+            source_instance,
+            ..
+        } = error
+        else {
+            panic!("expected mismatched source-kind error");
+        };
+        assert_eq!(mode, ProviderStreamMode::YellowstoneGrpc);
+        assert_eq!(source_kind, "laserstream");
+        assert_eq!(source_instance, "laserstream-1");
+    }
+
+    #[test]
+    fn built_in_provider_mode_rejects_unattributed_update() {
+        let update = sample_provider_transaction_update();
+        let error =
+            validate_provider_stream_update_mode(ProviderStreamMode::YellowstoneGrpc, &update)
+                .expect_err("expected unattributed built-in update failure");
+        let ProviderStreamRuntimeError::UnattributedBuiltInUpdate { mode, update_kind } = error
+        else {
+            panic!("expected unattributed built-in update error");
+        };
+        assert_eq!(mode, ProviderStreamMode::YellowstoneGrpc);
+        assert_eq!(update_kind, "transaction update");
     }
 
     #[test]
