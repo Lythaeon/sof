@@ -81,6 +81,8 @@ Because even when the ingress question is settled, the runtime work still remain
 - provider-specific reconnect and replay handling
 - queue boundaries and overload behavior
 - hot-path copy and allocation control
+- removing redundant work that only burns CPU
+- introducing fast paths that avoid deeper work when the answer is already known
 - consistent hooks and filters across modes
 - health, readiness, and metrics
 - local control-plane and derived-state plumbing
@@ -95,6 +97,15 @@ changes. The runtime is tuned by:
 - using `perf`, fixture benchmarks, and runtime metrics to decide what stays
 
 The goal is to remove repeated guesswork, not just repeated code.
+
+That tuning has happened across multiple releases. `0.13.0` carried the largest single batch of
+measured runtime/provider improvements so far, including:
+
+- redundant work removed from hot paths
+- new fast paths that stop unnecessary work earlier
+- fewer copies and allocations in validated provider/runtime paths
+- lower instruction count for the same work on several measured paths
+- reduced branching and, where the data showed it, better cache behavior
 
 ## The Short Version
 

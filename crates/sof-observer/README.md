@@ -37,6 +37,8 @@ problems:
 - verification posture and trust modeling
 - packet/FEC/dataset reconstruction work
 - low-level hot-path tuning around instructions, cache misses, allocations, and copies
+- removal of redundant work that creates CPU cost without adding observer value
+- fast paths so ignored or low-value traffic can exit earlier
 - health, readiness, telemetry, and bounded degradation under pressure
 
 SOF packages that work into one runtime so application developers can stay focused on the Solana
@@ -60,6 +62,16 @@ That optimization work is hypothesis-driven rather than intuitive. The normal lo
 
 So SOF's performance claim is not "this should help." It is "this was tested and kept because it
 did help."
+
+That work is cumulative across releases, and `0.13.0` carried the biggest single concentration of
+measured runtime/provider optimizations so far. The changes in that line were not just "more code":
+
+- redundant work removed from the runtime path
+- early fast paths added to avoid unnecessary downstream work
+- lower-copy and lower-allocation provider handling
+- reduced instruction count on validated hot paths
+- lower branch churn and, where measurable, better cache behavior
+- hardening work kept without erasing the primary ingest/runtime gains
 
 ## Plugin Contract
 

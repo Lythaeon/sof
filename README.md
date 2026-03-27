@@ -94,6 +94,9 @@ SOF is useful because it already spent the engineering effort on the details mos
 - fewer avoidable allocations and copies
 - borrowed/shared data where the runtime can safely keep it borrowed/shared
 - SIMD-based parsing where it is a real win
+- fast paths that avoid work the runtime does not actually need to do
+- removal of redundant work that used to survive deeper into the pipeline
+- lower branch and cache churn where measurement showed that mattered
 - replay dedupe and semantic duplicate suppression
 - provider reconnect, replay, watchdog, and startup validation behavior
 - typed health, readiness, and degradation reporting
@@ -115,6 +118,16 @@ review. The normal workflow is:
 - keep the change only if the measurements actually improve
 
 So "optimized" here means measured and retained, not guessed and merged.
+
+That is also cumulative across releases. SOF has been tuned incrementally over time, and `0.13.0`
+contained the largest single concentration of measured runtime/provider-path optimizations so far:
+
+- redundant work removed from hot paths
+- early fast paths added so ignored or low-value traffic dies sooner
+- lower-copy and lower-allocation provider/runtime paths
+- reduced instruction count for the same work on several validated paths
+- reduced branching and, where it was measurable, improved cache behavior
+- queueing, replay, reconnect, and health hardening kept without giving back the main ingest wins
 
 ## The Main Idea
 
