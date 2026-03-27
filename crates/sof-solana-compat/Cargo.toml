@@ -1,6 +1,6 @@
 [package]
 name = "sof-solana-compat"
-version = "0.13.0"
+version = "0.13.1"
 edition.workspace = true
 description = "Explicit Solana-coupled compatibility layer for SOF and sof-tx"
 license = "Apache-2.0 OR MIT"
@@ -16,8 +16,8 @@ workspace = true
 
 [dependencies]
 async-trait = "0.1"
-sof-tx = { path = "../sof-tx", version = "0.13.0" }
-sof-types = { path = "../sof-types", version = "0.13.0", features = ["solana-compat"] }
+sof-tx = { path = "../sof-tx", version = "0.13.1" }
+sof-types = { path = "../sof-types", version = "0.13.1", features = ["solana-compat"] }
 bincode = "1.3.3"
 solana-compute-budget-interface = "3.0.0"
 solana-keypair = "3.0.1"
