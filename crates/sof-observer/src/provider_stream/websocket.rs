@@ -1927,7 +1927,7 @@ fn parse_logs_notification(
     }))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn materialize_transaction_baseline(
     bytes: &mut [u8],
     commitment_status: WebsocketTransactionCommitment,

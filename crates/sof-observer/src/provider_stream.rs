@@ -72,6 +72,11 @@
 //! [`ReservedProviderStreamSender`] automatically attributes every update it
 //! sends to that reserved provider source.
 //!
+//! Generic readiness becomes source-aware only after a custom producer emits
+//! [`ProviderStreamUpdate::Health`] for that reserved source. Until then,
+//! `ProviderStreamMode::Generic` falls back to progress-based readiness and
+//! only knows that typed updates are flowing at all.
+//!
 //! Variant-to-runtime mapping:
 //!
 //! - `Transaction`:
@@ -167,6 +172,7 @@ use crate::framework::{
     ObservedRecentBlockhashEvent, ReorgEvent, SlotStatusEvent, TransactionEvent,
     TransactionLogEvent, TransactionStatusEvent, TransactionViewBatchEvent,
 };
+#[cfg(test)]
 use agave_transaction_view::{
     transaction_data::TransactionData, transaction_view::SanitizedTransactionView,
 };
@@ -658,10 +664,20 @@ pub(crate) struct ProviderSourceReservation {
     fan_in: ProviderStreamFanIn,
     /// Stable source identity held until the reservation is dropped.
     source: ProviderSourceIdentity,
+    /// Sender used to prune generic source health when the reservation drops.
+    removal_sender: Option<ProviderStreamSender>,
 }
 
 impl Drop for ProviderSourceReservation {
     fn drop(&mut self) {
+        if let Some(sender) = self.removal_sender.clone() {
+            emit_provider_source_removed(
+                &sender,
+                self.source.clone(),
+                ProviderSourceReadiness::Optional,
+                "reserved provider source sender dropped and was removed from tracking",
+            );
+        }
         self.fan_in.release_source_identity(&self.source);
     }
 }
@@ -741,22 +757,12 @@ impl ProviderSourceTaskGuard {
 impl Drop for ProviderSourceTaskGuard {
     fn drop(&mut self) {
         let _keep_reservation_alive = self.reservation.take();
-        let event = ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
-            source: self.source.clone(),
-            readiness: self.readiness,
-            status: ProviderSourceHealthStatus::Removed,
-            reason: ProviderSourceHealthReason::SourceRemoved,
-            message: "provider source task stopped and was removed from tracking".to_owned(),
-        });
-        match self.sender.try_send(event) {
-            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
-            Err(mpsc::error::TrySendError::Full(update)) => {
-                let sender = self.sender.clone();
-                tokio::spawn(async move {
-                    drop(sender.send(update).await);
-                });
-            }
-        }
+        emit_provider_source_removed(
+            &self.sender,
+            self.source.clone(),
+            self.readiness,
+            "provider source task stopped and was removed from tracking",
+        );
     }
 }
 
@@ -780,7 +786,7 @@ impl ProviderStreamFanIn {
         &self,
         source: ProviderSourceIdentity,
     ) -> Result<ReservedProviderStreamSender, ProviderSourceIdentityRegistrationError> {
-        let reservation = self.reserve_source_identity(source)?;
+        let reservation = self.reserve_source_identity_generic(source)?;
         Ok(ReservedProviderStreamSender {
             sender: self.sender.clone(),
             reservation: Arc::new(reservation),
@@ -808,7 +814,18 @@ impl ProviderStreamFanIn {
         Ok(ProviderSourceReservation {
             fan_in: self.clone(),
             source,
+            removal_sender: None,
         })
+    }
+
+    /// Reserves one stable source identity for a generic producer and prunes it on drop.
+    fn reserve_source_identity_generic(
+        &self,
+        source: ProviderSourceIdentity,
+    ) -> Result<ProviderSourceReservation, ProviderSourceIdentityRegistrationError> {
+        let mut reservation = self.reserve_source_identity(source)?;
+        reservation.removal_sender = Some(self.sender.clone());
+        Ok(reservation)
     }
 
     /// Releases one previously reserved stable source identity.
@@ -954,7 +971,7 @@ pub(crate) fn classify_provider_transaction_kind(tx: &VersionedTransaction) -> T
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 /// Classifies provider-fed transaction views consistently across built-in adapters.
 pub(crate) fn classify_provider_transaction_kind_view<D: TransactionData>(
     view: &SanitizedTransactionView<D>,
@@ -982,6 +999,31 @@ pub(crate) fn classify_provider_transaction_kind_view<D: TransactionData>(
         TxKind::Mixed
     } else {
         TxKind::NonVote
+    }
+}
+
+/// Emits one terminal provider-source removal event and prunes runtime tracking.
+fn emit_provider_source_removed(
+    sender: &ProviderStreamSender,
+    source: ProviderSourceIdentity,
+    readiness: ProviderSourceReadiness,
+    message: &'static str,
+) {
+    let event = ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
+        source,
+        readiness,
+        status: ProviderSourceHealthStatus::Removed,
+        reason: ProviderSourceHealthReason::SourceRemoved,
+        message: message.to_owned(),
+    });
+    match sender.try_send(event) {
+        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+        Err(mpsc::error::TrySendError::Full(update)) => {
+            let sender = sender.clone();
+            tokio::spawn(async move {
+                drop(sender.send(update).await);
+            });
+        }
     }
 }
 
@@ -1100,6 +1142,47 @@ mod tests {
             let source = event.provider_source.expect("bound provider source");
             assert_eq!(source.kind_str(), "custom");
             assert_eq!(source.instance_str(), "source-a");
+        });
+    }
+
+    #[test]
+    fn reserved_provider_sender_emits_removed_health_on_drop() {
+        let (fan_in, mut rx) = create_provider_stream_fan_in(4);
+        let source = ProviderSourceIdentity::new(
+            ProviderSourceId::Generic(Arc::<str>::from("custom")),
+            "source-a",
+        );
+        let sender = fan_in
+            .sender_for_source(source.clone())
+            .expect("reserve source");
+
+        Runtime::new().expect("runtime").block_on(async move {
+            sender
+                .send(ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
+                    source: source.clone(),
+                    readiness: ProviderSourceReadiness::Required,
+                    status: ProviderSourceHealthStatus::Healthy,
+                    reason: ProviderSourceHealthReason::SubscriptionAckReceived,
+                    message: "source subscription acknowledged".to_owned(),
+                }))
+                .await
+                .expect("send health");
+            drop(sender);
+
+            let first = rx.recv().await.expect("health update");
+            let ProviderStreamUpdate::Health(first) = first else {
+                panic!("expected first health update");
+            };
+            assert_eq!(first.source, source);
+            assert_eq!(first.status, ProviderSourceHealthStatus::Healthy);
+
+            let second = rx.recv().await.expect("removed update");
+            let ProviderStreamUpdate::Health(second) = second else {
+                panic!("expected removed health update");
+            };
+            assert_eq!(second.source, source);
+            assert_eq!(second.status, ProviderSourceHealthStatus::Removed);
+            assert_eq!(second.reason, ProviderSourceHealthReason::SourceRemoved);
         });
     }
 

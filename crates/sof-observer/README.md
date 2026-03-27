@@ -349,6 +349,12 @@ If you build a generic source directly, reserve one stable source identity with
 every update it emits, so replay dedupe, readiness, and observability all stay
 source-aware.
 
+One important detail for custom generic producers: source-aware readiness only
+starts once the producer emits `ProviderStreamUpdate::Health` for that reserved
+source. Until then, `ProviderStreamMode::Generic` falls back to progress-based
+readiness and only knows that typed updates are flowing, not whether each
+expected source instance is healthy.
+
 The runtime then routes those typed updates into the normal SOF surfaces:
 
 - `Transaction` / `SerializedTransaction`

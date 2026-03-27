@@ -70,3 +70,10 @@ Follow-up findings after the readiness/readiness-class pass:
   needed to prune themselves on normal stop/abort instead of only on startup
   failure, and public docs/metrics needed to spell out that `Removed` is a
   pruning control event rather than a persistent health state.
+
+- 2026-03-28 follow-up: generic reserved sources still needed to emit
+  `Removed` on last-drop so custom producers do not leave stale health behind,
+  generic readiness docs needed to say explicitly that per-source readiness
+  begins only after custom health events arrive, and the remaining non-test
+  `dead_code` suppressions on baseline/provider helper functions needed to be
+  removed by tightening cfg boundaries instead of silencing clippy.
