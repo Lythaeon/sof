@@ -11,6 +11,7 @@ use sof::framework::{
     BranchReorgedEvent, ClusterNodeInfo, ClusterTopologyEvent, LeaderScheduleEntry,
     LeaderScheduleEvent, ObservedRecentBlockhashEvent, PluginHost, SlotStatusChangedEvent,
 };
+use sof_types::PubkeyBytes;
 use solana_pubkey::Pubkey;
 
 use crate::providers::{LeaderTarget, RecentBlockhashProvider};
@@ -301,7 +302,8 @@ impl TxProviderAdapterCore {
     }
 
     /// Inserts or updates one TPU address mapping for a leader identity.
-    pub(crate) fn set_leader_tpu_addr(&self, identity: Pubkey, tpu_addr: SocketAddr) {
+    pub(crate) fn set_leader_tpu_addr(&self, identity: PubkeyBytes, tpu_addr: SocketAddr) {
+        let identity = identity.to_solana();
         self.update(move |state| {
             let ingress = state.ingress_by_identity.entry(identity).or_default();
             ingress.tpu = Some(tpu_addr);
@@ -310,7 +312,8 @@ impl TxProviderAdapterCore {
     }
 
     /// Removes one TPU address mapping for a leader identity.
-    pub(crate) fn remove_leader_tpu_addr(&self, identity: Pubkey) {
+    pub(crate) fn remove_leader_tpu_addr(&self, identity: PubkeyBytes) {
+        let identity = identity.to_solana();
         self.update(move |state| {
             let _ = state.ingress_by_identity.remove(&identity);
         });
@@ -784,7 +787,10 @@ fn append_ingress_targets(
         if !seen_addrs.insert(candidate) {
             continue;
         }
-        output.push(LeaderTarget::new(Some(identity), candidate));
+        output.push(LeaderTarget::new(
+            Some(PubkeyBytes::from_solana(identity)),
+            candidate,
+        ));
     }
 }
 

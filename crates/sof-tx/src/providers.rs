@@ -7,7 +7,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use solana_pubkey::Pubkey;
+use sof_types::PubkeyBytes;
 
 use crate::submit::SubmitTransportError;
 
@@ -15,7 +15,7 @@ use crate::submit::SubmitTransportError;
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct LeaderTarget {
     /// Optional validator identity.
-    pub identity: Option<Pubkey>,
+    pub identity: Option<PubkeyBytes>,
     /// TPU/ingress socket used for direct submit.
     pub tpu_addr: SocketAddr,
 }
@@ -23,7 +23,7 @@ pub struct LeaderTarget {
 impl LeaderTarget {
     /// Creates a leader target with optional identity.
     #[must_use]
-    pub const fn new(identity: Option<Pubkey>, tpu_addr: SocketAddr) -> Self {
+    pub const fn new(identity: Option<PubkeyBytes>, tpu_addr: SocketAddr) -> Self {
         Self { identity, tpu_addr }
     }
 }

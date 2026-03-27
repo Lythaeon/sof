@@ -7,8 +7,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use solana_signature::Signature;
-use solana_signer::signers::Signers;
+use sof_types::SignatureBytes;
 use solana_transaction::versioned::VersionedTransaction;
 use tokio::{
     net::TcpStream,
@@ -25,7 +24,6 @@ use super::{
     TxToxicFlowTelemetrySnapshot,
 };
 use crate::{
-    builder::TxBuilder,
     providers::{
         LeaderProvider, LeaderTarget, RecentBlockhashProvider, RpcRecentBlockhashProvider,
         StaticLeaderProvider,
@@ -254,103 +252,6 @@ impl TxSubmitClient {
         }
     }
 
-    /// Builds, signs, and submits a transaction in one API call.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SubmitError`] when blockhash lookup, signing, dedupe, routing, or submission
-    /// fails.
-    pub async fn submit_unsigned<T>(
-        &mut self,
-        builder: TxBuilder,
-        signers: &T,
-        mode: SubmitMode,
-    ) -> Result<SubmitResult, SubmitError>
-    where
-        T: Signers + ?Sized,
-    {
-        if let Some(provider) = &self.on_demand_blockhash_provider {
-            provider
-                .refresh()
-                .await
-                .map_err(|source| SubmitError::Rpc { source })?;
-        }
-        let blockhash = self
-            .blockhash_provider
-            .latest_blockhash()
-            .ok_or(SubmitError::MissingRecentBlockhash)?;
-        let tx = builder
-            .build_and_sign(blockhash, signers)
-            .map_err(|source| SubmitError::Build { source })?;
-        self.submit_transaction_with_context(tx, mode, TxSubmitContext::default())
-            .await
-    }
-
-    /// Builds, signs, and submits a transaction with explicit toxic-flow context.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SubmitError`] when blockhash lookup, signing, dedupe, toxic-flow guards,
-    /// routing, or submission fails.
-    pub async fn submit_unsigned_with_context<T>(
-        &mut self,
-        builder: TxBuilder,
-        signers: &T,
-        mode: SubmitMode,
-        context: TxSubmitContext,
-    ) -> Result<SubmitResult, SubmitError>
-    where
-        T: Signers + ?Sized,
-    {
-        if let Some(provider) = &self.on_demand_blockhash_provider {
-            provider
-                .refresh()
-                .await
-                .map_err(|source| SubmitError::Rpc { source })?;
-        }
-        let blockhash = self
-            .blockhash_provider
-            .latest_blockhash()
-            .ok_or(SubmitError::MissingRecentBlockhash)?;
-        let tx = builder
-            .build_and_sign(blockhash, signers)
-            .map_err(|source| SubmitError::Build { source })?;
-        self.submit_transaction_with_context(tx, mode, context)
-            .await
-    }
-
-    /// Submits one signed `VersionedTransaction`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SubmitError`] when encoding, dedupe, routing, or submission fails.
-    pub async fn submit_transaction(
-        &mut self,
-        tx: VersionedTransaction,
-        mode: SubmitMode,
-    ) -> Result<SubmitResult, SubmitError> {
-        self.submit_transaction_with_context(tx, mode, TxSubmitContext::default())
-            .await
-    }
-
-    /// Submits one signed `VersionedTransaction` with explicit toxic-flow context.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SubmitError`] when encoding, dedupe, toxic-flow guards, routing, or submission
-    /// fails.
-    pub async fn submit_transaction_with_context(
-        &mut self,
-        tx: VersionedTransaction,
-        mode: SubmitMode,
-        context: TxSubmitContext,
-    ) -> Result<SubmitResult, SubmitError> {
-        let signature = tx.signatures.first().copied();
-        let tx_bytes =
-            bincode::serialize(&tx).map_err(|source| SubmitError::DecodeSignedBytes { source })?;
-        self.submit_bytes(tx_bytes, signature, mode, context).await
-    }
-
     /// Submits externally signed transaction bytes.
     ///
     /// # Errors
@@ -383,15 +284,42 @@ impl TxSubmitClient {
         };
         let tx: VersionedTransaction = bincode::deserialize(&tx_bytes)
             .map_err(|source| SubmitError::DecodeSignedBytes { source })?;
-        let signature = tx.signatures.first().copied();
+        let signature = tx
+            .signatures
+            .first()
+            .copied()
+            .map(SignatureBytes::from_solana);
         self.submit_bytes(tx_bytes, signature, mode, context).await
+    }
+
+    /// Refreshes any configured on-demand RPC blockhash source and returns the latest bytes.
+    ///
+    /// This is intended for explicit compatibility layers that build Solana-native transactions
+    /// outside the core byte-oriented `sof-tx` API surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubmitTransportError`] when the RPC-backed blockhash refresh fails.
+    pub async fn refresh_latest_blockhash_bytes(
+        &self,
+    ) -> Result<Option<[u8; 32]>, SubmitTransportError> {
+        if let Some(provider) = &self.on_demand_blockhash_provider {
+            let _ = provider.refresh().await?;
+        }
+        Ok(self.latest_blockhash_bytes())
+    }
+
+    /// Returns the latest cached recent blockhash bytes when available.
+    #[must_use]
+    pub fn latest_blockhash_bytes(&self) -> Option<[u8; 32]> {
+        self.blockhash_provider.latest_blockhash()
     }
 
     /// Submits raw tx bytes after dedupe check.
     async fn submit_bytes(
         &mut self,
         tx_bytes: Vec<u8>,
-        signature: Option<Signature>,
+        signature: Option<SignatureBytes>,
         mode: SubmitMode,
         context: TxSubmitContext,
     ) -> Result<SubmitResult, SubmitError> {
@@ -406,7 +334,7 @@ impl TxSubmitClient {
     }
 
     /// Applies signature dedupe policy.
-    fn enforce_dedupe(&mut self, signature: Option<Signature>) -> Result<(), SubmitError> {
+    fn enforce_dedupe(&mut self, signature: Option<SignatureBytes>) -> Result<(), SubmitError> {
         if let Some(signature) = signature {
             let now = Instant::now();
             if !self.deduper.check_and_insert(signature, now) {
@@ -419,7 +347,7 @@ impl TxSubmitClient {
     /// Applies toxic-flow guard policy before transport.
     fn enforce_toxic_flow_guards(
         &mut self,
-        signature: Option<Signature>,
+        signature: Option<SignatureBytes>,
         mode: SubmitMode,
         context: &TxSubmitContext,
     ) -> Result<(), SubmitError> {
@@ -527,7 +455,7 @@ impl TxSubmitClient {
         &self,
         reason: TxToxicFlowRejectionReason,
         outcome_kind: TxSubmitOutcomeKind,
-        signature: Option<Signature>,
+        signature: Option<SignatureBytes>,
         mode: SubmitMode,
         state_version: Option<u64>,
         opportunity_age_ms: Option<u64>,
@@ -547,7 +475,7 @@ impl TxSubmitClient {
     async fn submit_rpc_only(
         &self,
         tx_bytes: Vec<u8>,
-        signature: Option<Signature>,
+        signature: Option<SignatureBytes>,
         mode: SubmitMode,
     ) -> Result<SubmitResult, SubmitError> {
         let rpc = self
@@ -585,7 +513,7 @@ impl TxSubmitClient {
     async fn submit_jito_only(
         &self,
         tx_bytes: Vec<u8>,
-        signature: Option<Signature>,
+        signature: Option<SignatureBytes>,
         mode: SubmitMode,
     ) -> Result<SubmitResult, SubmitError> {
         let jito = self
@@ -623,7 +551,7 @@ impl TxSubmitClient {
     async fn submit_direct_only(
         &self,
         tx_bytes: Vec<u8>,
-        signature: Option<Signature>,
+        signature: Option<SignatureBytes>,
         mode: SubmitMode,
     ) -> Result<SubmitResult, SubmitError> {
         let direct = self
@@ -697,7 +625,7 @@ impl TxSubmitClient {
     async fn submit_hybrid(
         &self,
         tx_bytes: Vec<u8>,
-        signature: Option<Signature>,
+        signature: Option<SignatureBytes>,
         mode: SubmitMode,
     ) -> Result<SubmitResult, SubmitError> {
         let direct = self

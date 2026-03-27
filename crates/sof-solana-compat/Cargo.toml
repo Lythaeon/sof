@@ -1,0 +1,30 @@
+[package]
+name = "sof-solana-compat"
+version = "0.13.0"
+edition.workspace = true
+description = "Explicit Solana-coupled compatibility layer for SOF and sof-tx"
+license = "Apache-2.0 OR MIT"
+documentation = "https://docs.rs/sof-solana-compat"
+readme = "README.md"
+repository = "https://github.com/Lythaeon/sof"
+homepage = "https://github.com/Lythaeon/sof"
+keywords = ["solana", "compat", "sdk", "transactions"]
+categories = ["network-programming", "cryptography::cryptocurrencies"]
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = "0.1"
+sof-tx = { path = "../sof-tx", version = "0.13.0" }
+sof-types = { path = "../sof-types", version = "0.13.0", features = ["solana-compat"] }
+bincode = "1.3.3"
+solana-compute-budget-interface = "3.0.0"
+solana-keypair = "3.0.1"
+solana-message = "3.0.1"
+solana-packet = "3.0.0"
+solana-pubkey = "3.0.0"
+solana-signer = "3.0.0"
+solana-system-interface = { version = "3.0.0", features = ["bincode"] }
+solana-transaction = { version = "3.0.2", features = ["bincode"] }
+thiserror = "2.0"

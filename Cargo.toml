@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/sof-gossip-tuning", "crates/sof-observer", "crates/sof-tx"]
+members = [
+    "crates/sof-gossip-tuning",
+    "crates/sof-observer",
+    "crates/sof-solana-compat",
+    "crates/sof-tx",
+    "crates/sof-types",
+]
 exclude = ["crates/sof-solana-gossip"]
 
 [patch.crates-io]

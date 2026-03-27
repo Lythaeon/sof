@@ -12,10 +12,10 @@ use std::{
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use solana_signature::Signature;
+use sof_types::SignatureBytes;
 use thiserror::Error;
 
-use crate::{builder::BuilderError, providers::LeaderTarget, routing::RoutingPolicy};
+use crate::{providers::LeaderTarget, routing::RoutingPolicy};
 
 /// Runtime submit mode.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -255,12 +255,6 @@ pub enum SubmitTransportError {
 /// Submission-level errors.
 #[derive(Debug, Error)]
 pub enum SubmitError {
-    /// Could not build/sign transaction for unsigned submit path.
-    #[error("failed to build/sign transaction: {source}")]
-    Build {
-        /// Builder-layer failure.
-        source: BuilderError,
-    },
     /// No blockhash available for unsigned submit path.
     #[error("blockhash provider returned no recent blockhash")]
     MissingRecentBlockhash,
@@ -321,7 +315,7 @@ pub enum SubmitError {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SubmitResult {
     /// Signature parsed from submitted transaction bytes.
-    pub signature: Option<Signature>,
+    pub signature: Option<SignatureBytes>,
     /// Mode selected by caller.
     pub mode: SubmitMode,
     /// Target chosen by direct path when applicable.
@@ -405,7 +399,7 @@ pub trait TxFlowSafetySource: Send + Sync {
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TxSubmitSuppressionKey {
     /// Suppress by signature.
-    Signature(Signature),
+    Signature(SignatureBytes),
     /// Suppress by opaque opportunity identifier.
     Opportunity([u8; 32]),
     /// Suppress by hashed account set identifier.
@@ -553,7 +547,7 @@ pub struct TxSubmitOutcome {
     /// Outcome classification.
     pub kind: TxSubmitOutcomeKind,
     /// Transaction signature when available.
-    pub signature: Option<Signature>,
+    pub signature: Option<SignatureBytes>,
     /// Mode selected for the submit attempt.
     pub mode: SubmitMode,
     /// Current state version at outcome time when known.

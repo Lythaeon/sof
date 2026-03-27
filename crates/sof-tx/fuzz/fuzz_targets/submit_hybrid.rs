@@ -7,8 +7,9 @@ use async_trait::async_trait;
 use libfuzzer_sys::fuzz_target;
 use solana_keypair::Keypair;
 use solana_signer::Signer;
+use sof_solana_compat::TxBuilder;
 use sof_tx::{
-    DirectSubmitConfig, RpcSubmitConfig, SignedTx, SubmitMode, SubmitTransportError, TxBuilder,
+    DirectSubmitConfig, RpcSubmitConfig, SignedTx, SubmitMode, SubmitTransportError,
     TxSubmitClient,
     providers::{LeaderTarget, StaticLeaderProvider, StaticRecentBlockhashProvider},
     routing::RoutingPolicy,

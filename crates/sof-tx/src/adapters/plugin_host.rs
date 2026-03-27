@@ -7,7 +7,7 @@ use sof::framework::{
     ClusterTopologyEvent, LeaderScheduleEvent, ObservedRecentBlockhashEvent, ObserverPlugin,
     PluginHost,
 };
-use solana_pubkey::Pubkey;
+use sof_types::PubkeyBytes;
 
 use crate::{
     adapters::common::{
@@ -50,12 +50,12 @@ impl PluginHostTxProviderAdapter {
     }
 
     /// Inserts or updates one TPU address mapping for a leader identity.
-    pub fn set_leader_tpu_addr(&self, identity: Pubkey, tpu_addr: SocketAddr) {
+    pub fn set_leader_tpu_addr(&self, identity: PubkeyBytes, tpu_addr: SocketAddr) {
         self.core.set_leader_tpu_addr(identity, tpu_addr);
     }
 
     /// Removes one TPU address mapping for a leader identity.
-    pub fn remove_leader_tpu_addr(&self, identity: Pubkey) {
+    pub fn remove_leader_tpu_addr(&self, identity: PubkeyBytes) {
         self.core.remove_leader_tpu_addr(identity);
     }
 
