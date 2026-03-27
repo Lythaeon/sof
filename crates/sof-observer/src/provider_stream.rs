@@ -10,6 +10,8 @@
 //! - `YellowstoneGrpc`: built-in adapter emits `on_transaction`
 //! - `LaserStream`: built-in adapter emits `on_transaction`
 //! - `WebsocketTransaction`: built-in adapter emits `on_transaction`
+//! - built-in websocket logs and gRPC slot feeds can be fanned into
+//!   `ProviderStreamMode::Generic`
 //!
 //! Generic provider producers may still enqueue `TransactionViewBatch`,
 //! `RecentBlockhash`, `SlotStatus`, `ClusterTopology`, `LeaderSchedule`, or
@@ -298,11 +300,18 @@ pub enum ProviderSourceId {
     Generic(&'static str),
     /// Built-in Yellowstone gRPC source.
     YellowstoneGrpc,
+    /// Built-in Yellowstone gRPC slot source.
+    YellowstoneGrpcSlots,
     /// Built-in LaserStream source.
     LaserStream,
+    /// Built-in LaserStream slot source.
+    LaserStreamSlots,
     #[cfg(feature = "provider-websocket")]
     /// Built-in websocket `transactionSubscribe` source.
     WebsocketTransaction,
+    #[cfg(feature = "provider-websocket")]
+    /// Built-in websocket `logsSubscribe` source.
+    WebsocketLogs,
 }
 
 impl ProviderSourceId {
@@ -312,9 +321,13 @@ impl ProviderSourceId {
         match self {
             Self::Generic(label) => label,
             Self::YellowstoneGrpc => "yellowstone_grpc",
+            Self::YellowstoneGrpcSlots => "yellowstone_grpc_slots",
             Self::LaserStream => "laserstream",
+            Self::LaserStreamSlots => "laserstream_slots",
             #[cfg(feature = "provider-websocket")]
             Self::WebsocketTransaction => "websocket_transaction",
+            #[cfg(feature = "provider-websocket")]
+            Self::WebsocketLogs => "websocket_logs",
         }
     }
 }
@@ -366,6 +379,20 @@ impl ProviderSourceHealthReason {
 pub type ProviderStreamSender = mpsc::Sender<ProviderStreamUpdate>;
 /// Receiver type for processed provider-stream ingress.
 pub type ProviderStreamReceiver = mpsc::Receiver<ProviderStreamUpdate>;
+
+/// Helper for feeding one SOF provider queue from multiple provider sources.
+#[derive(Clone, Debug)]
+pub struct ProviderStreamFanIn {
+    sender: ProviderStreamSender,
+}
+
+impl ProviderStreamFanIn {
+    /// Returns a cloned sender for one provider source.
+    #[must_use]
+    pub fn sender(&self) -> ProviderStreamSender {
+        self.sender.clone()
+    }
+}
 
 /// One serialized provider-fed transaction that has not yet been materialized.
 #[derive(Debug, Clone)]
@@ -443,6 +470,24 @@ pub fn create_provider_stream_queue(
     capacity: usize,
 ) -> (ProviderStreamSender, ProviderStreamReceiver) {
     mpsc::channel(capacity.max(1))
+}
+
+/// Creates one bounded queue plus a typed helper for multi-source provider fan-in.
+///
+/// # Examples
+///
+/// ```rust
+/// use sof::provider_stream::{create_provider_stream_fan_in, ProviderStreamMode};
+///
+/// let (_fan_in, _rx) = create_provider_stream_fan_in(256);
+/// let _mode = ProviderStreamMode::Generic;
+/// ```
+#[must_use]
+pub fn create_provider_stream_fan_in(
+    capacity: usize,
+) -> (ProviderStreamFanIn, ProviderStreamReceiver) {
+    let (sender, receiver) = create_provider_stream_queue(capacity);
+    (ProviderStreamFanIn { sender }, receiver)
 }
 
 /// Classifies provider-fed transactions consistently across built-in adapters.

@@ -27,12 +27,13 @@ use yellowstone_grpc_proto::prelude::{
 };
 
 use crate::{
-    event::{TxCommitmentStatus, TxKind},
-    framework::{TransactionEvent, signature_bytes_opt},
+    event::{ForkSlotStatus, TxCommitmentStatus, TxKind},
+    framework::{SlotStatusEvent, TransactionEvent, signature_bytes_opt},
     provider_stream::{
         ProviderCommitmentWatermarks, ProviderReplayMode, ProviderSourceHealthEvent,
         ProviderSourceHealthReason, ProviderSourceHealthStatus, ProviderSourceId,
-        ProviderStreamSender, ProviderStreamUpdate, classify_provider_transaction_kind,
+        ProviderStreamFanIn, ProviderStreamSender, ProviderStreamUpdate,
+        classify_provider_transaction_kind,
     },
 };
 
@@ -318,6 +319,146 @@ impl YellowstoneGrpcConfig {
     }
 }
 
+/// Connection and replay config for Yellowstone slot subscriptions.
+#[derive(Clone, Debug)]
+pub struct YellowstoneGrpcSlotsConfig {
+    endpoint: String,
+    x_token: Option<String>,
+    commitment: YellowstoneGrpcCommitment,
+    connect_timeout: Option<Duration>,
+    stall_timeout: Option<Duration>,
+    ping_interval: Option<Duration>,
+    reconnect_delay: Duration,
+    max_reconnect_attempts: Option<u32>,
+    replay_mode: ProviderReplayMode,
+}
+
+impl YellowstoneGrpcSlotsConfig {
+    /// Creates a slot-stream config for one Yellowstone endpoint.
+    #[must_use]
+    pub fn new(endpoint: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            x_token: None,
+            commitment: YellowstoneGrpcCommitment::Processed,
+            connect_timeout: Some(Duration::from_secs(10)),
+            stall_timeout: Some(Duration::from_secs(30)),
+            ping_interval: Some(Duration::from_secs(30)),
+            reconnect_delay: Duration::from_secs(1),
+            max_reconnect_attempts: None,
+            replay_mode: ProviderReplayMode::Resume,
+        }
+    }
+
+    /// Returns the configured endpoint.
+    #[must_use]
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// Sets the provider x-token.
+    #[must_use]
+    pub fn with_x_token(mut self, x_token: impl Into<String>) -> Self {
+        self.x_token = Some(x_token.into());
+        self
+    }
+
+    /// Sets the Yellowstone commitment.
+    #[must_use]
+    pub const fn with_commitment(mut self, commitment: YellowstoneGrpcCommitment) -> Self {
+        self.commitment = commitment;
+        self
+    }
+
+    /// Sets the connect timeout.
+    #[must_use]
+    pub const fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = Some(timeout);
+        self
+    }
+
+    /// Sets the idle watchdog timeout for one stream session.
+    #[must_use]
+    pub const fn with_stall_timeout(mut self, timeout: Duration) -> Self {
+        self.stall_timeout = Some(timeout);
+        self
+    }
+
+    /// Sets the periodic ping interval.
+    #[must_use]
+    pub const fn with_ping_interval(mut self, interval: Duration) -> Self {
+        self.ping_interval = Some(interval);
+        self
+    }
+
+    /// Sets the reconnect backoff used after stream failures.
+    #[must_use]
+    pub const fn with_reconnect_delay(mut self, delay: Duration) -> Self {
+        self.reconnect_delay = delay;
+        self
+    }
+
+    /// Sets the maximum reconnect attempts. `None` keeps retrying forever.
+    #[must_use]
+    pub const fn with_max_reconnect_attempts(mut self, attempts: u32) -> Self {
+        self.max_reconnect_attempts = Some(attempts);
+        self
+    }
+
+    /// Sets provider replay behavior.
+    #[must_use]
+    pub const fn with_replay_mode(mut self, mode: ProviderReplayMode) -> Self {
+        self.replay_mode = mode;
+        self
+    }
+
+    fn subscribe_request_with_state(&self, tracked_slot: u64) -> SubscribeRequest {
+        let mut request = SubscribeRequest {
+            slots: HashMap::from([(
+                "sof".to_owned(),
+                SubscribeRequestFilterSlots {
+                    filter_by_commitment: Some(true),
+                    ..SubscribeRequestFilterSlots::default()
+                },
+            )]),
+            commitment: Some(self.commitment.as_proto() as i32),
+            ..SubscribeRequest::default()
+        };
+        if let Some(from_slot) = self.replay_from_slot(tracked_slot) {
+            request.from_slot = Some(from_slot);
+        }
+        request
+    }
+
+    const fn replay_from_slot(&self, tracked_slot: u64) -> Option<u64> {
+        match self.replay_mode {
+            ProviderReplayMode::Live => None,
+            ProviderReplayMode::Resume => {
+                if tracked_slot == 0 {
+                    None
+                } else {
+                    Some(match self.commitment {
+                        YellowstoneGrpcCommitment::Processed => tracked_slot.saturating_sub(31),
+                        YellowstoneGrpcCommitment::Confirmed
+                        | YellowstoneGrpcCommitment::Finalized => tracked_slot,
+                    })
+                }
+            }
+            ProviderReplayMode::FromSlot(slot) => {
+                if tracked_slot == 0 {
+                    Some(slot)
+                } else {
+                    Some(match self.commitment {
+                        YellowstoneGrpcCommitment::Processed => tracked_slot.saturating_sub(31),
+                        YellowstoneGrpcCommitment::Confirmed
+                        | YellowstoneGrpcCommitment::Finalized => tracked_slot,
+                    })
+                }
+            }
+        }
+    }
+}
+
 /// Yellowstone transaction-stream error surface.
 #[derive(Debug, Error)]
 pub enum YellowstoneGrpcError {
@@ -334,11 +475,30 @@ pub enum YellowstoneGrpcError {
     #[error("yellowstone transaction conversion failed: {0}")]
     Convert(&'static str),
     /// Yellowstone protocol/runtime failure.
-    #[error("yellowstone protocol error: {0}")]
-    Protocol(String),
+    #[error(transparent)]
+    Protocol(#[from] YellowstoneGrpcProtocolError),
     /// Provider-stream queue is closed.
     #[error("provider-stream queue closed")]
     QueueClosed,
+}
+
+/// Typed Yellowstone protocol/runtime failures.
+#[derive(Debug, Error)]
+pub enum YellowstoneGrpcProtocolError {
+    /// One Yellowstone transaction stream stopped making progress.
+    #[error("yellowstone transaction stream stalled without inbound progress")]
+    TransactionStreamStalled,
+    /// One Yellowstone slot stream stopped making progress.
+    #[error("yellowstone slot stream stalled without inbound progress")]
+    SlotStreamStalled,
+    /// Reconnect attempts were exhausted.
+    ///
+    /// `attempts` is the consecutive-failure count that tripped the budget.
+    #[error("exhausted yellowstone reconnect attempts after {attempts} failures")]
+    ReconnectBudgetExhausted {
+        /// Consecutive-failure count that exhausted the reconnect budget.
+        attempts: u32,
+    },
 }
 
 type YellowstoneSubscribeSink = std::pin::Pin<
@@ -471,7 +631,115 @@ pub async fn spawn_yellowstone_grpc_transaction_source(
                     detail.clone(),
                 )
                 .await?;
-                return Err(YellowstoneGrpcError::Protocol(detail));
+                return Err(
+                    YellowstoneGrpcProtocolError::ReconnectBudgetExhausted { attempts }.into(),
+                );
+            }
+            tokio::time::sleep(config.reconnect_delay).await;
+        }
+    }))
+}
+
+/// Spawns one Yellowstone gRPC slot forwarder into a SOF provider-stream queue.
+pub async fn spawn_yellowstone_grpc_slot_source(
+    config: YellowstoneGrpcSlotsConfig,
+    sender: ProviderStreamSender,
+) -> Result<JoinHandle<Result<(), YellowstoneGrpcError>>, YellowstoneGrpcError> {
+    let first_session = establish_yellowstone_slot_session(&config, 0).await?;
+    Ok(tokio::spawn(async move {
+        let mut attempts = 0_u32;
+        let mut tracked_slot = 0_u64;
+        let mut watermarks = ProviderCommitmentWatermarks::default();
+        let mut slot_states = HashMap::new();
+        let mut first_session = Some(first_session);
+        loop {
+            let mut session_established = false;
+            let session = match first_session.take() {
+                Some(session) => Ok(session),
+                None => establish_yellowstone_slot_session(&config, tracked_slot).await,
+            };
+            match session {
+                Ok((subscribe_tx, stream)) => match run_yellowstone_slot_connection(
+                    &config,
+                    &sender,
+                    &mut tracked_slot,
+                    &mut watermarks,
+                    &mut slot_states,
+                    &mut session_established,
+                    subscribe_tx,
+                    stream,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        let detail = "yellowstone slot stream ended unexpectedly".to_owned();
+                        tracing::warn!(
+                            endpoint = config.endpoint(),
+                            detail,
+                            "provider stream yellowstone slot session ended unexpectedly; reconnecting"
+                        );
+                        send_provider_slot_health(
+                            &sender,
+                            ProviderSourceHealthStatus::Reconnecting,
+                            ProviderSourceHealthReason::UpstreamStreamClosedUnexpectedly,
+                            detail,
+                        )
+                        .await?;
+                    }
+                    Err(YellowstoneGrpcError::QueueClosed) => {
+                        return Err(YellowstoneGrpcError::QueueClosed);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            endpoint = config.endpoint(),
+                            "provider stream yellowstone slot session ended; reconnecting"
+                        );
+                        send_provider_slot_health(
+                            &sender,
+                            ProviderSourceHealthStatus::Reconnecting,
+                            yellowstone_health_reason(&error),
+                            error.to_string(),
+                        )
+                        .await?;
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        endpoint = config.endpoint(),
+                        "provider stream yellowstone slot connect/subscribe failed; reconnecting"
+                    );
+                    send_provider_slot_health(
+                        &sender,
+                        ProviderSourceHealthStatus::Reconnecting,
+                        yellowstone_health_reason(&error),
+                        error.to_string(),
+                    )
+                    .await?;
+                }
+            }
+            if session_established {
+                attempts = 0;
+            } else {
+                attempts = attempts.saturating_add(1);
+            }
+            if let Some(max_attempts) = config.max_reconnect_attempts
+                && attempts >= max_attempts
+            {
+                let detail = format!(
+                    "exhausted yellowstone slot reconnect attempts after {attempts} failures"
+                );
+                send_provider_slot_health(
+                    &sender,
+                    ProviderSourceHealthStatus::Unhealthy,
+                    ProviderSourceHealthReason::ReconnectBudgetExhausted,
+                    detail.clone(),
+                )
+                .await?;
+                return Err(
+                    YellowstoneGrpcProtocolError::ReconnectBudgetExhausted { attempts }.into(),
+                );
             }
             tokio::time::sleep(config.reconnect_delay).await;
         }
@@ -494,7 +762,7 @@ async fn run_yellowstone_transaction_connection(
         sender,
         ProviderSourceHealthStatus::Healthy,
         ProviderSourceHealthReason::SubscriptionAckReceived,
-        "subscription acknowledged".to_owned(),
+        PROVIDER_SUBSCRIPTION_ACKNOWLEDGED.to_owned(),
     )
     .await?;
     let mut ping = config.ping_interval.map(tokio::time::interval);
@@ -524,9 +792,7 @@ async fn run_yellowstone_transaction_connection(
                     futures_util::future::pending::<()>().await;
                 }
             } => {
-                return Err(YellowstoneGrpcError::Protocol(
-                    "yellowstone stream stalled without inbound progress".to_owned(),
-                ));
+                return Err(YellowstoneGrpcProtocolError::TransactionStreamStalled.into());
             }
             maybe_update = stream.next() => {
                 let Some(update) = maybe_update else {
@@ -578,6 +844,93 @@ async fn run_yellowstone_transaction_connection(
     }
 }
 
+async fn run_yellowstone_slot_connection(
+    config: &YellowstoneGrpcSlotsConfig,
+    sender: &ProviderStreamSender,
+    tracked_slot: &mut u64,
+    watermarks: &mut ProviderCommitmentWatermarks,
+    slot_states: &mut HashMap<u64, ForkSlotStatus>,
+    session_established: &mut bool,
+    mut subscribe_tx: YellowstoneSubscribeSink,
+    mut stream: YellowstoneUpdateStream,
+) -> Result<(), YellowstoneGrpcError> {
+    *session_established = false;
+    *session_established = true;
+    send_provider_slot_health(
+        sender,
+        ProviderSourceHealthStatus::Healthy,
+        ProviderSourceHealthReason::SubscriptionAckReceived,
+        PROVIDER_SUBSCRIPTION_ACKNOWLEDGED.to_owned(),
+    )
+    .await?;
+    let mut ping = config.ping_interval.map(tokio::time::interval);
+    let mut last_progress = Instant::now();
+    loop {
+        tokio::select! {
+            () = async {
+                if let Some(interval) = ping.as_mut() {
+                    interval.tick().await;
+                } else {
+                    futures_util::future::pending::<()>().await;
+                }
+            } => {
+                subscribe_tx
+                    .send(SubscribeRequest {
+                        ping: Some(SubscribeRequestPing { id: 1 }),
+                        ..SubscribeRequest::default()
+                    })
+                    .await
+                    .map_err(GeyserGrpcClientError::SubscribeSendError)?;
+            }
+            () = async {
+                if let Some(timeout) = config.stall_timeout {
+                    let deadline = last_progress.checked_add(timeout).unwrap_or(last_progress);
+                    tokio::time::sleep_until(deadline.into()).await;
+                } else {
+                    futures_util::future::pending::<()>().await;
+                }
+            } => {
+                return Err(YellowstoneGrpcProtocolError::SlotStreamStalled.into());
+            }
+            maybe_update = stream.next() => {
+                let Some(update) = maybe_update else {
+                    return Ok(());
+                };
+                let update = update?;
+                last_progress = Instant::now();
+                match update.update_oneof {
+                    Some(UpdateOneof::Slot(slot_update)) => {
+                        *tracked_slot = (*tracked_slot).max(slot_update.slot);
+                        if let Some(event) = slot_status_event_from_update(
+                            slot_update.slot,
+                            slot_update.parent,
+                            SlotStatus::try_from(slot_update.status).ok(),
+                            watermarks,
+                            slot_states,
+                        ) {
+                            sender
+                                .send(ProviderStreamUpdate::SlotStatus(event))
+                                .await
+                                .map_err(|_error| YellowstoneGrpcError::QueueClosed)?;
+                        }
+                    }
+                    Some(UpdateOneof::Ping(_)) => {
+                        subscribe_tx
+                            .send(SubscribeRequest {
+                                ping: Some(SubscribeRequestPing { id: 1 }),
+                                ..SubscribeRequest::default()
+                            })
+                            .await
+                            .map_err(GeyserGrpcClientError::SubscribeSendError)?;
+                    }
+                    Some(UpdateOneof::Pong(_)) | None => {}
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 async fn establish_yellowstone_transaction_session(
     config: &YellowstoneGrpcConfig,
     tracked_slot: u64,
@@ -585,6 +938,23 @@ async fn establish_yellowstone_transaction_session(
     let mut builder = GeyserGrpcClient::build_from_shared(config.endpoint.clone())?
         .x_token(config.x_token.clone())?
         .max_decoding_message_size(config.max_decoding_message_size);
+    if let Some(timeout) = config.connect_timeout {
+        builder = builder.connect_timeout(timeout);
+    }
+    let mut client = builder.connect().await?;
+    let (subscribe_tx, stream) = client
+        .subscribe_with_request(Some(config.subscribe_request_with_state(tracked_slot)))
+        .await?;
+    Ok((Box::pin(subscribe_tx), Box::pin(stream)))
+}
+
+async fn establish_yellowstone_slot_session(
+    config: &YellowstoneGrpcSlotsConfig,
+    tracked_slot: u64,
+) -> Result<(YellowstoneSubscribeSink, YellowstoneUpdateStream), YellowstoneGrpcError> {
+    let mut builder = GeyserGrpcClient::build_from_shared(config.endpoint.clone())?
+        .x_token(config.x_token.clone())?
+        .max_decoding_message_size(64 * 1024 * 1024);
     if let Some(timeout) = config.connect_timeout {
         builder = builder.connect_timeout(timeout);
     }
@@ -612,6 +982,23 @@ async fn send_provider_health(
         .map_err(|_error| YellowstoneGrpcError::QueueClosed)
 }
 
+async fn send_provider_slot_health(
+    sender: &ProviderStreamSender,
+    status: ProviderSourceHealthStatus,
+    reason: ProviderSourceHealthReason,
+    message: String,
+) -> Result<(), YellowstoneGrpcError> {
+    sender
+        .send(ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
+            source: ProviderSourceId::YellowstoneGrpcSlots,
+            status,
+            reason,
+            message,
+        }))
+        .await
+        .map_err(|_error| YellowstoneGrpcError::QueueClosed)
+}
+
 const fn yellowstone_health_reason(error: &YellowstoneGrpcError) -> ProviderSourceHealthReason {
     match error {
         YellowstoneGrpcError::Build(_)
@@ -623,6 +1010,8 @@ const fn yellowstone_health_reason(error: &YellowstoneGrpcError) -> ProviderSour
         YellowstoneGrpcError::QueueClosed => ProviderSourceHealthReason::UpstreamProtocolFailure,
     }
 }
+
+const PROVIDER_SUBSCRIPTION_ACKNOWLEDGED: &str = "subscription acknowledged";
 
 fn transaction_event_from_update(
     slot: u64,
@@ -660,6 +1049,61 @@ fn transaction_event_from_update(
         },
         tx: std::sync::Arc::new(tx),
     })
+}
+
+fn slot_status_event_from_update(
+    slot: u64,
+    parent_slot: Option<u64>,
+    status: Option<SlotStatus>,
+    watermarks: &mut ProviderCommitmentWatermarks,
+    slot_states: &mut HashMap<u64, ForkSlotStatus>,
+) -> Option<SlotStatusEvent> {
+    let mapped = match status? {
+        SlotStatus::SlotConfirmed => {
+            watermarks.observe_confirmed_slot(slot);
+            ForkSlotStatus::Confirmed
+        }
+        SlotStatus::SlotFinalized => {
+            watermarks.observe_finalized_slot(slot);
+            ForkSlotStatus::Finalized
+        }
+        SlotStatus::SlotDead => ForkSlotStatus::Orphaned,
+        SlotStatus::SlotProcessed
+        | SlotStatus::SlotFirstShredReceived
+        | SlotStatus::SlotCompleted
+        | SlotStatus::SlotCreatedBank => ForkSlotStatus::Processed,
+    };
+    let previous_status = slot_states.insert(slot, mapped);
+    if previous_status == Some(mapped) {
+        return None;
+    }
+    Some(SlotStatusEvent {
+        slot,
+        parent_slot,
+        previous_status,
+        status: mapped,
+        tip_slot: None,
+        confirmed_slot: watermarks.confirmed_slot,
+        finalized_slot: watermarks.finalized_slot,
+    })
+}
+
+impl ProviderStreamFanIn {
+    /// Spawns one Yellowstone gRPC transaction source into this fan-in.
+    pub async fn spawn_yellowstone_grpc_transaction_source(
+        &self,
+        config: YellowstoneGrpcConfig,
+    ) -> Result<JoinHandle<Result<(), YellowstoneGrpcError>>, YellowstoneGrpcError> {
+        spawn_yellowstone_grpc_transaction_source(config, self.sender()).await
+    }
+
+    /// Spawns one Yellowstone gRPC slot source into this fan-in.
+    pub async fn spawn_yellowstone_grpc_slot_source(
+        &self,
+        config: YellowstoneGrpcSlotsConfig,
+    ) -> Result<JoinHandle<Result<(), YellowstoneGrpcError>>, YellowstoneGrpcError> {
+        spawn_yellowstone_grpc_slot_source(config, self.sender()).await
+    }
 }
 
 #[inline]
@@ -810,6 +1254,16 @@ mod tests {
             .subscribe_request_with_state(0);
         assert!(request.slots.contains_key(INTERNAL_SLOT_FILTER));
         assert_eq!(request.from_slot, Some(200));
+    }
+
+    #[test]
+    fn yellowstone_slot_subscribe_request_tracks_slots_and_replay_cursor() {
+        let request = YellowstoneGrpcSlotsConfig::new("http://127.0.0.1:10000")
+            .with_replay_mode(ProviderReplayMode::FromSlot(200))
+            .with_commitment(YellowstoneGrpcCommitment::Processed)
+            .subscribe_request_with_state(250);
+        assert!(request.slots.contains_key("sof"));
+        assert_eq!(request.from_slot, Some(219));
     }
 
     #[test]
