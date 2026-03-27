@@ -9,10 +9,11 @@ use std::{cell::RefCell, sync::Arc};
 use thiserror::Error;
 
 use crate::framework::events::{
-    AccountTouchEvent, AccountTouchEventRef, AccountUpdateEvent, ClusterTopologyEvent,
-    DatasetEvent, LeaderScheduleEvent, ObservedRecentBlockhashEvent, RawPacketEvent, ReorgEvent,
-    ShredEvent, SlotStatusEvent, TransactionBatchEvent, TransactionEvent, TransactionEventRef,
-    TransactionLogEvent, TransactionStatusEvent, TransactionViewBatchEvent,
+    AccountTouchEvent, AccountTouchEventRef, AccountUpdateEvent, BlockMetaEvent,
+    ClusterTopologyEvent, DatasetEvent, LeaderScheduleEvent, ObservedRecentBlockhashEvent,
+    RawPacketEvent, ReorgEvent, ShredEvent, SlotStatusEvent, TransactionBatchEvent,
+    TransactionEvent, TransactionEventRef, TransactionLogEvent, TransactionStatusEvent,
+    TransactionViewBatchEvent,
 };
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -402,6 +403,8 @@ pub struct PluginConfig {
     pub account_touch: bool,
     /// Enables `on_account_update`.
     pub account_update: bool,
+    /// Enables `on_block_meta`.
+    pub block_meta: bool,
     /// Enables `on_slot_status`.
     pub slot_status: bool,
     /// Enables `on_reorg`.
@@ -578,6 +581,13 @@ impl PluginConfig {
     #[must_use]
     pub const fn with_account_update(mut self) -> Self {
         self.account_update = true;
+        self
+    }
+
+    /// Enables `on_block_meta`.
+    #[must_use]
+    pub const fn with_block_meta(mut self) -> Self {
+        self.block_meta = true;
         self
     }
 
@@ -818,6 +828,14 @@ pub trait ObserverPlugin: Send + Sync + 'static {
 
     /// Called for one upstream account update.
     async fn on_account_update(&self, _event: &AccountUpdateEvent) {}
+
+    /// Returns true when this plugin wants a specific block-meta callback.
+    fn accepts_block_meta(&self, _event: &BlockMetaEvent) -> bool {
+        true
+    }
+
+    /// Called for one upstream block-meta update.
+    async fn on_block_meta(&self, _event: &BlockMetaEvent) {}
 
     /// Returns true when this plugin wants a specific account-update callback.
     fn accepts_account_update(&self, _event: &AccountUpdateEvent) -> bool {

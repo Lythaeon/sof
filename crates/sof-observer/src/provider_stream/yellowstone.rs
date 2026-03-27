@@ -4,6 +4,7 @@
 
 use std::{
     collections::HashMap,
+    str::FromStr,
     time::{Duration, Instant},
 };
 
@@ -22,15 +23,16 @@ use tokio::task::JoinHandle;
 use yellowstone_grpc_client::{GeyserGrpcBuilderError, GeyserGrpcClient, GeyserGrpcClientError};
 use yellowstone_grpc_proto::prelude::{
     CommitmentLevel, SlotStatus, SubscribeRequest, SubscribeRequestFilterAccounts,
-    SubscribeRequestFilterSlots, SubscribeRequestFilterTransactions, SubscribeRequestPing,
-    SubscribeUpdate, subscribe_update::UpdateOneof,
+    SubscribeRequestFilterBlocksMeta, SubscribeRequestFilterSlots,
+    SubscribeRequestFilterTransactions, SubscribeRequestPing, SubscribeUpdate,
+    subscribe_update::UpdateOneof,
 };
 
 use crate::{
     event::{ForkSlotStatus, TxCommitmentStatus, TxKind},
     framework::{
-        AccountUpdateEvent, SlotStatusEvent, TransactionEvent, TransactionStatusEvent,
-        pubkey_bytes, signature_bytes_opt,
+        AccountUpdateEvent, BlockMetaEvent, SlotStatusEvent, TransactionEvent,
+        TransactionStatusEvent, pubkey_bytes, signature_bytes_opt,
     },
     provider_stream::{
         ProviderCommitmentWatermarks, ProviderReplayMode, ProviderSourceHealthEvent,
@@ -320,6 +322,12 @@ impl YellowstoneGrpcConfig {
             YellowstoneGrpcStream::Accounts => {
                 request.accounts = HashMap::from([("sof".to_owned(), self.account_filter())]);
             }
+            YellowstoneGrpcStream::BlockMeta => {
+                request.blocks_meta = HashMap::from([(
+                    "sof".to_owned(),
+                    SubscribeRequestFilterBlocksMeta::default(),
+                )]);
+            }
         }
         if let Some(from_slot) = self.replay_from_slot(tracked_slot) {
             request.from_slot = Some(from_slot);
@@ -394,6 +402,7 @@ impl YellowstoneGrpcConfig {
                 ProviderSourceId::YellowstoneGrpcTransactionStatus
             }
             YellowstoneGrpcStream::Accounts => ProviderSourceId::YellowstoneGrpcAccounts,
+            YellowstoneGrpcStream::BlockMeta => ProviderSourceId::YellowstoneGrpcBlockMeta,
         }
     }
 
@@ -404,6 +413,7 @@ impl YellowstoneGrpcConfig {
                 YellowstoneGrpcStreamKind::TransactionStatus
             }
             YellowstoneGrpcStream::Accounts => YellowstoneGrpcStreamKind::Accounts,
+            YellowstoneGrpcStream::BlockMeta => YellowstoneGrpcStreamKind::BlockMeta,
         }
     }
 }
@@ -418,6 +428,8 @@ pub enum YellowstoneGrpcStream {
     TransactionStatus,
     /// Account updates mapped onto `on_account_update`.
     Accounts,
+    /// Block-meta updates mapped onto `on_block_meta`.
+    BlockMeta,
 }
 
 /// Connection and replay config for Yellowstone slot subscriptions.
@@ -614,6 +626,8 @@ pub enum YellowstoneGrpcStreamKind {
     TransactionStatus,
     /// Account stream.
     Accounts,
+    /// Block-meta stream.
+    BlockMeta,
     /// Slot stream.
     Slots,
 }
@@ -624,6 +638,7 @@ impl std::fmt::Display for YellowstoneGrpcStreamKind {
             Self::Transaction => f.write_str("transaction"),
             Self::TransactionStatus => f.write_str("transaction-status"),
             Self::Accounts => f.write_str("account"),
+            Self::BlockMeta => f.write_str("block-meta"),
             Self::Slots => f.write_str("slot"),
         }
     }
@@ -983,6 +998,25 @@ async fn run_yellowstone_primary_connection(
                             .await
                             .map_err(|_error| YellowstoneGrpcError::QueueClosed)?;
                     }
+                    Some(UpdateOneof::BlockMeta(block_meta_update))
+                        if config.stream == YellowstoneGrpcStream::BlockMeta =>
+                    {
+                        *tracked_slot = (*tracked_slot).max(block_meta_update.slot);
+                        observe_non_transaction_commitment(
+                            watermarks,
+                            block_meta_update.slot,
+                            commitment,
+                        );
+                        let event = block_meta_event_from_update(
+                            commitment,
+                            *watermarks,
+                            block_meta_update,
+                        )?;
+                        sender
+                            .send(ProviderStreamUpdate::BlockMeta(event))
+                            .await
+                            .map_err(|_error| YellowstoneGrpcError::QueueClosed)?;
+                    }
                     Some(UpdateOneof::Slot(slot_update)) => {
                         *tracked_slot = (*tracked_slot).max(slot_update.slot);
                         match SlotStatus::try_from(slot_update.status).ok() {
@@ -1276,6 +1310,30 @@ fn account_update_event_from_yellowstone(
     })
 }
 
+fn block_meta_event_from_update(
+    commitment_status: TxCommitmentStatus,
+    watermarks: ProviderCommitmentWatermarks,
+    update: yellowstone_grpc_proto::prelude::SubscribeUpdateBlockMeta,
+) -> Result<BlockMetaEvent, YellowstoneGrpcError> {
+    let blockhash = Hash::from_str(&update.blockhash)
+        .map_err(|_error| YellowstoneGrpcError::Convert("invalid block-meta blockhash"))?;
+    let parent_blockhash = Hash::from_str(&update.parent_blockhash)
+        .map_err(|_error| YellowstoneGrpcError::Convert("invalid parent blockhash"))?;
+    Ok(BlockMetaEvent {
+        slot: update.slot,
+        commitment_status,
+        confirmed_slot: watermarks.confirmed_slot,
+        finalized_slot: watermarks.finalized_slot,
+        blockhash: blockhash.to_bytes(),
+        parent_slot: update.parent_slot,
+        parent_blockhash: parent_blockhash.to_bytes(),
+        block_time: update.block_time.map(|value| value.timestamp),
+        block_height: update.block_height.map(|value| value.block_height),
+        executed_transaction_count: update.executed_transaction_count,
+        entries_count: update.entries_count,
+    })
+}
+
 fn observe_non_transaction_commitment(
     watermarks: &mut ProviderCommitmentWatermarks,
     slot: u64,
@@ -1534,6 +1592,18 @@ mod tests {
     }
 
     #[test]
+    fn yellowstone_subscribe_request_can_target_block_meta() {
+        let request = YellowstoneGrpcConfig::new("http://127.0.0.1:10000")
+            .with_stream(YellowstoneGrpcStream::BlockMeta)
+            .subscribe_request_with_state(0);
+        assert!(request.transactions.is_empty());
+        assert!(request.accounts.is_empty());
+        assert!(request.transactions_status.is_empty());
+        assert!(request.blocks_meta.contains_key("sof"));
+        assert!(request.slots.contains_key(INTERNAL_SLOT_FILTER));
+    }
+
+    #[test]
     fn yellowstone_slot_subscribe_request_tracks_slots_and_replay_cursor() {
         let request = YellowstoneGrpcSlotsConfig::new("http://127.0.0.1:10000")
             .with_replay_mode(ProviderReplayMode::FromSlot(200))
@@ -1754,6 +1824,51 @@ mod tests {
         server.await.expect("Yellowstone server task");
     }
 
+    #[tokio::test]
+    async fn yellowstone_local_source_delivers_block_meta_update() {
+        let update = sample_block_meta_update(94);
+        let (addr, shutdown_tx, server) = spawn_yellowstone_test_server(MockYellowstone {
+            expected_stream: MockYellowstoneStream::BlockMeta,
+            expected_account: None,
+            expected_owner: None,
+            update,
+        })
+        .await;
+
+        let (tx, mut rx) = create_provider_stream_queue(8);
+        let config = YellowstoneGrpcConfig::new(format!("http://{addr}"))
+            .with_stream(YellowstoneGrpcStream::BlockMeta)
+            .with_max_reconnect_attempts(1)
+            .with_reconnect_delay(Duration::from_millis(10))
+            .with_connect_timeout(Duration::from_secs(2));
+        let handle = spawn_yellowstone_grpc_transaction_source(config, tx)
+            .await
+            .expect("spawn Yellowstone block-meta source");
+
+        let event = loop {
+            let update = timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("provider update timeout")
+                .expect("provider update");
+            match update {
+                ProviderStreamUpdate::BlockMeta(event) => break event,
+                ProviderStreamUpdate::Health(_) => continue,
+                other => panic!("expected block-meta update, got {other:?}"),
+            }
+        };
+        assert_eq!(event.slot, 94);
+        assert_eq!(event.parent_slot, 93);
+        assert_eq!(event.block_time, Some(1_700_000_094));
+        assert_eq!(event.block_height, Some(9_094));
+        assert_eq!(event.executed_transaction_count, 12);
+        assert_eq!(event.entries_count, 5);
+
+        handle.abort();
+        handle.await.ok();
+        let _ = shutdown_tx.send(());
+        server.await.expect("Yellowstone server task");
+    }
+
     fn proto_transaction_from_versioned(tx: &VersionedTransaction) -> Transaction {
         let message = match &tx.message {
             VersionedMessage::Legacy(message) => ProtoMessage {
@@ -1891,11 +2006,36 @@ mod tests {
         }
     }
 
+    fn sample_block_meta_update(slot: u64) -> SubscribeUpdate {
+        SubscribeUpdate {
+            filters: vec!["sof".to_owned()],
+            created_at: None,
+            update_oneof: Some(UpdateOneof::BlockMeta(
+                yellowstone_grpc_proto::prelude::SubscribeUpdateBlockMeta {
+                    slot,
+                    blockhash: Hash::new_unique().to_string(),
+                    rewards: None,
+                    block_time: Some(yellowstone_grpc_proto::prelude::UnixTimestamp {
+                        timestamp: 1_700_000_000 + i64::try_from(slot).unwrap_or(0),
+                    }),
+                    block_height: Some(yellowstone_grpc_proto::prelude::BlockHeight {
+                        block_height: 9_000 + slot,
+                    }),
+                    parent_slot: slot.saturating_sub(1),
+                    parent_blockhash: Hash::new_unique().to_string(),
+                    executed_transaction_count: 12,
+                    entries_count: 5,
+                },
+            )),
+        }
+    }
+
     #[derive(Clone, Copy)]
     enum MockYellowstoneStream {
         Transaction,
         TransactionStatus,
         Accounts,
+        BlockMeta,
         Slots,
     }
 
@@ -1941,6 +2081,9 @@ mod tests {
                     if let Some(owner) = &self.expected_owner {
                         assert!(filter.owner.iter().any(|value| value == owner));
                     }
+                }
+                MockYellowstoneStream::BlockMeta => {
+                    assert!(first.blocks_meta.contains_key("sof"));
                 }
                 MockYellowstoneStream::Slots => {
                     assert!(first.slots.contains_key("sof"));

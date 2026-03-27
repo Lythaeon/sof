@@ -13,13 +13,14 @@
 //!   `transactionSubscribe`
 //! - richer built-in source selectors, such as websocket
 //!   `accountSubscribe` / `programSubscribe` or gRPC transaction-status /
-//!   account feeds, should be fed through `ProviderStreamMode::Generic`
+//!   account / block-meta feeds, should be fed through
+//!   `ProviderStreamMode::Generic`
 //! - built-in websocket logs and gRPC slot feeds are also intended to fan into
 //!   `ProviderStreamMode::Generic`
 //!
 //! Generic provider producers may still enqueue `TransactionViewBatch`,
-//! `RecentBlockhash`, `SlotStatus`, `ClusterTopology`, `LeaderSchedule`, or
-//! `Reorg` updates directly.
+//! `BlockMeta`, `RecentBlockhash`, `SlotStatus`, `ClusterTopology`,
+//! `LeaderSchedule`, or `Reorg` updates directly.
 //!
 //! `ProviderStreamMode::Generic` is SOF's typed custom-adapter mode.
 //! Your producer ingests an upstream format and maps it into one of the
@@ -36,14 +37,16 @@
 //! - Yellowstone:
 //!   - [`yellowstone::YellowstoneGrpcConfig`] can target
 //!     [`yellowstone::YellowstoneGrpcStream::Transaction`],
-//!     [`yellowstone::YellowstoneGrpcStream::TransactionStatus`], or
-//!     [`yellowstone::YellowstoneGrpcStream::Accounts`]
+//!     [`yellowstone::YellowstoneGrpcStream::TransactionStatus`],
+//!     [`yellowstone::YellowstoneGrpcStream::Accounts`], or
+//!     [`yellowstone::YellowstoneGrpcStream::BlockMeta`]
 //!   - [`yellowstone::YellowstoneGrpcSlotsConfig`] targets slot updates
 //! - LaserStream:
 //!   - [`laserstream::LaserStreamConfig`] can target
 //!     [`laserstream::LaserStreamStream::Transaction`],
-//!     [`laserstream::LaserStreamStream::TransactionStatus`], or
-//!     [`laserstream::LaserStreamStream::Accounts`]
+//!     [`laserstream::LaserStreamStream::TransactionStatus`],
+//!     [`laserstream::LaserStreamStream::Accounts`], or
+//!     [`laserstream::LaserStreamStream::BlockMeta`]
 //!   - [`laserstream::LaserStreamSlotsConfig`] targets slot updates
 //!
 //! Those source selectors do not create a second runtime API. They extend the
@@ -67,6 +70,8 @@
 //!   - drives `on_transaction_view_batch`
 //! - `AccountUpdate`:
 //!   - drives `on_account_update`
+//! - `BlockMeta`:
+//!   - drives `on_block_meta`
 //! - `RecentBlockhash`:
 //!   - drives `on_recent_blockhash`
 //! - `SlotStatus`:
@@ -131,9 +136,9 @@ use tokio::sync::mpsc;
 use crate::event::TxCommitmentStatus;
 use crate::event::TxKind;
 use crate::framework::{
-    AccountUpdateEvent, ClusterTopologyEvent, LeaderScheduleEvent, ObservedRecentBlockhashEvent,
-    ReorgEvent, SlotStatusEvent, TransactionEvent, TransactionLogEvent, TransactionStatusEvent,
-    TransactionViewBatchEvent,
+    AccountUpdateEvent, BlockMetaEvent, ClusterTopologyEvent, LeaderScheduleEvent,
+    ObservedRecentBlockhashEvent, ReorgEvent, SlotStatusEvent, TransactionEvent,
+    TransactionLogEvent, TransactionStatusEvent, TransactionViewBatchEvent,
 };
 use agave_transaction_view::{
     transaction_data::TransactionData, transaction_view::SanitizedTransactionView,
@@ -168,6 +173,7 @@ pub enum ProviderStreamMode {
     /// - `TransactionStatus` -> `on_transaction_status`
     /// - `TransactionViewBatch` -> `on_transaction_view_batch`
     /// - `AccountUpdate` -> `on_account_update`
+    /// - `BlockMeta` -> `on_block_meta`
     /// - `RecentBlockhash` -> `on_recent_blockhash`
     /// - `SlotStatus` -> `on_slot_status`
     /// - `ClusterTopology` -> `on_cluster_topology`
@@ -255,6 +261,8 @@ pub enum ProviderStreamUpdate {
     TransactionViewBatch(TransactionViewBatchEvent),
     /// One provider account update.
     AccountUpdate(AccountUpdateEvent),
+    /// One provider block-meta update.
+    BlockMeta(BlockMetaEvent),
     /// One provider recent-blockhash observation.
     RecentBlockhash(ObservedRecentBlockhashEvent),
     /// One provider slot-status update.
@@ -302,6 +310,12 @@ impl From<TransactionViewBatchEvent> for ProviderStreamUpdate {
 impl From<AccountUpdateEvent> for ProviderStreamUpdate {
     fn from(event: AccountUpdateEvent) -> Self {
         Self::AccountUpdate(event)
+    }
+}
+
+impl From<BlockMetaEvent> for ProviderStreamUpdate {
+    fn from(event: BlockMetaEvent) -> Self {
+        Self::BlockMeta(event)
     }
 }
 
@@ -365,6 +379,8 @@ pub enum ProviderSourceId {
     YellowstoneGrpcTransactionStatus,
     /// Built-in Yellowstone gRPC account source.
     YellowstoneGrpcAccounts,
+    /// Built-in Yellowstone gRPC block-meta source.
+    YellowstoneGrpcBlockMeta,
     /// Built-in Yellowstone gRPC slot source.
     YellowstoneGrpcSlots,
     /// Built-in LaserStream source.
@@ -373,6 +389,8 @@ pub enum ProviderSourceId {
     LaserStreamTransactionStatus,
     /// Built-in LaserStream account source.
     LaserStreamAccounts,
+    /// Built-in LaserStream block-meta source.
+    LaserStreamBlockMeta,
     /// Built-in LaserStream slot source.
     LaserStreamSlots,
     #[cfg(feature = "provider-websocket")]
@@ -398,10 +416,12 @@ impl ProviderSourceId {
             Self::YellowstoneGrpc => "yellowstone_grpc",
             Self::YellowstoneGrpcTransactionStatus => "yellowstone_grpc_transaction_status",
             Self::YellowstoneGrpcAccounts => "yellowstone_grpc_accounts",
+            Self::YellowstoneGrpcBlockMeta => "yellowstone_grpc_block_meta",
             Self::YellowstoneGrpcSlots => "yellowstone_grpc_slots",
             Self::LaserStream => "laserstream",
             Self::LaserStreamTransactionStatus => "laserstream_transaction_status",
             Self::LaserStreamAccounts => "laserstream_accounts",
+            Self::LaserStreamBlockMeta => "laserstream_block_meta",
             Self::LaserStreamSlots => "laserstream_slots",
             #[cfg(feature = "provider-websocket")]
             Self::WebsocketTransaction => "websocket_transaction",

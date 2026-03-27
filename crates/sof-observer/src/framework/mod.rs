@@ -34,7 +34,7 @@ pub use derived_state::{
     InMemoryDerivedStateReplaySource, SlotStatusChangedEvent, TransactionAppliedEvent,
 };
 pub use events::{
-    AccountTouchEvent, AccountTouchEventRef, AccountUpdateEvent, ClusterNodeInfo,
+    AccountTouchEvent, AccountTouchEventRef, AccountUpdateEvent, BlockMetaEvent, ClusterNodeInfo,
     ClusterTopologyEvent, ControlPlaneSource, DatasetEvent, LeaderScheduleEntry,
     LeaderScheduleEvent, ObservedRecentBlockhashEvent, RawPacketEvent, ReorgEvent,
     SerializedTransactionRange, ShredEvent, SlotStatusEvent, TransactionBatchEvent,

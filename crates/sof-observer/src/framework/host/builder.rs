@@ -335,6 +335,10 @@ impl PluginHostBuilder {
             collect_hook_plugins(&plugins, &plugin_subscriptions, |subscription| {
                 subscription.account_update
             });
+        let block_meta_plugins =
+            collect_hook_plugins(&plugins, &plugin_subscriptions, |subscription| {
+                subscription.block_meta
+            });
         let slot_status_plugins =
             collect_hook_plugins(&plugins, &plugin_subscriptions, |subscription| {
                 subscription.slot_status
@@ -381,6 +385,7 @@ impl PluginHostBuilder {
                 .any(|subscription| subscription.inline_transaction_view_batch),
             account_touch: !account_touch_plugins.is_empty(),
             account_update: !account_update_plugins.is_empty(),
+            block_meta: !block_meta_plugins.is_empty(),
             slot_status: !slot_status_plugins.is_empty(),
             reorg: !reorg_plugins.is_empty(),
             recent_blockhash: !recent_blockhash_plugins.is_empty(),
@@ -398,6 +403,7 @@ impl PluginHostBuilder {
                 transaction_view_batch: transaction_view_batch_plugins.clone(),
                 account_touch: account_touch_plugins.clone(),
                 account_update: account_update_plugins.clone(),
+                block_meta: block_meta_plugins.clone(),
                 slot_status: slot_status_plugins,
                 reorg: reorg_plugins,
                 recent_blockhash: recent_blockhash_plugins,
@@ -432,6 +438,7 @@ impl PluginHostBuilder {
             transaction_view_batch_plugin_inline_preferences,
             account_touch_plugins,
             account_update_plugins,
+            block_meta_plugins,
             dispatcher,
             transaction_dispatcher,
             subscriptions,

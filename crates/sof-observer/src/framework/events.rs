@@ -134,6 +134,33 @@ pub struct TransactionStatusEvent {
     pub err: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+/// Runtime event emitted for one upstream block-metadata update.
+pub struct BlockMetaEvent {
+    /// Slot context attached to the upstream block-meta update.
+    pub slot: u64,
+    /// Commitment status configured for the upstream subscription.
+    pub commitment_status: TxCommitmentStatus,
+    /// Latest observed confirmed slot watermark when event was emitted.
+    pub confirmed_slot: Option<u64>,
+    /// Latest observed finalized slot watermark when event was emitted.
+    pub finalized_slot: Option<u64>,
+    /// Current blockhash for this slot.
+    pub blockhash: [u8; 32],
+    /// Parent slot for this block.
+    pub parent_slot: u64,
+    /// Parent blockhash for this block.
+    pub parent_blockhash: [u8; 32],
+    /// Provider-reported block time when available.
+    pub block_time: Option<i64>,
+    /// Provider-reported block height when available.
+    pub block_height: Option<u64>,
+    /// Number of executed transactions in this block.
+    pub executed_transaction_count: u64,
+    /// Number of entries in this block.
+    pub entries_count: u64,
+}
+
 #[derive(Debug, Clone)]
 /// Runtime event emitted once per completed dataset with all decoded transactions.
 ///

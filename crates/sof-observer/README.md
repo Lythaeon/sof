@@ -161,11 +161,13 @@ Built-in source selectors:
   - `YellowstoneGrpcConfig::with_stream(YellowstoneGrpcStream::Transaction)`
   - `YellowstoneGrpcConfig::with_stream(YellowstoneGrpcStream::TransactionStatus)`
   - `YellowstoneGrpcConfig::with_stream(YellowstoneGrpcStream::Accounts)`
+  - `YellowstoneGrpcConfig::with_stream(YellowstoneGrpcStream::BlockMeta)`
   - `YellowstoneGrpcSlotsConfig` for slot updates
 - LaserStream:
   - `LaserStreamConfig::with_stream(LaserStreamStream::Transaction)`
   - `LaserStreamConfig::with_stream(LaserStreamStream::TransactionStatus)`
   - `LaserStreamConfig::with_stream(LaserStreamStream::Accounts)`
+  - `LaserStreamConfig::with_stream(LaserStreamStream::BlockMeta)`
   - `LaserStreamSlotsConfig` for slot updates
 
 Typed runtime mapping for those richer sources:
@@ -174,6 +176,7 @@ Typed runtime mapping for those richer sources:
 - websocket logs -> `on_transaction_log`
 - transaction-status feeds -> `on_transaction_status`
 - account/program/account-stream feeds -> `on_account_update`
+- block-meta feeds -> `on_block_meta`
 - slot feeds -> `on_slot_status`
 
 Built-in processed providers still do not expose standalone control-plane hooks

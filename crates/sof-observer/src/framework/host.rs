@@ -159,6 +159,8 @@ struct PluginHookSubscriptions {
     account_touch: bool,
     /// At least one plugin wants account-update callbacks.
     account_update: bool,
+    /// At least one plugin wants block-meta callbacks.
+    block_meta: bool,
     /// At least one plugin wants slot-status callbacks.
     slot_status: bool,
     /// At least one plugin wants reorg callbacks.
@@ -201,6 +203,7 @@ impl From<&PluginConfig> for PluginHookSubscriptions {
                 ),
             account_touch: config.account_touch,
             account_update: config.account_update,
+            block_meta: config.block_meta,
             slot_status: config.slot_status,
             reorg: config.reorg,
             recent_blockhash: config.recent_blockhash,

@@ -9,6 +9,7 @@
 
 use std::{
     collections::HashMap,
+    str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -38,7 +39,10 @@ use tokio::task::JoinHandle;
 
 use crate::{
     event::{ForkSlotStatus, TxCommitmentStatus, TxKind},
-    framework::{AccountUpdateEvent, SlotStatusEvent, TransactionEvent, TransactionStatusEvent},
+    framework::{
+        AccountUpdateEvent, BlockMetaEvent, SlotStatusEvent, TransactionEvent,
+        TransactionStatusEvent,
+    },
     provider_stream::{
         ProviderCommitmentWatermarks, ProviderReplayMode, ProviderSourceHealthEvent,
         ProviderSourceHealthReason, ProviderSourceHealthStatus, ProviderSourceId,
@@ -335,6 +339,12 @@ impl LaserStreamConfig {
             LaserStreamStream::Accounts => {
                 request.accounts = HashMap::from([("sof".to_owned(), self.account_filter())]);
             }
+            LaserStreamStream::BlockMeta => {
+                request.blocks_meta = HashMap::from([(
+                    "sof".to_owned(),
+                    grpc::SubscribeRequestFilterBlocksMeta::default(),
+                )]);
+            }
         }
         request
     }
@@ -420,6 +430,7 @@ impl LaserStreamConfig {
             LaserStreamStream::Transaction => ProviderSourceId::LaserStream,
             LaserStreamStream::TransactionStatus => ProviderSourceId::LaserStreamTransactionStatus,
             LaserStreamStream::Accounts => ProviderSourceId::LaserStreamAccounts,
+            LaserStreamStream::BlockMeta => ProviderSourceId::LaserStreamBlockMeta,
         }
     }
 
@@ -428,6 +439,7 @@ impl LaserStreamConfig {
             LaserStreamStream::Transaction => LaserStreamStreamKind::Transaction,
             LaserStreamStream::TransactionStatus => LaserStreamStreamKind::TransactionStatus,
             LaserStreamStream::Accounts => LaserStreamStreamKind::Accounts,
+            LaserStreamStream::BlockMeta => LaserStreamStreamKind::BlockMeta,
         }
     }
 }
@@ -442,6 +454,8 @@ pub enum LaserStreamStream {
     TransactionStatus,
     /// Account updates mapped onto `on_account_update`.
     Accounts,
+    /// Block-meta updates mapped onto `on_block_meta`.
+    BlockMeta,
 }
 
 /// Connection and replay config for LaserStream slot subscriptions.
@@ -677,6 +691,8 @@ pub enum LaserStreamStreamKind {
     TransactionStatus,
     /// Account stream.
     Accounts,
+    /// Block-meta stream.
+    BlockMeta,
     /// Slot stream.
     Slots,
 }
@@ -687,6 +703,7 @@ impl std::fmt::Display for LaserStreamStreamKind {
             Self::Transaction => f.write_str("transaction"),
             Self::TransactionStatus => f.write_str("transaction-status"),
             Self::Accounts => f.write_str("account"),
+            Self::BlockMeta => f.write_str("block-meta"),
             Self::Slots => f.write_str("slot"),
         }
     }
@@ -1054,6 +1071,25 @@ async fn run_laserstream_primary_connection(
                             account_update_event_from_laserstream(account_update, commitment, *watermarks)?;
                         sender
                             .send(ProviderStreamUpdate::AccountUpdate(event))
+                            .await
+                            .map_err(|_error| LaserStreamError::QueueClosed)?;
+                    }
+                    Some(grpc::subscribe_update::UpdateOneof::BlockMeta(block_meta_update))
+                        if config.stream == LaserStreamStream::BlockMeta =>
+                    {
+                        *tracked_slot = (*tracked_slot).max(block_meta_update.slot);
+                        observe_non_transaction_commitment(
+                            watermarks,
+                            block_meta_update.slot,
+                            commitment,
+                        );
+                        let event = block_meta_event_from_update(
+                            commitment,
+                            *watermarks,
+                            block_meta_update,
+                        )?;
+                        sender
+                            .send(ProviderStreamUpdate::BlockMeta(event))
                             .await
                             .map_err(|_error| LaserStreamError::QueueClosed)?;
                     }
@@ -1453,6 +1489,30 @@ fn account_update_event_from_laserstream(
     })
 }
 
+fn block_meta_event_from_update(
+    commitment_status: TxCommitmentStatus,
+    watermarks: ProviderCommitmentWatermarks,
+    update: grpc::SubscribeUpdateBlockMeta,
+) -> Result<BlockMetaEvent, LaserStreamError> {
+    let blockhash = Hash::from_str(&update.blockhash)
+        .map_err(|_error| LaserStreamError::Convert("invalid block-meta blockhash"))?;
+    let parent_blockhash = Hash::from_str(&update.parent_blockhash)
+        .map_err(|_error| LaserStreamError::Convert("invalid parent blockhash"))?;
+    Ok(BlockMetaEvent {
+        slot: update.slot,
+        commitment_status,
+        confirmed_slot: watermarks.confirmed_slot,
+        finalized_slot: watermarks.finalized_slot,
+        blockhash: blockhash.to_bytes(),
+        parent_slot: update.parent_slot,
+        parent_blockhash: parent_blockhash.to_bytes(),
+        block_time: update.block_time.map(|value| value.timestamp),
+        block_height: update.block_height.map(|value| value.block_height),
+        executed_transaction_count: update.executed_transaction_count,
+        entries_count: update.entries_count,
+    })
+}
+
 fn signature_bytes_from_slice(
     bytes: &[u8],
     message: &'static str,
@@ -1636,7 +1696,7 @@ mod tests {
     use futures_util::stream::{self, Stream};
     use laserstream_core_proto::geyser::geyser_server::{Geyser, GeyserServer};
     use laserstream_core_proto::prelude::{
-        CompiledInstruction as ProtoCompiledInstruction, GetBlockHeightRequest,
+        BlockHeight, CompiledInstruction as ProtoCompiledInstruction, GetBlockHeightRequest,
         GetBlockHeightResponse, GetLatestBlockhashRequest, GetLatestBlockhashResponse,
         GetSlotRequest, GetSlotResponse, GetVersionRequest, GetVersionResponse,
         IsBlockhashValidRequest, IsBlockhashValidResponse, Message as ProtoMessage,
@@ -1645,7 +1705,7 @@ mod tests {
         SubscribePreprocessedRequest, SubscribePreprocessedUpdate, SubscribeReplayInfoRequest,
         SubscribeReplayInfoResponse, SubscribeRequest, SubscribeUpdate, SubscribeUpdateAccount,
         SubscribeUpdateAccountInfo, SubscribeUpdateTransactionInfo,
-        SubscribeUpdateTransactionStatus,
+        SubscribeUpdateTransactionStatus, UnixTimestamp,
     };
     use laserstream_core_proto::tonic::{self, Request, Response, Status, transport::Server};
     use solana_instruction::Instruction;
@@ -1794,6 +1854,18 @@ mod tests {
         assert_eq!(filter.account, vec![key.to_string()]);
         assert_eq!(filter.owner, vec![owner.to_string()]);
         assert_eq!(filter.nonempty_txn_signature, Some(true));
+        assert!(request.slots.contains_key(INTERNAL_WATERMARK_SLOT_FILTER));
+    }
+
+    #[test]
+    fn laserstream_subscribe_request_can_target_block_meta() {
+        let request = LaserStreamConfig::new("https://laserstream.example", "token")
+            .with_stream(LaserStreamStream::BlockMeta)
+            .subscribe_request_with_state(0);
+        assert!(request.transactions.is_empty());
+        assert!(request.accounts.is_empty());
+        assert!(request.transactions_status.is_empty());
+        assert!(request.blocks_meta.contains_key("sof"));
         assert!(request.slots.contains_key(INTERNAL_WATERMARK_SLOT_FILTER));
     }
 
@@ -1991,6 +2063,51 @@ mod tests {
         server.await.expect("LaserStream server task");
     }
 
+    #[tokio::test]
+    async fn laserstream_local_source_delivers_block_meta_update() {
+        let update = sample_block_meta_update(94);
+        let (addr, shutdown_tx, server) = spawn_laserstream_test_server(MockLaserStream {
+            expected_stream: MockLaserStreamStream::BlockMeta,
+            expected_account: None,
+            expected_owner: None,
+            update,
+        })
+        .await;
+
+        let (tx, mut rx) = create_provider_stream_queue(8);
+        let config = LaserStreamConfig::new(format!("http://{addr}"), "token")
+            .with_stream(LaserStreamStream::BlockMeta)
+            .with_max_reconnect_attempts(1)
+            .with_reconnect_delay(Duration::from_millis(10))
+            .with_connect_timeout(Duration::from_secs(2));
+        let handle = spawn_laserstream_transaction_source(config, tx)
+            .await
+            .expect("spawn LaserStream block-meta source");
+
+        let event = loop {
+            let update = timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("provider update timeout")
+                .expect("provider update");
+            match update {
+                ProviderStreamUpdate::BlockMeta(event) => break event,
+                ProviderStreamUpdate::Health(_) => continue,
+                other => panic!("expected block-meta update, got {other:?}"),
+            }
+        };
+        assert_eq!(event.slot, 94);
+        assert_eq!(event.parent_slot, 93);
+        assert_eq!(event.block_time, Some(1_700_000_094));
+        assert_eq!(event.block_height, Some(9_094));
+        assert_eq!(event.executed_transaction_count, 12);
+        assert_eq!(event.entries_count, 5);
+
+        handle.abort();
+        handle.await.ok();
+        let _ = shutdown_tx.send(());
+        server.await.expect("LaserStream server task");
+    }
+
     fn sample_transaction() -> VersionedTransaction {
         let signer = Keypair::new();
         let instructions = [
@@ -2151,11 +2268,36 @@ mod tests {
         }
     }
 
+    fn sample_block_meta_update(slot: u64) -> grpc::SubscribeUpdate {
+        grpc::SubscribeUpdate {
+            filters: vec!["sof".to_owned()],
+            created_at: None,
+            update_oneof: Some(grpc::subscribe_update::UpdateOneof::BlockMeta(
+                grpc::SubscribeUpdateBlockMeta {
+                    slot,
+                    blockhash: Hash::new_unique().to_string(),
+                    rewards: None,
+                    block_time: Some(UnixTimestamp {
+                        timestamp: 1_700_000_000 + i64::try_from(slot).unwrap_or(0),
+                    }),
+                    block_height: Some(BlockHeight {
+                        block_height: 9_000 + slot,
+                    }),
+                    parent_slot: slot.saturating_sub(1),
+                    parent_blockhash: Hash::new_unique().to_string(),
+                    executed_transaction_count: 12,
+                    entries_count: 5,
+                },
+            )),
+        }
+    }
+
     #[derive(Clone, Copy)]
     enum MockLaserStreamStream {
         Transaction,
         TransactionStatus,
         Accounts,
+        BlockMeta,
         Slots,
     }
 
@@ -2202,6 +2344,9 @@ mod tests {
                     if let Some(owner) = &self.expected_owner {
                         assert!(filter.owner.iter().any(|value| value == owner));
                     }
+                }
+                MockLaserStreamStream::BlockMeta => {
+                    assert!(first.blocks_meta.contains_key("sof"));
                 }
                 MockLaserStreamStream::Slots => {
                     assert!(first.slots.contains_key("sof"));

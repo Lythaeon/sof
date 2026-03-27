@@ -4,8 +4,8 @@ use super::dispatch::{
     ClassifiedAccountTouchDispatch, ClassifiedTransactionBatchDispatch,
     ClassifiedTransactionDispatch, ClassifiedTransactionViewBatchDispatch, PluginDispatchEvent,
     PluginDispatcher, SelectedAccountTouchDispatch, SelectedAccountUpdateDispatch,
-    SelectedTransactionLogDispatch, SelectedTransactionStatusDispatch, TransactionDispatchPriority,
-    TransactionDispatchQueueMetrics, TransactionPluginDispatcher,
+    SelectedBlockMetaDispatch, SelectedTransactionLogDispatch, SelectedTransactionStatusDispatch,
+    TransactionDispatchPriority, TransactionDispatchQueueMetrics, TransactionPluginDispatcher,
 };
 use super::state::{ObservedRecentBlockhashState, ObservedTpuLeaderState};
 
@@ -14,7 +14,9 @@ use crate::framework::PluginContext;
 use crate::framework::events::AccountTouchEventRef;
 use crate::framework::events::TransactionEventRef;
 use crate::framework::pubkey_bytes;
-use crate::framework::{AccountTouchEvent, AccountUpdateEvent, TransactionStatusEvent};
+use crate::framework::{
+    AccountTouchEvent, AccountUpdateEvent, BlockMetaEvent, TransactionStatusEvent,
+};
 use agave_transaction_view::{
     transaction_data::TransactionData, transaction_view::SanitizedTransactionView,
 };
@@ -125,6 +127,8 @@ pub struct PluginHost {
     pub(super) account_touch_plugins: Arc<[Arc<dyn ObserverPlugin>]>,
     /// Plugins interested in account-update callbacks.
     pub(super) account_update_plugins: Arc<[Arc<dyn ObserverPlugin>]>,
+    /// Plugins interested in block-meta callbacks.
+    pub(super) block_meta_plugins: Arc<[Arc<dyn ObserverPlugin>]>,
     /// Optional async dispatcher state (absent when no plugins are registered).
     pub(super) dispatcher: Option<PluginDispatcher>,
     /// Optional sharded accepted-transaction dispatcher.
@@ -171,6 +175,7 @@ impl Default for PluginHost {
             transaction_view_batch_plugin_inline_preferences: Arc::from(Vec::<bool>::new()),
             account_touch_plugins: Arc::from(Vec::<Arc<dyn ObserverPlugin>>::new()),
             account_update_plugins: Arc::from(Vec::<Arc<dyn ObserverPlugin>>::new()),
+            block_meta_plugins: Arc::from(Vec::<Arc<dyn ObserverPlugin>>::new()),
             dispatcher: None,
             transaction_dispatcher: None,
             subscriptions: PluginHookSubscriptions::default(),
@@ -300,6 +305,12 @@ impl PluginHost {
     #[must_use]
     pub const fn wants_account_update(&self) -> bool {
         self.subscriptions.account_update
+    }
+
+    /// Returns true when at least one plugin wants block-meta callbacks.
+    #[must_use]
+    pub const fn wants_block_meta(&self) -> bool {
+        self.subscriptions.block_meta
     }
 
     /// Returns true when at least one plugin wants recent-blockhash callbacks.
@@ -821,6 +832,21 @@ impl PluginHost {
             SelectedAccountUpdateDispatch::from_plugins(&self.account_update_plugins, event)
         {
             dispatcher.dispatch(PluginDispatchEvent::SelectedAccountUpdate(dispatch));
+        }
+    }
+
+    /// Enqueues block-meta hook to registered plugins.
+    pub fn on_block_meta(&self, event: BlockMetaEvent) {
+        if !self.subscriptions.block_meta {
+            return;
+        }
+        let Some(dispatcher) = &self.dispatcher else {
+            return;
+        };
+        if let Some(dispatch) =
+            SelectedBlockMetaDispatch::from_plugins(&self.block_meta_plugins, event)
+        {
+            dispatcher.dispatch(PluginDispatchEvent::SelectedBlockMeta(dispatch));
         }
     }
 
