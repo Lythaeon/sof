@@ -142,9 +142,20 @@ Implemented provider-stream adapters:
 Built-in runtime mode surface:
 
 - `ProviderStreamMode::YellowstoneGrpc`: built-in transaction feed
+- `ProviderStreamMode::YellowstoneGrpcTransactionStatus`: built-in transaction-status feed
+- `ProviderStreamMode::YellowstoneGrpcAccounts`: built-in account feed
+- `ProviderStreamMode::YellowstoneGrpcBlockMeta`: built-in block-meta feed
+- `ProviderStreamMode::YellowstoneGrpcSlots`: built-in slot feed
 - `ProviderStreamMode::LaserStream`: built-in transaction feed
+- `ProviderStreamMode::LaserStreamTransactionStatus`: built-in transaction-status feed
+- `ProviderStreamMode::LaserStreamAccounts`: built-in account feed
+- `ProviderStreamMode::LaserStreamBlockMeta`: built-in block-meta feed
+- `ProviderStreamMode::LaserStreamSlots`: built-in slot feed
 - `ProviderStreamMode::WebsocketTransaction`: built-in websocket
   `transactionSubscribe` feed
+- `ProviderStreamMode::WebsocketLogs`: built-in websocket `logsSubscribe` feed
+- `ProviderStreamMode::WebsocketAccount`: built-in websocket `accountSubscribe` feed
+- `ProviderStreamMode::WebsocketProgram`: built-in websocket `programSubscribe` feed
 
 Each built-in source config exposes `runtime_mode()`, and that is the mode you
 should pass to `ObserverRuntime::with_provider_stream_ingress(...)` for a
@@ -179,9 +190,6 @@ Built-in provider configs also support:
 SOF defaults auxiliary websocket logs and slot-only feeds to optional readiness.
 Primary transaction, transaction-status, account, and block-meta feeds default
 to required readiness.
-  - `LaserStreamConfig::with_stream(LaserStreamStream::Accounts)`
-  - `LaserStreamConfig::with_stream(LaserStreamStream::BlockMeta)`
-  - `LaserStreamSlotsConfig` for slot updates
 
 Typed runtime mapping for those richer sources:
 
@@ -225,10 +233,11 @@ Built-in durability behavior:
   - provider `/readyz` stays unready until a built-in source has actually
     reached a healthy session, or until a generic producer has emitted real
     ingress progress
-  - for multi-source provider runtimes, readiness is grouped by source kind:
-    one reconnecting backup source does not fail `/readyz` if another source of
-    the same kind is healthy, but a source kind with no healthy instance still
-    keeps the runtime unready
+  - for multi-source provider runtimes, only sources marked `Required` gate
+    `/readyz`; sources marked `Optional` are advisory and do not hold readiness
+    down
+  - if multiple sources are marked `Required`, each required source instance
+    must be healthy
   - generic provider replay dedupe also covers transaction-log and
     transaction-view-batch updates now, not only transaction/control-plane
     events
@@ -314,6 +323,7 @@ That update surface is:
 - `TransactionStatus`
 - `TransactionViewBatch`
 - `AccountUpdate`
+- `BlockMeta`
 - `RecentBlockhash`
 - `SlotStatus`
 - `ClusterTopology`

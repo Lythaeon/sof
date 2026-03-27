@@ -20,8 +20,8 @@ use crate::{
         DerivedStateConsumerRecoveryState, DerivedStateHost, PluginHost, RuntimeExtensionHost,
     },
     provider_stream::{
-        ProviderSourceHealthEvent, ProviderSourceHealthStatus, ProviderSourceId,
-        ProviderSourceIdentity, ProviderSourceReadiness,
+        ProviderSourceHealthEvent, ProviderSourceHealthStatus, ProviderSourceIdentity,
+        ProviderSourceReadiness,
     },
     runtime_metrics,
 };
@@ -65,26 +65,19 @@ impl RuntimeObservabilityHandle {
             return;
         };
         sources.insert(event.source.clone(), event.clone());
-        let mut required_health_by_kind = HashMap::<ProviderSourceId, bool>::new();
+        let mut required_healthy = Vec::new();
         let mut optional_healthy = false;
         for source in sources.values() {
             let is_healthy = matches!(source.status, ProviderSourceHealthStatus::Healthy);
             match source.readiness {
-                ProviderSourceReadiness::Required => {
-                    let has_healthy = required_health_by_kind
-                        .entry(source.source.kind.clone())
-                        .or_insert(false);
-                    *has_healthy |= is_healthy;
-                }
-                ProviderSourceReadiness::Optional => {
-                    optional_healthy |= is_healthy;
-                }
+                ProviderSourceReadiness::Required => required_healthy.push(is_healthy),
+                ProviderSourceReadiness::Optional => optional_healthy |= is_healthy,
             }
         }
-        let ready = if required_health_by_kind.is_empty() {
+        let ready = if required_healthy.is_empty() {
             optional_healthy
         } else {
-            required_health_by_kind.values().all(|healthy| *healthy)
+            required_healthy.into_iter().all(std::convert::identity)
         };
         self.inner.ready.store(ready, Ordering::Relaxed);
     }
@@ -2831,7 +2824,7 @@ mod tests {
     }
 
     #[test]
-    fn readiness_groups_redundant_sources_by_kind() {
+    fn readiness_requires_each_required_source_instance_to_be_healthy() {
         let handle = RuntimeObservabilityHandle::default();
         handle.mark_live();
         handle.observe_provider_source_health(&ProviderSourceHealthEvent {
@@ -2862,7 +2855,7 @@ mod tests {
             &DerivedStateHost::builder().build(),
         );
 
-        assert!(metrics.contains("sof_runtime_ready 1"));
+        assert!(metrics.contains("sof_runtime_ready 0"));
         assert!(metrics.contains("sof_provider_sources_reconnecting 1"));
     }
 
