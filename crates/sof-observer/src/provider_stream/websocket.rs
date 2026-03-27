@@ -12,7 +12,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use simd_json::serde::from_slice as simd_from_slice;
+use simd_json::{Buffers as SimdJsonBuffers, serde::from_slice as simd_from_slice};
 use sof_types::{PubkeyBytes, SignatureBytes};
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
@@ -937,6 +937,7 @@ async fn run_websocket_primary_connection(
                             last_seen_slot,
                             watermarks,
                             frame_bytes_mut(&mut scratch.frame_bytes, text.as_str().as_bytes()),
+                            &mut scratch.json_buffers,
                             &mut scratch.tx_bytes,
                         )
                         .await?;
@@ -948,6 +949,7 @@ async fn run_websocket_primary_connection(
                             last_seen_slot,
                             watermarks,
                             frame_bytes_mut(&mut scratch.frame_bytes, bytes.as_ref()),
+                            &mut scratch.json_buffers,
                             &mut scratch.tx_bytes,
                         )
                         .await?;
@@ -1091,12 +1093,14 @@ fn handle_logs_subscription_text(bytes: &mut [u8]) -> Result<bool, WebsocketLogs
 
 fn parse_transaction_notification(
     bytes: &mut [u8],
+    json_buffers: &mut SimdJsonBuffers,
     tx_bytes: &mut Vec<u8>,
     commitment_status: WebsocketTransactionCommitment,
     watermarks: &mut ProviderCommitmentWatermarks,
 ) -> Result<Option<SerializedTransactionEvent>, WebsocketTransactionError> {
-    let value: WebsocketTransactionEnvelopeMessage = simd_from_slice(bytes)
-        .map_err(|error| WebsocketProtocolError::InvalidJson(error.to_string()))?;
+    let value: WebsocketTransactionEnvelopeMessage =
+        simd_json::serde::from_slice_with_buffers(bytes, json_buffers)
+            .map_err(|error| WebsocketProtocolError::InvalidJson(error.to_string()))?;
     if let Some(error) = value.error {
         return Err(WebsocketProtocolError::ProviderError(error.to_string()).into());
     }
@@ -1135,12 +1139,14 @@ fn parse_transaction_notification(
 
 fn parse_account_notification(
     bytes: &mut [u8],
+    json_buffers: &mut SimdJsonBuffers,
     tx_bytes: &mut Vec<u8>,
     config: &WebsocketTransactionConfig,
     watermarks: &mut ProviderCommitmentWatermarks,
 ) -> Result<Option<AccountUpdateEvent>, WebsocketTransactionError> {
-    let value: WebsocketAccountEnvelopeMessage = simd_from_slice(bytes)
-        .map_err(|error| WebsocketProtocolError::InvalidJson(error.to_string()))?;
+    let value: WebsocketAccountEnvelopeMessage =
+        simd_json::serde::from_slice_with_buffers(bytes, json_buffers)
+            .map_err(|error| WebsocketProtocolError::InvalidJson(error.to_string()))?;
     if let Some(error) = value.error {
         return Err(WebsocketProtocolError::ProviderError(error.to_string()).into());
     }
@@ -1274,13 +1280,18 @@ async fn handle_primary_notification(
     last_seen_slot: &mut Option<u64>,
     watermarks: &mut ProviderCommitmentWatermarks,
     bytes: &mut [u8],
+    json_buffers: &mut SimdJsonBuffers,
     tx_bytes: &mut Vec<u8>,
 ) -> Result<(), WebsocketTransactionError> {
     match config.stream {
         WebsocketPrimaryStream::Transaction => {
-            if let Some(update) =
-                parse_transaction_notification(bytes, tx_bytes, config.commitment, watermarks)?
-            {
+            if let Some(update) = parse_transaction_notification(
+                bytes,
+                json_buffers,
+                tx_bytes,
+                config.commitment,
+                watermarks,
+            )? {
                 *last_seen_slot = Some((*last_seen_slot).unwrap_or(update.slot).max(update.slot));
                 sender
                     .send(ProviderStreamUpdate::SerializedTransaction(update))
@@ -1289,7 +1300,9 @@ async fn handle_primary_notification(
             }
         }
         WebsocketPrimaryStream::Account(_) | WebsocketPrimaryStream::Program(_) => {
-            if let Some(update) = parse_account_notification(bytes, tx_bytes, config, watermarks)? {
+            if let Some(update) =
+                parse_account_notification(bytes, json_buffers, tx_bytes, config, watermarks)?
+            {
                 *last_seen_slot = Some((*last_seen_slot).unwrap_or(update.slot).max(update.slot));
                 sender
                     .send(ProviderStreamUpdate::AccountUpdate(update))
@@ -1527,10 +1540,20 @@ fn materialize_transaction_baseline(
     }))
 }
 
-#[derive(Default)]
 struct WebsocketParseScratch {
     frame_bytes: Vec<u8>,
+    json_buffers: SimdJsonBuffers,
     tx_bytes: Vec<u8>,
+}
+
+impl Default for WebsocketParseScratch {
+    fn default() -> Self {
+        Self {
+            frame_bytes: Vec::new(),
+            json_buffers: SimdJsonBuffers::default(),
+            tx_bytes: Vec::new(),
+        }
+    }
 }
 
 fn frame_bytes_mut<'buffer>(buffer: &'buffer mut Vec<u8>, bytes: &[u8]) -> &'buffer mut [u8] {
@@ -2203,10 +2226,12 @@ mod tests {
     fn websocket_transaction_notification_tracks_commitment_watermarks() {
         let payload = sample_notification_payload();
         let mut frame_bytes = payload;
+        let mut json_buffers = SimdJsonBuffers::default();
         let mut tx_bytes = Vec::new();
         let mut watermarks = ProviderCommitmentWatermarks::default();
         let event = parse_transaction_notification(
             &mut frame_bytes,
+            &mut json_buffers,
             &mut tx_bytes,
             WebsocketTransactionCommitment::Confirmed,
             &mut watermarks,
@@ -2313,16 +2338,22 @@ mod tests {
         .to_string()
         .into_bytes();
         let mut payload = payload;
+        let mut json_buffers = SimdJsonBuffers::default();
         let mut scratch = Vec::new();
         let mut watermarks = ProviderCommitmentWatermarks::default();
         let config = WebsocketTransactionConfig::new("wss://example.invalid")
             .with_stream(WebsocketPrimaryStream::Account(pubkey))
             .with_commitment(WebsocketTransactionCommitment::Confirmed);
 
-        let event =
-            parse_account_notification(&mut payload, &mut scratch, &config, &mut watermarks)
-                .expect("account notification should parse")
-                .expect("account update event");
+        let event = parse_account_notification(
+            &mut payload,
+            &mut json_buffers,
+            &mut scratch,
+            &config,
+            &mut watermarks,
+        )
+        .expect("account notification should parse")
+        .expect("account update event");
 
         assert_eq!(event.slot, 77);
         assert_eq!(event.commitment_status, TxCommitmentStatus::Confirmed);
@@ -2363,16 +2394,22 @@ mod tests {
         .to_string()
         .into_bytes();
         let mut payload = payload;
+        let mut json_buffers = SimdJsonBuffers::default();
         let mut scratch = Vec::new();
         let mut watermarks = ProviderCommitmentWatermarks::default();
         let config = WebsocketTransactionConfig::new("wss://example.invalid")
             .with_stream(WebsocketPrimaryStream::Program(program_id))
             .with_commitment(WebsocketTransactionCommitment::Finalized);
 
-        let event =
-            parse_account_notification(&mut payload, &mut scratch, &config, &mut watermarks)
-                .expect("program notification should parse")
-                .expect("account update event");
+        let event = parse_account_notification(
+            &mut payload,
+            &mut json_buffers,
+            &mut scratch,
+            &config,
+            &mut watermarks,
+        )
+        .expect("program notification should parse")
+        .expect("account update event");
 
         assert_eq!(event.slot, 88);
         assert_eq!(event.commitment_status, TxCommitmentStatus::Finalized);
@@ -2974,12 +3011,14 @@ mod tests {
 
         let optimized_started = Instant::now();
         let mut frame_bytes = Vec::new();
+        let mut json_buffers = SimdJsonBuffers::default();
         let mut tx_bytes = Vec::new();
         let mut watermarks = ProviderCommitmentWatermarks::default();
         for _ in 0..iterations {
             let frame = frame_bytes_mut(&mut frame_bytes, &payload);
             let event = parse_transaction_notification(
                 frame,
+                &mut json_buffers,
                 &mut tx_bytes,
                 WebsocketTransactionCommitment::Confirmed,
                 &mut watermarks,
@@ -3023,12 +3062,14 @@ mod tests {
 
         let payload = sample_notification_payload();
         let mut frame_bytes = Vec::new();
+        let mut json_buffers = SimdJsonBuffers::default();
         let mut tx_bytes = Vec::new();
         let mut watermarks = ProviderCommitmentWatermarks::default();
         for _ in 0..iterations {
             let frame = frame_bytes_mut(&mut frame_bytes, &payload);
             let event = parse_transaction_notification(
                 frame,
+                &mut json_buffers,
                 &mut tx_bytes,
                 WebsocketTransactionCommitment::Confirmed,
                 &mut watermarks,
