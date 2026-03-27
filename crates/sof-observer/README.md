@@ -50,6 +50,17 @@ That performance claim is intentionally scoped: on the validated release fixture
 no regression was observed on ingest-critical runtime/provider paths, and most of those paths were
 net-positive against the older baseline implementations.
 
+That optimization work is hypothesis-driven rather than intuitive. The normal loop is:
+
+- identify a concrete suspected bottleneck
+- capture a baseline
+- change one thing
+- re-run release-fixture A/B checks, `perf`, and runtime metrics
+- keep only the changes that measurably improve the path
+
+So SOF's performance claim is not "this should help." It is "this was tested and kept because it
+did help."
+
 ## Plugin Contract
 
 The plugin model is intentionally explicit:

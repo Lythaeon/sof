@@ -87,6 +87,15 @@ Because even when the ingress question is settled, the runtime work still remain
 
 SOF is the reusable layer for that work.
 
+That includes the performance method itself. SOF is not meant to be a pile of "probably faster"
+changes. The runtime is tuned by:
+
+- forming explicit bottleneck hypotheses
+- testing them with A/B runs
+- using `perf`, fixture benchmarks, and runtime metrics to decide what stays
+
+The goal is to remove repeated guesswork, not just repeated code.
+
 ## The Short Version
 
 SOF exists so teams can own their Solana runtime boundary without rebuilding the same ingest,

@@ -56,3 +56,10 @@ The other important boundary is honesty about ingress:
 - raw-shred modes own more of the substrate
 - processed providers start later in the pipeline
 - public gossip is the independent baseline, not the universal fast path
+
+The same honesty applies to performance claims. SOF treats optimization as measured engineering:
+
+- start from a concrete hypothesis
+- measure the baseline
+- test one change at a time
+- keep only the changes that survive A/B validation

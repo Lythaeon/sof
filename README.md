@@ -105,6 +105,17 @@ That performance claim is intentionally scoped: on the validated release fixture
 no regression was observed on ingest-critical runtime/provider paths, and most of those paths were
 net-positive against the older baseline implementations.
 
+The performance method matters too. SOF does not keep changes just because they looked faster in
+review. The normal workflow is:
+
+- form a concrete performance hypothesis
+- capture a baseline
+- change one thing
+- re-run A/B validation with release fixtures, `perf`, and runtime metrics
+- keep the change only if the measurements actually improve
+
+So "optimized" here means measured and retained, not guessed and merged.
+
 ## The Main Idea
 
 SOF separates **how data enters the system** from **how your application consumes it**.

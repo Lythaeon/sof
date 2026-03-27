@@ -66,6 +66,13 @@ revisiting thread knobs:
 3. measure
 4. change one advanced knob at a time
 
+That measurement step is explicit. The intended workflow is:
+
+- make a concrete bottleneck hypothesis
+- capture before-state queue metrics, drop counters, health, and latency
+- validate code-path changes with release fixtures and `perf` where applicable
+- keep only the changes that survive A/B comparison
+
 For transaction plugins, prefer API-level fast paths before runtime knob tuning:
 
 - use `TransactionDispatchMode::Inline` when the plugin actually benefits from earliest tx
@@ -87,3 +94,4 @@ For transaction plugins, prefer API-level fast paths before runtime knob tuning:
 - keep a host-specific tuning log
 - change one family of knobs at a time
 - watch queue depth, drop counters, replay health, and repair behavior before and after each change
+- do not keep a knob or code change just because it sounded faster before measurement

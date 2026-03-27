@@ -13,5 +13,14 @@ integration behavior.
 - local control-plane state is part of the runtime model
 - replayable and restart-safe stateful consumers are separate from observational plugins
 - performance decisions are documented as architecture, not hidden as trivia
+- performance changes are expected to be measured, not assumed
+
+The intended performance workflow is:
+
+- form a concrete hypothesis
+- capture a baseline
+- change one thing
+- verify with release fixtures, `perf`, and runtime metrics
+- keep only the changes that are measurably better
 
 Start with [System Overview](system-overview.md) if you want the shortest diagram-first view.
