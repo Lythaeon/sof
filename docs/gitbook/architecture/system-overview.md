@@ -33,6 +33,12 @@ flowchart LR
 
 ## Read It From Left To Right
 
+SOF's architecture is easiest to reason about as three layers:
+
+- ingress
+- runtime
+- consumption
+
 - traffic enters from one of the supported ingress modes
 - `sof` ingests packets and parses them into useful runtime data
 - the runtime reconstructs datasets and updates local control-plane state

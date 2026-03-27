@@ -46,7 +46,7 @@ That is also why SOF tries to keep semantics consistent across ingress modes. Th
 developer writes one plugin/runtime consumer model while SOF owns the provider-specific runtime
 plumbing and performance discipline underneath it.
 
-That performance claim is intentionally scoped: on the release fixtures validated on this branch,
+That performance claim is intentionally scoped: on the validated release fixtures on this branch,
 no regression was observed on ingest-critical runtime/provider paths, and most of those paths were
 net-positive against the older baseline implementations.
 
@@ -63,6 +63,8 @@ The plugin model is intentionally explicit:
 - full queues drop the incoming event; SOF does not evict older queued plugin events
 - queue ownership is shared per host/lane, not per plugin
 - SOF does not currently guarantee per-plugin fairness under pressure
+
+In other words: overflow is drop-new, not drop-oldest.
 - `PluginDispatchMode::Sequential` preserves registration order for one queued event
 - `PluginDispatchMode::BoundedConcurrent(n)` gives bounded parallelism instead of strict per-event
   callback ordering
@@ -79,7 +81,8 @@ Queue telemetry is available at aggregate host/lane level:
 - `sof_plugin_transaction_critical_queue_depth`
 - `sof_plugin_transaction_background_queue_depth`
 
-Per-plugin pressure visibility is not exposed yet.
+Those metrics let operators detect backpressure, event loss, and degraded provider behavior in real
+time. Per-plugin pressure visibility is not exposed yet.
 
 ## Explicit Trust Model
 
@@ -205,7 +208,8 @@ all commitment levels.
 `sof-tx` is a different case: the existing SOF adapters are complete today on
 raw-shred/gossip runtimes, or on `ProviderStreamMode::Generic` when the custom
 producer also supplies the full control-plane feed. Built-in Yellowstone,
-LaserStream, and websocket adapters remain transaction-first today.
+LaserStream, and websocket adapters remain transaction-first today, so SOF
+explicitly rejects those adapters at runtime/config validation time.
 
 That tradeoff should be explicit: public gossip is the independent baseline, trusted raw shred
 distribution is the fast path, and processed provider streams are a different observer model.

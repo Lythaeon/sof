@@ -41,6 +41,8 @@ SOF's plugin surface is intentionally bounded. The important rules are:
 - full queues drop the incoming event; SOF does not evict older queued plugin events to make room
 - queue ownership is host-wide per lane, not per plugin
 - SOF does not currently guarantee per-plugin fairness under pressure
+
+In other words: overflow is drop-new, not drop-oldest.
 - `PluginDispatchMode::Sequential` preserves registration order for one queued event
 - `PluginDispatchMode::BoundedConcurrent(n)` trades that strict per-event callback ordering for
   bounded parallelism
@@ -56,7 +58,8 @@ Queue visibility exists too, but today it is aggregate:
 - transaction lane queue depth and drop counters
 - dataset and packet-worker queue depth and drop counters
 
-Per-plugin queue pressure is not a first-class metric surface yet.
+Those metrics let operators detect backpressure, event loss, and degraded provider behavior in real
+time. Per-plugin queue pressure is not a first-class metric surface yet.
 
 ## Why Build On SOF
 
@@ -98,7 +101,7 @@ SOF is useful because it already spent the engineering effort on the details mos
 
 If you build your own Solana runtime stack from scratch for every service, you end up paying that optimization and correctness tax every time.
 
-That performance claim is intentionally scoped: on the release fixtures validated on this branch,
+That performance claim is intentionally scoped: on the validated release fixtures on this branch,
 no regression was observed on ingest-critical runtime/provider paths, and most of those paths were
 net-positive against the older baseline implementations.
 
@@ -115,7 +118,7 @@ You can feed SOF from:
 - websocket `transactionSubscribe`
 - a custom processed provider producer
 
-And still keep the same local runtime/plugin surface where the semantics line up.
+And still keep one bounded runtime and one plugin/derived-state model with aligned semantics.
 
 That last clause matters. Switching ingest modes is not just a transport change:
 

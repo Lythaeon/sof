@@ -115,6 +115,8 @@ These rules should be treated as part of the plugin contract:
 - full queues drop the arriving event; SOF does not evict older queued plugin events
 - queue ownership is host-wide per lane, not per plugin
 - SOF does not currently guarantee per-plugin fairness under pressure
+
+In other words: overflow is drop-new, not drop-oldest.
 - `PluginDispatchMode::Sequential` preserves registration order for one queued event
 - `PluginDispatchMode::BoundedConcurrent(n)` keeps parallelism bounded but does not promise the
   same strict per-event callback ordering
