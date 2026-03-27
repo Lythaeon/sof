@@ -2182,6 +2182,9 @@ fn dispatch_provider_stream_update(
     derived_state_host: &DerivedStateHost,
     update: ProviderStreamUpdate,
 ) {
+    if plugin_host.is_empty() && derived_state_host.is_empty() {
+        return;
+    }
     match update {
         ProviderStreamUpdate::Transaction(event) => {
             if plugin_host.wants_recent_blockhash() {
@@ -2281,9 +2284,11 @@ fn dispatch_provider_stream_serialized_transaction(
     derived_state_host: &DerivedStateHost,
     event: &crate::provider_stream::SerializedTransactionEvent,
 ) {
+    let derived_state_empty = derived_state_host.is_empty();
     let wants_transaction = plugin_host.transaction_enabled_at_commitment(event.commitment_status);
     let wants_recent_blockhash = plugin_host.wants_recent_blockhash();
-    let wants_derived_state_transaction = derived_state_host.wants_transaction_applied();
+    let wants_derived_state_transaction =
+        !derived_state_empty && derived_state_host.wants_transaction_applied();
     if !wants_transaction && !wants_recent_blockhash && !wants_derived_state_transaction {
         return;
     }
