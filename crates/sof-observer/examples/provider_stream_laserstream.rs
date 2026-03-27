@@ -10,9 +10,7 @@ use sof::{
     framework::{ObserverPlugin, PluginConfig, PluginHost, TransactionEvent},
     provider_stream::{
         create_provider_stream_queue,
-        laserstream::{
-            LaserStreamCommitment, LaserStreamConfig, spawn_laserstream_transaction_source,
-        },
+        laserstream::{LaserStreamCommitment, LaserStreamConfig, spawn_laserstream_source},
     },
     runtime::ObserverRuntime,
 };
@@ -70,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mode = config.runtime_mode();
-    let source = spawn_laserstream_transaction_source(config, provider_tx).await?;
+    let source = spawn_laserstream_source(config, provider_tx).await?;
     let host = PluginHost::builder()
         .add_plugin(LaserStreamTransactionLogger)
         .build();

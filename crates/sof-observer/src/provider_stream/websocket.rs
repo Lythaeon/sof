@@ -31,8 +31,9 @@ use crate::{
     provider_stream::{
         ProviderCommitmentWatermarks, ProviderSourceHealthEvent, ProviderSourceHealthReason,
         ProviderSourceHealthStatus, ProviderSourceId, ProviderSourceIdentity,
-        ProviderSourceReadiness, ProviderStreamFanIn, ProviderStreamMode, ProviderStreamSender,
-        ProviderStreamUpdate, SerializedTransactionEvent, classify_provider_transaction_kind,
+        ProviderSourceIdentityRegistrationError, ProviderSourceReadiness, ProviderStreamFanIn,
+        ProviderStreamMode, ProviderStreamSender, ProviderStreamUpdate, SerializedTransactionEvent,
+        classify_provider_transaction_kind,
     },
 };
 
@@ -520,6 +521,11 @@ impl WebsocketTransactionConfig {
         self.readiness
     }
 
+    fn source_identity(&self) -> Option<ProviderSourceIdentity> {
+        self.source_instance()
+            .map(|instance| ProviderSourceIdentity::new(self.source_id(), instance))
+    }
+
     const fn stream_kind(&self) -> WebsocketStreamKind {
         match self.stream {
             WebsocketPrimaryStream::Transaction => WebsocketStreamKind::Transaction,
@@ -706,6 +712,11 @@ impl WebsocketLogsConfig {
     const fn readiness(&self) -> ProviderSourceReadiness {
         self.readiness
     }
+
+    fn source_identity(&self) -> Option<ProviderSourceIdentity> {
+        self.source_instance()
+            .map(|instance| ProviderSourceIdentity::new(ProviderSourceId::WebsocketLogs, instance))
+    }
 }
 
 /// Websocket `transactionSubscribe` error surface.
@@ -726,6 +737,9 @@ pub enum WebsocketTransactionError {
     /// Provider-stream queue is closed.
     #[error("provider-stream queue closed")]
     QueueClosed,
+    /// One duplicated stable source identity was registered in the same fan-in.
+    #[error(transparent)]
+    DuplicateSourceIdentity(#[from] ProviderSourceIdentityRegistrationError),
 }
 
 /// Websocket `logsSubscribe` error surface.
@@ -740,6 +754,9 @@ pub enum WebsocketLogsError {
     /// Provider-stream queue is closed.
     #[error("provider-stream queue closed")]
     QueueClosed,
+    /// One duplicated stable source identity was registered in the same fan-in.
+    #[error(transparent)]
+    DuplicateSourceIdentity(#[from] ProviderSourceIdentityRegistrationError),
 }
 
 /// Typed websocket protocol/runtime failures used by both transaction and log feeds.
@@ -838,21 +855,21 @@ const PROVIDER_SUBSCRIPTION_ACKNOWLEDGED: &str = "subscription acknowledged";
 
 type WebsocketProviderStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-/// Spawns one websocket `transactionSubscribe` source into a SOF provider-stream queue.
+/// Spawns one websocket primary source into a SOF provider-stream queue.
 ///
 /// # Examples
 ///
 /// ```no_run
 /// use sof::provider_stream::{
 ///     create_provider_stream_queue,
-///     websocket::{spawn_websocket_transaction_source, WebsocketTransactionConfig},
+///     websocket::{spawn_websocket_source, WebsocketTransactionConfig},
 /// };
 ///
 /// # #[tokio::main]
 /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let (tx, _rx) = create_provider_stream_queue(1024);
 /// let config = WebsocketTransactionConfig::new("wss://mainnet.helius-rpc.com/?api-key=example");
-/// let handle = spawn_websocket_transaction_source(&config, tx).await?;
+/// let handle = spawn_websocket_source(&config, tx).await?;
 /// handle.abort();
 /// # Ok(())
 /// # }
@@ -861,27 +878,16 @@ type WebsocketProviderStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// # Errors
 ///
 /// Returns any connection/bootstrap error before the forwarder task starts.
-pub async fn spawn_websocket_transaction_source(
+pub async fn spawn_websocket_source(
     config: &WebsocketTransactionConfig,
     sender: ProviderStreamSender,
 ) -> Result<JoinHandle<Result<(), WebsocketTransactionError>>, WebsocketTransactionError> {
     config.validate()?;
     let config = config.clone();
     let source = ProviderSourceIdentity::generated(config.source_id(), config.source_instance());
+    register_websocket_initial_health(&source, config.readiness(), &sender);
     let first_session = establish_websocket_primary_session(&config).await?;
     Ok(tokio::spawn(async move {
-        send_primary_provider_health(
-            &source,
-            config.readiness(),
-            &sender,
-            ProviderSourceHealthStatus::Reconnecting,
-            ProviderSourceHealthReason::InitialConnectPending,
-            format!(
-                "waiting for first websocket {} session ack",
-                config.stream_kind()
-            ),
-        )
-        .await?;
         let mut attempts = 0_u32;
         let mut last_seen_slot = None;
         let mut watermarks = ProviderCommitmentWatermarks::default();
@@ -990,17 +996,9 @@ pub async fn spawn_websocket_logs_source(
         ProviderSourceId::WebsocketLogs,
         config.source_instance(),
     );
+    register_websocket_logs_initial_health(&source, config.readiness(), &sender);
     let first_session = establish_websocket_logs_session(&config).await?;
     Ok(tokio::spawn(async move {
-        send_provider_logs_health(
-            &source,
-            config.readiness(),
-            &sender,
-            ProviderSourceHealthStatus::Reconnecting,
-            ProviderSourceHealthReason::InitialConnectPending,
-            "waiting for first websocket logs session ack".to_owned(),
-        )
-        .await?;
         let mut attempts = 0_u32;
         let mut first_session = Some(first_session);
         loop {
@@ -1230,6 +1228,27 @@ async fn send_primary_provider_health(
         .map_err(|_error| WebsocketTransactionError::QueueClosed)
 }
 
+fn register_websocket_initial_health(
+    source: &ProviderSourceIdentity,
+    readiness: ProviderSourceReadiness,
+    sender: &ProviderStreamSender,
+) {
+    let sender = sender.clone();
+    let event = ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
+        source: source.clone(),
+        readiness,
+        status: ProviderSourceHealthStatus::Reconnecting,
+        reason: ProviderSourceHealthReason::InitialConnectPending,
+        message: format!(
+            "waiting for first websocket {} session ack",
+            source.kind_str().trim_start_matches("websocket_")
+        ),
+    });
+    tokio::spawn(async move {
+        drop(sender.send(event).await);
+    });
+}
+
 async fn send_provider_logs_health(
     source: &ProviderSourceIdentity,
     readiness: ProviderSourceReadiness,
@@ -1250,6 +1269,24 @@ async fn send_provider_logs_health(
         .map_err(|_error| WebsocketLogsError::QueueClosed)
 }
 
+fn register_websocket_logs_initial_health(
+    source: &ProviderSourceIdentity,
+    readiness: ProviderSourceReadiness,
+    sender: &ProviderStreamSender,
+) {
+    let sender = sender.clone();
+    let event = ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
+        source: source.clone(),
+        readiness,
+        status: ProviderSourceHealthStatus::Reconnecting,
+        reason: ProviderSourceHealthReason::InitialConnectPending,
+        message: "waiting for first websocket logs session ack".to_owned(),
+    });
+    tokio::spawn(async move {
+        drop(sender.send(event).await);
+    });
+}
+
 const fn websocket_health_reason(error: &WebsocketTransactionError) -> ProviderSourceHealthReason {
     match error {
         WebsocketTransactionError::Config(_) => ProviderSourceHealthReason::UpstreamProtocolFailure,
@@ -1262,13 +1299,18 @@ const fn websocket_health_reason(error: &WebsocketTransactionError) -> ProviderS
         WebsocketTransactionError::QueueClosed => {
             ProviderSourceHealthReason::UpstreamProtocolFailure
         }
+        WebsocketTransactionError::DuplicateSourceIdentity(_) => {
+            ProviderSourceHealthReason::UpstreamProtocolFailure
+        }
     }
 }
 
 const fn websocket_logs_health_reason(error: &WebsocketLogsError) -> ProviderSourceHealthReason {
     match error {
         WebsocketLogsError::Transport(_) => ProviderSourceHealthReason::UpstreamTransportFailure,
-        WebsocketLogsError::Protocol(_) | WebsocketLogsError::QueueClosed => {
+        WebsocketLogsError::Protocol(_)
+        | WebsocketLogsError::QueueClosed
+        | WebsocketLogsError::DuplicateSourceIdentity(_) => {
             ProviderSourceHealthReason::UpstreamProtocolFailure
         }
     }
@@ -2174,17 +2216,29 @@ struct WebsocketUiAccount {
 }
 
 impl ProviderStreamFanIn {
-    /// Spawns one websocket `transactionSubscribe` source into this fan-in.
+    /// Spawns one websocket primary source into this fan-in.
     ///
     /// # Errors
     ///
     /// Returns an error if the selected config is invalid or the source cannot
     /// be started.
-    pub async fn spawn_websocket_transaction_source(
+    pub async fn spawn_websocket_source(
         &self,
         config: &WebsocketTransactionConfig,
     ) -> Result<JoinHandle<Result<(), WebsocketTransactionError>>, WebsocketTransactionError> {
-        spawn_websocket_transaction_source(config, self.sender()).await
+        let reserved_source = config.source_identity();
+        if let Some(source) = reserved_source.as_ref() {
+            self.reserve_source_identity(source.clone())?;
+        }
+        match spawn_websocket_source(config, self.sender()).await {
+            Ok(handle) => Ok(handle),
+            Err(error) => {
+                if let Some(source) = reserved_source.as_ref() {
+                    self.release_source_identity(source);
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Spawns one websocket `logsSubscribe` source into this fan-in.
@@ -2196,7 +2250,19 @@ impl ProviderStreamFanIn {
         &self,
         config: &WebsocketLogsConfig,
     ) -> Result<JoinHandle<Result<(), WebsocketLogsError>>, WebsocketLogsError> {
-        spawn_websocket_logs_source(config, self.sender()).await
+        let reserved_source = config.source_identity();
+        if let Some(source) = reserved_source.as_ref() {
+            self.reserve_source_identity(source.clone())?;
+        }
+        match spawn_websocket_logs_source(config, self.sender()).await {
+            Ok(handle) => Ok(handle),
+            Err(error) => {
+                if let Some(source) = reserved_source.as_ref() {
+                    self.release_source_identity(source);
+                }
+                Err(error)
+            }
+        }
     }
 }
 
@@ -2723,7 +2789,7 @@ mod tests {
             .with_stream(WebsocketPrimaryStream::Program(Pubkey::new_unique()))
             .with_vote(true);
 
-        let error = spawn_websocket_transaction_source(&config, tx)
+        let error = spawn_websocket_source(&config, tx)
             .await
             .expect_err("program stream should reject transaction-only filters");
 
@@ -2838,7 +2904,7 @@ mod tests {
         let config = WebsocketTransactionConfig::new(format!("ws://{addr}"))
             .with_max_reconnect_attempts(1)
             .with_reconnect_delay(Duration::from_millis(10));
-        let handle = spawn_websocket_transaction_source(&config, tx)
+        let handle = spawn_websocket_source(&config, tx)
             .await
             .expect("spawn websocket transaction source");
 
@@ -2914,7 +2980,7 @@ mod tests {
             .with_ping_interval(Duration::from_millis(250))
             .with_reconnect_delay(Duration::from_millis(10))
             .with_max_reconnect_attempts(1);
-        let handle = spawn_websocket_transaction_source(&config, tx)
+        let handle = spawn_websocket_source(&config, tx)
             .await
             .expect("spawn websocket account source");
 
@@ -3004,7 +3070,7 @@ mod tests {
             .with_ping_interval(Duration::from_millis(250))
             .with_reconnect_delay(Duration::from_millis(10))
             .with_max_reconnect_attempts(1);
-        let handle = spawn_websocket_transaction_source(&config, tx)
+        let handle = spawn_websocket_source(&config, tx)
             .await
             .expect("spawn websocket program source");
 
@@ -3075,7 +3141,7 @@ mod tests {
         let config = WebsocketTransactionConfig::new(format!("ws://{addr}"))
             .with_max_reconnect_attempts(1)
             .with_reconnect_delay(Duration::from_millis(10));
-        let handle = spawn_websocket_transaction_source(&config, tx)
+        let handle = spawn_websocket_source(&config, tx)
             .await
             .expect("spawn websocket source");
 
@@ -3163,7 +3229,7 @@ mod tests {
             .with_max_reconnect_attempts(1)
             .with_ping_interval(Duration::from_millis(250))
             .with_reconnect_delay(Duration::from_millis(10));
-        let handle = spawn_websocket_transaction_source(&config, tx)
+        let handle = spawn_websocket_source(&config, tx)
             .await
             .expect("spawn websocket source");
 
@@ -3287,7 +3353,7 @@ mod tests {
 
         let (fan_in, mut rx) = create_provider_stream_fan_in(8);
         let tx_handle = fan_in
-            .spawn_websocket_transaction_source(
+            .spawn_websocket_source(
                 &WebsocketTransactionConfig::new(format!("ws://{tx_addr}"))
                     .with_max_reconnect_attempts(1)
                     .with_reconnect_delay(Duration::from_millis(10)),
@@ -3398,7 +3464,7 @@ mod tests {
 
         let (fan_in, mut rx) = create_provider_stream_fan_in(8);
         let handle_a = fan_in
-            .spawn_websocket_transaction_source(
+            .spawn_websocket_source(
                 &WebsocketTransactionConfig::new(format!("ws://{addr_a}"))
                     .with_max_reconnect_attempts(1)
                     .with_reconnect_delay(Duration::from_millis(10)),
@@ -3406,7 +3472,7 @@ mod tests {
             .await
             .expect("spawn source a");
         let handle_b = fan_in
-            .spawn_websocket_transaction_source(
+            .spawn_websocket_source(
                 &WebsocketTransactionConfig::new(format!("ws://{addr_b}"))
                     .with_max_reconnect_attempts(1)
                     .with_reconnect_delay(Duration::from_millis(10)),
@@ -3454,25 +3520,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_fan_in_rejects_duplicate_stable_source_identity() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        let payload = sample_notification_payload();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = accept_async(stream).await.expect("websocket handshake");
+            let subscribe = ws.next().await.expect("subscribe").expect("subscribe msg");
+            match subscribe {
+                WsMessage::Text(text) => assert!(text.contains("transactionSubscribe")),
+                other => panic!("expected subscribe text frame, got {other:?}"),
+            }
+            ws.send(WsMessage::Text(
+                String::from(r#"{"jsonrpc":"2.0","id":1,"result":42}"#).into(),
+            ))
+            .await
+            .expect("ack");
+            ws.send(WsMessage::Text(
+                String::from_utf8(payload).expect("payload utf8").into(),
+            ))
+            .await
+            .expect("notification");
+            ws.close(None).await.expect("close");
+        });
+
+        let (fan_in, _rx) = create_provider_stream_fan_in(8);
+        let first = fan_in
+            .spawn_websocket_source(
+                &WebsocketTransactionConfig::new(format!("ws://{addr}"))
+                    .with_source_instance("shared-primary")
+                    .with_max_reconnect_attempts(1)
+                    .with_reconnect_delay(Duration::from_millis(10)),
+            )
+            .await
+            .expect("spawn first source");
+
+        let error = fan_in
+            .spawn_websocket_source(
+                &WebsocketTransactionConfig::new("ws://127.0.0.1:9")
+                    .with_source_instance("shared-primary"),
+            )
+            .await
+            .expect_err("duplicate source identity should be rejected");
+
+        match error {
+            WebsocketTransactionError::DuplicateSourceIdentity(error) => {
+                assert_eq!(error.0.kind, ProviderSourceId::WebsocketTransaction);
+                assert_eq!(error.0.instance_str(), "shared-primary");
+            }
+            other => panic!("expected duplicate source identity error, got {other:?}"),
+        }
+
+        first.abort();
+        first.await.ok();
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
     async fn websocket_spawn_fails_fast_on_dead_endpoint() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
         let addr = listener.local_addr().expect("local addr");
         drop(listener);
 
         let (tx, _rx) = create_provider_stream_queue(1);
-        let error = spawn_websocket_transaction_source(
-            &WebsocketTransactionConfig::new(format!("ws://{addr}")),
-            tx,
-        )
-        .await
-        .expect_err("dead endpoint should fail during preflight");
+        let error =
+            spawn_websocket_source(&WebsocketTransactionConfig::new(format!("ws://{addr}")), tx)
+                .await
+                .expect_err("dead endpoint should fail during preflight");
         assert!(error.to_string().contains("IO error") || error.to_string().contains("Connection"));
     }
 
     #[tokio::test]
     async fn websocket_spawn_fails_fast_without_replay_http_endpoint() {
         let (tx, _rx) = create_provider_stream_queue(1);
-        let error = spawn_websocket_transaction_source(
+        let error = spawn_websocket_source(
             &WebsocketTransactionConfig::new("http://example.invalid"),
             tx,
         )

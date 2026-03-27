@@ -54,3 +54,7 @@ Follow-up findings after the readiness/readiness-class pass:
    - Initial health registration was sent before `tokio::spawn`.
    - In multi-source startup, that could block a later source spawn before the
      runtime had begun draining the provider queue.
+
+- 2026-03-27 follow-up: fixed stale GitBook wording that still described built-in processed providers as transaction-first; clarified that built-ins now cover typed transaction, transaction-status, account, block-meta, log, and slot feeds where supported, while `ProviderStreamMode::Generic` remains the path for custom typed producers, multi-source fan-in, and richer control-plane feeds.
+
+- 2026-03-27 follow-up: built-in source registration still happened after first session bootstrap, fan-in still allowed duplicate full source identities, and built-in spawn API names remained transaction-only even though config-selected streams now include accounts, block-meta, transaction-status, logs, and slots.

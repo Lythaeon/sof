@@ -22,9 +22,11 @@ Plugins are the right fit for downstream logic that consumes decoded runtime eve
 Provider mode matters here:
 
 - raw-shred and gossip runtimes can emit the full normal plugin surface
-- built-in processed providers are intentionally transaction-first
-- `ProviderStreamMode::Generic` is the path for custom producers that want to feed richer
-  control-plane updates through the same host surface
+- built-in processed providers can emit typed transaction, transaction-status, account,
+  block-meta, log, and slot events where supported, but they still expose a narrower surface than
+  the full raw-shred runtime
+- `ProviderStreamMode::Generic` is the path for custom producers and multi-source fan-in that want
+  to feed richer control-plane updates through the same host surface
 
 ## 2. Runtime Extensions
 

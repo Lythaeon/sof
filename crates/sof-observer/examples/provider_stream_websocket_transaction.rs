@@ -10,8 +10,7 @@ use sof::{
     provider_stream::{
         create_provider_stream_queue,
         websocket::{
-            WebsocketTransactionCommitment, WebsocketTransactionConfig,
-            spawn_websocket_transaction_source,
+            WebsocketTransactionCommitment, WebsocketTransactionConfig, spawn_websocket_source,
         },
     },
     runtime::ObserverRuntime,
@@ -78,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mode = config.runtime_mode();
-    let source = spawn_websocket_transaction_source(&config, provider_tx).await?;
+    let source = spawn_websocket_source(&config, provider_tx).await?;
     let host = PluginHost::builder()
         .add_plugin(WebsocketTransactionPlugin)
         .build();

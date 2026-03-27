@@ -18,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (fan_in, rx) = create_provider_stream_fan_in(1024);
 
     let transaction_source = fan_in
-        .spawn_websocket_transaction_source(&WebsocketTransactionConfig::new(
+        .spawn_websocket_source(&WebsocketTransactionConfig::new(
             "wss://mainnet.helius-rpc.com/?api-key=example",
         ))
         .await?;

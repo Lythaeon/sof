@@ -11,8 +11,7 @@ use sof::{
     provider_stream::{
         create_provider_stream_queue,
         yellowstone::{
-            YellowstoneGrpcCommitment, YellowstoneGrpcConfig,
-            spawn_yellowstone_grpc_transaction_source,
+            YellowstoneGrpcCommitment, YellowstoneGrpcConfig, spawn_yellowstone_grpc_source,
         },
     },
     runtime::ObserverRuntime,
@@ -74,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mode = config.runtime_mode();
-    let source = spawn_yellowstone_grpc_transaction_source(config, provider_tx).await?;
+    let source = spawn_yellowstone_grpc_source(config, provider_tx).await?;
     let host = PluginHost::builder()
         .add_plugin(YellowstoneTransactionLogger)
         .build();

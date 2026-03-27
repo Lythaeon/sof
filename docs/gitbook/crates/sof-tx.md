@@ -231,8 +231,9 @@ Two important adapter paths:
 - `DerivedStateTxProviderAdapter`: replayable adapter for restart-safe services
 
 Those adapter paths are complete today with raw-shred or gossip-backed SOF runtimes. Built-in
-processed provider adapters such as Yellowstone, LaserStream, and websocket are transaction-first
-today and do not, by themselves, provide the full `sof-tx` control-plane feed.
+processed provider adapters such as Yellowstone, LaserStream, and websocket can now emit several
+typed processed-event families, but they still do not by themselves provide the full `sof-tx`
+control-plane feed.
 
 That split matters:
 

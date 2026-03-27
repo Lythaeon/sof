@@ -12,7 +12,7 @@ This page is the operator-facing mode matrix. For the newcomer mental model behi
 | Direct UDP listener | you control packet sources or want the simplest bring-up | no gossip-discovered topology/bootstrap |
 | Gossip bootstrap | you want cluster discovery, topology updates, relay, and bounded repair | more moving parts and more outbound control-plane traffic |
 | External kernel-bypass ingress | you own a specialized network front end | higher integration complexity |
-| Processed provider stream | you already have a transaction-first provider feed | SOF starts later in the pipeline than raw-shred modes |
+| Processed provider stream | you already have a processed provider feed for transaction, account, block-meta, log, or slot data | SOF starts later in the pipeline than raw-shred modes |
 
 For lowest latency, the important distinction is usually not "UDP vs gossip." It is:
 
@@ -88,8 +88,10 @@ Best for:
 Important behavior:
 
 - SOF does not run packet parsing, raw shred verification, FEC recovery, or dataset reconstruction
-- built-in processed providers are transaction-first
-- `ProviderStreamMode::Generic` is the flexible mode for custom producers that need richer updates
+- built-in processed providers cover typed transaction, transaction-status, account, block-meta,
+  log, and slot feeds where supported
+- `ProviderStreamMode::Generic` is the flexible mode for custom producers and multi-source fan-in
+  that need custom typed updates or richer control-plane feeds
 - provider durability and replay behavior depend on the specific upstream
 
 Use [Integration Model](../architecture/integration-model.md) if you need the semantic boundary

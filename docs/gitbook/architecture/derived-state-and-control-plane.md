@@ -18,9 +18,9 @@ and failure cost of routing every check through RPC.
 
 Processed provider mode is different:
 
-- built-in Yellowstone, LaserStream, and websocket adapters are transaction-first
-- they can still drive transaction consumers and recent-blockhash extraction from
-  observed transactions
+- built-in Yellowstone, LaserStream, and websocket adapters can drive transaction, transaction
+  status, account update, block-meta, log, and slot consumers where supported
+- they can still drive recent-blockhash extraction from observed transactions
 - they do not, by themselves, form the full live control-plane surface needed by
   `sof-tx` adapters
 - `ProviderStreamMode::Generic` is the processed-provider path that can carry

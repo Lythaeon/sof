@@ -46,8 +46,9 @@ use crate::{
     provider_stream::{
         ProviderCommitmentWatermarks, ProviderReplayMode, ProviderSourceHealthEvent,
         ProviderSourceHealthReason, ProviderSourceHealthStatus, ProviderSourceId,
-        ProviderSourceIdentity, ProviderSourceReadiness, ProviderStreamFanIn, ProviderStreamMode,
-        ProviderStreamSender, ProviderStreamUpdate, classify_provider_transaction_kind,
+        ProviderSourceIdentity, ProviderSourceIdentityRegistrationError, ProviderSourceReadiness,
+        ProviderStreamFanIn, ProviderStreamMode, ProviderStreamSender, ProviderStreamUpdate,
+        classify_provider_transaction_kind,
     },
 };
 
@@ -571,6 +572,11 @@ impl LaserStreamConfig {
         self.readiness
     }
 
+    fn source_identity(&self) -> Option<ProviderSourceIdentity> {
+        self.source_instance()
+            .map(|instance| ProviderSourceIdentity::new(self.source_id(), instance))
+    }
+
     /// Returns the runtime mode matching this built-in LaserStream stream selection.
     #[must_use]
     pub const fn runtime_mode(&self) -> ProviderStreamMode {
@@ -679,6 +685,12 @@ impl LaserStreamSlotsConfig {
 
     const fn readiness(&self) -> ProviderSourceReadiness {
         self.readiness
+    }
+
+    fn source_identity(&self) -> Option<ProviderSourceIdentity> {
+        self.source_instance().map(|instance| {
+            ProviderSourceIdentity::new(ProviderSourceId::LaserStreamSlots, instance)
+        })
     }
 
     /// Sets the LaserStream commitment.
@@ -822,6 +834,9 @@ pub enum LaserStreamError {
     /// Provider-stream queue is closed.
     #[error("provider-stream queue closed")]
     QueueClosed,
+    /// One duplicated stable source identity was registered in the same fan-in.
+    #[error(transparent)]
+    DuplicateSourceIdentity(#[from] ProviderSourceIdentityRegistrationError),
 }
 
 /// Typed LaserStream protocol/runtime failures.
@@ -918,14 +933,14 @@ struct LaserStreamSlotConnectionState<'state> {
     session_established: &'state mut bool,
 }
 
-/// Spawns one LaserStream transaction forwarder into a SOF provider-stream queue.
+/// Spawns one LaserStream primary source into a SOF provider-stream queue.
 ///
 /// # Examples
 ///
 /// ```no_run
 /// use sof::provider_stream::{
 ///     create_provider_stream_queue,
-///     laserstream::{spawn_laserstream_transaction_source, LaserStreamConfig},
+///     laserstream::{spawn_laserstream_source, LaserStreamConfig},
 /// };
 ///
 /// # #[tokio::main]
@@ -933,7 +948,7 @@ struct LaserStreamSlotConnectionState<'state> {
 /// let (tx, _rx) = create_provider_stream_queue(1024);
 /// let config =
 ///     LaserStreamConfig::new("https://laserstream-mainnet-fra.helius-rpc.com", "api-key");
-/// let handle = spawn_laserstream_transaction_source(config, tx).await?;
+/// let handle = spawn_laserstream_source(config, tx).await?;
 /// handle.abort();
 /// # Ok(())
 /// # }
@@ -942,27 +957,16 @@ struct LaserStreamSlotConnectionState<'state> {
 /// # Errors
 ///
 /// Returns any connection/bootstrap error before the forwarder task starts.
-pub async fn spawn_laserstream_transaction_source(
+pub async fn spawn_laserstream_source(
     config: LaserStreamConfig,
     sender: ProviderStreamSender,
 ) -> Result<JoinHandle<Result<(), LaserStreamError>>, LaserStreamError> {
     config.validate()?;
     let source = ProviderSourceIdentity::generated(config.source_id(), config.source_instance());
+    register_laserstream_primary_initial_health(&source, config.readiness(), &sender);
     let first_session =
         connect_and_subscribe_once(&config, config.subscribe_request_with_state(0)).await?;
     Ok(tokio::spawn(async move {
-        send_primary_provider_health(
-            &source,
-            config.readiness(),
-            &sender,
-            ProviderSourceHealthStatus::Reconnecting,
-            ProviderSourceHealthReason::InitialConnectPending,
-            format!(
-                "waiting for first laserstream {} session ack",
-                config.stream_kind()
-            ),
-        )
-        .await?;
         let mut attempts = 0_u32;
         let mut tracked_slot = 0_u64;
         let mut watermarks = ProviderCommitmentWatermarks::default();
@@ -1077,7 +1081,7 @@ pub async fn spawn_laserstream_transaction_source(
     }))
 }
 
-/// Spawns one LaserStream slot forwarder into a SOF provider-stream queue.
+/// Spawns one LaserStream slot source into a SOF provider-stream queue.
 ///
 /// # Errors
 ///
@@ -1090,18 +1094,10 @@ pub async fn spawn_laserstream_slot_source(
         ProviderSourceId::LaserStreamSlots,
         config.source_instance(),
     );
+    register_laserstream_slot_initial_health(&source, config.readiness(), &sender);
     let first_session =
         connect_and_subscribe_slots_once(&config, config.subscribe_request_with_state(0)).await?;
     Ok(tokio::spawn(async move {
-        send_provider_slot_health(
-            &source,
-            config.readiness(),
-            &sender,
-            ProviderSourceHealthStatus::Reconnecting,
-            ProviderSourceHealthReason::InitialConnectPending,
-            "waiting for first laserstream slot session ack".to_owned(),
-        )
-        .await?;
         let mut attempts = 0_u32;
         let mut tracked_slot = 0_u64;
         let mut watermarks = ProviderCommitmentWatermarks::default();
@@ -1452,6 +1448,27 @@ async fn send_primary_provider_health(
         .map_err(|_error| LaserStreamError::QueueClosed)
 }
 
+fn register_laserstream_primary_initial_health(
+    source: &ProviderSourceIdentity,
+    readiness: ProviderSourceReadiness,
+    sender: &ProviderStreamSender,
+) {
+    let sender = sender.clone();
+    let event = ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
+        source: source.clone(),
+        readiness,
+        status: ProviderSourceHealthStatus::Reconnecting,
+        reason: ProviderSourceHealthReason::InitialConnectPending,
+        message: format!(
+            "waiting for first laserstream {} session ack",
+            source.kind_str().trim_start_matches("laserstream_")
+        ),
+    });
+    tokio::spawn(async move {
+        drop(sender.send(event).await);
+    });
+}
+
 async fn send_provider_slot_health(
     source: &ProviderSourceIdentity,
     readiness: ProviderSourceReadiness,
@@ -1472,12 +1489,33 @@ async fn send_provider_slot_health(
         .map_err(|_error| LaserStreamError::QueueClosed)
 }
 
+fn register_laserstream_slot_initial_health(
+    source: &ProviderSourceIdentity,
+    readiness: ProviderSourceReadiness,
+    sender: &ProviderStreamSender,
+) {
+    let sender = sender.clone();
+    let event = ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
+        source: source.clone(),
+        readiness,
+        status: ProviderSourceHealthStatus::Reconnecting,
+        reason: ProviderSourceHealthReason::InitialConnectPending,
+        message: "waiting for first laserstream slot session ack".to_owned(),
+    });
+    tokio::spawn(async move {
+        drop(sender.send(event).await);
+    });
+}
+
 const fn laserstream_health_reason(error: &LaserStreamError) -> ProviderSourceHealthReason {
     match error {
         LaserStreamError::Client(_) => ProviderSourceHealthReason::UpstreamTransportFailure,
         LaserStreamError::Config(_)
         | LaserStreamError::Convert(_)
-        | LaserStreamError::Protocol(_) => ProviderSourceHealthReason::UpstreamProtocolFailure,
+        | LaserStreamError::Protocol(_)
+        | LaserStreamError::DuplicateSourceIdentity(_) => {
+            ProviderSourceHealthReason::UpstreamProtocolFailure
+        }
         LaserStreamError::QueueClosed => ProviderSourceHealthReason::UpstreamProtocolFailure,
     }
 }
@@ -1870,17 +1908,29 @@ fn slot_status_event_from_update(
 }
 
 impl ProviderStreamFanIn {
-    /// Spawns one LaserStream transaction source into this fan-in.
+    /// Spawns one LaserStream primary source into this fan-in.
     ///
     /// # Errors
     ///
     /// Returns an error if the selected config is invalid or the source cannot
     /// be started.
-    pub async fn spawn_laserstream_transaction_source(
+    pub async fn spawn_laserstream_source(
         &self,
         config: LaserStreamConfig,
     ) -> Result<JoinHandle<Result<(), LaserStreamError>>, LaserStreamError> {
-        spawn_laserstream_transaction_source(config, self.sender()).await
+        let reserved_source = config.source_identity();
+        if let Some(source) = reserved_source.as_ref() {
+            self.reserve_source_identity(source.clone())?;
+        }
+        match spawn_laserstream_source(config, self.sender()).await {
+            Ok(handle) => Ok(handle),
+            Err(error) => {
+                if let Some(source) = reserved_source.as_ref() {
+                    self.release_source_identity(source);
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Spawns one LaserStream slot source into this fan-in.
@@ -1892,7 +1942,19 @@ impl ProviderStreamFanIn {
         &self,
         config: LaserStreamSlotsConfig,
     ) -> Result<JoinHandle<Result<(), LaserStreamError>>, LaserStreamError> {
-        spawn_laserstream_slot_source(config, self.sender()).await
+        let reserved_source = config.source_identity();
+        if let Some(source) = reserved_source.as_ref() {
+            self.reserve_source_identity(source.clone())?;
+        }
+        match spawn_laserstream_slot_source(config, self.sender()).await {
+            Ok(handle) => Ok(handle),
+            Err(error) => {
+                if let Some(source) = reserved_source.as_ref() {
+                    self.release_source_identity(source);
+                }
+                Err(error)
+            }
+        }
     }
 }
 
@@ -2193,7 +2255,7 @@ mod tests {
             .with_max_reconnect_attempts(1)
             .with_reconnect_delay(Duration::from_millis(10))
             .with_connect_timeout(Duration::from_secs(2));
-        let handle = spawn_laserstream_transaction_source(config, tx)
+        let handle = spawn_laserstream_source(config, tx)
             .await
             .expect("spawn LaserStream transaction source");
 
@@ -2249,7 +2311,7 @@ mod tests {
             .with_max_reconnect_attempts(1)
             .with_reconnect_delay(Duration::from_millis(10))
             .with_connect_timeout(Duration::from_secs(2));
-        let handle = spawn_laserstream_transaction_source(config, tx)
+        let handle = spawn_laserstream_source(config, tx)
             .await
             .expect("spawn LaserStream transaction source");
 
@@ -2289,7 +2351,7 @@ mod tests {
             .with_max_reconnect_attempts(1)
             .with_reconnect_delay(Duration::from_millis(10))
             .with_connect_timeout(Duration::from_secs(2));
-        let handle = spawn_laserstream_transaction_source(config, tx)
+        let handle = spawn_laserstream_source(config, tx)
             .await
             .expect("spawn LaserStream status source");
 
@@ -2335,7 +2397,7 @@ mod tests {
             .with_max_reconnect_attempts(1)
             .with_reconnect_delay(Duration::from_millis(10))
             .with_connect_timeout(Duration::from_secs(2));
-        let handle = spawn_laserstream_transaction_source(config, tx)
+        let handle = spawn_laserstream_source(config, tx)
             .await
             .expect("spawn LaserStream account source");
 
@@ -2432,7 +2494,7 @@ mod tests {
             .with_max_reconnect_attempts(1)
             .with_reconnect_delay(Duration::from_millis(10))
             .with_connect_timeout(Duration::from_secs(2));
-        let handle = spawn_laserstream_transaction_source(config, tx)
+        let handle = spawn_laserstream_source(config, tx)
             .await
             .expect("spawn LaserStream block-meta source");
 
@@ -2930,7 +2992,7 @@ mod tests {
             .with_stream(LaserStreamStream::BlockMeta)
             .with_accounts([Pubkey::new_unique()]);
 
-        let error = spawn_laserstream_transaction_source(config, tx)
+        let error = spawn_laserstream_source(config, tx)
             .await
             .expect_err("block-meta stream should reject account filters");
 

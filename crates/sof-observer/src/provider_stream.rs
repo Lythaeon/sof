@@ -146,7 +146,9 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+use thiserror::Error;
 use tokio::sync::mpsc;
 
 #[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
@@ -483,6 +485,12 @@ impl ProviderSourceIdentity {
     }
 }
 
+impl std::fmt::Display for ProviderSourceIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.kind.as_str(), self.instance)
+    }
+}
+
 /// Stable provider source identifier used in runtime health reporting.
 #[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum ProviderSourceId {
@@ -623,18 +631,62 @@ pub type ProviderStreamReceiver = mpsc::Receiver<ProviderStreamUpdate>;
 /// Shared provider source identity carried by provider-origin events.
 pub type ProviderSourceRef = Arc<ProviderSourceIdentity>;
 
+/// Duplicate provider source identity registration failure for multi-source fan-in.
+#[derive(Debug, Error)]
+#[error("provider fan-in already contains source identity {0}")]
+pub struct ProviderSourceIdentityRegistrationError(pub ProviderSourceIdentity);
+
 /// Helper for feeding one SOF provider queue from multiple provider sources.
 #[derive(Clone, Debug)]
 pub struct ProviderStreamFanIn {
     /// Shared sender used to fan multiple provider sources into one ingress queue.
     sender: ProviderStreamSender,
+    /// Registered stable source identities reserved for this fan-in.
+    identities: Arc<Mutex<HashSet<ProviderSourceIdentity>>>,
 }
 
 impl ProviderStreamFanIn {
-    /// Returns a cloned sender for one provider source.
+    /// Reserves one stable source identity and returns a sender for that source.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the same full source identity was already reserved
+    /// for this fan-in.
+    pub fn sender_for_source(
+        &self,
+        source: ProviderSourceIdentity,
+    ) -> Result<ProviderStreamSender, ProviderSourceIdentityRegistrationError> {
+        self.reserve_source_identity(source)?;
+        Ok(self.sender.clone())
+    }
+
+    /// Returns a cloned sender for built-in helper methods after identity checks.
+    #[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
     #[must_use]
-    pub fn sender(&self) -> ProviderStreamSender {
+    pub(crate) fn sender(&self) -> ProviderStreamSender {
         self.sender.clone()
+    }
+
+    /// Reserves one stable source identity for this fan-in.
+    pub(crate) fn reserve_source_identity(
+        &self,
+        source: ProviderSourceIdentity,
+    ) -> Result<(), ProviderSourceIdentityRegistrationError> {
+        let Ok(mut identities) = self.identities.lock() else {
+            return Err(ProviderSourceIdentityRegistrationError(source));
+        };
+        if !identities.insert(source.clone()) {
+            return Err(ProviderSourceIdentityRegistrationError(source));
+        }
+        Ok(())
+    }
+
+    /// Releases one previously reserved stable source identity.
+    #[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
+    pub(crate) fn release_source_identity(&self, source: &ProviderSourceIdentity) {
+        if let Ok(mut identities) = self.identities.lock() {
+            identities.remove(source);
+        }
     }
 }
 
@@ -733,7 +785,13 @@ pub fn create_provider_stream_fan_in(
     capacity: usize,
 ) -> (ProviderStreamFanIn, ProviderStreamReceiver) {
     let (sender, receiver) = create_provider_stream_queue(capacity);
-    (ProviderStreamFanIn { sender }, receiver)
+    (
+        ProviderStreamFanIn {
+            sender,
+            identities: Arc::new(Mutex::new(HashSet::new())),
+        },
+        receiver,
+    )
 }
 
 /// Classifies provider-fed transactions consistently across built-in adapters.

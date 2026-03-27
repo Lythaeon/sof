@@ -43,8 +43,9 @@ That is the normal pairing for services that:
 - need one process or one host to own both observation and submission decisions
 
 That adapter path is complete today in raw-shred and gossip-backed SOF runtimes. Built-in
-processed provider adapters are transaction-first and do not yet provide a complete built-in
-`sof-tx` control-plane surface by themselves.
+processed provider adapters can now emit transactions, transaction status, account updates,
+block-meta, logs, and slots where supported, but they still do not by themselves provide the full
+live `sof-tx` control-plane surface.
 
 This does not mean `sof-tx` depends on `sof` in general. It does not. `sof-tx` is still useful on
 its own for RPC, Jito, and signed-byte flows.
