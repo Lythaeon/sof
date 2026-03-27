@@ -99,13 +99,23 @@ changes. The runtime is tuned by:
 The goal is to remove repeated guesswork, not just repeated code.
 
 That tuning has happened across multiple releases. `0.13.0` carried the largest single batch of
-measured runtime/provider improvements so far, including:
+measured runtime/provider improvements so far.
+
+Examples from the measured release fixtures on that line:
+
+- provider tx-kind classification: `34112us -> 4487us`
+- provider serialized-ignore path: `42422us -> 23760us`
+- websocket full-tx parse path: `162560us -> 133309us`
+- provider dispatch path: `39157us -> 5751us`
+
+Those wins came from specific choices:
 
 - redundant work removed from hot paths
 - new fast paths that stop unnecessary work earlier
 - fewer copies and allocations in validated provider/runtime paths
 - lower instruction count for the same work on several measured paths
 - reduced branching and, where the data showed it, better cache behavior
+- regressions rejected when an apparent improvement did not hold up under A/B validation
 
 ## The Short Version
 

@@ -120,14 +120,24 @@ review. The normal workflow is:
 So "optimized" here means measured and retained, not guessed and merged.
 
 That is also cumulative across releases. SOF has been tuned incrementally over time, and `0.13.0`
-contained the largest single concentration of measured runtime/provider-path optimizations so far:
+contained the largest single concentration of measured runtime/provider-path optimizations so far.
+
+Concrete examples from the measured release fixtures on that line:
+
+- provider transaction-kind classification: `34112us -> 4487us` (`~87%` faster)
+- provider serialized-ignore path: `42422us -> 23760us` (`~44%` faster)
+- websocket full-transaction parse path: `162560us -> 133309us` (`~18%` faster)
+- provider transaction dispatch path: `39157us -> 5751us` (`~85%` faster)
+
+Those wins came from concrete changes, not generic cleanup:
 
 - redundant work removed from hot paths
 - early fast paths added so ignored or low-value traffic dies sooner
 - lower-copy and lower-allocation provider/runtime paths
-- reduced instruction count for the same work on several validated paths
+- reduced instruction count for the same work on validated paths
 - reduced branching and, where it was measurable, improved cache behavior
-- queueing, replay, reconnect, and health hardening kept without giving back the main ingest wins
+- regressions were rejected rather than rationalized, for example when an apparent optimization did
+  not survive A/B measurement on the actual path
 
 ## The Main Idea
 
