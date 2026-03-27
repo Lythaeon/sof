@@ -30,6 +30,7 @@
   - [`sof-solana-gossip`](crates/sof-solana-gossip.md)
   - [Architecture](architecture/README.md)
     - [System Overview](architecture/system-overview.md)
+    - [Performance and Measurement](architecture/performance-and-measurement.md)
     - [Runtime Pipeline](architecture/runtime-pipeline.md)
     - [Integration Model](architecture/integration-model.md)
     - [Plugin Config and Lifecycle](architecture/plugin-config-and-lifecycle.md)

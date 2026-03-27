@@ -66,12 +66,8 @@ revisiting thread knobs:
 3. measure
 4. change one advanced knob at a time
 
-That measurement step is explicit. The intended workflow is:
-
-- make a concrete bottleneck hypothesis
-- capture before-state queue metrics, drop counters, health, and latency
-- validate code-path changes with release fixtures and `perf` where applicable
-- keep only the changes that survive A/B comparison
+That measurement step is explicit. For the actual optimization workflow and release-level measured
+results, use [Performance and Measurement](../architecture/performance-and-measurement.md).
 
 For transaction plugins, prefer API-level fast paths before runtime knob tuning:
 

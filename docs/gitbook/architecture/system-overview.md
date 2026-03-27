@@ -57,13 +57,6 @@ The other important boundary is honesty about ingress:
 - processed providers start later in the pipeline
 - public gossip is the independent baseline, not the universal fast path
 
-The same honesty applies to performance claims. SOF treats optimization as measured engineering:
-
-- start from a concrete hypothesis
-- measure the baseline
-- test one change at a time
-- keep only the changes that survive A/B validation
-
-The detailed multi-release performance history lives in
-[Why SOF Exists](../use-sof/why-sof-exists.md). This page stays focused on the architecture
-boundaries rather than repeating the whole optimization story here.
+The detailed optimization history and measurement method live in
+[Performance and Measurement](performance-and-measurement.md). This page stays focused on the
+architecture boundaries instead of repeating that material here.
