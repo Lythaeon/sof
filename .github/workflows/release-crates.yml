@@ -89,7 +89,14 @@ jobs:
           }
 
           # Define crates in dependency order
-          crates=("sof-gossip-tuning" "sof-solana-gossip" "sof" "sof-tx")
+          crates=(
+            "sof-gossip-tuning"
+            "sof-solana-gossip"
+            "sof-types"
+            "sof"
+            "sof-tx"
+            "sof-solana-compat"
+          )
 
           for pkg in "${crates[@]}"; do
             crate_version="$(version_for "$pkg")"
