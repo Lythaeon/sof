@@ -950,19 +950,19 @@ pub async fn spawn_laserstream_transaction_source(
     let source = ProviderSourceIdentity::generated(config.source_id(), config.source_instance());
     let first_session =
         connect_and_subscribe_once(&config, config.subscribe_request_with_state(0)).await?;
-    send_primary_provider_health(
-        &source,
-        config.readiness(),
-        &sender,
-        ProviderSourceHealthStatus::Reconnecting,
-        ProviderSourceHealthReason::InitialConnectPending,
-        format!(
-            "waiting for first laserstream {} session ack",
-            config.stream_kind()
-        ),
-    )
-    .await?;
     Ok(tokio::spawn(async move {
+        send_primary_provider_health(
+            &source,
+            config.readiness(),
+            &sender,
+            ProviderSourceHealthStatus::Reconnecting,
+            ProviderSourceHealthReason::InitialConnectPending,
+            format!(
+                "waiting for first laserstream {} session ack",
+                config.stream_kind()
+            ),
+        )
+        .await?;
         let mut attempts = 0_u32;
         let mut tracked_slot = 0_u64;
         let mut watermarks = ProviderCommitmentWatermarks::default();
@@ -1092,16 +1092,16 @@ pub async fn spawn_laserstream_slot_source(
     );
     let first_session =
         connect_and_subscribe_slots_once(&config, config.subscribe_request_with_state(0)).await?;
-    send_provider_slot_health(
-        &source,
-        config.readiness(),
-        &sender,
-        ProviderSourceHealthStatus::Reconnecting,
-        ProviderSourceHealthReason::InitialConnectPending,
-        "waiting for first laserstream slot session ack".to_owned(),
-    )
-    .await?;
     Ok(tokio::spawn(async move {
+        send_provider_slot_health(
+            &source,
+            config.readiness(),
+            &sender,
+            ProviderSourceHealthStatus::Reconnecting,
+            ProviderSourceHealthReason::InitialConnectPending,
+            "waiting for first laserstream slot session ack".to_owned(),
+        )
+        .await?;
         let mut attempts = 0_u32;
         let mut tracked_slot = 0_u64;
         let mut watermarks = ProviderCommitmentWatermarks::default();

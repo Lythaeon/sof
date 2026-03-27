@@ -869,19 +869,19 @@ pub async fn spawn_websocket_transaction_source(
     let config = config.clone();
     let source = ProviderSourceIdentity::generated(config.source_id(), config.source_instance());
     let first_session = establish_websocket_primary_session(&config).await?;
-    send_primary_provider_health(
-        &source,
-        config.readiness(),
-        &sender,
-        ProviderSourceHealthStatus::Reconnecting,
-        ProviderSourceHealthReason::InitialConnectPending,
-        format!(
-            "waiting for first websocket {} session ack",
-            config.stream_kind()
-        ),
-    )
-    .await?;
     Ok(tokio::spawn(async move {
+        send_primary_provider_health(
+            &source,
+            config.readiness(),
+            &sender,
+            ProviderSourceHealthStatus::Reconnecting,
+            ProviderSourceHealthReason::InitialConnectPending,
+            format!(
+                "waiting for first websocket {} session ack",
+                config.stream_kind()
+            ),
+        )
+        .await?;
         let mut attempts = 0_u32;
         let mut last_seen_slot = None;
         let mut watermarks = ProviderCommitmentWatermarks::default();
@@ -991,16 +991,16 @@ pub async fn spawn_websocket_logs_source(
         config.source_instance(),
     );
     let first_session = establish_websocket_logs_session(&config).await?;
-    send_provider_logs_health(
-        &source,
-        config.readiness(),
-        &sender,
-        ProviderSourceHealthStatus::Reconnecting,
-        ProviderSourceHealthReason::InitialConnectPending,
-        "waiting for first websocket logs session ack".to_owned(),
-    )
-    .await?;
     Ok(tokio::spawn(async move {
+        send_provider_logs_health(
+            &source,
+            config.readiness(),
+            &sender,
+            ProviderSourceHealthStatus::Reconnecting,
+            ProviderSourceHealthReason::InitialConnectPending,
+            "waiting for first websocket logs session ack".to_owned(),
+        )
+        .await?;
         let mut attempts = 0_u32;
         let mut first_session = Some(first_session);
         loop {

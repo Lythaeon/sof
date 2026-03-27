@@ -49,3 +49,8 @@ Follow-up findings after the readiness/readiness-class pass:
 9. In-code provider adapter module docs drifted.
    - Websocket module docs still described only transaction adapters.
    - Yellowstone config docs still described only transaction subscriptions.
+
+10. Built-in initial source registration could block startup on a full queue.
+   - Initial health registration was sent before `tokio::spawn`.
+   - In multi-source startup, that could block a later source spawn before the
+     runtime had begun draining the provider queue.
