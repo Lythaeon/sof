@@ -46,6 +46,10 @@ That is also why SOF tries to keep semantics consistent across ingress modes. Th
 developer writes one plugin/runtime consumer model while SOF owns the provider-specific runtime
 plumbing and performance discipline underneath it.
 
+That performance claim is intentionally scoped: on the release fixtures validated on this branch,
+no regression was observed on ingest-critical runtime/provider paths, and most of those paths were
+net-positive against the older baseline implementations.
+
 ## Plugin Contract
 
 The plugin model is intentionally explicit:
@@ -57,6 +61,8 @@ The plugin model is intentionally explicit:
 - non-transaction hooks share one bounded queue
 - accepted transactions use separate inline-critical, critical, and background lanes
 - full queues drop the incoming event; SOF does not evict older queued plugin events
+- queue ownership is shared per host/lane, not per plugin
+- SOF does not currently guarantee per-plugin fairness under pressure
 - `PluginDispatchMode::Sequential` preserves registration order for one queued event
 - `PluginDispatchMode::BoundedConcurrent(n)` gives bounded parallelism instead of strict per-event
   callback ordering
@@ -91,6 +97,9 @@ SOF exposes two explicit raw-shred trust modes:
 `processed_provider_stream` products such as Yellowstone gRPC, LaserStream, or websocket feeds are
 easier to consume, but they are a different product category. They are not `SOF_SHRED_TRUST_MODE`
 values because they do not feed SOF raw shreds.
+
+`trusted_raw_shred_provider` disables local shred verification by default. Misuse can let invalid
+data enter the observer pipeline. Treat it as a trust-boundary choice, not a generic speed knob.
 
 SOF exposes those processed feeds through `ProviderStreamMode`. In that path, provider updates go
 straight into transaction or transaction-view-batch dispatch instead of the packet/shred/FEC
@@ -142,6 +151,11 @@ Built-in durability behavior:
   - generic provider replay dedupe also covers transaction-log and
     transaction-view-batch updates now, not only transaction/control-plane
     events
+  - provider replay dedupe is runtime-wide for the active provider ingress
+    before plugin/derived-state dispatch; it is not a per-plugin cache
+  - SOF does not run raw-shred and provider-stream ingest together inside one
+    observer runtime, so there is no cross-family replay dedupe boundary inside
+    a single running SOF instance
 
 Provider config defaults are inclusive:
 

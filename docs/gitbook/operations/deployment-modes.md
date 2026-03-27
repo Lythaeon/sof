@@ -24,7 +24,8 @@ application.
 | `public_untrusted` | you want to own the whole stack and keep independent verification | higher CPU cost and usually later visibility than private shred distribution |
 | `trusted_raw_shred_provider` | you have access to a trusted private shred feed and want SOF's fastest practical path | you are explicitly depending on upstream trust instead of only public-edge verification |
 
-`trusted_raw_shred_provider` should be treated as a trust-boundary decision, not just a
+`trusted_raw_shred_provider` disables local shred verification by default. Misuse can let invalid
+data enter the observer pipeline. It should be treated as a trust-boundary decision, not just a
 performance knob. It is intended for validator-adjacent or privately authenticated raw shred
 distribution. If you are still on public gossip or public peers, this is the wrong posture.
 
@@ -92,6 +93,11 @@ SOF exposes this category through `ProviderStreamMode`. In that mode:
     runtime startup
   - generic provider replay dedupe also covers `TransactionLog` and
     `TransactionViewBatch` updates, not only transaction/control-plane events
+  - provider replay dedupe is runtime-wide for the active provider ingress
+    before plugin and derived-state dispatch; it is not a per-plugin cache
+  - SOF does not run raw-shred and provider-stream ingest together inside one
+    observer runtime, so there is no cross-family replay dedupe boundary inside
+    a single running SOF instance
 - `ProviderStreamMode::Generic` can be used for finite replay/batch producers
   too, but that is explicit:
   - set `SOF_PROVIDER_STREAM_ALLOW_EOF=true` if bounded generic ingress should

@@ -39,6 +39,8 @@ SOF's plugin surface is intentionally bounded. The important rules are:
 - non-transaction hooks share one bounded general queue
 - accepted transactions use separate bounded lanes for inline-critical, critical, and background work
 - full queues drop the incoming event; SOF does not evict older queued plugin events to make room
+- queue ownership is host-wide per lane, not per plugin
+- SOF does not currently guarantee per-plugin fairness under pressure
 - `PluginDispatchMode::Sequential` preserves registration order for one queued event
 - `PluginDispatchMode::BoundedConcurrent(n)` trades that strict per-event callback ordering for
   bounded parallelism
@@ -95,6 +97,10 @@ SOF is useful because it already spent the engineering effort on the details mos
 - a consistent transaction/plugin model across multiple ingress families
 
 If you build your own Solana runtime stack from scratch for every service, you end up paying that optimization and correctness tax every time.
+
+That performance claim is intentionally scoped: on the release fixtures validated on this branch,
+no regression was observed on ingest-critical runtime/provider paths, and most of those paths were
+net-positive against the older baseline implementations.
 
 ## The Main Idea
 
@@ -165,10 +171,11 @@ Raw shred trust modes:
   - meant for trusted private shred feeds
   - lower observer-side CPU cost
 
-`trusted_raw_shred_provider` is intentionally not the safe default. Use it only when your upstream
-trust boundary is explicit, for example validator-adjacent raw shred distribution or a private
-provider you have already decided to trust operationally. If that sentence is not clearly true for
-your deployment, stay on `public_untrusted`.
+`trusted_raw_shred_provider` disables local shred verification by default. Misuse can let invalid
+data enter the observer pipeline. It is intentionally not the safe default. Use it only when your
+upstream trust boundary is explicit, for example validator-adjacent raw shred distribution or a
+private provider you have already decided to trust operationally. If that sentence is not clearly
+true for your deployment, stay on `public_untrusted`.
 
 Trusted raw-shred mode still uses the normal SOF downstream path after admission:
 
@@ -216,6 +223,11 @@ This is the flexible processed-provider mode:
 - custom producers can send richer control-plane updates
 - generic mode can power `sof-tx` adapters if it provides the full control-plane surface
 - capability mismatch can either warn or fail
+- provider replay dedupe is runtime-wide for the active provider ingress before plugin and
+  derived-state dispatch
+- that dedupe is not per-plugin
+- SOF does not run raw-shred and provider-stream ingest together inside one observer runtime, so
+  there is no cross-family replay dedupe boundary inside a single running SOF instance
 
 Useful knobs:
 

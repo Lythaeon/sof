@@ -113,6 +113,8 @@ These rules should be treated as part of the plugin contract:
 - non-transaction hooks share one bounded queue
 - accepted transactions use separate bounded inline-critical, critical, and background lanes
 - full queues drop the arriving event; SOF does not evict older queued plugin events
+- queue ownership is host-wide per lane, not per plugin
+- SOF does not currently guarantee per-plugin fairness under pressure
 - `PluginDispatchMode::Sequential` preserves registration order for one queued event
 - `PluginDispatchMode::BoundedConcurrent(n)` keeps parallelism bounded but does not promise the
   same strict per-event callback ordering
