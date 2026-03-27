@@ -56,3 +56,7 @@ The other important boundary is honesty about ingress:
 - raw-shred modes own more of the substrate
 - processed providers start later in the pipeline
 - public gossip is the independent baseline, not the universal fast path
+
+The detailed optimization history and measurement method live in
+[Performance and Measurement](performance-and-measurement.md). This page stays focused on the
+architecture boundaries instead of repeating that material here.

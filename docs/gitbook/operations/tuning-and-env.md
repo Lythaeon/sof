@@ -66,6 +66,9 @@ revisiting thread knobs:
 3. measure
 4. change one advanced knob at a time
 
+That measurement step is explicit. For the actual optimization workflow and release-level measured
+results, use [Performance and Measurement](../architecture/performance-and-measurement.md).
+
 For transaction plugins, prefer API-level fast paths before runtime knob tuning:
 
 - use `TransactionDispatchMode::Inline` when the plugin actually benefits from earliest tx
@@ -87,3 +90,4 @@ For transaction plugins, prefer API-level fast paths before runtime knob tuning:
 - keep a host-specific tuning log
 - change one family of knobs at a time
 - watch queue depth, drop counters, replay health, and repair behavior before and after each change
+- do not keep a knob or code change just because it sounded faster before measurement

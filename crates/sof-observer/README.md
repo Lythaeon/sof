@@ -37,6 +37,8 @@ problems:
 - verification posture and trust modeling
 - packet/FEC/dataset reconstruction work
 - low-level hot-path tuning around instructions, cache misses, allocations, and copies
+- removal of redundant work that creates CPU cost without adding observer value
+- fast paths so ignored or low-value traffic can exit earlier
 - health, readiness, telemetry, and bounded degradation under pressure
 
 SOF packages that work into one runtime so application developers can stay focused on the Solana
@@ -46,9 +48,28 @@ That is also why SOF tries to keep semantics consistent across ingress modes. Th
 developer writes one plugin/runtime consumer model while SOF owns the provider-specific runtime
 plumbing and performance discipline underneath it.
 
-That performance claim is intentionally scoped: on the validated release fixtures on this branch,
-no regression was observed on ingest-critical runtime/provider paths, and most of those paths were
-net-positive against the older baseline implementations.
+That performance claim is intentionally scoped: on the validated release fixtures, no regression
+was observed on ingest-critical runtime/provider paths, and most of those paths were net-positive
+against the older baseline implementations.
+
+The important part is that SOF got there incrementally:
+
+- earlier releases reduced packet churn, dispatch overhead, allocator pressure, and plugin fanout
+- `0.12.0` tightened inline transaction visibility and improved validated VPS latency from
+  `59.978 / 8.007 / 6.415 ms` to `44.929 / 6.593 / 5.370 ms` for
+  `first_shred / last_required_shred / ready -> plugin`
+- `0.13.0` added the densest provider/runtime perf slice so far, including:
+  - provider transaction-kind classification: `34112us -> 4487us` (`~7.6x`)
+  - provider transaction dispatch path: `39157us -> 5751us` (`~6.8x`)
+  - provider serialized-ignore path: `42422us -> 23760us` (`~44%` faster)
+  - websocket full-transaction parse path: `162560us -> 133309us` (`~18%` faster)
+
+SOF keeps those wins only when measurement proves them. The normal loop is: identify a suspected
+bottleneck, capture a baseline, change one thing, re-run A/B checks plus `perf` and runtime
+metrics, then keep the change only if the path is measurably better.
+
+The detailed performance history and methodology are in
+[`docs/gitbook/use-sof/why-sof-exists.md`](../../docs/gitbook/use-sof/why-sof-exists.md).
 
 ## Plugin Contract
 

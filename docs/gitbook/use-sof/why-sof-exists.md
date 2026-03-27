@@ -81,11 +81,34 @@ Because even when the ingress question is settled, the runtime work still remain
 - provider-specific reconnect and replay handling
 - queue boundaries and overload behavior
 - hot-path copy and allocation control
+- removing redundant work that only burns CPU
+- introducing fast paths that avoid deeper work when the answer is already known
 - consistent hooks and filters across modes
 - health, readiness, and metrics
 - local control-plane and derived-state plumbing
 
 SOF is the reusable layer for that work.
+
+The detailed performance and measurement story lives in
+[Performance and Measurement](../architecture/performance-and-measurement.md). That page carries
+the actual methodology, multi-release optimization history, and concrete measured wins in one
+place.
+
+## What SOF Is Actually Claiming
+
+The claim is not:
+
+- SOF is automatically the fastest way to see Solana data
+
+The claim is:
+
+- SOF removes a large amount of local runtime waste
+- SOF gives you one reusable runtime instead of rebuilding ingest and dispatch every time
+- SOF keeps measured wins and rejects regressions
+- SOF makes the runtime behavior more explicit and more observable while staying fast on the
+  validated hot paths
+
+So the value is not just "speed." It is speed plus correctness boundaries plus operational clarity.
 
 ## The Short Version
 
