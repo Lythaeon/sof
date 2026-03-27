@@ -33,8 +33,9 @@ use crate::{
         ProviderCommitmentWatermarks, ProviderSourceHealthEvent, ProviderSourceHealthReason,
         ProviderSourceHealthStatus, ProviderSourceId, ProviderSourceIdentity,
         ProviderSourceIdentityRegistrationError, ProviderSourceReadiness,
-        ProviderSourceReservation, ProviderStreamFanIn, ProviderStreamMode, ProviderStreamSender,
-        ProviderStreamUpdate, SerializedTransactionEvent, classify_provider_transaction_kind,
+        ProviderSourceReservation, ProviderSourceTaskGuard, ProviderStreamFanIn,
+        ProviderStreamMode, ProviderStreamSender, ProviderStreamUpdate, SerializedTransactionEvent,
+        classify_provider_transaction_kind,
     },
 };
 
@@ -925,8 +926,14 @@ async fn spawn_websocket_source_inner(
             return Err(error);
         }
     };
+    let source_task = ProviderSourceTaskGuard::new(
+        sender.clone(),
+        source.clone(),
+        config.readiness(),
+        reservation,
+    );
     Ok(tokio::spawn(async move {
-        let _reservation = reservation;
+        let _source_task = source_task;
         let mut attempts = 0_u32;
         let mut last_seen_slot = None;
         let mut watermarks = ProviderCommitmentWatermarks::default();
@@ -1060,8 +1067,14 @@ async fn spawn_websocket_logs_source_inner(
             return Err(error);
         }
     };
+    let source_task = ProviderSourceTaskGuard::new(
+        sender.clone(),
+        source.clone(),
+        config.readiness(),
+        reservation,
+    );
     Ok(tokio::spawn(async move {
-        let _reservation = reservation;
+        let _source_task = source_task;
         let mut attempts = 0_u32;
         let mut first_session = Some(first_session);
         loop {
@@ -3012,6 +3025,65 @@ mod tests {
 
         handle.abort();
         handle.await.ok();
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn websocket_transaction_source_emits_removed_health_on_abort() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = accept_async(stream).await.expect("websocket handshake");
+            let subscribe = ws
+                .next()
+                .await
+                .expect("subscribe frame")
+                .expect("subscribe message");
+            match subscribe {
+                WsMessage::Text(text) => assert!(text.contains("transactionSubscribe")),
+                other => panic!("expected subscribe text frame, got {other:?}"),
+            }
+            ws.send(WsMessage::Text(
+                String::from(r#"{"jsonrpc":"2.0","id":1,"result":42}"#).into(),
+            ))
+            .await
+            .expect("ack");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _ = ws.close(None).await;
+        });
+
+        let (tx, mut rx) = create_provider_stream_queue(8);
+        let config = WebsocketTransactionConfig::new(format!("ws://{addr}"))
+            .with_max_reconnect_attempts(1)
+            .with_reconnect_delay(Duration::from_millis(10));
+        let handle = spawn_websocket_source(&config, tx)
+            .await
+            .expect("spawn websocket transaction source");
+
+        let first = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("provider update timeout")
+            .expect("provider update");
+        let ProviderStreamUpdate::Health(first) = first else {
+            panic!("expected initial provider health update");
+        };
+        assert_eq!(first.status, ProviderSourceHealthStatus::Reconnecting);
+
+        handle.abort();
+        handle.await.ok();
+
+        let second = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("removed provider update timeout")
+            .expect("removed provider update");
+        let ProviderStreamUpdate::Health(second) = second else {
+            panic!("expected removed provider health update");
+        };
+        assert_eq!(second.status, ProviderSourceHealthStatus::Removed);
+        assert_eq!(second.reason, ProviderSourceHealthReason::SourceRemoved);
+
         server.await.expect("server task");
     }
 

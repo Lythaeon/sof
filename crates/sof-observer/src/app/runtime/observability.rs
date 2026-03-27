@@ -355,7 +355,7 @@ fn render_metrics(
     append_metric_family(
         &mut buffer,
         "sof_provider_source_status",
-        "Typed provider source health state by source.",
+        "Current typed provider source health state by active tracked source. Removed sources are pruned instead of remaining visible.",
         PrometheusMetricType::Gauge,
     );
     for event in &state.provider_sources {

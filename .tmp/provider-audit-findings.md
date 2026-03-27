@@ -64,3 +64,9 @@ Follow-up findings after the readiness/readiness-class pass:
   source/task shutdown for both built-in and generic sender paths, and the old
   public spawn names needed compatibility shims instead of a silent semver
   break.
+
+- 2026-03-28 follow-up: generic reserved senders still needed to bind every
+  emitted update to their reserved source identity, built-in source tasks still
+  needed to prune themselves on normal stop/abort instead of only on startup
+  failure, and public docs/metrics needed to spell out that `Removed` is a
+  pruning control event rather than a persistent health state.

@@ -40,8 +40,9 @@ use crate::{
         ProviderCommitmentWatermarks, ProviderReplayMode, ProviderSourceHealthEvent,
         ProviderSourceHealthReason, ProviderSourceHealthStatus, ProviderSourceId,
         ProviderSourceIdentity, ProviderSourceIdentityRegistrationError, ProviderSourceReadiness,
-        ProviderSourceReservation, ProviderStreamFanIn, ProviderStreamMode, ProviderStreamSender,
-        ProviderStreamUpdate, classify_provider_transaction_kind,
+        ProviderSourceReservation, ProviderSourceTaskGuard, ProviderStreamFanIn,
+        ProviderStreamMode, ProviderStreamSender, ProviderStreamUpdate,
+        classify_provider_transaction_kind,
     },
 };
 
@@ -942,8 +943,14 @@ async fn spawn_yellowstone_grpc_source_inner(
             return Err(error);
         }
     };
+    let source_task = ProviderSourceTaskGuard::new(
+        sender.clone(),
+        source.clone(),
+        config.readiness(),
+        reservation,
+    );
     Ok(tokio::spawn(async move {
-        let _reservation = reservation;
+        let _source_task = source_task;
         let mut attempts = 0_u32;
         let mut tracked_slot = 0_u64;
         let mut watermarks = ProviderCommitmentWatermarks::default();
@@ -1092,8 +1099,14 @@ async fn spawn_yellowstone_grpc_slot_source_inner(
             return Err(error);
         }
     };
+    let source_task = ProviderSourceTaskGuard::new(
+        sender.clone(),
+        source.clone(),
+        config.readiness(),
+        reservation,
+    );
     Ok(tokio::spawn(async move {
-        let _reservation = reservation;
+        let _source_task = source_task;
         let mut attempts = 0_u32;
         let mut tracked_slot = 0_u64;
         let mut watermarks = ProviderCommitmentWatermarks::default();

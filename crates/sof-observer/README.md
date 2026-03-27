@@ -230,6 +230,7 @@ Built-in durability behavior:
   than a clean stop
   - provider-source health is also exposed through the runtime observability
     endpoint, so reconnecting/unhealthy provider states are visible as metrics
+    and a source removal event prunes a stopped source from active tracking
   - provider `/readyz` stays unready until a built-in source has actually
     reached a healthy session, or until a generic producer has emitted real
     ingress progress
@@ -342,6 +343,11 @@ for example:
 
 The built-in source configs stay the same in that setup. The fan-in helper just
 gives them one typed queue.
+
+If you build a generic source directly, reserve one stable source identity with
+`sender_for_source(...)`. The returned sender binds that reserved source to
+every update it emits, so replay dedupe, readiness, and observability all stay
+source-aware.
 
 The runtime then routes those typed updates into the normal SOF surfaces:
 

@@ -67,6 +67,11 @@
 //! - a stable source instance label for observability via `with_source_instance(...)`
 //! - whether one source is readiness-gating or optional via `with_readiness(...)`
 //!
+//! Generic multi-source producers can reserve one stable source identity with
+//! [`ProviderStreamFanIn::sender_for_source`]. The returned
+//! [`ReservedProviderStreamSender`] automatically attributes every update it
+//! sends to that reserved provider source.
+//!
 //! Variant-to-runtime mapping:
 //!
 //! - `Transaction`:
@@ -147,10 +152,10 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::SendError;
 
 #[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -569,6 +574,10 @@ pub enum ProviderSourceHealthStatus {
     /// Source exhausted recovery and is no longer healthy.
     Unhealthy,
     /// Source registration was withdrawn and should be removed from tracking.
+    ///
+    /// This is a lifecycle control event, not a persistent steady-state health
+    /// value. Runtime health and observability prune removed sources instead of
+    /// surfacing them as active tracked sources.
     Removed,
 }
 
@@ -609,6 +618,8 @@ pub enum ProviderSourceHealthReason {
     ReplayBackfillFailure,
     /// Reconnect budget was exhausted.
     ReconnectBudgetExhausted,
+    /// Source task stopped and its registration was pruned from tracking.
+    SourceRemoved,
 }
 
 impl ProviderSourceHealthReason {
@@ -623,6 +634,7 @@ impl ProviderSourceHealthReason {
             Self::UpstreamProtocolFailure => "upstream_protocol_failure",
             Self::ReplayBackfillFailure => "replay_backfill_failure",
             Self::ReconnectBudgetExhausted => "reconnect_budget_exhausted",
+            Self::SourceRemoved => "source_removed",
         }
     }
 }
@@ -670,18 +682,81 @@ impl ReservedProviderStreamSender {
         &self.reservation.source
     }
 
-    /// Returns a cloned raw sender for APIs that require ownership of the sender value.
-    #[must_use]
-    pub fn sender(&self) -> ProviderStreamSender {
-        self.sender.clone()
+    /// Binds one outgoing update to this sender's reserved provider source.
+    fn bind_update(&self, update: ProviderStreamUpdate) -> ProviderStreamUpdate {
+        update.with_provider_source(self.reservation.source.clone())
+    }
+
+    /// Sends one provider update attributed to this reserved source identity.
+    ///
+    /// Any provider source already present on `update` is replaced with this
+    /// sender's reserved source identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying queue send error when the provider ingress queue
+    /// is closed.
+    pub async fn send(
+        &self,
+        update: ProviderStreamUpdate,
+    ) -> Result<(), SendError<ProviderStreamUpdate>> {
+        self.sender.send(self.bind_update(update)).await
     }
 }
 
-impl Deref for ReservedProviderStreamSender {
-    type Target = ProviderStreamSender;
+/// One running provider task that should prune its source registration when it stops.
+#[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
+#[derive(Debug)]
+pub(crate) struct ProviderSourceTaskGuard {
+    /// Sender used to publish the terminal removal event.
+    sender: ProviderStreamSender,
+    /// Source identity removed when the task stops.
+    source: ProviderSourceIdentity,
+    /// Readiness class preserved on the terminal removal event.
+    readiness: ProviderSourceReadiness,
+    /// Reservation kept alive until the task stops.
+    reservation: Option<Arc<ProviderSourceReservation>>,
+}
 
-    fn deref(&self) -> &Self::Target {
-        &self.sender
+#[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
+impl ProviderSourceTaskGuard {
+    /// Creates one guard for a running provider source task.
+    #[must_use]
+    pub(crate) const fn new(
+        sender: ProviderStreamSender,
+        source: ProviderSourceIdentity,
+        readiness: ProviderSourceReadiness,
+        reservation: Option<Arc<ProviderSourceReservation>>,
+    ) -> Self {
+        Self {
+            sender,
+            source,
+            readiness,
+            reservation,
+        }
+    }
+}
+
+#[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
+impl Drop for ProviderSourceTaskGuard {
+    fn drop(&mut self) {
+        let _keep_reservation_alive = self.reservation.take();
+        let event = ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
+            source: self.source.clone(),
+            readiness: self.readiness,
+            status: ProviderSourceHealthStatus::Removed,
+            reason: ProviderSourceHealthReason::SourceRemoved,
+            message: "provider source task stopped and was removed from tracking".to_owned(),
+        });
+        match self.sender.try_send(event) {
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Full(update)) => {
+                let sender = self.sender.clone();
+                tokio::spawn(async move {
+                    drop(sender.send(update).await);
+                });
+            }
+        }
     }
 }
 
@@ -930,7 +1005,8 @@ mod tests {
     use solana_message::{Message, VersionedMessage};
     use solana_sdk_ids::system_program;
     use solana_signer::Signer;
-    use std::time::Instant;
+    use std::{sync::Arc, time::Instant};
+    use tokio::runtime::Runtime;
 
     fn profile_iterations(default: usize) -> usize {
         std::env::var("SOF_PROFILE_ITERATIONS")
@@ -988,6 +1064,71 @@ mod tests {
     fn classify_provider_transaction_kind_detects_mixed() {
         let tx = sample_mixed_transaction();
         assert_eq!(classify_provider_transaction_kind(&tx), TxKind::Mixed);
+    }
+
+    #[test]
+    fn reserved_provider_sender_binds_reserved_source_identity() {
+        let (fan_in, mut rx) = create_provider_stream_fan_in(4);
+        let sender = fan_in
+            .sender_for_source(ProviderSourceIdentity::new(
+                ProviderSourceId::Generic(Arc::<str>::from("custom")),
+                "source-a",
+            ))
+            .expect("reserve source");
+        let other_source = ProviderSourceIdentity::new(
+            ProviderSourceId::Generic(Arc::<str>::from("other")),
+            "source-b",
+        );
+
+        Runtime::new().expect("runtime").block_on(async move {
+            sender
+                .send(ProviderStreamUpdate::RecentBlockhash(
+                    ObservedRecentBlockhashEvent {
+                        slot: 7,
+                        recent_blockhash: solana_hash::Hash::new_unique().to_bytes(),
+                        dataset_tx_count: 0,
+                        provider_source: Some(Arc::new(other_source)),
+                    },
+                ))
+                .await
+                .expect("send");
+
+            let update = rx.recv().await.expect("provider update");
+            let ProviderStreamUpdate::RecentBlockhash(event) = update else {
+                panic!("expected recent blockhash update");
+            };
+            let source = event.provider_source.expect("bound provider source");
+            assert_eq!(source.kind_str(), "custom");
+            assert_eq!(source.instance_str(), "source-a");
+        });
+    }
+
+    #[test]
+    fn provider_source_task_guard_emits_removed_health_on_drop() {
+        let (tx, mut rx) = create_provider_stream_queue(4);
+        let source = ProviderSourceIdentity::new(
+            ProviderSourceId::Generic(Arc::<str>::from("custom")),
+            "source-a",
+        );
+
+        {
+            let _guard = ProviderSourceTaskGuard::new(
+                tx,
+                source.clone(),
+                ProviderSourceReadiness::Required,
+                None,
+            );
+        }
+
+        Runtime::new().expect("runtime").block_on(async move {
+            let update = rx.recv().await.expect("provider update");
+            let ProviderStreamUpdate::Health(event) = update else {
+                panic!("expected health update");
+            };
+            assert_eq!(event.source, source);
+            assert_eq!(event.status, ProviderSourceHealthStatus::Removed);
+            assert_eq!(event.reason, ProviderSourceHealthReason::SourceRemoved);
+        });
     }
 
     #[test]
