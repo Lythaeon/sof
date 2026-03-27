@@ -133,6 +133,7 @@ pub(in crate::app::runtime) fn process_completed_dataset(
                     commitment_status,
                     confirmed_slot: commitment_snapshot.confirmed_slot,
                     finalized_slot: commitment_snapshot.finalized_slot,
+                    provider_source: None,
                     payload: Arc::from(view_batch.payload),
                     transactions: view_batch.transactions.clone(),
                 },

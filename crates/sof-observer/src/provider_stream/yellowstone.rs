@@ -37,8 +37,8 @@ use crate::{
     provider_stream::{
         ProviderCommitmentWatermarks, ProviderReplayMode, ProviderSourceHealthEvent,
         ProviderSourceHealthReason, ProviderSourceHealthStatus, ProviderSourceId,
-        ProviderSourceIdentity, ProviderStreamFanIn, ProviderStreamSender, ProviderStreamUpdate,
-        classify_provider_transaction_kind,
+        ProviderSourceIdentity, ProviderStreamFanIn, ProviderStreamMode, ProviderStreamSender,
+        ProviderStreamUpdate, classify_provider_transaction_kind,
     },
 };
 
@@ -405,7 +405,7 @@ impl YellowstoneGrpcConfig {
         self
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn subscribe_request(&self) -> SubscribeRequest {
         self.subscribe_request_with_state(0)
     }
@@ -518,6 +518,19 @@ impl YellowstoneGrpcConfig {
         }
     }
 
+    /// Returns the runtime mode matching this built-in Yellowstone stream selection.
+    #[must_use]
+    pub const fn runtime_mode(&self) -> ProviderStreamMode {
+        match self.stream {
+            YellowstoneGrpcStream::Transaction => ProviderStreamMode::YellowstoneGrpc,
+            YellowstoneGrpcStream::TransactionStatus => {
+                ProviderStreamMode::YellowstoneGrpcTransactionStatus
+            }
+            YellowstoneGrpcStream::Accounts => ProviderStreamMode::YellowstoneGrpcAccounts,
+            YellowstoneGrpcStream::BlockMeta => ProviderStreamMode::YellowstoneGrpcBlockMeta,
+        }
+    }
+
     const fn stream_kind(&self) -> YellowstoneGrpcStreamKind {
         match self.stream {
             YellowstoneGrpcStream::Transaction => YellowstoneGrpcStreamKind::Transaction,
@@ -579,6 +592,12 @@ impl YellowstoneGrpcSlotsConfig {
     #[must_use]
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    /// Returns the runtime mode matching this built-in Yellowstone slot stream.
+    #[must_use]
+    pub const fn runtime_mode(&self) -> ProviderStreamMode {
+        ProviderStreamMode::YellowstoneGrpcSlots
     }
 
     /// Sets the provider x-token.

@@ -7,16 +7,25 @@
 //!
 //! Built-in mode capability summary:
 //!
-//! - `YellowstoneGrpc`: fixed runtime mode for the built-in transaction feed
-//! - `LaserStream`: fixed runtime mode for the built-in transaction feed
-//! - `WebsocketTransaction`: fixed runtime mode for websocket
-//!   `transactionSubscribe`
-//! - richer built-in source selectors, such as websocket
-//!   `accountSubscribe` / `programSubscribe` or gRPC transaction-status /
-//!   account / block-meta feeds, should be fed through
-//!   `ProviderStreamMode::Generic`
-//! - built-in websocket logs and gRPC slot feeds are also intended to fan into
-//!   `ProviderStreamMode::Generic`
+//! - `YellowstoneGrpc`: built-in Yellowstone transaction feed
+//! - `YellowstoneGrpcTransactionStatus`: built-in Yellowstone transaction-status feed
+//! - `YellowstoneGrpcAccounts`: built-in Yellowstone account-update feed
+//! - `YellowstoneGrpcBlockMeta`: built-in Yellowstone block-meta feed
+//! - `YellowstoneGrpcSlots`: built-in Yellowstone slot feed
+//! - `LaserStream`: built-in LaserStream transaction feed
+//! - `LaserStreamTransactionStatus`: built-in LaserStream transaction-status feed
+//! - `LaserStreamAccounts`: built-in LaserStream account-update feed
+//! - `LaserStreamBlockMeta`: built-in LaserStream block-meta feed
+//! - `LaserStreamSlots`: built-in LaserStream slot feed
+//! - `WebsocketTransaction`: built-in websocket `transactionSubscribe`
+//! - `WebsocketLogs`: built-in websocket `logsSubscribe`
+//! - `WebsocketAccount`: built-in websocket `accountSubscribe`
+//! - `WebsocketProgram`: built-in websocket `programSubscribe`
+//!
+//! Each built-in source config can report its matching runtime mode directly
+//! through `runtime_mode()`. `ProviderStreamMode::Generic` remains the typed
+//! custom-adapter path and the fan-in mode when you want to combine multiple
+//! heterogeneous upstream sources into one runtime ingress.
 //!
 //! Generic provider producers may still enqueue `TransactionViewBatch`,
 //! `BlockMeta`, `RecentBlockhash`, `SlotStatus`, `ClusterTopology`,
@@ -187,27 +196,37 @@ pub enum ProviderStreamMode {
     /// - `Health` -> runtime health/readiness only
     Generic,
     /// Yellowstone gRPC / Geyser-style processed transaction feeds.
-    ///
-    /// This fixed runtime mode is for the built-in transaction feed. If you use
-    /// richer Yellowstone stream selectors such as transaction-status or
-    /// account updates, feed them through [`Self::Generic`] so SOF can dispatch
-    /// the broader typed update surface.
     YellowstoneGrpc,
+    /// Yellowstone gRPC transaction-status feeds.
+    YellowstoneGrpcTransactionStatus,
+    /// Yellowstone gRPC account-update feeds.
+    YellowstoneGrpcAccounts,
+    /// Yellowstone gRPC block-meta feeds.
+    YellowstoneGrpcBlockMeta,
+    /// Yellowstone gRPC slot feeds.
+    YellowstoneGrpcSlots,
     /// LaserStream-style processed transaction feeds.
-    ///
-    /// This fixed runtime mode is for the built-in transaction feed. If you use
-    /// richer LaserStream stream selectors such as transaction-status or
-    /// account updates, feed them through [`Self::Generic`] so SOF can dispatch
-    /// the broader typed update surface.
     LaserStream,
+    /// LaserStream transaction-status feeds.
+    LaserStreamTransactionStatus,
+    /// LaserStream account-update feeds.
+    LaserStreamAccounts,
+    /// LaserStream block-meta feeds.
+    LaserStreamBlockMeta,
+    /// LaserStream slot feeds.
+    LaserStreamSlots,
     #[cfg(feature = "provider-websocket")]
     /// Websocket `transactionSubscribe` processed transaction feeds.
-    ///
-    /// This fixed runtime mode is for websocket `transactionSubscribe`. If you
-    /// use websocket `logsSubscribe`, `accountSubscribe`, or `programSubscribe`,
-    /// feed them through [`Self::Generic`] so SOF can dispatch the matching
-    /// typed updates.
     WebsocketTransaction,
+    #[cfg(feature = "provider-websocket")]
+    /// Websocket `logsSubscribe` processed log feeds.
+    WebsocketLogs,
+    #[cfg(feature = "provider-websocket")]
+    /// Websocket `accountSubscribe` processed account feeds.
+    WebsocketAccount,
+    #[cfg(feature = "provider-websocket")]
+    /// Websocket `programSubscribe` processed account feeds.
+    WebsocketProgram,
 }
 
 impl ProviderStreamMode {
@@ -217,9 +236,23 @@ impl ProviderStreamMode {
         match self {
             Self::Generic => "generic_provider",
             Self::YellowstoneGrpc => "yellowstone_grpc",
+            Self::YellowstoneGrpcTransactionStatus => "yellowstone_grpc_transaction_status",
+            Self::YellowstoneGrpcAccounts => "yellowstone_grpc_accounts",
+            Self::YellowstoneGrpcBlockMeta => "yellowstone_grpc_block_meta",
+            Self::YellowstoneGrpcSlots => "yellowstone_grpc_slots",
             Self::LaserStream => "laserstream",
+            Self::LaserStreamTransactionStatus => "laserstream_transaction_status",
+            Self::LaserStreamAccounts => "laserstream_accounts",
+            Self::LaserStreamBlockMeta => "laserstream_block_meta",
+            Self::LaserStreamSlots => "laserstream_slots",
             #[cfg(feature = "provider-websocket")]
             Self::WebsocketTransaction => "websocket_transaction",
+            #[cfg(feature = "provider-websocket")]
+            Self::WebsocketLogs => "websocket_logs",
+            #[cfg(feature = "provider-websocket")]
+            Self::WebsocketAccount => "websocket_account",
+            #[cfg(feature = "provider-websocket")]
+            Self::WebsocketProgram => "websocket_program",
         }
     }
 }
@@ -292,7 +325,7 @@ impl ProviderStreamUpdate {
             Self::SerializedTransaction(event) => event.provider_source = Some(Arc::clone(&source)),
             Self::TransactionLog(event) => event.provider_source = Some(Arc::clone(&source)),
             Self::TransactionStatus(event) => event.provider_source = Some(Arc::clone(&source)),
-            Self::TransactionViewBatch(_) => {}
+            Self::TransactionViewBatch(event) => event.provider_source = Some(Arc::clone(&source)),
             Self::AccountUpdate(event) => event.provider_source = Some(Arc::clone(&source)),
             Self::BlockMeta(event) => event.provider_source = Some(Arc::clone(&source)),
             Self::RecentBlockhash(event) => event.provider_source = Some(Arc::clone(&source)),

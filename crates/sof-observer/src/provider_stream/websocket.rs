@@ -30,7 +30,7 @@ use crate::{
     provider_stream::{
         ProviderCommitmentWatermarks, ProviderSourceHealthEvent, ProviderSourceHealthReason,
         ProviderSourceHealthStatus, ProviderSourceId, ProviderSourceIdentity, ProviderStreamFanIn,
-        ProviderStreamSender, ProviderStreamUpdate, SerializedTransactionEvent,
+        ProviderStreamMode, ProviderStreamSender, ProviderStreamUpdate, SerializedTransactionEvent,
         classify_provider_transaction_kind,
     },
 };
@@ -475,6 +475,16 @@ impl WebsocketTransactionConfig {
         }
     }
 
+    /// Returns the runtime mode matching this built-in websocket stream selection.
+    #[must_use]
+    pub const fn runtime_mode(&self) -> ProviderStreamMode {
+        match self.stream {
+            WebsocketPrimaryStream::Transaction => ProviderStreamMode::WebsocketTransaction,
+            WebsocketPrimaryStream::Account(_) => ProviderStreamMode::WebsocketAccount,
+            WebsocketPrimaryStream::Program(_) => ProviderStreamMode::WebsocketProgram,
+        }
+    }
+
     const fn source_id(&self) -> ProviderSourceId {
         match self.stream {
             WebsocketPrimaryStream::Transaction => ProviderSourceId::WebsocketTransaction,
@@ -636,6 +646,12 @@ impl WebsocketLogsConfig {
                 }
             ]
         })
+    }
+
+    /// Returns the runtime mode matching this built-in websocket logs stream.
+    #[must_use]
+    pub const fn runtime_mode(&self) -> ProviderStreamMode {
+        ProviderStreamMode::WebsocketLogs
     }
 }
 

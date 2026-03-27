@@ -1200,6 +1200,7 @@ fn transaction_batch_and_view_commitment_selector_filter_dispatch() {
             commitment_status: TxCommitmentStatus::Processed,
             confirmed_slot: None,
             finalized_slot: None,
+            provider_source: None,
             payload: Arc::from(payload.clone().into_boxed_slice()),
             transactions: Arc::from(
                 vec![SerializedTransactionRange::new(0, payload_len as u32)].into_boxed_slice(),
@@ -1234,6 +1235,7 @@ fn transaction_batch_and_view_commitment_selector_filter_dispatch() {
             commitment_status: TxCommitmentStatus::Confirmed,
             confirmed_slot: Some(21),
             finalized_slot: None,
+            provider_source: None,
             payload: Arc::from(payload.into_boxed_slice()),
             transactions: Arc::from(
                 vec![SerializedTransactionRange::new(0, payload_len as u32)].into_boxed_slice(),

@@ -1978,7 +1978,7 @@ fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderR
         }
         ProviderStreamUpdate::TransactionViewBatch(event) => {
             Some(ProviderReplayDedupeKey::ControlPlane {
-                source: None,
+                source: event.provider_source.clone(),
                 slot: event.slot,
                 kind: 7,
                 fingerprint: provider_replay_transaction_view_batch_fingerprint(event),
@@ -2261,6 +2261,15 @@ fn provider_stream_unsupported_hooks(
     plugin_host: &PluginHost,
     derived_state_host: &DerivedStateHost,
 ) -> Vec<&'static str> {
+    let supports_account_update = provider_stream_mode_supports_account_update(mode);
+    let supports_block_meta = provider_stream_mode_supports_block_meta(mode);
+    let supports_recent_blockhash = provider_stream_mode_supports_recent_blockhash(mode);
+    let supports_transaction_log = provider_stream_mode_supports_transaction_log(mode);
+    let supports_transaction_status = provider_stream_mode_supports_transaction_status(mode);
+    let supports_transaction_view_batch =
+        provider_stream_mode_supports_transaction_view_batch(mode);
+    let supports_slot_status = provider_stream_mode_supports_slot_status(mode);
+    let supports_control_plane = provider_stream_mode_supports_control_plane(mode);
     let mut unsupported = Vec::new();
     if plugin_host.wants_raw_packet() {
         unsupported.push("on_raw_packet");
@@ -2274,48 +2283,112 @@ fn provider_stream_unsupported_hooks(
     if plugin_host.wants_account_touch() {
         unsupported.push("on_account_touch");
     }
-    if plugin_host.wants_account_update() && mode != ProviderStreamMode::Generic {
+    if plugin_host.wants_account_update() && !supports_account_update {
         unsupported.push("on_account_update");
     }
-    if plugin_host.wants_block_meta() && mode != ProviderStreamMode::Generic {
+    if plugin_host.wants_block_meta() && !supports_block_meta {
         unsupported.push("on_block_meta");
     }
     if plugin_host.wants_transaction_batch() {
         unsupported.push("on_transaction_batch");
     }
-    if mode != ProviderStreamMode::Generic {
-        if plugin_host.wants_recent_blockhash() {
-            unsupported.push("on_recent_blockhash");
-        }
-        if plugin_host.wants_transaction_log() {
-            unsupported.push("on_transaction_log");
-        }
-        if plugin_host.wants_transaction_status() {
-            unsupported.push("on_transaction_status");
-        }
-        if plugin_host.wants_transaction_view_batch() {
-            unsupported.push("on_transaction_view_batch");
-        }
-        if plugin_host.wants_slot_status() {
-            unsupported.push("on_slot_status");
-        }
-        if plugin_host.wants_cluster_topology() {
-            unsupported.push("on_cluster_topology");
-        }
-        if plugin_host.wants_leader_schedule() {
-            unsupported.push("on_leader_schedule");
-        }
-        if plugin_host.wants_reorg() {
-            unsupported.push("on_reorg");
-        }
+    if plugin_host.wants_recent_blockhash() && !supports_recent_blockhash {
+        unsupported.push("on_recent_blockhash");
+    }
+    if plugin_host.wants_transaction_log() && !supports_transaction_log {
+        unsupported.push("on_transaction_log");
+    }
+    if plugin_host.wants_transaction_status() && !supports_transaction_status {
+        unsupported.push("on_transaction_status");
+    }
+    if plugin_host.wants_transaction_view_batch() && !supports_transaction_view_batch {
+        unsupported.push("on_transaction_view_batch");
+    }
+    if plugin_host.wants_slot_status() && !supports_slot_status {
+        unsupported.push("on_slot_status");
+    }
+    if plugin_host.wants_cluster_topology() && !supports_control_plane {
+        unsupported.push("on_cluster_topology");
+    }
+    if plugin_host.wants_leader_schedule() && !supports_control_plane {
+        unsupported.push("on_leader_schedule");
+    }
+    if plugin_host.wants_reorg() && !supports_control_plane {
+        unsupported.push("on_reorg");
     }
     if derived_state_host.wants_account_touch_observed() {
         unsupported.push("derived_state.account_touch_observed");
     }
-    if mode != ProviderStreamMode::Generic && derived_state_host.wants_control_plane_observed() {
+    if !supports_control_plane && derived_state_host.wants_control_plane_observed() {
         unsupported.push("derived_state.control_plane_observed");
     }
     unsupported
+}
+
+const fn provider_stream_mode_supports_account_update(mode: ProviderStreamMode) -> bool {
+    match mode {
+        ProviderStreamMode::Generic
+        | ProviderStreamMode::YellowstoneGrpcAccounts
+        | ProviderStreamMode::LaserStreamAccounts => true,
+        #[cfg(feature = "provider-websocket")]
+        ProviderStreamMode::WebsocketAccount | ProviderStreamMode::WebsocketProgram => true,
+        _ => false,
+    }
+}
+
+const fn provider_stream_mode_supports_block_meta(mode: ProviderStreamMode) -> bool {
+    matches!(
+        mode,
+        ProviderStreamMode::Generic
+            | ProviderStreamMode::YellowstoneGrpcBlockMeta
+            | ProviderStreamMode::LaserStreamBlockMeta
+    )
+}
+
+const fn provider_stream_mode_supports_recent_blockhash(mode: ProviderStreamMode) -> bool {
+    match mode {
+        ProviderStreamMode::Generic
+        | ProviderStreamMode::YellowstoneGrpc
+        | ProviderStreamMode::LaserStream => true,
+        #[cfg(feature = "provider-websocket")]
+        ProviderStreamMode::WebsocketTransaction => true,
+        _ => false,
+    }
+}
+
+const fn provider_stream_mode_supports_transaction_log(mode: ProviderStreamMode) -> bool {
+    match mode {
+        ProviderStreamMode::Generic => true,
+        #[cfg(feature = "provider-websocket")]
+        ProviderStreamMode::WebsocketLogs => true,
+        _ => false,
+    }
+}
+
+const fn provider_stream_mode_supports_transaction_status(mode: ProviderStreamMode) -> bool {
+    matches!(
+        mode,
+        ProviderStreamMode::Generic
+            | ProviderStreamMode::YellowstoneGrpcTransactionStatus
+            | ProviderStreamMode::LaserStreamTransactionStatus
+    )
+}
+
+const fn provider_stream_mode_supports_transaction_view_batch(mode: ProviderStreamMode) -> bool {
+    matches!(mode, ProviderStreamMode::Generic)
+}
+
+const fn provider_stream_mode_supports_slot_status(mode: ProviderStreamMode) -> bool {
+    matches!(
+        mode,
+        ProviderStreamMode::Generic
+            | ProviderStreamMode::YellowstoneGrpcSlots
+            | ProviderStreamMode::LaserStreamSlots
+    )
+}
+
+const fn provider_stream_mode_supports_control_plane(mode: ProviderStreamMode) -> bool {
+    matches!(mode, ProviderStreamMode::Generic)
 }
 
 fn enforce_provider_stream_capability_policy(
@@ -3314,6 +3387,7 @@ mod tests {
             commitment_status: crate::event::TxCommitmentStatus::Processed,
             confirmed_slot: None,
             finalized_slot: None,
+            provider_source: None,
             payload,
             transactions,
         })
@@ -3690,7 +3764,7 @@ mod tests {
     }
 
     #[test]
-    fn built_in_provider_modes_reject_recent_blockhash_even_under_warn() {
+    fn built_in_non_transaction_provider_modes_reject_recent_blockhash_even_under_warn() {
         crate::runtime_env::set_runtime_env_overrides([(
             String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
             String::from("warn"),
@@ -3700,7 +3774,7 @@ mod tests {
             .build();
         let derived_state_host = DerivedStateHost::builder().build();
         let result = enforce_provider_stream_capability_policy(
-            ProviderStreamMode::YellowstoneGrpc,
+            ProviderStreamMode::YellowstoneGrpcAccounts,
             &plugin_host,
             &derived_state_host,
         );
@@ -4035,6 +4109,128 @@ mod tests {
 
         assert!(!dedupe.observe(&update));
         assert!(dedupe.observe(&update));
+    }
+
+    #[test]
+    fn provider_replay_dedupe_keeps_same_transaction_view_batch_from_distinct_sources() {
+        let source_a = crate::provider_stream::ProviderSourceIdentity::new(
+            crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
+            "yellowstone-view-batch-1",
+        );
+        let source_b = crate::provider_stream::ProviderSourceIdentity::new(
+            crate::provider_stream::ProviderSourceId::LaserStream,
+            "laserstream-view-batch-1",
+        );
+        let update_a =
+            sample_provider_transaction_view_batch_update(42).with_provider_source(source_a);
+        let update_b =
+            sample_provider_transaction_view_batch_update(42).with_provider_source(source_b);
+        let mut dedupe = ProviderReplayDedupe::new(8);
+
+        assert!(!dedupe.observe(&update_a));
+        assert!(!dedupe.observe(&update_b));
+    }
+
+    #[test]
+    fn provider_stream_strict_policy_allows_transaction_status_account_block_meta_and_slot_modes() {
+        struct TransactionStatusPlugin;
+        struct AccountUpdatePlugin;
+        struct BlockMetaPlugin;
+        struct SlotStatusPlugin;
+
+        #[async_trait]
+        impl ObserverPlugin for TransactionStatusPlugin {
+            fn name(&self) -> &'static str {
+                "transaction-status-plugin"
+            }
+
+            fn config(&self) -> PluginConfig {
+                PluginConfig::new().with_transaction_status()
+            }
+        }
+
+        #[async_trait]
+        impl ObserverPlugin for AccountUpdatePlugin {
+            fn name(&self) -> &'static str {
+                "account-update-plugin"
+            }
+
+            fn config(&self) -> PluginConfig {
+                PluginConfig::new().with_account_update()
+            }
+        }
+
+        #[async_trait]
+        impl ObserverPlugin for BlockMetaPlugin {
+            fn name(&self) -> &'static str {
+                "block-meta-plugin"
+            }
+
+            fn config(&self) -> PluginConfig {
+                PluginConfig::new().with_block_meta()
+            }
+        }
+
+        #[async_trait]
+        impl ObserverPlugin for SlotStatusPlugin {
+            fn name(&self) -> &'static str {
+                "slot-status-plugin"
+            }
+
+            fn config(&self) -> PluginConfig {
+                PluginConfig::new().with_slot_status()
+            }
+        }
+
+        crate::runtime_env::set_runtime_env_overrides([(
+            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+            String::from("strict"),
+        )]);
+
+        let transaction_status_host = PluginHost::builder()
+            .add_plugin(TransactionStatusPlugin)
+            .build();
+        let account_update_host = PluginHost::builder()
+            .add_plugin(AccountUpdatePlugin)
+            .build();
+        let block_meta_host = PluginHost::builder().add_plugin(BlockMetaPlugin).build();
+        let slot_status_host = PluginHost::builder().add_plugin(SlotStatusPlugin).build();
+        let derived_state_host = DerivedStateHost::builder().build();
+
+        assert!(
+            enforce_provider_stream_capability_policy(
+                ProviderStreamMode::YellowstoneGrpcTransactionStatus,
+                &transaction_status_host,
+                &derived_state_host,
+            )
+            .is_ok()
+        );
+        assert!(
+            enforce_provider_stream_capability_policy(
+                ProviderStreamMode::YellowstoneGrpcAccounts,
+                &account_update_host,
+                &derived_state_host,
+            )
+            .is_ok()
+        );
+        assert!(
+            enforce_provider_stream_capability_policy(
+                ProviderStreamMode::YellowstoneGrpcBlockMeta,
+                &block_meta_host,
+                &derived_state_host,
+            )
+            .is_ok()
+        );
+        assert!(
+            enforce_provider_stream_capability_policy(
+                ProviderStreamMode::YellowstoneGrpcSlots,
+                &slot_status_host,
+                &derived_state_host,
+            )
+            .is_ok()
+        );
+
+        crate::runtime_env::clear_runtime_env_overrides();
     }
 
     #[tokio::test]

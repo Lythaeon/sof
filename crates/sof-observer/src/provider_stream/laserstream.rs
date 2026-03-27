@@ -46,8 +46,8 @@ use crate::{
     provider_stream::{
         ProviderCommitmentWatermarks, ProviderReplayMode, ProviderSourceHealthEvent,
         ProviderSourceHealthReason, ProviderSourceHealthStatus, ProviderSourceId,
-        ProviderSourceIdentity, ProviderStreamFanIn, ProviderStreamSender, ProviderStreamUpdate,
-        classify_provider_transaction_kind,
+        ProviderSourceIdentity, ProviderStreamFanIn, ProviderStreamMode, ProviderStreamSender,
+        ProviderStreamUpdate, classify_provider_transaction_kind,
     },
 };
 
@@ -420,7 +420,7 @@ impl LaserStreamConfig {
         self
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn subscribe_request(&self) -> grpc::SubscribeRequest {
         self.subscribe_request_with_state(0)
     }
@@ -545,6 +545,19 @@ impl LaserStreamConfig {
         }
     }
 
+    /// Returns the runtime mode matching this built-in LaserStream stream selection.
+    #[must_use]
+    pub const fn runtime_mode(&self) -> ProviderStreamMode {
+        match self.stream {
+            LaserStreamStream::Transaction => ProviderStreamMode::LaserStream,
+            LaserStreamStream::TransactionStatus => {
+                ProviderStreamMode::LaserStreamTransactionStatus
+            }
+            LaserStreamStream::Accounts => ProviderStreamMode::LaserStreamAccounts,
+            LaserStreamStream::BlockMeta => ProviderStreamMode::LaserStreamBlockMeta,
+        }
+    }
+
     const fn stream_kind(&self) -> LaserStreamStreamKind {
         match self.stream {
             LaserStreamStream::Transaction => LaserStreamStreamKind::Transaction,
@@ -608,6 +621,12 @@ impl LaserStreamSlotsConfig {
     #[must_use]
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    /// Returns the runtime mode matching this built-in LaserStream slot stream.
+    #[must_use]
+    pub const fn runtime_mode(&self) -> ProviderStreamMode {
+        ProviderStreamMode::LaserStreamSlots
     }
 
     /// Sets the LaserStream commitment.

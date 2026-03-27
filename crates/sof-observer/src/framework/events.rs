@@ -277,6 +277,8 @@ pub struct TransactionViewBatchEvent {
     pub confirmed_slot: Option<u64>,
     /// Latest observed finalized slot watermark when event was emitted.
     pub finalized_slot: Option<u64>,
+    /// Provider source instance when this view batch came from provider ingress.
+    pub provider_source: Option<ProviderSourceRef>,
     /// Shared contiguous completed-dataset payload bytes.
     pub payload: Arc<[u8]>,
     /// Serialized transaction byte ranges in dataset order.
