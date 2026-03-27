@@ -1,14 +1,14 @@
 # Build An Observer Service
 
-Start here when you want one service that ingests live Solana traffic and emits your own
-application-level events, metrics, or logs.
+Start here when you want one service that observes Solana traffic and emits your own events,
+metrics, or logs.
 
-This is the lowest-friction real product shape for `sof`.
+This is the simplest useful `sof` shape.
 
-Low-friction does not automatically mean lowest-latency. If latency is the reason you are here,
-the service also needs early shred visibility from either direct low-latency validator or peer
-access, or from an external shred propagation network. SOF's efficient local processing only pays
-off once ingress is early enough to matter.
+It is also a good place to stay honest about latency:
+
+- if ingress is early, this shape can be low-latency
+- if ingress is late, this shape is still useful, but it is not magically early
 
 ## Use This When
 
@@ -70,62 +70,9 @@ async fn main() -> Result<(), sof::runtime::RuntimeError> {
 }
 ```
 
-Use `.at_commitment(...)` when the service should ignore lower-confidence traffic,
-or `.only_at_commitment(...)` when it should react only to one exact commitment.
-If you do not set either one, SOF defaults to processed-or-better delivery.
-
-This is the right first service because it proves all of the important boundaries:
-
-- SOF can start on your host
-- your service can receive decoded events
-- your application logic can stay outside the runtime core
-
-If the plugin needs initialization or cleanup, add `setup(ctx)` and `shutdown(ctx)`.
-The packaged runtime invokes both automatically when the host is attached.
-
-For HFT-style transaction services, prefer the explicit inline transaction mode:
-
-```rust
-use async_trait::async_trait;
-use sof::{
-    event::TxKind,
-    framework::{Plugin, PluginConfig, PluginHost, TransactionDispatchMode, TransactionEvent},
-    runtime::ObserverRuntime,
-};
-
-#[derive(Clone, Copy, Debug, Default)]
-struct InlineTxLogger;
-
-#[async_trait]
-impl Plugin for InlineTxLogger {
-    fn config(&self) -> PluginConfig {
-        PluginConfig::new().with_transaction_mode(TransactionDispatchMode::Inline)
-    }
-
-    async fn on_transaction(&self, event: &TransactionEvent) {
-        if event.kind == TxKind::VoteOnly {
-            return;
-        }
-        tracing::info!(slot = event.slot, kind = ?event.kind, "inline transaction observed");
-    }
-}
-
-#[tokio::main]
-async fn main() -> Result<(), sof::runtime::RuntimeError> {
-    let host = PluginHost::builder().add_plugin(InlineTxLogger).build();
-
-    ObserverRuntime::new()
-        .with_plugin_host(host)
-        .run_until_termination_signal()
-        .await
-}
-```
-
-That keeps `on_transaction` on the low-latency inline path. Other dataset
-consumers can still continue on the dataset-worker path in parallel.
-
-Inline dispatch removes local scheduling and queueing overhead. It does not fix late ingress. If
-the host sees shreds late, inline still starts from late data.
+Use `.at_commitment(...)` when the service should ignore lower-confidence traffic, or
+`.only_at_commitment(...)` when it should react only to one exact commitment. If you do not set
+either one, SOF defaults to processed-or-better delivery.
 
 ## What You Usually Add Next
 
@@ -134,7 +81,10 @@ Once this works, the normal next step is one of these:
 - write events into your own queue or channel
 - aggregate metrics from transaction or slot events
 - add more plugins for different event classes
-- switch from direct UDP mode to gossip mode when you need richer topology/leader context
+- switch ingress mode when you have a real reason
+  - gossip for cluster discovery and topology
+  - private raw ingress for earlier shreds
+  - processed providers when you want a transaction-first stream
 
 ## What To Avoid In The First Version
 
@@ -146,9 +96,3 @@ Do not add all of this on day one:
 - replayable derived-state consumers
 
 Those are second-step concerns. First prove that your observer logic is correct.
-
-## Real Example Files
-
-- [`observer_runtime.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/observer_runtime.rs)
-- [`observer_with_non_vote_plugin.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/observer_with_non_vote_plugin.rs)
-- [`observer_with_multiple_plugins.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/observer_with_multiple_plugins.rs)

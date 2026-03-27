@@ -1,6 +1,8 @@
 # Relay, Repair, and Traffic
 
-Operators often miss one key point: in gossip mode, SOF is not observer-only by default.
+In gossip mode, SOF is not observer-only by default.
+
+That is the main reason this page exists.
 
 If that sentence is surprising, go back to [Before You Start](../getting-started/before-you-start.md)
 first. The rest of this guide assumes the difference between direct UDP mode and gossip-bootstrap
@@ -14,7 +16,8 @@ When `gossip-bootstrap` is enabled, SOF can:
 - relay recent shreds through a bounded cache
 - serve bounded repair responses
 
-That design is intentional. SOF contributes capacity instead of only consuming it.
+This is cluster-participating behavior. Use it because you need it, not because you assume gossip
+is the premium path.
 
 ## Reduce Outbound Activity
 
@@ -25,10 +28,7 @@ SOF_UDP_RELAY_ENABLED=false
 SOF_REPAIR_ENABLED=false
 ```
 
-Those are the blunt controls.
-
-Before disabling behavior entirely, the operations guidance in this repository also recommends
-trying more conservative reductions such as:
+Before disabling behavior entirely, also consider narrower changes such as:
 
 - narrowing `SOF_GOSSIP_VALIDATORS`
 - keeping `SOF_UDP_RELAY_REQUIRE_TURBINE_SOURCE_PORTS=true`
@@ -47,13 +47,3 @@ Examples of explicit bounds:
 - per-peer serve limits and byte budgets
 
 These limits are part of the anti-amplification and hot-path discipline, not just tuning details.
-
-## When To Tune These Knobs
-
-Tune relay and repair only when you have one of these symptoms:
-
-- low ingest coverage with otherwise healthy packet sources
-- unnecessary outbound bandwidth for your deployment role
-- repeated repair escalation caused by genuine packet loss
-
-If those conditions are not present, stick to defaults.

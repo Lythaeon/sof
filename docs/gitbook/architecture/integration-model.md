@@ -18,32 +18,13 @@ Use plugins when you want callbacks for:
 - leader schedule changes
 
 Plugins are the right fit for downstream logic that consumes decoded runtime events.
-They declare static hook interest with `PluginConfig` and may use startup/shutdown lifecycle hooks
-for plugin-local initialization and cleanup.
 
 Provider mode matters here:
 
 - raw-shred and gossip runtimes can emit the full normal plugin surface
 - built-in processed providers are intentionally transaction-first
-- `ProviderStreamMode::Generic` is the path for custom producers that want to
-  feed richer control-plane updates through the same host surface
-
-`ProviderStreamMode::Generic` is the typed processed-provider adapter path. A
-generic producer converts upstream data into `ProviderStreamUpdate`, and SOF
-then dispatches those typed updates into the normal runtime surfaces:
-
-- `Transaction` / `SerializedTransaction` -> transaction-family hooks
-- `TransactionLog` -> `on_transaction_log`
-- `TransactionViewBatch` -> `on_transaction_view_batch`
-- `RecentBlockhash` -> `on_recent_blockhash`
-- `SlotStatus` -> `on_slot_status`
-- `ClusterTopology` -> `on_cluster_topology`
-- `LeaderSchedule` -> `on_leader_schedule`
-- `Reorg` -> `on_reorg`
-- `Health` -> runtime health/readiness only
-
-That asymmetry is deliberate, not accidental. Switching ingress modes changes
-both transport and semantics.
+- `ProviderStreamMode::Generic` is the path for custom producers that want to feed richer
+  control-plane updates through the same host surface
 
 ## 2. Runtime Extensions
 
@@ -61,7 +42,7 @@ than semantic decoded events.
 
 ## 3. Derived-State Consumers
 
-Derived-state consumers are for authoritative state materialization and replay.
+Derived-state consumers are for deterministic local state materialization and replay.
 
 Use this path when you need:
 
@@ -69,8 +50,6 @@ Use this path when you need:
 - checkpointing
 - restart-safe replay
 - explicit rollback handling
-
-This is the correct surface for stateful systems such as local banks or geyser-like materializers.
 
 ## Choosing The Right Surface
 
@@ -81,18 +60,10 @@ This is the correct surface for stateful systems such as local banks or geyser-l
 | maintain restart-safe local derived state | derived-state consumer |
 | feed local leader and blockhash state into `sof-tx` | plugin or derived-state adapter, depending on recovery needs |
 
-One important boundary:
-
-- built-in Yellowstone, LaserStream, and websocket adapters are not a complete
-  `sof-tx` control-plane source today
-- `ProviderStreamMode::Generic` can be, if the producer supplies the full feed
-
-So users should think in two steps:
+Users should think in two steps:
 
 1. what ingest path reaches the host earliest
 2. what semantic surface that path can honestly emit
 
-## Common Mistake To Avoid
-
-Do not use plugins as a substitute for a replay contract. Plugins are primarily observational. If
-you need authoritative state derivation with rollback semantics, move to the derived-state path.
+Do not use plugins as a substitute for a replay contract. If you need authoritative local state
+with rollback semantics, move to the derived-state path.

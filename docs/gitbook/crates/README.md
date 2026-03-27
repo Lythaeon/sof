@@ -1,6 +1,6 @@
 # Crates
 
-SOF is not one wide crate with mixed concerns. It is a small product family split by job:
+SOF is a small product family split by job:
 
 - observe and derive local runtime state
 - build and submit transactions
@@ -12,7 +12,7 @@ That split is intentional because most services do not need the full surface at 
 
 - `sof` owns ingest, runtime composition, and downstream event surfaces
 - `sof-tx` owns transaction construction and submission policy
-- `sof-gossip-tuning` owns typed tuning profiles instead of stringly runtime presets
+- `sof-gossip-tuning` owns typed tuning profiles instead of stringly presets
 - `sof-solana-gossip` stays vendored and internal to preserve a tighter public API boundary
 
 ## Typical Adoption Patterns
@@ -43,11 +43,9 @@ This is the right fit when:
 - you want direct or hybrid sending based on locally observed traffic rather than only external RPC
   lookups
 
+This does not mean `sof-tx` only makes sense with `sof`. It does not. `sof-tx` is still useful on
+its own for RPC, Jito, and signed-byte flows.
+
 ### Embedded host with repeatable deployment presets
 
 Add [`sof-gossip-tuning`](sof-gossip-tuning.md) on top of `sof`.
-
-### I am debugging or tuning the bundled gossip backend
-
-Most external users can skip this. Read [`sof-solana-gossip`](sof-solana-gossip.md) only if you
-are debugging the optional bootstrap backend or working on SOF internals.

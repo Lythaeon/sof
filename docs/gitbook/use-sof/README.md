@@ -1,50 +1,47 @@
 # Use SOF
 
-Use these pages when the goal is to run SOF, embed it, or evaluate it as part of a service.
+Use this section when the goal is to decide whether SOF belongs in your service, and if it does,
+how to run it honestly.
 
 At the highest level:
 
-- `sof` is the observer/runtime product
-- `sof-tx` is the execution and submission product
-- `sof-gossip-tuning` is the typed tuning layer for embedded `sof` hosts
+- `sof` is the observer/runtime
+- `sof-tx` is the execution and submission SDK
+- `sof-gossip-tuning` is the typed tuning layer for `sof`
 
-Read this section if you are:
+This section is for:
 
-- embedding `sof` into your own runtime or service
-- using `sof-tx` for execution or routing
-- operating SOF on a host and tuning deployment behavior
-- evaluating whether SOF fits your architecture
+- teams evaluating SOF against RPC, managed providers, validators, or their own ingest stack
+- operators choosing between direct UDP, gossip, private raw ingress, or processed providers
+- services combining local observation with local submission
 
-If the network model still feels unfamiliar, start with the onboarding pages before going deeper
-into crate and operations material:
-
-- [Why SOF Exists](why-sof-exists.md)
-- [SOF Compared To The Usual Alternatives](sof-compared.md)
-- [Before You Start](../getting-started/before-you-start.md)
-- [Common Questions](../getting-started/common-questions.md)
-
-## Start Here
+## Read These First
 
 1. [Why SOF Exists](why-sof-exists.md)
 2. [SOF Compared To The Usual Alternatives](sof-compared.md)
 3. [Choose the Right SOF Path](adoption-paths.md)
 4. [Before You Start](../getting-started/before-you-start.md)
 5. [Common Questions](../getting-started/common-questions.md)
-6. [Choose Your Control Plane Source](control-plane-sourcing.md)
-7. [Common Recipes](common-recipes.md)
-8. [Build An Observer Service](observer-service.md)
-9. [Build One Process That Observes And Submits](observe-and-submit-service.md)
-10. [Build A Live-Only Stream Service](live-only-stream-service.md)
-11. [Getting Started](../getting-started/README.md)
-12. [First Runtime Bring-Up](../getting-started/first-runtime.md)
-13. [Crates](../crates/README.md)
-14. [Operations](../operations/README.md)
 
-## What This Track Optimizes For
+## Then Use The Pages By Job
 
-- choosing the right crate or combination of crates
-- getting to a working runtime quickly
-- understanding the operational posture before production use
-- avoiding repository-internal detail unless it is needed for integration decisions
+- control-plane sourcing
+  - [Choose Your Control Plane Source](control-plane-sourcing.md)
+- service shape
+  - [Build An Observer Service](observer-service.md)
+  - [Build One Process That Observes And Submits](observe-and-submit-service.md)
+  - [Build A Live-Only Stream Service](live-only-stream-service.md)
+- recipes and practical choices
+  - [Common Recipes](common-recipes.md)
+  - [Getting Started](../getting-started/README.md)
+  - [Operations](../operations/README.md)
 
-Repository and contributor material lives under [Maintain SOF](../maintainers/README.md).
+## What This Track Assumes
+
+- ingress choice matters more than slogans about being "fast"
+- public gossip is useful, but not usually the lowest-latency source
+- private raw feeds, direct validator-adjacent ingress, and good host placement usually beat it
+- SOF is most useful when you want one reusable runtime instead of rebuilding the same Solana
+  ingest and correctness machinery in every service
+
+Repository-internal material lives under [Maintain SOF](../maintainers/README.md).
