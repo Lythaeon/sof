@@ -1950,6 +1950,13 @@ fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderR
                 fingerprint: provider_replay_transaction_log_fingerprint(event),
             })
         }
+        ProviderStreamUpdate::TransactionStatus(event) => {
+            Some(ProviderReplayDedupeKey::ControlPlane {
+                slot: event.slot,
+                kind: 8,
+                fingerprint: provider_replay_fingerprint(event),
+            })
+        }
         ProviderStreamUpdate::TransactionViewBatch(event) => {
             Some(ProviderReplayDedupeKey::ControlPlane {
                 slot: event.slot,
@@ -1957,6 +1964,11 @@ fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderR
                 fingerprint: provider_replay_transaction_view_batch_fingerprint(event),
             })
         }
+        ProviderStreamUpdate::AccountUpdate(event) => Some(ProviderReplayDedupeKey::ControlPlane {
+            slot: event.slot,
+            kind: 9,
+            fingerprint: provider_replay_fingerprint(event),
+        }),
         ProviderStreamUpdate::Health(_) => None,
     }
 }
@@ -2044,9 +2056,19 @@ fn dispatch_provider_stream_update(
                 plugin_host.on_transaction_log(event);
             }
         }
+        ProviderStreamUpdate::TransactionStatus(event) => {
+            if plugin_host.wants_transaction_status() {
+                plugin_host.on_transaction_status(event);
+            }
+        }
         ProviderStreamUpdate::TransactionViewBatch(event) => {
             if plugin_host.wants_transaction_view_batch() {
                 plugin_host.on_transaction_view_batch(event, Instant::now());
+            }
+        }
+        ProviderStreamUpdate::AccountUpdate(event) => {
+            if plugin_host.wants_account_update() {
+                plugin_host.on_account_update(event);
             }
         }
         ProviderStreamUpdate::RecentBlockhash(event) => {
@@ -2215,6 +2237,9 @@ fn provider_stream_unsupported_hooks(
     if plugin_host.wants_account_touch() {
         unsupported.push("on_account_touch");
     }
+    if plugin_host.wants_account_update() && mode != ProviderStreamMode::Generic {
+        unsupported.push("on_account_update");
+    }
     if plugin_host.wants_transaction_batch() {
         unsupported.push("on_transaction_batch");
     }
@@ -2224,6 +2249,9 @@ fn provider_stream_unsupported_hooks(
         }
         if plugin_host.wants_transaction_log() {
             unsupported.push("on_transaction_log");
+        }
+        if plugin_host.wants_transaction_status() {
+            unsupported.push("on_transaction_status");
         }
         if plugin_host.wants_transaction_view_batch() {
             unsupported.push("on_transaction_view_batch");
@@ -2968,8 +2996,14 @@ mod tests {
             ProviderStreamUpdate::TransactionLog(event) => {
                 plugin_host.on_transaction_log(event);
             }
+            ProviderStreamUpdate::TransactionStatus(event) => {
+                plugin_host.on_transaction_status(event);
+            }
             ProviderStreamUpdate::TransactionViewBatch(event) => {
                 plugin_host.on_transaction_view_batch(event, Instant::now());
+            }
+            ProviderStreamUpdate::AccountUpdate(event) => {
+                plugin_host.on_account_update(event);
             }
             ProviderStreamUpdate::RecentBlockhash(event) => {
                 derived_state_host.on_recent_blockhash(event.clone());
@@ -3112,7 +3146,9 @@ mod tests {
             }
             other @ ProviderStreamUpdate::SerializedTransaction(_)
             | other @ ProviderStreamUpdate::TransactionLog(_)
+            | other @ ProviderStreamUpdate::TransactionStatus(_)
             | other @ ProviderStreamUpdate::TransactionViewBatch(_)
+            | other @ ProviderStreamUpdate::AccountUpdate(_)
             | other @ ProviderStreamUpdate::RecentBlockhash(_)
             | other @ ProviderStreamUpdate::SlotStatus(_)
             | other @ ProviderStreamUpdate::ClusterTopology(_)
@@ -3131,7 +3167,9 @@ mod tests {
             }
             other @ ProviderStreamUpdate::SerializedTransaction(_)
             | other @ ProviderStreamUpdate::TransactionLog(_)
+            | other @ ProviderStreamUpdate::TransactionStatus(_)
             | other @ ProviderStreamUpdate::TransactionViewBatch(_)
+            | other @ ProviderStreamUpdate::AccountUpdate(_)
             | other @ ProviderStreamUpdate::RecentBlockhash(_)
             | other @ ProviderStreamUpdate::SlotStatus(_)
             | other @ ProviderStreamUpdate::ClusterTopology(_)
@@ -3150,7 +3188,9 @@ mod tests {
             }
             other @ ProviderStreamUpdate::Transaction(_)
             | other @ ProviderStreamUpdate::TransactionLog(_)
+            | other @ ProviderStreamUpdate::TransactionStatus(_)
             | other @ ProviderStreamUpdate::TransactionViewBatch(_)
+            | other @ ProviderStreamUpdate::AccountUpdate(_)
             | other @ ProviderStreamUpdate::RecentBlockhash(_)
             | other @ ProviderStreamUpdate::SlotStatus(_)
             | other @ ProviderStreamUpdate::ClusterTopology(_)
@@ -3171,7 +3211,9 @@ mod tests {
             }
             other @ ProviderStreamUpdate::SerializedTransaction(_)
             | other @ ProviderStreamUpdate::TransactionLog(_)
+            | other @ ProviderStreamUpdate::TransactionStatus(_)
             | other @ ProviderStreamUpdate::TransactionViewBatch(_)
+            | other @ ProviderStreamUpdate::AccountUpdate(_)
             | other @ ProviderStreamUpdate::RecentBlockhash(_)
             | other @ ProviderStreamUpdate::SlotStatus(_)
             | other @ ProviderStreamUpdate::ClusterTopology(_)

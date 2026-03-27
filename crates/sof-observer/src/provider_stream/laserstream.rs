@@ -37,7 +37,10 @@ use tokio::task::JoinHandle;
 
 use crate::{
     event::{ForkSlotStatus, TxCommitmentStatus, TxKind},
-    framework::{SlotStatusEvent, TransactionEvent, signature_bytes_opt},
+    framework::{
+        AccountUpdateEvent, SlotStatusEvent, TransactionEvent, TransactionStatusEvent,
+        pubkey_bytes, signature_bytes_opt,
+    },
     provider_stream::{
         ProviderCommitmentWatermarks, ProviderReplayMode, ProviderSourceHealthEvent,
         ProviderSourceHealthReason, ProviderSourceHealthStatus, ProviderSourceId,
@@ -85,6 +88,7 @@ impl LaserStreamCommitment {
 pub struct LaserStreamConfig {
     endpoint: String,
     api_key: String,
+    stream: LaserStreamStream,
     commitment: LaserStreamCommitment,
     vote: Option<bool>,
     failed: Option<bool>,
@@ -92,6 +96,9 @@ pub struct LaserStreamConfig {
     account_include: Vec<Pubkey>,
     account_exclude: Vec<Pubkey>,
     account_required: Vec<Pubkey>,
+    accounts: Vec<Pubkey>,
+    owners: Vec<Pubkey>,
+    require_txn_signature: bool,
     connect_timeout: Option<Duration>,
     timeout: Option<Duration>,
     stall_timeout: Option<Duration>,
@@ -124,6 +131,7 @@ impl LaserStreamConfig {
         Self {
             endpoint: endpoint.into(),
             api_key: api_key.into(),
+            stream: LaserStreamStream::Transaction,
             commitment: LaserStreamCommitment::Processed,
             vote: None,
             failed: None,
@@ -131,6 +139,9 @@ impl LaserStreamConfig {
             account_include: Vec::new(),
             account_exclude: Vec::new(),
             account_required: Vec::new(),
+            accounts: Vec::new(),
+            owners: Vec::new(),
+            require_txn_signature: false,
             connect_timeout: Some(Duration::from_secs(10)),
             timeout: Some(Duration::from_secs(30)),
             stall_timeout: Some(Duration::from_secs(30)),
@@ -146,6 +157,13 @@ impl LaserStreamConfig {
     #[must_use]
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    /// Selects the LaserStream stream family this config should subscribe to.
+    #[must_use]
+    pub const fn with_stream(mut self, stream: LaserStreamStream) -> Self {
+        self.stream = stream;
+        self
     }
 
     /// Sets the LaserStream commitment.
@@ -203,6 +221,33 @@ impl LaserStreamConfig {
         I: IntoIterator<Item = Pubkey>,
     {
         self.account_required.extend(keys);
+        self
+    }
+
+    /// Filters account streams to one or more explicit pubkeys.
+    #[must_use]
+    pub fn with_accounts<I>(mut self, keys: I) -> Self
+    where
+        I: IntoIterator<Item = Pubkey>,
+    {
+        self.accounts.extend(keys);
+        self
+    }
+
+    /// Filters account streams to one or more owners/program ids.
+    #[must_use]
+    pub fn with_owners<I>(mut self, keys: I) -> Self
+    where
+        I: IntoIterator<Item = Pubkey>,
+    {
+        self.owners.extend(keys);
+        self
+    }
+
+    /// Requires account updates to carry a transaction signature.
+    #[must_use]
+    pub const fn require_transaction_signature(mut self) -> Self {
+        self.require_txn_signature = true;
         self
     }
 
@@ -268,27 +313,7 @@ impl LaserStreamConfig {
     }
 
     pub(crate) fn subscribe_request_with_state(&self, tracked_slot: u64) -> grpc::SubscribeRequest {
-        let filter = grpc::SubscribeRequestFilterTransactions {
-            vote: self.vote,
-            failed: self.failed,
-            signature: self.signature.map(|signature| signature.to_string()),
-            account_include: self
-                .account_include
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-            account_exclude: self
-                .account_exclude
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-            account_required: self
-                .account_required
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-        };
-        grpc::SubscribeRequest {
+        let mut request = grpc::SubscribeRequest {
             slots: HashMap::from([(
                 INTERNAL_WATERMARK_SLOT_FILTER.to_owned(),
                 grpc::SubscribeRequestFilterSlots {
@@ -296,11 +321,24 @@ impl LaserStreamConfig {
                     ..grpc::SubscribeRequestFilterSlots::default()
                 },
             )]),
-            transactions: HashMap::from([("sof".to_owned(), filter)]),
             commitment: Some(self.commitment.as_proto() as i32),
             from_slot: self.replay_from_slot(tracked_slot),
             ..grpc::SubscribeRequest::default()
+        };
+        match self.stream {
+            LaserStreamStream::Transaction => {
+                request.transactions =
+                    HashMap::from([("sof".to_owned(), self.transaction_filter())]);
+            }
+            LaserStreamStream::TransactionStatus => {
+                request.transactions_status =
+                    HashMap::from([("sof".to_owned(), self.transaction_filter())]);
+            }
+            LaserStreamStream::Accounts => {
+                request.accounts = HashMap::from([("sof".to_owned(), self.account_filter())]);
+            }
         }
+        request
     }
 
     fn client_config(&self) -> ClientConfig {
@@ -346,6 +384,66 @@ impl LaserStreamConfig {
             }
         }
     }
+
+    fn transaction_filter(&self) -> grpc::SubscribeRequestFilterTransactions {
+        grpc::SubscribeRequestFilterTransactions {
+            vote: self.vote,
+            failed: self.failed,
+            signature: self.signature.map(|signature| signature.to_string()),
+            account_include: self
+                .account_include
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            account_exclude: self
+                .account_exclude
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            account_required: self
+                .account_required
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        }
+    }
+
+    fn account_filter(&self) -> grpc::SubscribeRequestFilterAccounts {
+        grpc::SubscribeRequestFilterAccounts {
+            account: self.accounts.iter().map(ToString::to_string).collect(),
+            owner: self.owners.iter().map(ToString::to_string).collect(),
+            filters: Vec::new(),
+            nonempty_txn_signature: Some(self.require_txn_signature),
+        }
+    }
+
+    const fn source_id(&self) -> ProviderSourceId {
+        match self.stream {
+            LaserStreamStream::Transaction => ProviderSourceId::LaserStream,
+            LaserStreamStream::TransactionStatus => ProviderSourceId::LaserStreamTransactionStatus,
+            LaserStreamStream::Accounts => ProviderSourceId::LaserStreamAccounts,
+        }
+    }
+
+    const fn stream_kind(&self) -> LaserStreamStreamKind {
+        match self.stream {
+            LaserStreamStream::Transaction => LaserStreamStreamKind::Transaction,
+            LaserStreamStream::TransactionStatus => LaserStreamStreamKind::TransactionStatus,
+            LaserStreamStream::Accounts => LaserStreamStreamKind::Accounts,
+        }
+    }
+}
+
+/// Primary LaserStream stream families supported by the built-in adapter.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LaserStreamStream {
+    /// Full transaction updates mapped onto `on_transaction`.
+    #[default]
+    Transaction,
+    /// Signature-level transaction status updates mapped onto `on_transaction_status`.
+    TransactionStatus,
+    /// Account updates mapped onto `on_account_update`.
+    Accounts,
 }
 
 /// Connection and replay config for LaserStream slot subscriptions.
@@ -532,9 +630,12 @@ pub enum LaserStreamError {
 /// Typed LaserStream protocol/runtime failures.
 #[derive(Debug, Error)]
 pub enum LaserStreamProtocolError {
-    /// One LaserStream transaction stream stopped making progress.
-    #[error("laserstream transaction stream stalled without inbound progress")]
-    TransactionStreamStalled,
+    /// One LaserStream primary stream stopped making progress.
+    #[error("laserstream {stream} stream stalled without inbound progress")]
+    StreamStalled {
+        /// Typed LaserStream stream family that stalled.
+        stream: LaserStreamStreamKind,
+    },
     /// One LaserStream slot stream stopped making progress.
     #[error("laserstream slot stream stalled without inbound progress")]
     SlotStreamStalled,
@@ -567,6 +668,30 @@ pub enum LaserStreamProtocolError {
         /// Consecutive-failure count that exhausted the reconnect budget.
         attempts: u32,
     },
+}
+
+/// Stable LaserStream stream kinds used by typed protocol errors.
+#[derive(Clone, Copy, Debug)]
+pub enum LaserStreamStreamKind {
+    /// Transaction stream.
+    Transaction,
+    /// Transaction status stream.
+    TransactionStatus,
+    /// Account stream.
+    Accounts,
+    /// Slot stream.
+    Slots,
+}
+
+impl std::fmt::Display for LaserStreamStreamKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transaction => f.write_str("transaction"),
+            Self::TransactionStatus => f.write_str("transaction-status"),
+            Self::Accounts => f.write_str("account"),
+            Self::Slots => f.write_str("slot"),
+        }
+    }
 }
 
 type LaserStreamSubscribeSink = std::pin::Pin<
@@ -628,7 +753,7 @@ pub async fn spawn_laserstream_transaction_source(
                 }
             };
             match session {
-                Ok((subscribe_tx, stream)) => match run_laserstream_transaction_connection(
+                Ok((subscribe_tx, stream)) => match run_laserstream_primary_connection(
                     &config,
                     &sender,
                     &mut tracked_slot,
@@ -640,13 +765,17 @@ pub async fn spawn_laserstream_transaction_source(
                 .await
                 {
                     Ok(()) => {
-                        let detail = "laserstream stream ended unexpectedly".to_owned();
+                        let detail = format!(
+                            "laserstream {} stream ended unexpectedly",
+                            config.stream_kind()
+                        );
                         tracing::warn!(
                             endpoint = config.endpoint(),
                             detail,
                             "provider stream laserstream session ended unexpectedly; reconnecting"
                         );
-                        send_provider_health(
+                        send_primary_provider_health(
+                            &config,
                             &sender,
                             ProviderSourceHealthStatus::Reconnecting,
                             ProviderSourceHealthReason::UpstreamStreamClosedUnexpectedly,
@@ -663,7 +792,8 @@ pub async fn spawn_laserstream_transaction_source(
                             endpoint = config.endpoint(),
                             "provider stream laserstream session ended; reconnecting"
                         );
-                        send_provider_health(
+                        send_primary_provider_health(
+                            &config,
                             &sender,
                             ProviderSourceHealthStatus::Reconnecting,
                             laserstream_health_reason(&error),
@@ -678,7 +808,8 @@ pub async fn spawn_laserstream_transaction_source(
                         endpoint = config.endpoint(),
                         "provider stream laserstream connect/subscribe failed; reconnecting"
                     );
-                    send_provider_health(
+                    send_primary_provider_health(
+                        &config,
                         &sender,
                         ProviderSourceHealthStatus::Reconnecting,
                         laserstream_health_reason(&error),
@@ -697,7 +828,8 @@ pub async fn spawn_laserstream_transaction_source(
             {
                 let detail =
                     format!("exhausted laserstream reconnect attempts after {attempts} failures");
-                send_provider_health(
+                send_primary_provider_health(
+                    &config,
                     &sender,
                     ProviderSourceHealthStatus::Unhealthy,
                     ProviderSourceHealthReason::ReconnectBudgetExhausted,
@@ -822,7 +954,7 @@ pub async fn spawn_laserstream_slot_source(
     }))
 }
 
-async fn run_laserstream_transaction_connection(
+async fn run_laserstream_primary_connection(
     config: &LaserStreamConfig,
     sender: &ProviderStreamSender,
     tracked_slot: &mut u64,
@@ -834,7 +966,8 @@ async fn run_laserstream_transaction_connection(
     *session_established = false;
     let commitment = config.commitment.as_tx_commitment();
     *session_established = true;
-    send_provider_health(
+    send_primary_provider_health(
+        config,
         sender,
         ProviderSourceHealthStatus::Healthy,
         ProviderSourceHealthReason::SubscriptionAckReceived,
@@ -852,7 +985,10 @@ async fn run_laserstream_transaction_connection(
                     futures_util::future::pending::<()>().await;
                 }
             } => {
-                return Err(LaserStreamProtocolError::TransactionStreamStalled.into());
+                return Err(LaserStreamProtocolError::StreamStalled {
+                    stream: config.stream_kind(),
+                }
+                .into());
             }
             maybe_update = stream.next() => {
                 let Some(update) = maybe_update else {
@@ -880,7 +1016,9 @@ async fn run_laserstream_transaction_connection(
                             }
                         }
                     }
-                    Some(grpc::subscribe_update::UpdateOneof::Transaction(tx_update)) => {
+                    Some(grpc::subscribe_update::UpdateOneof::Transaction(tx_update))
+                        if config.stream == LaserStreamStream::Transaction =>
+                    {
                         *tracked_slot = (*tracked_slot).max(tx_update.slot);
                         watermarks.observe_transaction_commitment(tx_update.slot, commitment);
                         let event = transaction_event_from_update(
@@ -891,6 +1029,33 @@ async fn run_laserstream_transaction_connection(
                         )?;
                         sender
                             .send(ProviderStreamUpdate::Transaction(event))
+                            .await
+                            .map_err(|_error| LaserStreamError::QueueClosed)?;
+                    }
+                    Some(grpc::subscribe_update::UpdateOneof::TransactionStatus(status_update))
+                        if config.stream == LaserStreamStream::TransactionStatus =>
+                    {
+                        *tracked_slot = (*tracked_slot).max(status_update.slot);
+                        watermarks.observe_transaction_commitment(status_update.slot, commitment);
+                        let event = transaction_status_event_from_update(
+                            commitment,
+                            *watermarks,
+                            status_update,
+                        )?;
+                        sender
+                            .send(ProviderStreamUpdate::TransactionStatus(event))
+                            .await
+                            .map_err(|_error| LaserStreamError::QueueClosed)?;
+                    }
+                    Some(grpc::subscribe_update::UpdateOneof::Account(account_update))
+                        if config.stream == LaserStreamStream::Accounts =>
+                    {
+                        *tracked_slot = (*tracked_slot).max(account_update.slot);
+                        observe_non_transaction_commitment(watermarks, account_update.slot, commitment);
+                        let event =
+                            account_update_event_from_laserstream(account_update, commitment, *watermarks)?;
+                        sender
+                            .send(ProviderStreamUpdate::AccountUpdate(event))
                             .await
                             .map_err(|_error| LaserStreamError::QueueClosed)?;
                     }
@@ -960,7 +1125,8 @@ async fn run_laserstream_slot_connection(
     }
 }
 
-async fn send_provider_health(
+async fn send_primary_provider_health(
+    config: &LaserStreamConfig,
     sender: &ProviderStreamSender,
     status: ProviderSourceHealthStatus,
     reason: ProviderSourceHealthReason,
@@ -968,7 +1134,7 @@ async fn send_provider_health(
 ) -> Result<(), LaserStreamError> {
     sender
         .send(ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
-            source: ProviderSourceId::LaserStream,
+            source: config.source_id(),
             status,
             reason,
             message,
@@ -1226,6 +1392,74 @@ fn transaction_event_from_update(
         },
         tx: Arc::new(tx),
     })
+}
+
+fn transaction_status_event_from_update(
+    commitment_status: TxCommitmentStatus,
+    watermarks: ProviderCommitmentWatermarks,
+    update: grpc::SubscribeUpdateTransactionStatus,
+) -> Result<TransactionStatusEvent, LaserStreamError> {
+    let signature = Signature::try_from(update.signature.as_slice())
+        .map_err(|_error| LaserStreamError::Convert("invalid transaction-status signature"))?;
+    Ok(TransactionStatusEvent {
+        slot: update.slot,
+        commitment_status,
+        confirmed_slot: watermarks.confirmed_slot,
+        finalized_slot: watermarks.finalized_slot,
+        signature: signature.into(),
+        is_vote: update.is_vote,
+        index: Some(update.index),
+        err: update.err.map(|error| format!("{error:?}")),
+    })
+}
+
+fn account_update_event_from_laserstream(
+    update: grpc::SubscribeUpdateAccount,
+    commitment_status: TxCommitmentStatus,
+    watermarks: ProviderCommitmentWatermarks,
+) -> Result<AccountUpdateEvent, LaserStreamError> {
+    let account = update
+        .account
+        .ok_or(LaserStreamError::Convert("missing account payload"))?;
+    let pubkey = Pubkey::try_from(account.pubkey.as_slice())
+        .map_err(|_error| LaserStreamError::Convert("invalid account pubkey"))?;
+    let owner = Pubkey::try_from(account.owner.as_slice())
+        .map_err(|_error| LaserStreamError::Convert("invalid account owner"))?;
+    let txn_signature = match account.txn_signature {
+        Some(signature) => Some(
+            Signature::try_from(signature.as_slice())
+                .map_err(|_error| LaserStreamError::Convert("invalid account txn signature"))?,
+        ),
+        None => None,
+    };
+    Ok(AccountUpdateEvent {
+        slot: update.slot,
+        commitment_status,
+        confirmed_slot: watermarks.confirmed_slot,
+        finalized_slot: watermarks.finalized_slot,
+        pubkey: pubkey_bytes(pubkey),
+        owner: pubkey_bytes(owner),
+        lamports: account.lamports,
+        executable: account.executable,
+        rent_epoch: account.rent_epoch,
+        data: account.data.into(),
+        write_version: Some(account.write_version),
+        txn_signature: signature_bytes_opt(txn_signature),
+        is_startup: update.is_startup,
+        matched_filter: None,
+    })
+}
+
+fn observe_non_transaction_commitment(
+    watermarks: &mut ProviderCommitmentWatermarks,
+    slot: u64,
+    commitment_status: TxCommitmentStatus,
+) {
+    match commitment_status {
+        TxCommitmentStatus::Processed => {}
+        TxCommitmentStatus::Confirmed => watermarks.observe_confirmed_slot(slot),
+        TxCommitmentStatus::Finalized => watermarks.observe_finalized_slot(slot),
+    }
 }
 
 fn slot_status_event_from_update(
@@ -1493,6 +1727,33 @@ mod tests {
             .with_replay_mode(ProviderReplayMode::FromSlot(321))
             .subscribe_request_with_state(777);
         assert_eq!(request.from_slot, Some(777));
+    }
+
+    #[test]
+    fn laserstream_subscribe_request_can_target_transaction_status() {
+        let request = LaserStreamConfig::new("https://laserstream.example", "token")
+            .with_stream(LaserStreamStream::TransactionStatus)
+            .subscribe_request_with_state(0);
+        assert!(request.transactions.is_empty());
+        assert!(request.transactions_status.contains_key("sof"));
+        assert!(request.slots.contains_key(INTERNAL_WATERMARK_SLOT_FILTER));
+    }
+
+    #[test]
+    fn laserstream_subscribe_request_can_target_accounts() {
+        let key = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let request = LaserStreamConfig::new("https://laserstream.example", "token")
+            .with_stream(LaserStreamStream::Accounts)
+            .with_accounts([key])
+            .with_owners([owner])
+            .require_transaction_signature()
+            .subscribe_request_with_state(0);
+        let filter = request.accounts.get("sof").expect("accounts filter");
+        assert_eq!(filter.account, vec![key.to_string()]);
+        assert_eq!(filter.owner, vec![owner.to_string()]);
+        assert_eq!(filter.nonempty_txn_signature, Some(true));
+        assert!(request.slots.contains_key(INTERNAL_WATERMARK_SLOT_FILTER));
     }
 
     fn sample_transaction() -> VersionedTransaction {

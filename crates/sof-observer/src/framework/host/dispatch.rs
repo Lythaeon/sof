@@ -2,8 +2,8 @@
 #![allow(clippy::result_large_err)]
 
 use super::*;
-use crate::framework::AccountTouchEvent;
 use crate::framework::TransactionInterest;
+use crate::framework::{AccountTouchEvent, AccountUpdateEvent, TransactionStatusEvent};
 use crossbeam_queue::ArrayQueue;
 use futures_util::{FutureExt, StreamExt, stream};
 use smallvec::SmallVec;
@@ -63,12 +63,16 @@ pub(super) enum PluginHookKind {
     Transaction,
     /// Transaction-log callbacks.
     TransactionLog,
+    /// Transaction-status callbacks.
+    TransactionStatus,
     /// Completed-dataset transaction-batch callbacks.
     TransactionBatch,
     /// Completed-dataset transaction-view-batch callbacks.
     TransactionViewBatch,
     /// Account-touch callbacks.
     AccountTouch,
+    /// Account-update callbacks.
+    AccountUpdate,
     /// Slot-status callbacks.
     SlotStatus,
     /// Reorg callbacks.
@@ -90,9 +94,11 @@ impl PluginHookKind {
             Self::Dataset => "on_dataset",
             Self::Transaction => "on_transaction",
             Self::TransactionLog => "on_transaction_log",
+            Self::TransactionStatus => "on_transaction_status",
             Self::TransactionBatch => "on_transaction_batch",
             Self::TransactionViewBatch => "on_transaction_view_batch",
             Self::AccountTouch => "on_account_touch",
+            Self::AccountUpdate => "on_account_update",
             Self::SlotStatus => "on_slot_status",
             Self::Reorg => "on_reorg",
             Self::RecentBlockhash => "on_recent_blockhash",
@@ -132,12 +138,16 @@ pub(super) struct PluginDispatchTargets {
     pub(super) dataset: Arc<[Arc<dyn ObserverPlugin>]>,
     /// Plugins interested in transaction-log callbacks.
     pub(super) transaction_log: Arc<[Arc<dyn ObserverPlugin>]>,
+    /// Plugins interested in transaction-status callbacks.
+    pub(super) transaction_status: Arc<[Arc<dyn ObserverPlugin>]>,
     /// Plugins interested in transaction-batch callbacks.
     pub(super) transaction_batch: Arc<[Arc<dyn ObserverPlugin>]>,
     /// Plugins interested in transaction-view-batch callbacks.
     pub(super) transaction_view_batch: Arc<[Arc<dyn ObserverPlugin>]>,
     /// Plugins interested in account-touch callbacks.
     pub(super) account_touch: Arc<[Arc<dyn ObserverPlugin>]>,
+    /// Plugins interested in account-update callbacks.
+    pub(super) account_update: Arc<[Arc<dyn ObserverPlugin>]>,
     /// Plugins interested in slot-status callbacks.
     pub(super) slot_status: Arc<[Arc<dyn ObserverPlugin>]>,
     /// Plugins interested in reorg callbacks.
@@ -157,9 +167,11 @@ impl PluginDispatchTargets {
             && self.shred.is_empty()
             && self.dataset.is_empty()
             && self.transaction_log.is_empty()
+            && self.transaction_status.is_empty()
             && self.transaction_batch.is_empty()
             && self.transaction_view_batch.is_empty()
             && self.account_touch.is_empty()
+            && self.account_update.is_empty()
             && self.slot_status.is_empty()
             && self.reorg.is_empty()
             && self.recent_blockhash.is_empty()
@@ -175,9 +187,11 @@ impl PluginDispatchTargets {
             PluginHookKind::Dataset => &self.dataset,
             PluginHookKind::Transaction => &[],
             PluginHookKind::TransactionLog => &self.transaction_log,
+            PluginHookKind::TransactionStatus => &self.transaction_status,
             PluginHookKind::TransactionBatch => &[],
             PluginHookKind::TransactionViewBatch => &[],
             PluginHookKind::AccountTouch => &self.account_touch,
+            PluginHookKind::AccountUpdate => &self.account_update,
             PluginHookKind::SlotStatus => &self.slot_status,
             PluginHookKind::Reorg => &self.reorg,
             PluginHookKind::RecentBlockhash => &self.recent_blockhash,
@@ -981,6 +995,8 @@ pub(super) enum PluginDispatchEvent {
     Dataset(DatasetEvent),
     /// Provider/websocket transaction-log callback payload targeted to a subset of plugins.
     SelectedTransactionLog(SelectedTransactionLogDispatch),
+    /// Provider transaction-status callback payload targeted to a subset of plugins.
+    SelectedTransactionStatus(SelectedTransactionStatusDispatch),
     /// Completed-dataset transaction-batch callback payload.
     TransactionBatch(AcceptedTransactionBatchDispatch),
     /// Completed-dataset transaction-view-batch callback payload.
@@ -989,6 +1005,8 @@ pub(super) enum PluginDispatchEvent {
     AccountTouch(Arc<AccountTouchEvent>),
     /// Static account-touch callback payload targeted to a subset of plugins.
     SelectedAccountTouch(SelectedAccountTouchDispatch),
+    /// Upstream account-update callback payload targeted to a subset of plugins.
+    SelectedAccountUpdate(SelectedAccountUpdateDispatch),
     /// Slot-status callback payload.
     SlotStatus(SlotStatusEvent),
     /// Canonical reorg callback payload.
@@ -1009,10 +1027,12 @@ impl PluginDispatchEvent {
             Self::Shred(_) => PluginHookKind::Shred,
             Self::Dataset(_) => PluginHookKind::Dataset,
             Self::SelectedTransactionLog(_) => PluginHookKind::TransactionLog,
+            Self::SelectedTransactionStatus(_) => PluginHookKind::TransactionStatus,
             Self::TransactionBatch(_) => PluginHookKind::TransactionBatch,
             Self::TransactionViewBatch(_) => PluginHookKind::TransactionViewBatch,
             Self::AccountTouch(_) => PluginHookKind::AccountTouch,
             Self::SelectedAccountTouch(_) => PluginHookKind::AccountTouch,
+            Self::SelectedAccountUpdate(_) => PluginHookKind::AccountUpdate,
             Self::SlotStatus(_) => PluginHookKind::SlotStatus,
             Self::Reorg(_) => PluginHookKind::Reorg,
             Self::ObservedRecentBlockhash(_) => PluginHookKind::RecentBlockhash,
@@ -1058,6 +1078,24 @@ pub(super) enum SelectedTransactionLogDispatch {
     },
 }
 
+/// One selected transaction-status callback fan-out unit.
+pub(super) enum SelectedTransactionStatusDispatch {
+    /// One interested plugin receives the event directly.
+    Single {
+        /// Selected plugin callback target.
+        plugin: Arc<dyn ObserverPlugin>,
+        /// Event payload for the selected plugin.
+        event: TransactionStatusEvent,
+    },
+    /// Multiple interested plugins share the same event payload.
+    Multi {
+        /// Selected plugin callback targets.
+        plugins: SmallVec<[Arc<dyn ObserverPlugin>; 4]>,
+        /// Shared event payload.
+        event: Arc<TransactionStatusEvent>,
+    },
+}
+
 impl SelectedTransactionLogDispatch {
     pub(super) fn from_plugins(
         plugins: &[Arc<dyn ObserverPlugin>],
@@ -1070,6 +1108,75 @@ impl SelectedTransactionLogDispatch {
             .filter(|(_plugin, selector)| selector.matches(event.commitment_status))
             .filter(|(plugin, _selector)| plugin.accepts_transaction_log(&event))
             .map(|(plugin, _minimum)| Arc::clone(plugin))
+            .collect();
+        match interested.len() {
+            0 => None,
+            1 => Some(Self::Single {
+                plugin: interested.into_iter().next()?,
+                event,
+            }),
+            _ => Some(Self::Multi {
+                plugins: interested,
+                event: Arc::new(event),
+            }),
+        }
+    }
+}
+
+impl SelectedTransactionStatusDispatch {
+    pub(super) fn from_plugins(
+        plugins: &[Arc<dyn ObserverPlugin>],
+        commitment_selectors: &[crate::framework::plugin::TransactionCommitmentSelector],
+        event: TransactionStatusEvent,
+    ) -> Option<Self> {
+        let interested: SmallVec<[Arc<dyn ObserverPlugin>; 4]> = plugins
+            .iter()
+            .zip(commitment_selectors.iter().copied())
+            .filter(|(_plugin, selector)| selector.matches(event.commitment_status))
+            .filter(|(plugin, _selector)| plugin.accepts_transaction_status(&event))
+            .map(|(plugin, _selector)| Arc::clone(plugin))
+            .collect();
+        match interested.len() {
+            0 => None,
+            1 => Some(Self::Single {
+                plugin: interested.into_iter().next()?,
+                event,
+            }),
+            _ => Some(Self::Multi {
+                plugins: interested,
+                event: Arc::new(event),
+            }),
+        }
+    }
+}
+
+/// One selected account-update callback fan-out unit.
+pub(super) enum SelectedAccountUpdateDispatch {
+    /// One interested plugin receives the event directly.
+    Single {
+        /// Selected plugin callback target.
+        plugin: Arc<dyn ObserverPlugin>,
+        /// Event payload for the selected plugin.
+        event: AccountUpdateEvent,
+    },
+    /// Multiple interested plugins share the same event payload.
+    Multi {
+        /// Selected plugin callback targets.
+        plugins: SmallVec<[Arc<dyn ObserverPlugin>; 4]>,
+        /// Shared event payload.
+        event: Arc<AccountUpdateEvent>,
+    },
+}
+
+impl SelectedAccountUpdateDispatch {
+    pub(super) fn from_plugins(
+        plugins: &[Arc<dyn ObserverPlugin>],
+        event: AccountUpdateEvent,
+    ) -> Option<Self> {
+        let interested: SmallVec<[Arc<dyn ObserverPlugin>; 4]> = plugins
+            .iter()
+            .filter(|plugin| plugin.accepts_account_update(&event))
+            .map(Arc::clone)
             .collect();
         match interested.len() {
             0 => None,
@@ -1716,6 +1823,9 @@ async fn dispatch_event(
         PluginDispatchEvent::SelectedTransactionLog(event) => {
             dispatch_selected_transaction_log_event(event, dispatch_mode).await
         }
+        PluginDispatchEvent::SelectedTransactionStatus(event) => {
+            dispatch_selected_transaction_status_event(event, dispatch_mode).await
+        }
         PluginDispatchEvent::TransactionBatch(event) => {
             dispatch_transaction_batch_event(event, dispatch_mode).await
         }
@@ -1736,6 +1846,9 @@ async fn dispatch_event(
         }
         PluginDispatchEvent::SelectedAccountTouch(event) => {
             dispatch_selected_account_touch_event(event, dispatch_mode).await
+        }
+        PluginDispatchEvent::SelectedAccountUpdate(event) => {
+            dispatch_selected_account_update_event(event, dispatch_mode).await
         }
         PluginDispatchEvent::SlotStatus(event) => {
             dispatch_hook_event(
@@ -2007,6 +2120,52 @@ async fn dispatch_selected_transaction_log_event(
                 dispatch_mode,
                 |plugin, hook_event| async move {
                     plugin.on_transaction_log(hook_event.as_ref()).await;
+                },
+            )
+            .await;
+        }
+    }
+}
+
+async fn dispatch_selected_transaction_status_event(
+    event: SelectedTransactionStatusDispatch,
+    dispatch_mode: PluginDispatchMode,
+) {
+    match event {
+        SelectedTransactionStatusDispatch::Single { plugin, event } => {
+            plugin.on_transaction_status(&event).await;
+        }
+        SelectedTransactionStatusDispatch::Multi { plugins, event } => {
+            dispatch_hook_event(
+                &plugins,
+                PluginHookKind::TransactionStatus,
+                event,
+                dispatch_mode,
+                |plugin, hook_event| async move {
+                    plugin.on_transaction_status(hook_event.as_ref()).await;
+                },
+            )
+            .await;
+        }
+    }
+}
+
+async fn dispatch_selected_account_update_event(
+    event: SelectedAccountUpdateDispatch,
+    dispatch_mode: PluginDispatchMode,
+) {
+    match event {
+        SelectedAccountUpdateDispatch::Single { plugin, event } => {
+            plugin.on_account_update(&event).await;
+        }
+        SelectedAccountUpdateDispatch::Multi { plugins, event } => {
+            dispatch_hook_event(
+                &plugins,
+                PluginHookKind::AccountUpdate,
+                event,
+                dispatch_mode,
+                |plugin, hook_event| async move {
+                    plugin.on_account_update(hook_event.as_ref()).await;
                 },
             )
             .await;

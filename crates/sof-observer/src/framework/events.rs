@@ -110,6 +110,30 @@ pub struct TransactionLogEvent {
     pub matched_filter: Option<PubkeyBytes>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+/// Runtime event emitted for one provider/websocket transaction-status update.
+///
+/// This is intended for feeds that surface signature-level execution status
+/// without carrying a full decoded transaction object.
+pub struct TransactionStatusEvent {
+    /// Slot context attached to the upstream status update.
+    pub slot: u64,
+    /// Commitment status configured for the upstream subscription.
+    pub commitment_status: TxCommitmentStatus,
+    /// Latest observed confirmed slot watermark when event was emitted.
+    pub confirmed_slot: Option<u64>,
+    /// Latest observed finalized slot watermark when event was emitted.
+    pub finalized_slot: Option<u64>,
+    /// Transaction signature carried by the status update.
+    pub signature: SignatureBytes,
+    /// Whether the upstream provider marked this as a vote transaction.
+    pub is_vote: bool,
+    /// Transaction index within the slot when the provider included it.
+    pub index: Option<u64>,
+    /// Transaction error detail when execution failed.
+    pub err: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 /// Runtime event emitted once per completed dataset with all decoded transactions.
 ///
@@ -337,6 +361,39 @@ pub struct AccountTouchEvent {
     pub readonly_account_keys: Arc<[PubkeyBytes]>,
     /// Lookup table account pubkeys referenced by the message itself.
     pub lookup_table_account_keys: Arc<[PubkeyBytes]>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+/// Runtime event emitted for one upstream account update.
+pub struct AccountUpdateEvent {
+    /// Slot context attached to the upstream account update.
+    pub slot: u64,
+    /// Commitment status configured for the upstream subscription.
+    pub commitment_status: TxCommitmentStatus,
+    /// Latest observed confirmed slot watermark when event was emitted.
+    pub confirmed_slot: Option<u64>,
+    /// Latest observed finalized slot watermark when event was emitted.
+    pub finalized_slot: Option<u64>,
+    /// Updated account pubkey.
+    pub pubkey: PubkeyBytes,
+    /// Account owner program id.
+    pub owner: PubkeyBytes,
+    /// Current lamport balance.
+    pub lamports: u64,
+    /// Whether the account is executable.
+    pub executable: bool,
+    /// Current rent epoch.
+    pub rent_epoch: u64,
+    /// Raw account data bytes.
+    pub data: Arc<[u8]>,
+    /// Provider write-version when available.
+    pub write_version: Option<u64>,
+    /// Transaction signature that produced the write when available.
+    pub txn_signature: Option<SignatureBytes>,
+    /// True when the provider marked this as startup/backfill state.
+    pub is_startup: bool,
+    /// Matching subscription/filter pubkey when one concrete key drove the feed.
+    pub matched_filter: Option<PubkeyBytes>,
 }
 
 #[derive(Debug, Clone, Copy)]

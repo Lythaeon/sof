@@ -32,8 +32,12 @@
 //!   - same transaction-family path, but lets SOF prefilter before full decode
 //! - `TransactionLog`:
 //!   - drives `on_transaction_log`
+//! - `TransactionStatus`:
+//!   - drives `on_transaction_status`
 //! - `TransactionViewBatch`:
 //!   - drives `on_transaction_view_batch`
+//! - `AccountUpdate`:
+//!   - drives `on_account_update`
 //! - `RecentBlockhash`:
 //!   - drives `on_recent_blockhash`
 //! - `SlotStatus`:
@@ -98,8 +102,9 @@ use tokio::sync::mpsc;
 use crate::event::TxCommitmentStatus;
 use crate::event::TxKind;
 use crate::framework::{
-    ClusterTopologyEvent, LeaderScheduleEvent, ObservedRecentBlockhashEvent, ReorgEvent,
-    SlotStatusEvent, TransactionEvent, TransactionLogEvent, TransactionViewBatchEvent,
+    AccountUpdateEvent, ClusterTopologyEvent, LeaderScheduleEvent, ObservedRecentBlockhashEvent,
+    ReorgEvent, SlotStatusEvent, TransactionEvent, TransactionLogEvent, TransactionStatusEvent,
+    TransactionViewBatchEvent,
 };
 use agave_transaction_view::{
     transaction_data::TransactionData, transaction_view::SanitizedTransactionView,
@@ -131,7 +136,9 @@ pub enum ProviderStreamMode {
     ///
     /// - `Transaction` / `SerializedTransaction` -> transaction-family hooks
     /// - `TransactionLog` -> `on_transaction_log`
+    /// - `TransactionStatus` -> `on_transaction_status`
     /// - `TransactionViewBatch` -> `on_transaction_view_batch`
+    /// - `AccountUpdate` -> `on_account_update`
     /// - `RecentBlockhash` -> `on_recent_blockhash`
     /// - `SlotStatus` -> `on_slot_status`
     /// - `ClusterTopology` -> `on_cluster_topology`
@@ -204,8 +211,12 @@ pub enum ProviderStreamUpdate {
     SerializedTransaction(SerializedTransactionEvent),
     /// One provider/websocket transaction-log notification.
     TransactionLog(TransactionLogEvent),
+    /// One provider transaction-status notification.
+    TransactionStatus(TransactionStatusEvent),
     /// One provider transaction-view batch mapped onto SOF's view-batch surface.
     TransactionViewBatch(TransactionViewBatchEvent),
+    /// One provider account update.
+    AccountUpdate(AccountUpdateEvent),
     /// One provider recent-blockhash observation.
     RecentBlockhash(ObservedRecentBlockhashEvent),
     /// One provider slot-status update.
@@ -238,9 +249,21 @@ impl From<TransactionLogEvent> for ProviderStreamUpdate {
     }
 }
 
+impl From<TransactionStatusEvent> for ProviderStreamUpdate {
+    fn from(event: TransactionStatusEvent) -> Self {
+        Self::TransactionStatus(event)
+    }
+}
+
 impl From<TransactionViewBatchEvent> for ProviderStreamUpdate {
     fn from(event: TransactionViewBatchEvent) -> Self {
         Self::TransactionViewBatch(event)
+    }
+}
+
+impl From<AccountUpdateEvent> for ProviderStreamUpdate {
+    fn from(event: AccountUpdateEvent) -> Self {
+        Self::AccountUpdate(event)
     }
 }
 
@@ -300,10 +323,18 @@ pub enum ProviderSourceId {
     Generic(&'static str),
     /// Built-in Yellowstone gRPC source.
     YellowstoneGrpc,
+    /// Built-in Yellowstone gRPC transaction-status source.
+    YellowstoneGrpcTransactionStatus,
+    /// Built-in Yellowstone gRPC account source.
+    YellowstoneGrpcAccounts,
     /// Built-in Yellowstone gRPC slot source.
     YellowstoneGrpcSlots,
     /// Built-in LaserStream source.
     LaserStream,
+    /// Built-in LaserStream transaction-status source.
+    LaserStreamTransactionStatus,
+    /// Built-in LaserStream account source.
+    LaserStreamAccounts,
     /// Built-in LaserStream slot source.
     LaserStreamSlots,
     #[cfg(feature = "provider-websocket")]
@@ -312,6 +343,12 @@ pub enum ProviderSourceId {
     #[cfg(feature = "provider-websocket")]
     /// Built-in websocket `logsSubscribe` source.
     WebsocketLogs,
+    #[cfg(feature = "provider-websocket")]
+    /// Built-in websocket `accountSubscribe` source.
+    WebsocketAccount,
+    #[cfg(feature = "provider-websocket")]
+    /// Built-in websocket `programSubscribe` source.
+    WebsocketProgram,
 }
 
 impl ProviderSourceId {
@@ -321,13 +358,21 @@ impl ProviderSourceId {
         match self {
             Self::Generic(label) => label,
             Self::YellowstoneGrpc => "yellowstone_grpc",
+            Self::YellowstoneGrpcTransactionStatus => "yellowstone_grpc_transaction_status",
+            Self::YellowstoneGrpcAccounts => "yellowstone_grpc_accounts",
             Self::YellowstoneGrpcSlots => "yellowstone_grpc_slots",
             Self::LaserStream => "laserstream",
+            Self::LaserStreamTransactionStatus => "laserstream_transaction_status",
+            Self::LaserStreamAccounts => "laserstream_accounts",
             Self::LaserStreamSlots => "laserstream_slots",
             #[cfg(feature = "provider-websocket")]
             Self::WebsocketTransaction => "websocket_transaction",
             #[cfg(feature = "provider-websocket")]
             Self::WebsocketLogs => "websocket_logs",
+            #[cfg(feature = "provider-websocket")]
+            Self::WebsocketAccount => "websocket_account",
+            #[cfg(feature = "provider-websocket")]
+            Self::WebsocketProgram => "websocket_program",
         }
     }
 }

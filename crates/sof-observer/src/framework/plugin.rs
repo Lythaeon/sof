@@ -9,10 +9,10 @@ use std::{cell::RefCell, sync::Arc};
 use thiserror::Error;
 
 use crate::framework::events::{
-    AccountTouchEvent, AccountTouchEventRef, ClusterTopologyEvent, DatasetEvent,
-    LeaderScheduleEvent, ObservedRecentBlockhashEvent, RawPacketEvent, ReorgEvent, ShredEvent,
-    SlotStatusEvent, TransactionBatchEvent, TransactionEvent, TransactionEventRef,
-    TransactionLogEvent, TransactionViewBatchEvent,
+    AccountTouchEvent, AccountTouchEventRef, AccountUpdateEvent, ClusterTopologyEvent,
+    DatasetEvent, LeaderScheduleEvent, ObservedRecentBlockhashEvent, RawPacketEvent, ReorgEvent,
+    ShredEvent, SlotStatusEvent, TransactionBatchEvent, TransactionEvent, TransactionEventRef,
+    TransactionLogEvent, TransactionStatusEvent, TransactionViewBatchEvent,
 };
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -384,6 +384,8 @@ pub struct PluginConfig {
     pub transaction: bool,
     /// Enables `on_transaction_log`.
     pub transaction_log: bool,
+    /// Enables `on_transaction_status`.
+    pub transaction_status: bool,
     /// Commitment selector applied to transaction-family hooks.
     pub transaction_commitment: TransactionCommitmentSelector,
     /// Requested delivery path for `on_transaction`.
@@ -398,6 +400,8 @@ pub struct PluginConfig {
     pub transaction_view_batch_dispatch_mode: TransactionDispatchMode,
     /// Enables `on_account_touch`.
     pub account_touch: bool,
+    /// Enables `on_account_update`.
+    pub account_update: bool,
     /// Enables `on_slot_status`.
     pub slot_status: bool,
     /// Enables `on_reorg`.
@@ -455,11 +459,19 @@ impl PluginConfig {
         self
     }
 
+    /// Enables `on_transaction_status`.
+    #[must_use]
+    pub const fn with_transaction_status(mut self) -> Self {
+        self.transaction_status = true;
+        self
+    }
+
     /// Sets the minimum commitment required before transaction-family hooks are delivered.
     ///
     /// This applies uniformly to:
     /// - `on_transaction`
     /// - `on_transaction_log`
+    /// - `on_transaction_status`
     /// - `on_transaction_batch`
     /// - `on_transaction_view_batch`
     ///
@@ -559,6 +571,13 @@ impl PluginConfig {
     #[must_use]
     pub const fn with_account_touch(mut self) -> Self {
         self.account_touch = true;
+        self
+    }
+
+    /// Enables `on_account_update`.
+    #[must_use]
+    pub const fn with_account_update(mut self) -> Self {
+        self.account_update = true;
         self
     }
 
@@ -750,6 +769,15 @@ pub trait ObserverPlugin: Send + Sync + 'static {
         true
     }
 
+    /// Called for one provider transaction-status update that does not carry a
+    /// full decoded transaction object.
+    async fn on_transaction_status(&self, _event: &TransactionStatusEvent) {}
+
+    /// Returns true when this plugin wants a specific transaction-status callback.
+    fn accepts_transaction_status(&self, _event: &TransactionStatusEvent) -> bool {
+        true
+    }
+
     /// Called once per completed dataset with all decoded transactions in dataset order.
     ///
     /// This hook is non-speculative. SOF invokes it only after a contiguous dataset is fully
@@ -787,6 +815,14 @@ pub trait ObserverPlugin: Send + Sync + 'static {
 
     /// Called for each decoded transaction's static touched-account set.
     async fn on_account_touch(&self, _event: &AccountTouchEvent) {}
+
+    /// Called for one upstream account update.
+    async fn on_account_update(&self, _event: &AccountUpdateEvent) {}
+
+    /// Returns true when this plugin wants a specific account-update callback.
+    fn accepts_account_update(&self, _event: &AccountUpdateEvent) -> bool {
+        true
+    }
 
     /// Called when local slot status transitions (processed/confirmed/finalized/orphaned).
     async fn on_slot_status(&self, _event: SlotStatusEvent) {}
