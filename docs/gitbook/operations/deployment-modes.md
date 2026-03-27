@@ -75,9 +75,8 @@ SOF exposes this category through `ProviderStreamMode`. In that mode:
 - `ProviderStreamMode::Generic` is the flexible mode for custom producers; there
   `SOF_PROVIDER_STREAM_CAPABILITY_POLICY` controls whether unsupported requests
   warn or fail
-- `ProviderStreamMode::Generic` is still a typed SOF ingress surface, not an
-  arbitrary payload channel
-  - the producer must convert upstream data into `ProviderStreamUpdate`
+- `ProviderStreamMode::Generic` is SOF's typed custom-provider ingress surface
+  - the producer converts upstream data into `ProviderStreamUpdate`
   - SOF then routes those updates by variant into the matching plugin,
     derived-state, and runtime health surfaces
   - this is how a custom producer can restore richer processed-provider

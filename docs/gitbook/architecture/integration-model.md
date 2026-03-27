@@ -28,10 +28,9 @@ Provider mode matters here:
 - `ProviderStreamMode::Generic` is the path for custom producers that want to
   feed richer control-plane updates through the same host surface
 
-`ProviderStreamMode::Generic` is still typed. It does not accept arbitrary
-provider blobs. A generic producer must convert upstream data into
-`ProviderStreamUpdate`, and SOF then dispatches those typed updates into the
-normal runtime surfaces:
+`ProviderStreamMode::Generic` is the typed processed-provider adapter path. A
+generic producer converts upstream data into `ProviderStreamUpdate`, and SOF
+then dispatches those typed updates into the normal runtime surfaces:
 
 - `Transaction` / `SerializedTransaction` -> transaction-family hooks
 - `TransactionLog` -> `on_transaction_log`

@@ -203,9 +203,9 @@ choice:
 - built-in processed providers are narrower on purpose
 - `ProviderStreamMode::Generic` exists when a custom producer needs to restore that richer surface
 
-`ProviderStreamMode::Generic` is a typed adapter boundary, not an arbitrary
-payload channel. A custom producer may ingest any upstream format, but before
-data enters SOF it must be mapped into `ProviderStreamUpdate`.
+`ProviderStreamMode::Generic` is SOF's typed adapter boundary. A custom
+producer ingests any upstream format it wants and maps it into
+`ProviderStreamUpdate` before handing it to the runtime.
 
 That update surface is:
 
@@ -245,7 +245,7 @@ The runtime then routes those typed updates into the normal SOF surfaces:
   - not a plugin callback
 
 So `Generic` should be read as “custom provider adapter feeds SOF's typed
-provider event surface,” not “SOF accepts any arbitrary provider blob.”
+provider event surface.”
 
 Programmatic setup uses the typed runtime API:
 

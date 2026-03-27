@@ -15,10 +15,9 @@
 //! `RecentBlockhash`, `SlotStatus`, `ClusterTopology`, `LeaderSchedule`, or
 //! `Reorg` updates directly.
 //!
-//! `ProviderStreamMode::Generic` is therefore not an “arbitrary payload” mode.
-//! It is a typed custom-adapter mode. Your producer can ingest any upstream
-//! format it wants, but before data enters SOF it must be mapped into one of
-//! the typed `ProviderStreamUpdate` variants below.
+//! `ProviderStreamMode::Generic` is SOF's typed custom-adapter mode.
+//! Your producer ingests an upstream format and maps it into one of the
+//! `ProviderStreamUpdate` variants below before handing it to SOF.
 //!
 //! Variant-to-runtime mapping:
 //!
@@ -116,9 +115,8 @@ pub enum ProviderStreamMode {
     /// Generic custom provider-stream ingress supplied by the embedding application.
     ///
     /// This mode is for producers that push typed `ProviderStreamUpdate` items
-    /// directly into SOF. It is not a free-form payload mode: your custom
-    /// adapter is responsible for converting upstream provider data into SOF's
-    /// typed transaction, control-plane, or health updates.
+    /// directly into SOF. A custom adapter converts upstream provider data into
+    /// SOF's transaction, control-plane, or health updates.
     ///
     /// Use it when:
     ///

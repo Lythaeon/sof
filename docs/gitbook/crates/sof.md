@@ -257,12 +257,11 @@ Important boundary:
 - `sof-tx` adapter completeness still depends on a full control-plane feed, not
   only transaction updates
 
-What `ProviderStreamMode::Generic` actually means:
+What `ProviderStreamMode::Generic` means:
 
-- it is not an arbitrary payload lane
-- it is a typed custom-adapter mode
-- your producer can ingest any upstream format, but it must convert that data
-  into SOF's `ProviderStreamUpdate` variants before sending it into the runtime
+- it is SOF's typed custom-adapter mode
+- your producer can ingest any upstream format, but it converts that data into
+  SOF's `ProviderStreamUpdate` variants before sending it into the runtime
 
 The accepted update shapes are:
 
