@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use solana_signature::Signature;
+use sof_types::SignatureBytes;
 
 use crate::providers::{LeaderProvider, LeaderTarget};
 
@@ -92,7 +92,7 @@ pub struct SignatureDeduper {
     /// Time-to-live for seen signatures.
     ttl: Duration,
     /// Last seen timestamps by signature.
-    seen: HashMap<Signature, Instant>,
+    seen: HashMap<SignatureBytes, Instant>,
 }
 
 impl SignatureDeduper {
@@ -106,7 +106,7 @@ impl SignatureDeduper {
     }
 
     /// Returns true when signature is new (and records it), false when duplicate.
-    pub fn check_and_insert(&mut self, signature: Signature, now: Instant) -> bool {
+    pub fn check_and_insert(&mut self, signature: SignatureBytes, now: Instant) -> bool {
         self.evict_expired(now);
         if self.seen.contains_key(&signature) {
             return false;
@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn deduper_rejects_recent_duplicate_and_allows_after_ttl() {
-        let signature = Signature::from([7_u8; 64]);
+        let signature = SignatureBytes::from([7_u8; 64]);
         let now = Instant::now();
         let mut deduper = SignatureDeduper::new(Duration::from_millis(25));
         assert!(deduper.check_and_insert(signature, now));

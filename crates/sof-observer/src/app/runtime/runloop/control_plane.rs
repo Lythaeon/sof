@@ -1,9 +1,14 @@
 #[cfg(feature = "gossip-bootstrap")]
 use super::*;
+#[cfg(feature = "gossip-bootstrap")]
+use crate::framework::{
+    ClusterNodeInfo, ClusterTopologyEvent, ControlPlaneSource, LeaderScheduleEntry,
+    LeaderScheduleEvent, pubkey_bytes,
+};
 
 #[cfg(feature = "gossip-bootstrap")]
 pub(super) struct ClusterTopologyTracker {
-    last_nodes: HashMap<Pubkey, ClusterNodeInfo>,
+    last_nodes: HashMap<crate::framework::PubkeyBytes, ClusterNodeInfo>,
     last_polled_at: Option<Instant>,
     last_snapshot_at: Option<Instant>,
     poll_interval: Duration,
@@ -34,7 +39,8 @@ impl ClusterTopologyTracker {
         }
         self.last_polled_at = Some(now);
 
-        let mut current_nodes: HashMap<Pubkey, ClusterNodeInfo> = HashMap::new();
+        let mut current_nodes: HashMap<crate::framework::PubkeyBytes, ClusterNodeInfo> =
+            HashMap::new();
         for (contact_info, _) in cluster_info.all_peers() {
             let node = cluster_node_info_from_contact(&contact_info);
             let _ = current_nodes.insert(node.pubkey, node);
@@ -59,7 +65,7 @@ impl ClusterTopologyTracker {
 
         sort_cluster_nodes(&mut added_nodes);
         sort_cluster_nodes(&mut updated_nodes);
-        removed_pubkeys.sort_unstable_by_key(Pubkey::to_bytes);
+        removed_pubkeys.sort_unstable_by_key(|pubkey| pubkey.into_array());
 
         let emit_snapshot = self
             .last_snapshot_at
@@ -120,7 +126,7 @@ pub(super) fn emit_slot_leader_diff_event(
         .into_iter()
         .map(|(slot, leader)| LeaderScheduleEntry {
             slot,
-            leader: Pubkey::new_from_array(leader),
+            leader: pubkey_bytes(Pubkey::new_from_array(leader)),
         })
         .collect();
     let mut updated_leaders: Vec<LeaderScheduleEntry> = diff
@@ -128,7 +134,7 @@ pub(super) fn emit_slot_leader_diff_event(
         .into_iter()
         .map(|(slot, leader)| LeaderScheduleEntry {
             slot,
-            leader: Pubkey::new_from_array(leader),
+            leader: pubkey_bytes(Pubkey::new_from_array(leader)),
         })
         .collect();
     let mut removed_slots = diff.removed_slots;
@@ -137,10 +143,10 @@ pub(super) fn emit_slot_leader_diff_event(
     sort_leader_entries(&mut updated_leaders);
     removed_slots.sort_unstable();
     for entry in &added_leaders {
-        let _ = emitted_slot_leaders.insert(entry.slot, entry.leader.to_bytes());
+        let _ = emitted_slot_leaders.insert(entry.slot, entry.leader.into_array());
     }
     for entry in &updated_leaders {
-        let _ = emitted_slot_leaders.insert(entry.slot, entry.leader.to_bytes());
+        let _ = emitted_slot_leaders.insert(entry.slot, entry.leader.into_array());
     }
     for slot in &removed_slots {
         let _ = emitted_slot_leaders.remove(slot);
@@ -178,7 +184,7 @@ pub(super) fn emit_observed_slot_leader_bytes_event(
     slot_leader_window: u64,
 ) {
     let previous = emitted_slot_leaders.insert(observed_slot, leader_bytes);
-    let leader = Pubkey::new_from_array(leader_bytes);
+    let leader = pubkey_bytes(Pubkey::new_from_array(leader_bytes));
     let (added_leaders, updated_leaders) = match previous {
         None => (
             vec![LeaderScheduleEntry {
@@ -218,7 +224,7 @@ pub(super) fn emit_observed_slot_leader_bytes_event(
 #[cfg(feature = "gossip-bootstrap")]
 fn cluster_node_info_from_contact(contact_info: &ContactInfo) -> ClusterNodeInfo {
     ClusterNodeInfo {
-        pubkey: *contact_info.pubkey(),
+        pubkey: pubkey_bytes(*contact_info.pubkey()),
         wallclock: contact_info.wallclock(),
         shred_version: contact_info.shred_version(),
         gossip: contact_info.gossip(),
@@ -234,7 +240,7 @@ fn cluster_node_info_from_contact(contact_info: &ContactInfo) -> ClusterNodeInfo
 
 #[cfg(feature = "gossip-bootstrap")]
 fn sort_cluster_nodes(nodes: &mut [ClusterNodeInfo]) {
-    nodes.sort_unstable_by_key(|node| node.pubkey.to_bytes());
+    nodes.sort_unstable_by_key(|node| node.pubkey.into_array());
 }
 
 #[cfg(feature = "gossip-bootstrap")]

@@ -4,8 +4,7 @@ use agave_transaction_view::{
     transaction_data::TransactionData, transaction_view::SanitizedTransactionView,
 };
 use async_trait::async_trait;
-use solana_pubkey::Pubkey;
-use solana_signature::Signature;
+use sof_types::{PubkeyBytes, SignatureBytes};
 use std::{cell::RefCell, sync::Arc};
 use thiserror::Error;
 
@@ -19,7 +18,7 @@ use crate::framework::events::{
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct CachedTransactionEventKey {
     slot: u64,
-    signature: Option<Signature>,
+    signature: Option<SignatureBytes>,
     tx_ptr: *const solana_transaction::versioned::VersionedTransaction,
     kind: crate::event::TxKind,
 }
@@ -114,10 +113,10 @@ pub enum TransactionInterest {
 ///
 /// ```rust
 /// use sof::framework::{TransactionInterest, TransactionPrefilter};
-/// use solana_pubkey::Pubkey;
+/// use sof::PubkeyBytes;
 ///
-/// let pool = Pubkey::new_unique();
-/// let program = Pubkey::new_unique();
+/// let pool = PubkeyBytes::new([1_u8; 32]);
+/// let program = PubkeyBytes::new([2_u8; 32]);
 ///
 /// let filter = TransactionPrefilter::new(TransactionInterest::Critical)
 ///     .with_account_required([pool, program]);
@@ -126,10 +125,10 @@ pub enum TransactionInterest {
 /// ```
 pub struct TransactionPrefilter {
     matched_interest: TransactionInterest,
-    signature: Option<Signature>,
-    account_include: Arc<[Pubkey]>,
-    account_exclude: Arc<[Pubkey]>,
-    account_required: Arc<[Pubkey]>,
+    signature: Option<SignatureBytes>,
+    account_include: Arc<[PubkeyBytes]>,
+    account_exclude: Arc<[PubkeyBytes]>,
+    account_required: Arc<[PubkeyBytes]>,
 }
 
 impl TransactionPrefilter {
@@ -153,8 +152,11 @@ impl TransactionPrefilter {
 
     /// Requires one exact transaction signature.
     #[must_use]
-    pub const fn with_signature(mut self, signature: Signature) -> Self {
-        self.signature = Some(signature);
+    pub fn with_signature<S>(mut self, signature: S) -> Self
+    where
+        S: Into<SignatureBytes>,
+    {
+        self.signature = Some(signature.into());
         self
     }
 
@@ -162,9 +164,10 @@ impl TransactionPrefilter {
     #[must_use]
     pub fn with_account_include<I>(mut self, keys: I) -> Self
     where
-        I: IntoIterator<Item = Pubkey>,
+        I: IntoIterator,
+        I::Item: Into<PubkeyBytes>,
     {
-        self.account_include = Arc::from(keys.into_iter().collect::<Vec<_>>());
+        self.account_include = Arc::from(keys.into_iter().map(Into::into).collect::<Vec<_>>());
         self
     }
 
@@ -172,9 +175,10 @@ impl TransactionPrefilter {
     #[must_use]
     pub fn with_account_exclude<I>(mut self, keys: I) -> Self
     where
-        I: IntoIterator<Item = Pubkey>,
+        I: IntoIterator,
+        I::Item: Into<PubkeyBytes>,
     {
-        self.account_exclude = Arc::from(keys.into_iter().collect::<Vec<_>>());
+        self.account_exclude = Arc::from(keys.into_iter().map(Into::into).collect::<Vec<_>>());
         self
     }
 
@@ -182,9 +186,10 @@ impl TransactionPrefilter {
     #[must_use]
     pub fn with_account_required<I>(mut self, keys: I) -> Self
     where
-        I: IntoIterator<Item = Pubkey>,
+        I: IntoIterator,
+        I::Item: Into<PubkeyBytes>,
     {
-        self.account_required = Arc::from(keys.into_iter().collect::<Vec<_>>());
+        self.account_required = Arc::from(keys.into_iter().map(Into::into).collect::<Vec<_>>());
         self
     }
 
@@ -231,7 +236,7 @@ impl TransactionPrefilter {
         view: &SanitizedTransactionView<D>,
     ) -> TransactionInterest {
         if let Some(signature) = self.signature
-            && view.signatures().first().copied() != Some(signature)
+            && view.signatures().first().copied() != Some(signature.to_solana())
         {
             return TransactionInterest::Ignore;
         }
@@ -266,8 +271,9 @@ impl TransactionPrefilter {
 
 fn transaction_mentions_account_key(
     tx: &solana_transaction::versioned::VersionedTransaction,
-    key: Pubkey,
+    key: PubkeyBytes,
 ) -> bool {
+    let key = key.to_solana();
     tx.message.static_account_keys().contains(&key)
         || tx
             .message
@@ -277,8 +283,9 @@ fn transaction_mentions_account_key(
 
 fn transaction_view_mentions_account_key<D: TransactionData>(
     view: &SanitizedTransactionView<D>,
-    key: Pubkey,
+    key: PubkeyBytes,
 ) -> bool {
+    let key = key.to_solana();
     view.static_account_keys().contains(&key)
         || view
             .address_table_lookup_iter()

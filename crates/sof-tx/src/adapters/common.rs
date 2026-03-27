@@ -11,7 +11,7 @@ use sof::framework::{
     BranchReorgedEvent, ClusterNodeInfo, ClusterTopologyEvent, LeaderScheduleEntry,
     LeaderScheduleEvent, ObservedRecentBlockhashEvent, PluginHost, SlotStatusChangedEvent,
 };
-use solana_pubkey::Pubkey;
+use sof_types::PubkeyBytes;
 
 use crate::providers::{LeaderTarget, RecentBlockhashProvider};
 
@@ -301,7 +301,7 @@ impl TxProviderAdapterCore {
     }
 
     /// Inserts or updates one TPU address mapping for a leader identity.
-    pub(crate) fn set_leader_tpu_addr(&self, identity: Pubkey, tpu_addr: SocketAddr) {
+    pub(crate) fn set_leader_tpu_addr(&self, identity: PubkeyBytes, tpu_addr: SocketAddr) {
         self.update(move |state| {
             let ingress = state.ingress_by_identity.entry(identity).or_default();
             ingress.tpu = Some(tpu_addr);
@@ -310,7 +310,7 @@ impl TxProviderAdapterCore {
     }
 
     /// Removes one TPU address mapping for a leader identity.
-    pub(crate) fn remove_leader_tpu_addr(&self, identity: Pubkey) {
+    pub(crate) fn remove_leader_tpu_addr(&self, identity: PubkeyBytes) {
         self.update(move |state| {
             let _ = state.ingress_by_identity.remove(&identity);
         });
@@ -380,7 +380,7 @@ impl TxProviderAdapterCore {
             state.leader_by_slot = snapshot
                 .leader_by_slot
                 .into_iter()
-                .map(|(slot, identity)| (slot, Pubkey::new_from_array(identity)))
+                .map(|(slot, identity)| (slot, PubkeyBytes::new(identity)))
                 .collect();
             state.tip_slot = snapshot.tip_slot;
             state.leader_slot_cursor = snapshot.leader_slot_cursor;
@@ -391,7 +391,7 @@ impl TxProviderAdapterCore {
                 .into_iter()
                 .map(|entry| {
                     (
-                        Pubkey::new_from_array(entry.identity),
+                        PubkeyBytes::new(entry.identity),
                         NodeIngress {
                             tpu: entry.tpu,
                             tpu_quic: entry.tpu_quic,
@@ -418,7 +418,7 @@ impl TxProviderAdapterCore {
             leader_by_slot: state
                 .leader_by_slot
                 .iter()
-                .map(|(slot, identity)| (*slot, identity.to_bytes()))
+                .map(|(slot, identity)| (*slot, identity.into_array()))
                 .collect(),
             tip_slot: state.tip_slot,
             leader_slot_cursor: state.leader_slot_cursor,
@@ -428,7 +428,7 @@ impl TxProviderAdapterCore {
                 .ingress_by_identity
                 .iter()
                 .map(|(identity, ingress)| TxProviderIngressSnapshot {
-                    identity: identity.to_bytes(),
+                    identity: identity.into_array(),
                     tpu: ingress.tpu,
                     tpu_quic: ingress.tpu_quic,
                     tpu_forwards: ingress.tpu_forwards,
@@ -563,7 +563,7 @@ struct AdapterState {
     /// Slot that produced `latest_recent_blockhash`.
     latest_recent_blockhash_slot: Option<u64>,
     /// Slot-indexed leader identities used for leader-window lookups.
-    leader_by_slot: BTreeMap<u64, Pubkey>,
+    leader_by_slot: BTreeMap<u64, PubkeyBytes>,
     /// Latest processed tip slot seen by the adapter.
     tip_slot: Option<u64>,
     /// Cursor used to keep leader-window iteration moving forward with the tip.
@@ -573,7 +573,7 @@ struct AdapterState {
     /// Slot of the latest leader-schedule update.
     leader_schedule_slot: Option<u64>,
     /// Known TPU ingress endpoints keyed by validator identity.
-    ingress_by_identity: HashMap<Pubkey, NodeIngress>,
+    ingress_by_identity: HashMap<PubkeyBytes, NodeIngress>,
 }
 
 impl AdapterState {
@@ -632,7 +632,7 @@ fn apply_cluster_topology(state: &mut AdapterState, event: &ClusterTopologyEvent
 /// Inserts or replaces ingress endpoints from one topology batch.
 fn insert_node_ingresses(
     nodes: &[ClusterNodeInfo],
-    ingress_by_identity: &mut HashMap<Pubkey, NodeIngress>,
+    ingress_by_identity: &mut HashMap<PubkeyBytes, NodeIngress>,
 ) {
     for node in nodes {
         let ingress = NodeIngress {
@@ -749,7 +749,7 @@ fn collect_leader_targets_from_state(state: &AdapterState, requested: usize) -> 
             .iter()
             .map(|(identity, ingress)| (*identity, *ingress))
             .collect::<Vec<_>>();
-        topology_targets.sort_unstable_by_key(|(identity, _)| identity.to_bytes());
+        topology_targets.sort_unstable_by_key(|(identity, _)| identity.into_array());
         for (identity, ingress) in topology_targets {
             append_ingress_targets(&mut output, &mut seen_addrs, identity, ingress, requested);
             if output.len() >= requested {
@@ -765,7 +765,7 @@ fn collect_leader_targets_from_state(state: &AdapterState, requested: usize) -> 
 fn append_ingress_targets(
     output: &mut Vec<LeaderTarget>,
     seen_addrs: &mut HashSet<SocketAddr>,
-    identity: Pubkey,
+    identity: PubkeyBytes,
     ingress: NodeIngress,
     requested: usize,
 ) {

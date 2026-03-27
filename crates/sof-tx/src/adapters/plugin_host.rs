@@ -7,7 +7,7 @@ use sof::framework::{
     ClusterTopologyEvent, LeaderScheduleEvent, ObservedRecentBlockhashEvent, ObserverPlugin,
     PluginHost,
 };
-use solana_pubkey::Pubkey;
+use sof_types::PubkeyBytes;
 
 use crate::{
     adapters::common::{
@@ -50,12 +50,12 @@ impl PluginHostTxProviderAdapter {
     }
 
     /// Inserts or updates one TPU address mapping for a leader identity.
-    pub fn set_leader_tpu_addr(&self, identity: Pubkey, tpu_addr: SocketAddr) {
+    pub fn set_leader_tpu_addr(&self, identity: PubkeyBytes, tpu_addr: SocketAddr) {
         self.core.set_leader_tpu_addr(identity, tpu_addr);
     }
 
     /// Removes one TPU address mapping for a leader identity.
-    pub fn remove_leader_tpu_addr(&self, identity: Pubkey) {
+    pub fn remove_leader_tpu_addr(&self, identity: PubkeyBytes) {
         self.core.remove_leader_tpu_addr(identity);
     }
 
@@ -178,12 +178,14 @@ mod tests {
 
     use super::*;
     use sof::framework::{ClusterNodeInfo, ControlPlaneSource, LeaderScheduleEntry, PluginHost};
+    use sof_types::PubkeyBytes;
+    use solana_pubkey::Pubkey;
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
     }
 
-    fn node(pubkey: Pubkey, tpu_port: u16) -> ClusterNodeInfo {
+    fn node(pubkey: PubkeyBytes, tpu_port: u16) -> ClusterNodeInfo {
         ClusterNodeInfo {
             pubkey,
             wallclock: 0,
@@ -200,7 +202,7 @@ mod tests {
     }
 
     fn node_with_forwards(
-        pubkey: Pubkey,
+        pubkey: PubkeyBytes,
         tpu_port: u16,
         tpu_forwards_port: u16,
     ) -> ClusterNodeInfo {
@@ -276,9 +278,9 @@ mod tests {
     #[tokio::test]
     async fn adapter_maps_topology_and_leaders_into_targets() {
         let adapter = PluginHostTxProviderAdapter::default();
-        let leader_a = Pubkey::new_unique();
-        let leader_b = Pubkey::new_unique();
-        let leader_c = Pubkey::new_unique();
+        let leader_a: PubkeyBytes = Pubkey::new_unique().into();
+        let leader_b: PubkeyBytes = Pubkey::new_unique().into();
+        let leader_c: PubkeyBytes = Pubkey::new_unique().into();
 
         adapter
             .on_cluster_topology(topology_snapshot(vec![
@@ -320,9 +322,9 @@ mod tests {
     #[tokio::test]
     async fn adapter_falls_back_to_topology_when_schedule_is_unmapped() {
         let adapter = PluginHostTxProviderAdapter::default();
-        let unmapped_leader = Pubkey::new_unique();
-        let topo_a = Pubkey::new_unique();
-        let topo_b = Pubkey::new_unique();
+        let unmapped_leader: PubkeyBytes = Pubkey::new_unique().into();
+        let topo_a: PubkeyBytes = Pubkey::new_unique().into();
+        let topo_b: PubkeyBytes = Pubkey::new_unique().into();
 
         adapter
             .on_cluster_topology(topology_snapshot(vec![
@@ -356,8 +358,8 @@ mod tests {
     #[tokio::test]
     async fn adapter_next_leaders_skip_current_identity_and_return_next_identity() {
         let adapter = PluginHostTxProviderAdapter::default();
-        let leader_a = Pubkey::new_unique();
-        let leader_b = Pubkey::new_unique();
+        let leader_a: PubkeyBytes = Pubkey::new_unique().into();
+        let leader_b: PubkeyBytes = Pubkey::new_unique().into();
 
         adapter
             .on_cluster_topology(topology_snapshot(vec![
@@ -397,9 +399,9 @@ mod tests {
             max_leader_slots: 2,
             max_next_leaders: 8,
         });
-        let leader_a = Pubkey::new_unique();
-        let leader_b = Pubkey::new_unique();
-        let leader_c = Pubkey::new_unique();
+        let leader_a: PubkeyBytes = Pubkey::new_unique().into();
+        let leader_b: PubkeyBytes = Pubkey::new_unique().into();
+        let leader_c: PubkeyBytes = Pubkey::new_unique().into();
 
         adapter.set_leader_tpu_addr(leader_a, addr(9011));
         adapter.set_leader_tpu_addr(leader_b, addr(9012));
@@ -439,7 +441,7 @@ mod tests {
     #[tokio::test]
     async fn adapter_can_be_primed_from_plugin_host_state() {
         let mut host = PluginHost::builder().build();
-        let leader = Pubkey::new_unique();
+        let leader: PubkeyBytes = Pubkey::new_unique().into();
         host.on_recent_blockhash(ObservedRecentBlockhashEvent {
             slot: 42,
             recent_blockhash: [11_u8; 32],
@@ -472,7 +474,7 @@ mod tests {
     #[tokio::test]
     async fn adapter_reports_stale_control_plane_state() {
         let adapter = PluginHostTxProviderAdapter::default();
-        let leader = Pubkey::new_unique();
+        let leader: PubkeyBytes = Pubkey::new_unique().into();
 
         adapter
             .on_recent_blockhash(ObservedRecentBlockhashEvent {

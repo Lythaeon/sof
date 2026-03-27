@@ -41,10 +41,12 @@ solana-signer = "3.0.0"
 solana-system-interface = { version = "3.0.0", features = ["bincode"] }
 solana-transaction = { version = "3.0.2", features = ["bincode"] }
 sof = { version = "0.13.0", path = "../sof-observer", default-features = false, optional = true }
+sof-types = { version = "0.13.0", path = "../sof-types", features = ["solana-compat"] }
 thiserror = "2.0"
 tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
 tonic = { version = "0.12", optional = true, default-features = false, features = ["codegen", "prost", "transport", "tls-webpki-roots"] }
 arcshift = "0.4.2"
 
 [dev-dependencies]
+sof-solana-compat = { version = "0.13.0", path = "../sof-solana-compat" }
 xdp = "0.7.3"

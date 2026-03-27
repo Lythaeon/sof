@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use solana_signature::Signature;
+use sof_types::SignatureBytes;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 /// Transaction classification used by runtime and plugins.
@@ -71,7 +71,7 @@ pub enum TxObservedEvent {
         /// Slot where transaction was observed.
         slot: u64,
         /// Transaction signature.
-        signature: Signature,
+        signature: SignatureBytes,
         /// Transaction kind classification.
         kind: TxKind,
         /// Commitment status at observation time.

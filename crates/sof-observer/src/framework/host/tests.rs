@@ -14,11 +14,19 @@ use std::{
 
 use crate::event::TxKind;
 use crate::framework::{
-    PluginConfig, PluginContext, PluginSetupError, SerializedTransactionRange,
-    TransactionBatchEvent, TransactionDispatchMode, TransactionEvent, TransactionEventRef,
-    TransactionInterest, TransactionLogEvent, TransactionPrefilter, TransactionViewBatchEvent,
-    TxCommitmentStatus,
+    PluginConfig, PluginContext, PluginSetupError, PubkeyBytes, SerializedTransactionRange,
+    SignatureBytes, TransactionBatchEvent, TransactionDispatchMode, TransactionEvent,
+    TransactionEventRef, TransactionInterest, TransactionLogEvent, TransactionPrefilter,
+    TransactionViewBatchEvent, TxCommitmentStatus,
 };
+
+fn pb(value: Pubkey) -> PubkeyBytes {
+    PubkeyBytes::from_solana(value)
+}
+
+fn sb(value: Signature) -> SignatureBytes {
+    SignatureBytes::from_solana(value)
+}
 
 #[derive(Clone, Copy)]
 struct PluginA;
@@ -628,7 +636,7 @@ fn latest_observed_tpu_leader_is_stateful() {
         epoch: None,
         added_leaders: vec![LeaderScheduleEntry {
             slot: 100,
-            leader: leader_a,
+            leader: pb(leader_a),
         }],
         removed_slots: Vec::new(),
         updated_leaders: Vec::new(),
@@ -638,7 +646,7 @@ fn latest_observed_tpu_leader_is_stateful() {
         host.latest_observed_tpu_leader(),
         Some(LeaderScheduleEntry {
             slot: 100,
-            leader: leader_a,
+            leader: pb(leader_a),
         })
     );
 
@@ -648,7 +656,7 @@ fn latest_observed_tpu_leader_is_stateful() {
         epoch: None,
         added_leaders: vec![LeaderScheduleEntry {
             slot: 99,
-            leader: leader_b,
+            leader: pb(leader_b),
         }],
         removed_slots: Vec::new(),
         updated_leaders: Vec::new(),
@@ -658,7 +666,7 @@ fn latest_observed_tpu_leader_is_stateful() {
         host.latest_observed_tpu_leader(),
         Some(LeaderScheduleEntry {
             slot: 100,
-            leader: leader_a,
+            leader: pb(leader_a),
         })
     );
 
@@ -670,7 +678,7 @@ fn latest_observed_tpu_leader_is_stateful() {
         removed_slots: Vec::new(),
         updated_leaders: vec![LeaderScheduleEntry {
             slot: 100,
-            leader: leader_b,
+            leader: pb(leader_b),
         }],
         snapshot_leaders: Vec::new(),
     });
@@ -678,7 +686,7 @@ fn latest_observed_tpu_leader_is_stateful() {
         host.latest_observed_tpu_leader(),
         Some(LeaderScheduleEntry {
             slot: 100,
-            leader: leader_b,
+            leader: pb(leader_b),
         })
     );
 }
@@ -882,7 +890,7 @@ fn transaction_prefilter_matches_manual_account_classifier() {
         commitment_status: TxCommitmentStatus::Processed,
         confirmed_slot: None,
         finalized_slot: None,
-        signature: Some(Signature::from([7_u8; 64])),
+        signature: Some(sb(Signature::from([7_u8; 64]))),
         tx: &tx,
         kind: TxKind::NonVote,
     };
@@ -920,7 +928,7 @@ fn transaction_prefilter_view_classification_matches_decoded() {
         commitment_status: TxCommitmentStatus::Processed,
         confirmed_slot: None,
         finalized_slot: None,
-        signature,
+        signature: signature.map(sb),
         tx: &tx,
         kind: TxKind::NonVote,
     };
@@ -958,7 +966,7 @@ fn transaction_view_prefilter_marks_manual_plugins_for_full_decode() {
         commitment_status: TxCommitmentStatus::Processed,
         confirmed_slot: None,
         finalized_slot: None,
-        signature,
+        signature: signature.map(sb),
         tx: &tx,
         kind: TxKind::NonVote,
     };
@@ -1095,7 +1103,7 @@ fn transaction_log_commitment_selector_filters_dispatch() {
     host.on_transaction_log(TransactionLogEvent {
         slot: 10,
         commitment_status: TxCommitmentStatus::Processed,
-        signature: Signature::from([10_u8; 64]),
+        signature: sb(Signature::from([10_u8; 64])),
         err: None,
         logs: Arc::from(Vec::<String>::new()),
         matched_filter: None,
@@ -1103,7 +1111,7 @@ fn transaction_log_commitment_selector_filters_dispatch() {
     host.on_transaction_log(TransactionLogEvent {
         slot: 11,
         commitment_status: TxCommitmentStatus::Confirmed,
-        signature: Signature::from([11_u8; 64]),
+        signature: sb(Signature::from([11_u8; 64])),
         err: None,
         logs: Arc::from(Vec::<String>::new()),
         matched_filter: None,
@@ -1255,7 +1263,7 @@ fn transaction_prefilter_profile_fixture() {
         commitment_status: TxCommitmentStatus::Processed,
         confirmed_slot: None,
         finalized_slot: None,
-        signature: Some(Signature::from([42_u8; 64])),
+        signature: Some(sb(Signature::from([42_u8; 64]))),
         tx: &tx,
         kind: TxKind::NonVote,
     };
@@ -1328,7 +1336,7 @@ fn test_transaction_event_with_signature(slot: u64, signature_seed: u8) -> Trans
         confirmed_slot: None,
         finalized_slot: None,
         signature: (signature_seed != 0)
-            .then(|| solana_signature::Signature::from([signature_seed; 64])),
+            .then(|| sb(solana_signature::Signature::from([signature_seed; 64]))),
         tx: Arc::new(tx),
         kind: TxKind::NonVote,
     }

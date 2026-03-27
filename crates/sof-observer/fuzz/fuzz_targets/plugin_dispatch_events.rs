@@ -92,7 +92,10 @@ fn read_leader_entries(input: &mut &[u8], max: usize) -> Vec<LeaderScheduleEntry
         let Some(leader) = take_pubkey(input) else {
             break;
         };
-        out.push(LeaderScheduleEntry { slot, leader });
+        out.push(LeaderScheduleEntry {
+            slot,
+            leader: leader.into(),
+        });
     }
     out
 }
@@ -147,7 +150,7 @@ fn read_nodes(input: &mut &[u8], max: usize) -> Vec<ClusterNodeInfo> {
             None
         };
         out.push(ClusterNodeInfo {
-            pubkey,
+            pubkey: pubkey.into(),
             wallclock,
             shred_version,
             gossip,
@@ -315,7 +318,7 @@ fuzz_target!(|bytes: &[u8]| {
                 let mut removed_pubkeys = Vec::with_capacity(removed_count);
                 for _ in 0..removed_count {
                     if let Some(pubkey) = take_pubkey(&mut input) {
-                        removed_pubkeys.push(pubkey);
+                        removed_pubkeys.push(pubkey.into());
                     }
                 }
                 let snapshot_nodes = read_nodes(&mut input, 8);

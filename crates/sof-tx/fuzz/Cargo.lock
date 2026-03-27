@@ -2343,8 +2343,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "sof-solana-compat"
+version = "0.13.0"
+dependencies = [
+ "async-trait",
+ "bincode",
+ "sof-tx",
+ "sof-types",
+ "solana-compute-budget-interface",
+ "solana-keypair",
+ "solana-message",
+ "solana-packet",
+ "solana-pubkey 3.0.0",
+ "solana-signer",
+ "solana-system-interface",
+ "solana-transaction",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "sof-tx"
-version = "0.11.0"
+version = "0.13.0"
 dependencies = [
  "arcshift",
  "async-trait",
@@ -2354,6 +2373,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sof-types",
  "solana-compute-budget-interface",
  "solana-connection-cache",
  "solana-keypair",
@@ -2376,6 +2396,7 @@ dependencies = [
  "async-trait",
  "bincode",
  "libfuzzer-sys",
+ "sof-solana-compat",
  "sof-tx",
  "solana-keypair",
  "solana-message",
@@ -2384,6 +2405,17 @@ dependencies = [
  "solana-signer",
  "solana-system-interface",
  "tokio",
+]
+
+[[package]]
+name = "sof-types"
+version = "0.13.0"
+dependencies = [
+ "bs58",
+ "serde",
+ "solana-pubkey 3.0.0",
+ "solana-signature",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

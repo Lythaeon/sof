@@ -102,8 +102,8 @@ use crate::framework::{
 use agave_transaction_view::{
     transaction_data::TransactionData, transaction_view::SanitizedTransactionView,
 };
+use sof_types::SignatureBytes;
 use solana_sdk_ids::{compute_budget, vote};
-use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 
 /// Default queue capacity for processed provider-stream ingress.
@@ -379,7 +379,7 @@ pub struct SerializedTransactionEvent {
     /// Latest observed finalized slot watermark when event was emitted.
     pub finalized_slot: Option<u64>,
     /// Transaction signature if present.
-    pub signature: Option<Signature>,
+    pub signature: Option<SignatureBytes>,
     /// Serialized transaction bytes.
     pub bytes: Box<[u8]>,
 }

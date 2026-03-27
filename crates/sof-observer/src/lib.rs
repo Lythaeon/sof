@@ -175,6 +175,8 @@
 //! More user-facing examples live in `crates/sof-observer/README.md` and the published example
 //! programs under `crates/sof-observer/examples/`.
 
+pub use sof_types::{PubkeyBytes, SignatureBytes};
+
 #[doc(hidden)]
 mod app;
 /// Runtime environment override storage used by code-driven setup APIs.

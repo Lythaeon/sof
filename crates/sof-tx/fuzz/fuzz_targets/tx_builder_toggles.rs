@@ -3,7 +3,7 @@
 use libfuzzer_sys::fuzz_target;
 use solana_message::VersionedMessage;
 use solana_pubkey::Pubkey;
-use sof_tx::{TxBuilder, TxMessageVersion};
+use sof_solana_compat::{TxBuilder, TxMessageVersion};
 
 fn take_bytes<'a>(input: &mut &'a [u8], len: usize) -> Option<&'a [u8]> {
     if input.len() < len {

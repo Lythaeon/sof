@@ -13,6 +13,7 @@ use crate::framework::AccountTouchEvent;
 use crate::framework::PluginContext;
 use crate::framework::events::AccountTouchEventRef;
 use crate::framework::events::TransactionEventRef;
+use crate::framework::pubkey_bytes;
 use agave_transaction_view::{
     transaction_data::TransactionData, transaction_view::SanitizedTransactionView,
 };
@@ -460,7 +461,7 @@ impl PluginHost {
             .as_ref()
             .map(|state| LeaderScheduleEntry {
                 slot: state.slot,
-                leader: state.leader,
+                leader: pubkey_bytes(state.leader),
             })
     }
 
@@ -852,17 +853,17 @@ impl PluginHost {
                 None => {
                     next_state = Some(ObservedTpuLeaderState {
                         slot: newest_entry.slot,
-                        leader: newest_entry.leader,
+                        leader: newest_entry.leader.to_solana(),
                     });
                     true
                 }
                 Some(current)
                     if newest_entry.slot > current.slot
                         || (newest_entry.slot == current.slot
-                            && newest_entry.leader != current.leader) =>
+                            && newest_entry.leader.to_solana() != current.leader) =>
                 {
                     current.slot = newest_entry.slot;
-                    current.leader = newest_entry.leader;
+                    current.leader = newest_entry.leader.to_solana();
                     true
                 }
                 Some(_) => false,

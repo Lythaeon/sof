@@ -7,17 +7,17 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sof::framework::{
     ClusterNodeInfo, ClusterTopologyEvent, LeaderScheduleEvent, Plugin, PluginConfig, PluginHost,
+    PubkeyBytes,
 };
 use sof::runtime::RuntimeSetup;
-use solana_pubkey::Pubkey;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
 #[derive(Debug, Default)]
 struct TpuLeaderLoggerState {
-    nodes: HashMap<Pubkey, ClusterNodeInfo>,
-    seen_tpu_leaders: HashSet<Pubkey>,
-    pending_leaders: HashSet<Pubkey>,
+    nodes: HashMap<PubkeyBytes, ClusterNodeInfo>,
+    seen_tpu_leaders: HashSet<PubkeyBytes>,
+    pending_leaders: HashSet<PubkeyBytes>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -54,7 +54,7 @@ impl Plugin for TpuLeaderLoggerPlugin {
             }
         }
 
-        let pending: Vec<Pubkey> = state.pending_leaders.iter().copied().collect();
+        let pending: Vec<PubkeyBytes> = state.pending_leaders.iter().copied().collect();
         for leader in pending {
             if try_log_new_tpu_leader(
                 &mut state,
@@ -84,7 +84,7 @@ impl Plugin for TpuLeaderLoggerPlugin {
 
 fn try_log_new_tpu_leader(
     state: &mut TpuLeaderLoggerState,
-    leader: Pubkey,
+    leader: PubkeyBytes,
     slot: u64,
     active_entrypoint: Option<&str>,
 ) -> bool {

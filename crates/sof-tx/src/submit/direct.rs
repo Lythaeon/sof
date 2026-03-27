@@ -9,6 +9,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use sof_types::PubkeyBytes;
 use solana_connection_cache::{
     connection_cache::NewConnectionConfig, nonblocking::client_connection::ClientConnection,
 };
@@ -322,7 +323,7 @@ fn required_distinct_quic_targets(available_distinct_targets: usize) -> usize {
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 enum DistinctTargetKey {
     /// Deduplicate targets that share the same validator identity.
-    Identity(solana_pubkey::Pubkey),
+    Identity(PubkeyBytes),
     /// Fallback key for targets without a known validator identity.
     Addr(SocketAddr),
 }
@@ -432,7 +433,7 @@ mod tests {
 
     #[test]
     fn quic_distinct_target_count_deduplicates_same_identity() {
-        let identity = solana_pubkey::Pubkey::new_unique();
+        let identity = PubkeyBytes::from_solana(solana_pubkey::Pubkey::new_unique());
         let targets = vec![
             LeaderTarget::new(Some(identity), SocketAddr::from(([127, 0, 0, 1], 9001))),
             LeaderTarget::new(Some(identity), SocketAddr::from(([127, 0, 0, 1], 9002))),

@@ -1,5 +1,7 @@
 //! Public plugin framework surface for embedding custom observers into SOF runtime.
 
+pub use sof_types::{PubkeyBytes, SignatureBytes};
+
 /// Experimental derived-state feed scaffold for official stateful extensions.
 pub mod derived_state;
 /// Framework event payload types delivered to plugins.
@@ -12,6 +14,8 @@ pub mod extension_host;
 pub mod host;
 /// Plugin trait implemented by user extensions.
 pub mod plugin;
+
+pub(crate) use events::{arc_pubkey_bytes, pubkey_bytes, signature_bytes, signature_bytes_opt};
 
 pub use crate::event::{ForkSlotStatus, TxCommitmentStatus};
 pub use derived_state::{

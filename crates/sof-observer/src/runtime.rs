@@ -1893,6 +1893,7 @@ fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderR
     match update {
         ProviderStreamUpdate::Transaction(event) => event
             .signature
+            .map(crate::framework::SignatureBytes::to_solana)
             .or_else(|| event.tx.signatures.first().copied())
             .map(|signature| ProviderReplayDedupeKey::Transaction {
                 slot: event.slot,
@@ -1901,17 +1902,16 @@ fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderR
                 confirmed_slot: event.confirmed_slot,
                 finalized_slot: event.finalized_slot,
             }),
-        ProviderStreamUpdate::SerializedTransaction(event) => {
-            event
-                .signature
-                .map(|signature| ProviderReplayDedupeKey::Transaction {
-                    slot: event.slot,
-                    signature,
-                    commitment_status: provider_replay_commitment_key(event.commitment_status),
-                    confirmed_slot: event.confirmed_slot,
-                    finalized_slot: event.finalized_slot,
-                })
-        }
+        ProviderStreamUpdate::SerializedTransaction(event) => event
+            .signature
+            .map(crate::framework::SignatureBytes::to_solana)
+            .map(|signature| ProviderReplayDedupeKey::Transaction {
+                slot: event.slot,
+                signature,
+                commitment_status: provider_replay_commitment_key(event.commitment_status),
+                confirmed_slot: event.confirmed_slot,
+                finalized_slot: event.finalized_slot,
+            }),
         ProviderStreamUpdate::RecentBlockhash(event) => {
             Some(ProviderReplayDedupeKey::ControlPlane {
                 slot: event.slot,
@@ -2115,7 +2115,11 @@ fn dispatch_provider_stream_serialized_transaction(
         && let Ok(view) = SanitizedTransactionView::try_new_sanitized(event.bytes.as_ref(), true)
     {
         if signature.is_none() {
-            signature = view.signatures().first().copied();
+            signature = view
+                .signatures()
+                .first()
+                .copied()
+                .map(crate::framework::SignatureBytes::from_solana);
         }
         if wants_recent_blockhash {
             recent_blockhash = Some(view.recent_blockhash().to_bytes());
@@ -2167,7 +2171,12 @@ fn dispatch_provider_stream_serialized_transaction(
         commitment_status: event.commitment_status,
         confirmed_slot: event.confirmed_slot,
         finalized_slot: event.finalized_slot,
-        signature: signature.or_else(|| tx.signatures.first().copied()),
+        signature: signature.or_else(|| {
+            tx.signatures
+                .first()
+                .copied()
+                .map(crate::framework::SignatureBytes::from_solana)
+        }),
         kind: crate::provider_stream::classify_provider_transaction_kind(&tx),
         tx,
     };
@@ -2704,7 +2713,11 @@ mod tests {
             commitment_status: crate::event::TxCommitmentStatus::Processed,
             confirmed_slot: None,
             finalized_slot: None,
-            signature: tx.signatures.first().copied(),
+            signature: tx
+                .signatures
+                .first()
+                .copied()
+                .map(crate::framework::SignatureBytes::from_solana),
             kind: crate::event::TxKind::NonVote,
             tx: Arc::new(tx),
         })
@@ -3000,7 +3013,11 @@ mod tests {
         let mut kind = None;
         if let Ok(view) = SanitizedTransactionView::try_new_sanitized(event.bytes.as_ref(), true) {
             if signature.is_none() {
-                signature = view.signatures().first().copied();
+                signature = view
+                    .signatures()
+                    .first()
+                    .copied()
+                    .map(crate::framework::SignatureBytes::from_solana);
             }
             kind = Some(crate::provider_stream::classify_provider_transaction_kind_view(&view));
             if wants_recent_blockhash {
@@ -3051,7 +3068,12 @@ mod tests {
             commitment_status: event.commitment_status,
             confirmed_slot: event.confirmed_slot,
             finalized_slot: event.finalized_slot,
-            signature: signature.or_else(|| tx.signatures.first().copied()),
+            signature: signature.or_else(|| {
+                tx.signatures
+                    .first()
+                    .copied()
+                    .map(crate::framework::SignatureBytes::from_solana)
+            }),
             kind: kind
                 .unwrap_or_else(|| crate::provider_stream::classify_provider_transaction_kind(&tx)),
             tx,
@@ -3142,7 +3164,9 @@ mod tests {
         match sample_provider_transaction_update() {
             ProviderStreamUpdate::Transaction(mut event) => {
                 event.slot = slot;
-                event.signature = Some(Signature::from([slot as u8; 64]));
+                event.signature = Some(crate::framework::SignatureBytes::from_solana(
+                    Signature::from([slot as u8; 64]),
+                ));
                 ProviderStreamUpdate::Transaction(event)
             }
             other @ ProviderStreamUpdate::SerializedTransaction(_)
@@ -3169,7 +3193,9 @@ mod tests {
         ProviderStreamUpdate::TransactionLog(crate::framework::TransactionLogEvent {
             slot,
             commitment_status: crate::event::TxCommitmentStatus::Processed,
-            signature: Signature::from([slot as u8; 64]),
+            signature: crate::framework::SignatureBytes::from_solana(Signature::from(
+                [slot as u8; 64],
+            )),
             err: None,
             logs: Arc::from([String::from("program log: hello")]),
             matched_filter: None,

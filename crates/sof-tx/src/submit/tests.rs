@@ -12,6 +12,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use sof_types::SignatureBytes;
 use solana_keypair::Keypair;
 use solana_signature::Signature;
 use solana_signer::Signer;
@@ -224,7 +225,10 @@ async fn rpc_only_uses_rpc_transport() {
 
     assert!(result.is_ok());
     if let Ok(result) = result {
-        assert_eq!(result.signature, Some(signature));
+        assert_eq!(
+            result.signature,
+            Some(SignatureBytes::from_solana(signature))
+        );
         assert_eq!(result.rpc_signature, Some("rpc-signature".to_owned()));
         assert_eq!(result.jito_signature, None);
         assert_eq!(result.jito_bundle_id, None);
@@ -260,7 +264,10 @@ async fn builder_allows_signed_rpc_submit_without_blockhash_provider() {
 
     assert!(result.is_ok());
     if let Ok(result) = result {
-        assert_eq!(result.signature, Some(signature));
+        assert_eq!(
+            result.signature,
+            Some(SignatureBytes::from_solana(signature))
+        );
         assert_eq!(result.rpc_signature, Some("rpc-signature".to_owned()));
     }
     assert_eq!(rpc.calls.load(Ordering::Relaxed), 1);
@@ -301,7 +308,10 @@ async fn jito_only_uses_jito_transport() {
 
     assert!(result.is_ok());
     if let Ok(result) = result {
-        assert_eq!(result.signature, Some(signature));
+        assert_eq!(
+            result.signature,
+            Some(SignatureBytes::from_solana(signature))
+        );
         assert_eq!(result.rpc_signature, None);
         assert_eq!(result.jito_signature, Some("jito-signature".to_owned()));
         assert_eq!(result.jito_bundle_id, None);
@@ -342,7 +352,10 @@ async fn jito_only_accepts_bundle_id_from_grpc_transport() {
 
     assert!(result.is_ok());
     if let Ok(result) = result {
-        assert_eq!(result.signature, Some(signature));
+        assert_eq!(
+            result.signature,
+            Some(SignatureBytes::from_solana(signature))
+        );
         assert_eq!(result.rpc_signature, None);
         assert_eq!(result.jito_signature, None);
         assert_eq!(result.jito_bundle_id, Some("bundle-uuid".to_owned()));
@@ -393,14 +406,24 @@ async fn rpc_only_constructor_uses_rpc_for_blockhash_and_submit() {
     let client = TxSubmitClient::rpc_only(format!("http://{addr}"));
     assert!(client.is_ok());
     let mut client = client.unwrap_or_else(|error| panic!("{error}"));
+    let refreshed = client.refresh_latest_blockhash_bytes().await;
+    assert_eq!(refreshed, Ok(Some([31_u8; 32])));
 
     let payer = Keypair::new();
     let recipient = Keypair::new();
     let builder = TxBuilder::new(payer.pubkey()).add_instruction(
         solana_system_interface::instruction::transfer(&payer.pubkey(), &recipient.pubkey(), 1),
     );
+    let tx = builder.build_and_sign([31_u8; 32], &[&payer]);
+    assert!(tx.is_ok());
+    let tx = tx.unwrap_or_else(|error| panic!("{error}"));
+    let tx_bytes = bincode::serialize(&tx);
+    assert!(tx_bytes.is_ok());
     let result = client
-        .submit_unsigned(builder, &[&payer], SubmitMode::RpcOnly)
+        .submit_signed(
+            SignedTx::VersionedTransactionBytes(tx_bytes.unwrap_or_default()),
+            SubmitMode::RpcOnly,
+        )
         .await;
 
     assert!(result.is_ok());
@@ -453,14 +476,24 @@ async fn builder_rpc_defaults_uses_rpc_for_blockhash_and_submit() {
     let built = TxSubmitClient::builder().with_rpc_defaults(format!("http://{addr}"));
     assert!(built.is_ok());
     let mut client = built.unwrap_or_else(|error| panic!("{error}")).build();
+    let refreshed = client.refresh_latest_blockhash_bytes().await;
+    assert_eq!(refreshed, Ok(Some([41_u8; 32])));
 
     let payer = Keypair::new();
     let recipient = Keypair::new();
     let builder = TxBuilder::new(payer.pubkey()).add_instruction(
         solana_system_interface::instruction::transfer(&payer.pubkey(), &recipient.pubkey(), 1),
     );
+    let tx = builder.build_and_sign([41_u8; 32], &[&payer]);
+    assert!(tx.is_ok());
+    let tx = tx.unwrap_or_else(|error| panic!("{error}"));
+    let tx_bytes = bincode::serialize(&tx);
+    assert!(tx_bytes.is_ok());
     let result = client
-        .submit_unsigned(builder, &[&payer], SubmitMode::RpcOnly)
+        .submit_signed(
+            SignedTx::VersionedTransactionBytes(tx_bytes.unwrap_or_default()),
+            SubmitMode::RpcOnly,
+        )
         .await;
 
     assert!(result.is_ok());

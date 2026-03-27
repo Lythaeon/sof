@@ -5420,6 +5420,7 @@ dependencies = [
  "socket2 0.5.10",
  "sof-gossip-tuning",
  "sof-solana-gossip",
+ "sof-types",
  "solana-entry",
  "solana-hash 3.1.0",
  "solana-instruction",
@@ -5451,6 +5452,25 @@ dependencies = [
 [[package]]
 name = "sof-gossip-tuning"
 version = "0.13.0"
+
+[[package]]
+name = "sof-solana-compat"
+version = "0.13.0"
+dependencies = [
+ "async-trait",
+ "bincode",
+ "sof-tx",
+ "sof-types",
+ "solana-compute-budget-interface",
+ "solana-keypair",
+ "solana-message",
+ "solana-packet",
+ "solana-pubkey 3.0.0",
+ "solana-signer",
+ "solana-system-interface 3.0.0",
+ "solana-transaction",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "sof-solana-gossip"
@@ -5533,6 +5553,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sof",
+ "sof-solana-compat",
+ "sof-types",
  "solana-compute-budget-interface",
  "solana-connection-cache",
  "solana-keypair",
@@ -5548,6 +5570,17 @@ dependencies = [
  "tokio",
  "tonic 0.12.3",
  "xdp",
+]
+
+[[package]]
+name = "sof-types"
+version = "0.13.0"
+dependencies = [
+ "bs58",
+ "serde",
+ "solana-pubkey 3.0.0",
+ "solana-signature",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
