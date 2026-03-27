@@ -132,6 +132,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 #[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
@@ -285,20 +286,21 @@ impl ProviderStreamUpdate {
     /// Tags one provider-origin update with the source instance that produced it.
     #[must_use]
     pub fn with_provider_source(mut self, source: ProviderSourceIdentity) -> Self {
+        let source = Arc::new(source);
         match &mut self {
-            Self::Transaction(event) => event.provider_source = Some(source),
-            Self::SerializedTransaction(event) => event.provider_source = Some(source),
-            Self::TransactionLog(event) => event.provider_source = Some(source),
-            Self::TransactionStatus(event) => event.provider_source = Some(source),
+            Self::Transaction(event) => event.provider_source = Some(Arc::clone(&source)),
+            Self::SerializedTransaction(event) => event.provider_source = Some(Arc::clone(&source)),
+            Self::TransactionLog(event) => event.provider_source = Some(Arc::clone(&source)),
+            Self::TransactionStatus(event) => event.provider_source = Some(Arc::clone(&source)),
             Self::TransactionViewBatch(_) => {}
-            Self::AccountUpdate(event) => event.provider_source = Some(source),
-            Self::BlockMeta(event) => event.provider_source = Some(source),
-            Self::RecentBlockhash(event) => event.provider_source = Some(source),
-            Self::SlotStatus(event) => event.provider_source = Some(source),
-            Self::ClusterTopology(event) => event.provider_source = Some(source),
-            Self::LeaderSchedule(event) => event.provider_source = Some(source),
-            Self::Reorg(event) => event.provider_source = Some(source),
-            Self::Health(event) => event.source = source,
+            Self::AccountUpdate(event) => event.provider_source = Some(Arc::clone(&source)),
+            Self::BlockMeta(event) => event.provider_source = Some(Arc::clone(&source)),
+            Self::RecentBlockhash(event) => event.provider_source = Some(Arc::clone(&source)),
+            Self::SlotStatus(event) => event.provider_source = Some(Arc::clone(&source)),
+            Self::ClusterTopology(event) => event.provider_source = Some(Arc::clone(&source)),
+            Self::LeaderSchedule(event) => event.provider_source = Some(Arc::clone(&source)),
+            Self::Reorg(event) => event.provider_source = Some(Arc::clone(&source)),
+            Self::Health(event) => event.source = Arc::unwrap_or_clone(source),
         }
         self
     }
@@ -401,13 +403,13 @@ pub struct ProviderSourceIdentity {
     /// Stable source kind, for example `WebsocketTransaction`.
     pub kind: ProviderSourceId,
     /// Runtime-unique or user-supplied source instance label.
-    pub instance: String,
+    pub instance: Arc<str>,
 }
 
 impl ProviderSourceIdentity {
     /// Creates one provider source identity from a stable kind and instance label.
     #[must_use]
-    pub fn new(kind: ProviderSourceId, instance: impl Into<String>) -> Self {
+    pub fn new(kind: ProviderSourceId, instance: impl Into<Arc<str>>) -> Self {
         Self {
             kind,
             instance: instance.into(),
@@ -416,14 +418,14 @@ impl ProviderSourceIdentity {
 
     /// Returns the source kind label, for example `websocket_transaction`.
     #[must_use]
-    pub const fn kind_str(&self) -> &str {
+    pub fn kind_str(&self) -> &str {
         self.kind.as_str()
     }
 
     /// Returns the source instance label.
     #[must_use]
-    pub const fn instance_str(&self) -> &str {
-        self.instance.as_str()
+    pub fn instance_str(&self) -> &str {
+        self.instance.as_ref()
     }
 
     /// Builds a generated provider-source identity with a unique instance suffix.
@@ -435,8 +437,7 @@ impl ProviderSourceIdentity {
             Some(label) => Self::new(kind, label),
             None => {
                 let instance = NEXT_PROVIDER_SOURCE_INSTANCE.fetch_add(1, Ordering::Relaxed);
-                let kind_label = kind.as_str().to_owned();
-                Self::new(kind, format!("{kind_label}-{instance}"))
+                Self::new(kind.clone(), format!("{}-{instance}", kind.as_str()))
             }
         }
     }
@@ -446,7 +447,7 @@ impl ProviderSourceIdentity {
 #[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum ProviderSourceId {
     /// Generic custom provider source label supplied by the embedding app.
-    Generic(String),
+    Generic(Arc<str>),
     /// Built-in Yellowstone gRPC source.
     YellowstoneGrpc,
     /// Built-in Yellowstone gRPC transaction-status source.
@@ -484,9 +485,9 @@ pub enum ProviderSourceId {
 impl ProviderSourceId {
     /// Returns the stable string label used in logs and error messages.
     #[must_use]
-    pub const fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         match self {
-            Self::Generic(label) => label.as_str(),
+            Self::Generic(label) => label.as_ref(),
             Self::YellowstoneGrpc => "yellowstone_grpc",
             Self::YellowstoneGrpcTransactionStatus => "yellowstone_grpc_transaction_status",
             Self::YellowstoneGrpcAccounts => "yellowstone_grpc_accounts",
@@ -556,6 +557,8 @@ impl ProviderSourceHealthReason {
 pub type ProviderStreamSender = mpsc::Sender<ProviderStreamUpdate>;
 /// Receiver type for processed provider-stream ingress.
 pub type ProviderStreamReceiver = mpsc::Receiver<ProviderStreamUpdate>;
+/// Shared provider source identity carried by provider-origin events.
+pub type ProviderSourceRef = Arc<ProviderSourceIdentity>;
 
 /// Helper for feeding one SOF provider queue from multiple provider sources.
 #[derive(Clone, Debug)]
@@ -586,7 +589,7 @@ pub struct SerializedTransactionEvent {
     /// Transaction signature if present.
     pub signature: Option<SignatureBytes>,
     /// Provider source instance when this transaction came from provider ingress.
-    pub provider_source: Option<ProviderSourceIdentity>,
+    pub provider_source: Option<ProviderSourceRef>,
     /// Serialized transaction bytes.
     pub bytes: Box<[u8]>,
 }

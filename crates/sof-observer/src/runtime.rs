@@ -1830,7 +1830,7 @@ impl ProviderStreamHealth {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum ProviderReplayDedupeKey {
     Transaction {
-        source: Option<ProviderSourceIdentity>,
+        source: Option<crate::provider_stream::ProviderSourceRef>,
         slot: u64,
         signature: Signature,
         commitment_status: u8,
@@ -1838,7 +1838,7 @@ enum ProviderReplayDedupeKey {
         finalized_slot: Option<u64>,
     },
     ControlPlane {
-        source: Option<ProviderSourceIdentity>,
+        source: Option<crate::provider_stream::ProviderSourceRef>,
         slot: u64,
         kind: u8,
         fingerprint: u64,
@@ -3937,11 +3937,11 @@ mod tests {
     #[test]
     fn provider_replay_dedupe_keeps_same_transaction_from_distinct_sources() {
         let source_a = crate::provider_stream::ProviderSourceIdentity::new(
-            crate::provider_stream::ProviderSourceId::Generic("source-a".to_owned()),
+            crate::provider_stream::ProviderSourceId::Generic("source-a".to_owned().into()),
             "ws-tx-1",
         );
         let source_b = crate::provider_stream::ProviderSourceIdentity::new(
-            crate::provider_stream::ProviderSourceId::Generic("source-b".to_owned()),
+            crate::provider_stream::ProviderSourceId::Generic("source-b".to_owned().into()),
             "ws-tx-2",
         );
         let update_a = sample_provider_transaction_update().with_provider_source(source_a);
@@ -4180,7 +4180,9 @@ mod tests {
             tx.send(
                 crate::provider_stream::ProviderSourceHealthEvent {
                     source: crate::provider_stream::ProviderSourceIdentity::new(
-                        crate::provider_stream::ProviderSourceId::Generic(instance.to_owned()),
+                        crate::provider_stream::ProviderSourceId::Generic(
+                            instance.to_owned().into(),
+                        ),
                         instance,
                     ),
                     status: crate::provider_stream::ProviderSourceHealthStatus::Reconnecting,
@@ -4265,7 +4267,9 @@ mod tests {
         tx.send(
             crate::provider_stream::ProviderSourceHealthEvent {
                 source: crate::provider_stream::ProviderSourceIdentity::new(
-                    crate::provider_stream::ProviderSourceId::Generic("generic_source".to_owned()),
+                    crate::provider_stream::ProviderSourceId::Generic(
+                        "generic_source".to_owned().into(),
+                    ),
                     "generic_source",
                 ),
                 status: crate::provider_stream::ProviderSourceHealthStatus::Reconnecting,
