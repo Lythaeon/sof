@@ -109,6 +109,12 @@ pub struct PluginHost {
     pub(super) transaction_plugin_inline_preferences: Arc<[bool]>,
     /// Optional compiled transaction prefilters in registration order.
     pub(super) transaction_plugin_prefilters: Arc<[Option<crate::framework::TransactionPrefilter>]>,
+    /// Cached processed-commitment prefilter availability for serialized transaction fast paths.
+    pub(super) transaction_prefilter_enabled_at_processed: bool,
+    /// Cached confirmed-commitment prefilter availability for serialized transaction fast paths.
+    pub(super) transaction_prefilter_enabled_at_confirmed: bool,
+    /// Cached finalized-commitment prefilter availability for serialized transaction fast paths.
+    pub(super) transaction_prefilter_enabled_at_finalized: bool,
     /// Plugins interested in transaction-batch callbacks.
     pub(super) transaction_batch_plugins: Arc<[Arc<dyn ObserverPlugin>]>,
     /// Per-transaction-batch-plugin commitment selector in registration order.
@@ -163,6 +169,9 @@ impl Default for PluginHost {
             transaction_plugin_prefilters: Arc::from(Vec::<
                 Option<crate::framework::TransactionPrefilter>,
             >::new()),
+            transaction_prefilter_enabled_at_processed: false,
+            transaction_prefilter_enabled_at_confirmed: false,
+            transaction_prefilter_enabled_at_finalized: false,
             transaction_batch_plugins: Arc::from(Vec::<Arc<dyn ObserverPlugin>>::new()),
             transaction_batch_plugin_commitments: Arc::from(Vec::<
                 crate::framework::plugin::TransactionCommitmentSelector,
@@ -235,14 +244,21 @@ impl PluginHost {
 
     /// Returns true when at least one in-scope transaction subscriber exposes a compiled prefilter.
     #[must_use]
-    pub(crate) fn has_transaction_prefilter_at_commitment(
+    pub(crate) const fn has_transaction_prefilter_at_commitment(
         &self,
         commitment_status: crate::event::TxCommitmentStatus,
     ) -> bool {
-        self.transaction_plugin_prefilters
-            .iter()
-            .zip(self.transaction_plugin_commitments.iter().copied())
-            .any(|(prefilter, selector)| prefilter.is_some() && selector.matches(commitment_status))
+        match commitment_status {
+            crate::event::TxCommitmentStatus::Processed => {
+                self.transaction_prefilter_enabled_at_processed
+            }
+            crate::event::TxCommitmentStatus::Confirmed => {
+                self.transaction_prefilter_enabled_at_confirmed
+            }
+            crate::event::TxCommitmentStatus::Finalized => {
+                self.transaction_prefilter_enabled_at_finalized
+            }
+        }
     }
 
     /// Returns true when at least one plugin wants transaction-log callbacks.

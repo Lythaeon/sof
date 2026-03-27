@@ -273,6 +273,24 @@ impl PluginHostBuilder {
                     .map(|(plugin, _subscription)| plugin.transaction_prefilter().cloned())
                     .collect::<Vec<_>>(),
             );
+        let transaction_prefilter_enabled_at_processed = transaction_plugin_prefilters
+            .iter()
+            .zip(transaction_plugin_commitments.iter().copied())
+            .any(|(prefilter, selector)| {
+                prefilter.is_some() && selector.matches(crate::event::TxCommitmentStatus::Processed)
+            });
+        let transaction_prefilter_enabled_at_confirmed = transaction_plugin_prefilters
+            .iter()
+            .zip(transaction_plugin_commitments.iter().copied())
+            .any(|(prefilter, selector)| {
+                prefilter.is_some() && selector.matches(crate::event::TxCommitmentStatus::Confirmed)
+            });
+        let transaction_prefilter_enabled_at_finalized = transaction_plugin_prefilters
+            .iter()
+            .zip(transaction_plugin_commitments.iter().copied())
+            .any(|(prefilter, selector)| {
+                prefilter.is_some() && selector.matches(crate::event::TxCommitmentStatus::Finalized)
+            });
         let transaction_batch_plugin_inline_preferences: Arc<[bool]> = Arc::from(
             plugin_subscriptions
                 .iter()
@@ -430,6 +448,9 @@ impl PluginHostBuilder {
             transaction_status_plugin_commitments,
             transaction_plugin_inline_preferences,
             transaction_plugin_prefilters,
+            transaction_prefilter_enabled_at_processed,
+            transaction_prefilter_enabled_at_confirmed,
+            transaction_prefilter_enabled_at_finalized,
             transaction_batch_plugins,
             transaction_batch_plugin_commitments,
             transaction_batch_plugin_inline_preferences,
