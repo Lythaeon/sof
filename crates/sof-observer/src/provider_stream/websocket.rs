@@ -13,7 +13,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use simd_json::serde::from_slice as simd_from_slice;
-use sof_types::PubkeyBytes;
+use sof_types::{PubkeyBytes, SignatureBytes};
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
@@ -1114,9 +1114,12 @@ fn parse_transaction_notification(
         .map_err(|_error| {
             WebsocketTransactionError::Convert("invalid base64 transaction payload")
         })?;
-    let signature = notification
-        .signature
-        .and_then(|signature| Signature::from_str(&signature).ok());
+    let signature = serialized_transaction_first_signature(tx_bytes).or_else(|| {
+        notification
+            .signature
+            .and_then(|signature| Signature::from_str(&signature).ok())
+            .map(SignatureBytes::from)
+    });
     watermarks
         .observe_transaction_commitment(notification.slot, commitment_status.as_tx_commitment());
     let tx_payload = std::mem::take(tx_bytes).into_boxed_slice();
@@ -1125,7 +1128,7 @@ fn parse_transaction_notification(
         commitment_status: commitment_status.as_tx_commitment(),
         confirmed_slot: watermarks.confirmed_slot,
         finalized_slot: watermarks.finalized_slot,
-        signature: signature_bytes_opt(signature),
+        signature,
         bytes: tx_payload,
     }))
 }
@@ -1229,6 +1232,35 @@ fn observe_non_transaction_commitment(
         TxCommitmentStatus::Confirmed => watermarks.observe_confirmed_slot(slot),
         TxCommitmentStatus::Finalized => watermarks.observe_finalized_slot(slot),
     }
+}
+
+fn serialized_transaction_first_signature(payload: &[u8]) -> Option<SignatureBytes> {
+    let mut offset = 0_usize;
+    let signature_count = decode_short_u16_len(payload, &mut offset)?;
+    if signature_count == 0 {
+        return None;
+    }
+    let end = offset.checked_add(64)?;
+    let bytes: [u8; 64] = payload.get(offset..end)?.try_into().ok()?;
+    Some(SignatureBytes::from(bytes))
+}
+
+fn decode_short_u16_len(payload: &[u8], offset: &mut usize) -> Option<usize> {
+    let mut value = 0_usize;
+    let mut shift = 0_u32;
+    for byte_index in 0..3 {
+        let byte = usize::from(*payload.get(*offset)?);
+        *offset = (*offset).saturating_add(1);
+        value |= (byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+        shift = shift.saturating_add(7);
+        if byte_index == 2 {
+            return None;
+        }
+    }
+    None
 }
 
 fn parse_pubkey(input: &str) -> Result<Pubkey, WebsocketTransactionError> {

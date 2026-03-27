@@ -23,6 +23,7 @@ use laserstream_core_proto::prelude::Transaction as LaserStreamTransaction;
 use laserstream_core_proto::tonic::{
     Status, codec::CompressionEncoding, metadata::MetadataValue, transport::Endpoint,
 };
+use sof_types::{PubkeyBytes, SignatureBytes};
 use solana_hash::Hash;
 use solana_message::{
     Message, MessageHeader, VersionedMessage,
@@ -37,10 +38,7 @@ use tokio::task::JoinHandle;
 
 use crate::{
     event::{ForkSlotStatus, TxCommitmentStatus, TxKind},
-    framework::{
-        AccountUpdateEvent, SlotStatusEvent, TransactionEvent, TransactionStatusEvent,
-        pubkey_bytes, signature_bytes_opt,
-    },
+    framework::{AccountUpdateEvent, SlotStatusEvent, TransactionEvent, TransactionStatusEvent},
     provider_stream::{
         ProviderCommitmentWatermarks, ProviderReplayMode, ProviderSourceHealthEvent,
         ProviderSourceHealthReason, ProviderSourceHealthStatus, ProviderSourceId,
@@ -1375,9 +1373,10 @@ fn transaction_event_from_update(
     let transaction =
         transaction.ok_or(LaserStreamError::Convert("missing transaction payload"))?;
     let is_vote = transaction.is_vote;
-    let signature = Signature::try_from(transaction.signature.as_slice())
-        .map(Some)
-        .map_err(|_error| LaserStreamError::Convert("invalid signature"))?;
+    let signature = Some(signature_bytes_from_slice(
+        transaction.signature.as_slice(),
+        "invalid signature",
+    )?);
     let tx = convert_transaction(
         transaction
             .transaction
@@ -1388,7 +1387,7 @@ fn transaction_event_from_update(
         commitment_status,
         confirmed_slot: watermarks.confirmed_slot,
         finalized_slot: watermarks.finalized_slot,
-        signature: signature_bytes_opt(signature),
+        signature,
         kind: if is_vote {
             TxKind::VoteOnly
         } else {
@@ -1403,14 +1402,16 @@ fn transaction_status_event_from_update(
     watermarks: ProviderCommitmentWatermarks,
     update: grpc::SubscribeUpdateTransactionStatus,
 ) -> Result<TransactionStatusEvent, LaserStreamError> {
-    let signature = Signature::try_from(update.signature.as_slice())
-        .map_err(|_error| LaserStreamError::Convert("invalid transaction-status signature"))?;
+    let signature = signature_bytes_from_slice(
+        update.signature.as_slice(),
+        "invalid transaction-status signature",
+    )?;
     Ok(TransactionStatusEvent {
         slot: update.slot,
         commitment_status,
         confirmed_slot: watermarks.confirmed_slot,
         finalized_slot: watermarks.finalized_slot,
-        signature: signature.into(),
+        signature,
         is_vote: update.is_vote,
         index: Some(update.index),
         err: update.err.map(|error| format!("{error:?}")),
@@ -1425,15 +1426,13 @@ fn account_update_event_from_laserstream(
     let account = update
         .account
         .ok_or(LaserStreamError::Convert("missing account payload"))?;
-    let pubkey = Pubkey::try_from(account.pubkey.as_slice())
-        .map_err(|_error| LaserStreamError::Convert("invalid account pubkey"))?;
-    let owner = Pubkey::try_from(account.owner.as_slice())
-        .map_err(|_error| LaserStreamError::Convert("invalid account owner"))?;
+    let pubkey = pubkey_bytes_from_slice(account.pubkey.as_slice(), "invalid account pubkey")?;
+    let owner = pubkey_bytes_from_slice(account.owner.as_slice(), "invalid account owner")?;
     let txn_signature = match account.txn_signature {
-        Some(signature) => Some(
-            Signature::try_from(signature.as_slice())
-                .map_err(|_error| LaserStreamError::Convert("invalid account txn signature"))?,
-        ),
+        Some(signature) => Some(signature_bytes_from_slice(
+            signature.as_slice(),
+            "invalid account txn signature",
+        )?),
         None => None,
     };
     Ok(AccountUpdateEvent {
@@ -1441,17 +1440,37 @@ fn account_update_event_from_laserstream(
         commitment_status,
         confirmed_slot: watermarks.confirmed_slot,
         finalized_slot: watermarks.finalized_slot,
-        pubkey: pubkey_bytes(pubkey),
-        owner: pubkey_bytes(owner),
+        pubkey,
+        owner,
         lamports: account.lamports,
         executable: account.executable,
         rent_epoch: account.rent_epoch,
         data: account.data.into(),
         write_version: Some(account.write_version),
-        txn_signature: signature_bytes_opt(txn_signature),
+        txn_signature,
         is_startup: update.is_startup,
         matched_filter: None,
     })
+}
+
+fn signature_bytes_from_slice(
+    bytes: &[u8],
+    message: &'static str,
+) -> Result<SignatureBytes, LaserStreamError> {
+    let raw: [u8; 64] = bytes
+        .try_into()
+        .map_err(|_error: std::array::TryFromSliceError| LaserStreamError::Convert(message))?;
+    Ok(SignatureBytes::from(raw))
+}
+
+fn pubkey_bytes_from_slice(
+    bytes: &[u8],
+    message: &'static str,
+) -> Result<PubkeyBytes, LaserStreamError> {
+    let raw: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_error: std::array::TryFromSliceError| LaserStreamError::Convert(message))?;
+    Ok(PubkeyBytes::from(raw))
 }
 
 fn observe_non_transaction_commitment(
