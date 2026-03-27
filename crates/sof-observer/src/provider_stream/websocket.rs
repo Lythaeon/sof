@@ -29,9 +29,9 @@ use crate::{
     framework::{AccountUpdateEvent, TransactionEvent, pubkey_bytes, signature_bytes_opt},
     provider_stream::{
         ProviderCommitmentWatermarks, ProviderSourceHealthEvent, ProviderSourceHealthReason,
-        ProviderSourceHealthStatus, ProviderSourceId, ProviderSourceIdentity, ProviderStreamFanIn,
-        ProviderStreamMode, ProviderStreamSender, ProviderStreamUpdate, SerializedTransactionEvent,
-        classify_provider_transaction_kind,
+        ProviderSourceHealthStatus, ProviderSourceId, ProviderSourceIdentity,
+        ProviderSourceReadiness, ProviderStreamFanIn, ProviderStreamMode, ProviderStreamSender,
+        ProviderStreamUpdate, SerializedTransactionEvent, classify_provider_transaction_kind,
     },
 };
 
@@ -70,6 +70,8 @@ impl WebsocketTransactionCommitment {
 pub struct WebsocketTransactionConfig {
     endpoint: String,
     http_endpoint: Option<String>,
+    source_instance: Option<Arc<str>>,
+    readiness: ProviderSourceReadiness,
     stream: WebsocketPrimaryStream,
     program_filters: Vec<WebsocketProgramFilter>,
     commitment: WebsocketTransactionCommitment,
@@ -163,6 +165,8 @@ impl WebsocketTransactionConfig {
         Self {
             endpoint: endpoint.into(),
             http_endpoint: None,
+            source_instance: None,
+            readiness: ProviderSourceReadiness::Required,
             stream: WebsocketPrimaryStream::Transaction,
             program_filters: Vec::new(),
             commitment: WebsocketTransactionCommitment::Processed,
@@ -193,6 +197,20 @@ impl WebsocketTransactionConfig {
     #[must_use]
     pub fn http_endpoint(&self) -> Option<&str> {
         self.http_endpoint.as_deref()
+    }
+
+    /// Sets one stable source instance label for observability and redundancy intent.
+    #[must_use]
+    pub fn with_source_instance(mut self, instance: impl Into<Arc<str>>) -> Self {
+        self.source_instance = Some(instance.into());
+        self
+    }
+
+    /// Sets whether this source participates in runtime readiness gating.
+    #[must_use]
+    pub const fn with_readiness(mut self, readiness: ProviderSourceReadiness) -> Self {
+        self.readiness = readiness;
+        self
     }
 
     /// Selects the websocket subscription family this config should use.
@@ -493,6 +511,14 @@ impl WebsocketTransactionConfig {
         }
     }
 
+    fn source_instance(&self) -> Option<&str> {
+        self.source_instance.as_deref()
+    }
+
+    const fn readiness(&self) -> ProviderSourceReadiness {
+        self.readiness
+    }
+
     const fn stream_kind(&self) -> WebsocketStreamKind {
         match self.stream {
             WebsocketPrimaryStream::Transaction => WebsocketStreamKind::Transaction,
@@ -558,6 +584,8 @@ pub enum WebsocketLogsFilter {
 #[derive(Clone, Debug)]
 pub struct WebsocketLogsConfig {
     endpoint: String,
+    source_instance: Option<Arc<str>>,
+    readiness: ProviderSourceReadiness,
     commitment: WebsocketTransactionCommitment,
     filter: WebsocketLogsFilter,
     ping_interval: Option<Duration>,
@@ -572,6 +600,8 @@ impl WebsocketLogsConfig {
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
+            source_instance: None,
+            readiness: ProviderSourceReadiness::Optional,
             commitment: WebsocketTransactionCommitment::Processed,
             filter: WebsocketLogsFilter::All,
             ping_interval: Some(Duration::from_secs(60)),
@@ -585,6 +615,20 @@ impl WebsocketLogsConfig {
     #[must_use]
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    /// Sets one stable source instance label for observability and redundancy intent.
+    #[must_use]
+    pub fn with_source_instance(mut self, instance: impl Into<Arc<str>>) -> Self {
+        self.source_instance = Some(instance.into());
+        self
+    }
+
+    /// Sets whether this source participates in runtime readiness gating.
+    #[must_use]
+    pub const fn with_readiness(mut self, readiness: ProviderSourceReadiness) -> Self {
+        self.readiness = readiness;
+        self
     }
 
     /// Sets the commitment level.
@@ -652,6 +696,14 @@ impl WebsocketLogsConfig {
     #[must_use]
     pub const fn runtime_mode(&self) -> ProviderStreamMode {
         ProviderStreamMode::WebsocketLogs
+    }
+
+    fn source_instance(&self) -> Option<&str> {
+        self.source_instance.as_deref()
+    }
+
+    const fn readiness(&self) -> ProviderSourceReadiness {
+        self.readiness
     }
 }
 
@@ -814,7 +866,7 @@ pub async fn spawn_websocket_transaction_source(
 ) -> Result<JoinHandle<Result<(), WebsocketTransactionError>>, WebsocketTransactionError> {
     config.validate()?;
     let config = config.clone();
-    let source = ProviderSourceIdentity::generated(config.source_id(), None);
+    let source = ProviderSourceIdentity::generated(config.source_id(), config.source_instance());
     let first_session = establish_websocket_primary_session(&config).await?;
     Ok(tokio::spawn(async move {
         let mut attempts = 0_u32;
@@ -848,6 +900,7 @@ pub async fn spawn_websocket_transaction_source(
                         );
                         send_primary_provider_health(
                             &source,
+                            config.readiness(),
                             &sender,
                             ProviderSourceHealthStatus::Reconnecting,
                             ProviderSourceHealthReason::UpstreamStreamClosedUnexpectedly,
@@ -862,6 +915,7 @@ pub async fn spawn_websocket_transaction_source(
                         tracing::warn!(%error, endpoint = config.endpoint(), "provider stream websocket session ended; reconnecting");
                         send_primary_provider_health(
                             &source,
+                            config.readiness(),
                             &sender,
                             ProviderSourceHealthStatus::Reconnecting,
                             websocket_health_reason(&error),
@@ -874,6 +928,7 @@ pub async fn spawn_websocket_transaction_source(
                     tracing::warn!(%error, endpoint = config.endpoint(), "provider stream websocket connect/subscribe failed; reconnecting");
                     send_primary_provider_health(
                         &source,
+                        config.readiness(),
                         &sender,
                         ProviderSourceHealthStatus::Reconnecting,
                         websocket_health_reason(&error),
@@ -894,6 +949,7 @@ pub async fn spawn_websocket_transaction_source(
                     format!("exhausted websocket reconnect attempts after {attempts} failures");
                 send_primary_provider_health(
                     &source,
+                    config.readiness(),
                     &sender,
                     ProviderSourceHealthStatus::Unhealthy,
                     ProviderSourceHealthReason::ReconnectBudgetExhausted,
@@ -917,7 +973,10 @@ pub async fn spawn_websocket_logs_source(
     sender: ProviderStreamSender,
 ) -> Result<JoinHandle<Result<(), WebsocketLogsError>>, WebsocketLogsError> {
     let config = config.clone();
-    let source = ProviderSourceIdentity::generated(ProviderSourceId::WebsocketLogs, None);
+    let source = ProviderSourceIdentity::generated(
+        ProviderSourceId::WebsocketLogs,
+        config.source_instance(),
+    );
     let first_session = establish_websocket_logs_session(&config).await?;
     Ok(tokio::spawn(async move {
         let mut attempts = 0_u32;
@@ -948,6 +1007,7 @@ pub async fn spawn_websocket_logs_source(
                             );
                             send_provider_logs_health(
                                 &source,
+                                config.readiness(),
                                 &sender,
                                 ProviderSourceHealthStatus::Reconnecting,
                                 ProviderSourceHealthReason::UpstreamStreamClosedUnexpectedly,
@@ -966,6 +1026,7 @@ pub async fn spawn_websocket_logs_source(
                             );
                             send_provider_logs_health(
                                 &source,
+                                config.readiness(),
                                 &sender,
                                 ProviderSourceHealthStatus::Reconnecting,
                                 websocket_logs_health_reason(&error),
@@ -983,6 +1044,7 @@ pub async fn spawn_websocket_logs_source(
                     );
                     send_provider_logs_health(
                         &source,
+                        config.readiness(),
                         &sender,
                         ProviderSourceHealthStatus::Reconnecting,
                         websocket_logs_health_reason(&error),
@@ -1004,6 +1066,7 @@ pub async fn spawn_websocket_logs_source(
                 );
                 send_provider_logs_health(
                     &source,
+                    config.readiness(),
                     &sender,
                     ProviderSourceHealthStatus::Unhealthy,
                     ProviderSourceHealthReason::ReconnectBudgetExhausted,
@@ -1031,6 +1094,7 @@ async fn run_websocket_primary_connection(
     *session_established = true;
     send_primary_provider_health(
         source,
+        config.readiness(),
         sender,
         ProviderSourceHealthStatus::Healthy,
         ProviderSourceHealthReason::SubscriptionAckReceived,
@@ -1126,6 +1190,7 @@ async fn run_websocket_primary_connection(
 
 async fn send_primary_provider_health(
     source: &ProviderSourceIdentity,
+    readiness: ProviderSourceReadiness,
     sender: &ProviderStreamSender,
     status: ProviderSourceHealthStatus,
     reason: ProviderSourceHealthReason,
@@ -1134,6 +1199,7 @@ async fn send_primary_provider_health(
     sender
         .send(ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
             source: source.clone(),
+            readiness,
             status,
             reason,
             message,
@@ -1144,6 +1210,7 @@ async fn send_primary_provider_health(
 
 async fn send_provider_logs_health(
     source: &ProviderSourceIdentity,
+    readiness: ProviderSourceReadiness,
     sender: &ProviderStreamSender,
     status: ProviderSourceHealthStatus,
     reason: ProviderSourceHealthReason,
@@ -1152,6 +1219,7 @@ async fn send_provider_logs_health(
     sender
         .send(ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
             source: source.clone(),
+            readiness,
             status,
             reason,
             message,
@@ -1509,6 +1577,7 @@ async fn run_websocket_logs_connection(
     *session_established = true;
     send_provider_logs_health(
         source,
+        config.readiness(),
         sender,
         ProviderSourceHealthStatus::Healthy,
         ProviderSourceHealthReason::SubscriptionAckReceived,
@@ -2767,6 +2836,7 @@ mod tests {
         let (tx, mut rx) = create_provider_stream_queue(8);
         let config = WebsocketTransactionConfig::new(format!("ws://{addr}"))
             .with_stream(WebsocketPrimaryStream::Account(pubkey))
+            .with_source_instance("websocket-account-primary")
             .with_ping_interval(Duration::from_millis(250))
             .with_reconnect_delay(Duration::from_millis(10))
             .with_max_reconnect_attempts(1);
@@ -2789,6 +2859,14 @@ mod tests {
         assert_eq!(event.pubkey, pubkey.into());
         assert_eq!(event.owner, owner.into());
         assert_eq!(event.data.as_ref(), &[1, 2, 3, 4]);
+        assert_eq!(
+            event
+                .provider_source
+                .as_deref()
+                .expect("provider source")
+                .instance_str(),
+            "websocket-account-primary"
+        );
 
         handle.abort();
         handle.await.ok();

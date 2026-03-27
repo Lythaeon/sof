@@ -46,8 +46,8 @@ use crate::{
     provider_stream::{
         ProviderCommitmentWatermarks, ProviderReplayMode, ProviderSourceHealthEvent,
         ProviderSourceHealthReason, ProviderSourceHealthStatus, ProviderSourceId,
-        ProviderSourceIdentity, ProviderStreamFanIn, ProviderStreamMode, ProviderStreamSender,
-        ProviderStreamUpdate, classify_provider_transaction_kind,
+        ProviderSourceIdentity, ProviderSourceReadiness, ProviderStreamFanIn, ProviderStreamMode,
+        ProviderStreamSender, ProviderStreamUpdate, classify_provider_transaction_kind,
     },
 };
 
@@ -90,6 +90,8 @@ impl LaserStreamCommitment {
 pub struct LaserStreamConfig {
     endpoint: String,
     api_key: String,
+    source_instance: Option<Arc<str>>,
+    readiness: ProviderSourceReadiness,
     stream: LaserStreamStream,
     commitment: LaserStreamCommitment,
     vote: Option<bool>,
@@ -185,6 +187,8 @@ impl LaserStreamConfig {
         Self {
             endpoint: endpoint.into(),
             api_key: api_key.into(),
+            source_instance: None,
+            readiness: ProviderSourceReadiness::Required,
             stream: LaserStreamStream::Transaction,
             commitment: LaserStreamCommitment::Processed,
             vote: None,
@@ -211,6 +215,20 @@ impl LaserStreamConfig {
     #[must_use]
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    /// Sets one stable source instance label for observability and redundancy intent.
+    #[must_use]
+    pub fn with_source_instance(mut self, instance: impl Into<Arc<str>>) -> Self {
+        self.source_instance = Some(instance.into());
+        self
+    }
+
+    /// Sets whether this source participates in runtime readiness gating.
+    #[must_use]
+    pub const fn with_readiness(mut self, readiness: ProviderSourceReadiness) -> Self {
+        self.readiness = readiness;
+        self
     }
 
     /// Selects the LaserStream stream family this config should subscribe to.
@@ -545,6 +563,14 @@ impl LaserStreamConfig {
         }
     }
 
+    fn source_instance(&self) -> Option<&str> {
+        self.source_instance.as_deref()
+    }
+
+    const fn readiness(&self) -> ProviderSourceReadiness {
+        self.readiness
+    }
+
     /// Returns the runtime mode matching this built-in LaserStream stream selection.
     #[must_use]
     pub const fn runtime_mode(&self) -> ProviderStreamMode {
@@ -587,6 +613,8 @@ pub enum LaserStreamStream {
 pub struct LaserStreamSlotsConfig {
     endpoint: String,
     api_key: String,
+    source_instance: Option<Arc<str>>,
+    readiness: ProviderSourceReadiness,
     commitment: LaserStreamCommitment,
     connect_timeout: Option<Duration>,
     timeout: Option<Duration>,
@@ -605,6 +633,8 @@ impl LaserStreamSlotsConfig {
         Self {
             endpoint: endpoint.into(),
             api_key: api_key.into(),
+            source_instance: None,
+            readiness: ProviderSourceReadiness::Optional,
             commitment: LaserStreamCommitment::Processed,
             connect_timeout: Some(Duration::from_secs(10)),
             timeout: Some(Duration::from_secs(30)),
@@ -623,10 +653,32 @@ impl LaserStreamSlotsConfig {
         &self.endpoint
     }
 
+    /// Sets one stable source instance label for observability and redundancy intent.
+    #[must_use]
+    pub fn with_source_instance(mut self, instance: impl Into<Arc<str>>) -> Self {
+        self.source_instance = Some(instance.into());
+        self
+    }
+
+    /// Sets whether this source participates in runtime readiness gating.
+    #[must_use]
+    pub const fn with_readiness(mut self, readiness: ProviderSourceReadiness) -> Self {
+        self.readiness = readiness;
+        self
+    }
+
     /// Returns the runtime mode matching this built-in LaserStream slot stream.
     #[must_use]
     pub const fn runtime_mode(&self) -> ProviderStreamMode {
         ProviderStreamMode::LaserStreamSlots
+    }
+
+    fn source_instance(&self) -> Option<&str> {
+        self.source_instance.as_deref()
+    }
+
+    const fn readiness(&self) -> ProviderSourceReadiness {
+        self.readiness
     }
 
     /// Sets the LaserStream commitment.
@@ -895,7 +947,7 @@ pub async fn spawn_laserstream_transaction_source(
     sender: ProviderStreamSender,
 ) -> Result<JoinHandle<Result<(), LaserStreamError>>, LaserStreamError> {
     config.validate()?;
-    let source = ProviderSourceIdentity::generated(config.source_id(), None);
+    let source = ProviderSourceIdentity::generated(config.source_id(), config.source_instance());
     let first_session =
         connect_and_subscribe_once(&config, config.subscribe_request_with_state(0)).await?;
     Ok(tokio::spawn(async move {
@@ -942,6 +994,7 @@ pub async fn spawn_laserstream_transaction_source(
                         );
                         send_primary_provider_health(
                             &source,
+                            config.readiness(),
                             &sender,
                             ProviderSourceHealthStatus::Reconnecting,
                             ProviderSourceHealthReason::UpstreamStreamClosedUnexpectedly,
@@ -960,6 +1013,7 @@ pub async fn spawn_laserstream_transaction_source(
                         );
                         send_primary_provider_health(
                             &source,
+                            config.readiness(),
                             &sender,
                             ProviderSourceHealthStatus::Reconnecting,
                             laserstream_health_reason(&error),
@@ -976,6 +1030,7 @@ pub async fn spawn_laserstream_transaction_source(
                     );
                     send_primary_provider_health(
                         &source,
+                        config.readiness(),
                         &sender,
                         ProviderSourceHealthStatus::Reconnecting,
                         laserstream_health_reason(&error),
@@ -996,6 +1051,7 @@ pub async fn spawn_laserstream_transaction_source(
                     format!("exhausted laserstream reconnect attempts after {attempts} failures");
                 send_primary_provider_health(
                     &source,
+                    config.readiness(),
                     &sender,
                     ProviderSourceHealthStatus::Unhealthy,
                     ProviderSourceHealthReason::ReconnectBudgetExhausted,
@@ -1018,7 +1074,10 @@ pub async fn spawn_laserstream_slot_source(
     config: LaserStreamSlotsConfig,
     sender: ProviderStreamSender,
 ) -> Result<JoinHandle<Result<(), LaserStreamError>>, LaserStreamError> {
-    let source = ProviderSourceIdentity::generated(ProviderSourceId::LaserStreamSlots, None);
+    let source = ProviderSourceIdentity::generated(
+        ProviderSourceId::LaserStreamSlots,
+        config.source_instance(),
+    );
     let first_session =
         connect_and_subscribe_slots_once(&config, config.subscribe_request_with_state(0)).await?;
     Ok(tokio::spawn(async move {
@@ -1064,6 +1123,7 @@ pub async fn spawn_laserstream_slot_source(
                         );
                         send_provider_slot_health(
                             &source,
+                            config.readiness(),
                             &sender,
                             ProviderSourceHealthStatus::Reconnecting,
                             ProviderSourceHealthReason::UpstreamStreamClosedUnexpectedly,
@@ -1082,6 +1142,7 @@ pub async fn spawn_laserstream_slot_source(
                         );
                         send_provider_slot_health(
                             &source,
+                            config.readiness(),
                             &sender,
                             ProviderSourceHealthStatus::Reconnecting,
                             laserstream_health_reason(&error),
@@ -1098,6 +1159,7 @@ pub async fn spawn_laserstream_slot_source(
                     );
                     send_provider_slot_health(
                         &source,
+                        config.readiness(),
                         &sender,
                         ProviderSourceHealthStatus::Reconnecting,
                         laserstream_health_reason(&error),
@@ -1119,6 +1181,7 @@ pub async fn spawn_laserstream_slot_source(
                 );
                 send_provider_slot_health(
                     &source,
+                    config.readiness(),
                     &sender,
                     ProviderSourceHealthStatus::Unhealthy,
                     ProviderSourceHealthReason::ReconnectBudgetExhausted,
@@ -1145,6 +1208,7 @@ async fn run_laserstream_primary_connection(
     *state.session_established = true;
     send_primary_provider_health(
         source,
+        config.readiness(),
         sender,
         ProviderSourceHealthStatus::Healthy,
         ProviderSourceHealthReason::SubscriptionAckReceived,
@@ -1297,6 +1361,7 @@ async fn run_laserstream_slot_connection(
     *state.session_established = true;
     send_provider_slot_health(
         source,
+        config.readiness(),
         sender,
         ProviderSourceHealthStatus::Healthy,
         ProviderSourceHealthReason::SubscriptionAckReceived,
@@ -1348,6 +1413,7 @@ async fn run_laserstream_slot_connection(
 
 async fn send_primary_provider_health(
     source: &ProviderSourceIdentity,
+    readiness: ProviderSourceReadiness,
     sender: &ProviderStreamSender,
     status: ProviderSourceHealthStatus,
     reason: ProviderSourceHealthReason,
@@ -1356,6 +1422,7 @@ async fn send_primary_provider_health(
     sender
         .send(ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
             source: source.clone(),
+            readiness,
             status,
             reason,
             message,
@@ -1366,6 +1433,7 @@ async fn send_primary_provider_health(
 
 async fn send_provider_slot_health(
     source: &ProviderSourceIdentity,
+    readiness: ProviderSourceReadiness,
     sender: &ProviderStreamSender,
     status: ProviderSourceHealthStatus,
     reason: ProviderSourceHealthReason,
@@ -1374,6 +1442,7 @@ async fn send_provider_slot_health(
     sender
         .send(ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
             source: source.clone(),
+            readiness,
             status,
             reason,
             message,
@@ -2099,6 +2168,7 @@ mod tests {
         let (tx, mut rx) = create_provider_stream_queue(8);
         let config = LaserStreamConfig::new(format!("http://{addr}"), "token")
             .with_stream(LaserStreamStream::Transaction)
+            .with_source_instance("laserstream-primary")
             .with_max_reconnect_attempts(1)
             .with_reconnect_delay(Duration::from_millis(10))
             .with_connect_timeout(Duration::from_secs(2));
@@ -2120,6 +2190,14 @@ mod tests {
         assert_eq!(event.slot, 91);
         assert_eq!(event.kind, TxKind::Mixed);
         assert!(event.signature.is_some());
+        assert_eq!(
+            event
+                .provider_source
+                .as_deref()
+                .expect("provider source")
+                .instance_str(),
+            "laserstream-primary"
+        );
 
         handle.abort();
         handle.await.ok();

@@ -62,6 +62,11 @@
 //! existing provider config objects and emit the matching `ProviderStreamUpdate`
 //! variants into the same runtime dispatch path.
 //!
+//! Built-in configs may also set:
+//!
+//! - a stable source instance label for observability via `with_source_instance(...)`
+//! - whether one source is readiness-gating or optional via `with_readiness(...)`
+//!
 //! Variant-to-runtime mapping:
 //!
 //! - `Transaction`:
@@ -422,6 +427,8 @@ impl From<ProviderSourceHealthEvent> for ProviderStreamUpdate {
 pub struct ProviderSourceHealthEvent {
     /// Stable source instance identifier, for example one websocket program feed.
     pub source: ProviderSourceIdentity,
+    /// Whether this source participates in readiness gating.
+    pub readiness: ProviderSourceReadiness,
     /// Current health state for this source.
     pub status: ProviderSourceHealthStatus,
     /// Typed reason for the transition.
@@ -552,6 +559,26 @@ pub enum ProviderSourceHealthStatus {
     Reconnecting,
     /// Source exhausted recovery and is no longer healthy.
     Unhealthy,
+}
+
+/// Readiness class for one provider source observed by SOF.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub enum ProviderSourceReadiness {
+    /// This source is required for the runtime to report ready.
+    Required,
+    /// This source is advisory or redundant and does not gate readiness.
+    Optional,
+}
+
+impl ProviderSourceReadiness {
+    /// Returns the stable string label used in metrics and logs.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::Optional => "optional",
+        }
+    }
 }
 
 /// Typed reason for one provider source health transition.

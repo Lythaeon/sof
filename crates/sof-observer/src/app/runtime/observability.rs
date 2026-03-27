@@ -21,7 +21,7 @@ use crate::{
     },
     provider_stream::{
         ProviderSourceHealthEvent, ProviderSourceHealthStatus, ProviderSourceId,
-        ProviderSourceIdentity,
+        ProviderSourceIdentity, ProviderSourceReadiness,
     },
     runtime_metrics,
 };
@@ -65,14 +65,27 @@ impl RuntimeObservabilityHandle {
             return;
         };
         sources.insert(event.source.clone(), event.clone());
-        let mut health_by_kind = HashMap::<ProviderSourceId, bool>::new();
+        let mut required_health_by_kind = HashMap::<ProviderSourceId, bool>::new();
+        let mut optional_healthy = false;
         for source in sources.values() {
-            let has_healthy = health_by_kind
-                .entry(source.source.kind.clone())
-                .or_insert(false);
-            *has_healthy |= matches!(source.status, ProviderSourceHealthStatus::Healthy);
+            let is_healthy = matches!(source.status, ProviderSourceHealthStatus::Healthy);
+            match source.readiness {
+                ProviderSourceReadiness::Required => {
+                    let has_healthy = required_health_by_kind
+                        .entry(source.source.kind.clone())
+                        .or_insert(false);
+                    *has_healthy |= is_healthy;
+                }
+                ProviderSourceReadiness::Optional => {
+                    optional_healthy |= is_healthy;
+                }
+            }
         }
-        let ready = !health_by_kind.is_empty() && health_by_kind.values().all(|healthy| *healthy);
+        let ready = if required_health_by_kind.is_empty() {
+            optional_healthy
+        } else {
+            required_health_by_kind.values().all(|healthy| *healthy)
+        };
         self.inner.ready.store(ready, Ordering::Relaxed);
     }
 
@@ -106,6 +119,7 @@ impl RuntimeObservabilityHandle {
             (
                 event.source.kind_str().to_owned(),
                 event.source.instance_str().to_owned(),
+                event.readiness.as_str().to_owned(),
                 event.reason.as_str().to_owned(),
             )
         });
@@ -351,6 +365,7 @@ fn render_metrics(
         let labels = [
             ("source_kind", event.source.kind_str()),
             ("source_instance", event.source.instance_str()),
+            ("readiness", event.readiness.as_str()),
             (
                 "status",
                 match event.status {
@@ -2751,6 +2766,7 @@ mod tests {
                 crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
                 "yellowstone_grpc-1",
             ),
+            readiness: ProviderSourceReadiness::Required,
             status: ProviderSourceHealthStatus::Reconnecting,
             reason: crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
             message: "upstream stalled".to_owned(),
@@ -2766,7 +2782,7 @@ mod tests {
         assert!(metrics.contains("sof_provider_sources_reconnecting 1"));
         assert!(metrics.contains("sof_provider_sources_unhealthy 0"));
         assert!(metrics.contains(
-            "sof_provider_source_status{source_kind=\"yellowstone_grpc\",source_instance=\"yellowstone_grpc-1\",status=\"reconnecting\",reason=\"upstream_protocol_failure\"} 1"
+            "sof_provider_source_status{source_kind=\"yellowstone_grpc\",source_instance=\"yellowstone_grpc-1\",readiness=\"required\",status=\"reconnecting\",reason=\"upstream_protocol_failure\"} 1"
         ));
     }
 
@@ -2780,6 +2796,7 @@ mod tests {
                 crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
                 shared_instance,
             ),
+            readiness: ProviderSourceReadiness::Required,
             status: ProviderSourceHealthStatus::Reconnecting,
             reason: crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
             message: "yellowstone stalled".to_owned(),
@@ -2789,6 +2806,7 @@ mod tests {
                 crate::provider_stream::ProviderSourceId::LaserStream,
                 shared_instance,
             ),
+            readiness: ProviderSourceReadiness::Required,
             status: ProviderSourceHealthStatus::Unhealthy,
             reason:
                 crate::provider_stream::ProviderSourceHealthReason::UpstreamStreamClosedUnexpectedly,
@@ -2805,10 +2823,10 @@ mod tests {
         assert!(metrics.contains("sof_provider_sources_reconnecting 1"));
         assert!(metrics.contains("sof_provider_sources_unhealthy 1"));
         assert!(metrics.contains(
-            "sof_provider_source_status{source_kind=\"yellowstone_grpc\",source_instance=\"shared-source\",status=\"reconnecting\",reason=\"upstream_protocol_failure\"} 1"
+            "sof_provider_source_status{source_kind=\"yellowstone_grpc\",source_instance=\"shared-source\",readiness=\"required\",status=\"reconnecting\",reason=\"upstream_protocol_failure\"} 1"
         ));
         assert!(metrics.contains(
-            "sof_provider_source_status{source_kind=\"laserstream\",source_instance=\"shared-source\",status=\"unhealthy\",reason=\"upstream_stream_closed_unexpectedly\"} 1"
+            "sof_provider_source_status{source_kind=\"laserstream\",source_instance=\"shared-source\",readiness=\"required\",status=\"unhealthy\",reason=\"upstream_stream_closed_unexpectedly\"} 1"
         ));
     }
 
@@ -2821,6 +2839,7 @@ mod tests {
                 crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
                 "yellowstone-a",
             ),
+            readiness: ProviderSourceReadiness::Required,
             status: ProviderSourceHealthStatus::Reconnecting,
             reason: crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
             message: "yellowstone reconnecting".to_owned(),
@@ -2830,6 +2849,7 @@ mod tests {
                 crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
                 "yellowstone-b",
             ),
+            readiness: ProviderSourceReadiness::Required,
             status: ProviderSourceHealthStatus::Healthy,
             reason: crate::provider_stream::ProviderSourceHealthReason::SubscriptionAckReceived,
             message: "yellowstone healthy".to_owned(),
@@ -2844,6 +2864,44 @@ mod tests {
 
         assert!(metrics.contains("sof_runtime_ready 1"));
         assert!(metrics.contains("sof_provider_sources_reconnecting 1"));
+    }
+
+    #[test]
+    fn readiness_ignores_optional_source_kinds_when_required_sources_are_healthy() {
+        let handle = RuntimeObservabilityHandle::default();
+        handle.mark_live();
+        handle.observe_provider_source_health(&ProviderSourceHealthEvent {
+            source: crate::provider_stream::ProviderSourceIdentity::new(
+                crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
+                "yellowstone-primary",
+            ),
+            readiness: ProviderSourceReadiness::Required,
+            status: ProviderSourceHealthStatus::Healthy,
+            reason: crate::provider_stream::ProviderSourceHealthReason::SubscriptionAckReceived,
+            message: "yellowstone healthy".to_owned(),
+        });
+        handle.observe_provider_source_health(&ProviderSourceHealthEvent {
+            source: crate::provider_stream::ProviderSourceIdentity::new(
+                crate::provider_stream::ProviderSourceId::YellowstoneGrpcSlots,
+                "yellowstone-slots",
+            ),
+            readiness: ProviderSourceReadiness::Optional,
+            status: ProviderSourceHealthStatus::Reconnecting,
+            reason: crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
+            message: "slots reconnecting".to_owned(),
+        });
+
+        let metrics = render_metrics(
+            &handle,
+            &PluginHost::builder().build(),
+            &RuntimeExtensionHost::builder().build(),
+            &DerivedStateHost::builder().build(),
+        );
+
+        assert!(metrics.contains("sof_runtime_ready 1"));
+        assert!(metrics.contains(
+            "sof_provider_source_status{source_kind=\"yellowstone_grpc_slots\",source_instance=\"yellowstone-slots\",readiness=\"optional\",status=\"reconnecting\",reason=\"upstream_protocol_failure\"} 1"
+        ));
     }
 
     #[test]

@@ -37,8 +37,8 @@ use crate::{
     provider_stream::{
         ProviderCommitmentWatermarks, ProviderReplayMode, ProviderSourceHealthEvent,
         ProviderSourceHealthReason, ProviderSourceHealthStatus, ProviderSourceId,
-        ProviderSourceIdentity, ProviderStreamFanIn, ProviderStreamMode, ProviderStreamSender,
-        ProviderStreamUpdate, classify_provider_transaction_kind,
+        ProviderSourceIdentity, ProviderSourceReadiness, ProviderStreamFanIn, ProviderStreamMode,
+        ProviderStreamSender, ProviderStreamUpdate, classify_provider_transaction_kind,
     },
 };
 
@@ -79,6 +79,8 @@ impl YellowstoneGrpcCommitment {
 pub struct YellowstoneGrpcConfig {
     endpoint: String,
     x_token: Option<String>,
+    source_instance: Option<std::sync::Arc<str>>,
+    readiness: ProviderSourceReadiness,
     stream: YellowstoneGrpcStream,
     commitment: YellowstoneGrpcCommitment,
     vote: Option<bool>,
@@ -170,6 +172,8 @@ impl YellowstoneGrpcConfig {
         Self {
             endpoint: endpoint.into(),
             x_token: None,
+            source_instance: None,
+            readiness: ProviderSourceReadiness::Required,
             stream: YellowstoneGrpcStream::Transaction,
             commitment: YellowstoneGrpcCommitment::Processed,
             vote: None,
@@ -195,6 +199,20 @@ impl YellowstoneGrpcConfig {
     #[must_use]
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    /// Sets one stable source instance label for observability and redundancy intent.
+    #[must_use]
+    pub fn with_source_instance(mut self, instance: impl Into<std::sync::Arc<str>>) -> Self {
+        self.source_instance = Some(instance.into());
+        self
+    }
+
+    /// Sets whether this source participates in runtime readiness gating.
+    #[must_use]
+    pub const fn with_readiness(mut self, readiness: ProviderSourceReadiness) -> Self {
+        self.readiness = readiness;
+        self
     }
 
     /// Selects the Yellowstone stream family this config should subscribe to.
@@ -518,6 +536,14 @@ impl YellowstoneGrpcConfig {
         }
     }
 
+    fn source_instance(&self) -> Option<&str> {
+        self.source_instance.as_deref()
+    }
+
+    const fn readiness(&self) -> ProviderSourceReadiness {
+        self.readiness
+    }
+
     /// Returns the runtime mode matching this built-in Yellowstone stream selection.
     #[must_use]
     pub const fn runtime_mode(&self) -> ProviderStreamMode {
@@ -562,6 +588,8 @@ pub enum YellowstoneGrpcStream {
 pub struct YellowstoneGrpcSlotsConfig {
     endpoint: String,
     x_token: Option<String>,
+    source_instance: Option<std::sync::Arc<str>>,
+    readiness: ProviderSourceReadiness,
     commitment: YellowstoneGrpcCommitment,
     connect_timeout: Option<Duration>,
     stall_timeout: Option<Duration>,
@@ -578,6 +606,8 @@ impl YellowstoneGrpcSlotsConfig {
         Self {
             endpoint: endpoint.into(),
             x_token: None,
+            source_instance: None,
+            readiness: ProviderSourceReadiness::Optional,
             commitment: YellowstoneGrpcCommitment::Processed,
             connect_timeout: Some(Duration::from_secs(10)),
             stall_timeout: Some(Duration::from_secs(30)),
@@ -594,10 +624,32 @@ impl YellowstoneGrpcSlotsConfig {
         &self.endpoint
     }
 
+    /// Sets one stable source instance label for observability and redundancy intent.
+    #[must_use]
+    pub fn with_source_instance(mut self, instance: impl Into<std::sync::Arc<str>>) -> Self {
+        self.source_instance = Some(instance.into());
+        self
+    }
+
+    /// Sets whether this source participates in runtime readiness gating.
+    #[must_use]
+    pub const fn with_readiness(mut self, readiness: ProviderSourceReadiness) -> Self {
+        self.readiness = readiness;
+        self
+    }
+
     /// Returns the runtime mode matching this built-in Yellowstone slot stream.
     #[must_use]
     pub const fn runtime_mode(&self) -> ProviderStreamMode {
         ProviderStreamMode::YellowstoneGrpcSlots
+    }
+
+    fn source_instance(&self) -> Option<&str> {
+        self.source_instance.as_deref()
+    }
+
+    const fn readiness(&self) -> ProviderSourceReadiness {
+        self.readiness
     }
 
     /// Sets the provider x-token.
@@ -833,7 +885,7 @@ pub async fn spawn_yellowstone_grpc_transaction_source(
     sender: ProviderStreamSender,
 ) -> Result<JoinHandle<Result<(), YellowstoneGrpcError>>, YellowstoneGrpcError> {
     config.validate()?;
-    let source = ProviderSourceIdentity::generated(config.source_id(), None);
+    let source = ProviderSourceIdentity::generated(config.source_id(), config.source_instance());
     let first_session = establish_yellowstone_session(&config, 0).await?;
     Ok(tokio::spawn(async move {
         let mut attempts = 0_u32;
@@ -873,6 +925,7 @@ pub async fn spawn_yellowstone_grpc_transaction_source(
                         );
                         send_primary_provider_health(
                             &source,
+                            config.readiness(),
                             &sender,
                             ProviderSourceHealthStatus::Reconnecting,
                             ProviderSourceHealthReason::UpstreamStreamClosedUnexpectedly,
@@ -891,6 +944,7 @@ pub async fn spawn_yellowstone_grpc_transaction_source(
                         );
                         send_primary_provider_health(
                             &source,
+                            config.readiness(),
                             &sender,
                             ProviderSourceHealthStatus::Reconnecting,
                             yellowstone_health_reason(&error),
@@ -907,6 +961,7 @@ pub async fn spawn_yellowstone_grpc_transaction_source(
                     );
                     send_primary_provider_health(
                         &source,
+                        config.readiness(),
                         &sender,
                         ProviderSourceHealthStatus::Reconnecting,
                         yellowstone_health_reason(&error),
@@ -927,6 +982,7 @@ pub async fn spawn_yellowstone_grpc_transaction_source(
                     format!("exhausted yellowstone reconnect attempts after {attempts} failures");
                 send_primary_provider_health(
                     &source,
+                    config.readiness(),
                     &sender,
                     ProviderSourceHealthStatus::Unhealthy,
                     ProviderSourceHealthReason::ReconnectBudgetExhausted,
@@ -951,7 +1007,10 @@ pub async fn spawn_yellowstone_grpc_slot_source(
     config: YellowstoneGrpcSlotsConfig,
     sender: ProviderStreamSender,
 ) -> Result<JoinHandle<Result<(), YellowstoneGrpcError>>, YellowstoneGrpcError> {
-    let source = ProviderSourceIdentity::generated(ProviderSourceId::YellowstoneGrpcSlots, None);
+    let source = ProviderSourceIdentity::generated(
+        ProviderSourceId::YellowstoneGrpcSlots,
+        config.source_instance(),
+    );
     let first_session = establish_yellowstone_slot_session(&config, 0).await?;
     Ok(tokio::spawn(async move {
         let mut attempts = 0_u32;
@@ -990,6 +1049,7 @@ pub async fn spawn_yellowstone_grpc_slot_source(
                         );
                         send_provider_slot_health(
                             &source,
+                            config.readiness(),
                             &sender,
                             ProviderSourceHealthStatus::Reconnecting,
                             ProviderSourceHealthReason::UpstreamStreamClosedUnexpectedly,
@@ -1008,6 +1068,7 @@ pub async fn spawn_yellowstone_grpc_slot_source(
                         );
                         send_provider_slot_health(
                             &source,
+                            config.readiness(),
                             &sender,
                             ProviderSourceHealthStatus::Reconnecting,
                             yellowstone_health_reason(&error),
@@ -1024,6 +1085,7 @@ pub async fn spawn_yellowstone_grpc_slot_source(
                     );
                     send_provider_slot_health(
                         &source,
+                        config.readiness(),
                         &sender,
                         ProviderSourceHealthStatus::Reconnecting,
                         yellowstone_health_reason(&error),
@@ -1045,6 +1107,7 @@ pub async fn spawn_yellowstone_grpc_slot_source(
                 );
                 send_provider_slot_health(
                     &source,
+                    config.readiness(),
                     &sender,
                     ProviderSourceHealthStatus::Unhealthy,
                     ProviderSourceHealthReason::ReconnectBudgetExhausted,
@@ -1073,6 +1136,7 @@ async fn run_yellowstone_primary_connection(
     *state.session_established = true;
     send_primary_provider_health(
         source,
+        config.readiness(),
         sender,
         ProviderSourceHealthStatus::Healthy,
         ProviderSourceHealthReason::SubscriptionAckReceived,
@@ -1244,6 +1308,7 @@ async fn run_yellowstone_slot_connection(
     *state.session_established = true;
     send_provider_slot_health(
         source,
+        config.readiness(),
         sender,
         ProviderSourceHealthStatus::Healthy,
         ProviderSourceHealthReason::SubscriptionAckReceived,
@@ -1357,6 +1422,7 @@ async fn establish_yellowstone_slot_session(
 
 async fn send_primary_provider_health(
     source: &ProviderSourceIdentity,
+    readiness: ProviderSourceReadiness,
     sender: &ProviderStreamSender,
     status: ProviderSourceHealthStatus,
     reason: ProviderSourceHealthReason,
@@ -1365,6 +1431,7 @@ async fn send_primary_provider_health(
     sender
         .send(ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
             source: source.clone(),
+            readiness,
             status,
             reason,
             message,
@@ -1375,6 +1442,7 @@ async fn send_primary_provider_health(
 
 async fn send_provider_slot_health(
     source: &ProviderSourceIdentity,
+    readiness: ProviderSourceReadiness,
     sender: &ProviderStreamSender,
     status: ProviderSourceHealthStatus,
     reason: ProviderSourceHealthReason,
@@ -1383,6 +1451,7 @@ async fn send_provider_slot_health(
     sender
         .send(ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
             source: source.clone(),
+            readiness,
             status,
             reason,
             message,
@@ -1861,6 +1930,7 @@ mod tests {
         let (tx, mut rx) = create_provider_stream_queue(8);
         let config = YellowstoneGrpcConfig::new(format!("http://{addr}"))
             .with_stream(YellowstoneGrpcStream::Transaction)
+            .with_source_instance("yellowstone-primary")
             .with_max_reconnect_attempts(1)
             .with_reconnect_delay(Duration::from_millis(10))
             .with_connect_timeout(Duration::from_secs(2));
@@ -1882,6 +1952,14 @@ mod tests {
         assert_eq!(event.slot, 91);
         assert_eq!(event.kind, TxKind::Mixed);
         assert!(event.signature.is_some());
+        assert_eq!(
+            event
+                .provider_source
+                .as_deref()
+                .expect("provider source")
+                .instance_str(),
+            "yellowstone-primary"
+        );
 
         handle.abort();
         handle.await.ok();

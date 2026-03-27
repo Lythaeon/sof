@@ -146,8 +146,7 @@ Built-in runtime mode surface:
 - `ProviderStreamMode::WebsocketTransaction`: built-in websocket
   `transactionSubscribe` feed
 
-Those fixed runtime modes remain transaction-first compatibility labels. The
-each built-in source config exposes `runtime_mode()`, and that is the mode you
+Each built-in source config exposes `runtime_mode()`, and that is the mode you
 should pass to `ObserverRuntime::with_provider_stream_ingress(...)` for a
 single built-in source. `ProviderStreamMode::Generic` is for custom typed
 producers and multi-source fan-in.
@@ -168,6 +167,18 @@ Built-in source selectors:
 - LaserStream:
   - `LaserStreamConfig::with_stream(LaserStreamStream::Transaction)`
   - `LaserStreamConfig::with_stream(LaserStreamStream::TransactionStatus)`
+  - `LaserStreamConfig::with_stream(LaserStreamStream::Accounts)`
+  - `LaserStreamConfig::with_stream(LaserStreamStream::BlockMeta)`
+  - `LaserStreamSlotsConfig` for slot updates
+
+Built-in provider configs also support:
+
+- `with_source_instance("primary-helius-fra")` for stable per-source observability labels
+- `with_readiness(...)` to mark one source as readiness-gating or optional
+
+SOF defaults auxiliary websocket logs and slot-only feeds to optional readiness.
+Primary transaction, transaction-status, account, and block-meta feeds default
+to required readiness.
   - `LaserStreamConfig::with_stream(LaserStreamStream::Accounts)`
   - `LaserStreamConfig::with_stream(LaserStreamStream::BlockMeta)`
   - `LaserStreamSlotsConfig` for slot updates
@@ -275,8 +286,11 @@ all commitment levels.
 `sof-tx` is a different case: the existing SOF adapters are complete today on
 raw-shred/gossip runtimes, or on `ProviderStreamMode::Generic` when the custom
 producer also supplies the full control-plane feed. Built-in Yellowstone,
-LaserStream, and websocket adapters remain transaction-first today, so SOF
-explicitly rejects those adapters at runtime/config validation time.
+LaserStream, and websocket adapters now cover transactions, transaction status,
+accounts, block-meta, logs, and slots, but they still do not form a complete
+built-in `sof-tx` control-plane source on their own. SOF therefore still
+rejects those adapters for the existing `sof-tx` live/replay adapters at
+runtime/config validation time.
 
 That tradeoff should be explicit: public gossip is the independent baseline, trusted raw shred
 distribution is the fast path, and processed provider streams are a different observer model.

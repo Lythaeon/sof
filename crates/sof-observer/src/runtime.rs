@@ -4485,6 +4485,7 @@ mod tests {
                     crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
                     "yellowstone-grpc-1",
                 ),
+                readiness: crate::provider_stream::ProviderSourceReadiness::Required,
                 status: crate::provider_stream::ProviderSourceHealthStatus::Reconnecting,
                 reason: crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
                 message: "upstream stalled".to_owned(),
@@ -4548,6 +4549,7 @@ mod tests {
                         ),
                         instance,
                     ),
+                    readiness: crate::provider_stream::ProviderSourceReadiness::Required,
                     status: crate::provider_stream::ProviderSourceHealthStatus::Reconnecting,
                     reason:
                         crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
@@ -4635,6 +4637,7 @@ mod tests {
                     ),
                     "generic_source",
                 ),
+                readiness: crate::provider_stream::ProviderSourceReadiness::Required,
                 status: crate::provider_stream::ProviderSourceHealthStatus::Reconnecting,
                 reason: crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
                 message: "upstream stalled".to_owned(),
