@@ -2354,6 +2354,239 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_logs_source_delivers_log_update() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+        let signature = Signature::from([9_u8; 64]);
+        let payload = json!({
+            "jsonrpc":"2.0",
+            "method":"logsNotification",
+            "params":{
+                "result":{
+                    "context":{"slot":88},
+                    "value":{
+                        "signature":signature.to_string(),
+                        "err":null,
+                        "logs":["Program log: test"]
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = accept_async(stream).await.expect("websocket handshake");
+            let subscribe = ws
+                .next()
+                .await
+                .expect("subscribe frame")
+                .expect("subscribe message");
+            match subscribe {
+                WsMessage::Text(text) => assert!(text.contains("logsSubscribe")),
+                other => panic!("expected subscribe text frame, got {other:?}"),
+            }
+            ws.send(WsMessage::Text(
+                String::from(r#"{"jsonrpc":"2.0","id":1,"result":42}"#).into(),
+            ))
+            .await
+            .expect("ack");
+            ws.send(WsMessage::Text(payload.into()))
+                .await
+                .expect("notification");
+            ws.close(None).await.expect("close");
+        });
+
+        let (tx, mut rx) = create_provider_stream_queue(8);
+        let config = WebsocketLogsConfig::new(format!("ws://{addr}"))
+            .with_ping_interval(Duration::from_millis(250))
+            .with_reconnect_delay(Duration::from_millis(10))
+            .with_max_reconnect_attempts(1);
+        let handle = spawn_websocket_logs_source(&config, tx)
+            .await
+            .expect("spawn websocket logs source");
+
+        let event = loop {
+            let update = timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("provider update timeout")
+                .expect("provider update");
+            match update {
+                ProviderStreamUpdate::TransactionLog(event) => break event,
+                ProviderStreamUpdate::Health(_) => continue,
+                other => panic!("expected log update, got {other:?}"),
+            }
+        };
+        assert_eq!(event.slot, 88);
+        assert_eq!(event.signature, signature.into());
+
+        handle.abort();
+        handle.await.ok();
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn websocket_account_source_delivers_account_update() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+        let pubkey = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let payload = json!({
+            "jsonrpc":"2.0",
+            "method":"accountNotification",
+            "params":{
+                "result":{
+                    "context":{"slot":77},
+                    "value":{
+                        "lamports":42,
+                        "data":[STANDARD.encode([1_u8, 2, 3, 4]), "base64"],
+                        "owner":owner.to_string(),
+                        "executable":false,
+                        "rentEpoch":9
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = accept_async(stream).await.expect("websocket handshake");
+            let subscribe = ws
+                .next()
+                .await
+                .expect("subscribe frame")
+                .expect("subscribe message");
+            match subscribe {
+                WsMessage::Text(text) => assert!(text.contains("accountSubscribe")),
+                other => panic!("expected subscribe text frame, got {other:?}"),
+            }
+            ws.send(WsMessage::Text(
+                String::from(r#"{"jsonrpc":"2.0","id":1,"result":42}"#).into(),
+            ))
+            .await
+            .expect("ack");
+            ws.send(WsMessage::Text(payload.into()))
+                .await
+                .expect("notification");
+            ws.close(None).await.expect("close");
+        });
+
+        let (tx, mut rx) = create_provider_stream_queue(8);
+        let config = WebsocketTransactionConfig::new(format!("ws://{addr}"))
+            .with_stream(WebsocketPrimaryStream::Account(pubkey))
+            .with_ping_interval(Duration::from_millis(250))
+            .with_reconnect_delay(Duration::from_millis(10))
+            .with_max_reconnect_attempts(1);
+        let handle = spawn_websocket_transaction_source(&config, tx)
+            .await
+            .expect("spawn websocket account source");
+
+        let event = loop {
+            let update = timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("provider update timeout")
+                .expect("provider update");
+            match update {
+                ProviderStreamUpdate::AccountUpdate(event) => break event,
+                ProviderStreamUpdate::Health(_) => continue,
+                other => panic!("expected account update, got {other:?}"),
+            }
+        };
+        assert_eq!(event.slot, 77);
+        assert_eq!(event.pubkey, pubkey.into());
+        assert_eq!(event.owner, owner.into());
+        assert_eq!(event.data.as_ref(), &[1, 2, 3, 4]);
+
+        handle.abort();
+        handle.await.ok();
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn websocket_program_source_delivers_account_update() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+        let program_id = Pubkey::new_unique();
+        let account_pubkey = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let payload = json!({
+            "jsonrpc":"2.0",
+            "method":"programNotification",
+            "params":{
+                "result":{
+                    "context":{"slot":88},
+                    "value":{
+                        "pubkey":account_pubkey.to_string(),
+                        "account":{
+                            "lamports":7,
+                            "data":[STANDARD.encode([5_u8, 6, 7]), "base64"],
+                            "owner":owner.to_string(),
+                            "executable":true,
+                            "rentEpoch":11
+                        }
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = accept_async(stream).await.expect("websocket handshake");
+            let subscribe = ws
+                .next()
+                .await
+                .expect("subscribe frame")
+                .expect("subscribe message");
+            match subscribe {
+                WsMessage::Text(text) => assert!(text.contains("programSubscribe")),
+                other => panic!("expected subscribe text frame, got {other:?}"),
+            }
+            ws.send(WsMessage::Text(
+                String::from(r#"{"jsonrpc":"2.0","id":1,"result":42}"#).into(),
+            ))
+            .await
+            .expect("ack");
+            ws.send(WsMessage::Text(payload.into()))
+                .await
+                .expect("notification");
+            ws.close(None).await.expect("close");
+        });
+
+        let (tx, mut rx) = create_provider_stream_queue(8);
+        let config = WebsocketTransactionConfig::new(format!("ws://{addr}"))
+            .with_stream(WebsocketPrimaryStream::Program(program_id))
+            .with_ping_interval(Duration::from_millis(250))
+            .with_reconnect_delay(Duration::from_millis(10))
+            .with_max_reconnect_attempts(1);
+        let handle = spawn_websocket_transaction_source(&config, tx)
+            .await
+            .expect("spawn websocket program source");
+
+        let event = loop {
+            let update = timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("provider update timeout")
+                .expect("provider update");
+            match update {
+                ProviderStreamUpdate::AccountUpdate(event) => break event,
+                ProviderStreamUpdate::Health(_) => continue,
+                other => panic!("expected account update, got {other:?}"),
+            }
+        };
+        assert_eq!(event.slot, 88);
+        assert_eq!(event.pubkey, account_pubkey.into());
+        assert_eq!(event.owner, owner.into());
+        assert_eq!(event.matched_filter, Some(program_id.into()));
+        assert_eq!(event.data.as_ref(), &[5, 6, 7]);
+
+        handle.abort();
+        handle.await.ok();
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
     async fn websocket_source_uses_first_acknowledged_session_as_live_stream() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
         let addr = listener.local_addr().expect("local addr");

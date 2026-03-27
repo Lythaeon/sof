@@ -1433,18 +1433,31 @@ fn convert_message(
 mod tests {
     use super::*;
     use crate::event::TxKind;
+    use crate::provider_stream::create_provider_stream_queue;
+    use futures_channel::mpsc as futures_mpsc;
+    use futures_util::stream::{self, Stream};
     use solana_instruction::Instruction;
     use solana_keypair::Keypair;
     use solana_message::{Message as SolanaMessage, VersionedMessage};
     use solana_sdk_ids::system_program;
     use solana_sdk_ids::{compute_budget, vote};
     use solana_signer::Signer;
-    use std::time::Instant;
+    use std::{pin::Pin, time::Instant};
+    use tokio::sync::oneshot;
+    use tokio::time::{Duration, timeout};
+    use yellowstone_grpc_proto::geyser::geyser_server::{Geyser, GeyserServer};
     use yellowstone_grpc_proto::prelude::{
-        CompiledInstruction as ProtoCompiledInstruction, Message as ProtoMessage,
+        CompiledInstruction as ProtoCompiledInstruction, GetBlockHeightRequest,
+        GetBlockHeightResponse, GetLatestBlockhashRequest, GetLatestBlockhashResponse,
+        GetSlotRequest, GetSlotResponse, GetVersionRequest, GetVersionResponse,
+        IsBlockhashValidRequest, IsBlockhashValidResponse, Message as ProtoMessage,
         MessageAddressTableLookup as ProtoMessageAddressTableLookup,
-        MessageHeader as ProtoMessageHeader, SubscribeUpdateTransactionInfo, Transaction,
+        MessageHeader as ProtoMessageHeader, PingRequest, PongResponse, SubscribeDeshredRequest,
+        SubscribeReplayInfoRequest, SubscribeReplayInfoResponse, SubscribeRequest, SubscribeUpdate,
+        SubscribeUpdateAccount, SubscribeUpdateAccountInfo, SubscribeUpdateDeshred,
+        SubscribeUpdateTransactionInfo, SubscribeUpdateTransactionStatus, Transaction,
     };
+    use yellowstone_grpc_proto::tonic::{self, Request, Response, Status, transport::Server};
 
     fn profile_iterations(default: usize) -> usize {
         std::env::var("SOF_PROFILE_ITERATIONS")
@@ -1547,6 +1560,96 @@ mod tests {
         assert_eq!(request.from_slot, None);
     }
 
+    #[tokio::test]
+    async fn yellowstone_local_source_delivers_transaction_status_update() {
+        let update = sample_status_update(91);
+        let (addr, shutdown_tx, server) = spawn_yellowstone_test_server(MockYellowstone {
+            expected_stream: YellowstoneGrpcStream::TransactionStatus,
+            expected_account: None,
+            expected_owner: None,
+            update,
+        })
+        .await;
+
+        let (tx, mut rx) = create_provider_stream_queue(8);
+        let config = YellowstoneGrpcConfig::new(format!("http://{addr}"))
+            .with_stream(YellowstoneGrpcStream::TransactionStatus)
+            .with_max_reconnect_attempts(1)
+            .with_reconnect_delay(Duration::from_millis(10))
+            .with_connect_timeout(Duration::from_secs(2));
+        let handle = spawn_yellowstone_grpc_transaction_source(config, tx)
+            .await
+            .expect("spawn Yellowstone status source");
+
+        let event = loop {
+            let update = timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("provider update timeout")
+                .expect("provider update");
+            match update {
+                ProviderStreamUpdate::TransactionStatus(event) => break event,
+                ProviderStreamUpdate::Health(_) => continue,
+                other => panic!("expected transaction-status update, got {other:?}"),
+            }
+        };
+        assert_eq!(event.slot, 91);
+        assert!(!event.is_vote);
+        assert_eq!(event.index, Some(7));
+
+        handle.abort();
+        handle.await.ok();
+        let _ = shutdown_tx.send(());
+        server.await.expect("Yellowstone server task");
+    }
+
+    #[tokio::test]
+    async fn yellowstone_local_source_delivers_account_update() {
+        let pubkey = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let update = sample_account_update(92, pubkey, owner);
+        let (addr, shutdown_tx, server) = spawn_yellowstone_test_server(MockYellowstone {
+            expected_stream: YellowstoneGrpcStream::Accounts,
+            expected_account: Some(pubkey.to_string()),
+            expected_owner: Some(owner.to_string()),
+            update,
+        })
+        .await;
+
+        let (tx, mut rx) = create_provider_stream_queue(8);
+        let config = YellowstoneGrpcConfig::new(format!("http://{addr}"))
+            .with_stream(YellowstoneGrpcStream::Accounts)
+            .with_accounts([pubkey])
+            .with_owners([owner])
+            .with_max_reconnect_attempts(1)
+            .with_reconnect_delay(Duration::from_millis(10))
+            .with_connect_timeout(Duration::from_secs(2));
+        let handle = spawn_yellowstone_grpc_transaction_source(config, tx)
+            .await
+            .expect("spawn Yellowstone account source");
+
+        let event = loop {
+            let update = timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("provider update timeout")
+                .expect("provider update");
+            match update {
+                ProviderStreamUpdate::AccountUpdate(event) => break event,
+                ProviderStreamUpdate::Health(_) => continue,
+                other => panic!("expected account update, got {other:?}"),
+            }
+        };
+        assert_eq!(event.slot, 92);
+        assert_eq!(event.pubkey, pubkey.into());
+        assert_eq!(event.owner, owner.into());
+        assert_eq!(event.lamports, 42);
+        assert_eq!(event.data.as_ref(), &[1, 2, 3, 4]);
+
+        handle.abort();
+        handle.await.ok();
+        let _ = shutdown_tx.send(());
+        server.await.expect("Yellowstone server task");
+    }
+
     fn proto_transaction_from_versioned(tx: &VersionedTransaction) -> Transaction {
         let message = match &tx.message {
             VersionedMessage::Legacy(message) => ProtoMessage {
@@ -1644,6 +1747,176 @@ mod tests {
             meta: None,
             index: 0,
         }
+    }
+
+    fn sample_status_update(slot: u64) -> SubscribeUpdate {
+        let tx = sample_transaction();
+        SubscribeUpdate {
+            filters: vec!["sof".to_owned()],
+            created_at: None,
+            update_oneof: Some(UpdateOneof::TransactionStatus(
+                SubscribeUpdateTransactionStatus {
+                    slot,
+                    signature: tx.signatures.first().expect("signature").as_ref().to_vec(),
+                    is_vote: false,
+                    index: 7,
+                    err: None,
+                },
+            )),
+        }
+    }
+
+    fn sample_account_update(slot: u64, pubkey: Pubkey, owner: Pubkey) -> SubscribeUpdate {
+        SubscribeUpdate {
+            filters: vec!["sof".to_owned()],
+            created_at: None,
+            update_oneof: Some(UpdateOneof::Account(SubscribeUpdateAccount {
+                slot,
+                is_startup: false,
+                account: Some(SubscribeUpdateAccountInfo {
+                    pubkey: pubkey.to_bytes().to_vec(),
+                    lamports: 42,
+                    owner: owner.to_bytes().to_vec(),
+                    executable: false,
+                    rent_epoch: 9,
+                    data: vec![1, 2, 3, 4],
+                    write_version: 11,
+                    txn_signature: None,
+                }),
+            })),
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockYellowstone {
+        expected_stream: YellowstoneGrpcStream,
+        expected_account: Option<String>,
+        expected_owner: Option<String>,
+        update: SubscribeUpdate,
+    }
+
+    #[async_trait::async_trait]
+    impl Geyser for MockYellowstone {
+        type SubscribeStream =
+            Pin<Box<dyn Stream<Item = Result<SubscribeUpdate, Status>> + Send + 'static>>;
+        type SubscribeDeshredStream =
+            Pin<Box<dyn Stream<Item = Result<SubscribeUpdateDeshred, Status>> + Send + 'static>>;
+
+        async fn subscribe(
+            &self,
+            request: Request<tonic::Streaming<SubscribeRequest>>,
+        ) -> Result<Response<Self::SubscribeStream>, Status> {
+            let mut inbound = request.into_inner();
+            let first = inbound
+                .message()
+                .await?
+                .ok_or_else(|| Status::invalid_argument("missing subscribe request"))?;
+            match self.expected_stream {
+                YellowstoneGrpcStream::Transaction => {
+                    assert!(first.transactions.contains_key("sof"));
+                }
+                YellowstoneGrpcStream::TransactionStatus => {
+                    assert!(first.transactions_status.contains_key("sof"));
+                }
+                YellowstoneGrpcStream::Accounts => {
+                    let filter = first
+                        .accounts
+                        .get("sof")
+                        .expect("expected Yellowstone accounts filter");
+                    if let Some(account) = &self.expected_account {
+                        assert!(filter.account.iter().any(|value| value == account));
+                    }
+                    if let Some(owner) = &self.expected_owner {
+                        assert!(filter.owner.iter().any(|value| value == owner));
+                    }
+                }
+            }
+            let (tx, rx) = futures_mpsc::unbounded();
+            tx.unbounded_send(Ok(self.update.clone()))
+                .expect("send Yellowstone test update");
+            Ok(Response::new(Box::pin(rx)))
+        }
+
+        async fn subscribe_deshred(
+            &self,
+            _request: Request<tonic::Streaming<SubscribeDeshredRequest>>,
+        ) -> Result<Response<Self::SubscribeDeshredStream>, Status> {
+            Ok(Response::new(Box::pin(stream::empty())))
+        }
+
+        async fn subscribe_replay_info(
+            &self,
+            _request: Request<SubscribeReplayInfoRequest>,
+        ) -> Result<Response<SubscribeReplayInfoResponse>, Status> {
+            Ok(Response::new(SubscribeReplayInfoResponse::default()))
+        }
+
+        async fn ping(
+            &self,
+            _request: Request<PingRequest>,
+        ) -> Result<Response<PongResponse>, Status> {
+            Ok(Response::new(PongResponse::default()))
+        }
+
+        async fn get_latest_blockhash(
+            &self,
+            _request: Request<GetLatestBlockhashRequest>,
+        ) -> Result<Response<GetLatestBlockhashResponse>, Status> {
+            Ok(Response::new(GetLatestBlockhashResponse::default()))
+        }
+
+        async fn get_block_height(
+            &self,
+            _request: Request<GetBlockHeightRequest>,
+        ) -> Result<Response<GetBlockHeightResponse>, Status> {
+            Ok(Response::new(GetBlockHeightResponse::default()))
+        }
+
+        async fn get_slot(
+            &self,
+            _request: Request<GetSlotRequest>,
+        ) -> Result<Response<GetSlotResponse>, Status> {
+            Ok(Response::new(GetSlotResponse::default()))
+        }
+
+        async fn is_blockhash_valid(
+            &self,
+            _request: Request<IsBlockhashValidRequest>,
+        ) -> Result<Response<IsBlockhashValidResponse>, Status> {
+            Ok(Response::new(IsBlockhashValidResponse::default()))
+        }
+
+        async fn get_version(
+            &self,
+            _request: Request<GetVersionRequest>,
+        ) -> Result<Response<GetVersionResponse>, Status> {
+            Ok(Response::new(GetVersionResponse::default()))
+        }
+    }
+
+    async fn spawn_yellowstone_test_server(
+        service: MockYellowstone,
+    ) -> (
+        std::net::SocketAddr,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind Yellowstone test");
+        let addr = listener.local_addr().expect("Yellowstone test addr");
+        drop(listener);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            Server::builder()
+                .add_service(GeyserServer::new(service))
+                .serve_with_shutdown(addr, async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("run Yellowstone test server");
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        (addr, shutdown_tx, handle)
     }
 
     fn transaction_event_from_update_baseline(
