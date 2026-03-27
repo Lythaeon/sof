@@ -21,16 +21,35 @@ ingress
 
 ### Ingress
 
-Traffic enters through one of three sources:
+Traffic enters through one of the raw-ingest sources:
 
 - direct UDP listener
 - gossip bootstrap path
 - external kernel-bypass ingress queue
 
+Processed provider mode is a fourth ingest family at the runtime boundary:
+
+- Yellowstone gRPC
+- LaserStream gRPC
+- websocket `transactionSubscribe`
+- `ProviderStreamMode::Generic` for custom producers
+
+Those providers enter SOF after the packet/shred stages. They feed
+transaction, transaction-view, and supported control-plane updates directly into
+the runtime.
+
 ### Parse and verify
 
-SOF parses raw packets into shreds and can optionally perform shred verification. Verification is
-off by default because it is an explicit CPU tradeoff.
+SOF parses raw packets into shreds and can optionally perform shred
+verification.
+
+Verification defaults depend on trust posture:
+
+- `public_untrusted`: verification on by default
+- `trusted_raw_shred_provider`: verification off by default unless you override
+  it explicitly
+- processed provider mode: no raw shred verification stage, because packets and
+  shreds are not entering SOF there
 
 ### Dedupe and conflict suppression
 
@@ -66,3 +85,21 @@ pressure:
 
 That makes the runtime easier to tune for low-latency hosts than systems that quietly turn every
 problem into more queued memory.
+
+## Scheduling Model
+
+SOF's current scheduling model is explicit but not magical:
+
+- packet ingest fans out into packet workers
+- completed datasets fan out into dataset workers
+- plugin hooks run through bounded dispatch queues
+- provider modes run supervised source sessions and then enter the same downstream host surface
+
+What SOF does not claim yet:
+
+- full NUMA-aware scheduling
+- automatic multi-socket placement
+- a universal best pinning policy across hosts
+
+Some pinning controls exist, but low-latency placement is still an operator concern that should be
+measured on the actual machine.

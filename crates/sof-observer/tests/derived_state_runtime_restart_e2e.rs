@@ -16,7 +16,7 @@ use sof::{
         DerivedStateHost, DerivedStateReplayBackend, DerivedStateReplayDurability, FeedSequence,
         FeedSessionId,
     },
-    ingest::{RawPacket, RawPacketBatch},
+    ingest::{RawPacketBatch, RawPacketIngress},
     protocol::shred_wire::{SIZE_OF_DATA_SHRED_PAYLOAD, VARIANT_MERKLE_DATA},
     runtime::{self, DerivedStateReplayConfig, DerivedStateRuntimeConfig, RuntimeSetup},
     shred::wire::SIZE_OF_DATA_SHRED_HEADERS,
@@ -141,7 +141,7 @@ fn unique_test_dir(name: &str) -> PathBuf {
     ))
 }
 
-fn build_raw_packet(sequence: u64, source_port: u16) -> RawPacket {
+fn build_raw_packet_bytes(sequence: u64) -> Vec<u8> {
     let slot = (sequence / 128).saturating_add(1);
     let index = u32::try_from(sequence % 128).unwrap_or(0);
     let fec_set_index = index;
@@ -165,11 +165,20 @@ fn build_raw_packet(sequence: u64, source_port: u16) -> RawPacket {
     let payload_end = SIZE_OF_DATA_SHRED_HEADERS.saturating_add(SHRED_PAYLOAD_BYTES);
     fill_bytes(&mut bytes, 88, payload_end, 0xAC);
 
-    RawPacket {
-        source: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), source_port),
-        ingress: sof::ingest::RawPacketIngress::Udp,
-        bytes: bytes.into(),
-    }
+    bytes
+}
+
+fn build_raw_packet_batch(sequence: u64, source_port: u16) -> RawPacketBatch {
+    let mut batch = RawPacketBatch::with_capacity(1);
+    let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), source_port);
+    let bytes = build_raw_packet_bytes(sequence);
+    let push_result = batch.push_packet_bytes(source, RawPacketIngress::Udp, &bytes);
+    assert!(
+        push_result.is_ok(),
+        "synthetic packet should fit in raw packet batch buffer: {:?}",
+        push_result.err()
+    );
+    batch
 }
 
 fn write_bytes(buffer: &mut [u8], offset: usize, value: &[u8]) {
@@ -233,7 +242,7 @@ async fn derived_state_runtime_restart_replays_retained_tail_from_disk()
         .await
     });
 
-    first_tx.send(vec![build_raw_packet(0, 8_899)]).await?;
+    first_tx.send(build_raw_packet_batch(0, 8_899)).await?;
     drop(first_tx);
 
     let first_result = tokio::time::timeout(Duration::from_secs(10), first_task)

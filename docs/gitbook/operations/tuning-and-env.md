@@ -20,14 +20,23 @@ When enabled, SOF exposes:
 - `/healthz`
 - `/readyz`
 
+If you are starting in processed provider mode instead of raw-shred ingest, the
+safe baseline is different:
+
+- keep the provider endpoint and auth config explicit in code
+- keep replay and durability settings at their defaults first
+- do not tune packet-worker, dataset-worker, FEC, or relay/repair knobs before
+  you have measured a raw-shred runtime, because built-in provider mode does not
+  use those packet/shred stages the same way
+
 If you configure the runtime in code, prefer `RuntimeSetup` and `sof-gossip-tuning` instead of raw
 string overrides.
 
 The typed `Vps` preset now reflects the validated public-host profile:
 
 - `SOF_UDP_BATCH_SIZE=96`
-- `SOF_TVU_SOCKETS=2`
-- `SOF_UDP_RECEIVER_PIN_BY_PORT=true`
+- `SOF_TVU_SOCKETS=4`
+- `SOF_UDP_RECEIVER_PIN_BY_PORT=false`
 - `SOF_UDP_BUSY_POLL_US` / `SOF_UDP_BUSY_POLL_BUDGET` / `SOF_UDP_PREFER_BUSY_POLL` (Linux-only, off by default; use only when you want lower interrupt jitter and accept higher CPU burn)
 - `SOF_GOSSIP_RECEIVER_CHANNEL_CAPACITY=131072`
 - `SOF_GOSSIP_SOCKET_CONSUME_CHANNEL_CAPACITY=65536`
@@ -48,12 +57,44 @@ they are too host-specific to recommend as defaults:
   packet-worker burst can hand back at once. Smaller values reduce burst
   head-of-line delay but add more queue churn.
 
+Pinning and placement should be read narrowly:
+
+- SOF exposes useful single-host controls
+- SOF does not yet claim full NUMA-aware scheduling
+- multi-socket and high-core-count hosts still need measured placement decisions
+
+Current playbook:
+
+- public single-socket VPS: start from `sof-gossip-tuning`'s validated `Vps` preset
+- processed provider mode: tune replay, durability, and source health before touching packet/shred worker knobs
+- trusted raw-shred mode: keep receive, packet-worker, and dataset-worker placement on the same socket when possible
+- multi-socket hosts: prefer one socket first unless measurement proves cross-socket fanout helps more than it hurts
+
+Measured public-VPS note from the current 4-core sweep:
+
+- default `SOF_TVU_SOCKETS=4` beat both `2` and `8` on tx-availability latency
+- `SOF_TVU_SOCKETS=2` improved throughput but made tx visibility slower
+- Linux busy-poll also made tx visibility slower on that host
+- larger host kernel receive buffers improved throughput but still hurt tx-availability latency
+
+So tune these only with before/after captures on the actual host you care about.
+
 ## Preferred Tuning Order
 
 1. keep defaults
 2. apply a typed `sof-gossip-tuning` preset
 3. measure
 4. change one advanced knob at a time
+
+For transaction plugins, prefer API-level fast paths before runtime knob tuning:
+
+- use `TransactionDispatchMode::Inline` when the plugin actually benefits from
+  earliest tx visibility
+- use `TransactionPrefilter` for signature/account-key matching instead of
+  custom `transaction_interest_ref` logic when possible
+
+That combination lets SOF reject irrelevant inline traffic from sanitized
+transaction views and skip full owned tx decode on misses.
 
 This order matters because many queue and worker controls simply trade one failure mode for
 another.
@@ -99,6 +140,13 @@ Useful runtime-owned endpoint metrics while tuning:
 - `sof_ingest_dropped_packets_total`
 - `sof_dataset_queue_depth`
 - `sof_packet_worker_queue_depth`
+- `sof_plugin_general_queue_depth`
+- `sof_plugin_general_dropped_events_total`
+- `sof_plugin_transaction_inline_critical_queue_depth`
+- `sof_plugin_transaction_critical_queue_depth`
+- `sof_plugin_transaction_background_queue_depth`
+- `sof_plugin_transaction_critical_dropped_events_total`
+- `sof_plugin_transaction_background_dropped_events_total`
 - `sof_shred_dedupe_capacity_evictions_total`
 - `sof_udp_relay_forwarded_packets_total`
 - `sof_udp_relay_source_filtered_packets_total`
@@ -114,6 +162,7 @@ Useful runtime-owned endpoint metrics while tuning:
 - worker counts exceed the host's ability to keep CPU caches warm
 - repair traffic grows faster than recovered useful data
 - changes are made without any metric or before/after capture
+- pinning is applied without checking whether it improved locality or just made queue imbalance worse
 
 ## Practical Advice
 

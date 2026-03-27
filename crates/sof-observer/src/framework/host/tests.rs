@@ -1,15 +1,23 @@
 use super::*;
+use agave_transaction_view::transaction_view::SanitizedTransactionView;
 use async_trait::async_trait;
+use solana_instruction::{AccountMeta, Instruction};
+use solana_keypair::Keypair;
+use solana_pubkey::Pubkey;
+use solana_signature::Signature;
+use solana_signer::Signer as _;
 use solana_transaction::Transaction;
 use std::{
-    sync::atomic::{AtomicBool, AtomicUsize},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 
 use crate::event::TxKind;
 use crate::framework::{
-    PluginConfig, PluginContext, PluginSetupError, TransactionDispatchMode, TransactionEventRef,
-    TransactionInterest, TxCommitmentStatus,
+    PluginConfig, PluginContext, PluginSetupError, SerializedTransactionRange,
+    TransactionBatchEvent, TransactionDispatchMode, TransactionEvent, TransactionEventRef,
+    TransactionInterest, TransactionLogEvent, TransactionPrefilter, TransactionViewBatchEvent,
+    TxCommitmentStatus,
 };
 
 #[derive(Clone, Copy)]
@@ -50,6 +58,30 @@ fn builder_registers_multiple_plugins_from_iterator() {
     assert_eq!(host.len(), 3);
 }
 
+#[test]
+fn builder_tracks_transaction_log_interest() {
+    struct TransactionLogPlugin;
+
+    #[async_trait]
+    impl ObserverPlugin for TransactionLogPlugin {
+        fn config(&self) -> PluginConfig {
+            PluginConfig {
+                transaction_log: true,
+                ..PluginConfig::new()
+            }
+        }
+
+        fn accepts_transaction_log(&self, _event: &TransactionLogEvent) -> bool {
+            true
+        }
+    }
+
+    let host = PluginHostBuilder::new()
+        .add_plugin(TransactionLogPlugin)
+        .build();
+    assert!(host.wants_transaction_log());
+}
+
 #[derive(Clone, Copy)]
 struct InlineTransactionPlugin;
 
@@ -77,7 +109,7 @@ impl ObserverPlugin for InlineCriticalTransactionPlugin {
         PluginConfig::new().with_inline_transaction()
     }
 
-    fn transaction_interest_ref(&self, _event: TransactionEventRef<'_>) -> TransactionInterest {
+    fn transaction_interest_ref(&self, _event: &TransactionEventRef<'_>) -> TransactionInterest {
         TransactionInterest::Critical
     }
 }
@@ -95,7 +127,7 @@ impl ObserverPlugin for StandardCriticalTransactionPlugin {
         PluginConfig::new().with_transaction()
     }
 
-    fn transaction_interest_ref(&self, _event: TransactionEventRef<'_>) -> TransactionInterest {
+    fn transaction_interest_ref(&self, _event: &TransactionEventRef<'_>) -> TransactionInterest {
         TransactionInterest::Critical
     }
 }
@@ -263,7 +295,7 @@ impl ObserverPlugin for FilteringTransactionPlugin {
         PluginConfig::new().with_transaction()
     }
 
-    fn accepts_transaction_ref(&self, event: TransactionEventRef<'_>) -> bool {
+    fn accepts_transaction_ref(&self, event: &TransactionEventRef<'_>) -> bool {
         let accept = event.slot.is_multiple_of(2);
         if accept {
             self.accepted.fetch_add(1, Ordering::Relaxed);
@@ -273,7 +305,7 @@ impl ObserverPlugin for FilteringTransactionPlugin {
         accept
     }
 
-    fn transaction_interest_ref(&self, event: TransactionEventRef<'_>) -> TransactionInterest {
+    fn transaction_interest_ref(&self, event: &TransactionEventRef<'_>) -> TransactionInterest {
         if self.accepts_transaction_ref(event) {
             TransactionInterest::Critical
         } else {
@@ -303,7 +335,7 @@ impl ObserverPlugin for PriorityTransactionPlugin {
         PluginConfig::new().with_transaction()
     }
 
-    fn transaction_interest_ref(&self, event: TransactionEventRef<'_>) -> TransactionInterest {
+    fn transaction_interest_ref(&self, event: &TransactionEventRef<'_>) -> TransactionInterest {
         if event.slot.is_multiple_of(2) {
             TransactionInterest::Critical
         } else {
@@ -318,6 +350,53 @@ impl ObserverPlugin for PriorityTransactionPlugin {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
         self.background_handled.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone)]
+struct PrefilterTransactionPlugin {
+    filter: TransactionPrefilter,
+}
+
+#[async_trait]
+impl ObserverPlugin for PrefilterTransactionPlugin {
+    fn name(&self) -> &'static str {
+        "prefilter-transaction-plugin"
+    }
+
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_inline_transaction()
+    }
+
+    fn transaction_prefilter(&self) -> Option<&TransactionPrefilter> {
+        Some(&self.filter)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ManualAccountMatchPlugin {
+    required_a: Pubkey,
+    required_b: Pubkey,
+}
+
+#[async_trait]
+impl ObserverPlugin for ManualAccountMatchPlugin {
+    fn name(&self) -> &'static str {
+        "manual-account-match-plugin"
+    }
+
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_inline_transaction()
+    }
+
+    fn transaction_interest_ref(&self, event: &TransactionEventRef<'_>) -> TransactionInterest {
+        let has_a = tx_mentions_account_key(event.tx, self.required_a);
+        let has_b = tx_mentions_account_key(event.tx, self.required_b);
+        if has_a && has_b {
+            TransactionInterest::Critical
+        } else {
+            TransactionInterest::Ignore
+        }
     }
 }
 
@@ -793,6 +872,437 @@ async fn startup_failure_shuts_down_started_plugins() {
     assert_eq!(shutdown_count.load(Ordering::Relaxed), 1);
 }
 
+#[test]
+fn transaction_prefilter_matches_manual_account_classifier() {
+    let required_a = Pubkey::new_unique();
+    let required_b = Pubkey::new_unique();
+    let tx = test_transaction_with_static_accounts([required_a, required_b, Pubkey::new_unique()]);
+    let event = TransactionEventRef {
+        slot: 7,
+        commitment_status: TxCommitmentStatus::Processed,
+        confirmed_slot: None,
+        finalized_slot: None,
+        signature: Some(Signature::from([7_u8; 64])),
+        tx: &tx,
+        kind: TxKind::NonVote,
+    };
+
+    let manual_host = PluginHostBuilder::new()
+        .add_plugin(ManualAccountMatchPlugin {
+            required_a,
+            required_b,
+        })
+        .build();
+    let prefilter_host = PluginHostBuilder::new()
+        .add_plugin(PrefilterTransactionPlugin {
+            filter: TransactionPrefilter::new(TransactionInterest::Critical)
+                .with_account_required([required_a, required_b]),
+        })
+        .build();
+
+    let manual = manual_host.classify_transaction_ref(event);
+    let prefiltered = prefilter_host.classify_transaction_ref(event);
+
+    assert_eq!(manual.is_empty(), prefiltered.is_empty());
+}
+
+#[test]
+fn transaction_prefilter_view_classification_matches_decoded() {
+    let required_a = Pubkey::new_unique();
+    let required_b = Pubkey::new_unique();
+    let tx = test_transaction_with_static_accounts([required_a, required_b, Pubkey::new_unique()]);
+    let serialized = bincode::serialize(&tx).expect("serialize transaction");
+    let view =
+        SanitizedTransactionView::try_new_sanitized(serialized.as_slice(), true).expect("view");
+    let signature = tx.signatures.first().copied();
+    let event = TransactionEventRef {
+        slot: 42,
+        commitment_status: TxCommitmentStatus::Processed,
+        confirmed_slot: None,
+        finalized_slot: None,
+        signature,
+        tx: &tx,
+        kind: TxKind::NonVote,
+    };
+
+    let host = PluginHostBuilder::new()
+        .add_plugin(PrefilterTransactionPlugin {
+            filter: TransactionPrefilter::new(TransactionInterest::Critical)
+                .with_account_required([required_a, required_b]),
+        })
+        .build();
+
+    let decoded =
+        host.classify_transaction_ref_in_scope(event, TransactionDispatchScope::InlineOnly);
+    let viewed = host.classify_transaction_view_in_scope(
+        &view,
+        TxCommitmentStatus::Processed,
+        TransactionDispatchScope::InlineOnly,
+    );
+
+    assert!(!viewed.needs_full_classification);
+    assert_eq!(decoded.is_empty(), viewed.dispatch.is_empty());
+}
+
+#[test]
+fn transaction_view_prefilter_marks_manual_plugins_for_full_decode() {
+    let required_a = Pubkey::new_unique();
+    let required_b = Pubkey::new_unique();
+    let tx = test_transaction_with_static_accounts([required_a, required_b, Pubkey::new_unique()]);
+    let serialized = bincode::serialize(&tx).expect("serialize transaction");
+    let view =
+        SanitizedTransactionView::try_new_sanitized(serialized.as_slice(), true).expect("view");
+    let signature = tx.signatures.first().copied();
+    let event = TransactionEventRef {
+        slot: 42,
+        commitment_status: TxCommitmentStatus::Processed,
+        confirmed_slot: None,
+        finalized_slot: None,
+        signature,
+        tx: &tx,
+        kind: TxKind::NonVote,
+    };
+
+    let host = PluginHostBuilder::new()
+        .add_plugin(ManualAccountMatchPlugin {
+            required_a,
+            required_b,
+        })
+        .build();
+
+    let decoded =
+        host.classify_transaction_ref_in_scope(event, TransactionDispatchScope::InlineOnly);
+    let viewed = host.classify_transaction_view_in_scope(
+        &view,
+        TxCommitmentStatus::Processed,
+        TransactionDispatchScope::InlineOnly,
+    );
+
+    assert!(viewed.needs_full_classification);
+    assert!(viewed.dispatch.is_empty());
+    assert!(!decoded.is_empty());
+}
+
+#[test]
+fn transaction_commitment_selector_filters_transaction_dispatch() {
+    struct ConfirmedTransactionPlugin {
+        counter: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ObserverPlugin for ConfirmedTransactionPlugin {
+        fn config(&self) -> PluginConfig {
+            PluginConfig::new()
+                .with_transaction()
+                .at_commitment(TxCommitmentStatus::Confirmed)
+        }
+
+        async fn on_transaction(&self, _event: &TransactionEvent) {
+            self.counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let host = PluginHostBuilder::new()
+        .add_plugin(ConfirmedTransactionPlugin {
+            counter: Arc::clone(&counter),
+        })
+        .build();
+
+    let mut processed = test_transaction_event(10);
+    processed.commitment_status = TxCommitmentStatus::Processed;
+    host.on_transaction(processed);
+
+    let mut confirmed = test_transaction_event(11);
+    confirmed.commitment_status = TxCommitmentStatus::Confirmed;
+    host.on_transaction(confirmed);
+
+    assert!(wait_until_counter(
+        counter.as_ref(),
+        1,
+        Duration::from_secs(2)
+    ));
+}
+
+#[test]
+fn transaction_commitment_selector_only_matches_exact_commitment() {
+    struct ConfirmedOnlyTransactionPlugin {
+        counter: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ObserverPlugin for ConfirmedOnlyTransactionPlugin {
+        fn config(&self) -> PluginConfig {
+            PluginConfig::new()
+                .with_transaction()
+                .only_at_commitment(TxCommitmentStatus::Confirmed)
+        }
+
+        async fn on_transaction(&self, _event: &TransactionEvent) {
+            self.counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let host = PluginHostBuilder::new()
+        .add_plugin(ConfirmedOnlyTransactionPlugin {
+            counter: Arc::clone(&counter),
+        })
+        .build();
+
+    let mut finalized = test_transaction_event(12);
+    finalized.commitment_status = TxCommitmentStatus::Finalized;
+    host.on_transaction(finalized);
+
+    let mut confirmed = test_transaction_event(13);
+    confirmed.commitment_status = TxCommitmentStatus::Confirmed;
+    host.on_transaction(confirmed);
+
+    assert!(wait_until_counter(
+        counter.as_ref(),
+        1,
+        Duration::from_secs(2)
+    ));
+}
+
+#[test]
+fn transaction_log_commitment_selector_filters_dispatch() {
+    struct ConfirmedLogPlugin {
+        counter: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ObserverPlugin for ConfirmedLogPlugin {
+        fn config(&self) -> PluginConfig {
+            PluginConfig {
+                transaction_log: true,
+                ..PluginConfig::new().at_commitment(TxCommitmentStatus::Confirmed)
+            }
+        }
+
+        async fn on_transaction_log(&self, _event: &TransactionLogEvent) {
+            self.counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let host = PluginHostBuilder::new()
+        .add_plugin(ConfirmedLogPlugin {
+            counter: Arc::clone(&counter),
+        })
+        .build();
+
+    host.on_transaction_log(TransactionLogEvent {
+        slot: 10,
+        commitment_status: TxCommitmentStatus::Processed,
+        signature: Signature::from([10_u8; 64]),
+        err: None,
+        logs: Arc::from(Vec::<String>::new()),
+        matched_filter: None,
+    });
+    host.on_transaction_log(TransactionLogEvent {
+        slot: 11,
+        commitment_status: TxCommitmentStatus::Confirmed,
+        signature: Signature::from([11_u8; 64]),
+        err: None,
+        logs: Arc::from(Vec::<String>::new()),
+        matched_filter: None,
+    });
+
+    assert!(wait_until_counter(
+        counter.as_ref(),
+        1,
+        Duration::from_secs(2)
+    ));
+}
+
+#[test]
+fn transaction_batch_and_view_commitment_selector_filter_dispatch() {
+    struct ConfirmedBatchPlugin {
+        batch_counter: Arc<AtomicUsize>,
+        view_counter: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ObserverPlugin for ConfirmedBatchPlugin {
+        fn config(&self) -> PluginConfig {
+            PluginConfig::new()
+                .at_commitment(TxCommitmentStatus::Confirmed)
+                .with_transaction_batch()
+                .with_transaction_view_batch()
+        }
+
+        async fn on_transaction_batch(&self, _event: &TransactionBatchEvent) {
+            self.batch_counter.fetch_add(1, Ordering::Relaxed);
+        }
+
+        async fn on_transaction_view_batch(&self, _event: &TransactionViewBatchEvent) {
+            self.view_counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let batch_counter = Arc::new(AtomicUsize::new(0));
+    let view_counter = Arc::new(AtomicUsize::new(0));
+    let host = PluginHostBuilder::new()
+        .add_plugin(ConfirmedBatchPlugin {
+            batch_counter: Arc::clone(&batch_counter),
+            view_counter: Arc::clone(&view_counter),
+        })
+        .build();
+
+    let tx = test_transaction_with_static_accounts([Pubkey::new_unique(), Pubkey::new_unique()]);
+    let payload = bincode::serialize(&tx).expect("serialize transaction");
+    let payload_len = payload.len();
+
+    host.on_transaction_batch(
+        TransactionBatchEvent {
+            slot: 20,
+            start_index: 0,
+            end_index: 0,
+            last_in_slot: false,
+            shreds: 1,
+            payload_len,
+            commitment_status: TxCommitmentStatus::Processed,
+            confirmed_slot: None,
+            finalized_slot: None,
+            transactions: Arc::from(vec![tx.clone()].into_boxed_slice()),
+        },
+        Instant::now(),
+    );
+    host.on_transaction_view_batch(
+        TransactionViewBatchEvent {
+            slot: 20,
+            start_index: 0,
+            end_index: 0,
+            last_in_slot: false,
+            shreds: 1,
+            payload_len,
+            commitment_status: TxCommitmentStatus::Processed,
+            confirmed_slot: None,
+            finalized_slot: None,
+            payload: Arc::from(payload.clone().into_boxed_slice()),
+            transactions: Arc::from(
+                vec![SerializedTransactionRange::new(0, payload_len as u32)].into_boxed_slice(),
+            ),
+        },
+        Instant::now(),
+    );
+
+    host.on_transaction_batch(
+        TransactionBatchEvent {
+            slot: 21,
+            start_index: 0,
+            end_index: 0,
+            last_in_slot: false,
+            shreds: 1,
+            payload_len,
+            commitment_status: TxCommitmentStatus::Confirmed,
+            confirmed_slot: Some(21),
+            finalized_slot: None,
+            transactions: Arc::from(vec![tx].into_boxed_slice()),
+        },
+        Instant::now(),
+    );
+    host.on_transaction_view_batch(
+        TransactionViewBatchEvent {
+            slot: 21,
+            start_index: 0,
+            end_index: 0,
+            last_in_slot: false,
+            shreds: 1,
+            payload_len,
+            commitment_status: TxCommitmentStatus::Confirmed,
+            confirmed_slot: Some(21),
+            finalized_slot: None,
+            payload: Arc::from(payload.into_boxed_slice()),
+            transactions: Arc::from(
+                vec![SerializedTransactionRange::new(0, payload_len as u32)].into_boxed_slice(),
+            ),
+        },
+        Instant::now(),
+    );
+
+    assert!(wait_until_counter(
+        batch_counter.as_ref(),
+        1,
+        Duration::from_secs(2),
+    ));
+    assert!(wait_until_counter(
+        view_counter.as_ref(),
+        1,
+        Duration::from_secs(2),
+    ));
+}
+
+#[test]
+#[ignore = "profiling fixture for transaction prefilter A/B"]
+fn transaction_prefilter_profile_fixture() {
+    let plugin_count = std::env::var("SOF_TRANSACTION_PREFILTER_PROFILE_PLUGINS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(64);
+    let iterations = std::env::var("SOF_TRANSACTION_PREFILTER_PROFILE_ITERS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(200_000);
+    let required_a = Pubkey::new_unique();
+    let required_b = Pubkey::new_unique();
+    let tx = test_transaction_with_static_accounts([required_a, required_b, Pubkey::new_unique()]);
+    let event = TransactionEventRef {
+        slot: 42,
+        commitment_status: TxCommitmentStatus::Processed,
+        confirmed_slot: None,
+        finalized_slot: None,
+        signature: Some(Signature::from([42_u8; 64])),
+        tx: &tx,
+        kind: TxKind::NonVote,
+    };
+
+    let manual_host = PluginHostBuilder::new()
+        .add_plugins((0..plugin_count).map(|_| ManualAccountMatchPlugin {
+            required_a,
+            required_b,
+        }))
+        .build();
+    let prefilter_host = PluginHostBuilder::new()
+        .add_plugins((0..plugin_count).map(|_| {
+            PrefilterTransactionPlugin {
+                filter: TransactionPrefilter::new(TransactionInterest::Critical)
+                    .with_account_required([required_a, required_b]),
+            }
+        }))
+        .build();
+
+    let manual_started_at = Instant::now();
+    let mut manual_hits = 0_usize;
+    for _ in 0..iterations {
+        manual_hits = manual_hits.saturating_add(usize::from(
+            !manual_host.classify_transaction_ref(event).is_empty(),
+        ));
+    }
+    let manual_elapsed = manual_started_at.elapsed();
+
+    let prefilter_started_at = Instant::now();
+    let mut prefilter_hits = 0_usize;
+    for _ in 0..iterations {
+        prefilter_hits = prefilter_hits.saturating_add(usize::from(
+            !prefilter_host.classify_transaction_ref(event).is_empty(),
+        ));
+    }
+    let prefilter_elapsed = prefilter_started_at.elapsed();
+
+    assert_eq!(manual_hits, prefilter_hits);
+    println!(
+        "transaction_prefilter_profile_fixture plugins={} iterations={} manual_us={} prefilter_us={}",
+        plugin_count,
+        iterations,
+        manual_elapsed.as_micros(),
+        prefilter_elapsed.as_micros()
+    );
+}
+
 fn wait_until_counter(counter: &AtomicUsize, expected: usize, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -822,4 +1332,35 @@ fn test_transaction_event_with_signature(slot: u64, signature_seed: u8) -> Trans
         tx: Arc::new(tx),
         kind: TxKind::NonVote,
     }
+}
+
+fn test_transaction_with_static_accounts<const N: usize>(
+    accounts: [Pubkey; N],
+) -> solana_transaction::versioned::VersionedTransaction {
+    let payer = Keypair::new();
+    let instruction = Instruction {
+        program_id: Pubkey::new_unique(),
+        accounts: accounts
+            .into_iter()
+            .map(|pubkey| AccountMeta::new_readonly(pubkey, false))
+            .collect(),
+        data: Vec::new(),
+    };
+    solana_transaction::versioned::VersionedTransaction::from(Transaction::new_signed_with_payer(
+        &[instruction],
+        Some(&payer.pubkey()),
+        &[&payer],
+        solana_hash::Hash::new_unique(),
+    ))
+}
+
+fn tx_mentions_account_key(
+    tx: &solana_transaction::versioned::VersionedTransaction,
+    key: Pubkey,
+) -> bool {
+    tx.message.static_account_keys().contains(&key)
+        || tx
+            .message
+            .address_table_lookups()
+            .is_some_and(|lookups| lookups.iter().any(|lookup| lookup.account_key == key))
 }

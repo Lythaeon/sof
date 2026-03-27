@@ -25,10 +25,13 @@ pub enum ForkSlotStatus {
     Orphaned,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize,
+)]
 /// Runtime commitment state for an observed transaction slot.
 pub enum TxCommitmentStatus {
     /// Transaction was observed from live shred stream, but slot is not yet confirmed.
+    #[default]
     Processed,
     /// Transaction slot is at or below current confirmed slot watermark.
     Confirmed,
@@ -51,6 +54,12 @@ impl TxCommitmentStatus {
             return Self::Confirmed;
         }
         Self::Processed
+    }
+
+    /// Returns true when this commitment satisfies one minimum delivery threshold.
+    #[must_use]
+    pub fn satisfies_minimum(self, minimum: Self) -> bool {
+        self >= minimum
     }
 }
 

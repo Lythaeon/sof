@@ -1,18 +1,320 @@
 # sof
 
-`sof` is the SOF observer/runtime crate.
+`sof` is the observer/runtime crate in the SOF stack.
 
-It is built for low-latency Solana data ingest, local runtime-derived signals, and services that
-need infrastructure-style control over replay, control-plane freshness, and bounded multicore
-packet handling.
+This crate is what you depend on when you want to:
 
-Core responsibilities:
+- ingest Solana data from raw shreds or processed providers
+- run plugins against a bounded, multicore runtime
+- derive local control-plane and commitment signals without rebuilding the ingest substrate
+- expose readiness, health, replay, and queue-pressure semantics through one runtime surface
 
-- shred ingestion (direct UDP, relay, optional gossip bootstrap)
-- optional shred verification
+The crate is intentionally infrastructure-shaped. It is not just a hook registry. It owns the
+runtime plumbing under those hooks so application code can stay focused on Solana logic instead of
+transport, replay, reconnect, dispatch, and observability.
+
+Crate responsibilities:
+
+- raw shred ingestion (direct UDP, relay, optional gossip bootstrap)
+- trusted raw-shred ingest with explicit verification posture
+- processed provider ingest (Yellowstone, LaserStream, websocket `transactionSubscribe`, generic)
 - dataset reconstruction and transaction extraction
-- plugin-driven event hooks for custom logic
-- local transaction commitment status tagging (`processed` / `confirmed` / `finalized`) without RPC dependency
+- plugin and derived-state dispatch
+- local commitment tagging (`processed` / `confirmed` / `finalized`) without RPC dependency
+- bounded runtime health, readiness, and queue observability
+
+## Why Not Rebuild This Per Application
+
+Most teams can write the application logic they want much faster than they can correctly and
+efficiently rebuild the substrate under it.
+
+If you build this layer from scratch for every Solana service, you end up re-solving the same
+problems:
+
+- raw or provider-stream ingest
+- reconnect and backoff behavior
+- duplicate suppression and other correctness boundaries
+- verification posture and trust modeling
+- packet/FEC/dataset reconstruction work
+- low-level hot-path tuning around instructions, cache misses, allocations, and copies
+- health, readiness, telemetry, and bounded degradation under pressure
+
+SOF packages that work into one runtime so application developers can stay focused on the Solana
+program or downstream service they actually want to build.
+
+That is also why SOF tries to keep semantics consistent across ingress modes. The goal is that a
+developer writes one plugin/runtime consumer model while SOF owns the provider-specific runtime
+plumbing and performance discipline underneath it.
+
+That performance claim is intentionally scoped: on the validated release fixtures on this branch,
+no regression was observed on ingest-critical runtime/provider paths, and most of those paths were
+net-positive against the older baseline implementations.
+
+## Plugin Contract
+
+The plugin model is intentionally explicit:
+
+- hook subscriptions are static at startup
+- borrowed classifiers run on the hot path and should stay cheap
+- async hooks run off the ingest hot path through bounded queues
+- queue pressure drops hook events instead of stalling ingest
+- non-transaction hooks share one bounded queue
+- accepted transactions use separate inline-critical, critical, and background lanes
+- full queues drop the incoming event; SOF does not evict older queued plugin events
+- queue ownership is shared per host/lane, not per plugin
+- SOF does not currently guarantee per-plugin fairness under pressure
+
+In other words: overflow is drop-new, not drop-oldest.
+- `PluginDispatchMode::Sequential` preserves registration order for one queued event
+- `PluginDispatchMode::BoundedConcurrent(n)` gives bounded parallelism instead of strict per-event
+  callback ordering
+- plugins are not the authoritative replay surface; derived-state consumers are
+
+That means SOF is trying to protect the runtime first and make ordering/backpressure tradeoffs
+visible, not implicit.
+
+Queue telemetry is available at aggregate host/lane level:
+
+- `sof_plugin_general_queue_depth`
+- `sof_plugin_general_dropped_events_total`
+- `sof_plugin_transaction_inline_critical_queue_depth`
+- `sof_plugin_transaction_critical_queue_depth`
+- `sof_plugin_transaction_background_queue_depth`
+
+Those metrics let operators detect backpressure, event loss, and degraded provider behavior in real
+time. Per-plugin pressure visibility is not exposed yet.
+
+## Explicit Trust Model
+
+SOF exposes two explicit raw-shred trust modes:
+
+- `public_untrusted`
+  - public gossip or direct public peers
+  - keep shred verification on by default
+  - highest independence, highest observer-side CPU cost
+- `trusted_raw_shred_provider`
+  - raw shreds delivered by a provider or private shred-distribution network you explicitly trust
+  - best fit when you want SOF's shred-native model without paying public-gossip verification cost
+  - this is the expected fast path for low-latency production SOF
+
+`processed_provider_stream` products such as Yellowstone gRPC, LaserStream, or websocket feeds are
+easier to consume, but they are a different product category. They are not `SOF_SHRED_TRUST_MODE`
+values because they do not feed SOF raw shreds.
+
+`trusted_raw_shred_provider` disables local shred verification by default. Misuse can let invalid
+data enter the observer pipeline. Treat it as a trust-boundary choice, not a generic speed knob.
+
+SOF exposes those processed feeds through `ProviderStreamMode`. In that path, provider updates go
+straight into transaction or transaction-view-batch dispatch instead of the packet/shred/FEC
+pipeline.
+
+Implemented provider-stream adapters:
+
+- Yellowstone gRPC
+- LaserStream gRPC
+- websocket `transactionSubscribe`
+
+Built-in hook surface by provider mode:
+
+- Yellowstone gRPC: `on_transaction`
+- LaserStream gRPC: `on_transaction`
+- websocket `transactionSubscribe`: `on_transaction`
+- built-in processed providers do not expose standalone control-plane hooks such
+  as `on_recent_blockhash`, `on_slot_status`, `on_cluster_topology`,
+  `on_leader_schedule`, or `on_reorg`
+
+Built-in durability behavior:
+
+- Yellowstone gRPC: explicit replay modes
+  - `Live`: start at stream head
+  - `Resume` (default): start live, resume from tracked slot after reconnect
+  - `FromSlot(n)`: start from slot `n`, then continue with tracked resume behavior
+  - built-in Yellowstone startup now owns the first acknowledged session as the
+    live session; it does not open a throwaway preflight subscription first
+- LaserStream gRPC: same explicit replay modes on top of SDK replay and slot-watermark tracking
+  - built-in LaserStream startup now keeps the first successful subscribe as
+    the live stream too, instead of dropping an initial preflight session
+- websocket `transactionSubscribe`: uses a stall watchdog and best-effort HTTP RPC gap backfill on
+  reconnect when SOF has a matching HTTP endpoint
+  - if replay is enabled, startup now fails unless that HTTP endpoint is explicit or derivable from
+    the websocket URL
+  - this remains best-effort because `transactionSubscribe` itself has no replay cursor
+  - SOF can fill recent slot gaps and suppress replay duplicates, but it cannot promise stronger
+    durability than the websocket provider plus HTTP RPC backfill path can actually provide
+  - built-in websocket startup also promotes the first acknowledged session to
+    the live stream, so there is no extra preflight handoff gap
+- built-in provider adapters emit explicit source health transitions into SOF,
+  and unexpected provider ingress closure is treated as a runtime failure rather
+  than a clean stop
+  - provider-source health is also exposed through the runtime observability
+    endpoint, so reconnecting/unhealthy provider states are visible as metrics
+  - provider `/readyz` stays unready until a built-in source has actually
+    reached a healthy session, or until a generic producer has emitted real
+    ingress progress
+  - generic provider replay dedupe also covers transaction-log and
+    transaction-view-batch updates now, not only transaction/control-plane
+    events
+  - provider replay dedupe is runtime-wide for the active provider ingress
+    before plugin/derived-state dispatch; it is not a per-plugin cache
+  - SOF does not run raw-shred and provider-stream ingest together inside one
+    observer runtime, so there is no cross-family replay dedupe boundary inside
+    a single running SOF instance
+
+Provider config defaults are inclusive:
+
+- vote transactions are included unless you explicitly set a vote filter
+- failed transactions are included unless you explicitly set a failed filter
+
+Built-in processed provider modes are fixed-surface and fail fast when you ask
+for hooks they do not emit. `ProviderStreamMode::Generic` is the flexible mode:
+it can accept richer control-plane updates from a custom producer, and
+`SOF_PROVIDER_STREAM_CAPABILITY_POLICY` controls whether unsupported requests
+warn or fail there.
+
+When generic mode continues under `warn`, SOF now exports that degraded
+capability state through runtime observability metrics instead of only emitting
+one startup log line.
+
+If a generic provider is intentionally finite, enable
+`SOF_PROVIDER_STREAM_ALLOW_EOF=true` so a bounded stream can terminate cleanly
+instead of being treated as an unexpected live-ingress closure.
+
+The same capability checks apply to derived-state consumers, not just plugins.
+
+SOF's internal transaction classifier hooks, including `transaction_prefilter`,
+`accepts_transaction_ref`, and `transaction_interest_ref`, work on the
+Yellowstone, LaserStream, and websocket transaction adapters because all three
+feed full transactions into `on_transaction`.
+
+Transaction-family hooks can also choose delivery commitment uniformly across
+all ingest modes:
+
+```rust
+use sof::framework::{PluginConfig, TxCommitmentStatus};
+
+let config = PluginConfig::new()
+    .with_transaction()
+    .at_commitment(TxCommitmentStatus::Confirmed);
+
+let exact = PluginConfig::new()
+    .with_transaction()
+    .only_at_commitment(TxCommitmentStatus::Finalized);
+```
+
+If neither selector is set, SOF defaults to
+`at_commitment(TxCommitmentStatus::Processed)`, so transaction-family hooks see
+all commitment levels.
+
+`sof-tx` is a different case: the existing SOF adapters are complete today on
+raw-shred/gossip runtimes, or on `ProviderStreamMode::Generic` when the custom
+producer also supplies the full control-plane feed. Built-in Yellowstone,
+LaserStream, and websocket adapters remain transaction-first today, so SOF
+explicitly rejects those adapters at runtime/config validation time.
+
+That tradeoff should be explicit: public gossip is the independent baseline, trusted raw shred
+distribution is the fast path, and processed provider streams are a different observer model.
+
+Switching ingress families is therefore not only a connectivity choice. It is also a semantic
+choice:
+
+- raw-shred modes expose the richest local observer/control-plane surface
+- built-in processed providers are narrower on purpose
+- `ProviderStreamMode::Generic` exists when a custom producer needs to restore that richer surface
+
+`ProviderStreamMode::Generic` is SOF's typed adapter boundary. A custom
+producer ingests any upstream format it wants and maps it into
+`ProviderStreamUpdate` before handing it to the runtime.
+
+That update surface is:
+
+- `Transaction`
+- `SerializedTransaction`
+- `TransactionLog`
+- `TransactionViewBatch`
+- `RecentBlockhash`
+- `SlotStatus`
+- `ClusterTopology`
+- `LeaderSchedule`
+- `Reorg`
+- `Health`
+
+The runtime then routes those typed updates into the normal SOF surfaces:
+
+- `Transaction` / `SerializedTransaction`
+  - `on_transaction`
+  - derived-state transaction apply when enabled
+  - synthesized `on_recent_blockhash` from the transaction message when requested
+- `TransactionLog`
+  - `on_transaction_log`
+- `TransactionViewBatch`
+  - `on_transaction_view_batch`
+- `RecentBlockhash`
+  - `on_recent_blockhash`
+- `SlotStatus`
+  - `on_slot_status`
+- `ClusterTopology`
+  - `on_cluster_topology`
+- `LeaderSchedule`
+  - `on_leader_schedule`
+- `Reorg`
+  - `on_reorg`
+- `Health`
+  - provider health/readiness/observability only
+  - not a plugin callback
+
+So `Generic` should be read as “custom provider adapter feeds SOF's typed
+provider event surface.”
+
+Programmatic setup uses the typed runtime API:
+
+```rust
+use sof::runtime::{RuntimeSetup, ShredTrustMode};
+
+let setup = RuntimeSetup::new()
+    .with_shred_trust_mode(ShredTrustMode::TrustedRawShredProvider);
+```
+
+The equivalent env knob is:
+
+```bash
+SOF_SHRED_TRUST_MODE=trusted_raw_shred_provider
+```
+
+Do not treat this as a generic “fast mode” switch. It is only correct when the upstream raw shred
+source is explicitly trusted. If you are still on public gossip or public peers, `public_untrusted`
+is the right mode.
+
+If you need to analyze only a specific gossip peer set, pin runtime switching to the configured
+entrypoints:
+
+```bash
+SOF_GOSSIP_ENTRYPOINT=1.2.3.4:8001,5.6.7.8:8001
+SOF_GOSSIP_ENTRYPOINT_PINNED=true
+```
+
+Trusted raw shred ingress still runs through the normal SOF pipeline after admission:
+
+- parse and classify raw packets
+- optional FEC recovery
+- dataset and transaction reconstruction
+- plugin and runtime-extension dispatch
+
+The trust-mode change only affects the default verification posture. It does not bypass
+reconstruction or plugin delivery.
+
+See the concrete example in
+[`examples/trusted_raw_shred_provider.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/trusted_raw_shred_provider.rs).
+For Yellowstone gRPC, see
+[`examples/provider_stream_yellowstone_grpc.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/provider_stream_yellowstone_grpc.rs).
+For LaserStream, see
+[`examples/provider_stream_laserstream.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/provider_stream_laserstream.rs).
+For websocket `transactionSubscribe`, see
+[`examples/provider_stream_websocket_transaction.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/provider_stream_websocket_transaction.rs).
+
+Build flags:
+
+- Yellowstone gRPC and LaserStream gRPC: `provider-grpc`
+- websocket `transactionSubscribe`: `provider-websocket`
 
 ## At a Glance
 
@@ -20,12 +322,40 @@ Core responsibilities:
 - Attach `Plugin` or `RuntimeExtension` consumers
 - Run with built-in UDP ingress or external kernel-bypass ingress
 - Treat SOF as a local market-data and control-plane engine, not just a passive observer
+- Reuse one optimized runtime foundation instead of rebuilding ingest/perf/correctness plumbing per service
 - Use packet-worker and dataset-worker fanout to keep multi-core hosts busy under sustained shred load
 - Consume local slot/reorg/transaction/account-touch signals
 - Use the replayable derived-state feed for restart-safe stateful consumers
 - Apply typed gossip and ingest tuning profiles instead of env-string bundles
 - Keep more runtime work on borrowed/shared data instead of eagerly allocating owned transaction or dataset payload copies
 - Drop duplicate or conflicting shred observations before they can re-emit duplicate dataset or transaction events downstream
+- Treat robustness and accuracy as first-class runtime behavior, not downstream application glue
+
+## Scheduling Model Today
+
+SOF already has an explicit execution shape:
+
+- raw ingress fans out into packet workers
+- completed datasets fan out into dataset workers
+- provider sessions are supervised independently and feed the same downstream runtime surface where
+  semantics line up
+- plugin dispatch is explicitly queued and bounded
+
+What is not claimed yet:
+
+- a first-class NUMA-aware scheduler
+- automatic host-topology placement
+- one universal worker geometry for every host class
+
+Pinning and thread-count controls exist, but high-end placement still needs measurement on the
+actual host.
+
+Current playbook:
+
+- public single-socket VPS: start from `sof-gossip-tuning`'s validated `Vps` preset
+- processed provider mode: tune replay/durability and source health first, not packet/shred knobs
+- trusted raw-shred mode: keep receive, packet-worker, and dataset-worker placement local to the same socket when possible
+- multi-socket hosts: treat cross-socket fanout as opt-in after measurement, not a default
 
 ## Install
 
@@ -36,13 +366,13 @@ cargo add sof
 Optional gossip bootstrap support at compile time:
 
 ```toml
-sof = { version = "0.12.0", features = ["gossip-bootstrap"] }
+sof = { version = "0.13.0", features = ["gossip-bootstrap"] }
 ```
 
 Optional external `kernel-bypass` ingress support:
 
 ```toml
-sof = { version = "0.12.0", features = ["kernel-bypass"] }
+sof = { version = "0.13.0", features = ["kernel-bypass"] }
 ```
 
 The bundled `sof-solana-gossip` backend defaults to SOF's lightweight in-memory duplicate/conflict
@@ -189,9 +519,15 @@ async fn main() -> Result<(), sof::runtime::RuntimeError> {
     // Publish batches from your bypass receiver thread:
     // let _ok = tx.send_batch(batch, false);
     // Spawn your kernel-bypass receiver and forward batches into `tx`.
-    sof::runtime::run_async_with_kernel_bypass_ingress(rx).await
+    sof::runtime::ObserverRuntime::new()
+        .with_kernel_bypass_ingress(rx)
+        .run_until_termination_signal()
+        .await
 }
 ```
+
+The packaged noop inline observer example now supports AF_XDP external ingress directly when built
+with `--features "kernel-bypass gossip-bootstrap"` and launched with `SOF_AF_XDP_IFACE=<iface>`.
 
 Run the kernel-bypass ingress metrics example for 180 seconds:
 
@@ -317,6 +653,48 @@ prefix early, inline dispatch falls back to the completed-dataset point for that
 If other plugins or subsystems still need deferred dataset processing, SOF can deliver
 the inline transaction hook first and then continue the same dataset through the
 standard dataset-worker path for those remaining consumers.
+
+For account/signature-driven transaction filters, prefer `TransactionPrefilter`
+over custom `transaction_interest_ref` logic:
+
+```rust
+use async_trait::async_trait;
+use solana_pubkey::Pubkey;
+use sof::framework::{
+    Plugin, PluginConfig, TransactionDispatchMode, TransactionInterest, TransactionPrefilter,
+};
+
+#[derive(Clone, Debug)]
+struct PoolWatcher {
+    filter: TransactionPrefilter,
+}
+
+impl Default for PoolWatcher {
+    fn default() -> Self {
+        let pool = Pubkey::new_unique();
+        let program = Pubkey::new_unique();
+        Self {
+            filter: TransactionPrefilter::new(TransactionInterest::Critical)
+                .with_account_required([pool, program]),
+        }
+    }
+}
+
+#[async_trait]
+impl Plugin for PoolWatcher {
+    fn config(&self) -> PluginConfig {
+        PluginConfig::new().with_transaction_mode(TransactionDispatchMode::Inline)
+    }
+
+    fn transaction_prefilter(&self) -> Option<&TransactionPrefilter> {
+        Some(&self.filter)
+    }
+}
+```
+
+When every in-scope inline transaction plugin uses a compiled prefilter and all
+of them ignore the tx, SOF can classify that transaction from a sanitized view
+and skip full owned `VersionedTransaction` decode entirely.
 
 When observability is enabled, SOF exports exact inline latency counters:
 

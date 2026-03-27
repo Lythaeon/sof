@@ -1,13 +1,53 @@
+#![allow(clippy::missing_docs_in_private_items)]
+#![allow(clippy::result_large_err)]
+
 use super::*;
 use crate::framework::AccountTouchEvent;
 use crate::framework::TransactionInterest;
-use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender, TrySendError};
+use crossbeam_queue::ArrayQueue;
 use futures_util::{FutureExt, StreamExt, stream};
 use smallvec::SmallVec;
+use solana_pubkey::Pubkey;
+use solana_signature::Signature;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::panic::AssertUnwindSafe;
+use std::str::FromStr;
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicUsize;
+use std::sync::mpsc::TrySendError as StdTrySendError;
 use std::time::Instant;
+
+struct DebugTxTraceConfig {
+    pool_account: Pubkey,
+}
+
+fn debug_tx_trace_config() -> Option<&'static DebugTxTraceConfig> {
+    static CONFIG: OnceLock<Option<DebugTxTraceConfig>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            std::env::var("SOF_DEBUG_TRACE_TX_POOL")
+                .ok()
+                .and_then(|value| Pubkey::from_str(&value).ok())
+                .map(|pool_account| DebugTxTraceConfig { pool_account })
+        })
+        .as_ref()
+}
+
+fn debug_tx_trace_signature(event: &TransactionEvent) -> Option<Signature> {
+    let config = debug_tx_trace_config()?;
+    if !event
+        .tx
+        .message
+        .static_account_keys()
+        .contains(&config.pool_account)
+    {
+        return None;
+    }
+    event
+        .signature
+        .or_else(|| event.tx.signatures.first().copied())
+}
 
 /// Names one plugin callback family for queue-drop telemetry and worker logs.
 #[derive(Clone, Copy, Debug)]
@@ -20,6 +60,8 @@ pub(super) enum PluginHookKind {
     Dataset,
     /// Accepted transaction callbacks.
     Transaction,
+    /// Transaction-log callbacks.
+    TransactionLog,
     /// Completed-dataset transaction-batch callbacks.
     TransactionBatch,
     /// Completed-dataset transaction-view-batch callbacks.
@@ -46,6 +88,7 @@ impl PluginHookKind {
             Self::Shred => "on_shred",
             Self::Dataset => "on_dataset",
             Self::Transaction => "on_transaction",
+            Self::TransactionLog => "on_transaction_log",
             Self::TransactionBatch => "on_transaction_batch",
             Self::TransactionViewBatch => "on_transaction_view_batch",
             Self::AccountTouch => "on_account_touch",
@@ -86,6 +129,8 @@ pub(super) struct PluginDispatchTargets {
     pub(super) shred: Arc<[Arc<dyn ObserverPlugin>]>,
     /// Plugins interested in dataset callbacks.
     pub(super) dataset: Arc<[Arc<dyn ObserverPlugin>]>,
+    /// Plugins interested in transaction-log callbacks.
+    pub(super) transaction_log: Arc<[Arc<dyn ObserverPlugin>]>,
     /// Plugins interested in transaction-batch callbacks.
     pub(super) transaction_batch: Arc<[Arc<dyn ObserverPlugin>]>,
     /// Plugins interested in transaction-view-batch callbacks.
@@ -110,6 +155,7 @@ impl PluginDispatchTargets {
         self.raw_packet.is_empty()
             && self.shred.is_empty()
             && self.dataset.is_empty()
+            && self.transaction_log.is_empty()
             && self.transaction_batch.is_empty()
             && self.transaction_view_batch.is_empty()
             && self.account_touch.is_empty()
@@ -127,6 +173,7 @@ impl PluginDispatchTargets {
             PluginHookKind::Shred => &self.shred,
             PluginHookKind::Dataset => &self.dataset,
             PluginHookKind::Transaction => &[],
+            PluginHookKind::TransactionLog => &self.transaction_log,
             PluginHookKind::TransactionBatch => &[],
             PluginHookKind::TransactionViewBatch => &[],
             PluginHookKind::AccountTouch => &self.account_touch,
@@ -143,9 +190,13 @@ impl PluginDispatchTargets {
 /// Shared sender/counters for asynchronous plugin event delivery.
 pub(super) struct PluginDispatcher {
     /// Bounded queue sender for plugin dispatch events.
-    tx: CrossbeamSender<PluginDispatchEvent>,
+    tx: EventDispatchSender,
     /// Counter of hook events dropped due to queue pressure or closure.
     dropped_events: Arc<AtomicU64>,
+    /// Current queue depth.
+    queue_depth: Arc<AtomicU64>,
+    /// Maximum queue depth observed since startup.
+    max_queue_depth: Arc<AtomicU64>,
 }
 
 impl PluginDispatcher {
@@ -158,10 +209,17 @@ impl PluginDispatcher {
         if targets.is_empty() {
             return None;
         }
-        let (tx, rx) = crossbeam_channel::bounded(queue_capacity.max(1));
+        let (tx, rx) = create_event_dispatch_queue(queue_capacity.max(1));
         let dropped_events = Arc::new(AtomicU64::new(0));
+        let queue_depth = Arc::clone(&tx.queue.queue_depth);
+        let max_queue_depth = Arc::clone(&tx.queue.max_queue_depth);
         spawn_dispatch_worker(targets, rx, dispatch_mode.normalized());
-        Some(Self { tx, dropped_events })
+        Some(Self {
+            tx,
+            dropped_events,
+            queue_depth,
+            max_queue_depth,
+        })
     }
 
     /// Attempts non-blocking enqueue of one hook event.
@@ -169,10 +227,10 @@ impl PluginDispatcher {
         let hook = event.hook_kind();
         match self.tx.try_send(event) {
             Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
+            Err(StdTrySendError::Full(_)) => {
                 self.record_drop(hook, PluginDispatchFailureReason::QueueFull);
             }
-            Err(TrySendError::Disconnected(_)) => {
+            Err(StdTrySendError::Disconnected(_)) => {
                 self.record_drop(hook, PluginDispatchFailureReason::QueueClosed);
             }
         }
@@ -181,6 +239,16 @@ impl PluginDispatcher {
     /// Returns total number of dropped hook events.
     pub(super) fn dropped_count(&self) -> u64 {
         self.dropped_events.load(Ordering::Relaxed)
+    }
+
+    /// Returns current queue depth across the general plugin dispatcher.
+    pub(super) fn queue_depth(&self) -> u64 {
+        self.queue_depth.load(Ordering::Relaxed)
+    }
+
+    /// Returns maximum queue depth observed since startup.
+    pub(super) fn max_queue_depth(&self) -> u64 {
+        self.max_queue_depth.load(Ordering::Relaxed)
     }
 
     /// Increments dropped counters and emits sampled warning logs.
@@ -254,25 +322,39 @@ pub(super) struct ClassifiedTransactionBatchDispatch;
 impl ClassifiedTransactionBatchDispatch {
     /// Builds one shared batch dispatch only when at least one plugin subscribed.
     pub(super) fn from_plugins(
-        plugins: Arc<[Arc<dyn ObserverPlugin>]>,
+        plugins: &[Arc<dyn ObserverPlugin>],
+        commitment_selectors: &[crate::framework::plugin::TransactionCommitmentSelector],
         inline_preferences: &[bool],
         event: crate::framework::TransactionBatchEvent,
         completed_at: Instant,
     ) -> Option<AcceptedTransactionBatchDispatch> {
-        match plugins.len() {
+        let selected_indices: SmallVec<[usize; 4]> = commitment_selectors
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(index, selector)| {
+                selector.matches(event.commitment_status).then_some(index)
+            })
+            .collect();
+        match selected_indices.len() {
             0 => None,
             1 => Some(AcceptedTransactionBatchDispatch::Single {
-                plugin: Arc::clone(plugins.first()?),
+                plugin: Arc::clone(plugins.get(*selected_indices.first()?)?),
                 event,
                 completed_at,
             }),
             _ => Some(AcceptedTransactionBatchDispatch::Multi {
-                plugins,
+                plugins: Arc::from(
+                    selected_indices
+                        .iter()
+                        .filter_map(|index| plugins.get(*index).cloned())
+                        .collect::<Vec<_>>(),
+                ),
                 event: Arc::new(event),
                 completed_at,
-                prefers_inline: inline_preferences
+                prefers_inline: selected_indices
                     .iter()
-                    .all(|prefers_inline| *prefers_inline),
+                    .all(|index| inline_preferences.get(*index).copied().unwrap_or(false)),
             }),
         }
     }
@@ -284,25 +366,39 @@ pub(super) struct ClassifiedTransactionViewBatchDispatch;
 impl ClassifiedTransactionViewBatchDispatch {
     /// Builds one shared view-batch dispatch only when at least one plugin subscribed.
     pub(super) fn from_plugins(
-        plugins: Arc<[Arc<dyn ObserverPlugin>]>,
+        plugins: &[Arc<dyn ObserverPlugin>],
+        commitment_selectors: &[crate::framework::plugin::TransactionCommitmentSelector],
         inline_preferences: &[bool],
         event: crate::framework::TransactionViewBatchEvent,
         completed_at: Instant,
     ) -> Option<AcceptedTransactionViewBatchDispatch> {
-        match plugins.len() {
+        let selected_indices: SmallVec<[usize; 4]> = commitment_selectors
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(index, selector)| {
+                selector.matches(event.commitment_status).then_some(index)
+            })
+            .collect();
+        match selected_indices.len() {
             0 => None,
             1 => Some(AcceptedTransactionViewBatchDispatch::Single {
-                plugin: Arc::clone(plugins.first()?),
+                plugin: Arc::clone(plugins.get(*selected_indices.first()?)?),
                 event,
                 completed_at,
             }),
             _ => Some(AcceptedTransactionViewBatchDispatch::Multi {
-                plugins,
+                plugins: Arc::from(
+                    selected_indices
+                        .iter()
+                        .filter_map(|index| plugins.get(*index).cloned())
+                        .collect::<Vec<_>>(),
+                ),
                 event: Arc::new(event),
                 completed_at,
-                prefers_inline: inline_preferences
+                prefers_inline: selected_indices
                     .iter()
-                    .all(|prefers_inline| *prefers_inline),
+                    .all(|index| inline_preferences.get(*index).copied().unwrap_or(false)),
             }),
         }
     }
@@ -331,31 +427,10 @@ pub(super) enum AcceptedTransactionDispatch {
         /// Zero-based transaction position inside the completed dataset.
         dataset_tx_position: u32,
     },
-    /// One interested plugin receives a shared event payload.
-    SingleShared {
-        /// Interested plugin.
-        plugin: Arc<dyn ObserverPlugin>,
-        /// Accepted transaction payload.
-        event: Arc<TransactionEvent>,
-        /// Time when the completed dataset became available to runtime processing.
-        completed_at: Instant,
-        /// Time when the first shred for this completed dataset entered runtime processing.
-        first_shred_observed_at: Instant,
-        /// Time when the last shred for this completed dataset entered runtime processing.
-        last_shred_observed_at: Instant,
-        /// Whether inline dispatch came from early prefix reconstruction or dataset fallback.
-        inline_source: InlineTransactionDispatchSource,
-        /// Delivery priority assigned by the host.
-        interest: TransactionInterest,
-        /// Number of decoded transactions in the completed dataset that produced this event.
-        dataset_tx_count: u32,
-        /// Zero-based transaction position inside the completed dataset.
-        dataset_tx_position: u32,
-    },
     /// Multiple interested plugins share the same event payload.
     Multi {
         /// Interested plugins.
-        plugins: Arc<[Arc<dyn ObserverPlugin>]>,
+        plugins: SmallVec<[Arc<dyn ObserverPlugin>; 2]>,
         /// Accepted transaction payload.
         event: Arc<TransactionEvent>,
         /// Time when the completed dataset became available to runtime processing.
@@ -501,40 +576,74 @@ impl ClassifiedTransactionDispatch {
                 critical_plugins,
                 background_plugins,
             } => {
-                let event = Arc::new(event);
-                let critical_inline = AcceptedTransactionDispatch::from_plugins(
-                    critical_inline_plugins,
-                    Arc::clone(&event),
-                    completed_at,
-                    first_shred_observed_at,
-                    last_shred_observed_at,
-                    inline_source,
-                    TransactionInterest::Critical,
-                    dataset_tx_count,
-                    dataset_tx_position,
-                );
-                let critical = AcceptedTransactionDispatch::from_plugins(
-                    critical_plugins,
-                    Arc::clone(&event),
-                    completed_at,
-                    first_shred_observed_at,
-                    last_shred_observed_at,
-                    inline_source,
-                    TransactionInterest::Critical,
-                    dataset_tx_count,
-                    dataset_tx_position,
-                );
-                let background = AcceptedTransactionDispatch::from_plugins(
-                    background_plugins,
-                    event,
-                    completed_at,
-                    first_shred_observed_at,
-                    last_shred_observed_at,
-                    inline_source,
-                    TransactionInterest::Background,
-                    dataset_tx_count,
-                    dataset_tx_position,
-                );
+                let has_critical_inline = !critical_inline_plugins.is_empty();
+                let has_critical = !critical_plugins.is_empty();
+                let has_background = !background_plugins.is_empty();
+                let mut remaining_lanes = 0usize;
+                if has_critical_inline {
+                    remaining_lanes = remaining_lanes.saturating_add(1);
+                }
+                if has_critical {
+                    remaining_lanes = remaining_lanes.saturating_add(1);
+                }
+                if has_background {
+                    remaining_lanes = remaining_lanes.saturating_add(1);
+                }
+                let fallback_event = event.clone();
+                let mut shared_event = Some(event);
+                let mut next_lane_event = || -> Option<TransactionEvent> {
+                    remaining_lanes = remaining_lanes.saturating_sub(1);
+                    if remaining_lanes == 0 {
+                        shared_event.take()
+                    } else {
+                        shared_event.as_ref().cloned()
+                    }
+                };
+                let critical_inline = if has_critical_inline {
+                    AcceptedTransactionDispatch::from_plugins(
+                        critical_inline_plugins,
+                        next_lane_event().unwrap_or_else(|| fallback_event.clone()),
+                        completed_at,
+                        first_shred_observed_at,
+                        last_shred_observed_at,
+                        inline_source,
+                        TransactionInterest::Critical,
+                        dataset_tx_count,
+                        dataset_tx_position,
+                    )
+                } else {
+                    None
+                };
+                let critical = if has_critical {
+                    AcceptedTransactionDispatch::from_plugins(
+                        critical_plugins,
+                        next_lane_event().unwrap_or_else(|| fallback_event.clone()),
+                        completed_at,
+                        first_shred_observed_at,
+                        last_shred_observed_at,
+                        inline_source,
+                        TransactionInterest::Critical,
+                        dataset_tx_count,
+                        dataset_tx_position,
+                    )
+                } else {
+                    None
+                };
+                let background = if has_background {
+                    AcceptedTransactionDispatch::from_plugins(
+                        background_plugins,
+                        next_lane_event().unwrap_or_else(|| fallback_event.clone()),
+                        completed_at,
+                        first_shred_observed_at,
+                        last_shred_observed_at,
+                        inline_source,
+                        TransactionInterest::Background,
+                        dataset_tx_count,
+                        dataset_tx_position,
+                    )
+                } else {
+                    None
+                };
                 (critical_inline, critical, background)
             }
         }
@@ -583,7 +692,7 @@ impl AcceptedTransactionDispatch {
     )]
     pub(super) fn from_plugins(
         plugins: SmallVec<[Arc<dyn ObserverPlugin>; 2]>,
-        event: Arc<TransactionEvent>,
+        event: TransactionEvent,
         completed_at: Instant,
         first_shred_observed_at: Instant,
         last_shred_observed_at: Instant,
@@ -594,7 +703,7 @@ impl AcceptedTransactionDispatch {
     ) -> Option<Self> {
         match plugins.len() {
             0 => None,
-            1 => Some(Self::SingleShared {
+            1 => Some(Self::SingleOwned {
                 plugin: plugins.into_iter().next()?,
                 event,
                 completed_at,
@@ -606,8 +715,8 @@ impl AcceptedTransactionDispatch {
                 dataset_tx_position,
             }),
             _ => Some(Self::Multi {
-                plugins: Arc::from(plugins.into_vec()),
-                event,
+                plugins,
+                event: Arc::new(event),
                 completed_at,
                 first_shred_observed_at,
                 last_shred_observed_at,
@@ -623,7 +732,7 @@ impl AcceptedTransactionDispatch {
     fn shard_key(&self) -> u64 {
         let event = match self {
             Self::SingleOwned { event, .. } => event,
-            Self::SingleShared { event, .. } | Self::Multi { event, .. } => event.as_ref(),
+            Self::Multi { event, .. } => event.as_ref(),
         };
         let mut hasher = DefaultHasher::new();
         event.slot.hash(&mut hasher);
@@ -641,15 +750,31 @@ impl AcceptedTransactionDispatch {
 /// Sharded dispatcher for accepted-transaction callbacks.
 pub(super) struct TransactionPluginDispatcher {
     /// Bounded low-jitter queue for inline-preferred critical transaction hooks.
-    inline_critical_txs: Arc<[CrossbeamSender<AcceptedTransactionDispatch>]>,
+    inline_critical_txs: Arc<[TxDispatchSender]>,
     /// Bounded per-worker queues for critical transaction hooks.
-    critical_txs: Arc<[CrossbeamSender<AcceptedTransactionDispatch>]>,
+    critical_txs: Arc<[TxDispatchSender]>,
     /// Bounded per-worker queues for background transaction hooks.
-    background_txs: Arc<[CrossbeamSender<AcceptedTransactionDispatch>]>,
+    background_txs: Arc<[TxDispatchSender]>,
     /// Total critical transaction hook drops.
     critical_dropped_events: Arc<AtomicU64>,
     /// Total background transaction hook drops.
     background_dropped_events: Arc<AtomicU64>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct TransactionDispatchQueueMetrics {
+    /// Current queue depth for the inline-critical lane.
+    pub(crate) inline_critical_queue_depth: u64,
+    /// Maximum queue depth observed for the inline-critical lane.
+    pub(crate) inline_critical_max_queue_depth: u64,
+    /// Current aggregate queue depth across critical lanes.
+    pub(crate) critical_queue_depth: u64,
+    /// Maximum aggregate queue depth observed across critical lanes.
+    pub(crate) critical_max_queue_depth: u64,
+    /// Current aggregate queue depth across background lanes.
+    pub(crate) background_queue_depth: u64,
+    /// Maximum aggregate queue depth observed across background lanes.
+    pub(crate) background_max_queue_depth: u64,
 }
 
 impl TransactionPluginDispatcher {
@@ -669,7 +794,7 @@ impl TransactionPluginDispatcher {
         let background_dropped_events = Arc::new(AtomicU64::new(0));
         let mut inline_critical_txs = Vec::with_capacity(inline_worker_count);
         for worker_index in 0..inline_worker_count {
-            let (tx, rx) = crossbeam_channel::bounded(inline_queue_capacity);
+            let (tx, rx) = create_tx_dispatch_queue(inline_queue_capacity);
             spawn_transaction_dispatch_worker(
                 worker_index,
                 TransactionDispatchPriority::InlineCritical,
@@ -680,7 +805,7 @@ impl TransactionPluginDispatcher {
         }
         let mut critical_txs = Vec::with_capacity(worker_count);
         for worker_index in 0..worker_count {
-            let (tx, rx) = crossbeam_channel::bounded(critical_queue_capacity);
+            let (tx, rx) = create_tx_dispatch_queue(critical_queue_capacity);
             spawn_transaction_dispatch_worker(
                 worker_index,
                 TransactionDispatchPriority::Critical,
@@ -691,7 +816,7 @@ impl TransactionPluginDispatcher {
         }
         let mut background_txs = Vec::with_capacity(background_worker_count);
         for worker_index in 0..background_worker_count {
-            let (tx, rx) = crossbeam_channel::bounded(background_queue_capacity);
+            let (tx, rx) = create_tx_dispatch_queue(background_queue_capacity);
             spawn_transaction_dispatch_worker(
                 worker_index,
                 TransactionDispatchPriority::Background,
@@ -742,7 +867,7 @@ impl TransactionPluginDispatcher {
     fn dispatch_to_lane(
         &self,
         priority: TransactionDispatchPriority,
-        txs: &[CrossbeamSender<AcceptedTransactionDispatch>],
+        txs: &[TxDispatchSender],
         shard: usize,
         event: AcceptedTransactionDispatch,
     ) {
@@ -752,10 +877,10 @@ impl TransactionPluginDispatcher {
         };
         match tx.try_send(event) {
             Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
+            Err(StdTrySendError::Full(_)) => {
                 self.record_drop(priority, PluginDispatchFailureReason::QueueFull);
             }
-            Err(TrySendError::Disconnected(_)) => {
+            Err(StdTrySendError::Disconnected(_)) => {
                 self.record_drop(priority, PluginDispatchFailureReason::QueueClosed);
             }
         }
@@ -769,6 +894,43 @@ impl TransactionPluginDispatcher {
     /// Returns dropped background transaction callbacks.
     pub(super) fn background_dropped_count(&self) -> u64 {
         self.background_dropped_events.load(Ordering::Relaxed)
+    }
+
+    /// Returns queue-depth telemetry aggregated by transaction-dispatch lane.
+    pub(super) fn queue_metrics(&self) -> TransactionDispatchQueueMetrics {
+        TransactionDispatchQueueMetrics {
+            inline_critical_queue_depth: self
+                .inline_critical_txs
+                .iter()
+                .map(TxDispatchSender::queue_depth)
+                .sum(),
+            inline_critical_max_queue_depth: self
+                .inline_critical_txs
+                .iter()
+                .map(TxDispatchSender::max_queue_depth)
+                .max()
+                .unwrap_or(0),
+            critical_queue_depth: self
+                .critical_txs
+                .iter()
+                .map(TxDispatchSender::queue_depth)
+                .sum(),
+            critical_max_queue_depth: self
+                .critical_txs
+                .iter()
+                .map(TxDispatchSender::max_queue_depth)
+                .sum(),
+            background_queue_depth: self
+                .background_txs
+                .iter()
+                .map(TxDispatchSender::queue_depth)
+                .sum(),
+            background_max_queue_depth: self
+                .background_txs
+                .iter()
+                .map(TxDispatchSender::max_queue_depth)
+                .sum(),
+        }
     }
 
     /// Records one dropped transaction callback.
@@ -815,6 +977,8 @@ pub(super) enum PluginDispatchEvent {
     Shred(ShredEvent),
     /// Reassembled dataset callback payload.
     Dataset(DatasetEvent),
+    /// Provider/websocket transaction-log callback payload targeted to a subset of plugins.
+    SelectedTransactionLog(SelectedTransactionLogDispatch),
     /// Completed-dataset transaction-batch callback payload.
     TransactionBatch(AcceptedTransactionBatchDispatch),
     /// Completed-dataset transaction-view-batch callback payload.
@@ -842,6 +1006,7 @@ impl PluginDispatchEvent {
             Self::RawPacket(_) => PluginHookKind::RawPacket,
             Self::Shred(_) => PluginHookKind::Shred,
             Self::Dataset(_) => PluginHookKind::Dataset,
+            Self::SelectedTransactionLog(_) => PluginHookKind::TransactionLog,
             Self::TransactionBatch(_) => PluginHookKind::TransactionBatch,
             Self::TransactionViewBatch(_) => PluginHookKind::TransactionViewBatch,
             Self::AccountTouch(_) => PluginHookKind::AccountTouch,
@@ -867,10 +1032,55 @@ pub(super) enum SelectedAccountTouchDispatch {
     /// Multiple interested plugins share the same event payload.
     Multi {
         /// Selected plugin callback targets.
-        plugins: Arc<[Arc<dyn ObserverPlugin>]>,
+        plugins: SmallVec<[Arc<dyn ObserverPlugin>; 2]>,
         /// Shared event payload for the selected plugin batch.
         event: Arc<AccountTouchEvent>,
     },
+}
+
+/// One selected transaction-log callback fan-out unit.
+pub(super) enum SelectedTransactionLogDispatch {
+    /// One interested plugin receives the event directly.
+    Single {
+        /// Selected plugin callback target.
+        plugin: Arc<dyn ObserverPlugin>,
+        /// Event payload for the selected plugin.
+        event: crate::framework::TransactionLogEvent,
+    },
+    /// Multiple interested plugins share the same event payload.
+    Multi {
+        /// Selected plugin callback targets.
+        plugins: SmallVec<[Arc<dyn ObserverPlugin>; 4]>,
+        /// Shared event payload.
+        event: Arc<crate::framework::TransactionLogEvent>,
+    },
+}
+
+impl SelectedTransactionLogDispatch {
+    pub(super) fn from_plugins(
+        plugins: &[Arc<dyn ObserverPlugin>],
+        commitment_selectors: &[crate::framework::plugin::TransactionCommitmentSelector],
+        event: crate::framework::TransactionLogEvent,
+    ) -> Option<Self> {
+        let interested: SmallVec<[Arc<dyn ObserverPlugin>; 4]> = plugins
+            .iter()
+            .zip(commitment_selectors.iter().copied())
+            .filter(|(_plugin, selector)| selector.matches(event.commitment_status))
+            .filter(|(plugin, _selector)| plugin.accepts_transaction_log(&event))
+            .map(|(plugin, _minimum)| Arc::clone(plugin))
+            .collect();
+        match interested.len() {
+            0 => None,
+            1 => Some(Self::Single {
+                plugin: interested.into_iter().next()?,
+                event,
+            }),
+            _ => Some(Self::Multi {
+                plugins: interested,
+                event: Arc::new(event),
+            }),
+        }
+    }
 }
 
 /// Preclassified account-touch routing target.
@@ -937,7 +1147,7 @@ impl SelectedAccountTouchDispatch {
                 Some(Self::Single { plugin, event })
             }
             ClassifiedAccountTouchDispatch::Multi { plugins } => Some(Self::Multi {
-                plugins: Arc::from(plugins.into_vec()),
+                plugins,
                 event: Arc::new(event),
             }),
         }
@@ -947,9 +1157,10 @@ impl SelectedAccountTouchDispatch {
 /// Spawns a dedicated worker thread that drains non-transaction hook events.
 fn spawn_dispatch_worker(
     targets: PluginDispatchTargets,
-    rx: CrossbeamReceiver<PluginDispatchEvent>,
+    mut rx: EventDispatchReceiver,
     dispatch_mode: PluginDispatchMode,
 ) {
+    const DISPATCH_WORKER_DRAIN_BATCH_MAX: usize = 32;
     let spawn_result = thread::Builder::new()
         .name("sof-plugin-dispatch".to_owned())
         .spawn(move || {
@@ -960,8 +1171,23 @@ fn spawn_dispatch_worker(
                 tracing::error!("failed to create plugin dispatch runtime");
                 return;
             };
-            while let Ok(event) = rx.recv() {
-                runtime.block_on(dispatch_event(&targets, event, dispatch_mode));
+            rx.register_current_thread();
+            while let Some(first_event) = rx.recv() {
+                let mut batch = SmallVec::<[PluginDispatchEvent; 8]>::new();
+                batch.push(first_event);
+                while batch.len() < DISPATCH_WORKER_DRAIN_BATCH_MAX {
+                    match rx.try_recv() {
+                        Ok(event) => batch.push(event),
+                        Err(StdTrySendError::Full(())) | Err(StdTrySendError::Disconnected(())) => {
+                            break;
+                        }
+                    }
+                }
+                runtime.block_on(async {
+                    for event in batch {
+                        dispatch_event(&targets, event, dispatch_mode).await;
+                    }
+                });
             }
         });
     if let Err(error) = spawn_result {
@@ -969,13 +1195,134 @@ fn spawn_dispatch_worker(
     }
 }
 
+struct EventDispatchQueue {
+    ring: ArrayQueue<PluginDispatchEvent>,
+    queue_depth: Arc<AtomicU64>,
+    max_queue_depth: Arc<AtomicU64>,
+    worker_thread: OnceLock<std::thread::Thread>,
+    closed: AtomicBool,
+    sender_count: AtomicUsize,
+}
+
+struct EventDispatchSender {
+    queue: Arc<EventDispatchQueue>,
+}
+
+struct EventDispatchReceiver {
+    queue: Arc<EventDispatchQueue>,
+}
+
+fn create_event_dispatch_queue(capacity: usize) -> (EventDispatchSender, EventDispatchReceiver) {
+    let queue = Arc::new(EventDispatchQueue {
+        ring: ArrayQueue::new(capacity.max(1)),
+        queue_depth: Arc::new(AtomicU64::new(0)),
+        max_queue_depth: Arc::new(AtomicU64::new(0)),
+        worker_thread: OnceLock::new(),
+        closed: AtomicBool::new(false),
+        sender_count: AtomicUsize::new(1),
+    });
+    (
+        EventDispatchSender {
+            queue: Arc::clone(&queue),
+        },
+        EventDispatchReceiver { queue },
+    )
+}
+
+impl EventDispatchSender {
+    fn try_send(
+        &self,
+        event: PluginDispatchEvent,
+    ) -> Result<(), StdTrySendError<PluginDispatchEvent>> {
+        if self.queue.closed.load(Ordering::Acquire) {
+            return Err(StdTrySendError::Disconnected(event));
+        }
+        let queue_depth = self
+            .queue
+            .queue_depth
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        self.queue
+            .max_queue_depth
+            .fetch_max(queue_depth, Ordering::Relaxed);
+        match self.queue.ring.push(event) {
+            Ok(()) => {
+                if let Some(thread) = self.queue.worker_thread.get() {
+                    thread.unpark();
+                }
+                Ok(())
+            }
+            Err(event) => {
+                self.queue.queue_depth.fetch_sub(1, Ordering::Relaxed);
+                if self.queue.closed.load(Ordering::Acquire) {
+                    Err(StdTrySendError::Disconnected(event))
+                } else {
+                    Err(StdTrySendError::Full(event))
+                }
+            }
+        }
+    }
+}
+
+impl Clone for EventDispatchSender {
+    fn clone(&self) -> Self {
+        self.queue.sender_count.fetch_add(1, Ordering::AcqRel);
+        Self {
+            queue: Arc::clone(&self.queue),
+        }
+    }
+}
+
+impl Drop for EventDispatchSender {
+    fn drop(&mut self) {
+        if self.queue.sender_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.queue.closed.store(true, Ordering::Release);
+            if let Some(thread) = self.queue.worker_thread.get() {
+                thread.unpark();
+            }
+        }
+    }
+}
+
+impl EventDispatchReceiver {
+    fn register_current_thread(&self) {
+        drop(self.queue.worker_thread.set(std::thread::current()));
+    }
+
+    fn recv(&mut self) -> Option<PluginDispatchEvent> {
+        loop {
+            if let Some(event) = self.queue.ring.pop() {
+                self.queue.queue_depth.fetch_sub(1, Ordering::Relaxed);
+                return Some(event);
+            }
+            if self.queue.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            std::thread::park();
+        }
+    }
+
+    fn try_recv(&mut self) -> Result<PluginDispatchEvent, StdTrySendError<()>> {
+        if let Some(event) = self.queue.ring.pop() {
+            self.queue.queue_depth.fetch_sub(1, Ordering::Relaxed);
+            return Ok(event);
+        }
+        if self.queue.closed.load(Ordering::Acquire) {
+            Err(StdTrySendError::Disconnected(()))
+        } else {
+            Err(StdTrySendError::Full(()))
+        }
+    }
+}
+
 /// Spawns one dedicated worker thread for one transaction priority shard.
 fn spawn_transaction_dispatch_worker(
     worker_index: usize,
     priority: TransactionDispatchPriority,
-    rx: CrossbeamReceiver<AcceptedTransactionDispatch>,
+    mut rx: TxDispatchReceiver,
     dispatch_mode: PluginDispatchMode,
 ) {
+    const TX_DISPATCH_WORKER_DRAIN_BATCH_MAX: usize = 32;
     let thread_name = format!("sof-plugin-tx-{}-{worker_index:02}", priority.as_str());
     let spawn_result = thread::Builder::new().name(thread_name).spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -988,12 +1335,27 @@ fn spawn_transaction_dispatch_worker(
             );
             return;
         };
-        while let Ok(event) = rx.recv() {
-            runtime.block_on(dispatch_accepted_transaction_event(
-                event,
-                dispatch_mode,
-                priority,
-            ));
+        rx.register_current_thread();
+        while let Some(first_event) = rx.recv() {
+            let mut batch = SmallVec::<[AcceptedTransactionDispatch; 8]>::new();
+            batch.push(first_event);
+            while batch.len() < TX_DISPATCH_WORKER_DRAIN_BATCH_MAX {
+                match rx.try_recv() {
+                    Ok(event) => batch.push(event),
+                    Err(StdTrySendError::Full(())) | Err(StdTrySendError::Disconnected(())) => {
+                        break;
+                    }
+                }
+            }
+            let mut metrics_batch = TransactionDispatchMetricsBatch::default();
+            runtime.block_on(async {
+                for event in batch {
+                    metrics_batch.observe(
+                        dispatch_accepted_transaction_event(event, dispatch_mode, priority).await,
+                    );
+                }
+            });
+            crate::runtime_metrics::observe_transaction_dispatch_metrics_batch(&metrics_batch);
         }
     });
     if let Err(error) = spawn_result {
@@ -1002,6 +1364,307 @@ fn spawn_transaction_dispatch_worker(
             priority = priority.as_str(),
             "failed to spawn transaction plugin dispatch worker"
         );
+    }
+}
+
+struct TxDispatchQueue {
+    ring: ArrayQueue<AcceptedTransactionDispatch>,
+    queue_depth: Arc<AtomicU64>,
+    max_queue_depth: Arc<AtomicU64>,
+    worker_thread: OnceLock<std::thread::Thread>,
+    closed: AtomicBool,
+    sender_count: AtomicUsize,
+}
+
+struct TxDispatchSender {
+    queue: Arc<TxDispatchQueue>,
+}
+
+struct TxDispatchReceiver {
+    queue: Arc<TxDispatchQueue>,
+}
+
+#[derive(Clone, Copy)]
+struct InlineLatencyObservation {
+    source: InlineTransactionDispatchSource,
+    first_shred_lag_us: u64,
+    last_shred_lag_us: u64,
+    completed_dataset_lag_us: u64,
+}
+
+#[derive(Clone, Copy)]
+struct TransactionDispatchObservation {
+    visibility_lag_us: u64,
+    queue_wait_us: u64,
+    callback_duration_us: u64,
+    dataset_tx_count: u32,
+    dataset_tx_position: u32,
+    inline_latency: Option<InlineLatencyObservation>,
+}
+
+#[derive(Default)]
+pub(crate) struct TransactionDispatchMetricsBatch {
+    pub(crate) visibility_samples_total: u64,
+    pub(crate) visibility_lag_us_total: u64,
+    pub(crate) latest_visibility_lag_us: u64,
+    pub(crate) max_visibility_lag_us: u64,
+    pub(crate) queue_wait_us_total: u64,
+    pub(crate) latest_queue_wait_us: u64,
+    pub(crate) max_queue_wait_us: u64,
+    pub(crate) callback_duration_us_total: u64,
+    pub(crate) latest_callback_duration_us: u64,
+    pub(crate) max_callback_duration_us: u64,
+    pub(crate) latest_dataset_tx_count: u32,
+    pub(crate) max_dataset_tx_count: u32,
+    pub(crate) latest_dataset_tx_position: u32,
+    pub(crate) max_dataset_tx_position: u32,
+    pub(crate) first_in_dataset_samples_total: u64,
+    pub(crate) first_in_dataset_queue_wait_us_total: u64,
+    pub(crate) max_first_in_dataset_queue_wait_us: u64,
+    pub(crate) nonfirst_in_dataset_samples_total: u64,
+    pub(crate) nonfirst_in_dataset_queue_wait_us_total: u64,
+    pub(crate) max_nonfirst_in_dataset_queue_wait_us: u64,
+    pub(crate) inline_latency_samples_total: u64,
+    pub(crate) inline_first_shred_lag_us_total: u64,
+    pub(crate) latest_inline_first_shred_lag_us: u64,
+    pub(crate) max_inline_first_shred_lag_us: u64,
+    pub(crate) inline_last_shred_lag_us_total: u64,
+    pub(crate) latest_inline_last_shred_lag_us: u64,
+    pub(crate) max_inline_last_shred_lag_us: u64,
+    pub(crate) inline_completed_dataset_lag_us_total: u64,
+    pub(crate) latest_inline_completed_dataset_lag_us: u64,
+    pub(crate) max_inline_completed_dataset_lag_us: u64,
+    pub(crate) early_prefix_latency_samples_total: u64,
+    pub(crate) early_prefix_first_shred_lag_us_total: u64,
+    pub(crate) early_prefix_last_shred_lag_us_total: u64,
+    pub(crate) early_prefix_completed_dataset_lag_us_total: u64,
+    pub(crate) completed_dataset_fallback_latency_samples_total: u64,
+    pub(crate) completed_dataset_fallback_first_shred_lag_us_total: u64,
+    pub(crate) completed_dataset_fallback_last_shred_lag_us_total: u64,
+    pub(crate) completed_dataset_fallback_completed_dataset_lag_us_total: u64,
+}
+
+impl TransactionDispatchMetricsBatch {
+    fn observe(&mut self, observation: TransactionDispatchObservation) {
+        self.visibility_samples_total = self.visibility_samples_total.saturating_add(1);
+        self.visibility_lag_us_total = self
+            .visibility_lag_us_total
+            .saturating_add(observation.visibility_lag_us);
+        self.latest_visibility_lag_us = observation.visibility_lag_us;
+        self.max_visibility_lag_us = self
+            .max_visibility_lag_us
+            .max(observation.visibility_lag_us);
+
+        self.queue_wait_us_total = self
+            .queue_wait_us_total
+            .saturating_add(observation.queue_wait_us);
+        self.latest_queue_wait_us = observation.queue_wait_us;
+        self.max_queue_wait_us = self.max_queue_wait_us.max(observation.queue_wait_us);
+
+        self.callback_duration_us_total = self
+            .callback_duration_us_total
+            .saturating_add(observation.callback_duration_us);
+        self.latest_callback_duration_us = observation.callback_duration_us;
+        self.max_callback_duration_us = self
+            .max_callback_duration_us
+            .max(observation.callback_duration_us);
+
+        self.latest_dataset_tx_count = observation.dataset_tx_count;
+        self.max_dataset_tx_count = self.max_dataset_tx_count.max(observation.dataset_tx_count);
+        self.latest_dataset_tx_position = observation.dataset_tx_position;
+        self.max_dataset_tx_position = self
+            .max_dataset_tx_position
+            .max(observation.dataset_tx_position);
+
+        if observation.dataset_tx_position == 0 {
+            self.first_in_dataset_samples_total =
+                self.first_in_dataset_samples_total.saturating_add(1);
+            self.first_in_dataset_queue_wait_us_total = self
+                .first_in_dataset_queue_wait_us_total
+                .saturating_add(observation.queue_wait_us);
+            self.max_first_in_dataset_queue_wait_us = self
+                .max_first_in_dataset_queue_wait_us
+                .max(observation.queue_wait_us);
+        } else {
+            self.nonfirst_in_dataset_samples_total =
+                self.nonfirst_in_dataset_samples_total.saturating_add(1);
+            self.nonfirst_in_dataset_queue_wait_us_total = self
+                .nonfirst_in_dataset_queue_wait_us_total
+                .saturating_add(observation.queue_wait_us);
+            self.max_nonfirst_in_dataset_queue_wait_us = self
+                .max_nonfirst_in_dataset_queue_wait_us
+                .max(observation.queue_wait_us);
+        }
+
+        if let Some(inline) = observation.inline_latency {
+            self.inline_latency_samples_total = self.inline_latency_samples_total.saturating_add(1);
+            self.inline_first_shred_lag_us_total = self
+                .inline_first_shred_lag_us_total
+                .saturating_add(inline.first_shred_lag_us);
+            self.latest_inline_first_shred_lag_us = inline.first_shred_lag_us;
+            self.max_inline_first_shred_lag_us = self
+                .max_inline_first_shred_lag_us
+                .max(inline.first_shred_lag_us);
+
+            self.inline_last_shred_lag_us_total = self
+                .inline_last_shred_lag_us_total
+                .saturating_add(inline.last_shred_lag_us);
+            self.latest_inline_last_shred_lag_us = inline.last_shred_lag_us;
+            self.max_inline_last_shred_lag_us = self
+                .max_inline_last_shred_lag_us
+                .max(inline.last_shred_lag_us);
+
+            self.inline_completed_dataset_lag_us_total = self
+                .inline_completed_dataset_lag_us_total
+                .saturating_add(inline.completed_dataset_lag_us);
+            self.latest_inline_completed_dataset_lag_us = inline.completed_dataset_lag_us;
+            self.max_inline_completed_dataset_lag_us = self
+                .max_inline_completed_dataset_lag_us
+                .max(inline.completed_dataset_lag_us);
+
+            match inline.source {
+                InlineTransactionDispatchSource::EarlyPrefix => {
+                    self.early_prefix_latency_samples_total =
+                        self.early_prefix_latency_samples_total.saturating_add(1);
+                    self.early_prefix_first_shred_lag_us_total = self
+                        .early_prefix_first_shred_lag_us_total
+                        .saturating_add(inline.first_shred_lag_us);
+                    self.early_prefix_last_shred_lag_us_total = self
+                        .early_prefix_last_shred_lag_us_total
+                        .saturating_add(inline.last_shred_lag_us);
+                    self.early_prefix_completed_dataset_lag_us_total = self
+                        .early_prefix_completed_dataset_lag_us_total
+                        .saturating_add(inline.completed_dataset_lag_us);
+                }
+                InlineTransactionDispatchSource::CompletedDatasetFallback => {
+                    self.completed_dataset_fallback_latency_samples_total = self
+                        .completed_dataset_fallback_latency_samples_total
+                        .saturating_add(1);
+                    self.completed_dataset_fallback_first_shred_lag_us_total = self
+                        .completed_dataset_fallback_first_shred_lag_us_total
+                        .saturating_add(inline.first_shred_lag_us);
+                    self.completed_dataset_fallback_last_shred_lag_us_total = self
+                        .completed_dataset_fallback_last_shred_lag_us_total
+                        .saturating_add(inline.last_shred_lag_us);
+                    self.completed_dataset_fallback_completed_dataset_lag_us_total = self
+                        .completed_dataset_fallback_completed_dataset_lag_us_total
+                        .saturating_add(inline.completed_dataset_lag_us);
+                }
+            }
+        }
+    }
+}
+
+fn create_tx_dispatch_queue(capacity: usize) -> (TxDispatchSender, TxDispatchReceiver) {
+    let queue = Arc::new(TxDispatchQueue {
+        ring: ArrayQueue::new(capacity.max(1)),
+        queue_depth: Arc::new(AtomicU64::new(0)),
+        max_queue_depth: Arc::new(AtomicU64::new(0)),
+        worker_thread: OnceLock::new(),
+        closed: AtomicBool::new(false),
+        sender_count: AtomicUsize::new(1),
+    });
+    (
+        TxDispatchSender {
+            queue: Arc::clone(&queue),
+        },
+        TxDispatchReceiver { queue },
+    )
+}
+
+impl TxDispatchSender {
+    fn try_send(
+        &self,
+        event: AcceptedTransactionDispatch,
+    ) -> Result<(), StdTrySendError<AcceptedTransactionDispatch>> {
+        if self.queue.closed.load(Ordering::Acquire) {
+            return Err(StdTrySendError::Disconnected(event));
+        }
+        let queue_depth = self
+            .queue
+            .queue_depth
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        self.queue
+            .max_queue_depth
+            .fetch_max(queue_depth, Ordering::Relaxed);
+        match self.queue.ring.push(event) {
+            Ok(()) => {
+                if let Some(thread) = self.queue.worker_thread.get() {
+                    thread.unpark();
+                }
+                Ok(())
+            }
+            Err(event) => {
+                self.queue.queue_depth.fetch_sub(1, Ordering::Relaxed);
+                if self.queue.closed.load(Ordering::Acquire) {
+                    Err(StdTrySendError::Disconnected(event))
+                } else {
+                    Err(StdTrySendError::Full(event))
+                }
+            }
+        }
+    }
+}
+
+impl Clone for TxDispatchSender {
+    fn clone(&self) -> Self {
+        self.queue.sender_count.fetch_add(1, Ordering::AcqRel);
+        Self {
+            queue: Arc::clone(&self.queue),
+        }
+    }
+}
+
+impl TxDispatchSender {
+    fn queue_depth(&self) -> u64 {
+        self.queue.queue_depth.load(Ordering::Relaxed)
+    }
+
+    fn max_queue_depth(&self) -> u64 {
+        self.queue.max_queue_depth.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for TxDispatchSender {
+    fn drop(&mut self) {
+        if self.queue.sender_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.queue.closed.store(true, Ordering::Release);
+            if let Some(thread) = self.queue.worker_thread.get() {
+                thread.unpark();
+            }
+        }
+    }
+}
+
+impl TxDispatchReceiver {
+    fn register_current_thread(&self) {
+        drop(self.queue.worker_thread.set(std::thread::current()));
+    }
+
+    fn recv(&mut self) -> Option<AcceptedTransactionDispatch> {
+        loop {
+            if let Some(event) = self.queue.ring.pop() {
+                self.queue.queue_depth.fetch_sub(1, Ordering::Relaxed);
+                return Some(event);
+            }
+            if self.queue.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            std::thread::park();
+        }
+    }
+
+    fn try_recv(&mut self) -> Result<AcceptedTransactionDispatch, StdTrySendError<()>> {
+        if let Some(event) = self.queue.ring.pop() {
+            self.queue.queue_depth.fetch_sub(1, Ordering::Relaxed);
+            return Ok(event);
+        }
+        if self.queue.closed.load(Ordering::Acquire) {
+            Err(StdTrySendError::Disconnected(()))
+        } else {
+            Err(StdTrySendError::Full(()))
+        }
     }
 }
 
@@ -1047,6 +1710,9 @@ async fn dispatch_event(
                 },
             )
             .await
+        }
+        PluginDispatchEvent::SelectedTransactionLog(event) => {
+            dispatch_selected_transaction_log_event(event, dispatch_mode).await
         }
         PluginDispatchEvent::TransactionBatch(event) => {
             dispatch_transaction_batch_event(event, dispatch_mode).await
@@ -1323,12 +1989,35 @@ async fn dispatch_selected_account_touch_event(
     }
 }
 
+async fn dispatch_selected_transaction_log_event(
+    event: SelectedTransactionLogDispatch,
+    dispatch_mode: PluginDispatchMode,
+) {
+    match event {
+        SelectedTransactionLogDispatch::Single { plugin, event } => {
+            plugin.on_transaction_log(&event).await;
+        }
+        SelectedTransactionLogDispatch::Multi { plugins, event } => {
+            dispatch_hook_event(
+                &plugins,
+                PluginHookKind::TransactionLog,
+                event,
+                dispatch_mode,
+                |plugin, hook_event| async move {
+                    plugin.on_transaction_log(hook_event.as_ref()).await;
+                },
+            )
+            .await;
+        }
+    }
+}
+
 /// Dispatches one accepted transaction event to one or many interested plugins.
 async fn dispatch_accepted_transaction_event(
     dispatch: AcceptedTransactionDispatch,
     dispatch_mode: PluginDispatchMode,
     priority: TransactionDispatchPriority,
-) {
+) -> TransactionDispatchObservation {
     let dequeued_at = Instant::now();
     match dispatch {
         AcceptedTransactionDispatch::SingleOwned {
@@ -1348,32 +2037,37 @@ async fn dispatch_accepted_transaction_event(
                     .as_micros(),
             )
             .unwrap_or(u64::MAX);
-            crate::runtime_metrics::observe_transaction_plugin_visibility_lag(queue_wait_us);
-            if priority == TransactionDispatchPriority::InlineCritical {
-                crate::runtime_metrics::observe_inline_transaction_plugin_latency(
-                    inline_source,
-                    u64::try_from(
-                        dequeued_at
-                            .saturating_duration_since(first_shred_observed_at)
-                            .as_micros(),
-                    )
-                    .unwrap_or(u64::MAX),
-                    u64::try_from(
-                        dequeued_at
-                            .saturating_duration_since(last_shred_observed_at)
-                            .as_micros(),
-                    )
-                    .unwrap_or(u64::MAX),
+            let callback_started_at = Instant::now();
+            let first_shred_lag_us = u64::try_from(
+                callback_started_at
+                    .saturating_duration_since(first_shred_observed_at)
+                    .as_micros(),
+            )
+            .unwrap_or(u64::MAX);
+            let last_shred_lag_us = u64::try_from(
+                callback_started_at
+                    .saturating_duration_since(last_shred_observed_at)
+                    .as_micros(),
+            )
+            .unwrap_or(u64::MAX);
+            if let Some(signature) = debug_tx_trace_signature(&event) {
+                tracing::info!(
+                    signature = %signature,
+                    priority = priority.as_str(),
                     queue_wait_us,
+                    first_shred_to_callback_us = first_shred_lag_us,
+                    last_shred_to_callback_us = last_shred_lag_us,
+                    ready_to_callback_us = queue_wait_us,
+                    "debug tx timing trace"
                 );
             }
-            crate::runtime_metrics::observe_transaction_plugin_queue_wait(queue_wait_us);
-            crate::runtime_metrics::observe_transaction_plugin_dataset_position(
-                dataset_tx_count,
-                dataset_tx_position,
-                queue_wait_us,
-            );
-            let callback_started_at = Instant::now();
+            let inline_latency = (priority == TransactionDispatchPriority::InlineCritical)
+                .then_some(InlineLatencyObservation {
+                    source: inline_source,
+                    first_shred_lag_us,
+                    last_shred_lag_us,
+                    completed_dataset_lag_us: queue_wait_us,
+                });
             if let Err(panic) =
                 AssertUnwindSafe(plugin.on_transaction_with_interest(&event, interest))
                     .catch_unwind()
@@ -1386,78 +2080,19 @@ async fn dispatch_accepted_transaction_event(
                     "plugin hook panicked; continuing runtime"
                 );
             }
-            crate::runtime_metrics::observe_transaction_plugin_callback_duration(
-                u64::try_from(
+            TransactionDispatchObservation {
+                visibility_lag_us: queue_wait_us,
+                queue_wait_us,
+                callback_duration_us: u64::try_from(
                     Instant::now()
                         .saturating_duration_since(callback_started_at)
                         .as_micros(),
                 )
                 .unwrap_or(u64::MAX),
-            );
-        }
-        AcceptedTransactionDispatch::SingleShared {
-            plugin,
-            event,
-            completed_at,
-            first_shred_observed_at,
-            last_shred_observed_at,
-            inline_source,
-            interest,
-            dataset_tx_count,
-            dataset_tx_position,
-        } => {
-            let queue_wait_us = u64::try_from(
-                dequeued_at
-                    .saturating_duration_since(completed_at)
-                    .as_micros(),
-            )
-            .unwrap_or(u64::MAX);
-            crate::runtime_metrics::observe_transaction_plugin_visibility_lag(queue_wait_us);
-            if priority == TransactionDispatchPriority::InlineCritical {
-                crate::runtime_metrics::observe_inline_transaction_plugin_latency(
-                    inline_source,
-                    u64::try_from(
-                        dequeued_at
-                            .saturating_duration_since(first_shred_observed_at)
-                            .as_micros(),
-                    )
-                    .unwrap_or(u64::MAX),
-                    u64::try_from(
-                        dequeued_at
-                            .saturating_duration_since(last_shred_observed_at)
-                            .as_micros(),
-                    )
-                    .unwrap_or(u64::MAX),
-                    queue_wait_us,
-                );
-            }
-            crate::runtime_metrics::observe_transaction_plugin_queue_wait(queue_wait_us);
-            crate::runtime_metrics::observe_transaction_plugin_dataset_position(
                 dataset_tx_count,
                 dataset_tx_position,
-                queue_wait_us,
-            );
-            let callback_started_at = Instant::now();
-            if let Err(panic) =
-                AssertUnwindSafe(plugin.on_transaction_with_interest(event.as_ref(), interest))
-                    .catch_unwind()
-                    .await
-            {
-                tracing::error!(
-                    plugin = plugin.name(),
-                    hook = PluginHookKind::Transaction.as_str(),
-                    panic = %panic_payload_to_string(panic.as_ref()),
-                    "plugin hook panicked; continuing runtime"
-                );
+                inline_latency,
             }
-            crate::runtime_metrics::observe_transaction_plugin_callback_duration(
-                u64::try_from(
-                    Instant::now()
-                        .saturating_duration_since(callback_started_at)
-                        .as_micros(),
-                )
-                .unwrap_or(u64::MAX),
-            );
         }
         AcceptedTransactionDispatch::Multi {
             plugins,
@@ -1476,32 +2111,37 @@ async fn dispatch_accepted_transaction_event(
                     .as_micros(),
             )
             .unwrap_or(u64::MAX);
-            crate::runtime_metrics::observe_transaction_plugin_visibility_lag(queue_wait_us);
-            if priority == TransactionDispatchPriority::InlineCritical {
-                crate::runtime_metrics::observe_inline_transaction_plugin_latency(
-                    inline_source,
-                    u64::try_from(
-                        dequeued_at
-                            .saturating_duration_since(first_shred_observed_at)
-                            .as_micros(),
-                    )
-                    .unwrap_or(u64::MAX),
-                    u64::try_from(
-                        dequeued_at
-                            .saturating_duration_since(last_shred_observed_at)
-                            .as_micros(),
-                    )
-                    .unwrap_or(u64::MAX),
+            let callback_started_at = Instant::now();
+            let first_shred_lag_us = u64::try_from(
+                callback_started_at
+                    .saturating_duration_since(first_shred_observed_at)
+                    .as_micros(),
+            )
+            .unwrap_or(u64::MAX);
+            let last_shred_lag_us = u64::try_from(
+                callback_started_at
+                    .saturating_duration_since(last_shred_observed_at)
+                    .as_micros(),
+            )
+            .unwrap_or(u64::MAX);
+            if let Some(signature) = debug_tx_trace_signature(event.as_ref()) {
+                tracing::info!(
+                    signature = %signature,
+                    priority = priority.as_str(),
                     queue_wait_us,
+                    first_shred_to_callback_us = first_shred_lag_us,
+                    last_shred_to_callback_us = last_shred_lag_us,
+                    ready_to_callback_us = queue_wait_us,
+                    "debug tx timing trace"
                 );
             }
-            crate::runtime_metrics::observe_transaction_plugin_queue_wait(queue_wait_us);
-            crate::runtime_metrics::observe_transaction_plugin_dataset_position(
-                dataset_tx_count,
-                dataset_tx_position,
-                queue_wait_us,
-            );
-            let callback_started_at = Instant::now();
+            let inline_latency = (priority == TransactionDispatchPriority::InlineCritical)
+                .then_some(InlineLatencyObservation {
+                    source: inline_source,
+                    first_shred_lag_us,
+                    last_shred_lag_us,
+                    completed_dataset_lag_us: queue_wait_us,
+                });
             dispatch_hook_event(
                 plugins.as_ref(),
                 PluginHookKind::Transaction,
@@ -1514,14 +2154,19 @@ async fn dispatch_accepted_transaction_event(
                 },
             )
             .await;
-            crate::runtime_metrics::observe_transaction_plugin_callback_duration(
-                u64::try_from(
+            TransactionDispatchObservation {
+                visibility_lag_us: queue_wait_us,
+                queue_wait_us,
+                callback_duration_us: u64::try_from(
                     Instant::now()
                         .saturating_duration_since(callback_started_at)
                         .as_micros(),
                 )
                 .unwrap_or(u64::MAX),
-            );
+                dataset_tx_count,
+                dataset_tx_position,
+                inline_latency,
+            }
         }
     }
 }
@@ -1538,6 +2183,26 @@ async fn dispatch_hook_event<Event, Dispatch, HookFuture>(
     Dispatch: Fn(Arc<dyn ObserverPlugin>, Event) -> HookFuture + Copy + Send + Sync + 'static,
     HookFuture: Future<Output = ()> + Send + 'static,
 {
+    match plugins {
+        [] => return,
+        [plugin] => {
+            let plugin = Arc::clone(plugin);
+            let plugin_name = plugin.name();
+            if let Err(panic) = AssertUnwindSafe(dispatch(plugin, event))
+                .catch_unwind()
+                .await
+            {
+                tracing::error!(
+                    plugin = plugin_name,
+                    hook = hook.as_str(),
+                    panic = %panic_payload_to_string(panic.as_ref()),
+                    "plugin hook panicked; continuing runtime"
+                );
+            }
+            return;
+        }
+        _ => {}
+    }
     match dispatch_mode {
         PluginDispatchMode::Sequential => {
             for plugin in plugins {

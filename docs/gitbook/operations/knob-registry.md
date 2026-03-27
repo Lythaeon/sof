@@ -16,7 +16,7 @@ This registry is intentionally different from the tuning guide:
 
 Snapshot date:
 
-- `2026-03-24`
+- `2026-03-26`
 
 ## How To Read The Registry
 
@@ -122,14 +122,28 @@ SOF's runtime-owned observability endpoint exposes low-cardinality operational m
 
 | Knob | Default | Scope | Meaning |
 | --- | --- | --- | --- |
-| `SOF_VERIFY_SHREDS` | `false` | all builds | Enable shred verification. |
+| `SOF_SHRED_TRUST_MODE` | `public_untrusted` | all builds | Raw-shred trust posture. Applies only to raw-shred ingest. `public_untrusted` keeps local verification on by default; `trusted_raw_shred_provider` disables it by default unless explicitly overridden. |
+| `SOF_VERIFY_SHREDS` | trust-mode default | all builds | Enable shred verification explicitly. Overrides `SOF_SHRED_TRUST_MODE` if set. |
 | `SOF_VERIFY_STRICT` | `false` | all builds | Reject unknown leaders more aggressively during verification. |
-| `SOF_VERIFY_RECOVERED_SHREDS` | `false` | all builds | Verify recovered shreds after FEC recovery. |
+| `SOF_VERIFY_RECOVERED_SHREDS` | trust-mode default | all builds | Verify recovered shreds after FEC recovery explicitly. Overrides `SOF_SHRED_TRUST_MODE` if set. |
 | `SOF_VERIFY_SIGNATURE_CACHE` | `65536` | all builds | Signature verification cache entries. |
 | `SOF_VERIFY_SLOT_WINDOW` | `4096` | all builds | Slot-leader verification window. |
 | `SOF_VERIFY_UNKNOWN_RETRY_MS` | `2000` | all builds | Retry interval for unknown-leader verification state. |
 | `SOF_SHRED_DEDUP_CAPACITY` | `262144` | all builds | Capacity of the semantic shred dedupe cache. |
 | `SOF_SHRED_DEDUP_TTL_MS` | `250` | all builds | Base eviction TTL for dedupe entries. |
+
+## Provider Stream
+
+| Knob | Default | Scope | Meaning |
+| --- | --- | --- | --- |
+| `SOF_PROVIDER_STREAM_CAPABILITY_POLICY` | `warn` | all builds | Startup policy when `ProviderStreamMode::Generic` cannot satisfy requested hooks. Built-in processed providers already fail fast on unsupported surfaces and remain transaction-first; `strict` vs `warn` only affects the flexible generic producer path. |
+| `SOF_PROVIDER_STREAM_ALLOW_EOF` | `false` | all builds | Allow `ProviderStreamMode::Generic` to terminate cleanly on EOF for bounded replay/batch producers, instead of treating ingress closure as a failed live stream. |
+
+## Gossip Selection
+
+| Knob | Default | Scope | Meaning |
+| --- | --- | --- | --- |
+| `SOF_GOSSIP_ENTRYPOINT_PINNED` | `false` | `gossip-bootstrap` | Keep gossip runtime switching inside the configured `SOF_GOSSIP_ENTRYPOINT` set instead of expanding to discovered peer candidates. Useful for topology experiments, malicious-node analysis, and repeatable peer-set studies. |
 
 ## Relay And Traffic Shaping
 

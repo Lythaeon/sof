@@ -1,4 +1,7 @@
+#![allow(clippy::missing_docs_in_private_items)]
+
 use super::*;
+use std::sync::atomic::AtomicBool;
 
 #[derive(Debug)]
 pub(super) struct PacketWorkerInput {
@@ -84,7 +87,7 @@ pub(super) struct PacketWorkerPoolConfig {
     pub(super) fec_retained_slot_lag: u64,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct WorkerVerifyCounters {
     verified: u64,
     unknown_leader: u64,
@@ -115,13 +118,15 @@ impl WorkerVerifyCounters {
         }
     }
 
-    const fn is_empty(&self) -> bool {
-        self.verified == 0
-            && self.unknown_leader == 0
-            && self.invalid_merkle == 0
-            && self.invalid_signature == 0
-            && self.malformed == 0
-            && self.dropped == 0
+    const fn merge_from(&mut self, other: &Self) {
+        self.verified = self.verified.saturating_add(other.verified);
+        self.unknown_leader = self.unknown_leader.saturating_add(other.unknown_leader);
+        self.invalid_merkle = self.invalid_merkle.saturating_add(other.invalid_merkle);
+        self.invalid_signature = self
+            .invalid_signature
+            .saturating_add(other.invalid_signature);
+        self.malformed = self.malformed.saturating_add(other.malformed);
+        self.dropped = self.dropped.saturating_add(other.dropped);
     }
 }
 
@@ -189,6 +194,7 @@ pub(super) struct PacketWorkerPool {
     worker_handles: Vec<JoinHandle<()>>,
     #[cfg(feature = "gossip-bootstrap")]
     known_pubkeys: SharedKnownPubkeys,
+    verify_strict_unknown: Arc<AtomicBool>,
     telemetry: Vec<PacketWorkerTelemetry>,
     queue_depth: Arc<AtomicU64>,
     max_queue_depth: Arc<AtomicU64>,
@@ -214,6 +220,7 @@ impl PacketWorkerPool {
             mpsc::channel::<PacketWorkerBatchResult>(worker_count.saturating_mul(sender_capacity));
         #[cfg(feature = "gossip-bootstrap")]
         let known_pubkeys = SharedKnownPubkeys::default();
+        let verify_strict_unknown = Arc::new(AtomicBool::new(verify_strict_unknown));
         let queue_depth = Arc::new(AtomicU64::new(0));
         let max_queue_depth = Arc::new(AtomicU64::new(0));
         let mut senders = Vec::with_capacity(worker_count);
@@ -228,6 +235,7 @@ impl PacketWorkerPool {
             let worker_telemetry = PacketWorkerTelemetry::new();
             let worker_telemetry_state = worker_telemetry.clone();
             let worker_queue_depth = Arc::clone(&queue_depth);
+            let worker_verify_strict_unknown = Arc::clone(&verify_strict_unknown);
             let worker_handle = tokio::task::spawn_blocking(move || {
                 let mut shred_verifier = verify_enabled.then(|| {
                     ShredVerifier::new(
@@ -259,11 +267,12 @@ impl PacketWorkerPool {
                         &mut verifier_generation,
                         shred_verifier.as_mut(),
                     );
+                    let strict_unknown = worker_verify_strict_unknown.load(Ordering::Relaxed);
                     let forwarded_all_results = process_packet_batch_streaming(
                         batch,
                         shred_verifier.as_mut(),
                         verify_recovered_shreds,
-                        verify_strict_unknown,
+                        strict_unknown,
                         &mut fec_recoverer,
                         |result| worker_result_tx.blocking_send(result).is_ok(),
                     );
@@ -284,6 +293,7 @@ impl PacketWorkerPool {
             worker_handles,
             #[cfg(feature = "gossip-bootstrap")]
             known_pubkeys,
+            verify_strict_unknown,
             telemetry,
             queue_depth,
             max_queue_depth,
@@ -364,6 +374,10 @@ impl PacketWorkerPool {
 
     pub(super) fn close_inputs(&mut self) {
         self.senders.clear();
+    }
+
+    pub(super) fn set_verify_strict_unknown(&self, enabled: bool) {
+        self.verify_strict_unknown.store(enabled, Ordering::Relaxed);
     }
 
     #[cfg(feature = "gossip-bootstrap")]
@@ -466,6 +480,8 @@ where
     {
         let mut drained_packets = packets.drain(..).peekable();
 
+        let mut pending_verify_counters = WorkerVerifyCounters::default();
+
         while let Some(packet) = drained_packets.next() {
             let mut accepted_shreds = Vec::new();
             #[cfg(feature = "gossip-bootstrap")]
@@ -559,20 +575,20 @@ where
                 ShredVerifier::take_slot_leader_diff,
             );
             #[cfg(not(feature = "gossip-bootstrap"))]
-            let should_emit = !accepted_shreds.is_empty()
-                || !verify_counters.is_empty()
-                || drained_packets.peek().is_none();
+            let should_emit = !accepted_shreds.is_empty() || drained_packets.peek().is_none();
             #[cfg(feature = "gossip-bootstrap")]
             let should_emit = !accepted_shreds.is_empty()
                 || !observed_slot_leaders.is_empty()
                 || !leader_diff.added.is_empty()
                 || !leader_diff.updated.is_empty()
                 || !leader_diff.removed_slots.is_empty()
-                || !verify_counters.is_empty()
                 || drained_packets.peek().is_none();
             if !should_emit {
+                pending_verify_counters.merge_from(&verify_counters);
                 continue;
             }
+
+            verify_counters.merge_from(&std::mem::take(&mut pending_verify_counters));
 
             if !emit_result(PacketWorkerBatchResult {
                 worker_index,
@@ -706,7 +722,7 @@ fn verify_packet_with_counters(
     let Some(shred_verifier) = shred_verifier else {
         return WorkerVerifyDecision::Accept;
     };
-    let verify_status = shred_verifier.verify_packet(packet, observed_at);
+    let verify_status = shred_verifier.verify_packet(packet, observed_at, verify_strict_unknown);
     verify_counters.observe(verify_status);
     if verify_status.is_accepted(verify_strict_unknown) {
         WorkerVerifyDecision::Accept
@@ -746,9 +762,13 @@ const fn derive_parent_slot(slot: u64, parent_offset: u16) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::{
-        protocol::shred_wire::{SIZE_OF_DATA_SHRED_PAYLOAD, VARIANT_MERKLE_DATA},
+        protocol::shred_wire::{
+            SIZE_OF_CODING_SHRED_HEADERS, SIZE_OF_CODING_SHRED_PAYLOAD, SIZE_OF_DATA_SHRED_PAYLOAD,
+            SIZE_OF_SIGNATURE, VARIANT_MERKLE_CODE, VARIANT_MERKLE_DATA,
+        },
         shred::wire::{SIZE_OF_DATA_SHRED_HEADERS, parse_shred_header},
     };
+    use reed_solomon_erasure::galois_8::ReedSolomon;
 
     fn build_data_shred_packet(
         slot: u64,
@@ -775,6 +795,188 @@ mod tests {
         let end = 88usize.saturating_add(payload.len());
         packet[88..end].copy_from_slice(payload);
         packet
+    }
+
+    fn build_coding_shard_packet(
+        slot: u64,
+        index: u32,
+        fec_set_index: u32,
+        num_data_shreds: u16,
+        num_coding_shreds: u16,
+        position: u16,
+        parity_shard: &[u8],
+    ) -> Vec<u8> {
+        let mut packet = vec![0_u8; SIZE_OF_CODING_SHRED_PAYLOAD];
+        packet[64] = VARIANT_MERKLE_CODE;
+        packet[65..73].copy_from_slice(&slot.to_le_bytes());
+        packet[73..77].copy_from_slice(&index.to_le_bytes());
+        packet[77..79].copy_from_slice(&1_u16.to_le_bytes());
+        packet[79..83].copy_from_slice(&fec_set_index.to_le_bytes());
+        packet[83..85].copy_from_slice(&num_data_shreds.to_le_bytes());
+        packet[85..87].copy_from_slice(&num_coding_shreds.to_le_bytes());
+        packet[87..89].copy_from_slice(&position.to_le_bytes());
+        let shard_end = SIZE_OF_CODING_SHRED_HEADERS.saturating_add(parity_shard.len());
+        packet[SIZE_OF_CODING_SHRED_HEADERS..shard_end].copy_from_slice(parity_shard);
+        packet
+    }
+
+    fn erasure_shard_len_for_test() -> usize {
+        SIZE_OF_CODING_SHRED_PAYLOAD.saturating_sub(SIZE_OF_CODING_SHRED_HEADERS + 32)
+    }
+
+    fn data_erasure_shard_for_test(packet: &[u8]) -> Vec<u8> {
+        let shard_len = erasure_shard_len_for_test();
+        packet[SIZE_OF_SIGNATURE..SIZE_OF_SIGNATURE + shard_len].to_vec()
+    }
+
+    fn build_recoverable_fec_pair(slot: u64) -> [(Arc<[u8]>, ParsedShredHeader); 2] {
+        let data0 = build_data_shred_packet(slot, 0, 0, 1, &[1, 2, 3, 4]);
+        let data1 = build_data_shred_packet(slot, 1, 0, 1, &[5, 6, 7, 8]);
+        let mut shards = vec![
+            data_erasure_shard_for_test(&data0),
+            data_erasure_shard_for_test(&data1),
+            vec![0_u8; erasure_shard_len_for_test()],
+        ];
+        ReedSolomon::new(2, 1)
+            .expect("reed solomon config")
+            .encode(&mut shards)
+            .expect("encode parity shard");
+        let code0 = build_coding_shard_packet(slot, 2, 0, 2, 1, 0, &shards[2]);
+        [
+            (
+                Arc::<[u8]>::from(data0.clone()),
+                parse_shred_header(&data0).expect("valid data shred"),
+            ),
+            (
+                Arc::<[u8]>::from(code0.clone()),
+                parse_shred_header(&code0).expect("valid coding shred"),
+            ),
+        ]
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for packet worker primary FEC ingest"]
+    fn packet_worker_primary_fec_profile_fixture() {
+        let iterations = std::env::var("SOF_PACKET_WORKER_FEC_PROFILE_ITERS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(50_000);
+        let packets = (0..iterations)
+            .map(|iteration| {
+                let slot =
+                    9_000_000_u64.saturating_add(u64::try_from(iteration).unwrap_or(u64::MAX));
+                let index = u32::try_from(iteration % 32).unwrap_or(u32::MAX);
+                let fec_set_index = index;
+                let payload = [
+                    u8::try_from(iteration & 0xff).unwrap_or_default(),
+                    u8::try_from((iteration >> 8) & 0xff).unwrap_or_default(),
+                    u8::try_from((iteration >> 16) & 0xff).unwrap_or_default(),
+                    u8::try_from((iteration >> 24) & 0xff).unwrap_or_default(),
+                ];
+                let packet_bytes = build_data_shred_packet(slot, index, fec_set_index, 1, &payload);
+                let parsed_header = parse_shred_header(&packet_bytes).expect("valid test shred");
+                (Arc::<[u8]>::from(packet_bytes), parsed_header)
+            })
+            .collect::<Vec<_>>();
+        let mut fec_recoverer = FecRecoverer::new(128, 1);
+        let started_at = Instant::now();
+        let mut emitted = 0_u64;
+        for (packet_bytes, parsed_header) in packets {
+            let forwarded = process_packet_batch_streaming(
+                PacketWorkerBatch {
+                    worker_index: 0,
+                    packets: vec![PacketWorkerInput {
+                        source: SocketAddr::from(([127, 0, 0, 1], 8_899)),
+                        packet_bytes,
+                        parsed_header,
+                        observed_at: Instant::now(),
+                    }],
+                },
+                None,
+                false,
+                false,
+                &mut fec_recoverer,
+                |_| {
+                    emitted = emitted.saturating_add(1);
+                    true
+                },
+            );
+            assert!(forwarded);
+        }
+        println!(
+            "packet_worker_primary_fec_profile_fixture iterations={} emitted={} elapsed_ms={}",
+            iterations,
+            emitted,
+            started_at.elapsed().as_millis()
+        );
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for packet worker FEC recovery"]
+    fn packet_worker_recovery_fec_profile_fixture() {
+        let iterations = std::env::var("SOF_PACKET_WORKER_FEC_RECOVERY_PROFILE_ITERS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(20_000);
+        let batches = (0..iterations)
+            .map(|iteration| {
+                let slot =
+                    10_000_000_u64.saturating_add(u64::try_from(iteration).unwrap_or(u64::MAX));
+                build_recoverable_fec_pair(slot)
+            })
+            .collect::<Vec<_>>();
+        let mut fec_recoverer = FecRecoverer::new(128, 1);
+        let started_at = Instant::now();
+        let mut emitted = 0_u64;
+        let mut recovered = 0_u64;
+        for [data_packet, code_packet] in batches {
+            let forwarded = process_packet_batch_streaming(
+                PacketWorkerBatch {
+                    worker_index: 0,
+                    packets: vec![
+                        PacketWorkerInput {
+                            source: SocketAddr::from(([127, 0, 0, 1], 8_899)),
+                            packet_bytes: data_packet.0,
+                            parsed_header: data_packet.1,
+                            observed_at: Instant::now(),
+                        },
+                        PacketWorkerInput {
+                            source: SocketAddr::from(([127, 0, 0, 1], 8_900)),
+                            packet_bytes: code_packet.0,
+                            parsed_header: code_packet.1,
+                            observed_at: Instant::now(),
+                        },
+                    ],
+                },
+                None,
+                false,
+                false,
+                &mut fec_recoverer,
+                |result| {
+                    emitted = emitted.saturating_add(1);
+                    recovered = recovered.saturating_add(
+                        result
+                            .accepted_shreds
+                            .iter()
+                            .filter(|shred| {
+                                matches!(shred.kind, WorkerAcceptedShredKind::RecoveredData { .. })
+                            })
+                            .count() as u64,
+                    );
+                    true
+                },
+            );
+            assert!(forwarded);
+        }
+        println!(
+            "packet_worker_recovery_fec_profile_fixture iterations={} emitted={} recovered={} elapsed_ms={}",
+            iterations,
+            emitted,
+            recovered,
+            started_at.elapsed().as_millis()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -5488,7 +5488,7 @@ dependencies = [
 
 [[package]]
 name = "sof-solana-gossip"
-version = "3.1.8-sof.5"
+version = "3.1.8-sof.6"
 dependencies = [
  "agave-feature-set",
  "agave-logger",

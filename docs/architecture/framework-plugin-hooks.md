@@ -47,6 +47,9 @@ Implementing `on_*` is not enough by itself. Plugins must opt in through
 - `config().transaction_dispatch_mode` expresses whether the plugin uses the standard
   dataset-worker path or the inline completed-dataset path
 - `accepts_transaction(&event)` allows cheap hot-path rejection before queueing
+- `transaction_prefilter()` is the preferred fast path for common
+  signature/account-key matching because SOF can evaluate it directly on a
+  sanitized transaction view
 
 Defaults:
 
@@ -73,6 +76,12 @@ fn config(&self) -> PluginConfig {
 Inline transaction plugins now stay inline even when dataset or derived-state
 consumers also exist. SOF keeps the transaction hook on the inline path while
 the dataset worker path continues for other subscribers.
+
+For inline transaction plugins that only need exact signatures or account-key
+presence/exclusion checks, prefer `TransactionPrefilter` over custom
+`transaction_interest_ref` logic. When every inline plugin in scope is
+prefilter-backed and all of them ignore the tx, SOF can skip full owned
+`VersionedTransaction` decode for that miss.
 
 ## Inline Delivery
 

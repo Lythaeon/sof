@@ -7,16 +7,20 @@ use super::packet_workers::{
     PacketWorkerPoolConfig, WorkerAcceptedShred, WorkerAcceptedShredKind,
 };
 use super::*;
+#[cfg(feature = "gossip-bootstrap")]
+use crate::app::runtime::bootstrap::gossip::GossipEntrypointBias;
 use crate::framework::host::TransactionDispatchScope;
 use crate::framework::{SerializedTransactionRange, TransactionEvent, events::TransactionEventRef};
 use crate::reassembly::dataset::CompletedDataSet;
 use crate::reassembly::inline::InlineContiguousDataSetSink;
 use crate::relay::CacheInsertOutcome;
+use crate::runtime::ShredTrustMode;
+use agave_transaction_view::transaction_view::SanitizedTransactionView;
 use crossbeam_channel::Sender as CrossbeamSender;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 #[cfg(feature = "gossip-bootstrap")]
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::{
     future::Future,
     net::{IpAddr, Ipv4Addr},
@@ -53,6 +57,232 @@ const CONTROL_PLANE_EVENT_TICK_MS: u64 = 250;
 const CONTROL_PLANE_EVENT_SNAPSHOT_SECS: u64 = 30;
 const PACKET_WORKER_QUEUE_OVERFLOW_POLICY: &str = "drop_newest";
 const PACKET_WORKER_FEC_PRESSURE_DIVISOR: u64 = 8;
+#[cfg(feature = "gossip-bootstrap")]
+const GOSSIP_SOURCE_SCORE_DECAY_INTERVAL_SECS: u64 = 5;
+#[cfg(feature = "gossip-bootstrap")]
+const GOSSIP_SOURCE_SCORE_STALE_AFTER_SECS: u64 = 30;
+#[cfg(feature = "gossip-bootstrap")]
+const GOSSIP_SOURCE_SCORE_TOP_IPS: usize = 12;
+#[cfg(feature = "gossip-bootstrap")]
+const GOSSIP_LOAD_SHED_EXIT_THRESHOLD_DIVISOR: u64 = 2;
+#[cfg(feature = "gossip-bootstrap")]
+const RELAY_CACHE_SERVE_KEEPALIVE_MS: u64 = 30_000;
+
+#[cfg(feature = "gossip-bootstrap")]
+#[derive(Clone, Copy, Debug, Default)]
+struct GossipSourceScore {
+    latest_slot: u64,
+    data_shreds: u64,
+    code_shreds: u64,
+    data_complete: u64,
+    last_in_slot: u64,
+    last_seen_at: Option<Instant>,
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+impl GossipSourceScore {
+    fn note_data_shred(
+        &mut self,
+        slot: u64,
+        data_complete: bool,
+        last_in_slot: bool,
+        now: Instant,
+    ) {
+        self.latest_slot = self.latest_slot.max(slot);
+        self.data_shreds = self.data_shreds.saturating_add(1);
+        if data_complete {
+            self.data_complete = self.data_complete.saturating_add(1);
+        }
+        if last_in_slot {
+            self.last_in_slot = self.last_in_slot.saturating_add(1);
+        }
+        self.last_seen_at = Some(now);
+    }
+
+    fn note_code_shred(&mut self, slot: u64, now: Instant) {
+        self.latest_slot = self.latest_slot.max(slot);
+        self.code_shreds = self.code_shreds.saturating_add(1);
+        self.last_seen_at = Some(now);
+    }
+
+    fn rank(self, now: Instant) -> (u64, u64, u64, u64) {
+        let freshness_ms = self
+            .last_seen_at
+            .map(|seen_at| {
+                let age_ms = duration_to_ms_u64(now.saturating_duration_since(seen_at));
+                duration_to_ms_u64(Duration::from_secs(GOSSIP_SOURCE_SCORE_STALE_AFTER_SECS))
+                    .saturating_sub(age_ms)
+            })
+            .unwrap_or(0);
+        let useful_score = self
+            .data_shreds
+            .saturating_mul(2)
+            .saturating_add(self.code_shreds)
+            .saturating_add(self.data_complete.saturating_mul(8))
+            .saturating_add(self.last_in_slot.saturating_mul(16));
+        (
+            useful_score,
+            self.latest_slot,
+            freshness_ms,
+            self.data_shreds.saturating_add(self.code_shreds),
+        )
+    }
+
+    const fn decay(&mut self) {
+        self.data_shreds /= 2;
+        self.code_shreds /= 2;
+        self.data_complete /= 2;
+        self.last_in_slot /= 2;
+    }
+
+    fn is_stale(self, now: Instant) -> bool {
+        self.last_seen_at.is_none_or(|seen_at| {
+            now.saturating_duration_since(seen_at)
+                > Duration::from_secs(GOSSIP_SOURCE_SCORE_STALE_AFTER_SECS)
+        })
+    }
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+#[derive(Debug, Default)]
+struct GossipSourceTracker {
+    scores_by_ip: HashMap<IpAddr, GossipSourceScore>,
+    last_decay_at: Option<Instant>,
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+impl GossipSourceTracker {
+    fn note_data_shred(
+        &mut self,
+        source_addr: SocketAddr,
+        slot: u64,
+        data_complete: bool,
+        last_in_slot: bool,
+        now: Instant,
+    ) {
+        self.decay_if_needed(now);
+        self.scores_by_ip
+            .entry(source_addr.ip())
+            .or_default()
+            .note_data_shred(slot, data_complete, last_in_slot, now);
+    }
+
+    fn note_code_shred(&mut self, source_addr: SocketAddr, slot: u64, now: Instant) {
+        self.decay_if_needed(now);
+        self.scores_by_ip
+            .entry(source_addr.ip())
+            .or_default()
+            .note_code_shred(slot, now);
+    }
+
+    fn ranked_source_ips(&mut self, now: Instant, limit: usize) -> Vec<IpAddr> {
+        self.decay_if_needed(now);
+        let mut ranked: Vec<(IpAddr, GossipSourceScore)> = self
+            .scores_by_ip
+            .iter()
+            .filter_map(|(ip, score)| (!score.is_stale(now)).then_some((*ip, *score)))
+            .collect();
+        ranked.sort_unstable_by(|left, right| {
+            right
+                .1
+                .rank(now)
+                .cmp(&left.1.rank(now))
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        ranked
+            .into_iter()
+            .take(limit)
+            .map(|(ip, _)| ip)
+            .collect::<Vec<_>>()
+    }
+
+    fn top_sources_summary(&mut self, now: Instant, limit: usize) -> String {
+        let ranked_ips = self.ranked_source_ips(now, limit);
+        if ranked_ips.is_empty() {
+            return "-".to_owned();
+        }
+        ranked_ips
+            .into_iter()
+            .filter_map(|ip| {
+                self.scores_by_ip
+                    .get(&ip)
+                    .copied()
+                    .map(|score| format!("{}@slot{}:{}", ip, score.latest_slot, score.rank(now).1))
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn entrypoint_bias(&mut self, now: Instant, limit: usize) -> Option<GossipEntrypointBias> {
+        let ranked_ips = self.ranked_source_ips(now, limit);
+        (!ranked_ips.is_empty()).then(|| GossipEntrypointBias::new(ranked_ips))
+    }
+
+    fn decay_if_needed(&mut self, now: Instant) {
+        let should_decay = self.last_decay_at.is_none_or(|last_decay_at| {
+            now.saturating_duration_since(last_decay_at)
+                >= Duration::from_secs(GOSSIP_SOURCE_SCORE_DECAY_INTERVAL_SECS)
+        });
+        if !should_decay {
+            return;
+        }
+        self.last_decay_at = Some(now);
+        self.scores_by_ip.retain(|_, score| {
+            score.decay();
+            !score.is_stale(now)
+                && (score.data_shreds > 0
+                    || score.code_shreds > 0
+                    || score.data_complete > 0
+                    || score.last_in_slot > 0)
+        });
+    }
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+fn gossip_load_shed_queue_depth_threshold_packets(
+    queue_capacity_batches: usize,
+    worker_count: usize,
+    _batch_max_packets: usize,
+    pressure_pct: u64,
+) -> u64 {
+    let total_capacity_packets = u64::try_from(queue_capacity_batches)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::try_from(worker_count.max(1)).unwrap_or(u64::MAX));
+    total_capacity_packets
+        .saturating_mul(pressure_pct.clamp(1, 100))
+        .checked_div(100)
+        .unwrap_or(0)
+        .max(1)
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+fn select_gossip_load_shed_source_ips(
+    gossip_source_tracker: &mut GossipSourceTracker,
+    now: Instant,
+    queue_depth_packets: u64,
+    active: &mut bool,
+    enter_threshold_packets: u64,
+    keep_top_sources: usize,
+) -> Option<Vec<IpAddr>> {
+    if keep_top_sources == 0 || enter_threshold_packets == 0 {
+        *active = false;
+        return None;
+    }
+    let exit_threshold_packets =
+        (enter_threshold_packets / GOSSIP_LOAD_SHED_EXIT_THRESHOLD_DIVISOR).max(1);
+    if *active {
+        if queue_depth_packets <= exit_threshold_packets {
+            *active = false;
+            return None;
+        }
+    } else if queue_depth_packets >= enter_threshold_packets {
+        *active = true;
+    } else {
+        return None;
+    }
+    let ranked_source_ips = gossip_source_tracker.ranked_source_ips(now, keep_top_sources);
+    (ranked_source_ips.len() >= keep_top_sources).then_some(ranked_source_ips)
+}
 
 #[derive(Debug)]
 struct RelayCacheInsertRequest {
@@ -292,6 +522,11 @@ async fn run_async_with_hosts_inner(
     let dataset_jobs_started_count = Arc::new(AtomicU64::new(0));
     let dataset_jobs_completed_count = Arc::new(AtomicU64::new(0));
     let dataset_queue_capacity = read_dataset_queue_capacity();
+    let dataset_decode_failures_unhealthy_per_tick =
+        read_runtime_dataset_decode_failures_unhealthy_per_tick();
+    let dataset_tail_skips_unhealthy_per_tick =
+        read_runtime_dataset_tail_skips_unhealthy_per_tick();
+    let dataset_unhealthy_sustain_ticks = read_runtime_dataset_unhealthy_sustain_ticks();
     let dataset_attempt_cache_capacity = read_dataset_attempt_cache_capacity();
     let dataset_attempt_success_ttl = Duration::from_millis(read_dataset_attempt_success_ttl_ms());
     let dataset_attempt_failure_ttl = Duration::from_millis(read_dataset_attempt_failure_ttl_ms());
@@ -586,9 +821,28 @@ async fn run_async_with_hosts_inner(
     if !live_shreds_enabled && verify_enabled {
         tracing::warn!("SOF_VERIFY_SHREDS=true ignored because SOF_LIVE_SHREDS_ENABLED=false");
     }
+    let shred_trust_mode = read_shred_trust_mode();
+    if live_shreds_enabled
+        && !verify_enabled
+        && matches!(shred_trust_mode, ShredTrustMode::TrustedRawShredProvider)
+    {
+        tracing::warn!(
+            trust_mode = shred_trust_mode.as_str(),
+            "running raw-shred ingest with local shred verification disabled; use this only with an authenticated trusted upstream, not public gossip or public peers"
+        );
+    }
     let verify_enabled = live_shreds_enabled && verify_enabled;
     let verify_strict_unknown = read_verify_strict_unknown();
     let verify_recovered_shreds = read_verify_recovered_shreds();
+    if live_shreds_enabled
+        && !verify_recovered_shreds
+        && matches!(shred_trust_mode, ShredTrustMode::TrustedRawShredProvider)
+    {
+        tracing::warn!(
+            trust_mode = shred_trust_mode.as_str(),
+            "running raw-shred ingest with recovered shred verification disabled; use this only with an authenticated trusted upstream, not public gossip or public peers"
+        );
+    }
     let verify_signature_cache_entries = read_verify_signature_cache_entries();
     let verify_unknown_retry = Duration::from_millis(read_verify_unknown_retry_ms());
     let dedupe_capacity = read_shred_dedupe_capacity();
@@ -739,6 +993,9 @@ async fn run_async_with_hosts_inner(
     let gossip_runtime_switch_enabled =
         repair_enabled && read_gossip_runtime_switch_enabled() && !read_gossip_bootstrap_only();
     #[cfg(feature = "gossip-bootstrap")]
+    let gossip_runtime_switch_proactive_enabled =
+        gossip_runtime_switch_enabled && read_gossip_runtime_switch_proactive_enabled();
+    #[cfg(feature = "gossip-bootstrap")]
     let gossip_runtime_switch_stall_ms = read_gossip_runtime_switch_stall_ms();
     #[cfg(feature = "gossip-bootstrap")]
     let gossip_runtime_switch_dataset_stall_ms = read_gossip_runtime_switch_dataset_stall_ms();
@@ -748,6 +1005,18 @@ async fn run_async_with_hosts_inner(
     #[cfg(feature = "gossip-bootstrap")]
     let gossip_runtime_switch_warmup =
         Duration::from_millis(read_gossip_runtime_switch_warmup_ms());
+    #[cfg(feature = "gossip-bootstrap")]
+    let gossip_runtime_switch_proactive_eval =
+        Duration::from_millis(read_gossip_runtime_switch_proactive_eval_ms());
+    #[cfg(feature = "gossip-bootstrap")]
+    let gossip_runtime_switch_proactive_active_rank_max =
+        read_gossip_runtime_switch_proactive_active_rank_max();
+    #[cfg(feature = "gossip-bootstrap")]
+    let gossip_runtime_switch_proactive_stable_evals =
+        read_gossip_runtime_switch_proactive_stable_evals();
+    #[cfg(feature = "gossip-bootstrap")]
+    let gossip_runtime_switch_proactive_min_runtime_age =
+        Duration::from_millis(read_gossip_runtime_switch_proactive_min_runtime_age_ms());
     #[cfg(feature = "gossip-bootstrap")]
     let gossip_runtime_switch_overlap =
         Duration::from_millis(read_gossip_runtime_switch_overlap_ms());
@@ -760,9 +1029,19 @@ async fn run_async_with_hosts_inner(
     #[cfg(feature = "gossip-bootstrap")]
     let mut last_gossip_runtime_switch_attempt = Instant::now();
     #[cfg(feature = "gossip-bootstrap")]
+    let mut last_gossip_runtime_proactive_sample = Instant::now();
+    #[cfg(feature = "gossip-bootstrap")]
     let mut gossip_runtime_started_at = Instant::now();
     #[cfg(feature = "gossip-bootstrap")]
     let mut gossip_runtime_stall_started_at: Option<Instant> = None;
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut gossip_runtime_proactive_top_sources: Vec<IpAddr> = Vec::new();
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut gossip_runtime_proactive_top_sources_stable_evals: usize = 0;
+    #[cfg(feature = "gossip-bootstrap")]
+    let gossip_load_shed_enabled = read_gossip_load_shed_enabled();
+    #[cfg(feature = "gossip-bootstrap")]
+    let gossip_load_shed_keep_top_sources = read_gossip_load_shed_keep_top_sources();
 
     let dataset_max_tracked_slots = read_dataset_max_tracked_slots();
     let dataset_retained_slot_lag = read_dataset_retained_slot_lag();
@@ -793,6 +1072,21 @@ async fn run_async_with_hosts_inner(
     });
     let packet_worker_assignment_slot_window =
         usize::try_from(fec_retained_slot_lag.max(32)).unwrap_or(usize::MAX);
+    #[cfg(feature = "gossip-bootstrap")]
+    let verify_strict_unknown_enter_threshold_packets =
+        gossip_load_shed_queue_depth_threshold_packets(
+            packet_worker_queue_capacity,
+            packet_workers,
+            packet_worker_batch_max_packets,
+            read_verify_strict_unknown_queue_pressure_pct(),
+        );
+    #[cfg(feature = "gossip-bootstrap")]
+    let gossip_load_shed_enter_threshold_packets = gossip_load_shed_queue_depth_threshold_packets(
+        packet_worker_queue_capacity,
+        packet_workers,
+        packet_worker_batch_max_packets,
+        read_gossip_load_shed_queue_pressure_pct(),
+    );
     let mut packet_worker_assignments =
         PacketWorkerAssignments::new(packet_worker_assignment_slot_window);
     let mut packet_batch_dispatch_scratch =
@@ -994,6 +1288,8 @@ async fn run_async_with_hosts_inner(
     let repair_source_hint_enqueued: u64 = 0;
     #[cfg(feature = "gossip-bootstrap")]
     let mut repair_source_hint_buffer_drops: u64 = 0;
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut relay_cache_keepalive_until: Option<Instant> = None;
     #[cfg(not(feature = "gossip-bootstrap"))]
     let repair_source_hint_buffer_drops: u64 = 0;
     #[cfg(feature = "gossip-bootstrap")]
@@ -1011,6 +1307,14 @@ async fn run_async_with_hosts_inner(
         Duration::from_millis(read_repair_source_hint_flush_ms());
     #[cfg(feature = "gossip-bootstrap")]
     let mut repair_source_hint_last_flush = Instant::now();
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut gossip_source_tracker = GossipSourceTracker::default();
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut gossip_load_shed_active = false;
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut gossip_load_shed_dropped_packets: u64 = 0;
+    #[cfg(feature = "gossip-bootstrap")]
+    let mut gossip_load_shed_last_kept_source_ips = String::from("-");
     let mut latest_shred_slot: Option<u64> = None;
     let mut fork_status_transitions_total: u64 = 0;
     let mut fork_reorg_count: u64 = 0;
@@ -1020,6 +1324,10 @@ async fn run_async_with_hosts_inner(
     let mut coverage_window = SlotCoverageWindow::new(read_coverage_window_slots());
     let mut telemetry_tick = interval(Duration::from_secs(TELEMETRY_INTERVAL_SECS));
     let mut telemetry_tick_count: u64 = 0;
+    let mut last_dataset_decode_failures_total: u64 = 0;
+    let mut last_dataset_tail_skips_total: u64 = 0;
+    let mut dataset_unhealthy_consecutive_ticks: u64 = 0;
+    let mut runtime_dataset_health_degraded = false;
     let mut repair_tick = interval(Duration::from_millis(read_repair_tick_ms()));
     let mut control_plane_tick = interval(Duration::from_millis(CONTROL_PLANE_EVENT_TICK_MS));
     let derived_state_checkpoint_enabled =
@@ -1240,6 +1548,8 @@ async fn run_async_with_hosts_inner(
                 repair_source_hint_buffer_drops: &mut repair_source_hint_buffer_drops,
                 #[cfg(feature = "gossip-bootstrap")]
                 repair_source_hint_last_flush: &mut repair_source_hint_last_flush,
+                #[cfg(feature = "gossip-bootstrap")]
+                gossip_source_tracker: &mut gossip_source_tracker,
             }
             .process(
                 worker_result,
@@ -1309,15 +1619,49 @@ async fn run_async_with_hosts_inner(
                     continue;
                 };
                 packet_batch_dispatch_scratch.refresh(&packet_worker_pool);
+                #[cfg(feature = "gossip-bootstrap")]
+                let packet_worker_queue_depth_now = packet_worker_pool.queue_depth();
+                #[cfg(feature = "gossip-bootstrap")]
+                let verify_strict_unknown_now = verify_strict_unknown
+                    || packet_worker_queue_depth_now
+                        >= verify_strict_unknown_enter_threshold_packets;
+                #[cfg(not(feature = "gossip-bootstrap"))]
+                let verify_strict_unknown_now = verify_strict_unknown;
+                packet_worker_pool.set_verify_strict_unknown(verify_strict_unknown_now);
+                #[cfg(feature = "gossip-bootstrap")]
+                let gossip_load_shed_source_ips = if gossip_load_shed_enabled {
+                    let selected = select_gossip_load_shed_source_ips(
+                        &mut gossip_source_tracker,
+                        Instant::now(),
+                        packet_worker_queue_depth_now,
+                        &mut gossip_load_shed_active,
+                        gossip_load_shed_enter_threshold_packets,
+                        gossip_load_shed_keep_top_sources,
+                    );
+                    gossip_load_shed_last_kept_source_ips = selected
+                        .as_ref()
+                        .map(|ips| {
+                            ips.iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        })
+                        .unwrap_or_else(|| "-".to_owned());
+                    selected
+                } else {
+                    gossip_load_shed_active = false;
+                    gossip_load_shed_last_kept_source_ips = "-".to_owned();
+                    None
+                };
                 let mut deferred_parsed_shred_side_effects =
                     Vec::with_capacity(packet_batch.len());
-                for packet in packet_batch {
+                for packet in packet_batch.packets().iter().copied() {
                     let observed_at = Instant::now();
                     let source_addr = packet.source;
-                    let packet_bytes = packet.bytes;
+                    let packet_bytes = packet_batch.packet_bytes(packet);
                     let shared_observer_packet =
                         (plugin_raw_packet_enabled || extension_hooks_enabled)
-                        .then(|| Arc::clone(&packet_bytes));
+                        .then(|| Arc::<[u8]>::from(packet_bytes));
                     if plugin_raw_packet_enabled
                         && let Some(shared_packet) = shared_observer_packet.as_ref()
                     {
@@ -1346,16 +1690,27 @@ async fn run_async_with_hosts_inner(
                     if !live_shreds_enabled {
                         continue;
                     }
-                    let parsed_shred = match parse_shred_header(packet_bytes.as_ref()) {
+                    #[cfg(feature = "gossip-bootstrap")]
+                    if let Some(kept_source_ips) = gossip_load_shed_source_ips.as_ref()
+                        && !kept_source_ips.contains(&source_addr.ip())
+                    {
+                        // Under overload, drop low-ranked sources before shred parsing,
+                        // dedupe, and worker dispatch. Repair control-plane packets are
+                        // still handled below when parsing is attempted for kept sources.
+                        gossip_load_shed_dropped_packets =
+                            gossip_load_shed_dropped_packets.saturating_add(1);
+                        continue;
+                    }
+                    let parsed_shred = match parse_shred_header(packet_bytes) {
                         Ok(parsed) => parsed,
                         Err(error) => {
                             #[cfg(feature = "gossip-bootstrap")]
                             if repair_driver_enabled
-                                && crate::repair::is_repair_response_ping_packet(packet_bytes.as_ref())
+                                && crate::repair::is_repair_response_ping_packet(packet_bytes)
                                 && let Some(command_tx) = repair_command_tx.as_ref()
                             {
                                 match command_tx.try_send(RepairCommand::HandleResponsePing {
-                                    packet: Arc::clone(&packet_bytes),
+                                    packet: Arc::<[u8]>::from(packet_bytes),
                                     from_addr: source_addr,
                                 }) {
                                     Ok(()) => {
@@ -1372,11 +1727,14 @@ async fn run_async_with_hosts_inner(
                             }
                             #[cfg(feature = "gossip-bootstrap")]
                             if repair_driver_enabled
-                                && crate::repair::is_supported_repair_request_packet(packet_bytes.as_ref())
+                                && crate::repair::is_supported_repair_request_packet(packet_bytes)
                                 && let Some(command_tx) = repair_command_tx.as_ref()
                             {
+                                relay_cache_keepalive_until = observed_at.checked_add(
+                                    Duration::from_millis(RELAY_CACHE_SERVE_KEEPALIVE_MS),
+                                );
                                 match command_tx.try_send(RepairCommand::HandleServeRequest {
-                                    packet: Arc::clone(&packet_bytes),
+                                    packet: Arc::<[u8]>::from(packet_bytes),
                                     from_addr: source_addr,
                                 }) {
                                     Ok(()) => {
@@ -1434,7 +1792,7 @@ async fn run_async_with_hosts_inner(
                         }
                     }
                     if let Some(cache) = shred_dedupe_cache.as_mut() {
-                        match cache.observe_shred(packet_bytes.as_ref(), &parsed_shred, observed_at)
+                        match cache.observe_shred(packet_bytes, &parsed_shred, observed_at)
                         {
                             ShredDedupeObservation::Accepted => {}
                             ShredDedupeObservation::Duplicate => {
@@ -1470,12 +1828,25 @@ async fn run_async_with_hosts_inner(
                             }
                         }
                     }
+                    #[cfg(feature = "gossip-bootstrap")]
+                    let relay_cache_capture_enabled = relay_cache_insert_tx.is_some()
+                        && relay_cache_keepalive_until
+                            .is_some_and(|keepalive_until| observed_at <= keepalive_until);
+                    #[cfg(not(feature = "gossip-bootstrap"))]
+                    let relay_cache_capture_enabled = relay_cache_insert_tx.is_some();
+                    #[cfg(feature = "gossip-bootstrap")]
+                    let udp_relay_active_now = udp_relay_enabled
+                        && relay_cache_keepalive_until
+                            .is_some_and(|keepalive_until| observed_at <= keepalive_until);
+                    #[cfg(not(feature = "gossip-bootstrap"))]
+                    let udp_relay_active_now = udp_relay_enabled;
                     let defer_parsed_shred_side_effects =
-                        relay_cache.is_some() || plugin_shred_enabled || udp_relay_enabled;
+                        relay_cache_capture_enabled || plugin_shred_enabled || udp_relay_active_now;
                     let deferred_packet_bytes =
-                        defer_parsed_shred_side_effects.then(|| Arc::clone(&packet_bytes));
+                        defer_parsed_shred_side_effects.then(|| Arc::<[u8]>::from(packet_bytes));
                     let deferred_parsed_shred =
                         defer_parsed_shred_side_effects.then(|| parsed_shred.clone());
+                    let worker_packet_bytes = Arc::<[u8]>::from(packet_bytes);
                     let worker_index = packet_worker_assignments.worker_for(
                         parsed_shred_slot(&parsed_shred),
                         parsed_shred_fec_set_index(&parsed_shred),
@@ -1486,7 +1857,7 @@ async fn run_async_with_hosts_inner(
                     {
                         batch.push(PacketWorkerInput {
                             source: source_addr,
-                            packet_bytes,
+                            packet_bytes: worker_packet_bytes,
                             parsed_header: parsed_shred,
                             observed_at,
                         });
@@ -1500,6 +1871,8 @@ async fn run_async_with_hosts_inner(
                             packet_bytes: deferred_packet_bytes,
                             parsed_shred: deferred_parsed_shred,
                             observed_at,
+                            relay_cache_capture_enabled,
+                            udp_relay_active: udp_relay_active_now,
                         });
                     }
                 }
@@ -1522,8 +1895,10 @@ async fn run_async_with_hosts_inner(
                         packet_bytes,
                         parsed_shred,
                         observed_at,
+                        relay_cache_capture_enabled,
+                        udp_relay_active: _udp_relay_active,
                     } = deferred;
-                    if relay_cache_insert_tx.is_some() {
+                    if relay_cache_capture_enabled {
                         relay_cache_insert_batch.push(RelayCacheInsertRequest {
                             packet_bytes: Arc::clone(&packet_bytes),
                             parsed_shred: parsed_shred.clone(),
@@ -1538,7 +1913,9 @@ async fn run_async_with_hosts_inner(
                         });
                     }
                     #[cfg(feature = "gossip-bootstrap")]
-                    if udp_relay_enabled
+                    let udp_relay_active = _udp_relay_active;
+                    #[cfg(feature = "gossip-bootstrap")]
+                    if udp_relay_active
                         && udp_relay_socket.is_some()
                         && !udp_relay_peers.is_empty()
                     {
@@ -1973,8 +2350,73 @@ async fn run_async_with_hosts_inner(
                         let runtime_ready_for_switch = runtime.gossip_runtime.is_none()
                             || now.saturating_duration_since(gossip_runtime_started_at)
                                 >= runtime_switch_warmup;
-                        if switch_stalled
-                            && stall_ready_for_switch
+                        let gossip_entrypoint_bias =
+                            gossip_source_tracker.entrypoint_bias(now, GOSSIP_SOURCE_SCORE_TOP_IPS);
+                        let proactive_signal = gossip_entrypoint_bias.as_ref().map(|bias| {
+                            bias.ranked_source_ips()
+                                .iter()
+                                .take(3)
+                                .copied()
+                                .collect::<Vec<_>>()
+                        });
+                        let proactive_sample_ready = last_gossip_runtime_proactive_sample
+                            .elapsed()
+                            >= gossip_runtime_switch_proactive_eval;
+                        if proactive_sample_ready {
+                            last_gossip_runtime_proactive_sample = now;
+                            if let Some(current_signal) = proactive_signal.as_ref() {
+                                if *current_signal == gossip_runtime_proactive_top_sources {
+                                    gossip_runtime_proactive_top_sources_stable_evals =
+                                        gossip_runtime_proactive_top_sources_stable_evals
+                                            .saturating_add(1);
+                                } else {
+                                    gossip_runtime_proactive_top_sources = current_signal.clone();
+                                    gossip_runtime_proactive_top_sources_stable_evals = 1;
+                                }
+                            } else {
+                                gossip_runtime_proactive_top_sources.clear();
+                                gossip_runtime_proactive_top_sources_stable_evals = 0;
+                            }
+                        }
+                        let proactive_switch_ready = gossip_runtime_switch_proactive_enabled
+                            && !switch_stalled
+                            && runtime_ready_for_switch
+                            && now.saturating_duration_since(gossip_runtime_started_at)
+                                >= gossip_runtime_switch_proactive_min_runtime_age
+                            && last_gossip_runtime_switch_attempt.elapsed()
+                                >= gossip_runtime_switch_cooldown
+                            && proactive_sample_ready
+                            && gossip_runtime_proactive_top_sources_stable_evals
+                                >= gossip_runtime_switch_proactive_stable_evals
+                            && gossip_entrypoint_bias.is_some();
+                        if proactive_switch_ready
+                            && let Some(bias) = gossip_entrypoint_bias.as_ref()
+                        {
+                            tracing::info!(
+                                active_entrypoint = runtime
+                                    .active_gossip_entrypoint
+                                    .as_deref()
+                                    .unwrap_or_default(),
+                                source_signal_stable_evals = gossip_runtime_proactive_top_sources_stable_evals,
+                                source_signal_required_evals = gossip_runtime_switch_proactive_stable_evals,
+                                min_runtime_age_ms = duration_to_ms_u64(
+                                    gossip_runtime_switch_proactive_min_runtime_age
+                                ),
+                                proactive_rank_max = gossip_runtime_switch_proactive_active_rank_max,
+                                evaluation_interval_ms = duration_to_ms_u64(
+                                    gossip_runtime_switch_proactive_eval
+                                ),
+                                ranked_source_ips = %bias
+                                    .ranked_source_ips()
+                                    .iter()
+                                    .take(6)
+                                    .map(ToString::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join(","),
+                                "triggering proactive gossip runtime switch evaluation"
+                            );
+                        }
+                        if (switch_stalled && stall_ready_for_switch || proactive_switch_ready)
                             && runtime_ready_for_switch
                             && last_gossip_runtime_switch_attempt.elapsed() >= gossip_runtime_switch_cooldown
                         {
@@ -1995,6 +2437,7 @@ async fn run_async_with_hosts_inner(
                                 &mut runtime,
                                 &packet_ingest_tx,
                                 &gossip_entrypoints,
+                                gossip_entrypoint_bias.as_ref(),
                             )
                             .await
                             {
@@ -2003,6 +2446,8 @@ async fn run_async_with_hosts_inner(
                                         gossip_runtime_switch_success.saturating_add(1);
                                     gossip_runtime_started_at = Instant::now();
                                     gossip_runtime_stall_started_at = None;
+                                    gossip_runtime_proactive_top_sources.clear();
+                                    gossip_runtime_proactive_top_sources_stable_evals = 0;
                                     latest_shred_updated_at = gossip_runtime_started_at;
                                     last_dataset_reconstructed_at = gossip_runtime_started_at;
                                     last_substantial_dataset_reconstructed_at =
@@ -2091,7 +2536,10 @@ async fn run_async_with_hosts_inner(
                 #[cfg(feature = "gossip-bootstrap")]
                 {
                     let now = Instant::now();
-                    if udp_relay_enabled
+                    let udp_relay_refresh_active = udp_relay_enabled
+                        && relay_cache_keepalive_until
+                            .is_some_and(|keepalive_until| now <= keepalive_until);
+                    if udp_relay_refresh_active
                         && udp_relay_fanout > 0
                         && now.saturating_duration_since(udp_relay_last_refresh)
                             >= udp_relay_refresh
@@ -2114,6 +2562,9 @@ async fn run_async_with_hosts_inner(
                             u64::try_from(peers.total_candidates).unwrap_or(u64::MAX);
                         udp_relay_peers = peers.selected_peers;
                         udp_relay_refreshes = udp_relay_refreshes.saturating_add(1);
+                    } else if !udp_relay_refresh_active && !udp_relay_peers.is_empty() {
+                        udp_relay_candidates = 0;
+                        udp_relay_peers.clear();
                     }
                 }
                 #[cfg(feature = "gossip-bootstrap")]
@@ -2183,6 +2634,23 @@ async fn run_async_with_hosts_inner(
                 #[cfg(feature = "gossip-bootstrap")]
                 let gossip_active_entrypoint =
                     runtime.active_gossip_entrypoint.as_deref().unwrap_or("");
+                #[cfg(feature = "gossip-bootstrap")]
+                let gossip_ranked_source_ips =
+                    gossip_source_tracker.top_sources_summary(Instant::now(), 6);
+                #[cfg(not(feature = "gossip-bootstrap"))]
+                let gossip_ranked_source_ips = "-".to_owned();
+                #[cfg(feature = "gossip-bootstrap")]
+                let gossip_load_shed_summary = format!(
+                    "enabled={} active={} keep_top={} enter_packets={} kept={} dropped={}",
+                    gossip_load_shed_enabled,
+                    gossip_load_shed_active,
+                    gossip_load_shed_keep_top_sources,
+                    gossip_load_shed_enter_threshold_packets,
+                    gossip_load_shed_last_kept_source_ips,
+                    gossip_load_shed_dropped_packets,
+                );
+                #[cfg(not(feature = "gossip-bootstrap"))]
+                let gossip_load_shed_summary = "-".to_owned();
                 #[cfg(not(feature = "gossip-bootstrap"))]
                 let gossip_active_entrypoint = "";
                 #[cfg(feature = "gossip-bootstrap")]
@@ -2362,6 +2830,58 @@ async fn run_async_with_hosts_inner(
                 let derived_state_consumer_telemetry = derived_state_host.consumer_telemetry();
                 let derived_state_replay_telemetry =
                     derived_state_host.replay_telemetry().unwrap_or_default();
+                let dataset_decode_failures_total =
+                    dataset_decode_fail_count.load(Ordering::Relaxed);
+                let dataset_tail_skips_total = dataset_tail_skip_count.load(Ordering::Relaxed);
+                let dataset_duplicate_drops_total =
+                    dataset_duplicate_drop_count.load(Ordering::Relaxed);
+                let dataset_decode_failures_delta = dataset_decode_failures_total
+                    .saturating_sub(last_dataset_decode_failures_total);
+                let dataset_tail_skips_delta =
+                    dataset_tail_skips_total.saturating_sub(last_dataset_tail_skips_total);
+                last_dataset_decode_failures_total = dataset_decode_failures_total;
+                last_dataset_tail_skips_total = dataset_tail_skips_total;
+                let dataset_unhealthy_this_tick =
+                    (dataset_decode_failures_unhealthy_per_tick > 0
+                        && dataset_decode_failures_delta
+                            >= dataset_decode_failures_unhealthy_per_tick)
+                        || (dataset_tail_skips_unhealthy_per_tick > 0
+                            && dataset_tail_skips_delta
+                                >= dataset_tail_skips_unhealthy_per_tick);
+                if dataset_unhealthy_this_tick {
+                    dataset_unhealthy_consecutive_ticks =
+                        dataset_unhealthy_consecutive_ticks.saturating_add(1);
+                } else {
+                    dataset_unhealthy_consecutive_ticks = 0;
+                }
+                let dataset_health_degraded =
+                    dataset_unhealthy_consecutive_ticks >= dataset_unhealthy_sustain_ticks;
+                if dataset_health_degraded != runtime_dataset_health_degraded {
+                    runtime_dataset_health_degraded = dataset_health_degraded;
+                    if let Some(observability_handle) = observability_handle.as_ref() {
+                        if runtime_dataset_health_degraded {
+                            observability_handle.mark_not_ready();
+                        } else {
+                            observability_handle.mark_ready();
+                        }
+                    }
+                    if runtime_dataset_health_degraded {
+                        tracing::warn!(
+                            dataset_decode_failures_delta,
+                            dataset_tail_skips_delta,
+                            dataset_decode_failures_unhealthy_per_tick,
+                            dataset_tail_skips_unhealthy_per_tick,
+                            dataset_unhealthy_sustain_ticks,
+                            "runtime readiness degraded by persistent dataset reconstruction failures"
+                        );
+                    } else {
+                        tracing::info!(
+                            dataset_decode_failures_delta,
+                            dataset_tail_skips_delta,
+                            "runtime readiness restored after dataset reconstruction pressure subsided"
+                        );
+                    }
+                }
                 let (
                     relay_cache_inserts_total,
                     relay_cache_replacements_total,
@@ -2464,6 +2984,7 @@ async fn run_async_with_hosts_inner(
                     || runtime_stage_metrics.packet_worker_dropped_packets_total > 0
                     || tx_event_drop_count.load(Ordering::Relaxed) > 0
                     || extension_dispatch.dropped_events > 0
+                    || runtime_dataset_health_degraded
                     || derived_state_unhealthy_consumers > 0
                     || derived_state_pending_recovery > 0
                     || derived_state_rebuild_required > 0
@@ -2597,9 +3118,9 @@ async fn run_async_with_hosts_inner(
                             ?derived_state_pending_recovery_names,
                         derived_state_rebuild_consumers = ?derived_state_rebuild_names,
                         derived_state_consumers = ?derived_state_consumer_telemetry,
-                        dataset_decode_failures = dataset_decode_fail_count.load(Ordering::Relaxed),
-                        dataset_tail_skips = dataset_tail_skip_count.load(Ordering::Relaxed),
-                        dataset_duplicate_drops = dataset_duplicate_drop_count.load(Ordering::Relaxed),
+                        dataset_decode_failures = dataset_decode_failures_total,
+                        dataset_tail_skips = dataset_tail_skips_total,
+                        dataset_duplicate_drops = dataset_duplicate_drops_total,
                         dataset_queue_capacity_per_worker = dataset_queue_capacity,
                         dataset_queue_capacity_total = dataset_queue_capacity_total,
                         dataset_worker_count = dataset_worker_count,
@@ -2704,6 +3225,8 @@ async fn run_async_with_hosts_inner(
                         repair_source_hint_drops = repair_source_hint_drops,
                         repair_source_hint_buffer_drops = repair_source_hint_buffer_drops,
                         gossip_active_entrypoint = gossip_active_entrypoint,
+                        gossip_ranked_source_ips = gossip_ranked_source_ips,
+                        gossip_load_shed = gossip_load_shed_summary,
                         gossip_runtime_switch_enabled = gossip_switch_enabled,
                         gossip_runtime_switch_stall_ms = gossip_switch_stall_ms,
                         gossip_runtime_switch_dataset_stall_ms = gossip_switch_dataset_stall_ms,
@@ -2884,9 +3407,9 @@ async fn run_async_with_hosts_inner(
                         ?derived_state_pending_recovery_names,
                     derived_state_rebuild_consumers = ?derived_state_rebuild_names,
                     derived_state_consumers = ?derived_state_consumer_telemetry,
-                    dataset_decode_failures = dataset_decode_fail_count.load(Ordering::Relaxed),
-                    dataset_tail_skips = dataset_tail_skip_count.load(Ordering::Relaxed),
-                    dataset_duplicate_drops = dataset_duplicate_drop_count.load(Ordering::Relaxed),
+                    dataset_decode_failures = dataset_decode_failures_total,
+                    dataset_tail_skips = dataset_tail_skips_total,
+                    dataset_duplicate_drops = dataset_duplicate_drops_total,
                     dataset_queue_capacity_per_worker = dataset_queue_capacity,
                     dataset_queue_capacity_total = dataset_queue_capacity_total,
                     dataset_worker_count = dataset_worker_count,
@@ -2991,6 +3514,8 @@ async fn run_async_with_hosts_inner(
                     repair_source_hint_drops = repair_source_hint_drops,
                     repair_source_hint_buffer_drops = repair_source_hint_buffer_drops,
                     gossip_active_entrypoint = gossip_active_entrypoint,
+                    gossip_ranked_source_ips = gossip_ranked_source_ips,
+                    gossip_load_shed = gossip_load_shed_summary,
                     gossip_runtime_switch_enabled = gossip_switch_enabled,
                     gossip_runtime_switch_stall_ms = gossip_switch_stall_ms,
                     gossip_runtime_switch_dataset_stall_ms = gossip_switch_dataset_stall_ms,
@@ -3225,6 +3750,8 @@ struct DeferredParsedShredSideEffects {
     packet_bytes: Arc<[u8]>,
     parsed_shred: ParsedShredHeader,
     observed_at: Instant,
+    relay_cache_capture_enabled: bool,
+    udp_relay_active: bool,
 }
 
 struct DataLikeShredInput {
@@ -3416,6 +3943,8 @@ struct PacketWorkerResultContext<'context> {
     repair_source_hint_buffer_drops: &'context mut u64,
     #[cfg(feature = "gossip-bootstrap")]
     repair_source_hint_last_flush: &'context mut Instant,
+    #[cfg(feature = "gossip-bootstrap")]
+    gossip_source_tracker: &'context mut GossipSourceTracker,
 }
 
 impl PacketWorkerResultContext<'_> {
@@ -3584,6 +4113,14 @@ impl PacketWorkerResultContext<'_> {
             );
             self.coverage_window.on_data_shred(input.slot);
             #[cfg(feature = "gossip-bootstrap")]
+            self.gossip_source_tracker.note_data_shred(
+                source_addr,
+                input.slot,
+                input.data_complete,
+                input.last_in_slot,
+                observed_at,
+            );
+            #[cfg(feature = "gossip-bootstrap")]
             self.record_repair_source_hint(source_addr, observed_at);
         }
 
@@ -3699,6 +4236,9 @@ impl PacketWorkerResultContext<'_> {
             self.source_port_8900_code,
             self.source_port_other_code,
         );
+        #[cfg(feature = "gossip-bootstrap")]
+        self.gossip_source_tracker
+            .note_code_shred(source_addr, slot, observed_at);
         self.note_slot(slot, observed_at);
         let fork_update = self.fork_tracker.observe_code_shred(slot);
         self.apply_fork_update(&fork_update);
@@ -3865,6 +4405,7 @@ impl PacketWorkerResultContext<'_> {
     fn process_open_inline_dataset(&mut self, slot: u64) {
         struct PreparedInlineTx {
             tx: Arc<VersionedTransaction>,
+            dispatch: crate::framework::host::ClassifiedTransactionDispatch,
             kind: crate::app::runtime::dataset::TxKind,
             signature: Option<Signature>,
             tx_ready_observed_at: Instant,
@@ -3931,6 +4472,22 @@ impl PacketWorkerResultContext<'_> {
                                 remove_state = true;
                                 break;
                             };
+                            let prefiltered_dispatch =
+                                SanitizedTransactionView::try_new_sanitized(bytes, true)
+                                    .ok()
+                                    .map(|view| {
+                                        self.plugin_host.classify_transaction_view_in_scope(
+                                            &view,
+                                            commitment_status,
+                                            TransactionDispatchScope::InlineOnly,
+                                        )
+                                    });
+                            if prefiltered_dispatch.as_ref().is_some_and(|prefiltered| {
+                                prefiltered.dispatch.is_empty()
+                                    && !prefiltered.needs_full_classification
+                            }) {
+                                continue;
+                            }
                             let Ok(tx) = bincode::deserialize::<VersionedTransaction>(bytes) else {
                                 remove_state = true;
                                 break;
@@ -3949,8 +4506,29 @@ impl PacketWorkerResultContext<'_> {
                             };
                             let kind = crate::app::runtime::dataset::classify_tx_kind(&tx);
                             let signature = tx.signatures.first().copied();
+                            let dispatch = match prefiltered_dispatch {
+                                Some(prefiltered) if !prefiltered.needs_full_classification => {
+                                    prefiltered.dispatch
+                                }
+                                _ => self.plugin_host.classify_transaction_ref_in_scope(
+                                    TransactionEventRef {
+                                        slot,
+                                        commitment_status,
+                                        confirmed_slot: commitment_snapshot.confirmed_slot,
+                                        finalized_slot: commitment_snapshot.finalized_slot,
+                                        signature,
+                                        tx: &tx,
+                                        kind,
+                                    },
+                                    TransactionDispatchScope::InlineOnly,
+                                ),
+                            };
+                            if dispatch.is_empty() {
+                                continue;
+                            }
                             prepared.push(PreparedInlineTx {
                                 tx: Arc::new(tx),
+                                dispatch,
                                 kind,
                                 signature,
                                 tx_ready_observed_at,
@@ -3973,23 +4551,8 @@ impl PacketWorkerResultContext<'_> {
             }
 
             for prepared_tx in prepared {
-                let dispatch = self.plugin_host.classify_transaction_ref_in_scope(
-                    TransactionEventRef {
-                        slot,
-                        commitment_status,
-                        confirmed_slot: commitment_snapshot.confirmed_slot,
-                        finalized_slot: commitment_snapshot.finalized_slot,
-                        signature: prepared_tx.signature,
-                        tx: prepared_tx.tx.as_ref(),
-                        kind: prepared_tx.kind,
-                    },
-                    TransactionDispatchScope::InlineOnly,
-                );
-                if dispatch.is_empty() {
-                    continue;
-                }
                 self.plugin_host.on_classified_transaction(
-                    dispatch,
+                    prepared_tx.dispatch,
                     TransactionEvent {
                         slot,
                         commitment_status,
@@ -4532,13 +5095,15 @@ mod tests {
         CheckpointBarrierEvent, DerivedStateCheckpoint, DerivedStateConsumer,
         DerivedStateConsumerFault, DerivedStateConsumerFaultKind, DerivedStateFeedEnvelope,
         DerivedStateFeedEvent, FeedSequence, Plugin, PluginConfig, PluginContext,
-        PluginDispatchMode, PluginHost, PluginSetupError,
+        PluginDispatchMode, PluginHost, PluginSetupError, TransactionInterest,
+        TransactionPrefilter,
     };
     use async_trait::async_trait;
     use rand::{SeedableRng, rngs::StdRng};
     use solana_entry::entry::{Entry, MaxDataShredsLen};
     use solana_hash::Hash;
     use solana_perf::test_tx::{new_test_vote_tx, test_tx};
+    use solana_pubkey::Pubkey;
     use solana_transaction::versioned::VersionedTransaction;
     use std::sync::{Arc, Mutex};
     use wincode::{
@@ -4626,6 +5191,66 @@ mod tests {
         async fn on_transaction(&self, _event: &crate::framework::TransactionEvent) {}
     }
 
+    #[derive(Debug, Clone, Copy)]
+    struct ProfileInlineManualIgnorePlugin {
+        required_key: Pubkey,
+    }
+
+    #[async_trait]
+    impl Plugin for ProfileInlineManualIgnorePlugin {
+        fn name(&self) -> &'static str {
+            "profile-inline-manual-ignore"
+        }
+
+        fn config(&self) -> PluginConfig {
+            PluginConfig::new().with_inline_transaction()
+        }
+
+        fn transaction_interest_ref(
+            &self,
+            event: &crate::framework::TransactionEventRef<'_>,
+        ) -> TransactionInterest {
+            if event
+                .tx
+                .message
+                .static_account_keys()
+                .contains(&self.required_key)
+            {
+                TransactionInterest::Critical
+            } else {
+                TransactionInterest::Ignore
+            }
+        }
+
+        async fn setup(&self, _ctx: PluginContext) -> Result<(), PluginSetupError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct ProfileInlinePrefilterIgnorePlugin {
+        filter: TransactionPrefilter,
+    }
+
+    #[async_trait]
+    impl Plugin for ProfileInlinePrefilterIgnorePlugin {
+        fn name(&self) -> &'static str {
+            "profile-inline-prefilter-ignore"
+        }
+
+        fn config(&self) -> PluginConfig {
+            PluginConfig::new().with_inline_transaction()
+        }
+
+        fn transaction_prefilter(&self) -> Option<&TransactionPrefilter> {
+            Some(&self.filter)
+        }
+
+        async fn setup(&self, _ctx: PluginContext) -> Result<(), PluginSetupError> {
+            Ok(())
+        }
+    }
+
     #[test]
     #[ignore = "profiling fixture for perf"]
     fn inline_open_dataset_profile_fixture() {
@@ -4704,22 +5329,42 @@ mod tests {
                         .payload
                         .get(start..end)
                         .expect("inline transaction bytes");
+                    let prefiltered_dispatch =
+                        SanitizedTransactionView::try_new_sanitized(bytes, true)
+                            .ok()
+                            .map(|view| {
+                                plugin_host.classify_transaction_view_in_scope(
+                                    &view,
+                                    commitment_status,
+                                    TransactionDispatchScope::InlineOnly,
+                                )
+                            });
+                    if prefiltered_dispatch.as_ref().is_some_and(|prefiltered| {
+                        prefiltered.dispatch.is_empty() && !prefiltered.needs_full_classification
+                    }) {
+                        continue;
+                    }
                     let tx = bincode::deserialize::<VersionedTransaction>(bytes)
                         .expect("deserialize inline transaction");
                     let kind = crate::app::runtime::dataset::classify_tx_kind(&tx);
                     let signature = tx.signatures.first().copied();
-                    let dispatch = plugin_host.classify_transaction_ref_in_scope(
-                        TransactionEventRef {
-                            slot,
-                            commitment_status,
-                            confirmed_slot: commitment_snapshot.confirmed_slot,
-                            finalized_slot: commitment_snapshot.finalized_slot,
-                            signature,
-                            tx: &tx,
-                            kind,
-                        },
-                        TransactionDispatchScope::InlineOnly,
-                    );
+                    let dispatch = match prefiltered_dispatch {
+                        Some(prefiltered) if !prefiltered.needs_full_classification => {
+                            prefiltered.dispatch
+                        }
+                        _ => plugin_host.classify_transaction_ref_in_scope(
+                            TransactionEventRef {
+                                slot,
+                                commitment_status,
+                                confirmed_slot: commitment_snapshot.confirmed_slot,
+                                finalized_slot: commitment_snapshot.finalized_slot,
+                                signature,
+                                tx: &tx,
+                                kind,
+                            },
+                            TransactionDispatchScope::InlineOnly,
+                        ),
+                    };
                     if dispatch.is_empty() {
                         continue;
                     }
@@ -4765,6 +5410,154 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "profiling fixture for inline prefilter decode skip A/B"]
+    fn inline_open_dataset_prefilter_profile_fixture() {
+        let mode = std::env::var("SOF_INLINE_PREFILTER_PROFILE_MODE")
+            .unwrap_or_else(|_| "manual".to_owned());
+        let iterations = std::env::var("SOF_INLINE_PREFILTER_PROFILE_ITERS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(2_048);
+        let fragment_count = std::env::var("SOF_INLINE_PREFILTER_PROFILE_FRAGMENTS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(32);
+        let payload = build_inline_profile_payload(32);
+        let fragments = split_inline_profile_payload(&payload, fragment_count);
+        let missing_key = Pubkey::new_unique();
+        let plugin_host = match mode.as_str() {
+            "prefilter" => PluginHost::builder()
+                .with_dispatch_mode(PluginDispatchMode::Sequential)
+                .with_transaction_dispatch_workers(4)
+                .add_plugin(ProfileInlinePrefilterIgnorePlugin {
+                    filter: TransactionPrefilter::new(TransactionInterest::Critical)
+                        .with_account_required([missing_key]),
+                })
+                .build(),
+            _ => PluginHost::builder()
+                .with_dispatch_mode(PluginDispatchMode::Sequential)
+                .with_transaction_dispatch_workers(4)
+                .add_plugin(ProfileInlineManualIgnorePlugin {
+                    required_key: missing_key,
+                })
+                .build(),
+        };
+        let tx_commitment_tracker = CommitmentSlotTracker::new();
+        let started_at = Instant::now();
+        let mut candidate_total = 0_usize;
+        let mut start_indices_scratch = Vec::<u32>::new();
+
+        for iteration in 0..iterations {
+            let slot = 4_000_000_u64.saturating_add(u64::try_from(iteration).unwrap_or(u64::MAX));
+            let mut reassembler =
+                crate::reassembly::inline::InlineDataReassembler::new(fragment_count.max(4));
+            let mut open_state = InlineOpenDatasetState::default();
+            for (index, fragment) in fragments.iter().enumerate() {
+                let observed_at = Instant::now();
+                let _ = reassembler.observe_data_shred_meta_at(
+                    slot,
+                    u32::try_from(index).unwrap_or(u32::MAX),
+                    0,
+                    index + 1 == fragments.len(),
+                    index + 1 == fragments.len(),
+                    crate::reassembly::dataset::SharedPayloadFragment::owned(fragment.clone()),
+                    observed_at,
+                );
+                reassembler.fill_inline_contiguous_dataset_starts(slot, &mut start_indices_scratch);
+                let Some(&start_index) = start_indices_scratch.first() else {
+                    continue;
+                };
+                let synced =
+                    reassembler.sync_inline_contiguous_dataset(slot, start_index, &mut open_state);
+                assert!(synced.is_some(), "inline dataset state should sync");
+                match open_state.advance_ready_ranges() {
+                    crate::app::runtime::dataset::EntryStreamPrefixAdvance::Complete
+                    | crate::app::runtime::dataset::EntryStreamPrefixAdvance::Incomplete => {}
+                    crate::app::runtime::dataset::EntryStreamPrefixAdvance::Malformed => {
+                        panic!("unexpected malformed inline prefix fixture")
+                    }
+                }
+                if open_state.emitted_tx_count >= open_state.ready_tx_ranges.len() {
+                    continue;
+                }
+                let commitment_snapshot = tx_commitment_tracker.snapshot();
+                let commitment_status = TxCommitmentStatus::from_slot(
+                    slot,
+                    commitment_snapshot.confirmed_slot,
+                    commitment_snapshot.finalized_slot,
+                );
+                for range in open_state
+                    .ready_tx_ranges
+                    .iter()
+                    .skip(open_state.emitted_tx_count)
+                {
+                    let start = usize::try_from(range.start()).expect("range start");
+                    let end = usize::try_from(range.end()).expect("range end");
+                    let bytes = open_state
+                        .payload
+                        .get(start..end)
+                        .expect("inline transaction bytes");
+                    let prefiltered_dispatch =
+                        SanitizedTransactionView::try_new_sanitized(bytes, true)
+                            .ok()
+                            .map(|view| {
+                                plugin_host.classify_transaction_view_in_scope(
+                                    &view,
+                                    commitment_status,
+                                    TransactionDispatchScope::InlineOnly,
+                                )
+                            });
+                    if prefiltered_dispatch.as_ref().is_some_and(|prefiltered| {
+                        prefiltered.dispatch.is_empty() && !prefiltered.needs_full_classification
+                    }) {
+                        candidate_total = candidate_total.saturating_add(1);
+                        continue;
+                    }
+                    let tx = bincode::deserialize::<VersionedTransaction>(bytes)
+                        .expect("deserialize inline transaction");
+                    let kind = crate::app::runtime::dataset::classify_tx_kind(&tx);
+                    let signature = tx.signatures.first().copied();
+                    let dispatch = match prefiltered_dispatch {
+                        Some(prefiltered) if !prefiltered.needs_full_classification => {
+                            prefiltered.dispatch
+                        }
+                        _ => plugin_host.classify_transaction_ref_in_scope(
+                            TransactionEventRef {
+                                slot,
+                                commitment_status,
+                                confirmed_slot: commitment_snapshot.confirmed_slot,
+                                finalized_slot: commitment_snapshot.finalized_slot,
+                                signature,
+                                tx: &tx,
+                                kind,
+                            },
+                            TransactionDispatchScope::InlineOnly,
+                        ),
+                    };
+                    candidate_total = candidate_total.saturating_add(1);
+                    assert!(
+                        dispatch.is_empty(),
+                        "profile fixture expects ignored traffic"
+                    );
+                }
+                open_state.emitted_tx_count = open_state.ready_tx_ranges.len();
+            }
+        }
+
+        assert!(candidate_total > 0);
+        println!(
+            "inline_open_dataset_prefilter_profile_fixture mode={} iterations={} fragments={} candidates={} elapsed_ms={}",
+            mode,
+            iterations,
+            fragment_count,
+            candidate_total,
+            started_at.elapsed().as_millis()
+        );
+    }
+
+    #[test]
     fn packet_worker_batch_chunking_preserves_order() {
         let mut packets = (0..10).collect::<Vec<_>>();
 
@@ -4790,6 +5583,74 @@ mod tests {
         assert_eq!(second, vec![8]);
         assert_eq!(third, vec![9]);
         assert!(packets.is_empty());
+    }
+
+    #[cfg(feature = "gossip-bootstrap")]
+    #[test]
+    fn gossip_load_shed_threshold_scales_with_worker_capacity() {
+        assert_eq!(
+            gossip_load_shed_queue_depth_threshold_packets(256, 4, 8, 50),
+            512
+        );
+        assert_eq!(
+            gossip_load_shed_queue_depth_threshold_packets(1, 1, 1, 1),
+            1
+        );
+    }
+
+    #[cfg(feature = "gossip-bootstrap")]
+    #[test]
+    fn gossip_load_shed_selection_uses_hysteresis_and_top_sources() {
+        let now = Instant::now();
+        let mut tracker = GossipSourceTracker::default();
+        tracker.note_data_shred(
+            "10.0.0.1:8899".parse().expect("source addr"),
+            100,
+            true,
+            true,
+            now,
+        );
+        tracker.note_data_shred(
+            "10.0.0.2:8899".parse().expect("source addr"),
+            101,
+            true,
+            false,
+            now,
+        );
+        tracker.note_code_shred("10.0.0.3:8899".parse().expect("source addr"), 102, now);
+
+        let mut active = false;
+        assert!(
+            select_gossip_load_shed_source_ips(&mut tracker, now, 10, &mut active, 100, 2)
+                .is_none()
+        );
+        assert!(!active);
+
+        let selected =
+            select_gossip_load_shed_source_ips(&mut tracker, now, 100, &mut active, 100, 2)
+                .expect("load shed should activate");
+        assert!(active);
+        assert_eq!(selected.len(), 2);
+        assert_eq!(
+            selected[0],
+            "10.0.0.1".parse::<std::net::IpAddr>().expect("ip")
+        );
+        assert_eq!(
+            selected[1],
+            "10.0.0.2".parse::<std::net::IpAddr>().expect("ip")
+        );
+
+        let selected_after_hysteresis =
+            select_gossip_load_shed_source_ips(&mut tracker, now, 60, &mut active, 100, 2)
+                .expect("hysteresis should keep shedding active");
+        assert_eq!(selected_after_hysteresis.len(), 2);
+        assert!(active);
+
+        assert!(
+            select_gossip_load_shed_source_ips(&mut tracker, now, 50, &mut active, 100, 2)
+                .is_none()
+        );
+        assert!(!active);
     }
 
     #[test]

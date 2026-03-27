@@ -88,7 +88,7 @@ stopping at a bare runtime:
 use async_trait::async_trait;
 use sof::{
     event::TxKind,
-    framework::{Plugin, PluginConfig, PluginHost, TransactionEvent},
+    framework::{Plugin, PluginConfig, PluginHost, TransactionEvent, TxCommitmentStatus},
     runtime::{ObserverRuntime, RuntimeSetup},
 };
 
@@ -98,7 +98,9 @@ struct NonVoteLogger;
 #[async_trait]
 impl Plugin for NonVoteLogger {
     fn config(&self) -> PluginConfig {
-        PluginConfig::new().with_transaction()
+        PluginConfig::new()
+            .with_transaction()
+            .at_commitment(TxCommitmentStatus::Confirmed)
     }
 
     async fn on_transaction(&self, event: &TransactionEvent) {

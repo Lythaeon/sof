@@ -34,6 +34,8 @@ mod tests;
 pub use builder::PluginHostBuilder;
 pub use core::PluginHost;
 pub(crate) use core::TransactionDispatchScope;
+pub(crate) use dispatch::ClassifiedTransactionDispatch;
+pub(crate) use dispatch::TransactionDispatchMetricsBatch;
 
 /// Default bounded queue capacity for asynchronous plugin hook dispatch.
 const DEFAULT_EVENT_QUEUE_CAPACITY: usize = 8_192;
@@ -135,6 +137,12 @@ struct PluginHookSubscriptions {
     dataset: bool,
     /// At least one plugin wants transaction callbacks.
     transaction: bool,
+    /// Lowest commitment required by any transaction subscriber.
+    transaction_min_commitment: crate::event::TxCommitmentStatus,
+    /// At least one transaction plugin exposes a compiled prefilter.
+    transaction_prefilter: bool,
+    /// At least one plugin wants transaction-log callbacks.
+    transaction_log: bool,
     /// At least one plugin requested inline transaction dispatch.
     inline_transaction: bool,
     /// At least one plugin wants transaction batch callbacks.
@@ -166,6 +174,9 @@ impl From<&PluginConfig> for PluginHookSubscriptions {
             shred: config.shred,
             dataset: config.dataset,
             transaction: config.transaction,
+            transaction_min_commitment: config.transaction_commitment.minimum_required(),
+            transaction_prefilter: false,
+            transaction_log: config.transaction_log,
             inline_transaction: config.transaction
                 && matches!(
                     config.transaction_dispatch_mode,

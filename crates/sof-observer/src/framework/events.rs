@@ -2,6 +2,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use agave_transaction_view::transaction_view::SanitizedTransactionView;
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
@@ -80,6 +81,36 @@ pub struct TransactionEvent {
 }
 
 #[derive(Debug, Clone)]
+/// Runtime event emitted for one provider-stream websocket log notification.
+///
+/// This is intended for `logsSubscribe`-style feeds that can surface signatures
+/// and log lines quickly but do not provide a full decoded transaction object.
+///
+/// # Examples
+///
+/// ```rust
+/// use sof::framework::TransactionLogEvent;
+///
+/// fn signature(event: &TransactionLogEvent) -> solana_signature::Signature {
+///     event.signature
+/// }
+/// ```
+pub struct TransactionLogEvent {
+    /// Slot context attached to the websocket log notification.
+    pub slot: u64,
+    /// Commitment status configured for the upstream websocket subscription.
+    pub commitment_status: TxCommitmentStatus,
+    /// Transaction signature carried by the log notification.
+    pub signature: Signature,
+    /// Transaction error payload when the upstream feed included one.
+    pub err: Option<JsonValue>,
+    /// Program/runtime log lines attached to the transaction.
+    pub logs: Arc<[String]>,
+    /// Matching pubkey for one `mentions`-style subscription when present.
+    pub matched_filter: Option<Pubkey>,
+}
+
+#[derive(Debug, Clone)]
 /// Runtime event emitted once per completed dataset with all decoded transactions.
 ///
 /// # Examples
@@ -114,7 +145,7 @@ pub struct TransactionBatchEvent {
     pub transactions: Arc<[VersionedTransaction]>,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 /// One authoritative serialized transaction byte range inside a completed dataset payload.
 pub struct SerializedTransactionRange {
     /// Start offset of the serialized transaction inside the contiguous dataset payload.
@@ -272,7 +303,7 @@ pub struct TransactionEventRef<'event> {
 impl TransactionEventRef<'_> {
     /// Materializes one owned transaction event only when downstream actually needs it.
     #[must_use]
-    pub fn to_owned(self) -> TransactionEvent {
+    pub fn to_owned(&self) -> TransactionEvent {
         TransactionEvent {
             slot: self.slot,
             commitment_status: self.commitment_status,
@@ -299,13 +330,13 @@ pub struct AccountTouchEvent {
     /// Transaction signature if present.
     pub signature: Option<Signature>,
     /// All static message account keys present on the transaction.
-    pub account_keys: Arc<Vec<Pubkey>>,
+    pub account_keys: Arc<[Pubkey]>,
     /// Writable static message account keys inferred from the versioned message header.
-    pub writable_account_keys: Arc<Vec<Pubkey>>,
+    pub writable_account_keys: Arc<[Pubkey]>,
     /// Read-only static message account keys inferred from the versioned message header.
-    pub readonly_account_keys: Arc<Vec<Pubkey>>,
+    pub readonly_account_keys: Arc<[Pubkey]>,
     /// Lookup table account pubkeys referenced by the message itself.
-    pub lookup_table_account_keys: Arc<Vec<Pubkey>>,
+    pub lookup_table_account_keys: Arc<[Pubkey]>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -327,7 +358,7 @@ pub struct AccountTouchEventRef<'event> {
     pub lookup_table_account_key_count: usize,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 /// Runtime event emitted when local canonical classification for one slot changes.
 pub struct SlotStatusEvent {
     /// Slot number whose status changed.
@@ -346,7 +377,7 @@ pub struct SlotStatusEvent {
     pub finalized_slot: Option<u64>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 /// Runtime event emitted when local canonical tip switches to a different fork branch.
 pub struct ReorgEvent {
     /// Previous local canonical tip slot.
@@ -365,7 +396,7 @@ pub struct ReorgEvent {
     pub finalized_slot: Option<u64>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 /// Runtime event emitted when a newer observed recent blockhash is detected.
 pub struct ObservedRecentBlockhashEvent {
     /// Slot where this recent blockhash was observed.
@@ -376,7 +407,7 @@ pub struct ObservedRecentBlockhashEvent {
     pub dataset_tx_count: u64,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
 /// Topology/leader event source.
 pub enum ControlPlaneSource {
     /// Data gathered from gossip-bootstrap runtime state.
@@ -385,7 +416,7 @@ pub enum ControlPlaneSource {
     Direct,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 /// One known cluster node and its key advertised endpoints.
 pub struct ClusterNodeInfo {
     /// Node identity.
@@ -412,7 +443,7 @@ pub struct ClusterNodeInfo {
     pub rpc: Option<SocketAddr>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 /// Low-frequency cluster topology update with diff + optional periodic snapshot.
 pub struct ClusterTopologyEvent {
     /// Event source mode.
@@ -437,7 +468,7 @@ pub struct ClusterTopologyEvent {
     pub snapshot_nodes: Vec<ClusterNodeInfo>,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
 /// One leader assignment for a slot.
 pub struct LeaderScheduleEntry {
     /// Slot number.
@@ -446,7 +477,7 @@ pub struct LeaderScheduleEntry {
     pub leader: Pubkey,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 /// Event-driven leader-schedule update with diff payloads.
 pub struct LeaderScheduleEvent {
     /// Event source mode.

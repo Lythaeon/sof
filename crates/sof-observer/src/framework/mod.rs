@@ -34,7 +34,7 @@ pub use events::{
     ControlPlaneSource, DatasetEvent, LeaderScheduleEntry, LeaderScheduleEvent,
     ObservedRecentBlockhashEvent, RawPacketEvent, ReorgEvent, SerializedTransactionRange,
     ShredEvent, SlotStatusEvent, TransactionBatchEvent, TransactionEvent, TransactionEventRef,
-    TransactionViewBatchEvent,
+    TransactionLogEvent, TransactionViewBatchEvent,
 };
 pub use extension::{
     ExtensionCapability, ExtensionContext, ExtensionManifest, ExtensionResourceSpec,
@@ -50,6 +50,6 @@ pub use extension_host::{
 pub use host::{PluginDispatchMode, PluginHost, PluginHostBuilder, PluginHostStartupError};
 pub use plugin::ObserverPlugin as Plugin;
 pub use plugin::{
-    ObserverPlugin, PluginConfig, PluginContext, PluginSetupError, TransactionDispatchMode,
-    TransactionInterest,
+    ObserverPlugin, PluginConfig, PluginContext, PluginSetupError, TransactionCommitmentSelector,
+    TransactionDispatchMode, TransactionInterest, TransactionPrefilter,
 };

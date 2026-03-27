@@ -92,6 +92,11 @@ pub(in crate::app::runtime) fn process_completed_dataset(
         .derived_state_host
         .wants_account_touch_key_partitions();
     let emit_detailed_tx_events = context.log_all_txs || context.log_non_vote_txs;
+    let selective_prefilter_decode_eligible = plugin_transaction_enabled
+        && !plugin_transaction_batch_enabled
+        && !plugin_account_touch_enabled
+        && !derived_state_transaction_enabled
+        && !derived_state_account_touch_enabled;
     let requires_owned_decode = plugin_transaction_enabled
         || plugin_transaction_batch_enabled
         || plugin_account_touch_enabled
@@ -99,17 +104,20 @@ pub(in crate::app::runtime) fn process_completed_dataset(
         || derived_state_account_touch_enabled;
 
     let joined_payload_for_view_extract = (plugin_transaction_view_batch_enabled
+        || selective_prefilter_decode_eligible
         || !requires_owned_decode)
         && payload_fragments.len() > 1;
-    let maybe_view_batch = (plugin_transaction_view_batch_enabled || !requires_owned_decode)
+    if let Some(view_batch) = (plugin_transaction_view_batch_enabled
+        || selective_prefilter_decode_eligible
+        || !requires_owned_decode)
         .then(|| {
             extract_transaction_view_batch_from_payload_fragments(
                 &payload_fragments,
                 &mut scratch.payload,
             )
         })
-        .flatten();
-    if let Some(view_batch) = maybe_view_batch {
+        .flatten()
+    {
         let effective_start_index = start_index.saturating_add(view_batch.skipped_prefix_shreds);
         if !view_batch.transactions.is_empty() && plugin_transaction_view_batch_enabled {
             context.plugin_host.on_transaction_view_batch(
@@ -123,11 +131,34 @@ pub(in crate::app::runtime) fn process_completed_dataset(
                     commitment_status,
                     confirmed_slot: commitment_snapshot.confirmed_slot,
                     finalized_slot: commitment_snapshot.finalized_slot,
-                    payload: view_batch.payload.clone(),
+                    payload: Arc::from(view_batch.payload),
                     transactions: view_batch.transactions.clone(),
                 },
                 completed_at,
             );
+        }
+        if selective_prefilter_decode_eligible
+            && let Some(outcome) = process_completed_dataset_with_prefiltered_transactions(
+                PrefilteredDatasetProcessInput {
+                    slot,
+                    start_index: effective_start_index,
+                    end_index,
+                    last_in_slot,
+                    completed_at,
+                    first_shred_observed_at,
+                    last_shred_observed_at,
+                    shred_count: payload_fragments.len(),
+                    confirmed_slot: commitment_snapshot.confirmed_slot,
+                    finalized_slot: commitment_snapshot.finalized_slot,
+                    commitment_status,
+                    emit_detailed_tx_events,
+                    payload_len: view_batch.payload_len,
+                },
+                &view_batch,
+                context,
+            )
+        {
+            return outcome;
         }
         if !requires_owned_decode {
             return process_completed_dataset_from_views(
@@ -638,7 +669,7 @@ pub(in crate::app::runtime) fn parse_entry_stream_ready_transaction_ranges(
 
 fn process_completed_dataset_from_views(
     input: ViewOnlyDatasetProcessInput,
-    view_batch: &ExtractedTransactionViewBatch,
+    view_batch: &ExtractedTransactionViewBatch<'_>,
     context: &DatasetProcessContext<'_>,
 ) -> DatasetProcessOutcome {
     let ViewOnlyDatasetProcessInput {
@@ -825,7 +856,10 @@ fn process_decoded_transaction(
     config: &ProcessDecodedTransactionConfig<'_, '_>,
     state: &mut ProcessDecodedTransactionState<'_>,
 ) {
-    let tx_ref: &VersionedTransaction = tx.as_ref();
+    let tx_ref: &VersionedTransaction = match &tx {
+        std::borrow::Cow::Borrowed(tx) => tx,
+        std::borrow::Cow::Owned(tx) => tx,
+    };
     if state.observed_recent_blockhash.is_none() {
         *state.observed_recent_blockhash = Some(tx_ref.message.recent_blockhash().to_bytes());
     }
@@ -876,12 +910,15 @@ fn process_decoded_transaction(
             .as_ref()
             .is_some_and(|dispatch| !dispatch.is_empty()))
     .then(|| {
-        let static_account_keys = Arc::new(static_account_keys.to_vec());
-        let (writable_account_keys, readonly_account_keys) =
+        let (static_account_keys, writable_account_keys, readonly_account_keys) =
             if config.account_touch_needs_key_partitions {
                 partition_static_account_keys(tx_ref)
             } else {
-                (empty_pubkey_vec(), empty_pubkey_vec())
+                (
+                    Arc::from(static_account_keys),
+                    empty_pubkey_vec(),
+                    empty_pubkey_vec(),
+                )
             };
         AccountTouchEvent {
             slot: config.slot,
@@ -921,15 +958,21 @@ fn process_decoded_transaction(
             .as_ref()
             .is_some_and(|dispatch| !dispatch.is_empty())
     {
-        Some(TransactionEvent {
-            slot: config.slot,
-            commitment_status: config.commitment_status,
-            confirmed_slot: config.confirmed_slot,
-            finalized_slot: config.finalized_slot,
-            signature,
-            tx: Arc::new(tx.into_owned()),
-            kind,
-        })
+        Some(
+            crate::framework::plugin::clone_cached_transaction_event(&transaction_event_ref)
+                .unwrap_or_else(|| TransactionEvent {
+                    slot: config.slot,
+                    commitment_status: config.commitment_status,
+                    confirmed_slot: config.confirmed_slot,
+                    finalized_slot: config.finalized_slot,
+                    signature,
+                    tx: Arc::new(match tx {
+                        std::borrow::Cow::Borrowed(tx) => tx.clone(),
+                        std::borrow::Cow::Owned(tx) => tx,
+                    }),
+                    kind,
+                }),
+        )
     } else {
         None
     };
@@ -1034,8 +1077,8 @@ fn emit_detailed_tx_observed_event(
     }
 }
 
-struct ExtractedTransactionViewBatch {
-    payload: Arc<[u8]>,
+struct ExtractedTransactionViewBatch<'payload> {
+    payload: &'payload [u8],
     transactions: Arc<[SerializedTransactionRange]>,
     payload_len: usize,
     skipped_prefix_shreds: u32,
@@ -1055,9 +1098,189 @@ struct ViewOnlyDatasetProcessInput {
     emit_detailed_tx_events: bool,
 }
 
-fn partition_static_account_keys(
-    tx: &VersionedTransaction,
-) -> (Arc<Vec<Pubkey>>, Arc<Vec<Pubkey>>) {
+#[derive(Clone, Copy)]
+struct PrefilteredDatasetProcessInput {
+    slot: u64,
+    start_index: u32,
+    end_index: u32,
+    last_in_slot: bool,
+    completed_at: std::time::Instant,
+    first_shred_observed_at: std::time::Instant,
+    last_shred_observed_at: std::time::Instant,
+    shred_count: usize,
+    confirmed_slot: Option<u64>,
+    finalized_slot: Option<u64>,
+    commitment_status: TxCommitmentStatus,
+    emit_detailed_tx_events: bool,
+    payload_len: usize,
+}
+
+fn process_completed_dataset_with_prefiltered_transactions(
+    input: PrefilteredDatasetProcessInput,
+    view_batch: &ExtractedTransactionViewBatch<'_>,
+    context: &DatasetProcessContext<'_>,
+) -> Option<DatasetProcessOutcome> {
+    let PrefilteredDatasetProcessInput {
+        slot,
+        start_index,
+        end_index,
+        last_in_slot,
+        completed_at,
+        first_shred_observed_at,
+        last_shred_observed_at,
+        shred_count,
+        confirmed_slot,
+        finalized_slot,
+        commitment_status,
+        emit_detailed_tx_events,
+        payload_len,
+    } = input;
+    let dataset_tx_count = u32::try_from(view_batch.transactions.len()).unwrap_or(u32::MAX);
+    let mut tx_count: u64 = 0;
+    let mut vote_only_count: u64 = 0;
+    let mut mixed_count: u64 = 0;
+    let mut non_vote_count: u64 = 0;
+    let mut observed_recent_blockhash: Option<[u8; 32]> = None;
+
+    for (dataset_tx_offset, range) in view_batch.transactions.iter().enumerate() {
+        let start = usize::try_from(range.start()).ok();
+        let end = usize::try_from(range.end()).ok();
+        let bytes = start
+            .zip(end)
+            .and_then(|(start, end)| view_batch.payload.get(start..end))?;
+        let view = SanitizedTransactionView::try_new_sanitized(bytes, true).ok()?;
+        let prefiltered = context.plugin_host.classify_transaction_view_in_scope(
+            &view,
+            commitment_status,
+            context.transaction_dispatch_scope,
+        );
+        if prefiltered.needs_full_classification {
+            return None;
+        }
+        if observed_recent_blockhash.is_none() {
+            observed_recent_blockhash = Some(view.recent_blockhash().to_bytes());
+        }
+        let kind = classify_tx_kind_view(&view);
+        tx_count = tx_count.saturating_add(1);
+        match kind {
+            TxKind::VoteOnly => vote_only_count = vote_only_count.saturating_add(1),
+            TxKind::Mixed => mixed_count = mixed_count.saturating_add(1),
+            TxKind::NonVote => non_vote_count = non_vote_count.saturating_add(1),
+        }
+        if context.skip_vote_only_tx_detail_path && kind == TxKind::VoteOnly {
+            emit_detailed_tx_observed_event(
+                context,
+                slot,
+                view.signatures().first().copied().unwrap_or_default(),
+                kind,
+                commitment_status,
+                emit_detailed_tx_events,
+            );
+            continue;
+        }
+        emit_detailed_tx_observed_event(
+            context,
+            slot,
+            view.signatures().first().copied().unwrap_or_default(),
+            kind,
+            commitment_status,
+            emit_detailed_tx_events,
+        );
+        if prefiltered.dispatch.is_empty() {
+            continue;
+        }
+        let tx = bincode::deserialize::<VersionedTransaction>(bytes).ok()?;
+        let signature = tx.signatures.first().copied();
+        context.plugin_host.on_classified_transaction(
+            prefiltered.dispatch,
+            TransactionEvent {
+                slot,
+                commitment_status,
+                confirmed_slot,
+                finalized_slot,
+                signature,
+                tx: Arc::new(tx),
+                kind,
+            },
+            completed_at,
+            first_shred_observed_at,
+            last_shred_observed_at,
+            crate::framework::host::InlineTransactionDispatchSource::CompletedDatasetFallback,
+            dataset_tx_count,
+            u32::try_from(dataset_tx_offset).unwrap_or(u32::MAX),
+        );
+    }
+
+    if !emit_detailed_tx_events && tx_count > 0 {
+        let event = TxObservedEvent::Summary {
+            slot,
+            vote_only: vote_only_count,
+            mixed: mixed_count,
+            non_vote: non_vote_count,
+        };
+        if context.tx_event_tx.try_send(event).is_err() {
+            let _ = context.tx_event_drop_count.fetch_add(1, Ordering::Relaxed);
+            crate::runtime_metrics::observe_tx_event_drops(1);
+        }
+    }
+
+    if let Some(recent_blockhash) = observed_recent_blockhash {
+        let event = ObservedRecentBlockhashEvent {
+            slot,
+            recent_blockhash,
+            dataset_tx_count: tx_count,
+        };
+        if context.derived_state_host.wants_control_plane_observed() {
+            let mut events = vec![DerivedStateFeedEvent::RecentBlockhashObserved(
+                event.clone(),
+            )];
+            context.derived_state_host.on_events_drain(
+                FeedWatermarks {
+                    canonical_tip_slot: None,
+                    processed_slot: Some(slot),
+                    confirmed_slot,
+                    finalized_slot,
+                },
+                &mut events,
+            );
+        }
+        if context.plugin_host.wants_recent_blockhash() {
+            context.plugin_host.on_recent_blockhash(event);
+        }
+    }
+
+    if context.plugin_host.wants_dataset() {
+        context.plugin_host.on_dataset(DatasetEvent {
+            slot,
+            start_index,
+            end_index,
+            last_in_slot,
+            shreds: shred_count,
+            payload_len,
+            tx_count,
+        });
+    }
+
+    if context.log_dataset_reconstruction {
+        tracing::info!(
+            slot,
+            start_index,
+            end_index,
+            last_in_slot,
+            shreds = shred_count,
+            payload_len,
+            tx_count,
+            skipped_prefix_shreds = view_batch.skipped_prefix_shreds,
+            "completed dataset reconstruction"
+        );
+    }
+    crate::runtime_metrics::observe_decoded_dataset(tx_count);
+    Some(DatasetProcessOutcome::Decoded)
+}
+
+type PartitionedStaticAccountKeys = (Arc<[Pubkey]>, Arc<[Pubkey]>, Arc<[Pubkey]>);
+
+fn partition_static_account_keys(tx: &VersionedTransaction) -> PartitionedStaticAccountKeys {
     let static_account_keys = tx.message.static_account_keys();
     let mut writable_account_keys = Vec::with_capacity(static_account_keys.len());
     let mut readonly_account_keys = Vec::with_capacity(static_account_keys.len());
@@ -1069,14 +1292,15 @@ fn partition_static_account_keys(
         }
     }
     (
-        Arc::new(writable_account_keys),
-        Arc::new(readonly_account_keys),
+        Arc::from(static_account_keys),
+        Arc::from(writable_account_keys),
+        Arc::from(readonly_account_keys),
     )
 }
 
-fn empty_pubkey_vec() -> Arc<Vec<Pubkey>> {
-    static EMPTY: std::sync::OnceLock<Arc<Vec<Pubkey>>> = std::sync::OnceLock::new();
-    EMPTY.get_or_init(|| Arc::new(Vec::new())).clone()
+fn empty_pubkey_vec() -> Arc<[Pubkey]> {
+    static EMPTY: std::sync::OnceLock<Arc<[Pubkey]>> = std::sync::OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| Arc::from([])))
 }
 
 fn lookup_table_account_key_count(tx: &VersionedTransaction) -> usize {
@@ -1085,14 +1309,19 @@ fn lookup_table_account_key_count(tx: &VersionedTransaction) -> usize {
         .map_or(0, |lookups| lookups.len())
 }
 
-fn lookup_table_account_keys(tx: &VersionedTransaction) -> Arc<Vec<Pubkey>> {
+fn lookup_table_account_keys(tx: &VersionedTransaction) -> Arc<[Pubkey]> {
     let Some(lookups) = tx.message.address_table_lookups() else {
         return empty_pubkey_vec();
     };
     if lookups.is_empty() {
         return empty_pubkey_vec();
     }
-    Arc::new(lookups.iter().map(|lookup| lookup.account_key).collect())
+    Arc::from(
+        lookups
+            .iter()
+            .map(|lookup| lookup.account_key)
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn decode_entries_from_payload_fragments(
@@ -1149,10 +1378,10 @@ fn decode_entries_from_payload_fragments(
     None
 }
 
-fn extract_transaction_view_batch_from_payload_fragments(
-    payload_fragments: &crate::reassembly::dataset::PayloadFragmentBatch,
-    scratch_payload: &mut Vec<u8>,
-) -> Option<ExtractedTransactionViewBatch> {
+fn extract_transaction_view_batch_from_payload_fragments<'payload>(
+    payload_fragments: &'payload crate::reassembly::dataset::PayloadFragmentBatch,
+    scratch_payload: &'payload mut Vec<u8>,
+) -> Option<ExtractedTransactionViewBatch<'payload>> {
     let total_payload_len = payload_fragments.total_len();
     if total_payload_len == 0 {
         return None;
@@ -1179,7 +1408,7 @@ fn extract_transaction_view_batch_from_payload_fragments(
             continue;
         };
         return Some(ExtractedTransactionViewBatch {
-            payload: Arc::from(payload.to_vec()),
+            payload,
             transactions: Arc::from(ranges),
             payload_len,
             skipped_prefix_shreds: u32::try_from(skipped_prefix).ok()?,
@@ -1729,6 +1958,7 @@ mod tests {
             ClusterNodeInfo, ClusterTopologyEvent, ControlPlaneSource, LeaderScheduleEntry,
             LeaderScheduleEvent, Plugin, PluginConfig, PluginContext, PluginDispatchMode,
             PluginHost, PluginSetupError, RawPacketEvent, ReorgEvent, ShredEvent, SlotStatusEvent,
+            TransactionInterest, TransactionPrefilter,
         },
         shred::wire::{
             CommonHeader, DataHeader, ParsedDataShredHeader, ParsedShredHeader, ShredType,
@@ -1854,6 +2084,76 @@ mod tests {
         on_leader_schedule,
         LeaderScheduleEvent
     );
+
+    #[derive(Debug, Clone)]
+    struct ProfileManualIgnoreTransactionPlugin {
+        ignored_account: Pubkey,
+    }
+
+    #[async_trait]
+    impl Plugin for ProfileManualIgnoreTransactionPlugin {
+        fn name(&self) -> &'static str {
+            "profile-manual-ignore-transaction"
+        }
+
+        fn config(&self) -> PluginConfig {
+            PluginConfig::new().with_transaction()
+        }
+
+        async fn setup(&self, _ctx: PluginContext) -> Result<(), PluginSetupError> {
+            Ok(())
+        }
+
+        fn transaction_interest_ref(&self, event: &TransactionEventRef<'_>) -> TransactionInterest {
+            if event
+                .tx
+                .message
+                .static_account_keys()
+                .contains(&self.ignored_account)
+            {
+                TransactionInterest::Critical
+            } else {
+                TransactionInterest::Ignore
+            }
+        }
+
+        async fn on_transaction(&self, _event: &TransactionEvent) {}
+    }
+
+    #[derive(Debug, Clone)]
+    struct ProfilePrefilterIgnoreTransactionPlugin {
+        filter: TransactionPrefilter,
+    }
+
+    impl ProfilePrefilterIgnoreTransactionPlugin {
+        fn new(ignored_account: Pubkey) -> Self {
+            Self {
+                filter: TransactionPrefilter::new(TransactionInterest::Critical)
+                    .with_account_required([ignored_account]),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Plugin for ProfilePrefilterIgnoreTransactionPlugin {
+        fn name(&self) -> &'static str {
+            "profile-prefilter-ignore-transaction"
+        }
+
+        fn config(&self) -> PluginConfig {
+            PluginConfig::new().with_transaction()
+        }
+
+        async fn setup(&self, _ctx: PluginContext) -> Result<(), PluginSetupError> {
+            Ok(())
+        }
+
+        fn transaction_prefilter(&self) -> Option<&TransactionPrefilter> {
+            Some(&self.filter)
+        }
+
+        async fn on_transaction(&self, _event: &TransactionEvent) {}
+    }
 
     #[test]
     fn transaction_view_batch_parser_matches_owned_decode() {
@@ -2155,6 +2455,77 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "profiling fixture for completed-dataset prefilter decode skip A/B"]
+    fn completed_dataset_prefilter_profile_fixture() {
+        let iterations = std::env::var("SOF_COMPLETED_DATASET_PREFILTER_PROFILE_ITERS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(20_000);
+        let mode = std::env::var("SOF_COMPLETED_DATASET_PREFILTER_PROFILE_MODE")
+            .unwrap_or_else(|_| "manual".to_owned());
+        let ignored_account = Pubkey::new_unique();
+        let payload = build_profile_payload(PROFILE_ENTRY_COUNT);
+        let payload_fragments =
+            crate::reassembly::dataset::PayloadFragmentBatch::from_owned_fragments(split_payload(
+                &payload,
+                PROFILE_FRAGMENT_COUNT,
+            ));
+        let plugin_host = build_profile_prefilter_plugin_host(mode.as_str(), ignored_account);
+        let derived_state_host = DerivedStateHost::default();
+        let (tx_event_tx, _tx_event_rx) = mpsc::channel::<TxObservedEvent>(262_144);
+        let tx_commitment_tracker = CommitmentSlotTracker::new();
+        let tx_event_drop_count = AtomicU64::new(0);
+        let dataset_decode_fail_count = AtomicU64::new(0);
+        let dataset_tail_skip_count = AtomicU64::new(0);
+        let context = DatasetProcessContext {
+            derived_state_host: &derived_state_host,
+            plugin_host: &plugin_host,
+            transaction_dispatch_scope: TransactionDispatchScope::DeferredOnly,
+            tx_event_tx: &tx_event_tx,
+            tx_commitment_tracker: &tx_commitment_tracker,
+            tx_event_drop_count: &tx_event_drop_count,
+            dataset_decode_fail_count: &dataset_decode_fail_count,
+            dataset_tail_skip_count: &dataset_tail_skip_count,
+            log_dataset_reconstruction: false,
+            log_all_txs: false,
+            log_non_vote_txs: false,
+            skip_vote_only_tx_detail_path: true,
+        };
+        let mut scratch = DatasetWorkerScratch::default();
+        let started_at = Instant::now();
+        for iteration in 0..iterations {
+            let slot = 3_000_000_u64.saturating_add(u64::try_from(iteration).unwrap_or(u64::MAX));
+            let outcome = process_completed_dataset(
+                DatasetProcessInput {
+                    slot,
+                    start_index: 0,
+                    end_index: u32::try_from(payload_fragments.len().saturating_sub(1))
+                        .unwrap_or(u32::MAX),
+                    last_in_slot: true,
+                    completed_at: Instant::now(),
+                    first_shred_observed_at: Instant::now(),
+                    last_shred_observed_at: Instant::now(),
+                    payload_fragments: payload_fragments.clone(),
+                },
+                &context,
+                &mut scratch,
+            );
+            assert!(matches!(outcome, DatasetProcessOutcome::Decoded));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(dataset_decode_fail_count.load(Ordering::Relaxed), 0);
+        assert_eq!(tx_event_drop_count.load(Ordering::Relaxed), 0);
+        assert_eq!(plugin_host.dropped_event_count(), 0);
+        println!(
+            "completed_dataset_prefilter_profile_fixture mode={} iterations={} elapsed_ms={}",
+            mode,
+            iterations,
+            started_at.elapsed().as_millis(),
+        );
+    }
+
     fn build_profile_plugin_host() -> PluginHost {
         PluginHost::builder()
             .with_event_queue_capacity(262_144)
@@ -2174,6 +2545,23 @@ mod tests {
             .add_plugin(ProfileClusterTopologyPlugin)
             .add_plugin(ProfileLeaderSchedulePlugin)
             .build()
+    }
+
+    fn build_profile_prefilter_plugin_host(mode: &str, ignored_account: Pubkey) -> PluginHost {
+        let builder = PluginHost::builder()
+            .with_event_queue_capacity(262_144)
+            .with_dispatch_mode(PluginDispatchMode::Sequential)
+            .with_transaction_dispatch_workers(4);
+        match mode {
+            "prefilter" => builder
+                .add_plugin(ProfilePrefilterIgnoreTransactionPlugin::new(
+                    ignored_account,
+                ))
+                .build(),
+            _ => builder
+                .add_plugin(ProfileManualIgnoreTransactionPlugin { ignored_account })
+                .build(),
+        }
     }
 
     fn build_profile_payload(entry_count: usize) -> Vec<u8> {

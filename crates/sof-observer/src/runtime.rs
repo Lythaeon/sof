@@ -1,15 +1,39 @@
-use std::{future::Future, net::SocketAddr, path::PathBuf};
+#![allow(clippy::missing_docs_in_private_items)]
 
+use std::{
+    collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher},
+    future::Future,
+    hash::{Hash, Hasher},
+    net::SocketAddr,
+    path::PathBuf,
+    pin::Pin,
+    time::Instant,
+};
+
+use crate::app::config::read_observability_bind_addr;
+use crate::app::runtime::RuntimeObservabilityService;
+use crate::framework::host::TransactionDispatchScope;
 use crate::framework::{
     DerivedStateHost, DerivedStateReplayBackend, DerivedStateReplayDurability, PluginHost,
-    RuntimeExtensionHost,
+    RuntimeExtensionHost, TransactionEvent,
 };
+use crate::provider_stream::{
+    ProviderSourceHealthEvent, ProviderSourceHealthStatus, ProviderSourceId, ProviderStreamMode,
+    ProviderStreamReceiver, ProviderStreamUpdate,
+};
+use agave_transaction_view::transaction_view::SanitizedTransactionView;
 use sof_gossip_tuning::{
     CpuCoreIndex, GossipChannelTuning, GossipTuningProfile, GossipTuningService, IngestQueueMode,
     QueueCapacity, ReceiverCoalesceWindow, RuntimeTuningPort, SofRuntimeTuning,
     TvuReceiveSocketCount,
 };
+use solana_signature::Signature;
+use solana_transaction::versioned::VersionedTransaction;
 use thiserror::Error;
+
+type ShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+const PROVIDER_REPLAY_DEDUPE_CAPACITY: usize = 65_536;
+const PROVIDER_REPLAY_DEDUPE_SLOT_WINDOW: u64 = 4_096;
 
 /// Public runtime error surface for packaged SOF entrypoints.
 #[derive(Debug, Error)]
@@ -17,9 +41,64 @@ pub enum RuntimeError {
     /// Tokio runtime initialization failed before ingest started.
     #[error("failed to build tokio runtime: {0}")]
     BuildTokioRuntime(std::io::Error),
+    /// Provider-stream runtime exited with a structured operational error.
+    #[error(transparent)]
+    ProviderStream(#[from] ProviderStreamRuntimeError),
     /// Runtime runloop exited with an operational error.
     #[error("runtime runloop failed: {0}")]
     Runloop(String),
+}
+
+/// Structured provider-stream runtime error surface.
+#[derive(Debug, Error)]
+pub enum ProviderStreamRuntimeError {
+    /// Provider-stream observability endpoint failed before ingest started.
+    #[error("failed to start provider-stream observability endpoint on {bind_addr}: {detail}")]
+    ObservabilityStart {
+        /// Requested bind address for the provider runtime observability endpoint.
+        bind_addr: SocketAddr,
+        /// Underlying socket/listener failure string.
+        detail: String,
+    },
+    /// One provider-stream startup stage failed before the runtime loop began.
+    #[error("provider-stream startup failed: {message}")]
+    Startup {
+        /// Human-readable startup failure detail.
+        message: String,
+    },
+    /// Requested hooks are not available for this provider-stream mode.
+    #[error(
+        "provider-stream mode {mode} does not support requested hooks: {unsupported_hooks:?}",
+        mode = .mode.as_str()
+    )]
+    UnsupportedHooks {
+        /// Provider-stream mode being validated.
+        mode: ProviderStreamMode,
+        /// Unsupported hook or feed labels.
+        unsupported_hooks: Vec<String>,
+    },
+    /// Built-in provider modes rejected unsupported hooks that only generic producers can satisfy.
+    #[error(
+        "built-in provider-stream mode {mode} does not support requested hooks: {unsupported_hooks:?}; use raw-shred/gossip mode or ProviderStreamMode::Generic with a custom producer for richer control-plane surfaces",
+        mode = .mode.as_str()
+    )]
+    BuiltInUnsupportedHooks {
+        /// Built-in processed provider mode being validated.
+        mode: ProviderStreamMode,
+        /// Unsupported hook or feed labels.
+        unsupported_hooks: Vec<String>,
+    },
+    /// Provider ingress channel closed unexpectedly.
+    #[error(
+        "provider-stream ingress channel closed unexpectedly for mode {mode}",
+        mode = .mode.as_str()
+    )]
+    IngressClosed {
+        /// Provider-stream mode active when the ingress channel closed.
+        mode: ProviderStreamMode,
+        /// Last degraded source states observed before closure.
+        degraded_sources: Vec<ProviderSourceHealthEvent>,
+    },
 }
 
 impl From<crate::app::runtime::RuntimeEntrypointError> for RuntimeError {
@@ -50,6 +129,69 @@ pub struct RuntimeSetup {
 pub struct RuntimeObservabilityConfig {
     /// Bind address for the runtime-owned observability endpoint.
     pub bind_addr: Option<SocketAddr>,
+}
+
+/// Explicit trust posture for raw-shred ingest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShredTrustMode {
+    /// Public gossip or public peers. Keep local verification on.
+    PublicUntrusted,
+    /// Trusted raw shred provider. Prefer provider trust over local verification cost.
+    TrustedRawShredProvider,
+}
+
+impl ShredTrustMode {
+    /// Returns the env-string representation used by `SOF_SHRED_TRUST_MODE`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PublicUntrusted => "public_untrusted",
+            Self::TrustedRawShredProvider => "trusted_raw_shred_provider",
+        }
+    }
+}
+
+/// Startup policy for provider-stream modes when plugins request unsupported hooks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderStreamCapabilityPolicy {
+    /// Log a warning and continue startup.
+    Warn,
+    /// Fail startup when any registered plugin requests an unsupported hook.
+    Strict,
+}
+
+#[derive(Debug, Default)]
+enum ProviderStreamCapabilityCheck {
+    #[default]
+    Supported,
+    Warn {
+        unsupported_hooks: Vec<String>,
+    },
+}
+
+impl ProviderStreamCapabilityPolicy {
+    /// Returns the env-string representation used by `SOF_PROVIDER_STREAM_CAPABILITY_POLICY`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Warn => "warn",
+            Self::Strict => "strict",
+        }
+    }
+
+    fn from_runtime_env() -> Self {
+        match crate::runtime_env::read_env_var("SOF_PROVIDER_STREAM_CAPABILITY_POLICY").as_deref() {
+            Some("strict") => Self::Strict,
+            _ => Self::Warn,
+        }
+    }
+}
+
+fn provider_stream_allow_eof_from_runtime_env() -> bool {
+    matches!(
+        crate::runtime_env::read_env_var("SOF_PROVIDER_STREAM_ALLOW_EOF").as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
 }
 
 /// Typed replay retention configuration for derived-state consumers.
@@ -207,6 +349,15 @@ impl RuntimeSetup {
             .collect::<Vec<_>>()
             .join(",");
         self.with_env("SOF_GOSSIP_ENTRYPOINT", serialized)
+    }
+
+    /// Sets `SOF_GOSSIP_ENTRYPOINT_PINNED`.
+    ///
+    /// When enabled, runtime switching stays inside the configured entrypoint
+    /// list instead of expanding to discovered gossip peers.
+    #[must_use]
+    pub fn with_gossip_entrypoint_pinned(self, pinned: bool) -> Self {
+        self.with_env("SOF_GOSSIP_ENTRYPOINT_PINNED", pinned.to_string())
     }
 
     /// Sets `SOF_GOSSIP_VALIDATORS` from a list of validator identity pubkeys.
@@ -539,10 +690,34 @@ impl RuntimeSetup {
         self.with_env("SOF_LIVE_SHREDS_ENABLED", enabled.to_string())
     }
 
-    /// Sets `SOF_VERIFY_SHREDS`.
+    /// Sets `SOF_VERIFY_SHREDS` explicitly, overriding the trust-mode default.
     #[must_use]
     pub fn with_verify_shreds(self, enabled: bool) -> Self {
         self.with_env("SOF_VERIFY_SHREDS", enabled.to_string())
+    }
+
+    /// Sets `SOF_SHRED_TRUST_MODE` for raw-shred ingest.
+    #[must_use]
+    pub fn with_shred_trust_mode(self, mode: ShredTrustMode) -> Self {
+        self.with_env("SOF_SHRED_TRUST_MODE", mode.as_str())
+    }
+
+    /// Sets `SOF_PROVIDER_STREAM_CAPABILITY_POLICY`.
+    #[must_use]
+    pub fn with_provider_stream_capability_policy(
+        self,
+        policy: ProviderStreamCapabilityPolicy,
+    ) -> Self {
+        self.with_env("SOF_PROVIDER_STREAM_CAPABILITY_POLICY", policy.as_str())
+    }
+
+    /// Sets `SOF_PROVIDER_STREAM_ALLOW_EOF`.
+    ///
+    /// When enabled, `ProviderStreamMode::Generic` may close its ingress queue
+    /// cleanly after emitting a bounded stream.
+    #[must_use]
+    pub fn with_provider_stream_allow_eof(self, allow_eof: bool) -> Self {
+        self.with_env("SOF_PROVIDER_STREAM_ALLOW_EOF", allow_eof.to_string())
     }
 
     /// Sets `SOF_VERIFY_STRICT`.
@@ -551,10 +726,37 @@ impl RuntimeSetup {
         self.with_env("SOF_VERIFY_STRICT", enabled.to_string())
     }
 
-    /// Sets `SOF_VERIFY_RECOVERED_SHREDS`.
+    /// Sets `SOF_VERIFY_RECOVERED_SHREDS` explicitly, overriding the trust-mode default.
     #[must_use]
     pub fn with_verify_recovered_shreds(self, enabled: bool) -> Self {
         self.with_env("SOF_VERIFY_RECOVERED_SHREDS", enabled.to_string())
+    }
+
+    /// Sets `SOF_RUNTIME_DATASET_DECODE_FAILURES_UNHEALTHY_PER_TICK`.
+    #[must_use]
+    pub fn with_runtime_dataset_decode_failures_unhealthy_per_tick(self, failures: u64) -> Self {
+        self.with_env(
+            "SOF_RUNTIME_DATASET_DECODE_FAILURES_UNHEALTHY_PER_TICK",
+            failures.to_string(),
+        )
+    }
+
+    /// Sets `SOF_RUNTIME_DATASET_TAIL_SKIPS_UNHEALTHY_PER_TICK`.
+    #[must_use]
+    pub fn with_runtime_dataset_tail_skips_unhealthy_per_tick(self, tail_skips: u64) -> Self {
+        self.with_env(
+            "SOF_RUNTIME_DATASET_TAIL_SKIPS_UNHEALTHY_PER_TICK",
+            tail_skips.to_string(),
+        )
+    }
+
+    /// Sets `SOF_RUNTIME_DATASET_UNHEALTHY_SUSTAIN_TICKS`.
+    #[must_use]
+    pub fn with_runtime_dataset_unhealthy_sustain_ticks(self, ticks: u64) -> Self {
+        self.with_env(
+            "SOF_RUNTIME_DATASET_UNHEALTHY_SUSTAIN_TICKS",
+            ticks.to_string(),
+        )
     }
 
     /// Sets `SOF_VERIFY_SLOT_WINDOW`.
@@ -808,6 +1010,117 @@ impl RuntimeSetup {
         self.with_env(
             "SOF_GOSSIP_RUNTIME_SWITCH_WARMUP_MS",
             switch_warmup_ms.to_string(),
+        )
+    }
+
+    /// Sets `SOF_GOSSIP_RUNTIME_SWITCH_PROACTIVE_ENABLED`.
+    #[must_use]
+    pub fn with_gossip_runtime_switch_proactive_enabled(self, enabled: bool) -> Self {
+        self.with_env(
+            "SOF_GOSSIP_RUNTIME_SWITCH_PROACTIVE_ENABLED",
+            enabled.to_string(),
+        )
+    }
+
+    /// Sets `SOF_GOSSIP_RUNTIME_SWITCH_PROACTIVE_EVAL_MS`.
+    #[must_use]
+    pub fn with_gossip_runtime_switch_proactive_eval_ms(self, eval_ms: u64) -> Self {
+        self.with_env(
+            "SOF_GOSSIP_RUNTIME_SWITCH_PROACTIVE_EVAL_MS",
+            eval_ms.to_string(),
+        )
+    }
+
+    /// Sets `SOF_GOSSIP_RUNTIME_SWITCH_PROACTIVE_ACTIVE_RANK_MAX`.
+    #[must_use]
+    pub fn with_gossip_runtime_switch_proactive_active_rank_max(
+        self,
+        active_rank_max: usize,
+    ) -> Self {
+        self.with_env(
+            "SOF_GOSSIP_RUNTIME_SWITCH_PROACTIVE_ACTIVE_RANK_MAX",
+            active_rank_max.to_string(),
+        )
+    }
+
+    /// Sets `SOF_GOSSIP_RUNTIME_SWITCH_PRIORITIZED_CANDIDATES_MAX`.
+    #[must_use]
+    pub fn with_gossip_runtime_switch_prioritized_candidates_max(
+        self,
+        candidates_max: usize,
+    ) -> Self {
+        self.with_env(
+            "SOF_GOSSIP_RUNTIME_SWITCH_PRIORITIZED_CANDIDATES_MAX",
+            candidates_max.to_string(),
+        )
+    }
+
+    /// Sets `SOF_GOSSIP_RUNTIME_SWITCH_STABILIZE_MIN_PEERS`.
+    #[must_use]
+    pub fn with_gossip_runtime_switch_stabilize_min_peers(self, min_peers: usize) -> Self {
+        self.with_env(
+            "SOF_GOSSIP_RUNTIME_SWITCH_STABILIZE_MIN_PEERS",
+            min_peers.to_string(),
+        )
+    }
+
+    /// Sets `SOF_GOSSIP_RUNTIME_SWITCH_PROACTIVE_STABLE_EVALS`.
+    #[must_use]
+    pub fn with_gossip_runtime_switch_proactive_stable_evals(self, stable_evals: usize) -> Self {
+        self.with_env(
+            "SOF_GOSSIP_RUNTIME_SWITCH_PROACTIVE_STABLE_EVALS",
+            stable_evals.to_string(),
+        )
+    }
+
+    /// Sets `SOF_GOSSIP_RUNTIME_SWITCH_PROACTIVE_MIN_RUNTIME_AGE_MS`.
+    #[must_use]
+    pub fn with_gossip_runtime_switch_proactive_min_runtime_age_ms(self, age_ms: u64) -> Self {
+        self.with_env(
+            "SOF_GOSSIP_RUNTIME_SWITCH_PROACTIVE_MIN_RUNTIME_AGE_MS",
+            age_ms.to_string(),
+        )
+    }
+
+    /// Sets `SOF_GOSSIP_LOAD_SHED_ENABLED`.
+    #[must_use]
+    pub fn with_gossip_load_shed_enabled(self, enabled: bool) -> Self {
+        self.with_env("SOF_GOSSIP_LOAD_SHED_ENABLED", enabled.to_string())
+    }
+
+    /// Sets `SOF_GOSSIP_LOAD_SHED_QUEUE_PRESSURE_PCT`.
+    #[must_use]
+    pub fn with_gossip_load_shed_queue_pressure_pct(self, pressure_pct: u64) -> Self {
+        self.with_env(
+            "SOF_GOSSIP_LOAD_SHED_QUEUE_PRESSURE_PCT",
+            pressure_pct.to_string(),
+        )
+    }
+
+    /// Sets `SOF_VERIFY_STRICT_UNKNOWN_QUEUE_PRESSURE_PCT`.
+    #[must_use]
+    pub fn with_verify_strict_unknown_queue_pressure_pct(self, pressure_pct: u64) -> Self {
+        self.with_env(
+            "SOF_VERIFY_STRICT_UNKNOWN_QUEUE_PRESSURE_PCT",
+            pressure_pct.to_string(),
+        )
+    }
+
+    /// Sets `SOF_GOSSIP_LOAD_SHED_KEEP_TOP_SOURCES`.
+    #[must_use]
+    pub fn with_gossip_load_shed_keep_top_sources(self, keep_top_sources: usize) -> Self {
+        self.with_env(
+            "SOF_GOSSIP_LOAD_SHED_KEEP_TOP_SOURCES",
+            keep_top_sources.to_string(),
+        )
+    }
+
+    /// Sets `SOF_GOSSIP_SOCKET_CONSUME_VERIFY_QUEUE_CAPACITY`.
+    #[must_use]
+    pub fn with_gossip_socket_consume_verify_queue_capacity(self, capacity: usize) -> Self {
+        self.with_env(
+            "SOF_GOSSIP_SOCKET_CONSUME_VERIFY_QUEUE_CAPACITY",
+            capacity.to_string(),
         )
     }
 
@@ -1108,7 +1421,7 @@ pub fn run_with_hosts_and_setup(
 ///     .await
 /// }
 /// ```
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct ObserverRuntime {
     /// Plugin host invoked by the packaged observer runtime.
     plugin_host: PluginHost,
@@ -1118,6 +1431,11 @@ pub struct ObserverRuntime {
     derived_state_host: DerivedStateHost,
     /// Programmatic setup overrides applied before startup.
     setup: RuntimeSetup,
+    /// Optional externally supplied ingress receiver used by kernel-bypass mode.
+    #[cfg(feature = "kernel-bypass")]
+    packet_ingest_rx: Option<KernelBypassIngressReceiver>,
+    /// Optional externally supplied processed provider-stream receiver.
+    provider_stream: Option<(ProviderStreamMode, ProviderStreamReceiver)>,
 }
 
 impl ObserverRuntime {
@@ -1173,18 +1491,88 @@ impl ObserverRuntime {
         self
     }
 
+    /// Replaces the raw-shred runtime with a processed provider-stream ingress.
+    ///
+    /// Processed provider streams such as Yellowstone gRPC or LaserStream feed
+    /// transactions directly into SOF's plugin/derived-state transaction
+    /// surfaces. They bypass packet, shred, FEC, and reconstruction stages.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use sof::{
+    ///     provider_stream::{create_provider_stream_queue, ProviderStreamMode},
+    ///     runtime::ObserverRuntime,
+    /// };
+    ///
+    /// let (_tx, rx) = create_provider_stream_queue(128);
+    /// let _runtime = ObserverRuntime::new()
+    ///     .with_provider_stream_ingress(ProviderStreamMode::YellowstoneGrpc, rx);
+    /// ```
+    #[must_use]
+    pub fn with_provider_stream_ingress(
+        mut self,
+        mode: ProviderStreamMode,
+        provider_stream_rx: ProviderStreamReceiver,
+    ) -> Self {
+        self.provider_stream = Some((mode, provider_stream_rx));
+        self
+    }
+
+    #[cfg(feature = "kernel-bypass")]
+    /// Replaces the built-in UDP ingress with an externally supplied kernel-bypass ingress receiver.
+    #[must_use]
+    pub fn with_kernel_bypass_ingress(
+        mut self,
+        packet_ingest_rx: impl Into<KernelBypassIngressReceiver>,
+    ) -> Self {
+        self.packet_ingest_rx = Some(packet_ingest_rx.into());
+        self
+    }
+
     /// Runs the configured runtime until it exits on its own.
     ///
     /// # Errors
     /// Returns any runtime initialization or shutdown error from the underlying observer runtime.
     pub async fn run(self) -> Result<(), RuntimeError> {
+        self.run_with_optional_shutdown(None).await
+    }
+
+    async fn run_with_optional_shutdown(
+        self,
+        shutdown_signal: Option<ShutdownSignal>,
+    ) -> Result<(), RuntimeError> {
         crate::runtime_env::clear_runtime_env_overrides();
         self.setup.apply();
+        if let Some((mode, provider_stream_rx)) = self.provider_stream {
+            return run_provider_stream_runtime(
+                self.plugin_host,
+                self.extension_host,
+                self.derived_state_host,
+                shutdown_signal,
+                mode,
+                provider_stream_rx,
+            )
+            .await;
+        }
+        #[cfg(feature = "kernel-bypass")]
+        if let Some(packet_ingest_rx) = self.packet_ingest_rx {
+            return Ok(
+                crate::app::runtime::run_async_with_hosts_and_kernel_bypass_ingress(
+                    self.plugin_host,
+                    self.extension_host,
+                    self.derived_state_host,
+                    shutdown_signal,
+                    packet_ingest_rx,
+                )
+                .await?,
+            );
+        }
         Ok(crate::app::runtime::run_async_with_hosts(
             self.plugin_host,
             self.extension_host,
             self.derived_state_host,
-            None,
+            shutdown_signal,
         )
         .await?)
     }
@@ -1212,26 +1600,17 @@ impl ObserverRuntime {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        crate::runtime_env::clear_runtime_env_overrides();
-        self.setup.apply();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             shutdown_signal.await;
             if shutdown_tx.send(()).is_err() {}
         });
-        Ok(crate::app::runtime::run_async_with_hosts(
-            self.plugin_host,
-            self.extension_host,
-            self.derived_state_host,
-            Some(Box::pin(async move {
-                if shutdown_rx.await.is_err() {
-                    tracing::warn!(
-                        "runtime shutdown trigger task dropped before notifying runloop"
-                    );
-                }
-            })),
-        )
-        .await?)
+        self.run_with_optional_shutdown(Some(Box::pin(async move {
+            if shutdown_rx.await.is_err() {
+                tracing::warn!("runtime shutdown trigger task dropped before notifying runloop");
+            }
+        })))
+        .await
     }
 
     /// Runs the configured runtime until the process receives a termination signal.
@@ -1246,6 +1625,658 @@ impl ObserverRuntime {
             wait_for_termination_signal().await;
         })
         .await
+    }
+}
+
+async fn run_provider_stream_runtime(
+    plugin_host: PluginHost,
+    extension_host: RuntimeExtensionHost,
+    derived_state_host: DerivedStateHost,
+    shutdown_signal: Option<ShutdownSignal>,
+    mode: ProviderStreamMode,
+    mut provider_stream_rx: ProviderStreamReceiver,
+) -> Result<(), RuntimeError> {
+    let capability_check =
+        enforce_provider_stream_capability_policy(mode, &plugin_host, &derived_state_host)?;
+    let observability = if let Some(bind_addr) = read_observability_bind_addr() {
+        let service = RuntimeObservabilityService::start(
+            bind_addr,
+            plugin_host.clone(),
+            extension_host.clone(),
+            derived_state_host.clone(),
+        )
+        .await
+        .map_err(|source| ProviderStreamRuntimeError::ObservabilityStart {
+            bind_addr,
+            detail: source.to_string(),
+        })?;
+        tracing::info!(
+            bind_addr = %service.local_addr(),
+            mode = mode.as_str(),
+            "provider-stream runtime observability endpoint enabled"
+        );
+        Some(service)
+    } else {
+        None
+    };
+    let observability_handle = observability
+        .as_ref()
+        .map(RuntimeObservabilityService::handle)
+        .cloned();
+    if let (Some(handle), ProviderStreamCapabilityCheck::Warn { unsupported_hooks }) =
+        (observability_handle.as_ref(), &capability_check)
+    {
+        handle.observe_provider_capability_warning(mode.as_str(), unsupported_hooks);
+    }
+    plugin_host
+        .startup()
+        .await
+        .map_err(|error| ProviderStreamRuntimeError::Startup {
+            message: error.to_string(),
+        })?;
+    let extension_report = extension_host.startup().await;
+    if extension_report.failed_extensions > 0 {
+        tracing::warn!(
+            mode = mode.as_str(),
+            failed_extensions = extension_report.failed_extensions,
+            "provider-stream runtime started with extension startup failures"
+        );
+    }
+    derived_state_host.initialize();
+    tracing::info!(mode = mode.as_str(), "starting SOF provider-stream runtime");
+
+    let mut shutdown_signal = shutdown_signal;
+    let mut replay_dedupe = ProviderReplayDedupe::new(PROVIDER_REPLAY_DEDUPE_CAPACITY);
+    let mut provider_health = ProviderStreamHealth::default();
+    let allow_eof =
+        mode == ProviderStreamMode::Generic && provider_stream_allow_eof_from_runtime_env();
+    let mut generic_progress_ready = false;
+    let result = loop {
+        tokio::select! {
+            biased;
+            () = async {
+                if let Some(signal) = shutdown_signal.as_mut() {
+                    signal.await;
+                } else {
+                    futures_util::future::pending::<()>().await;
+                }
+            } => {
+                break Ok(());
+            }
+            update = provider_stream_rx.recv() => {
+                let Some(update) = update else {
+                    if allow_eof && provider_health.degraded_sources().is_empty() {
+                        tracing::info!(
+                            mode = mode.as_str(),
+                            "SOF provider-stream runtime reached configured generic EOF"
+                        );
+                        break Ok(());
+                    }
+                    let error = provider_health.closed_error(mode);
+                    tracing::error!(mode = mode.as_str(), error = %error, "SOF provider-stream runtime stopped after provider ingress closed unexpectedly");
+                    break Err(RuntimeError::ProviderStream(error));
+                };
+                if let ProviderStreamUpdate::Health(event) = &update {
+                    provider_health.observe(event);
+                    if let Some(handle) = observability_handle.as_ref() {
+                        handle.observe_provider_source_health(event);
+                    }
+                    continue;
+                }
+                if mode == ProviderStreamMode::Generic
+                    && !generic_progress_ready
+                    && !provider_health.has_sources()
+                {
+                    if let Some(handle) = observability_handle.as_ref() {
+                        handle.mark_ready();
+                    }
+                    generic_progress_ready = true;
+                }
+                if replay_dedupe.observe(&update) {
+                    continue;
+                }
+                dispatch_provider_stream_update(&plugin_host, &derived_state_host, update);
+            }
+        }
+    };
+
+    plugin_host.shutdown().await;
+    extension_host.shutdown().await;
+    if let Some(service) = observability {
+        service.shutdown().await;
+    }
+    if result.is_ok() {
+        tracing::info!(mode = mode.as_str(), "SOF provider-stream runtime stopped");
+    }
+    result
+}
+
+#[derive(Default)]
+struct ProviderStreamHealth {
+    sources: HashMap<ProviderSourceId, ProviderSourceHealthEvent>,
+}
+
+impl ProviderStreamHealth {
+    fn observe(&mut self, event: &ProviderSourceHealthEvent) {
+        let previous = self.sources.insert(event.source, event.clone());
+        if previous.as_ref() == Some(event) {
+            return;
+        }
+        match event.status {
+            ProviderSourceHealthStatus::Healthy => {
+                tracing::info!(
+                    source = event.source.as_str(),
+                    reason = event.reason.as_str(),
+                    message = event.message.as_str(),
+                    "provider source is healthy"
+                );
+            }
+            ProviderSourceHealthStatus::Reconnecting => {
+                tracing::warn!(
+                    source = event.source.as_str(),
+                    reason = event.reason.as_str(),
+                    message = event.message.as_str(),
+                    "provider source is reconnecting"
+                );
+            }
+            ProviderSourceHealthStatus::Unhealthy => {
+                tracing::error!(
+                    source = event.source.as_str(),
+                    reason = event.reason.as_str(),
+                    message = event.message.as_str(),
+                    "provider source is unhealthy"
+                );
+            }
+        }
+    }
+
+    fn degraded_sources(&self) -> Vec<ProviderSourceHealthEvent> {
+        let mut degraded = self
+            .sources
+            .values()
+            .filter(|event| {
+                matches!(
+                    event.status,
+                    ProviderSourceHealthStatus::Reconnecting
+                        | ProviderSourceHealthStatus::Unhealthy
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        degraded.sort_by_key(|event| event.source.as_str());
+        degraded
+    }
+
+    fn has_sources(&self) -> bool {
+        !self.sources.is_empty()
+    }
+
+    fn closed_error(&self, mode: ProviderStreamMode) -> ProviderStreamRuntimeError {
+        ProviderStreamRuntimeError::IngressClosed {
+            mode,
+            degraded_sources: self.degraded_sources(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum ProviderReplayDedupeKey {
+    Transaction {
+        slot: u64,
+        signature: Signature,
+        commitment_status: u8,
+        confirmed_slot: Option<u64>,
+        finalized_slot: Option<u64>,
+    },
+    ControlPlane {
+        slot: u64,
+        kind: u8,
+        fingerprint: u64,
+    },
+}
+
+impl ProviderReplayDedupeKey {
+    const fn slot(self) -> u64 {
+        match self {
+            Self::Transaction { slot, .. } | Self::ControlPlane { slot, .. } => slot,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ProviderReplayDedupe {
+    seen: HashSet<ProviderReplayDedupeKey>,
+    order: VecDeque<ProviderReplayDedupeKey>,
+    capacity: usize,
+    max_slot_seen: u64,
+}
+
+impl ProviderReplayDedupe {
+    fn new(capacity: usize) -> Self {
+        Self {
+            seen: HashSet::with_capacity(capacity),
+            order: VecDeque::with_capacity(capacity),
+            capacity: capacity.max(1),
+            max_slot_seen: 0,
+        }
+    }
+
+    fn observe(&mut self, update: &ProviderStreamUpdate) -> bool {
+        let Some(key) = provider_replay_dedupe_key(update) else {
+            return false;
+        };
+        self.max_slot_seen = self.max_slot_seen.max(key.slot());
+        if self.seen.contains(&key) {
+            return true;
+        }
+        self.seen.insert(key);
+        self.order.push_back(key);
+        self.evict();
+        false
+    }
+
+    fn evict(&mut self) {
+        let min_slot = self
+            .max_slot_seen
+            .saturating_sub(PROVIDER_REPLAY_DEDUPE_SLOT_WINDOW);
+        while let Some(oldest) = self.order.front().copied() {
+            if self.order.len() <= self.capacity && oldest.slot() >= min_slot {
+                break;
+            }
+            let _ = self.order.pop_front();
+            self.seen.remove(&oldest);
+        }
+    }
+}
+
+fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderReplayDedupeKey> {
+    match update {
+        ProviderStreamUpdate::Transaction(event) => event
+            .signature
+            .or_else(|| event.tx.signatures.first().copied())
+            .map(|signature| ProviderReplayDedupeKey::Transaction {
+                slot: event.slot,
+                signature,
+                commitment_status: provider_replay_commitment_key(event.commitment_status),
+                confirmed_slot: event.confirmed_slot,
+                finalized_slot: event.finalized_slot,
+            }),
+        ProviderStreamUpdate::SerializedTransaction(event) => {
+            event
+                .signature
+                .map(|signature| ProviderReplayDedupeKey::Transaction {
+                    slot: event.slot,
+                    signature,
+                    commitment_status: provider_replay_commitment_key(event.commitment_status),
+                    confirmed_slot: event.confirmed_slot,
+                    finalized_slot: event.finalized_slot,
+                })
+        }
+        ProviderStreamUpdate::RecentBlockhash(event) => {
+            Some(ProviderReplayDedupeKey::ControlPlane {
+                slot: event.slot,
+                kind: 1,
+                fingerprint: provider_replay_fingerprint(event),
+            })
+        }
+        ProviderStreamUpdate::SlotStatus(event) => Some(ProviderReplayDedupeKey::ControlPlane {
+            slot: event.slot,
+            kind: 2,
+            fingerprint: provider_replay_fingerprint(event),
+        }),
+        ProviderStreamUpdate::ClusterTopology(event) => {
+            Some(ProviderReplayDedupeKey::ControlPlane {
+                slot: event.slot.unwrap_or_default(),
+                kind: 3,
+                fingerprint: provider_replay_fingerprint(event),
+            })
+        }
+        ProviderStreamUpdate::LeaderSchedule(event) => {
+            Some(ProviderReplayDedupeKey::ControlPlane {
+                slot: event.slot.unwrap_or_default(),
+                kind: 4,
+                fingerprint: provider_replay_fingerprint(event),
+            })
+        }
+        ProviderStreamUpdate::Reorg(event) => Some(ProviderReplayDedupeKey::ControlPlane {
+            slot: event.new_tip,
+            kind: 5,
+            fingerprint: provider_replay_fingerprint(event),
+        }),
+        ProviderStreamUpdate::TransactionLog(event) => {
+            Some(ProviderReplayDedupeKey::ControlPlane {
+                slot: event.slot,
+                kind: 6,
+                fingerprint: provider_replay_transaction_log_fingerprint(event),
+            })
+        }
+        ProviderStreamUpdate::TransactionViewBatch(event) => {
+            Some(ProviderReplayDedupeKey::ControlPlane {
+                slot: event.slot,
+                kind: 7,
+                fingerprint: provider_replay_transaction_view_batch_fingerprint(event),
+            })
+        }
+        ProviderStreamUpdate::Health(_) => None,
+    }
+}
+
+fn provider_replay_fingerprint<T: Hash>(value: &T) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn provider_replay_transaction_log_fingerprint(
+    event: &crate::framework::TransactionLogEvent,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    event.signature.hash(&mut hasher);
+    provider_replay_commitment_key(event.commitment_status).hash(&mut hasher);
+    event.matched_filter.hash(&mut hasher);
+    if let Some(err) = &event.err {
+        err.to_string().hash(&mut hasher);
+    }
+    for line in event.logs.iter() {
+        line.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn provider_replay_transaction_view_batch_fingerprint(
+    event: &crate::framework::TransactionViewBatchEvent,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    event.start_index.hash(&mut hasher);
+    event.end_index.hash(&mut hasher);
+    event.last_in_slot.hash(&mut hasher);
+    event.shreds.hash(&mut hasher);
+    event.payload_len.hash(&mut hasher);
+    provider_replay_commitment_key(event.commitment_status).hash(&mut hasher);
+    event.confirmed_slot.hash(&mut hasher);
+    event.finalized_slot.hash(&mut hasher);
+    event.payload.as_ref().hash(&mut hasher);
+    for range in event.transactions.iter() {
+        range.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+const fn provider_replay_commitment_key(commitment_status: crate::event::TxCommitmentStatus) -> u8 {
+    match commitment_status {
+        crate::event::TxCommitmentStatus::Processed => 0,
+        crate::event::TxCommitmentStatus::Confirmed => 1,
+        crate::event::TxCommitmentStatus::Finalized => 2,
+    }
+}
+
+fn dispatch_provider_stream_update(
+    plugin_host: &PluginHost,
+    derived_state_host: &DerivedStateHost,
+    update: ProviderStreamUpdate,
+) {
+    match update {
+        ProviderStreamUpdate::Transaction(event) => {
+            if plugin_host.wants_recent_blockhash() {
+                plugin_host.on_recent_blockhash(crate::framework::ObservedRecentBlockhashEvent {
+                    slot: event.slot,
+                    recent_blockhash: event.tx.message.recent_blockhash().to_bytes(),
+                    dataset_tx_count: 1,
+                });
+            }
+            if derived_state_host.wants_transaction_applied() {
+                let tx_index = derived_state_host.reserve_slot_tx_indexes(event.slot, 1);
+                derived_state_host.on_transaction(tx_index, event.clone());
+            }
+            if plugin_host.wants_transaction() {
+                plugin_host.on_transaction(event);
+            }
+        }
+        ProviderStreamUpdate::SerializedTransaction(event) => {
+            dispatch_provider_stream_serialized_transaction(
+                plugin_host,
+                derived_state_host,
+                &event,
+            );
+        }
+        ProviderStreamUpdate::TransactionLog(event) => {
+            if plugin_host.wants_transaction_log() {
+                plugin_host.on_transaction_log(event);
+            }
+        }
+        ProviderStreamUpdate::TransactionViewBatch(event) => {
+            if plugin_host.wants_transaction_view_batch() {
+                plugin_host.on_transaction_view_batch(event, Instant::now());
+            }
+        }
+        ProviderStreamUpdate::RecentBlockhash(event) => {
+            if !derived_state_host.is_empty() {
+                derived_state_host.on_recent_blockhash(event.clone());
+            }
+            if plugin_host.wants_recent_blockhash() {
+                plugin_host.on_recent_blockhash(event);
+            }
+        }
+        ProviderStreamUpdate::SlotStatus(event) => {
+            if !derived_state_host.is_empty() {
+                derived_state_host.on_slot_status(event);
+            }
+            if plugin_host.wants_slot_status() {
+                plugin_host.on_slot_status(event);
+            }
+        }
+        ProviderStreamUpdate::ClusterTopology(event) => {
+            if !derived_state_host.is_empty() {
+                derived_state_host.on_cluster_topology(event.clone());
+            }
+            if plugin_host.wants_cluster_topology() {
+                plugin_host.on_cluster_topology(event);
+            }
+        }
+        ProviderStreamUpdate::LeaderSchedule(event) => {
+            if !derived_state_host.is_empty() {
+                derived_state_host.on_leader_schedule(event.clone());
+            }
+            if plugin_host.wants_leader_schedule() {
+                plugin_host.on_leader_schedule(event);
+            }
+        }
+        ProviderStreamUpdate::Reorg(event) => {
+            if !derived_state_host.is_empty() {
+                derived_state_host.on_reorg(event.clone());
+            }
+            if plugin_host.wants_reorg() {
+                plugin_host.on_reorg(event);
+            }
+        }
+        ProviderStreamUpdate::Health(_) => {}
+    }
+}
+
+fn dispatch_provider_stream_serialized_transaction(
+    plugin_host: &PluginHost,
+    derived_state_host: &DerivedStateHost,
+    event: &crate::provider_stream::SerializedTransactionEvent,
+) {
+    let wants_transaction = plugin_host.transaction_enabled_at_commitment(event.commitment_status);
+    let wants_recent_blockhash = plugin_host.wants_recent_blockhash();
+    let wants_derived_state_transaction = derived_state_host.wants_transaction_applied();
+    if !wants_transaction && !wants_recent_blockhash && !wants_derived_state_transaction {
+        return;
+    }
+
+    let mut signature = event.signature;
+    let mut recent_blockhash = None;
+    let needs_view_prefilter = wants_transaction
+        && plugin_host.has_transaction_prefilter_at_commitment(event.commitment_status)
+        && !wants_derived_state_transaction;
+    let should_try_view = wants_recent_blockhash || needs_view_prefilter;
+    if should_try_view
+        && let Ok(view) = SanitizedTransactionView::try_new_sanitized(event.bytes.as_ref(), true)
+    {
+        if signature.is_none() {
+            signature = view.signatures().first().copied();
+        }
+        if wants_recent_blockhash {
+            recent_blockhash = Some(view.recent_blockhash().to_bytes());
+        }
+        if needs_view_prefilter {
+            let prefiltered = plugin_host.classify_transaction_view_in_scope(
+                &view,
+                event.commitment_status,
+                TransactionDispatchScope::All,
+            );
+            if !prefiltered.needs_full_classification
+                && prefiltered.dispatch.is_empty()
+                && !wants_derived_state_transaction
+            {
+                if let Some(recent_blockhash) = recent_blockhash {
+                    plugin_host.on_recent_blockhash(
+                        crate::framework::ObservedRecentBlockhashEvent {
+                            slot: event.slot,
+                            recent_blockhash,
+                            dataset_tx_count: 1,
+                        },
+                    );
+                }
+                return;
+            }
+        }
+        if !wants_transaction && !wants_derived_state_transaction {
+            if let Some(recent_blockhash) = recent_blockhash {
+                plugin_host.on_recent_blockhash(crate::framework::ObservedRecentBlockhashEvent {
+                    slot: event.slot,
+                    recent_blockhash,
+                    dataset_tx_count: 1,
+                });
+            }
+            return;
+        }
+    }
+
+    let Ok(tx) = bincode::deserialize::<VersionedTransaction>(event.bytes.as_ref()) else {
+        tracing::warn!(
+            slot = event.slot,
+            "failed to deserialize provider serialized transaction"
+        );
+        return;
+    };
+    let tx = std::sync::Arc::new(tx);
+    let event = TransactionEvent {
+        slot: event.slot,
+        commitment_status: event.commitment_status,
+        confirmed_slot: event.confirmed_slot,
+        finalized_slot: event.finalized_slot,
+        signature: signature.or_else(|| tx.signatures.first().copied()),
+        kind: crate::provider_stream::classify_provider_transaction_kind(&tx),
+        tx,
+    };
+    if wants_recent_blockhash {
+        plugin_host.on_recent_blockhash(crate::framework::ObservedRecentBlockhashEvent {
+            slot: event.slot,
+            recent_blockhash: recent_blockhash
+                .unwrap_or_else(|| event.tx.message.recent_blockhash().to_bytes()),
+            dataset_tx_count: 1,
+        });
+    }
+    if wants_derived_state_transaction {
+        let tx_index = derived_state_host.reserve_slot_tx_indexes(event.slot, 1);
+        derived_state_host.on_transaction(tx_index, event.clone());
+    }
+    if wants_transaction {
+        plugin_host.on_transaction(event);
+    }
+}
+
+fn provider_stream_unsupported_hooks(
+    mode: ProviderStreamMode,
+    plugin_host: &PluginHost,
+    derived_state_host: &DerivedStateHost,
+) -> Vec<&'static str> {
+    let mut unsupported = Vec::new();
+    if plugin_host.wants_raw_packet() {
+        unsupported.push("on_raw_packet");
+    }
+    if plugin_host.wants_shred() {
+        unsupported.push("on_shred");
+    }
+    if plugin_host.wants_dataset() {
+        unsupported.push("on_dataset");
+    }
+    if plugin_host.wants_account_touch() {
+        unsupported.push("on_account_touch");
+    }
+    if plugin_host.wants_transaction_batch() {
+        unsupported.push("on_transaction_batch");
+    }
+    if mode != ProviderStreamMode::Generic {
+        if plugin_host.wants_recent_blockhash() {
+            unsupported.push("on_recent_blockhash");
+        }
+        if plugin_host.wants_transaction_log() {
+            unsupported.push("on_transaction_log");
+        }
+        if plugin_host.wants_transaction_view_batch() {
+            unsupported.push("on_transaction_view_batch");
+        }
+        if plugin_host.wants_slot_status() {
+            unsupported.push("on_slot_status");
+        }
+        if plugin_host.wants_cluster_topology() {
+            unsupported.push("on_cluster_topology");
+        }
+        if plugin_host.wants_leader_schedule() {
+            unsupported.push("on_leader_schedule");
+        }
+        if plugin_host.wants_reorg() {
+            unsupported.push("on_reorg");
+        }
+    }
+    if derived_state_host.wants_account_touch_observed() {
+        unsupported.push("derived_state.account_touch_observed");
+    }
+    if mode != ProviderStreamMode::Generic && derived_state_host.wants_control_plane_observed() {
+        unsupported.push("derived_state.control_plane_observed");
+    }
+    unsupported
+}
+
+fn enforce_provider_stream_capability_policy(
+    mode: ProviderStreamMode,
+    plugin_host: &PluginHost,
+    derived_state_host: &DerivedStateHost,
+) -> Result<ProviderStreamCapabilityCheck, RuntimeError> {
+    let unsupported = provider_stream_unsupported_hooks(mode, plugin_host, derived_state_host);
+    if unsupported.is_empty() {
+        return Ok(ProviderStreamCapabilityCheck::Supported);
+    }
+    if mode != ProviderStreamMode::Generic {
+        return Err(ProviderStreamRuntimeError::BuiltInUnsupportedHooks {
+            mode,
+            unsupported_hooks: unsupported.into_iter().map(String::from).collect(),
+        }
+        .into());
+    }
+    match ProviderStreamCapabilityPolicy::from_runtime_env() {
+        ProviderStreamCapabilityPolicy::Warn => {
+            let unsupported_hooks = unsupported
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>();
+            tracing::warn!(
+                mode = mode.as_str(),
+                unsupported_hooks = unsupported_hooks.join(","),
+                "provider-stream mode will not emit some requested plugin hooks"
+            );
+            Ok(ProviderStreamCapabilityCheck::Warn { unsupported_hooks })
+        }
+        ProviderStreamCapabilityPolicy::Strict => {
+            Err(ProviderStreamRuntimeError::UnsupportedHooks {
+                mode,
+                unsupported_hooks: unsupported.into_iter().map(String::from).collect(),
+            }
+            .into())
+        }
     }
 }
 
@@ -1632,10 +2663,537 @@ pub async fn run_async_with_hosts_and_setup(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{
+        collections::BTreeMap,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Instant,
+    };
 
     use super::*;
+    use crate::framework::{
+        DerivedStateCheckpoint, DerivedStateConsumer, DerivedStateConsumerConfig,
+        DerivedStateConsumerContext, DerivedStateConsumerFault, DerivedStateFeedEnvelope,
+        ExtensionContext, ExtensionManifest, ObserverPlugin, PluginConfig, PluginContext,
+        RawPacketEvent, RuntimeExtension, TransactionInterest, TransactionPrefilter,
+    };
+    use async_trait::async_trait;
     use sof_gossip_tuning::{GossipTuningProfile, HostProfilePreset, IngestQueueMode};
+    use solana_keypair::Keypair;
+    use solana_message::{Message, VersionedMessage};
+    use solana_signer::Signer;
+    use solana_transaction::versioned::VersionedTransaction;
+
+    fn profile_iterations(default: usize) -> usize {
+        std::env::var("SOF_PROFILE_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default)
+    }
+
+    fn sample_provider_transaction_update() -> ProviderStreamUpdate {
+        let signer = Keypair::new();
+        let message = Message::new(&[], Some(&signer.pubkey()));
+        let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&signer])
+            .expect("tx");
+        ProviderStreamUpdate::Transaction(crate::framework::TransactionEvent {
+            slot: 1,
+            commitment_status: crate::event::TxCommitmentStatus::Processed,
+            confirmed_slot: None,
+            finalized_slot: None,
+            signature: tx.signatures.first().copied(),
+            kind: crate::event::TxKind::NonVote,
+            tx: Arc::new(tx),
+        })
+    }
+
+    struct RawPacketPlugin;
+
+    struct PrefilterIgnorePlugin {
+        filter: TransactionPrefilter,
+    }
+
+    struct TransactionOnlyPlugin;
+    struct RecentBlockhashPlugin;
+    struct StartupCounterPlugin {
+        counter: Arc<AtomicUsize>,
+    }
+    struct StartupCounterExtension {
+        counter: Arc<AtomicUsize>,
+    }
+    struct AccountTouchDerivedStateConsumer;
+    struct ControlPlaneDerivedStateConsumer;
+    struct SofTxAdapterLikePlugin;
+    struct SofTxDerivedStateAdapterLikeConsumer;
+
+    #[async_trait]
+    impl ObserverPlugin for RawPacketPlugin {
+        fn config(&self) -> PluginConfig {
+            PluginConfig::new().with_raw_packet()
+        }
+
+        async fn on_raw_packet(&self, _event: RawPacketEvent) {}
+    }
+
+    #[async_trait]
+    impl ObserverPlugin for PrefilterIgnorePlugin {
+        fn config(&self) -> PluginConfig {
+            PluginConfig::new().with_transaction()
+        }
+
+        fn transaction_prefilter(&self) -> Option<&TransactionPrefilter> {
+            Some(&self.filter)
+        }
+    }
+
+    #[async_trait]
+    impl ObserverPlugin for TransactionOnlyPlugin {
+        fn config(&self) -> PluginConfig {
+            PluginConfig::new().with_transaction()
+        }
+    }
+
+    #[async_trait]
+    impl ObserverPlugin for RecentBlockhashPlugin {
+        fn config(&self) -> PluginConfig {
+            PluginConfig::new().with_recent_blockhash()
+        }
+    }
+
+    #[async_trait]
+    impl ObserverPlugin for StartupCounterPlugin {
+        fn config(&self) -> PluginConfig {
+            PluginConfig::new().with_raw_packet()
+        }
+
+        async fn setup(
+            &self,
+            _ctx: PluginContext,
+        ) -> Result<(), crate::framework::PluginSetupError> {
+            self.counter.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn on_raw_packet(&self, _event: RawPacketEvent) {}
+    }
+
+    #[async_trait]
+    impl RuntimeExtension for StartupCounterExtension {
+        async fn setup(
+            &self,
+            _ctx: ExtensionContext,
+        ) -> Result<ExtensionManifest, crate::framework::extension::ExtensionSetupError> {
+            self.counter.fetch_add(1, Ordering::Relaxed);
+            Ok(ExtensionManifest::default())
+        }
+    }
+
+    impl DerivedStateConsumer for AccountTouchDerivedStateConsumer {
+        fn name(&self) -> &'static str {
+            "account-touch-derived-state"
+        }
+
+        fn state_version(&self) -> u32 {
+            1
+        }
+
+        fn extension_version(&self) -> &'static str {
+            "1"
+        }
+
+        fn load_checkpoint(
+            &mut self,
+        ) -> Result<Option<DerivedStateCheckpoint>, DerivedStateConsumerFault> {
+            Ok(None)
+        }
+
+        fn config(&self) -> DerivedStateConsumerConfig {
+            DerivedStateConsumerConfig::new().with_account_touch_observed()
+        }
+
+        fn setup(
+            &mut self,
+            _ctx: DerivedStateConsumerContext,
+        ) -> Result<(), crate::framework::DerivedStateConsumerSetupError> {
+            Ok(())
+        }
+
+        fn apply(
+            &mut self,
+            _envelope: &DerivedStateFeedEnvelope,
+        ) -> Result<(), DerivedStateConsumerFault> {
+            Ok(())
+        }
+
+        fn flush_checkpoint(
+            &mut self,
+            checkpoint: DerivedStateCheckpoint,
+        ) -> Result<(), DerivedStateConsumerFault> {
+            let _ = checkpoint;
+            Ok(())
+        }
+    }
+
+    impl DerivedStateConsumer for ControlPlaneDerivedStateConsumer {
+        fn name(&self) -> &'static str {
+            "control-plane-derived-state"
+        }
+
+        fn state_version(&self) -> u32 {
+            1
+        }
+
+        fn extension_version(&self) -> &'static str {
+            "1"
+        }
+
+        fn load_checkpoint(
+            &mut self,
+        ) -> Result<Option<DerivedStateCheckpoint>, DerivedStateConsumerFault> {
+            Ok(None)
+        }
+
+        fn config(&self) -> DerivedStateConsumerConfig {
+            DerivedStateConsumerConfig::new().with_control_plane_observed()
+        }
+
+        fn setup(
+            &mut self,
+            _ctx: DerivedStateConsumerContext,
+        ) -> Result<(), crate::framework::DerivedStateConsumerSetupError> {
+            Ok(())
+        }
+
+        fn apply(
+            &mut self,
+            _envelope: &DerivedStateFeedEnvelope,
+        ) -> Result<(), DerivedStateConsumerFault> {
+            Ok(())
+        }
+
+        fn flush_checkpoint(
+            &mut self,
+            checkpoint: DerivedStateCheckpoint,
+        ) -> Result<(), DerivedStateConsumerFault> {
+            let _ = checkpoint;
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl ObserverPlugin for SofTxAdapterLikePlugin {
+        fn name(&self) -> &'static str {
+            "sof-tx-provider-adapter"
+        }
+
+        fn config(&self) -> PluginConfig {
+            PluginConfig::new()
+                .with_recent_blockhash()
+                .with_cluster_topology()
+                .with_leader_schedule()
+        }
+    }
+
+    impl DerivedStateConsumer for SofTxDerivedStateAdapterLikeConsumer {
+        fn name(&self) -> &'static str {
+            "sof-tx-derived-state-provider-adapter"
+        }
+
+        fn state_version(&self) -> u32 {
+            1
+        }
+
+        fn extension_version(&self) -> &'static str {
+            "1"
+        }
+
+        fn load_checkpoint(
+            &mut self,
+        ) -> Result<Option<DerivedStateCheckpoint>, DerivedStateConsumerFault> {
+            Ok(None)
+        }
+
+        fn config(&self) -> DerivedStateConsumerConfig {
+            DerivedStateConsumerConfig::new().with_control_plane_observed()
+        }
+
+        fn apply(
+            &mut self,
+            _envelope: &DerivedStateFeedEnvelope,
+        ) -> Result<(), DerivedStateConsumerFault> {
+            Ok(())
+        }
+
+        fn flush_checkpoint(
+            &mut self,
+            _checkpoint: DerivedStateCheckpoint,
+        ) -> Result<(), DerivedStateConsumerFault> {
+            Ok(())
+        }
+    }
+
+    fn dispatch_provider_stream_update_baseline(
+        plugin_host: &PluginHost,
+        derived_state_host: &DerivedStateHost,
+        update: ProviderStreamUpdate,
+    ) {
+        match update {
+            ProviderStreamUpdate::Transaction(event) => {
+                plugin_host.on_recent_blockhash(crate::framework::ObservedRecentBlockhashEvent {
+                    slot: event.slot,
+                    recent_blockhash: event.tx.message.recent_blockhash().to_bytes(),
+                    dataset_tx_count: 1,
+                });
+                let tx_index = derived_state_host.reserve_slot_tx_indexes(event.slot, 1);
+                derived_state_host.on_transaction(tx_index, event.clone());
+                plugin_host.on_transaction(event);
+            }
+            ProviderStreamUpdate::SerializedTransaction(_) => {}
+            ProviderStreamUpdate::TransactionLog(event) => {
+                plugin_host.on_transaction_log(event);
+            }
+            ProviderStreamUpdate::TransactionViewBatch(event) => {
+                plugin_host.on_transaction_view_batch(event, Instant::now());
+            }
+            ProviderStreamUpdate::RecentBlockhash(event) => {
+                derived_state_host.on_recent_blockhash(event.clone());
+                plugin_host.on_recent_blockhash(event);
+            }
+            ProviderStreamUpdate::SlotStatus(event) => {
+                derived_state_host.on_slot_status(event);
+                plugin_host.on_slot_status(event);
+            }
+            ProviderStreamUpdate::ClusterTopology(event) => {
+                derived_state_host.on_cluster_topology(event.clone());
+                plugin_host.on_cluster_topology(event);
+            }
+            ProviderStreamUpdate::LeaderSchedule(event) => {
+                derived_state_host.on_leader_schedule(event.clone());
+                plugin_host.on_leader_schedule(event);
+            }
+            ProviderStreamUpdate::Reorg(event) => {
+                derived_state_host.on_reorg(event.clone());
+                plugin_host.on_reorg(event);
+            }
+            ProviderStreamUpdate::Health(_) => {}
+        }
+    }
+
+    fn dispatch_provider_stream_serialized_transaction_baseline(
+        plugin_host: &PluginHost,
+        derived_state_host: &DerivedStateHost,
+        event: &crate::provider_stream::SerializedTransactionEvent,
+    ) {
+        let wants_transaction =
+            plugin_host.transaction_enabled_at_commitment(event.commitment_status);
+        let wants_recent_blockhash = plugin_host.wants_recent_blockhash();
+        let wants_derived_state_transaction = derived_state_host.wants_transaction_applied();
+        if !wants_transaction && !wants_recent_blockhash && !wants_derived_state_transaction {
+            return;
+        }
+
+        let mut signature = event.signature;
+        let mut recent_blockhash = None;
+        let mut kind = None;
+        if let Ok(view) = SanitizedTransactionView::try_new_sanitized(event.bytes.as_ref(), true) {
+            if signature.is_none() {
+                signature = view.signatures().first().copied();
+            }
+            kind = Some(crate::provider_stream::classify_provider_transaction_kind_view(&view));
+            if wants_recent_blockhash {
+                recent_blockhash = Some(view.recent_blockhash().to_bytes());
+            }
+            if wants_transaction {
+                let prefiltered = plugin_host.classify_transaction_view_in_scope(
+                    &view,
+                    event.commitment_status,
+                    TransactionDispatchScope::All,
+                );
+                if !prefiltered.needs_full_classification
+                    && prefiltered.dispatch.is_empty()
+                    && !wants_derived_state_transaction
+                {
+                    if let Some(recent_blockhash) = recent_blockhash {
+                        plugin_host.on_recent_blockhash(
+                            crate::framework::ObservedRecentBlockhashEvent {
+                                slot: event.slot,
+                                recent_blockhash,
+                                dataset_tx_count: 1,
+                            },
+                        );
+                    }
+                    return;
+                }
+            }
+            if !wants_transaction && !wants_derived_state_transaction {
+                if let Some(recent_blockhash) = recent_blockhash {
+                    plugin_host.on_recent_blockhash(
+                        crate::framework::ObservedRecentBlockhashEvent {
+                            slot: event.slot,
+                            recent_blockhash,
+                            dataset_tx_count: 1,
+                        },
+                    );
+                }
+                return;
+            }
+        }
+
+        let Ok(tx) = bincode::deserialize::<VersionedTransaction>(event.bytes.as_ref()) else {
+            return;
+        };
+        let tx = Arc::new(tx);
+        let event = TransactionEvent {
+            slot: event.slot,
+            commitment_status: event.commitment_status,
+            confirmed_slot: event.confirmed_slot,
+            finalized_slot: event.finalized_slot,
+            signature: signature.or_else(|| tx.signatures.first().copied()),
+            kind: kind
+                .unwrap_or_else(|| crate::provider_stream::classify_provider_transaction_kind(&tx)),
+            tx,
+        };
+        if wants_recent_blockhash {
+            plugin_host.on_recent_blockhash(crate::framework::ObservedRecentBlockhashEvent {
+                slot: event.slot,
+                recent_blockhash: recent_blockhash
+                    .unwrap_or_else(|| event.tx.message.recent_blockhash().to_bytes()),
+                dataset_tx_count: 1,
+            });
+        }
+        if wants_derived_state_transaction {
+            let tx_index = derived_state_host.reserve_slot_tx_indexes(event.slot, 1);
+            derived_state_host.on_transaction(tx_index, event.clone());
+        }
+        if wants_transaction {
+            plugin_host.on_transaction(event);
+        }
+    }
+
+    fn sample_serialized_provider_transaction_update() -> ProviderStreamUpdate {
+        match sample_provider_transaction_update() {
+            ProviderStreamUpdate::Transaction(event) => {
+                let bytes = bincode::serialize(event.tx.as_ref()).expect("serialize tx");
+                ProviderStreamUpdate::SerializedTransaction(
+                    crate::provider_stream::SerializedTransactionEvent {
+                        slot: event.slot,
+                        commitment_status: event.commitment_status,
+                        confirmed_slot: event.confirmed_slot,
+                        finalized_slot: event.finalized_slot,
+                        signature: event.signature,
+                        bytes: bytes.into_boxed_slice(),
+                    },
+                )
+            }
+            other @ ProviderStreamUpdate::SerializedTransaction(_)
+            | other @ ProviderStreamUpdate::TransactionLog(_)
+            | other @ ProviderStreamUpdate::TransactionViewBatch(_)
+            | other @ ProviderStreamUpdate::RecentBlockhash(_)
+            | other @ ProviderStreamUpdate::SlotStatus(_)
+            | other @ ProviderStreamUpdate::ClusterTopology(_)
+            | other @ ProviderStreamUpdate::LeaderSchedule(_)
+            | other @ ProviderStreamUpdate::Reorg(_)
+            | other @ ProviderStreamUpdate::Health(_) => other,
+        }
+    }
+
+    fn sample_confirmed_provider_transaction_update() -> ProviderStreamUpdate {
+        match sample_provider_transaction_update() {
+            ProviderStreamUpdate::Transaction(mut event) => {
+                event.commitment_status = crate::event::TxCommitmentStatus::Confirmed;
+                event.confirmed_slot = Some(event.slot);
+                ProviderStreamUpdate::Transaction(event)
+            }
+            other @ ProviderStreamUpdate::SerializedTransaction(_)
+            | other @ ProviderStreamUpdate::TransactionLog(_)
+            | other @ ProviderStreamUpdate::TransactionViewBatch(_)
+            | other @ ProviderStreamUpdate::RecentBlockhash(_)
+            | other @ ProviderStreamUpdate::SlotStatus(_)
+            | other @ ProviderStreamUpdate::ClusterTopology(_)
+            | other @ ProviderStreamUpdate::LeaderSchedule(_)
+            | other @ ProviderStreamUpdate::Reorg(_)
+            | other @ ProviderStreamUpdate::Health(_) => other,
+        }
+    }
+
+    fn sample_confirmed_serialized_provider_transaction_update() -> ProviderStreamUpdate {
+        match sample_serialized_provider_transaction_update() {
+            ProviderStreamUpdate::SerializedTransaction(mut event) => {
+                event.commitment_status = crate::event::TxCommitmentStatus::Confirmed;
+                event.confirmed_slot = Some(event.slot);
+                ProviderStreamUpdate::SerializedTransaction(event)
+            }
+            other @ ProviderStreamUpdate::Transaction(_)
+            | other @ ProviderStreamUpdate::TransactionLog(_)
+            | other @ ProviderStreamUpdate::TransactionViewBatch(_)
+            | other @ ProviderStreamUpdate::RecentBlockhash(_)
+            | other @ ProviderStreamUpdate::SlotStatus(_)
+            | other @ ProviderStreamUpdate::ClusterTopology(_)
+            | other @ ProviderStreamUpdate::LeaderSchedule(_)
+            | other @ ProviderStreamUpdate::Reorg(_)
+            | other @ ProviderStreamUpdate::Health(_) => other,
+        }
+    }
+
+    fn sample_provider_transaction_update_at(slot: u64) -> ProviderStreamUpdate {
+        match sample_provider_transaction_update() {
+            ProviderStreamUpdate::Transaction(mut event) => {
+                event.slot = slot;
+                event.signature = Some(Signature::from([slot as u8; 64]));
+                ProviderStreamUpdate::Transaction(event)
+            }
+            other @ ProviderStreamUpdate::SerializedTransaction(_)
+            | other @ ProviderStreamUpdate::TransactionLog(_)
+            | other @ ProviderStreamUpdate::TransactionViewBatch(_)
+            | other @ ProviderStreamUpdate::RecentBlockhash(_)
+            | other @ ProviderStreamUpdate::SlotStatus(_)
+            | other @ ProviderStreamUpdate::ClusterTopology(_)
+            | other @ ProviderStreamUpdate::LeaderSchedule(_)
+            | other @ ProviderStreamUpdate::Reorg(_)
+            | other @ ProviderStreamUpdate::Health(_) => other,
+        }
+    }
+
+    fn sample_provider_recent_blockhash_update(slot: u64) -> ProviderStreamUpdate {
+        ProviderStreamUpdate::RecentBlockhash(crate::framework::ObservedRecentBlockhashEvent {
+            slot,
+            recent_blockhash: [slot as u8; 32],
+            dataset_tx_count: 1,
+        })
+    }
+
+    fn sample_provider_transaction_log_update(slot: u64) -> ProviderStreamUpdate {
+        ProviderStreamUpdate::TransactionLog(crate::framework::TransactionLogEvent {
+            slot,
+            commitment_status: crate::event::TxCommitmentStatus::Processed,
+            signature: Signature::from([slot as u8; 64]),
+            err: None,
+            logs: Arc::from([String::from("program log: hello")]),
+            matched_filter: None,
+        })
+    }
+
+    fn sample_provider_transaction_view_batch_update(slot: u64) -> ProviderStreamUpdate {
+        let payload: Arc<[u8]> = Arc::from([1_u8, 2, 3, 4]);
+        let transactions: Arc<[crate::framework::SerializedTransactionRange]> =
+            Arc::from([crate::framework::SerializedTransactionRange::new(0, 4)]);
+        ProviderStreamUpdate::TransactionViewBatch(crate::framework::TransactionViewBatchEvent {
+            slot,
+            start_index: 0,
+            end_index: 0,
+            last_in_slot: false,
+            shreds: 1,
+            payload_len: payload.len(),
+            commitment_status: crate::event::TxCommitmentStatus::Processed,
+            confirmed_slot: None,
+            finalized_slot: None,
+            payload,
+            transactions,
+        })
+    }
 
     #[test]
     fn typed_derived_state_config_serializes_into_env_overrides() {
@@ -1717,8 +3275,12 @@ mod tests {
         assert!(
             setup
                 .env_overrides
-                .contains(&(String::from("SOF_TVU_SOCKETS"), String::from("2")))
+                .contains(&(String::from("SOF_TVU_SOCKETS"), String::from("4")))
         );
+        assert!(setup.env_overrides.contains(&(
+            String::from("SOF_UDP_RECEIVER_PIN_BY_PORT"),
+            String::from("false")
+        )));
         assert!(setup.env_overrides.contains(&(
             String::from("SOF_GOSSIP_RECEIVER_CHANNEL_CAPACITY"),
             String::from("131072")
@@ -1755,8 +3317,30 @@ mod tests {
         )));
         assert!(setup.env_overrides.contains(&(
             String::from("SOF_UDP_RECEIVER_PIN_BY_PORT"),
-            String::from("true")
+            String::from("false")
         )));
+    }
+
+    #[test]
+    fn runtime_dataset_health_thresholds_serialize_into_env_overrides() {
+        let setup = RuntimeSetup::new()
+            .with_runtime_dataset_decode_failures_unhealthy_per_tick(7)
+            .with_runtime_dataset_tail_skips_unhealthy_per_tick(11)
+            .with_runtime_dataset_unhealthy_sustain_ticks(5);
+        let overrides = setup.env_overrides.into_iter().collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            overrides.get("SOF_RUNTIME_DATASET_DECODE_FAILURES_UNHEALTHY_PER_TICK"),
+            Some(&"7".to_owned())
+        );
+        assert_eq!(
+            overrides.get("SOF_RUNTIME_DATASET_TAIL_SKIPS_UNHEALTHY_PER_TICK"),
+            Some(&"11".to_owned())
+        );
+        assert_eq!(
+            overrides.get("SOF_RUNTIME_DATASET_UNHEALTHY_SUSTAIN_TICKS"),
+            Some(&"5".to_owned())
+        );
     }
 
     #[test]
@@ -1785,6 +3369,38 @@ mod tests {
             String::from("SOF_GOSSIP_SAMPLE_LOGS_ENABLED"),
             String::from("false")
         )));
+    }
+
+    #[test]
+    fn gossip_load_shed_tuning_sets_expected_env_overrides() {
+        let setup = RuntimeSetup::new()
+            .with_gossip_load_shed_enabled(true)
+            .with_gossip_load_shed_queue_pressure_pct(65)
+            .with_verify_strict_unknown_queue_pressure_pct(12)
+            .with_gossip_load_shed_keep_top_sources(3)
+            .with_gossip_socket_consume_verify_queue_capacity(1024);
+        let overrides = setup.env_overrides.into_iter().collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            overrides.get("SOF_GOSSIP_LOAD_SHED_ENABLED"),
+            Some(&"true".to_owned())
+        );
+        assert_eq!(
+            overrides.get("SOF_GOSSIP_LOAD_SHED_QUEUE_PRESSURE_PCT"),
+            Some(&"65".to_owned())
+        );
+        assert_eq!(
+            overrides.get("SOF_VERIFY_STRICT_UNKNOWN_QUEUE_PRESSURE_PCT"),
+            Some(&"12".to_owned())
+        );
+        assert_eq!(
+            overrides.get("SOF_GOSSIP_LOAD_SHED_KEEP_TOP_SOURCES"),
+            Some(&"3".to_owned())
+        );
+        assert_eq!(
+            overrides.get("SOF_GOSSIP_SOCKET_CONSUME_VERIFY_QUEUE_CAPACITY"),
+            Some(&"1024".to_owned())
+        );
     }
 
     #[test]
@@ -1844,6 +3460,784 @@ mod tests {
         assert_eq!(
             overrides.get("SOF_UDP_PREFER_BUSY_POLL"),
             Some(&"true".to_owned())
+        );
+    }
+
+    #[test]
+    fn typed_shred_trust_mode_uses_expected_strings() {
+        let setup =
+            RuntimeSetup::new().with_shred_trust_mode(ShredTrustMode::TrustedRawShredProvider);
+        assert_eq!(
+            setup.env_overrides.last(),
+            Some(&(
+                String::from("SOF_SHRED_TRUST_MODE"),
+                String::from("trusted_raw_shred_provider"),
+            ))
+        );
+    }
+
+    #[test]
+    fn typed_provider_stream_capability_policy_uses_expected_strings() {
+        let setup = RuntimeSetup::new()
+            .with_provider_stream_capability_policy(ProviderStreamCapabilityPolicy::Strict);
+        assert_eq!(
+            setup.env_overrides.last(),
+            Some(&(
+                String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+                String::from("strict"),
+            ))
+        );
+    }
+
+    #[test]
+    fn typed_provider_stream_allow_eof_uses_expected_strings() {
+        let setup = RuntimeSetup::new().with_provider_stream_allow_eof(true);
+        assert_eq!(
+            setup.env_overrides.last(),
+            Some(&(
+                String::from("SOF_PROVIDER_STREAM_ALLOW_EOF"),
+                String::from("true"),
+            ))
+        );
+    }
+
+    #[test]
+    fn provider_stream_warn_policy_allows_unsupported_hooks() {
+        crate::runtime_env::set_runtime_env_overrides([(
+            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+            String::from("warn"),
+        )]);
+        let plugin_host = PluginHost::builder().add_plugin(RawPacketPlugin).build();
+        let derived_state_host = DerivedStateHost::builder().build();
+        let result = enforce_provider_stream_capability_policy(
+            ProviderStreamMode::Generic,
+            &plugin_host,
+            &derived_state_host,
+        );
+        crate::runtime_env::clear_runtime_env_overrides();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn provider_stream_strict_policy_rejects_unsupported_hooks() {
+        crate::runtime_env::set_runtime_env_overrides([(
+            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+            String::from("strict"),
+        )]);
+        let plugin_host = PluginHost::builder().add_plugin(RawPacketPlugin).build();
+        let derived_state_host = DerivedStateHost::builder().build();
+        let result = enforce_provider_stream_capability_policy(
+            ProviderStreamMode::YellowstoneGrpc,
+            &plugin_host,
+            &derived_state_host,
+        );
+        crate::runtime_env::clear_runtime_env_overrides();
+        match result {
+            Err(RuntimeError::ProviderStream(
+                ProviderStreamRuntimeError::BuiltInUnsupportedHooks {
+                    mode,
+                    unsupported_hooks,
+                },
+            )) => {
+                assert_eq!(mode, ProviderStreamMode::YellowstoneGrpc);
+                assert!(unsupported_hooks.contains(&String::from("on_raw_packet")));
+            }
+            other => panic!("expected strict provider capability failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_stream_strict_policy_allows_supported_provider_updates() {
+        crate::runtime_env::set_runtime_env_overrides([(
+            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+            String::from("strict"),
+        )]);
+        let plugin_host = PluginHost::builder()
+            .add_plugin(TransactionOnlyPlugin)
+            .build();
+        let derived_state_host = DerivedStateHost::builder().build();
+        let result = enforce_provider_stream_capability_policy(
+            ProviderStreamMode::YellowstoneGrpc,
+            &plugin_host,
+            &derived_state_host,
+        );
+        crate::runtime_env::clear_runtime_env_overrides();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn built_in_provider_modes_reject_recent_blockhash_even_under_warn() {
+        crate::runtime_env::set_runtime_env_overrides([(
+            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+            String::from("warn"),
+        )]);
+        let plugin_host = PluginHost::builder()
+            .add_plugin(RecentBlockhashPlugin)
+            .build();
+        let derived_state_host = DerivedStateHost::builder().build();
+        let result = enforce_provider_stream_capability_policy(
+            ProviderStreamMode::YellowstoneGrpc,
+            &plugin_host,
+            &derived_state_host,
+        );
+        crate::runtime_env::clear_runtime_env_overrides();
+        match result {
+            Err(RuntimeError::ProviderStream(
+                ProviderStreamRuntimeError::BuiltInUnsupportedHooks {
+                    unsupported_hooks, ..
+                },
+            )) => {
+                assert!(unsupported_hooks.contains(&String::from("on_recent_blockhash")));
+            }
+            other => panic!("expected built-in recent-blockhash capability failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_stream_strict_policy_rejects_unsupported_derived_state_subscriptions() {
+        crate::runtime_env::set_runtime_env_overrides([(
+            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+            String::from("strict"),
+        )]);
+        let plugin_host = PluginHost::builder().build();
+        let derived_state_host = DerivedStateHost::builder()
+            .add_consumer(AccountTouchDerivedStateConsumer)
+            .add_consumer(ControlPlaneDerivedStateConsumer)
+            .build();
+        let result = enforce_provider_stream_capability_policy(
+            ProviderStreamMode::YellowstoneGrpc,
+            &plugin_host,
+            &derived_state_host,
+        );
+        crate::runtime_env::clear_runtime_env_overrides();
+        match result {
+            Err(RuntimeError::ProviderStream(
+                ProviderStreamRuntimeError::BuiltInUnsupportedHooks {
+                    unsupported_hooks, ..
+                },
+            )) => {
+                assert!(
+                    unsupported_hooks
+                        .contains(&String::from("derived_state.account_touch_observed"))
+                );
+                assert!(
+                    unsupported_hooks
+                        .contains(&String::from("derived_state.control_plane_observed"))
+                );
+            }
+            other => panic!("expected strict provider capability failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn built_in_provider_modes_reject_control_plane_hooks_even_under_warn() {
+        crate::runtime_env::set_runtime_env_overrides([(
+            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+            String::from("warn"),
+        )]);
+        struct ControlPlanePlugin;
+
+        #[async_trait]
+        impl ObserverPlugin for ControlPlanePlugin {
+            fn name(&self) -> &'static str {
+                "control-plane-plugin"
+            }
+
+            fn config(&self) -> PluginConfig {
+                PluginConfig::new()
+                    .with_cluster_topology()
+                    .with_leader_schedule()
+                    .with_reorg()
+            }
+        }
+
+        let plugin_host = PluginHost::builder().add_plugin(ControlPlanePlugin).build();
+        let derived_state_host = DerivedStateHost::builder()
+            .add_consumer(ControlPlaneDerivedStateConsumer)
+            .build();
+        let result = enforce_provider_stream_capability_policy(
+            ProviderStreamMode::YellowstoneGrpc,
+            &plugin_host,
+            &derived_state_host,
+        );
+        crate::runtime_env::clear_runtime_env_overrides();
+        match result {
+            Err(RuntimeError::ProviderStream(
+                ProviderStreamRuntimeError::BuiltInUnsupportedHooks {
+                    unsupported_hooks, ..
+                },
+            )) => {
+                assert!(unsupported_hooks.contains(&String::from("on_cluster_topology")));
+                assert!(unsupported_hooks.contains(&String::from("on_leader_schedule")));
+                assert!(unsupported_hooks.contains(&String::from("on_reorg")));
+                assert!(
+                    unsupported_hooks
+                        .contains(&String::from("derived_state.control_plane_observed"))
+                );
+            }
+            other => panic!("expected built-in provider capability failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_stream_strict_policy_allows_generic_leader_schedule_reorg_and_control_plane() {
+        crate::runtime_env::set_runtime_env_overrides([(
+            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+            String::from("strict"),
+        )]);
+        struct LeaderScheduleReorgPlugin;
+
+        #[async_trait]
+        impl ObserverPlugin for LeaderScheduleReorgPlugin {
+            fn name(&self) -> &'static str {
+                "leader-schedule-reorg-plugin"
+            }
+
+            fn config(&self) -> PluginConfig {
+                PluginConfig::new().with_leader_schedule().with_reorg()
+            }
+        }
+
+        let plugin_host = PluginHost::builder()
+            .add_plugin(LeaderScheduleReorgPlugin)
+            .build();
+        let derived_state_host = DerivedStateHost::builder()
+            .add_consumer(ControlPlaneDerivedStateConsumer)
+            .build();
+        let result = enforce_provider_stream_capability_policy(
+            ProviderStreamMode::Generic,
+            &plugin_host,
+            &derived_state_host,
+        );
+        crate::runtime_env::clear_runtime_env_overrides();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn provider_stream_rejects_sof_tx_live_adapter_even_under_warn() {
+        crate::runtime_env::set_runtime_env_overrides([(
+            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+            String::from("warn"),
+        )]);
+        let plugin_host = PluginHost::builder()
+            .add_plugin(SofTxAdapterLikePlugin)
+            .build();
+        let derived_state_host = DerivedStateHost::builder().build();
+        let result = enforce_provider_stream_capability_policy(
+            ProviderStreamMode::YellowstoneGrpc,
+            &plugin_host,
+            &derived_state_host,
+        );
+        crate::runtime_env::clear_runtime_env_overrides();
+        match result {
+            Err(RuntimeError::ProviderStream(
+                ProviderStreamRuntimeError::BuiltInUnsupportedHooks {
+                    unsupported_hooks, ..
+                },
+            )) => {
+                assert!(unsupported_hooks.contains(&String::from("on_cluster_topology")));
+                assert!(unsupported_hooks.contains(&String::from("on_leader_schedule")));
+            }
+            other => panic!("expected sof-tx live adapter failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_stream_rejects_sof_tx_replay_adapter_even_under_warn() {
+        crate::runtime_env::set_runtime_env_overrides([(
+            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+            String::from("warn"),
+        )]);
+        let plugin_host = PluginHost::builder().build();
+        let derived_state_host = DerivedStateHost::builder()
+            .add_consumer(SofTxDerivedStateAdapterLikeConsumer)
+            .build();
+        let result = enforce_provider_stream_capability_policy(
+            ProviderStreamMode::YellowstoneGrpc,
+            &plugin_host,
+            &derived_state_host,
+        );
+        crate::runtime_env::clear_runtime_env_overrides();
+        match result {
+            Err(RuntimeError::ProviderStream(
+                ProviderStreamRuntimeError::BuiltInUnsupportedHooks {
+                    unsupported_hooks, ..
+                },
+            )) => {
+                assert!(
+                    unsupported_hooks
+                        .contains(&String::from("derived_state.control_plane_observed"))
+                );
+            }
+            other => panic!("expected sof-tx replay adapter failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_stream_allows_sof_tx_live_adapter_on_generic_mode() {
+        let plugin_host = PluginHost::builder()
+            .add_plugin(SofTxAdapterLikePlugin)
+            .build();
+        let derived_state_host = DerivedStateHost::builder().build();
+        let result = enforce_provider_stream_capability_policy(
+            ProviderStreamMode::Generic,
+            &plugin_host,
+            &derived_state_host,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn provider_stream_allows_sof_tx_replay_adapter_on_generic_mode() {
+        let plugin_host = PluginHost::builder().build();
+        let derived_state_host = DerivedStateHost::builder()
+            .add_consumer(SofTxDerivedStateAdapterLikeConsumer)
+            .build();
+        let result = enforce_provider_stream_capability_policy(
+            ProviderStreamMode::Generic,
+            &plugin_host,
+            &derived_state_host,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn provider_replay_dedupe_skips_duplicate_transaction_updates() {
+        let update = sample_provider_transaction_update();
+        let mut dedupe = ProviderReplayDedupe::new(8);
+
+        assert!(!dedupe.observe(&update));
+        assert!(dedupe.observe(&update));
+    }
+
+    #[test]
+    fn provider_replay_dedupe_skips_duplicate_serialized_transaction_updates() {
+        let update = sample_serialized_provider_transaction_update();
+        let mut dedupe = ProviderReplayDedupe::new(8);
+
+        assert!(!dedupe.observe(&update));
+        assert!(dedupe.observe(&update));
+    }
+
+    #[test]
+    fn provider_replay_dedupe_keeps_higher_commitment_transaction_update() {
+        let initial = sample_provider_transaction_update();
+        let progressed = sample_confirmed_provider_transaction_update();
+        let mut dedupe = ProviderReplayDedupe::new(8);
+
+        assert!(!dedupe.observe(&initial));
+        assert!(!dedupe.observe(&progressed));
+    }
+
+    #[test]
+    fn provider_replay_dedupe_keeps_higher_commitment_serialized_update() {
+        let initial = sample_serialized_provider_transaction_update();
+        let progressed = sample_confirmed_serialized_provider_transaction_update();
+        let mut dedupe = ProviderReplayDedupe::new(8);
+
+        assert!(!dedupe.observe(&initial));
+        assert!(!dedupe.observe(&progressed));
+    }
+
+    #[test]
+    fn provider_replay_dedupe_evicts_slots_outside_window() {
+        let old = sample_provider_transaction_update_at(1);
+        let new = sample_provider_transaction_update_at(PROVIDER_REPLAY_DEDUPE_SLOT_WINDOW + 2);
+        let mut dedupe = ProviderReplayDedupe::new(8);
+
+        assert!(!dedupe.observe(&old));
+        assert!(!dedupe.observe(&new));
+        assert!(!dedupe.observe(&old));
+    }
+
+    #[test]
+    fn provider_replay_dedupe_skips_duplicate_control_plane_updates() {
+        let update = sample_provider_recent_blockhash_update(42);
+        let mut dedupe = ProviderReplayDedupe::new(8);
+
+        assert!(!dedupe.observe(&update));
+        assert!(dedupe.observe(&update));
+    }
+
+    #[test]
+    fn provider_replay_dedupe_skips_duplicate_transaction_log_updates() {
+        let update = sample_provider_transaction_log_update(42);
+        let mut dedupe = ProviderReplayDedupe::new(8);
+
+        assert!(!dedupe.observe(&update));
+        assert!(dedupe.observe(&update));
+    }
+
+    #[test]
+    fn provider_replay_dedupe_skips_duplicate_transaction_view_batch_updates() {
+        let update = sample_provider_transaction_view_batch_update(42);
+        let mut dedupe = ProviderReplayDedupe::new(8);
+
+        assert!(!dedupe.observe(&update));
+        assert!(dedupe.observe(&update));
+    }
+
+    #[tokio::test]
+    async fn provider_stream_strict_policy_fails_before_plugin_and_extension_startup() {
+        crate::runtime_env::set_runtime_env_overrides([(
+            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+            String::from("strict"),
+        )]);
+        let plugin_counter = Arc::new(AtomicUsize::new(0));
+        let extension_counter = Arc::new(AtomicUsize::new(0));
+        let plugin_host = PluginHost::builder()
+            .add_plugin(StartupCounterPlugin {
+                counter: Arc::clone(&plugin_counter),
+            })
+            .build();
+        let extension_host = RuntimeExtensionHost::builder()
+            .add_extension(StartupCounterExtension {
+                counter: Arc::clone(&extension_counter),
+            })
+            .build();
+        let (_tx, rx) = crate::provider_stream::create_provider_stream_queue(1);
+
+        let result = run_provider_stream_runtime(
+            plugin_host,
+            extension_host,
+            DerivedStateHost::builder().build(),
+            None,
+            ProviderStreamMode::YellowstoneGrpc,
+            rx,
+        )
+        .await;
+        crate::runtime_env::clear_runtime_env_overrides();
+
+        assert!(matches!(
+            result,
+            Err(RuntimeError::ProviderStream(
+                ProviderStreamRuntimeError::BuiltInUnsupportedHooks { .. }
+            ))
+        ));
+        assert_eq!(plugin_counter.load(Ordering::Relaxed), 0);
+        assert_eq!(extension_counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn provider_stream_runtime_errors_when_ingress_channel_closes_unexpectedly() {
+        let plugin_host = PluginHost::builder()
+            .add_plugin(TransactionOnlyPlugin)
+            .build();
+        let extension_host = RuntimeExtensionHost::builder().build();
+        let (tx, rx) = crate::provider_stream::create_provider_stream_queue(1);
+        drop(tx);
+
+        let result = run_provider_stream_runtime(
+            plugin_host,
+            extension_host,
+            DerivedStateHost::builder().build(),
+            None,
+            ProviderStreamMode::YellowstoneGrpc,
+            rx,
+        )
+        .await;
+
+        match result {
+            Err(RuntimeError::ProviderStream(ProviderStreamRuntimeError::IngressClosed {
+                mode,
+                degraded_sources,
+            })) => {
+                assert_eq!(mode, ProviderStreamMode::YellowstoneGrpc);
+                assert!(degraded_sources.is_empty());
+            }
+            other => panic!("expected provider ingress closure failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_stream_runtime_surfaces_degraded_source_on_channel_close() {
+        let plugin_host = PluginHost::builder()
+            .add_plugin(TransactionOnlyPlugin)
+            .build();
+        let extension_host = RuntimeExtensionHost::builder().build();
+        let (tx, rx) = crate::provider_stream::create_provider_stream_queue(4);
+        tx.send(
+            crate::provider_stream::ProviderSourceHealthEvent {
+                source: crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
+                status: crate::provider_stream::ProviderSourceHealthStatus::Reconnecting,
+                reason: crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
+                message: "upstream stalled".to_owned(),
+            }
+            .into(),
+        )
+        .await
+        .expect("health sent");
+        drop(tx);
+
+        let result = run_provider_stream_runtime(
+            plugin_host,
+            extension_host,
+            DerivedStateHost::builder().build(),
+            None,
+            ProviderStreamMode::YellowstoneGrpc,
+            rx,
+        )
+        .await;
+
+        match result {
+            Err(RuntimeError::ProviderStream(ProviderStreamRuntimeError::IngressClosed {
+                degraded_sources,
+                ..
+            })) => {
+                assert_eq!(degraded_sources.len(), 1);
+                assert_eq!(
+                    degraded_sources[0].source,
+                    crate::provider_stream::ProviderSourceId::YellowstoneGrpc
+                );
+                assert_eq!(
+                    degraded_sources[0].status,
+                    crate::provider_stream::ProviderSourceHealthStatus::Reconnecting
+                );
+                assert_eq!(
+                    degraded_sources[0].reason,
+                    crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure
+                );
+                assert_eq!(degraded_sources[0].message, "upstream stalled");
+            }
+            other => panic!("expected degraded provider closure failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_stream_runtime_allows_generic_eof_when_configured() {
+        crate::runtime_env::set_runtime_env_overrides([(
+            String::from("SOF_PROVIDER_STREAM_ALLOW_EOF"),
+            String::from("true"),
+        )]);
+        let plugin_host = PluginHost::builder()
+            .add_plugin(TransactionOnlyPlugin)
+            .build();
+        let extension_host = RuntimeExtensionHost::builder().build();
+        let (tx, rx) = crate::provider_stream::create_provider_stream_queue(1);
+        drop(tx);
+
+        let result = run_provider_stream_runtime(
+            plugin_host,
+            extension_host,
+            DerivedStateHost::builder().build(),
+            None,
+            ProviderStreamMode::Generic,
+            rx,
+        )
+        .await;
+        crate::runtime_env::clear_runtime_env_overrides();
+
+        assert!(
+            result.is_ok(),
+            "expected configured generic EOF to stop cleanly"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_stream_runtime_rejects_generic_eof_after_degraded_health() {
+        crate::runtime_env::set_runtime_env_overrides([(
+            String::from("SOF_PROVIDER_STREAM_ALLOW_EOF"),
+            String::from("true"),
+        )]);
+        let plugin_host = PluginHost::builder()
+            .add_plugin(TransactionOnlyPlugin)
+            .build();
+        let extension_host = RuntimeExtensionHost::builder().build();
+        let (tx, rx) = crate::provider_stream::create_provider_stream_queue(4);
+        tx.send(
+            crate::provider_stream::ProviderSourceHealthEvent {
+                source: crate::provider_stream::ProviderSourceId::Generic("generic_source"),
+                status: crate::provider_stream::ProviderSourceHealthStatus::Reconnecting,
+                reason: crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
+                message: "upstream stalled".to_owned(),
+            }
+            .into(),
+        )
+        .await
+        .expect("health sent");
+        drop(tx);
+
+        let result = run_provider_stream_runtime(
+            plugin_host,
+            extension_host,
+            DerivedStateHost::builder().build(),
+            None,
+            ProviderStreamMode::Generic,
+            rx,
+        )
+        .await;
+        crate::runtime_env::clear_runtime_env_overrides();
+
+        match result {
+            Err(RuntimeError::ProviderStream(ProviderStreamRuntimeError::IngressClosed {
+                mode,
+                degraded_sources,
+            })) => {
+                assert_eq!(mode, ProviderStreamMode::Generic);
+                assert_eq!(degraded_sources.len(), 1);
+                assert_eq!(degraded_sources[0].source.as_str(), "generic_source");
+            }
+            other => panic!("expected degraded generic EOF failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for provider-stream dispatch A/B"]
+    fn provider_stream_transaction_dispatch_profile_fixture() {
+        let iterations = profile_iterations(500_000);
+        let plugin_host = PluginHost::builder().build();
+        let derived_state_host = DerivedStateHost::builder().build();
+        let update = sample_provider_transaction_update();
+
+        let baseline_started = Instant::now();
+        for _ in 0..iterations {
+            dispatch_provider_stream_update_baseline(
+                &plugin_host,
+                &derived_state_host,
+                update.clone(),
+            );
+        }
+        let baseline_elapsed = baseline_started.elapsed();
+
+        let optimized_started = Instant::now();
+        for _ in 0..iterations {
+            dispatch_provider_stream_update(&plugin_host, &derived_state_host, update.clone());
+        }
+        let optimized_elapsed = optimized_started.elapsed();
+
+        eprintln!(
+            "provider_stream_transaction_dispatch_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            iterations,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
+        );
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for provider serialized tx ignore fast-path"]
+    fn provider_stream_serialized_transaction_prefilter_ignore_profile_fixture() {
+        let iterations = profile_iterations(500_000);
+        let plugin_host = PluginHost::builder()
+            .add_plugin(PrefilterIgnorePlugin {
+                filter: TransactionPrefilter::new(TransactionInterest::Critical)
+                    .with_account_required([solana_pubkey::Pubkey::new_unique()]),
+            })
+            .build();
+        let derived_state_host = DerivedStateHost::builder().build();
+        let baseline_update = sample_provider_transaction_update();
+        let optimized_update = sample_serialized_provider_transaction_update();
+
+        let baseline_started = Instant::now();
+        for _ in 0..iterations {
+            dispatch_provider_stream_update_baseline(
+                &plugin_host,
+                &derived_state_host,
+                baseline_update.clone(),
+            );
+        }
+        let baseline_elapsed = baseline_started.elapsed();
+
+        let optimized_started = Instant::now();
+        for _ in 0..iterations {
+            dispatch_provider_stream_update(
+                &plugin_host,
+                &derived_state_host,
+                optimized_update.clone(),
+            );
+        }
+        let optimized_elapsed = optimized_started.elapsed();
+
+        eprintln!(
+            "provider_stream_serialized_transaction_prefilter_ignore_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            iterations,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
+        );
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for baseline provider serialized tx ignore path"]
+    fn provider_stream_serialized_transaction_prefilter_ignore_baseline_profile_fixture() {
+        let iterations = profile_iterations(500_000);
+        let plugin_host = PluginHost::builder()
+            .add_plugin(PrefilterIgnorePlugin {
+                filter: TransactionPrefilter::new(TransactionInterest::Critical)
+                    .with_account_required([solana_pubkey::Pubkey::new_unique()]),
+            })
+            .build();
+        let derived_state_host = DerivedStateHost::builder().build();
+        let baseline_update = sample_provider_transaction_update();
+
+        for _ in 0..iterations {
+            dispatch_provider_stream_update_baseline(
+                &plugin_host,
+                &derived_state_host,
+                baseline_update.clone(),
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for optimized provider serialized tx ignore path"]
+    fn provider_stream_serialized_transaction_prefilter_ignore_optimized_profile_fixture() {
+        let iterations = profile_iterations(500_000);
+        let plugin_host = PluginHost::builder()
+            .add_plugin(PrefilterIgnorePlugin {
+                filter: TransactionPrefilter::new(TransactionInterest::Critical)
+                    .with_account_required([solana_pubkey::Pubkey::new_unique()]),
+            })
+            .build();
+        let derived_state_host = DerivedStateHost::builder().build();
+        let optimized_update = sample_serialized_provider_transaction_update();
+
+        for _ in 0..iterations {
+            dispatch_provider_stream_update(
+                &plugin_host,
+                &derived_state_host,
+                optimized_update.clone(),
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for provider serialized tx accepted path"]
+    fn provider_stream_serialized_transaction_accept_profile_fixture() {
+        let iterations = profile_iterations(500_000);
+        let plugin_host = PluginHost::builder()
+            .add_plugin(TransactionOnlyPlugin)
+            .build();
+        let derived_state_host = DerivedStateHost::builder().build();
+        let baseline_update = sample_serialized_provider_transaction_update();
+        let optimized_update = baseline_update.clone();
+
+        let baseline_started = Instant::now();
+        for _ in 0..iterations {
+            let ProviderStreamUpdate::SerializedTransaction(event) = baseline_update.clone() else {
+                panic!("expected serialized update fixture");
+            };
+            dispatch_provider_stream_serialized_transaction_baseline(
+                &plugin_host,
+                &derived_state_host,
+                &event,
+            );
+        }
+        let baseline_elapsed = baseline_started.elapsed();
+
+        let optimized_started = Instant::now();
+        for _ in 0..iterations {
+            dispatch_provider_stream_update(
+                &plugin_host,
+                &derived_state_host,
+                optimized_update.clone(),
+            );
+        }
+        let optimized_elapsed = optimized_started.elapsed();
+
+        eprintln!(
+            "provider_stream_serialized_transaction_accept_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            iterations,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
         );
     }
 }

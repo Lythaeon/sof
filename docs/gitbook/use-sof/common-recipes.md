@@ -48,7 +48,9 @@ Use this when:
 You will usually start with:
 
 - RPC transport first
-- `Hybrid` once direct routing inputs are proven trustworthy
+- Jito if block-engine submission is already part of the product
+- `submit_signed(...)` if signing already happens elsewhere
+- `Hybrid` only once direct routing inputs are proven trustworthy
 
 Implementation shape:
 
@@ -71,6 +73,10 @@ Use this when:
 
 This is the normal product shape for local execution services that want live TPU and leader state
 without a separate internal control-plane service.
+
+For this shape, the biggest prerequisite is early ingress. If the host gets shreds late, keeping
+`sof` and `sof-tx` together still removes internal overhead, but it does not create true
+low-latency visibility on its own.
 
 Implementation shape:
 
@@ -112,6 +118,9 @@ Use this when:
 - the built-in UDP ingress is not the final network shape you need
 
 Do not start here unless you have already measured why the standard ingress path is insufficient.
+
+This is also the page to care about if your real constraint is not SOF's local runtime overhead
+but getting earlier shred visibility onto the host in the first place.
 
 ## Live-Only Stream Product
 

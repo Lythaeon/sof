@@ -3,8 +3,21 @@ use std::{num::NonZeroUsize, path::PathBuf};
 use super::{read_bool_env, read_env_var};
 use crate::{
     framework::{DerivedStateReplayBackend, DerivedStateReplayDurability},
-    runtime::{DerivedStateReplayConfig, DerivedStateRuntimeConfig},
+    runtime::{DerivedStateReplayConfig, DerivedStateRuntimeConfig, ShredTrustMode},
 };
+
+fn read_optional_bool_env(name: &str) -> Option<bool> {
+    read_env_var(name).map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+pub fn read_shred_trust_mode() -> ShredTrustMode {
+    match read_env_var("SOF_SHRED_TRUST_MODE").as_deref() {
+        Some("trusted_raw_shred_provider" | "trusted-raw-shred-provider") => {
+            ShredTrustMode::TrustedRawShredProvider
+        }
+        _ => ShredTrustMode::PublicUntrusted,
+    }
+}
 
 pub fn read_worker_threads() -> usize {
     read_env_var("SOF_WORKER_THREADS")
@@ -191,7 +204,8 @@ pub fn read_log_repair_peer_traffic_every() -> u64 {
 }
 
 pub fn read_verify_shreds() -> bool {
-    read_bool_env("SOF_VERIFY_SHREDS", false)
+    read_optional_bool_env("SOF_VERIFY_SHREDS")
+        .unwrap_or_else(|| matches!(read_shred_trust_mode(), ShredTrustMode::PublicUntrusted))
 }
 
 pub fn read_verify_strict_unknown() -> bool {
@@ -199,7 +213,27 @@ pub fn read_verify_strict_unknown() -> bool {
 }
 
 pub fn read_verify_recovered_shreds() -> bool {
-    read_bool_env("SOF_VERIFY_RECOVERED_SHREDS", false)
+    read_optional_bool_env("SOF_VERIFY_RECOVERED_SHREDS")
+        .unwrap_or_else(|| matches!(read_shred_trust_mode(), ShredTrustMode::PublicUntrusted))
+}
+
+pub fn read_runtime_dataset_decode_failures_unhealthy_per_tick() -> u64 {
+    read_env_var("SOF_RUNTIME_DATASET_DECODE_FAILURES_UNHEALTHY_PER_TICK")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(32)
+}
+
+pub fn read_runtime_dataset_tail_skips_unhealthy_per_tick() -> u64 {
+    read_env_var("SOF_RUNTIME_DATASET_TAIL_SKIPS_UNHEALTHY_PER_TICK")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(256)
+}
+
+pub fn read_runtime_dataset_unhealthy_sustain_ticks() -> u64 {
+    read_env_var("SOF_RUNTIME_DATASET_UNHEALTHY_SUSTAIN_TICKS")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(3)
 }
 
 pub fn read_verify_signature_cache_entries() -> usize {

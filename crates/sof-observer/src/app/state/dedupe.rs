@@ -161,10 +161,12 @@ impl ShredDedupeCache {
                     }
                 }
             };
-            existing.seen_at = now;
-            self.order.push_back((now, key));
-            self.evict(now);
-            self.observe_depths();
+            if matches!(observation, ShredDedupeObservation::Accepted) {
+                existing.seen_at = now;
+                self.order.push_back((now, key));
+                self.evict(now);
+                self.observe_depths();
+            }
             return observation;
         }
         self.entries.insert(
@@ -238,6 +240,9 @@ fn make_shred_dedupe_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        protocol::shred_wire::SIZE_OF_DATA_SHRED_PAYLOAD, shred::wire::parse_shred_header,
+    };
 
     fn test_key(slot: u64, index: u32) -> ShredDedupeIdentity {
         ShredDedupeIdentity {
@@ -410,5 +415,189 @@ mod tests {
             ),
             ShredDedupeObservation::Duplicate
         );
+    }
+
+    #[test]
+    fn duplicate_observations_do_not_refresh_eviction_queue() {
+        let now = Instant::now();
+        let mut cache = ShredDedupeCache::new(16, Duration::from_secs(1), 64);
+        let key = test_key(42, 7);
+
+        assert_eq!(
+            cache.observe_key(key, [1_u8; 64], now, ShredDedupeStage::Ingress),
+            ShredDedupeObservation::Accepted
+        );
+        assert_eq!(cache.metrics().queue_depth, 1);
+
+        assert_eq!(
+            cache.observe_key(
+                key,
+                [1_u8; 64],
+                now + Duration::from_millis(1),
+                ShredDedupeStage::Ingress,
+            ),
+            ShredDedupeObservation::Duplicate
+        );
+        assert_eq!(cache.metrics().queue_depth, 1);
+
+        assert_eq!(
+            cache.observe_key(
+                key,
+                [2_u8; 64],
+                now + Duration::from_millis(2),
+                ShredDedupeStage::Ingress,
+            ),
+            ShredDedupeObservation::Conflict
+        );
+        assert_eq!(cache.metrics().queue_depth, 1);
+    }
+
+    #[test]
+    fn canonical_transition_refreshes_queue_once() {
+        let now = Instant::now();
+        let mut cache = ShredDedupeCache::new(16, Duration::from_secs(1), 64);
+        let key = test_key(42, 7);
+
+        assert_eq!(
+            cache.observe_key(key, [1_u8; 64], now, ShredDedupeStage::Ingress),
+            ShredDedupeObservation::Accepted
+        );
+        assert_eq!(cache.metrics().queue_depth, 1);
+
+        assert_eq!(
+            cache.observe_key(
+                key,
+                [1_u8; 64],
+                now + Duration::from_millis(1),
+                ShredDedupeStage::Canonical,
+            ),
+            ShredDedupeObservation::Accepted
+        );
+        assert_eq!(cache.metrics().queue_depth, 2);
+
+        assert_eq!(
+            cache.observe_key(
+                key,
+                [1_u8; 64],
+                now + Duration::from_millis(2),
+                ShredDedupeStage::Canonical,
+            ),
+            ShredDedupeObservation::Duplicate
+        );
+        assert_eq!(cache.metrics().queue_depth, 2);
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for duplicate ingress dedupe churn"]
+    fn duplicate_ingress_profile_fixture() {
+        let now = Instant::now();
+        let iterations = std::env::var("SOF_DEDUPE_PROFILE_ITERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(2_000_000);
+        let unique_keys = std::env::var("SOF_DEDUPE_PROFILE_KEYS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1_024);
+        let mut cache = ShredDedupeCache::new(
+            unique_keys.saturating_mul(4),
+            Duration::from_secs(60),
+            4_096,
+        );
+
+        for key_index in 0..unique_keys {
+            let key = test_key(10_000, u32::try_from(key_index).unwrap_or(u32::MAX));
+            let signature = [u8::try_from(key_index % 251).unwrap_or(0); 64];
+            assert_eq!(
+                cache.observe_key(key, signature, now, ShredDedupeStage::Ingress),
+                ShredDedupeObservation::Accepted
+            );
+        }
+
+        let start = Instant::now();
+        for duplicate_index in 0..iterations {
+            let key_index = duplicate_index % unique_keys;
+            let key = test_key(10_000, u32::try_from(key_index).unwrap_or(u32::MAX));
+            let signature = [u8::try_from(key_index % 251).unwrap_or(0); 64];
+            let observed_at =
+                now + Duration::from_micros(u64::try_from(duplicate_index).unwrap_or(u64::MAX));
+            assert_eq!(
+                cache.observe_key(key, signature, observed_at, ShredDedupeStage::Ingress),
+                ShredDedupeObservation::Duplicate
+            );
+        }
+        let elapsed = start.elapsed();
+        let metrics = cache.metrics();
+        println!(
+            "duplicate_ingress_profile_fixture iterations={} unique_keys={} elapsed_us={} queue_depth={} entries={}",
+            iterations,
+            unique_keys,
+            elapsed.as_micros(),
+            metrics.queue_depth,
+            metrics.entries,
+        );
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for duplicate parse plus ingress dedupe churn"]
+    fn duplicate_parse_and_ingress_profile_fixture() {
+        let now = Instant::now();
+        let iterations = std::env::var("SOF_DEDUPE_PROFILE_ITERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(2_000_000);
+        let packet = build_data_shred_packet(10_000, 7, 0, b"dup");
+        let parsed = parse_shred_header(&packet).expect("valid test shred");
+        let mut cache = ShredDedupeCache::new(4, Duration::from_secs(60), 4_096);
+
+        assert_eq!(
+            cache.observe_shred(&packet, &parsed, now),
+            ShredDedupeObservation::Accepted
+        );
+
+        let start = Instant::now();
+        for duplicate_index in 0..iterations {
+            let observed_at =
+                now + Duration::from_micros(u64::try_from(duplicate_index).unwrap_or(u64::MAX));
+            let parsed_duplicate = parse_shred_header(&packet).expect("valid test shred");
+            assert_eq!(
+                cache.observe_shred(&packet, &parsed_duplicate, observed_at),
+                ShredDedupeObservation::Duplicate
+            );
+        }
+        let elapsed = start.elapsed();
+        let metrics = cache.metrics();
+        println!(
+            "duplicate_parse_and_ingress_profile_fixture iterations={} elapsed_us={} queue_depth={} entries={}",
+            iterations,
+            elapsed.as_micros(),
+            metrics.queue_depth,
+            metrics.entries,
+        );
+    }
+
+    fn build_data_shred_packet(
+        slot: u64,
+        index: u32,
+        fec_set_index: u32,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let total = 88usize.saturating_add(payload.len());
+        let mut packet = vec![0_u8; SIZE_OF_DATA_SHRED_PAYLOAD];
+        packet[64] = 0x90;
+        packet[65..73].copy_from_slice(&slot.to_le_bytes());
+        packet[73..77].copy_from_slice(&index.to_le_bytes());
+        packet[77..79].copy_from_slice(&u16::to_le_bytes(1));
+        packet[79..83].copy_from_slice(&fec_set_index.to_le_bytes());
+        packet[83..85].copy_from_slice(&u16::to_le_bytes(1));
+        packet[85] = 0b0100_0000;
+        let size = u16::try_from(total).expect("test packet too large");
+        packet[86..88].copy_from_slice(&size.to_le_bytes());
+        let payload_end = 88usize.saturating_add(payload.len());
+        packet[88..payload_end].copy_from_slice(payload);
+        packet
     }
 }

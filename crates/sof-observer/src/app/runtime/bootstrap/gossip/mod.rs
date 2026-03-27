@@ -5,6 +5,8 @@ mod receiver;
 mod switch;
 
 #[cfg(feature = "gossip-bootstrap")]
+pub(crate) use entrypoints::GossipEntrypointBias;
+#[cfg(feature = "gossip-bootstrap")]
 pub(crate) use handoff::stop_gossip_runtime_components;
 #[cfg(feature = "kernel-bypass")]
 pub(crate) use receiver::start_external_receiver;

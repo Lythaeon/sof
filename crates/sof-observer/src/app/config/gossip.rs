@@ -57,11 +57,29 @@ const DEFAULT_RUNTIME_SWITCH_STABILIZE_MIN_PACKETS: u64 = 8;
 #[cfg(feature = "gossip-bootstrap")]
 const DEFAULT_RUNTIME_SWITCH_STABILIZE_MAX_WAIT_MS: u64 = 8_000;
 #[cfg(feature = "gossip-bootstrap")]
+const DEFAULT_RUNTIME_SWITCH_STABILIZE_MIN_PEERS: usize = 8;
+#[cfg(feature = "gossip-bootstrap")]
 const DEFAULT_BOOTSTRAP_STABILIZE_MAX_WAIT_MS: u64 = 20_000;
 #[cfg(feature = "gossip-bootstrap")]
 const DEFAULT_BOOTSTRAP_STABILIZE_MIN_PEERS: usize = 128;
 #[cfg(feature = "gossip-bootstrap")]
 const DEFAULT_RUNTIME_SWITCH_PEER_CANDIDATES: usize = 64;
+#[cfg(feature = "gossip-bootstrap")]
+const DEFAULT_RUNTIME_SWITCH_PROACTIVE_EVAL_MS: u64 = 30_000;
+#[cfg(feature = "gossip-bootstrap")]
+const DEFAULT_RUNTIME_SWITCH_PROACTIVE_ACTIVE_RANK_MAX: usize = 1;
+#[cfg(feature = "gossip-bootstrap")]
+const DEFAULT_RUNTIME_SWITCH_PRIORITIZED_CANDIDATES_MAX: usize = 8;
+#[cfg(feature = "gossip-bootstrap")]
+const DEFAULT_RUNTIME_SWITCH_PROACTIVE_STABLE_EVALS: usize = 2;
+#[cfg(feature = "gossip-bootstrap")]
+const DEFAULT_RUNTIME_SWITCH_PROACTIVE_MIN_RUNTIME_AGE_MS: u64 = 120_000;
+#[cfg(feature = "gossip-bootstrap")]
+const DEFAULT_GOSSIP_LOAD_SHED_QUEUE_PRESSURE_PCT: u64 = 8;
+#[cfg(feature = "gossip-bootstrap")]
+const DEFAULT_VERIFY_STRICT_UNKNOWN_QUEUE_PRESSURE_PCT: u64 = 4;
+#[cfg(feature = "gossip-bootstrap")]
+const DEFAULT_GOSSIP_LOAD_SHED_KEEP_TOP_SOURCES: usize = 4;
 #[cfg(feature = "gossip-bootstrap")]
 const GOSSIP_VALIDATORS_MAX: usize = 2_048;
 
@@ -206,6 +224,11 @@ pub fn read_gossip_runtime_switch_enabled() -> bool {
 }
 
 #[cfg(feature = "gossip-bootstrap")]
+pub fn read_gossip_entrypoint_pinned() -> bool {
+    read_bool_env("SOF_GOSSIP_ENTRYPOINT_PINNED", false)
+}
+
+#[cfg(feature = "gossip-bootstrap")]
 pub fn read_gossip_bootstrap_only() -> bool {
     read_bool_env("SOF_GOSSIP_BOOTSTRAP_ONLY", false)
 }
@@ -305,6 +328,14 @@ pub fn read_gossip_runtime_switch_stabilize_max_wait_ms() -> u64 {
 }
 
 #[cfg(feature = "gossip-bootstrap")]
+pub fn read_gossip_runtime_switch_stabilize_min_peers() -> usize {
+    read_env_var("SOF_GOSSIP_RUNTIME_SWITCH_STABILIZE_MIN_PEERS")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_RUNTIME_SWITCH_STABILIZE_MIN_PEERS)
+}
+
+#[cfg(feature = "gossip-bootstrap")]
 pub fn read_gossip_bootstrap_stabilize_max_wait_ms() -> u64 {
     read_env_var("SOF_GOSSIP_BOOTSTRAP_STABILIZE_MAX_WAIT_MS")
         .and_then(|value| value.parse::<u64>().ok())
@@ -326,4 +357,78 @@ pub fn read_gossip_runtime_switch_peer_candidates() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_RUNTIME_SWITCH_PEER_CANDIDATES)
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+pub fn read_gossip_runtime_switch_proactive_enabled() -> bool {
+    read_bool_env("SOF_GOSSIP_RUNTIME_SWITCH_PROACTIVE_ENABLED", false)
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+pub fn read_gossip_runtime_switch_proactive_eval_ms() -> u64 {
+    read_env_var("SOF_GOSSIP_RUNTIME_SWITCH_PROACTIVE_EVAL_MS")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_RUNTIME_SWITCH_PROACTIVE_EVAL_MS)
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+pub fn read_gossip_runtime_switch_proactive_active_rank_max() -> usize {
+    read_env_var("SOF_GOSSIP_RUNTIME_SWITCH_PROACTIVE_ACTIVE_RANK_MAX")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_RUNTIME_SWITCH_PROACTIVE_ACTIVE_RANK_MAX)
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+pub fn read_gossip_runtime_switch_prioritized_candidates_max() -> usize {
+    read_env_var("SOF_GOSSIP_RUNTIME_SWITCH_PRIORITIZED_CANDIDATES_MAX")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_RUNTIME_SWITCH_PRIORITIZED_CANDIDATES_MAX)
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+pub fn read_gossip_runtime_switch_proactive_stable_evals() -> usize {
+    read_env_var("SOF_GOSSIP_RUNTIME_SWITCH_PROACTIVE_STABLE_EVALS")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_RUNTIME_SWITCH_PROACTIVE_STABLE_EVALS)
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+pub fn read_gossip_runtime_switch_proactive_min_runtime_age_ms() -> u64 {
+    read_env_var("SOF_GOSSIP_RUNTIME_SWITCH_PROACTIVE_MIN_RUNTIME_AGE_MS")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_RUNTIME_SWITCH_PROACTIVE_MIN_RUNTIME_AGE_MS)
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+pub fn read_gossip_load_shed_enabled() -> bool {
+    read_bool_env("SOF_GOSSIP_LOAD_SHED_ENABLED", true)
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+pub fn read_gossip_load_shed_queue_pressure_pct() -> u64 {
+    read_env_var("SOF_GOSSIP_LOAD_SHED_QUEUE_PRESSURE_PCT")
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value.clamp(1, 100))
+        .unwrap_or(DEFAULT_GOSSIP_LOAD_SHED_QUEUE_PRESSURE_PCT)
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+pub fn read_verify_strict_unknown_queue_pressure_pct() -> u64 {
+    read_env_var("SOF_VERIFY_STRICT_UNKNOWN_QUEUE_PRESSURE_PCT")
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value.clamp(1, 100))
+        .unwrap_or(DEFAULT_VERIFY_STRICT_UNKNOWN_QUEUE_PRESSURE_PCT)
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+pub fn read_gossip_load_shed_keep_top_sources() -> usize {
+    read_env_var("SOF_GOSSIP_LOAD_SHED_KEEP_TOP_SOURCES")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(32))
+        .unwrap_or(DEFAULT_GOSSIP_LOAD_SHED_KEEP_TOP_SOURCES)
 }

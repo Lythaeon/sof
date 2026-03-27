@@ -19,9 +19,11 @@ Start with [`sof`](../crates/sof.md) when the service needs:
 Start with [`sof-tx`](../crates/sof-tx.md) when the service needs:
 
 - a transaction builder
-- direct leader routing
-- hybrid direct plus RPC submission
+- RPC-backed submission
 - Jito integration
+- signed-byte submission
+- optional direct leader routing or hybrid direct plus RPC submission once local routing is
+  available
 
 Important boundary:
 
@@ -38,7 +40,7 @@ state for submission decisions.
 That is the normal pairing for services that:
 
 - derive leader, topology, slot, and recent blockhash state from live traffic
-- want low-latency direct sends
+- want low-latency direct sends or hybrid routing decisions
 - need flow-safety checks before submitting
 
 How they fit together:
@@ -48,6 +50,10 @@ How they fit together:
 - `sof-tx` adapters bridge `sof` plugin events or derived-state feed state into those provider
   traits
 - `sof-tx` then uses that state to decide whether direct or hybrid submission is safe
+
+That adapter path is complete today in raw-shred and gossip-backed SOF runtimes. Built-in
+processed provider adapters are transaction-first and do not yet provide a complete built-in
+`sof-tx` control-plane surface by themselves.
 
 ### I need repeatable host tuning profiles
 

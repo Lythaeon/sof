@@ -13,6 +13,7 @@ flowchart LR
         UDP["Direct UDP ingest"]
         GOSSIP["Gossip bootstrap"]
         KB["Kernel-bypass queue"]
+        PROVIDER["Processed provider stream"]
     end
 
     subgraph Runtime["sof runtime"]
@@ -26,15 +27,30 @@ flowchart LR
     UDP --> INGEST
     GOSSIP --> INGEST
     KB --> INGEST
+    PROVIDER --> HOOKS
     INGEST --> PARSE --> FEC --> STATE --> HOOKS
 </div>
 
 ## Read It From Left To Right
 
+SOF's architecture is easiest to reason about as three layers:
+
+- ingress
+- runtime
+- consumption
+
 - traffic enters from one of the supported ingress modes
 - `sof` ingests packets and parses them into useful runtime data
 - the runtime reconstructs datasets and updates local control-plane state
 - plugins and local state consumers sit on top of those outputs
+
+Processed provider mode is the important exception to the raw packet path:
+
+- Yellowstone gRPC, LaserStream gRPC, websocket `transactionSubscribe`, and
+  `ProviderStreamMode::Generic` enter SOF after the packet/shred stages
+- built-in processed providers are transaction-first
+- generic provider mode is the flexible path when a custom producer wants to
+  feed richer control-plane updates into the same runtime surface
 
 ## Why This Matters
 

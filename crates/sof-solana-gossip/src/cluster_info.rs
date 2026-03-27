@@ -619,7 +619,8 @@ fn gossip_socket_consume_parallel_packet_threshold() -> usize {
 pub(crate) fn gossip_socket_consume_verify_queue_capacity() -> usize {
     // Keep the coordinator ahead of the crypto workers during bursty gossip
     // traffic instead of stalling on a tiny handoff queue.
-    gossip_socket_consume_threads().max(1).saturating_mul(16).max(64)
+    read_usize_env("SOF_GOSSIP_SOCKET_CONSUME_VERIFY_QUEUE_CAPACITY")
+        .unwrap_or_else(|| gossip_socket_consume_threads().max(1).saturating_mul(16).max(64))
 }
 
 fn gossip_listen_parallel_batch_threshold() -> usize {
@@ -3265,6 +3266,13 @@ mod tests {
         let parsed = parse_allowed_core_ids_from_proc_status(status)
             .expect("expected allowed core ids from proc status");
         assert_eq!(parsed, vec![0, 1, 3, 5, 6]);
+    }
+
+    #[test]
+    fn test_gossip_socket_consume_verify_queue_capacity_prefers_override() {
+        std::env::set_var("SOF_GOSSIP_SOCKET_CONSUME_VERIFY_QUEUE_CAPACITY", "1024");
+        assert_eq!(gossip_socket_consume_verify_queue_capacity(), 1024);
+        std::env::remove_var("SOF_GOSSIP_SOCKET_CONSUME_VERIFY_QUEUE_CAPACITY");
     }
 
     #[test]

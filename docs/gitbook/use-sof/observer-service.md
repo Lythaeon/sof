@@ -5,6 +5,11 @@ application-level events, metrics, or logs.
 
 This is the lowest-friction real product shape for `sof`.
 
+Low-friction does not automatically mean lowest-latency. If latency is the reason you are here,
+the service also needs early shred visibility from either direct low-latency validator or peer
+access, or from an external shred propagation network. SOF's efficient local processing only pays
+off once ingress is early enough to matter.
+
 ## Use This When
 
 - you need transaction or slot observation
@@ -31,7 +36,7 @@ That means your service shape is:
 use async_trait::async_trait;
 use sof::{
     event::TxKind,
-    framework::{Plugin, PluginConfig, PluginHost, TransactionEvent},
+    framework::{Plugin, PluginConfig, PluginHost, TransactionEvent, TxCommitmentStatus},
     runtime::ObserverRuntime,
 };
 
@@ -41,7 +46,9 @@ struct NonVoteLogger;
 #[async_trait]
 impl Plugin for NonVoteLogger {
     fn config(&self) -> PluginConfig {
-        PluginConfig::new().with_transaction()
+        PluginConfig::new()
+            .with_transaction()
+            .at_commitment(TxCommitmentStatus::Confirmed)
     }
 
     async fn on_transaction(&self, event: &TransactionEvent) {
@@ -62,6 +69,10 @@ async fn main() -> Result<(), sof::runtime::RuntimeError> {
         .await
 }
 ```
+
+Use `.at_commitment(...)` when the service should ignore lower-confidence traffic,
+or `.only_at_commitment(...)` when it should react only to one exact commitment.
+If you do not set either one, SOF defaults to processed-or-better delivery.
 
 This is the right first service because it proves all of the important boundaries:
 
@@ -112,6 +123,9 @@ async fn main() -> Result<(), sof::runtime::RuntimeError> {
 
 That keeps `on_transaction` on the low-latency inline path. Other dataset
 consumers can still continue on the dataset-worker path in parallel.
+
+Inline dispatch removes local scheduling and queueing overhead. It does not fix late ingress. If
+the host sees shreds late, inline still starts from late data.
 
 ## What You Usually Add Next
 

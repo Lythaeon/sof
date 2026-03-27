@@ -35,15 +35,15 @@ let setup = sof::runtime::RuntimeSetup::new()
 Built-in presets:
 
 - `Home`: bounded ingest and conservative socket fanout for small self-hosted machines
-- `Vps`: validated public-host profile with dual-socket fanout, deeper gossip queues, `4` gossip workers per stage, and `524288` shred dedupe capacity
+- `Vps`: validated public-host profile with four TVU receive sockets, deeper gossip queues, `4` gossip workers per stage, and `524288` shred dedupe capacity
 - `Dedicated`: aggressive fanout and larger queue/dedupe budgets for dedicated ingest machines
 
 The `Vps` preset mirrors the public Hetzner-style profile that was validated against live mainnet
 traffic:
 
 - `SOF_UDP_BATCH_SIZE=96`
-- `SOF_TVU_SOCKETS=2`
-- `SOF_UDP_RECEIVER_PIN_BY_PORT=true`
+- `SOF_TVU_SOCKETS=4`
+- `SOF_UDP_RECEIVER_PIN_BY_PORT=false`
 - `SOF_GOSSIP_RECEIVER_CHANNEL_CAPACITY=131072`
 - `SOF_GOSSIP_SOCKET_CONSUME_CHANNEL_CAPACITY=65536`
 - `SOF_GOSSIP_RESPONSE_CHANNEL_CAPACITY=65536`

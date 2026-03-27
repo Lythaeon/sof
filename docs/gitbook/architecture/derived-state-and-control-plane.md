@@ -16,6 +16,16 @@ From live shred flow, the runtime can surface:
 That means downstream services can make decisions from local state instead of paying the latency
 and failure cost of routing every check through RPC.
 
+Processed provider mode is different:
+
+- built-in Yellowstone, LaserStream, and websocket adapters are transaction-first
+- they can still drive transaction consumers and recent-blockhash extraction from
+  observed transactions
+- they do not, by themselves, form the full live control-plane surface needed by
+  `sof-tx` adapters
+- `ProviderStreamMode::Generic` is the processed-provider path that can carry
+  richer control-plane updates when a custom producer has them
+
 ## Why `sof-tx` Cares
 
 Direct or hybrid transaction submission only works well when you have timely answers for:
@@ -61,3 +71,27 @@ Derived-state consumers now follow the same broad discipline as plugins:
 
 That split matters because startup hooks are operational, while checkpoint methods define replay
 continuity.
+
+## Lifecycle and Rebuild Semantics
+
+The intended derived-state lifecycle is:
+
+1. consumer `setup`
+2. checkpoint load
+3. retained replay tail and/or configured replay source application
+4. live event application
+5. checkpoint flush on the configured durability boundary
+6. consumer `shutdown`
+
+Persistence guarantees depend on what you configured:
+
+- without a checkpoint store, the consumer is live-only
+- with a checkpoint store, recovery starts from the last durable checkpoint
+- with a retained replay tail, SOF can bridge recent history on top of that checkpoint
+
+Rebuild semantics are explicit too:
+
+- if replay continuity is intact, SOF re-applies retained history and returns to live mode
+- if replay continuity is broken, the consumer is marked unhealthy instead of silently pretending recovery succeeded
+
+That is why derived state is the authoritative state surface and plugins are not.

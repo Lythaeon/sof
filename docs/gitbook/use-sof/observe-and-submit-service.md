@@ -5,6 +5,11 @@ using that same local control plane.
 
 This is the normal SOF product shape for execution services.
 
+This shape only reaches its latency potential when the same process also has early shred
+visibility. In practice that means pairing SOF with direct low-latency validator or peer access,
+or feeding the host from an external shred propagation network. Otherwise the process is still
+well integrated, but it starts from stale visibility.
+
 ## Use This When
 
 - you want fresh local leader and topology state
@@ -21,6 +26,10 @@ You are combining:
 
 That adapter consumes blockhash, leader, and topology events from `sof`, then exposes them through
 the provider traits that `sof-tx` already understands.
+
+That path is complete today in raw-shred and gossip-backed SOF runtimes. Built-in processed
+provider adapters such as Yellowstone, LaserStream, and websocket are transaction-first today, so
+they do not yet form a complete built-in `sof-tx` control-plane source on their own.
 
 ## Minimal Integration Skeleton
 
@@ -84,6 +93,10 @@ The main benefit is freshness:
 - `sof-tx` can use those inputs for direct or hybrid submission decisions
 
 This avoids depending on a separate internal control-plane service for the first version.
+
+The caveat is that "local freshness" still depends on ingress freshness first. SOF removes the
+extra service hop between observation and execution. It does not erase latency that already
+happened before the shreds reached the box.
 
 ## What You Usually Add Next
 

@@ -34,6 +34,7 @@ pub struct SlotLeaderDiff {
 pub struct ShredVerifier {
     known_pubkey_verifiers: Vec<PreparedPubkeyVerifier>,
     slot_leaders: HashMap<u64, [u8; 32]>,
+    unknown_slots: HashMap<u64, Instant>,
     pending_added_slot_leaders: HashMap<u64, [u8; 32]>,
     pending_updated_slot_leaders: HashMap<u64, [u8; 32]>,
     pending_removed_slots: HashSet<u64>,
@@ -54,6 +55,7 @@ impl ShredVerifier {
         Self {
             known_pubkey_verifiers: Vec::new(),
             slot_leaders: HashMap::new(),
+            unknown_slots: HashMap::new(),
             pending_added_slot_leaders: HashMap::new(),
             pending_updated_slot_leaders: HashMap::new(),
             pending_removed_slots: HashSet::new(),
@@ -93,6 +95,7 @@ impl ShredVerifier {
         let mut has_latest = self.has_latest_slot;
         for (slot, pubkey) in leaders {
             let previous = self.slot_leaders.insert(slot, pubkey);
+            let _ = self.unknown_slots.remove(&slot);
             self.record_slot_leader_change(slot, pubkey, previous);
             if !has_latest || slot > latest {
                 latest = slot;
@@ -135,7 +138,12 @@ impl ShredVerifier {
         }
     }
 
-    pub fn verify_packet(&mut self, packet: &[u8], now: Instant) -> VerifyStatus {
+    pub fn verify_packet(
+        &mut self,
+        packet: &[u8],
+        now: Instant,
+        strict_unknown: bool,
+    ) -> VerifyStatus {
         let Some(variant) = parse_variant(packet) else {
             return VerifyStatus::Malformed;
         };
@@ -162,12 +170,31 @@ impl ShredVerifier {
         let had_slot_leader = slot_leader.is_some();
 
         // Unknown-leader retries can be dropped before Merkle work when a slot
-        // leader is still unavailable.
+        // leader is still unavailable. Slot-level backoff matters because each
+        // shred in the same slot has a different signature, so signature-only
+        // caching still repeats this expensive path under live load.
+        if !had_slot_leader
+            && let Some(last_checked) = self.unknown_slots.get(&slot)
+            && now.saturating_duration_since(*last_checked) < self.unknown_retry
+        {
+            return VerifyStatus::UnknownLeader;
+        }
+
         if !had_slot_leader
             && let Some(SignatureCacheEntry::Unknown(last_checked)) =
                 self.signature_cache.get(&signature_bytes)
             && now.saturating_duration_since(last_checked) < self.unknown_retry
         {
+            return VerifyStatus::UnknownLeader;
+        }
+
+        // Under packet-worker pressure, avoid the expensive Merkle + known-pubkey
+        // brute-force path for slots whose leader is still unknown. This keeps
+        // low-confidence shred fan-in from burning CPU while the runloop is behind.
+        if !had_slot_leader && strict_unknown {
+            self.signature_cache
+                .insert(signature_bytes, SignatureCacheEntry::Unknown(now));
+            self.unknown_slots.insert(slot, now);
             return VerifyStatus::UnknownLeader;
         }
 
@@ -222,6 +249,7 @@ impl ShredVerifier {
         if had_slot_leader {
             VerifyStatus::InvalidSignature
         } else {
+            self.unknown_slots.insert(slot, now);
             VerifyStatus::UnknownLeader
         }
     }
@@ -266,6 +294,7 @@ impl ShredVerifier {
 
     fn remember_slot_leader(&mut self, slot: u64, pubkey: [u8; 32]) {
         let previous = self.slot_leaders.insert(slot, pubkey);
+        let _ = self.unknown_slots.remove(&slot);
         self.record_slot_leader_change(slot, pubkey, previous);
         if !self.has_latest_slot || slot > self.latest_slot {
             self.latest_slot = slot;
@@ -314,7 +343,9 @@ impl ShredVerifier {
             let _ = self.pending_added_slot_leaders.remove(&slot);
             let _ = self.pending_updated_slot_leaders.remove(&slot);
             let _ = self.pending_removed_slots.insert(slot);
+            let _ = self.unknown_slots.remove(&slot);
         }
+        self.unknown_slots.retain(|slot, _| *slot >= floor);
     }
 }
 

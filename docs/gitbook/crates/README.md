@@ -28,8 +28,9 @@ Start with [`sof-tx`](sof-tx.md).
 This is the right fit when:
 
 - you already have a blockhash source
-- you already have a leader or TPU routing source
-- you only need transaction construction, routing, and submission
+- you want transaction construction and submission first
+- you may use RPC, Jito, signed-byte submission, or your own external providers
+- direct or TPU-targeted routing is optional, not required
 
 ### Execution service that wants locally observed control-plane state
 

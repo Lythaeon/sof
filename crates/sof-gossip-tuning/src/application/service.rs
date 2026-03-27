@@ -75,7 +75,7 @@ impl GossipTuningService {
                         DEFAULT_RECEIVER_COALESCE_WAIT_MS,
                     ),
                     udp_receiver_core: None,
-                    udp_receiver_pin_by_port: true,
+                    udp_receiver_pin_by_port: false,
                     tvu_receive_sockets: TvuReceiveSocketCount::fixed(VPS_TVU_RECEIVE_SOCKETS),
                     gossip_channel_consume_capacity: QueueCapacity::fixed(
                         VPS_GOSSIP_CHANNEL_CONSUME_CAPACITY,

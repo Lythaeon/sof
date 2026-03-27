@@ -1,7 +1,12 @@
 # `sof-tx`
 
 `sof-tx` is the transaction SDK in the workspace. It is built for services that need predictable
-submit behavior and can benefit from local control-plane signals.
+submit behavior.
+
+It works in two broad shapes:
+
+- standalone, with RPC/Jito/external providers or signed-byte submission
+- paired with `sof` when local control-plane signals should drive direct or hybrid routing
 
 It is not a traffic-ingest runtime. It does not observe shreds, derive slot state, or discover
 leaders by itself.
@@ -200,7 +205,8 @@ path.
 ### `Hybrid`
 
 Use when you want direct leader targeting first with an RPC fallback path. This is the normal
-starting point for latency-sensitive services because it balances speed with operational recovery.
+upgrade path after a service has already proven its RPC or Jito flow and now wants to add
+lower-latency direct routing on top.
 
 ### `JitoOnly`
 
@@ -223,6 +229,10 @@ Two important adapter paths:
 
 - `PluginHostTxProviderAdapter`: live in-process adapter fed by plugin events
 - `DerivedStateTxProviderAdapter`: replayable adapter for restart-safe services
+
+Those adapter paths are complete today with raw-shred or gossip-backed SOF runtimes. Built-in
+processed provider adapters such as Yellowstone, LaserStream, and websocket are transaction-first
+today and do not, by themselves, provide the full `sof-tx` control-plane feed.
 
 That split matters:
 
@@ -250,9 +260,11 @@ in implicit retries.
 ## Recommended Adoption Pattern
 
 1. start with `TxBuilder` and `TxSubmitClient`
-2. wire in RPC transport first
-3. add direct transport and `Hybrid` mode
-4. attach `sof` adapters only after local runtime state is available and measured
+2. wire in RPC transport first, or Jito if that is already the intended execution path
+3. use `submit_signed(...)` when signing and blockhash sourcing already live elsewhere
+4. add direct transport and `Hybrid` mode only after local routing state is available and measured
+5. attach `sof` adapters only when you want locally observed control-plane state to drive those
+   direct or hybrid decisions
 
 ## What To Open In The Repository
 
@@ -266,9 +278,9 @@ If the conceptual docs stop too early for what you need to build, open these nex
 ## Feature Flags
 
 ```toml
-sof-tx = { version = "0.12.0", features = ["sof-adapters"] }
-sof-tx = { version = "0.12.0", features = ["kernel-bypass"] }
-sof-tx = { version = "0.12.0", features = ["jito-grpc"] }
+sof-tx = { version = "0.13.0", features = ["sof-adapters"] }
+sof-tx = { version = "0.13.0", features = ["kernel-bypass"] }
+sof-tx = { version = "0.13.0", features = ["jito-grpc"] }
 ```
 
 ## Good Fit

@@ -1,8 +1,9 @@
 use std::{
+    collections::HashMap,
     io,
     net::SocketAddr,
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -15,7 +16,10 @@ use tokio::{
 };
 
 use crate::{
-    framework::{DerivedStateConsumerRecoveryState, DerivedStateHost, RuntimeExtensionHost},
+    framework::{
+        DerivedStateConsumerRecoveryState, DerivedStateHost, PluginHost, RuntimeExtensionHost,
+    },
+    provider_stream::{ProviderSourceHealthEvent, ProviderSourceHealthStatus},
     runtime_metrics,
 };
 
@@ -35,6 +39,9 @@ pub(crate) struct RuntimeObservabilityHandle {
 struct RuntimeObservabilityState {
     live: AtomicBool,
     ready: AtomicBool,
+    provider_sources: RwLock<HashMap<&'static str, ProviderSourceHealthEvent>>,
+    provider_capability_mode: RwLock<Option<&'static str>>,
+    provider_capability_unsupported_hooks: RwLock<Vec<String>>,
 }
 
 impl RuntimeObservabilityHandle {
@@ -50,23 +57,72 @@ impl RuntimeObservabilityHandle {
         self.inner.ready.store(false, Ordering::Relaxed);
     }
 
+    pub(crate) fn observe_provider_source_health(&self, event: &ProviderSourceHealthEvent) {
+        let Ok(mut sources) = self.inner.provider_sources.write() else {
+            return;
+        };
+        sources.insert(event.source.as_str(), event.clone());
+        let all_healthy = sources
+            .values()
+            .all(|source| matches!(source.status, ProviderSourceHealthStatus::Healthy));
+        self.inner.ready.store(all_healthy, Ordering::Relaxed);
+    }
+
+    pub(crate) fn observe_provider_capability_warning(
+        &self,
+        mode: &'static str,
+        unsupported_hooks: &[String],
+    ) {
+        if let Ok(mut capability_mode) = self.inner.provider_capability_mode.write() {
+            *capability_mode = Some(mode);
+        }
+        if let Ok(mut hooks) = self.inner.provider_capability_unsupported_hooks.write() {
+            hooks.clear();
+            hooks.extend(unsupported_hooks.iter().cloned());
+            hooks.sort();
+            hooks.dedup();
+        }
+    }
+
     fn mark_stopped(&self) {
         self.inner.ready.store(false, Ordering::Relaxed);
         self.inner.live.store(false, Ordering::Relaxed);
     }
 
     fn snapshot(&self) -> RuntimeObservabilitySnapshot {
+        let mut provider_sources = self.inner.provider_sources.read().map_or_else(
+            |_error| Vec::new(),
+            |sources| sources.values().cloned().collect(),
+        );
+        provider_sources.sort_by_key(|event| (event.source.as_str(), event.reason.as_str()));
+        let provider_capability_mode = self
+            .inner
+            .provider_capability_mode
+            .read()
+            .ok()
+            .and_then(|mode| *mode);
+        let provider_capability_unsupported_hooks = self
+            .inner
+            .provider_capability_unsupported_hooks
+            .read()
+            .map_or_else(|_error| Vec::new(), |hooks| hooks.clone());
         RuntimeObservabilitySnapshot {
             live: self.inner.live.load(Ordering::Relaxed),
             ready: self.inner.ready.load(Ordering::Relaxed),
+            provider_sources,
+            provider_capability_mode,
+            provider_capability_unsupported_hooks,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 struct RuntimeObservabilitySnapshot {
     live: bool,
     ready: bool,
+    provider_sources: Vec<ProviderSourceHealthEvent>,
+    provider_capability_mode: Option<&'static str>,
+    provider_capability_unsupported_hooks: Vec<String>,
 }
 
 pub(crate) struct RuntimeObservabilityService {
@@ -79,6 +135,7 @@ pub(crate) struct RuntimeObservabilityService {
 impl RuntimeObservabilityService {
     pub(crate) async fn start(
         bind_addr: SocketAddr,
+        plugin_host: PluginHost,
         extension_host: RuntimeExtensionHost,
         derived_state_host: DerivedStateHost,
     ) -> io::Result<Self> {
@@ -98,12 +155,14 @@ impl RuntimeObservabilityService {
                             break;
                         };
                         let request_handle = service_handle.clone();
+                        let request_plugin_host = plugin_host.clone();
                         let request_extension_host = extension_host.clone();
                         let request_derived_state_host = derived_state_host.clone();
                         tokio::spawn(async move {
                             if let Err(error) = handle_connection(
                                 stream,
                                 request_handle,
+                                request_plugin_host,
                                 request_extension_host,
                                 request_derived_state_host,
                             )
@@ -146,13 +205,14 @@ impl RuntimeObservabilityService {
 async fn handle_connection(
     mut stream: TcpStream,
     handle: RuntimeObservabilityHandle,
+    plugin_host: PluginHost,
     extension_host: RuntimeExtensionHost,
     derived_state_host: DerivedStateHost,
 ) -> io::Result<()> {
     let response = match read_request_path(&mut stream).await? {
         Some(METRICS_PATH) => HttpResponse::ok(
             CONTENT_TYPE_PROMETHEUS,
-            render_metrics(&handle, &extension_host, &derived_state_host),
+            render_metrics(&handle, &plugin_host, &extension_host, &derived_state_host),
         ),
         Some(HEALTH_PATH) => {
             let snapshot = handle.snapshot();
@@ -210,6 +270,7 @@ async fn read_request_path(stream: &mut TcpStream) -> io::Result<Option<&'static
 
 fn render_metrics(
     handle: &RuntimeObservabilityHandle,
+    plugin_host: &PluginHost,
     extension_host: &RuntimeExtensionHost,
     derived_state_host: &DerivedStateHost,
 ) -> String {
@@ -234,6 +295,92 @@ fn render_metrics(
         u8::from(state.ready),
         None,
     );
+    append_metric_family(
+        &mut buffer,
+        "sof_provider_sources_reconnecting",
+        "Provider sources currently reconnecting.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_provider_sources_reconnecting",
+        state
+            .provider_sources
+            .iter()
+            .filter(|event| matches!(event.status, ProviderSourceHealthStatus::Reconnecting))
+            .count(),
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_provider_sources_unhealthy",
+        "Provider sources currently unhealthy.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_provider_sources_unhealthy",
+        state
+            .provider_sources
+            .iter()
+            .filter(|event| matches!(event.status, ProviderSourceHealthStatus::Unhealthy))
+            .count(),
+        None,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_provider_source_status",
+        "Typed provider source health state by source.",
+        PrometheusMetricType::Gauge,
+    );
+    for event in &state.provider_sources {
+        let labels = [
+            ("source", event.source.as_str()),
+            (
+                "status",
+                match event.status {
+                    ProviderSourceHealthStatus::Healthy => "healthy",
+                    ProviderSourceHealthStatus::Reconnecting => "reconnecting",
+                    ProviderSourceHealthStatus::Unhealthy => "unhealthy",
+                },
+            ),
+            ("reason", event.reason.as_str()),
+        ];
+        append_metric_value(
+            &mut buffer,
+            "sof_provider_source_status",
+            1_u8,
+            Some(&labels),
+        );
+    }
+    append_metric_family(
+        &mut buffer,
+        "sof_provider_capability_degraded",
+        "Provider runtime started with unsupported requested hooks under warn policy.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_provider_capability_degraded",
+        u8::from(!state.provider_capability_unsupported_hooks.is_empty()),
+        None,
+    );
+    if let Some(mode) = state.provider_capability_mode {
+        append_metric_family(
+            &mut buffer,
+            "sof_provider_capability_unsupported_hook",
+            "Unsupported requested hook or derived-state feed tolerated under provider warn policy.",
+            PrometheusMetricType::Gauge,
+        );
+        for hook in &state.provider_capability_unsupported_hooks {
+            append_metric_value(
+                &mut buffer,
+                "sof_provider_capability_unsupported_hook",
+                1_u8,
+                Some(&[("mode", mode), ("hook", hook.as_str())]),
+            );
+        }
+    }
 
     let snapshot = runtime_metrics::snapshot();
     append_metric_family(
@@ -1960,6 +2107,140 @@ fn render_metrics(
 
     append_metric_family(
         &mut buffer,
+        "sof_plugin_general_dropped_events_total",
+        "Non-transaction plugin events dropped by the bounded plugin dispatcher.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_plugin_general_queue_depth",
+        "Current non-transaction plugin dispatch queue depth.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_plugin_general_max_queue_depth",
+        "Maximum non-transaction plugin dispatch queue depth observed since startup.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_plugin_transaction_critical_dropped_events_total",
+        "Critical accepted-transaction plugin events dropped by bounded dispatch lanes.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_plugin_transaction_background_dropped_events_total",
+        "Background accepted-transaction plugin events dropped by bounded dispatch lanes.",
+        PrometheusMetricType::Counter,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_plugin_transaction_inline_critical_queue_depth",
+        "Current inline-critical accepted-transaction dispatch queue depth.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_plugin_transaction_inline_critical_max_queue_depth",
+        "Maximum inline-critical accepted-transaction dispatch queue depth observed since startup.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_plugin_transaction_critical_queue_depth",
+        "Current aggregate critical accepted-transaction dispatch queue depth.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_plugin_transaction_critical_max_queue_depth",
+        "Maximum aggregate critical accepted-transaction dispatch queue depth observed since startup.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_plugin_transaction_background_queue_depth",
+        "Current aggregate background accepted-transaction dispatch queue depth.",
+        PrometheusMetricType::Gauge,
+    );
+    append_metric_family(
+        &mut buffer,
+        "sof_plugin_transaction_background_max_queue_depth",
+        "Maximum aggregate background accepted-transaction dispatch queue depth observed since startup.",
+        PrometheusMetricType::Gauge,
+    );
+    let tx_queue_metrics = plugin_host.transaction_queue_metrics();
+    append_metric_value(
+        &mut buffer,
+        "sof_plugin_general_dropped_events_total",
+        plugin_host.general_dropped_event_count(),
+        None,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_plugin_general_queue_depth",
+        plugin_host.general_queue_depth(),
+        None,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_plugin_general_max_queue_depth",
+        plugin_host.general_max_queue_depth(),
+        None,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_plugin_transaction_critical_dropped_events_total",
+        plugin_host.transaction_dropped_event_count(),
+        None,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_plugin_transaction_background_dropped_events_total",
+        plugin_host.background_transaction_dropped_event_count(),
+        None,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_plugin_transaction_inline_critical_queue_depth",
+        tx_queue_metrics.inline_critical_queue_depth,
+        None,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_plugin_transaction_inline_critical_max_queue_depth",
+        tx_queue_metrics.inline_critical_max_queue_depth,
+        None,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_plugin_transaction_critical_queue_depth",
+        tx_queue_metrics.critical_queue_depth,
+        None,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_plugin_transaction_critical_max_queue_depth",
+        tx_queue_metrics.critical_max_queue_depth,
+        None,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_plugin_transaction_background_queue_depth",
+        tx_queue_metrics.background_queue_depth,
+        None,
+    );
+    append_metric_value(
+        &mut buffer,
+        "sof_plugin_transaction_background_max_queue_depth",
+        tx_queue_metrics.background_max_queue_depth,
+        None,
+    );
+
+    append_metric_family(
+        &mut buffer,
         "sof_runtime_extension_dropped_events_total",
         "Runtime extension events dropped by dispatcher.",
         PrometheusMetricType::Counter,
@@ -2429,6 +2710,7 @@ mod tests {
         handle.mark_ready();
         let metrics = render_metrics(
             &handle,
+            &PluginHost::builder().build(),
             &RuntimeExtensionHost::builder().build(),
             &DerivedStateHost::builder().build(),
         );
@@ -2437,16 +2719,68 @@ mod tests {
         assert!(metrics.contains("sof_runtime_ready 1"));
         assert!(metrics.contains("sof_ingest_packets_seen_total "));
         assert!(metrics.contains("sof_packet_worker_queue_depth "));
+        assert!(metrics.contains("sof_plugin_general_queue_depth "));
+        assert!(metrics.contains("sof_plugin_transaction_critical_queue_depth "));
         assert!(metrics.contains("sof_latest_shred_age_ms "));
         assert!(metrics.contains("sof_udp_relay_forwarded_packets_total "));
         assert!(metrics.contains("sof_repair_requests_total "));
         assert!(metrics.contains("sof_inline_transaction_plugin_source_latency_samples_total"));
     }
 
+    #[test]
+    fn metrics_include_provider_source_health() {
+        let handle = RuntimeObservabilityHandle::default();
+        handle.mark_live();
+        handle.observe_provider_source_health(&ProviderSourceHealthEvent {
+            source: crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
+            status: ProviderSourceHealthStatus::Reconnecting,
+            reason: crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
+            message: "upstream stalled".to_owned(),
+        });
+        let metrics = render_metrics(
+            &handle,
+            &PluginHost::builder().build(),
+            &RuntimeExtensionHost::builder().build(),
+            &DerivedStateHost::builder().build(),
+        );
+
+        assert!(metrics.contains("sof_runtime_ready 0"));
+        assert!(metrics.contains("sof_provider_sources_reconnecting 1"));
+        assert!(metrics.contains("sof_provider_sources_unhealthy 0"));
+        assert!(metrics.contains(
+            "sof_provider_source_status{source=\"yellowstone_grpc\",status=\"reconnecting\",reason=\"upstream_protocol_failure\"} 1"
+        ));
+    }
+
+    #[test]
+    fn metrics_include_provider_capability_warning_state() {
+        let handle = RuntimeObservabilityHandle::default();
+        handle.mark_live();
+        handle.observe_provider_capability_warning(
+            "generic_provider",
+            &[String::from("on_dataset"), String::from("on_raw_packet")],
+        );
+        let metrics = render_metrics(
+            &handle,
+            &PluginHost::builder().build(),
+            &RuntimeExtensionHost::builder().build(),
+            &DerivedStateHost::builder().build(),
+        );
+
+        assert!(metrics.contains("sof_provider_capability_degraded 1"));
+        assert!(metrics.contains(
+            "sof_provider_capability_unsupported_hook{mode=\"generic_provider\",hook=\"on_dataset\"} 1"
+        ));
+        assert!(metrics.contains(
+            "sof_provider_capability_unsupported_hook{mode=\"generic_provider\",hook=\"on_raw_packet\"} 1"
+        ));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn service_serves_health_and_metrics_endpoints() {
         let service = RuntimeObservabilityService::start(
             "127.0.0.1:0".parse().expect("valid bind addr"),
+            PluginHost::builder().build(),
             RuntimeExtensionHost::builder().build(),
             DerivedStateHost::builder().build(),
         )

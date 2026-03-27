@@ -74,7 +74,8 @@ pub(crate) async fn start_receiver(
                     .unwrap_or_else(|| "-".to_owned()),
                 "gossip runtime port plan initialized"
             );
-            let prioritized_entrypoints = prioritize_gossip_entrypoints(&gossip_entrypoints).await;
+            let prioritized_entrypoints =
+                prioritize_gossip_entrypoints(&gossip_entrypoints, None).await;
             if log_startup_steps {
                 tracing::info!(
                     step = "gossip_bootstrap_prioritized",
@@ -131,10 +132,11 @@ pub(crate) async fn start_receiver(
                         .await;
                         let discovered_peers = runtime.cluster_info.all_peers().len();
                         #[cfg(feature = "kernel-bypass")]
-                        let stabilized_by_peers = _control_plane_only_bootstrap
+                        let stabilized_by_peers = stabilization.packets_seen > 0
                             && discovered_peers >= bootstrap_stabilize_min_peers;
                         #[cfg(not(feature = "kernel-bypass"))]
-                        let stabilized_by_peers = false;
+                        let stabilized_by_peers = stabilization.packets_seen > 0
+                            && discovered_peers >= bootstrap_stabilize_min_peers;
                         let accepted = stabilization.stabilized || stabilized_by_peers;
                         if !accepted {
                             let candidate_receivers = gossip_receivers.len();

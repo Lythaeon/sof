@@ -1,12 +1,85 @@
+#![allow(clippy::missing_docs_in_private_items)]
+
+use agave_transaction_view::{
+    transaction_data::TransactionData, transaction_view::SanitizedTransactionView,
+};
 use async_trait::async_trait;
+use solana_pubkey::Pubkey;
+use solana_signature::Signature;
+use std::{cell::RefCell, sync::Arc};
 use thiserror::Error;
 
 use crate::framework::events::{
     AccountTouchEvent, AccountTouchEventRef, ClusterTopologyEvent, DatasetEvent,
     LeaderScheduleEvent, ObservedRecentBlockhashEvent, RawPacketEvent, ReorgEvent, ShredEvent,
     SlotStatusEvent, TransactionBatchEvent, TransactionEvent, TransactionEventRef,
-    TransactionViewBatchEvent,
+    TransactionLogEvent, TransactionViewBatchEvent,
 };
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct CachedTransactionEventKey {
+    slot: u64,
+    signature: Option<Signature>,
+    tx_ptr: *const solana_transaction::versioned::VersionedTransaction,
+    kind: crate::event::TxKind,
+}
+
+struct CachedTransactionEvent {
+    key: CachedTransactionEventKey,
+    event: TransactionEvent,
+}
+
+thread_local! {
+    static CACHED_TRANSACTION_EVENT: RefCell<Option<CachedTransactionEvent>> = const { RefCell::new(None) };
+}
+
+const fn cached_transaction_event_key(
+    event: &TransactionEventRef<'_>,
+) -> CachedTransactionEventKey {
+    CachedTransactionEventKey {
+        slot: event.slot,
+        signature: event.signature,
+        tx_ptr: event.tx as *const _,
+        kind: event.kind,
+    }
+}
+
+fn with_cached_transaction_event<R>(
+    event: &TransactionEventRef<'_>,
+    f: impl FnOnce(&TransactionEvent) -> R,
+) -> R {
+    let key = cached_transaction_event_key(event);
+    CACHED_TRANSACTION_EVENT.with(|cached| {
+        let mut cached = cached.borrow_mut();
+        if !cached
+            .as_ref()
+            .is_some_and(|cached_event| cached_event.key == key)
+        {
+            *cached = Some(CachedTransactionEvent {
+                key,
+                event: event.to_owned(),
+            });
+        }
+        if let Some(cached_event) = cached.as_ref() {
+            f(&cached_event.event)
+        } else {
+            let owned = event.to_owned();
+            f(&owned)
+        }
+    })
+}
+
+pub(crate) fn clone_cached_transaction_event(
+    event: &TransactionEventRef<'_>,
+) -> Option<TransactionEvent> {
+    let key = cached_transaction_event_key(event);
+    CACHED_TRANSACTION_EVENT.with(|cached| {
+        cached
+            .borrow()
+            .as_ref()
+            .and_then(|cached_event| (cached_event.key == key).then(|| cached_event.event.clone()))
+    })
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 /// Priority class for accepted transaction callbacks.
@@ -17,6 +90,199 @@ pub enum TransactionInterest {
     Background,
     /// HFT-critical transaction visibility that should stay on the fast lane.
     Critical,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+/// Compiled transaction classifier for common signature/account-key matching cases.
+///
+/// This lets SOF classify transactions on the hot path without calling the
+/// plugin's custom matcher for simple "does this transaction mention these
+/// keys/signature?" cases.
+///
+/// On the inline path, this is also the preferred way to reject irrelevant
+/// traffic. When every in-scope inline transaction plugin uses
+/// [`ObserverPlugin::transaction_prefilter`] and all matching prefilters return
+/// [`TransactionInterest::Ignore`], SOF can skip full owned
+/// `VersionedTransaction` decode for that transaction entirely.
+///
+/// Matching is performed against static message account keys and referenced
+/// address-table account keys. Loaded lookup addresses are not available on
+/// SOF's external shred path, so they are intentionally not part of this
+/// matcher.
+///
+/// # Examples
+///
+/// ```rust
+/// use sof::framework::{TransactionInterest, TransactionPrefilter};
+/// use solana_pubkey::Pubkey;
+///
+/// let pool = Pubkey::new_unique();
+/// let program = Pubkey::new_unique();
+///
+/// let filter = TransactionPrefilter::new(TransactionInterest::Critical)
+///     .with_account_required([pool, program]);
+///
+/// assert_eq!(filter.matched_interest(), TransactionInterest::Critical);
+/// ```
+pub struct TransactionPrefilter {
+    matched_interest: TransactionInterest,
+    signature: Option<Signature>,
+    account_include: Arc<[Pubkey]>,
+    account_exclude: Arc<[Pubkey]>,
+    account_required: Arc<[Pubkey]>,
+}
+
+impl TransactionPrefilter {
+    /// Creates an empty prefilter that returns the provided interest on match.
+    #[must_use]
+    pub fn new(matched_interest: TransactionInterest) -> Self {
+        Self {
+            matched_interest,
+            signature: None,
+            account_include: Arc::new([]),
+            account_exclude: Arc::new([]),
+            account_required: Arc::new([]),
+        }
+    }
+
+    /// Returns the interest emitted when this filter matches.
+    #[must_use]
+    pub const fn matched_interest(&self) -> TransactionInterest {
+        self.matched_interest
+    }
+
+    /// Requires one exact transaction signature.
+    #[must_use]
+    pub const fn with_signature(mut self, signature: Signature) -> Self {
+        self.signature = Some(signature);
+        self
+    }
+
+    /// Requires at least one listed account key to be present.
+    #[must_use]
+    pub fn with_account_include<I>(mut self, keys: I) -> Self
+    where
+        I: IntoIterator<Item = Pubkey>,
+    {
+        self.account_include = Arc::from(keys.into_iter().collect::<Vec<_>>());
+        self
+    }
+
+    /// Rejects transactions that mention any listed account key.
+    #[must_use]
+    pub fn with_account_exclude<I>(mut self, keys: I) -> Self
+    where
+        I: IntoIterator<Item = Pubkey>,
+    {
+        self.account_exclude = Arc::from(keys.into_iter().collect::<Vec<_>>());
+        self
+    }
+
+    /// Requires all listed account keys to be present.
+    #[must_use]
+    pub fn with_account_required<I>(mut self, keys: I) -> Self
+    where
+        I: IntoIterator<Item = Pubkey>,
+    {
+        self.account_required = Arc::from(keys.into_iter().collect::<Vec<_>>());
+        self
+    }
+
+    /// Returns the matched interest or [`TransactionInterest::Ignore`].
+    #[must_use]
+    pub fn classify_ref(&self, event: &TransactionEventRef<'_>) -> TransactionInterest {
+        if let Some(signature) = self.signature
+            && event.signature != Some(signature)
+        {
+            return TransactionInterest::Ignore;
+        }
+        if !self.account_include.is_empty()
+            && !self
+                .account_include
+                .iter()
+                .copied()
+                .any(|key| transaction_mentions_account_key(event.tx, key))
+        {
+            return TransactionInterest::Ignore;
+        }
+        if self
+            .account_exclude
+            .iter()
+            .copied()
+            .any(|key| transaction_mentions_account_key(event.tx, key))
+        {
+            return TransactionInterest::Ignore;
+        }
+        if !self
+            .account_required
+            .iter()
+            .copied()
+            .all(|key| transaction_mentions_account_key(event.tx, key))
+        {
+            return TransactionInterest::Ignore;
+        }
+        self.matched_interest
+    }
+
+    /// Returns the matched interest or [`TransactionInterest::Ignore`] from one transaction view.
+    #[must_use]
+    pub(crate) fn classify_view_ref<D: TransactionData>(
+        &self,
+        view: &SanitizedTransactionView<D>,
+    ) -> TransactionInterest {
+        if let Some(signature) = self.signature
+            && view.signatures().first().copied() != Some(signature)
+        {
+            return TransactionInterest::Ignore;
+        }
+        if !self.account_include.is_empty()
+            && !self
+                .account_include
+                .iter()
+                .copied()
+                .any(|key| transaction_view_mentions_account_key(view, key))
+        {
+            return TransactionInterest::Ignore;
+        }
+        if self
+            .account_exclude
+            .iter()
+            .copied()
+            .any(|key| transaction_view_mentions_account_key(view, key))
+        {
+            return TransactionInterest::Ignore;
+        }
+        if !self
+            .account_required
+            .iter()
+            .copied()
+            .all(|key| transaction_view_mentions_account_key(view, key))
+        {
+            return TransactionInterest::Ignore;
+        }
+        self.matched_interest
+    }
+}
+
+fn transaction_mentions_account_key(
+    tx: &solana_transaction::versioned::VersionedTransaction,
+    key: Pubkey,
+) -> bool {
+    tx.message.static_account_keys().contains(&key)
+        || tx
+            .message
+            .address_table_lookups()
+            .is_some_and(|lookups| lookups.iter().any(|lookup| lookup.account_key == key))
+}
+
+fn transaction_view_mentions_account_key<D: TransactionData>(
+    view: &SanitizedTransactionView<D>,
+    key: Pubkey,
+) -> bool {
+    view.static_account_keys().contains(&key)
+        || view
+            .address_table_lookup_iter()
+            .any(|lookup| *lookup.account_key == key)
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -44,20 +310,59 @@ pub enum TransactionDispatchMode {
     Inline,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+/// Commitment selector applied to transaction-family plugin hooks.
+pub enum TransactionCommitmentSelector {
+    /// Deliver transactions at or above one minimum commitment.
+    AtLeast(crate::event::TxCommitmentStatus),
+    /// Deliver transactions only at one exact commitment.
+    Only(crate::event::TxCommitmentStatus),
+}
+
+impl Default for TransactionCommitmentSelector {
+    fn default() -> Self {
+        Self::AtLeast(crate::event::TxCommitmentStatus::Processed)
+    }
+}
+
+impl TransactionCommitmentSelector {
+    /// Returns true when one transaction event should be delivered under this selector.
+    #[must_use]
+    pub fn matches(self, commitment_status: crate::event::TxCommitmentStatus) -> bool {
+        match self {
+            Self::AtLeast(minimum) => commitment_status.satisfies_minimum(minimum),
+            Self::Only(expected) => commitment_status == expected,
+        }
+    }
+
+    /// Returns the lowest commitment this selector can ever accept.
+    #[must_use]
+    pub const fn minimum_required(self) -> crate::event::TxCommitmentStatus {
+        match self {
+            Self::AtLeast(minimum) | Self::Only(minimum) => minimum,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 /// Static hook subscriptions requested by one plugin during host construction.
 ///
 /// # Examples
 ///
 /// ```rust
-/// use sof::framework::{PluginConfig, TransactionDispatchMode};
+/// use sof::framework::{PluginConfig, TransactionDispatchMode, TxCommitmentStatus};
 ///
 /// let config = PluginConfig::new()
 ///     .with_transaction_mode(TransactionDispatchMode::Inline)
+///     .at_commitment(TxCommitmentStatus::Confirmed)
 ///     .with_recent_blockhash()
 ///     .with_leader_schedule();
 ///
 /// assert!(config.transaction);
+/// assert_eq!(
+///     config.transaction_commitment,
+///     sof::framework::TransactionCommitmentSelector::AtLeast(TxCommitmentStatus::Confirmed)
+/// );
 /// assert!(config.recent_blockhash);
 /// assert!(config.leader_schedule);
 /// ```
@@ -70,6 +375,10 @@ pub struct PluginConfig {
     pub dataset: bool,
     /// Enables `on_transaction`.
     pub transaction: bool,
+    /// Enables `on_transaction_log`.
+    pub transaction_log: bool,
+    /// Commitment selector applied to transaction-family hooks.
+    pub transaction_commitment: TransactionCommitmentSelector,
     /// Requested delivery path for `on_transaction`.
     pub transaction_dispatch_mode: TransactionDispatchMode,
     /// Enables `on_transaction_batch`.
@@ -136,6 +445,33 @@ impl PluginConfig {
     #[must_use]
     pub const fn with_transaction(mut self) -> Self {
         self.transaction = true;
+        self
+    }
+
+    /// Sets the minimum commitment required before transaction-family hooks are delivered.
+    ///
+    /// This applies uniformly to:
+    /// - `on_transaction`
+    /// - `on_transaction_log`
+    /// - `on_transaction_batch`
+    /// - `on_transaction_view_batch`
+    ///
+    /// If you do not call [`Self::at_commitment`] or
+    /// [`Self::only_at_commitment`], the default is
+    /// `AtLeast(TxCommitmentStatus::Processed)`.
+    #[must_use]
+    pub const fn at_commitment(mut self, commitment: crate::event::TxCommitmentStatus) -> Self {
+        self.transaction_commitment = TransactionCommitmentSelector::AtLeast(commitment);
+        self
+    }
+
+    /// Delivers transaction-family hooks only at one exact commitment.
+    #[must_use]
+    pub const fn only_at_commitment(
+        mut self,
+        commitment: crate::event::TxCommitmentStatus,
+    ) -> Self {
+        self.transaction_commitment = TransactionCommitmentSelector::Only(commitment);
         self
     }
 
@@ -350,8 +686,8 @@ pub trait ObserverPlugin: Send + Sync + 'static {
     ///
     /// Plugins that only need borrowed fields should prefer this hook over
     /// [`Self::accepts_transaction`].
-    fn accepts_transaction_ref(&self, event: TransactionEventRef<'_>) -> bool {
-        self.accepts_transaction(&event.to_owned())
+    fn accepts_transaction_ref(&self, event: &TransactionEventRef<'_>) -> bool {
+        with_cached_transaction_event(event, |owned| self.accepts_transaction(owned))
     }
 
     /// Returns transaction-interest priority for one decoded transaction callback.
@@ -373,8 +709,22 @@ pub trait ObserverPlugin: Send + Sync + 'static {
     ///
     /// Priority-sensitive plugins should implement this hook directly so the
     /// dataset hot path can classify traffic without allocating.
-    fn transaction_interest_ref(&self, event: TransactionEventRef<'_>) -> TransactionInterest {
-        self.transaction_interest(&event.to_owned())
+    fn transaction_interest_ref(&self, event: &TransactionEventRef<'_>) -> TransactionInterest {
+        with_cached_transaction_event(event, |owned| self.transaction_interest(owned))
+    }
+
+    /// Returns one compiled hot-path transaction matcher when the plugin uses
+    /// only common signature/account-key classification rules.
+    ///
+    /// When this is present, SOF can classify transactions without calling the
+    /// plugin's custom borrowed classifier on the hot path.
+    ///
+    /// Prefer this over [`Self::transaction_interest_ref`] when the plugin only
+    /// needs exact signature matching or static/account-lookup key presence
+    /// checks. On the inline path, a prefilter-backed miss can let SOF skip full
+    /// owned transaction decode for that tx.
+    fn transaction_prefilter(&self) -> Option<&TransactionPrefilter> {
+        None
     }
 
     /// Called for each decoded transaction emitted from a completed contiguous data range.
@@ -383,6 +733,15 @@ pub trait ObserverPlugin: Send + Sync + 'static {
     /// transaction delivery receive this hook from the completed-dataset boundary even when
     /// other dataset consumers still continue on the dataset-worker path.
     async fn on_transaction(&self, _event: &TransactionEvent) {}
+
+    /// Called for one websocket/provider log notification that does not carry a
+    /// full decoded transaction object.
+    async fn on_transaction_log(&self, _event: &TransactionLogEvent) {}
+
+    /// Returns true when this plugin wants a specific transaction-log callback.
+    fn accepts_transaction_log(&self, _event: &TransactionLogEvent) -> bool {
+        true
+    }
 
     /// Called once per completed dataset with all decoded transactions in dataset order.
     ///
@@ -415,7 +774,7 @@ pub trait ObserverPlugin: Send + Sync + 'static {
     ///
     /// Override this to reject irrelevant account-touch callbacks before the
     /// runtime allocates owned account-key vectors.
-    fn accepts_account_touch_ref(&self, _event: AccountTouchEventRef<'_>) -> bool {
+    fn accepts_account_touch_ref(&self, _event: &AccountTouchEventRef<'_>) -> bool {
         true
     }
 
