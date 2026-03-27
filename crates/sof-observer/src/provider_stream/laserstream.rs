@@ -1092,6 +1092,7 @@ mod tests {
         let transaction =
             transaction.ok_or(LaserStreamError::Convert("missing transaction payload"))?;
         let signature = Signature::try_from(transaction.signature.as_slice())
+            .map(crate::framework::signature_bytes)
             .map(Some)
             .map_err(|_error| LaserStreamError::Convert("invalid signature"))?;
         let tx = convert_transaction(

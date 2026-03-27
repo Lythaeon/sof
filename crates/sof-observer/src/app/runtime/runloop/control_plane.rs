@@ -65,7 +65,7 @@ impl ClusterTopologyTracker {
 
         sort_cluster_nodes(&mut added_nodes);
         sort_cluster_nodes(&mut updated_nodes);
-        removed_pubkeys.sort_unstable_by_key(crate::framework::PubkeyBytes::to_bytes);
+        removed_pubkeys.sort_unstable_by_key(|pubkey| pubkey.into_array());
 
         let emit_snapshot = self
             .last_snapshot_at
@@ -143,10 +143,10 @@ pub(super) fn emit_slot_leader_diff_event(
     sort_leader_entries(&mut updated_leaders);
     removed_slots.sort_unstable();
     for entry in &added_leaders {
-        let _ = emitted_slot_leaders.insert(entry.slot, entry.leader.to_bytes());
+        let _ = emitted_slot_leaders.insert(entry.slot, entry.leader.into_array());
     }
     for entry in &updated_leaders {
-        let _ = emitted_slot_leaders.insert(entry.slot, entry.leader.to_bytes());
+        let _ = emitted_slot_leaders.insert(entry.slot, entry.leader.into_array());
     }
     for slot in &removed_slots {
         let _ = emitted_slot_leaders.remove(slot);
@@ -240,7 +240,7 @@ fn cluster_node_info_from_contact(contact_info: &ContactInfo) -> ClusterNodeInfo
 
 #[cfg(feature = "gossip-bootstrap")]
 fn sort_cluster_nodes(nodes: &mut [ClusterNodeInfo]) {
-    nodes.sort_unstable_by_key(|node| node.pubkey.to_bytes());
+    nodes.sort_unstable_by_key(|node| node.pubkey.into_array());
 }
 
 #[cfg(feature = "gossip-bootstrap")]

@@ -514,7 +514,7 @@ pub(crate) fn signature_bytes_opt(
 
 /// Converts one Solana pubkey into the public SOF-owned wrapper.
 #[must_use]
-pub(crate) fn pubkey_bytes(value: solana_pubkey::Pubkey) -> PubkeyBytes {
+pub(crate) const fn pubkey_bytes(value: solana_pubkey::Pubkey) -> PubkeyBytes {
     PubkeyBytes::from_solana(value)
 }
 

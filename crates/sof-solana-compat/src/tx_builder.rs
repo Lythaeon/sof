@@ -253,6 +253,7 @@ impl TxBuilder {
 /// Borrowed signer reference for Solana-coupled call sites.
 #[derive(Clone, Copy)]
 pub struct SignerRef<'signer> {
+    /// Borrowed signer trait object.
     signer: &'signer dyn Signer,
 }
 

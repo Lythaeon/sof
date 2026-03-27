@@ -936,6 +936,7 @@ mod tests {
         let transaction =
             transaction.ok_or(YellowstoneGrpcError::Convert("missing transaction payload"))?;
         let signature = Signature::try_from(transaction.signature.as_slice())
+            .map(crate::framework::signature_bytes)
             .map(Some)
             .map_err(|_error| YellowstoneGrpcError::Convert("invalid signature"))?;
         let tx = {

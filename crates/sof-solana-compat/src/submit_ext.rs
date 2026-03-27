@@ -105,7 +105,7 @@ impl TxSubmitClientSolanaExt for sof_tx::TxSubmitClient {
             .map_err(|source| SolanaCompatSubmitError::Submit {
                 source: sof_tx::SubmitError::Rpc { source },
             })?
-            .ok_or_else(|| SolanaCompatSubmitError::Submit {
+            .ok_or(SolanaCompatSubmitError::Submit {
                 source: sof_tx::SubmitError::MissingRecentBlockhash,
             })?;
         let tx = builder

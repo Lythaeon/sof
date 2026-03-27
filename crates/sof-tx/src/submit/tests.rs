@@ -406,6 +406,8 @@ async fn rpc_only_constructor_uses_rpc_for_blockhash_and_submit() {
     let client = TxSubmitClient::rpc_only(format!("http://{addr}"));
     assert!(client.is_ok());
     let mut client = client.unwrap_or_else(|error| panic!("{error}"));
+    let refreshed = client.refresh_latest_blockhash_bytes().await;
+    assert_eq!(refreshed, Ok(Some([31_u8; 32])));
 
     let payer = Keypair::new();
     let recipient = Keypair::new();
@@ -474,6 +476,8 @@ async fn builder_rpc_defaults_uses_rpc_for_blockhash_and_submit() {
     let built = TxSubmitClient::builder().with_rpc_defaults(format!("http://{addr}"));
     assert!(built.is_ok());
     let mut client = built.unwrap_or_else(|error| panic!("{error}")).build();
+    let refreshed = client.refresh_latest_blockhash_bytes().await;
+    assert_eq!(refreshed, Ok(Some([41_u8; 32])));
 
     let payer = Keypair::new();
     let recipient = Keypair::new();

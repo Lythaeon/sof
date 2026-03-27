@@ -25,7 +25,7 @@ use tokio_tungstenite::{
 
 use crate::{
     event::TxCommitmentStatus,
-    framework::{TransactionEvent, signature_bytes, signature_bytes_opt},
+    framework::{TransactionEvent, signature_bytes_opt},
     provider_stream::{
         ProviderCommitmentWatermarks, ProviderSourceHealthEvent, ProviderSourceHealthReason,
         ProviderSourceHealthStatus, ProviderSourceId, ProviderStreamSender, ProviderStreamUpdate,

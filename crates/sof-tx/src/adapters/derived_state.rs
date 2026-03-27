@@ -367,6 +367,7 @@ mod tests {
         DerivedStateFeedEvent, FeedSequence, FeedSessionId, FeedWatermarks, LeaderScheduleEntry,
         LeaderScheduleEvent, ObservedRecentBlockhashEvent, SlotStatusChangedEvent,
     };
+    use sof_types::PubkeyBytes;
     use solana_pubkey::Pubkey;
 
     use super::*;
@@ -375,7 +376,7 @@ mod tests {
         SocketAddr::from(([127, 0, 0, 1], port))
     }
 
-    fn node(pubkey: Pubkey, tpu_port: u16) -> ClusterNodeInfo {
+    fn node(pubkey: PubkeyBytes, tpu_port: u16) -> ClusterNodeInfo {
         ClusterNodeInfo {
             pubkey,
             wallclock: 0,
@@ -450,8 +451,8 @@ mod tests {
     #[test]
     fn derived_state_adapter_applies_replayable_control_plane_events() {
         let mut adapter = DerivedStateTxProviderAdapter::default();
-        let leader_a = Pubkey::new_unique();
-        let leader_b = Pubkey::new_unique();
+        let leader_a: PubkeyBytes = Pubkey::new_unique().into();
+        let leader_b: PubkeyBytes = Pubkey::new_unique().into();
 
         must(
             adapter.apply(&envelope(DerivedStateFeedEvent::ClusterTopologyChanged(
@@ -520,7 +521,7 @@ mod tests {
     #[test]
     fn derived_state_adapter_snapshot_round_trip_restores_state() {
         let mut adapter = DerivedStateTxProviderAdapter::default();
-        let leader = Pubkey::new_unique();
+        let leader: PubkeyBytes = Pubkey::new_unique().into();
         must(
             adapter.apply(&envelope(DerivedStateFeedEvent::ClusterTopologyChanged(
                 ClusterTopologyEvent {
@@ -563,7 +564,7 @@ mod tests {
     #[test]
     fn derived_state_adapter_persists_and_restores_checkpointed_snapshot() {
         let checkpoint_path = unique_temp_path("derived-state-adapter-checkpoint");
-        let leader = Pubkey::new_unique();
+        let leader: PubkeyBytes = Pubkey::new_unique().into();
         let mut adapter = DerivedStateTxProviderAdapter::with_checkpoint_path(
             DerivedStateTxProviderAdapterConfig::default(),
             &checkpoint_path,

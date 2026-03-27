@@ -2,7 +2,9 @@
 
 //! Explicit Solana-coupled compatibility layer for `sof` and `sof-tx`.
 
+/// Solana-native submit helpers layered on top of `sof-tx`.
 mod submit_ext;
+/// Solana-native transaction builder and signing helpers.
 mod tx_builder;
 
 pub use sof_tx;

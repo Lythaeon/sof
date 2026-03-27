@@ -87,7 +87,7 @@ impl PubkeyBytes {
 
     /// Converts this SOF-owned wrapper into one Solana pubkey.
     #[must_use]
-    pub fn to_solana(self) -> solana_pubkey::Pubkey {
+    pub const fn to_solana(self) -> solana_pubkey::Pubkey {
         solana_pubkey::Pubkey::new_from_array(self.into_array())
     }
 }
