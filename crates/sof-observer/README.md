@@ -48,39 +48,28 @@ That is also why SOF tries to keep semantics consistent across ingress modes. Th
 developer writes one plugin/runtime consumer model while SOF owns the provider-specific runtime
 plumbing and performance discipline underneath it.
 
-That performance claim is intentionally scoped: on the validated release fixtures on this branch,
-no regression was observed on ingest-critical runtime/provider paths, and most of those paths were
-net-positive against the older baseline implementations.
+That performance claim is intentionally scoped: on the validated release fixtures, no regression
+was observed on ingest-critical runtime/provider paths, and most of those paths were net-positive
+against the older baseline implementations.
 
-That optimization work is hypothesis-driven rather than intuitive. The normal loop is:
+The important part is that SOF got there incrementally:
 
-- identify a concrete suspected bottleneck
-- capture a baseline
-- change one thing
-- re-run release-fixture A/B checks, `perf`, and runtime metrics
-- keep only the changes that measurably improve the path
+- earlier releases reduced packet churn, dispatch overhead, allocator pressure, and plugin fanout
+- `0.12.0` tightened inline transaction visibility and improved validated VPS latency from
+  `59.978 / 8.007 / 6.415 ms` to `44.929 / 6.593 / 5.370 ms` for
+  `first_shred / last_required_shred / ready -> plugin`
+- `0.13.0` added the densest provider/runtime perf slice so far, including:
+  - provider transaction-kind classification: `34112us -> 4487us` (`~7.6x`)
+  - provider transaction dispatch path: `39157us -> 5751us` (`~6.8x`)
+  - provider serialized-ignore path: `42422us -> 23760us` (`~44%` faster)
+  - websocket full-transaction parse path: `162560us -> 133309us` (`~18%` faster)
 
-So SOF's performance claim is not "this should help." It is "this was tested and kept because it
-did help."
+SOF keeps those wins only when measurement proves them. The normal loop is: identify a suspected
+bottleneck, capture a baseline, change one thing, re-run A/B checks plus `perf` and runtime
+metrics, then keep the change only if the path is measurably better.
 
-That work is cumulative across releases, and `0.13.0` carried the biggest single concentration of
-measured runtime/provider optimizations so far.
-
-Concrete examples from the measured release fixtures on that line:
-
-- provider transaction-kind classification: `34112us -> 4487us` (`~87%` faster)
-- provider serialized-ignore path: `42422us -> 23760us` (`~44%` faster)
-- websocket full-transaction parse path: `162560us -> 133309us` (`~18%` faster)
-- provider transaction dispatch path: `39157us -> 5751us` (`~85%` faster)
-
-Those results came from concrete changes, not generic cleanup:
-
-- redundant work removed from the runtime path
-- early fast paths added to avoid unnecessary downstream work
-- lower-copy and lower-allocation provider handling
-- reduced instruction count on validated hot paths
-- lower branch churn and, where measurable, better cache behavior
-- hardening work kept only when it did not erase the primary ingest/runtime gains
+The detailed performance history and methodology are in
+[`docs/gitbook/use-sof/why-sof-exists.md`](../../docs/gitbook/use-sof/why-sof-exists.md).
 
 ## Plugin Contract
 

@@ -64,9 +64,6 @@ The same honesty applies to performance claims. SOF treats optimization as measu
 - test one change at a time
 - keep only the changes that survive A/B validation
 
-In practice that has meant:
-
-- removing redundant work from hot paths
-- adding fast paths so traffic can exit before deeper processing when appropriate
-- cutting copies and allocations where the runtime can safely do so
-- reducing instructions, branching, and sometimes cache churn for the same work
+The detailed multi-release performance history lives in
+[Why SOF Exists](../use-sof/why-sof-exists.md). This page stays focused on the architecture
+boundaries rather than repeating the whole optimization story here.

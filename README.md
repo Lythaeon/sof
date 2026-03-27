@@ -88,56 +88,36 @@ That gives you:
 
 ## Why SOF Can Be Better Than Rebuilding It Yourself
 
-SOF is useful because it already spent the engineering effort on the details most projects eventually trip over:
+SOF is useful because it already spent engineering effort on the runtime details most projects end
+up rediscovering:
 
-- fewer avoidable instructions in hot paths
-- fewer avoidable allocations and copies
+- lower-copy, lower-allocation hot paths
 - borrowed/shared data where the runtime can safely keep it borrowed/shared
-- SIMD-based parsing where it is a real win
 - fast paths that avoid work the runtime does not actually need to do
 - removal of redundant work that used to survive deeper into the pipeline
-- lower branch and cache churn where measurement showed that mattered
-- replay dedupe and semantic duplicate suppression
-- provider reconnect, replay, watchdog, and startup validation behavior
+- replay dedupe, reconnect, watchdog, and startup validation behavior
 - typed health, readiness, and degradation reporting
-- a consistent transaction/plugin model across multiple ingress families
+- one consistent transaction/plugin model across multiple ingress families
 
-If you build your own Solana runtime stack from scratch for every service, you end up paying that optimization and correctness tax every time.
+That work is cumulative across releases, not isolated to one branch:
 
-That performance claim is intentionally scoped: on the validated release fixtures on this branch,
-no regression was observed on ingest-critical runtime/provider paths, and most of those paths were
-net-positive against the older baseline implementations.
+- `0.7.x` and `0.8.x` moved SOF toward multi-core ingest, narrower plugin fanout, lower-copy
+  packet and dispatch paths, and cheaper dataset reassembly
+- `0.12.0` tightened the shred-to-plugin path and improved validated VPS latency from
+  `59.978 / 8.007 / 6.415 ms` to `44.929 / 6.593 / 5.370 ms` for
+  `first_shred / last_required_shred / ready -> plugin`
+- `0.13.0` carried the largest single batch of measured provider/runtime hot-path work, including:
+  - provider transaction-kind classification: `34112us -> 4487us` (`~7.6x`)
+  - provider transaction dispatch path: `39157us -> 5751us` (`~6.8x`)
+  - provider serialized-ignore path: `42422us -> 23760us` (`~44%` faster)
+  - websocket full-transaction parse path: `162560us -> 133309us` (`~18%` faster)
 
-The performance method matters too. SOF does not keep changes just because they looked faster in
-review. The normal workflow is:
+Just as important: SOF does not keep changes because they look faster in review. The normal loop is
+baseline, change one thing, A/B test it, check `perf` and runtime metrics, then keep the change
+only if the data holds. Regressions are rejected rather than rationalized.
 
-- form a concrete performance hypothesis
-- capture a baseline
-- change one thing
-- re-run A/B validation with release fixtures, `perf`, and runtime metrics
-- keep the change only if the measurements actually improve
-
-So "optimized" here means measured and retained, not guessed and merged.
-
-That is also cumulative across releases. SOF has been tuned incrementally over time, and `0.13.0`
-contained the largest single concentration of measured runtime/provider-path optimizations so far.
-
-Concrete examples from the measured release fixtures on that line:
-
-- provider transaction-kind classification: `34112us -> 4487us` (`~87%` faster)
-- provider serialized-ignore path: `42422us -> 23760us` (`~44%` faster)
-- websocket full-transaction parse path: `162560us -> 133309us` (`~18%` faster)
-- provider transaction dispatch path: `39157us -> 5751us` (`~85%` faster)
-
-Those wins came from concrete changes, not generic cleanup:
-
-- redundant work removed from hot paths
-- early fast paths added so ignored or low-value traffic dies sooner
-- lower-copy and lower-allocation provider/runtime paths
-- reduced instruction count for the same work on validated paths
-- reduced branching and, where it was measurable, improved cache behavior
-- regressions were rejected rather than rationalized, for example when an apparent optimization did
-  not survive A/B measurement on the actual path
+The detailed performance history and methodology live in
+[Why SOF Exists](docs/gitbook/use-sof/why-sof-exists.md).
 
 ## The Main Idea
 
