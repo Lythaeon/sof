@@ -1,48 +1,41 @@
 # First Runtime Bring-Up
 
-Use this page to get `sof` running locally and to understand which runtime mode is active.
+Use this page to prove that `sof` starts, stays healthy, and can feed one small piece of service
+logic.
 
-If terms like shreds, relay, repair, or leader schedule still feel fuzzy, read
-[Before You Start](before-you-start.md) first. The rest of this page assumes the basic shape
-of what SOF is doing on the network.
+Do not treat this page as a latency guide. First bring-up is about correctness and posture, not
+about winning a shred race.
 
-## Try It From This Repository
+## Start With The Simplest Runtime
 
-From a repository checkout, the packaged examples are the fastest starting point.
-
-### Simplest Runtime Start
-
-Run the packaged example:
+From a repository checkout:
 
 ```bash
 cargo run --release -p sof --example observer_runtime
 ```
 
-That path uses SOF's direct UDP listener mode.
+That uses the direct UDP path. It is the simplest runtime bring-up and the easiest way to verify
+that the host, logging, and runtime lifecycle all behave the way you expect.
 
-### Enable Gossip Bootstrap
+## Add Gossip Only When You Need Gossip
 
-If you want SOF to discover cluster peers and run the gossip-backed bootstrap path, build with the
-feature enabled:
+If you want cluster discovery and the active gossip-backed bootstrap path:
 
 ```bash
 cargo run --release -p sof --example observer_runtime --features gossip-bootstrap
 ```
 
-Important runtime effect:
+That changes more than startup:
 
-- without `gossip-bootstrap`, `sof` remains a local observer/runtime
-- with `gossip-bootstrap`, SOF can also operate as an active relay and bounded repair client
+- SOF can discover peers
+- SOF can participate in bounded relay
+- SOF can participate in bounded repair
+
+Use this because you need those semantics, not because you assume it is the fastest mode.
 
 ## Embed It In Your Own App
 
-For crate consumers, start with `ObserverRuntime` plus `RuntimeSetup` when startup should be
-explicit in code.
-
-### Programmatic Setup
-
-Embedded services usually want `RuntimeSetup` instead of pushing startup behavior into environment
-strings.
+The normal embedded entry point is `ObserverRuntime` plus `RuntimeSetup`.
 
 ```rust
 use sof::runtime::{ObserverRuntime, RuntimeSetup};
@@ -68,21 +61,23 @@ Useful setup helpers include:
 - `with_packet_workers(...)`
 - `with_dataset_workers(...)`
 
-### The First Useful Progression
+## The Right First Progression
 
-For a first real integration, this progression usually works well:
+This order usually prevents confusion:
 
-1. make `ObserverRuntime::new()` compile and start
-2. switch to `RuntimeSetup` so startup is explicit in code
-3. attach one plugin and prove you can consume events
-4. only then move into gossip mode, runtime extensions, or derived-state consumers
+1. start the runtime
+2. make startup explicit in code with `RuntimeSetup`
+3. attach one plugin and prove you receive events
+4. only then choose between direct UDP, gossip, private raw ingress, or processed providers for
+   the real deployment
 
-That progression matters because it separates “SOF starts” from “my app logic is wired correctly”.
+That separates:
 
-### A Minimal Plugin-Backed Bring-Up
+- "SOF starts"
+- "my service consumes events"
+- "my ingress choice is correct"
 
-If you need to validate that your service can actually consume SOF output, start here instead of
-stopping at a bare runtime:
+## Minimal Plugin Bring-Up
 
 ```rust
 use async_trait::async_trait;
@@ -124,52 +119,36 @@ async fn main() -> Result<(), sof::runtime::RuntimeError> {
 }
 ```
 
-If this works, the runtime is no longer just launching; it is already feeding service logic.
+If this works, the runtime is already useful. You have proven lifecycle, dispatch, and one piece
+of application logic.
 
 ## First Operational Knobs
 
-Use only these when you are bringing up a host for the first time:
+For first bring-up, keep it narrow:
 
 - `RUST_LOG`
 - `SOF_BIND`
-- `SOF_GOSSIP_ENTRYPOINT` for gossip mode
+- `SOF_GOSSIP_ENTRYPOINT` only if you are deliberately testing gossip
 
-If you need less outbound activity while keeping ingest active:
+If you want gossip but with a quieter first posture:
 
 - `SOF_UDP_RELAY_ENABLED=false`
 - `SOF_REPAIR_ENABLED=false`
 
-Do not start with the advanced queue, repair, or gossip thread knobs unless you are already
-measuring a concrete problem.
+Do not start by tuning queue counts, worker counts, or repair pacing unless you are already
+measuring a specific problem.
 
 ## What Success Looks Like
 
-For a first bring-up, success is usually one of these:
+Success on day one is simple:
 
-- the runtime starts and stays healthy for a few minutes
-- your plugin logs the event type you expected
-- you can clearly tell whether you are in direct UDP mode or gossip mode
+- the runtime starts and stays healthy
+- one plugin receives the event family you expected
+- you can clearly tell which ingress mode is active
 
-What is not required on day one:
+What is not required:
 
-- perfect packet coverage
+- best-possible coverage
 - final tuning values
-- understanding every environment variable
-- jumping immediately into relay/repair tuning
-
-## Examples Worth Trying
-
-- `observer_runtime`: base runtime bring-up
-- `observer_with_non_vote_plugin`: plugin wiring
-- `observer_with_multiple_plugins`: what a more realistic plugin host looks like
-- `runtime_extension_websocket_connector`: extension resource model
-- `derived_state_slot_mirror`: derived-state style consumer example; run it with
-  `SOF_RUN_EXAMPLE=1` because it is intentionally guarded
-- `kernel_bypass_ingress_metrics`: external ingress path
-
-If the next step is still unclear, open the example source before reading deeper operations pages:
-
-- [`observer_runtime.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/observer_runtime.rs)
-- [`observer_with_non_vote_plugin.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/observer_with_non_vote_plugin.rs)
-- [`observer_with_multiple_plugins.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/observer_with_multiple_plugins.rs)
-- [`tpu_leader_logger.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/tpu_leader_logger.rs)
+- using gossip immediately
+- proving a latency advantage before you have chosen the right ingress

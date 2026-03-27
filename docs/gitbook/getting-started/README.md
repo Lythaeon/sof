@@ -1,23 +1,19 @@
 # Getting Started
 
-Start here to get from evaluation to a first working integration.
+This section is for getting from evaluation to a first working setup.
 
-If Solana traffic internals still feel unfamiliar, do not skip the onboarding pages:
+Keep the product model simple:
 
-1. [Before You Start](before-you-start.md)
-2. [Common Questions](common-questions.md)
+- use `sof` when you need local ingest, local state, plugins, or operations control
+- use `sof-tx` when you need transaction construction and submission
+- use both when one service observes traffic and submits from that local view
 
-Before you start, keep the product model simple:
+The other thing to get clear early:
 
-- if you need ingest, local state, plugin events, or operations guidance, start with `sof`
-- if you need transaction building and submission, start with `sof-tx`
-- if you need both local observation and local submission decisions, use them together
-
-## Who This Is For
-
-- Runtime embedders who need a local Solana ingest engine
-- Execution services that want locally sourced leader and blockhash signals
-- Operators bringing up SOF on a VPS, dedicated host, or custom ingress stack
+- public gossip is not the default "fast path"
+- private raw feeds, direct validator-adjacent ingress, and physical proximity usually win on
+  latency
+- SOF is useful because it gives you one reusable runtime across those ingress choices
 
 ## Recommended Reading Order
 
@@ -31,14 +27,17 @@ Before you start, keep the product model simple:
 
 Repository and contributor material lives under [Maintain SOF](../maintainers/README.md).
 
-## What You Should Know Before Deploying
+## Who This Is For
 
-- `sof` can be an active relay client in gossip mode, not just a passive observer
-- `sof-tx` is designed for execution services, not for wallet UX
-- typed tuning profiles are preferred over ad hoc environment bundles
-- derived-state and local control-plane freshness are part of the design, not side topics
+- teams embedding a local Solana observer/runtime
+- execution services that want local blockhash or leader inputs
+- operators bringing up SOF on a VPS, dedicated host, or custom ingress stack
 
-If that list already feels too dense, read [Before You Start](before-you-start.md) before going
-further.
+## What To Decide Early
 
-Once you are comfortable with those basics, move into the crate guides and operations chapters.
+- are you using `sof`, `sof-tx`, or both
+- what ingress reaches your host earliest
+- whether you want public-edge independence or trusted low-latency ingress
+- whether the first version needs only observation or also local submission
+
+Once those decisions are clear, the crate guides and operations pages become much easier to read.

@@ -1,14 +1,12 @@
 # Build One Process That Observes And Submits
 
-Start here when one low-latency service should both observe live traffic and submit transactions
-using that same local control plane.
+Start here when one service should both observe traffic and submit transactions from that local
+view.
 
-This is the normal SOF product shape for execution services.
+This is a useful execution shape, but it is not mandatory. `sof-tx` still works on its own with
+RPC, Jito, and signed-byte flows.
 
-This shape only reaches its latency potential when the same process also has early shred
-visibility. In practice that means pairing SOF with direct low-latency validator or peer access,
-or feeding the host from an external shred propagation network. Otherwise the process is still
-well integrated, but it starts from stale visibility.
+This combined shape only reaches its latency potential when ingress is also early.
 
 ## Use This When
 
@@ -70,23 +68,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let _ = (builder, &mut client, SubmitMode::Hybrid);
 
-    // Run `sof` with this plugin host, then use the client from your strategy task.
     let _ = ObserverRuntime::new().with_plugin_host(host).run().await;
 
     Ok(())
 }
 ```
 
-That snippet shows the important wiring, not the final service orchestration. In a real service,
-you usually run:
-
-- the SOF runtime task
-- one strategy/execution task that owns the submit client
-- one application-specific decision loop that decides when to build and submit
-
 ## Why This Shape Is Useful
 
-The main benefit is freshness:
+The main benefit is local control:
 
 - `sof` sees live traffic directly
 - the adapter turns that into local control-plane inputs
@@ -94,9 +84,8 @@ The main benefit is freshness:
 
 This avoids depending on a separate internal control-plane service for the first version.
 
-The caveat is that "local freshness" still depends on ingress freshness first. SOF removes the
-extra service hop between observation and execution. It does not erase latency that already
-happened before the shreds reached the box.
+The caveat is the same one everywhere else in SOF: local freshness still depends on ingress
+freshness first.
 
 ## What You Usually Add Next
 
@@ -112,11 +101,3 @@ Do not start here if:
 - you only need RPC-based transaction submission
 - you need replay/recovery before you need low-latency local freshness
 - you have not yet proved your observer logic and your submit logic independently
-
-In those cases, start with either the pure observer service or the pure submitter first.
-
-## Real Example Files
-
-- [`observer_with_non_vote_plugin.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/observer_with_non_vote_plugin.rs)
-- [`tpu_leader_logger.rs`](https://github.com/Lythaeon/sof/blob/main/crates/sof-observer/examples/tpu_leader_logger.rs)
-- [`crates/sof-tx/README.md`](https://github.com/Lythaeon/sof/blob/main/crates/sof-tx/README.md)

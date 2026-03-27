@@ -12,6 +12,7 @@ If SOF is still new, start with:
 
 - start from safe defaults
 - measure before changing queue or thread counts
+- treat ingress choice as the first performance decision, not a late tuning detail
 - treat outbound relay and repair traffic as an explicit posture decision
 - prefer typed tuning profiles over copying environment bundles
 - document host-specific changes so they are reproducible
@@ -20,5 +21,6 @@ If SOF is still new, start with:
 
 - choosing the right deployment mode
 - understanding SOF's relay and repair behavior
+- understanding what SOF can and cannot change about latency
 - finding the safe baseline before expert-only tuning
 - looking up one specific runtime knob quickly in the [Knob Registry](knob-registry.md)

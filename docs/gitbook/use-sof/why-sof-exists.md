@@ -1,146 +1,93 @@
 # Why SOF Exists
 
-SOF was created to solve a practical problem: if you want low-latency Solana data, RPC is often
-too far away from the actual traffic.
+SOF exists because many Solana services need more control than RPC gives them, but less weight than
+running a full validator-shaped stack.
 
-RPC is convenient, but it is not where the network starts. By the time your application reads a
-response from an RPC node or a third-party stream provider, several things have already happened:
+That does not mean SOF is always the fastest answer.
 
-- the validator or provider saw the traffic first
-- the data was decoded and repackaged for an API surface you do not control
-- your service paid the extra network hop and the operational cost of that dependency
+The important distinction is:
 
-That is fine for many applications. It is not ideal when you need the earliest useful view of the
-network and you care about operating the data path yourself.
+- SOF is a runtime foundation
+- ingress still determines how early the host sees traffic
 
-One important constraint needs to be explicit:
+If you put SOF behind a late source, it starts from late data. If you put SOF behind an early
+source, it can keep parsing, local state, filtering, replay, and downstream logic on the same box
+with less custom glue.
 
-SOF is only as early as the traffic that reaches it.
+## The Real Problem
 
-If your host sees shreds late, SOF cannot recover that lost visibility just by being efficient
-after ingest. The best SOF deployments are the ones that combine SOF's low-overhead local runtime
-with the earliest ingress they can get, usually one of:
+Teams usually hit one of these problems:
 
-- direct low-latency access to validators or other useful peers
-- an external shred propagation network that feeds the host quickly
+- RPC is too far from the traffic source
+- managed providers define the stream shape and operational boundary for you
+- custom ingest stacks are tedious to build correctly
+- every service ends up reimplementing reconnect, replay, dedupe, filtering, health, and queueing
 
-That removes the biggest latency killer for observer-driven services: late shred visibility. Once
-that part is solved, SOF can keep parsing, control-plane derivation, and downstream logic on the
-same system instead of paying for another heavy external service boundary.
+SOF exists to stop that repetition.
 
-There is another practical problem too:
+## What SOF Is Good At
 
-even when a team knows exactly what it wants to build on Solana, rebuilding the ingest/runtime
-layer from scratch is usually tedious, performance-sensitive, and easy to get subtly wrong.
+SOF is good at owning the local runtime boundary:
 
-The cost is not just reading packets or subscribing to a provider. It is also:
+- ingest
+- parsing or provider adaptation
+- replay and dedupe boundaries
+- plugin and derived-state dispatch
+- health, readiness, and metrics
+- local control-plane derivation where the ingress mode supports it
 
-- getting provider-specific connection and reconnect behavior right
-- reducing instructions, copies, allocator churn, and cache misses in the hot path
-- preserving one consistent hook/filter model across different upstreams
-- treating duplicate suppression, verification posture, and replay behavior as correctness
-  boundaries instead of optional cleanup
-- keeping the runtime observable and bounded under pressure
+That lets teams focus on the service they actually want to build.
 
-SOF exists to make that substrate reusable so Solana developers can focus on the logic they
-actually care about.
+## What SOF Is Not
 
-One more constraint should be explicit:
+SOF is not:
 
-SOF does not assume every upstream is equally trusted.
+- a guarantee of best possible latency
+- a validator
+- a wallet framework
+- the only sensible way to build Solana infrastructure
 
-There are really two raw-shred trust modes plus one separate processed-stream category:
+If you want the earliest possible raw data, the better answer is often:
+
+- private shred distribution
+- direct validator-adjacent ingress
+- better host placement
+
+SOF becomes valuable there because it gives those setups one bounded runtime instead of another
+custom stack.
+
+## Trust Posture Matters
+
+SOF does not treat all ingress as equally trusted.
+
+For raw shreds there are two distinct postures:
 
 - `public_untrusted`
-  - public gossip or public peers
-  - keep verification on
-  - strongest independence, highest observer CPU tax
+  - verification on by default
+  - strongest independence
+  - highest observer CPU cost
 - `trusted_raw_shred_provider`
-  - raw shred distribution from a provider or private network you explicitly trust
-  - the best fit for the fastest SOF deployments
-- `processed_provider_stream`
-  - provider-defined processed feeds such as Yellowstone gRPC, LaserStream, or websocket products
-  - useful, but not the same raw-shred SOF model
-  - not a `SOF_SHRED_TRUST_MODE` value because it is not raw-shred ingest
+  - verification off by default
+  - intended for private, trusted raw feeds
+  - misuse can admit invalid data
 
-That distinction matters because the fastest SOF deployments are usually not the ones that only sit
-on the public gossip edge. They are the ones that combine:
+Processed providers such as Yellowstone, LaserStream, or websocket transaction feeds are a separate
+category. They are useful, but they are not raw-shred trust modes.
 
-- SOF's local runtime and shred-native processing
-- with an earlier trusted raw shred feed than public gossip can usually provide
+## Why Teams Use SOF Anyway
 
-## The Problem SOF Was Built To Solve
+Because even when the ingress question is settled, the runtime work still remains:
 
-SOF fits services that need one or more of these:
+- provider-specific reconnect and replay handling
+- queue boundaries and overload behavior
+- hot-path copy and allocation control
+- consistent hooks and filters across modes
+- health, readiness, and metrics
+- local control-plane and derived-state plumbing
 
-- live Solana traffic closer to the source than RPC
-- locally derived control-plane state such as recent blockhash and leader context
-- explicit bounded behavior under pressure instead of unbounded background machinery
-- a foundation for analytics, monitoring, automation, or low-latency submission
-- a reusable runtime foundation so every service does not need to reinvent Solana ingest,
-  provider handling, and correctness machinery
+SOF is the reusable layer for that work.
 
-The project started from the idea that there should be a middle ground between:
+## The Short Version
 
-- depending entirely on RPC or a managed stream provider
-- operating a full validator-shaped stack just to observe and react to traffic
-
-SOF is that middle ground.
-
-## What SOF Is Trying To Be
-
-SOF is not trying to replace every other Solana interface.
-
-It is trying to be a small, explicit, low-latency runtime for services that want to observe live
-traffic and do something useful with it.
-
-That means the project optimizes for:
-
-- direct network ingest
-- predictable, bounded runtime behavior
-- explicit operational tradeoffs
-- modular downstream consumers such as plugins, derived state, and `sof-tx`
-- a place where low-level Solana runtime optimizations are implemented once instead of in every app
-
-## Why Not Just Use RPC?
-
-RPC is often enough. SOF exists because some services need a different tradeoff.
-
-RPC is usually the right tool for:
-
-- simplicity
-- broad ecosystem compatibility
-- request/response reads more than live ingest
-
-SOF becomes attractive for services that need:
-
-- lower-latency access to live traffic
-- fewer external dependencies in the data path
-- control over how traffic is parsed, retained, and surfaced
-- direct integration into your own service architecture
-- a framework that already owns the performance and correctness details under the application
-
-That benefit is strongest when SOF is not only local to the application, but also close to the
-traffic source.
-
-## Why Not Just Run A Validator?
-
-Running a validator gives you a broad Solana surface, but it also brings validator-shaped
-operational cost and state complexity.
-
-SOF was created for services that do not need the whole validator job. They need a focused runtime
-that can:
-
-- ingest packets
-- parse and reconstruct useful data
-- surface transactions and state signals
-- stay bounded and tunable
-
-That is a narrower goal than being a validator, and it is a more practical one for many backend
-services.
-
-## The Core Idea In One Sentence
-
-SOF exists for services that need to see live Solana traffic early, derive useful local state from
-it, and act without rebuilding a heavy RPC-first, validator-first, or ad hoc ingest stack from
-scratch every time.
+SOF exists so teams can own their Solana runtime boundary without rebuilding the same ingest,
+correctness, and operations machinery over and over again.

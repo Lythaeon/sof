@@ -1,28 +1,44 @@
 # SOF Documentation
 
-SOF is a Solana infrastructure toolkit.
+SOF is a Solana observer/runtime and transaction toolkit.
 
-It is built for services that need one or both of these:
+It exists for teams that want to run their own ingest and control-plane layer instead of rebuilding
+that layer in every service.
 
-- a local observer/runtime that ingests live Solana traffic and derives control-plane state
-- a transaction SDK that uses that control plane for predictable low-latency submission
-
-In practice, SOF is three public products with one internal backend:
+The public crates are:
 
 - `sof`: observer/runtime
-- `sof-tx`: transaction SDK
-- `sof-gossip-tuning`: typed host tuning
-- `sof-solana-gossip`: vendored bootstrap backend used internally by `sof`
+- `sof-tx`: transaction construction and submission
+- `sof-gossip-tuning`: typed tuning profiles for `sof`
 
-SOF is not a wallet framework and it is not a validator. The project is shaped more like market
-infrastructure software: bounded queues, explicit runtime posture, local control-plane state, and
-operationally visible tradeoffs.
+There is also one internal backend crate:
 
-The docs are split into two reading tracks because product users and repository maintainers need
-different levels of detail.
+- `sof-solana-gossip`: vendored gossip bootstrap backend used by optional gossip mode
 
-If Solana network internals are still new to you, do not jump straight into crate pages. Start
-with:
+The most important point up front:
+
+SOF is not automatically the fastest way to see Solana traffic.
+
+Latency starts with ingress. If the host sees shreds late, SOF starts late too. The fastest real
+deployments usually use one or more of these:
+
+- a private raw shred distribution network
+- direct validator-adjacent or peer-adjacent ingress
+- host placement close to the source, often in the same datacenter
+
+Public gossip is the independent baseline. It is useful when you want to own the public edge of
+the stack yourself. It is usually not the fastest source of shreds.
+
+What SOF gives you is different:
+
+- one bounded runtime for raw shreds, processed providers, or a typed custom provider feed
+- one plugin and derived-state model with aligned semantics where the ingress supports them
+- explicit replay, dedupe, health, readiness, and queue boundaries
+- one place where the low-level Solana ingest work is implemented and measured once
+
+## Start Here
+
+If you are evaluating SOF as a product, read these first:
 
 - [Why SOF Exists](use-sof/why-sof-exists.md)
 - [SOF Compared To The Usual Alternatives](use-sof/sof-compared.md)
@@ -34,51 +50,43 @@ with:
 
 ### Use SOF
 
-Choose this if you are outside the repository and want to:
+Choose this track if you want to:
 
 - embed `sof` or `sof-tx`
-- operate SOF on a host
-- evaluate deployment modes and runtime behavior
+- run SOF on a host
+- compare ingress modes and trust postures
+- decide whether SOF fits your service at all
 
 Start here: [Use SOF](use-sof/README.md)
 
-Recommended next decisions:
-
-- [Why SOF Exists](use-sof/why-sof-exists.md)
-- [SOF Compared To The Usual Alternatives](use-sof/sof-compared.md)
-- [Before You Start](getting-started/before-you-start.md)
-- [Common Questions](getting-started/common-questions.md)
-- [Choose Your Control Plane Source](use-sof/control-plane-sourcing.md)
-- [Common Recipes](use-sof/common-recipes.md)
-
 ### Maintain SOF
 
-Choose this if you are working inside the repository and need:
+Choose this track if you are working inside the repository and need:
 
 - workspace layout
-- architecture rules
-- testing and contributor policy
+- architecture constraints
+- testing policy
+- contributor process
 
 Start here: [Maintain SOF](maintainers/README.md)
 
-## Workspace Components
+## Product Model
 
-- `sof`: the packaged observer/runtime for shred ingest, relay, repair, verification, dataset
-  reconstruction, plugin hooks, and runtime extensions
-- `sof-tx`: the transaction SDK for building, signing, and submitting Solana transactions through
-  RPC, Jito, signed-byte flows, or optional direct and hybrid routing when a control-plane source
-  is available
-- `sof-gossip-tuning`: typed tuning profiles for hosts embedding `sof`
-- `sof-solana-gossip`: the vendored gossip backend used by the optional `gossip-bootstrap` path
+- `sof`
+  - local observer/runtime
+  - can start from raw shreds, processed provider streams, or a typed custom provider feed
+- `sof-tx`
+  - transaction SDK
+  - can use RPC, Jito, signed-byte flows, and optional local control-plane inputs
+- `sof-gossip-tuning`
+  - typed host presets for `sof`
 
-## Design Posture
+SOF is not a validator and it is not a wallet framework. The runtime is shaped more like bounded
+infrastructure software:
 
-SOF is opinionated about bounded behavior:
+- explicit queues
+- explicit trust posture
+- explicit replay and dedupe boundaries
+- explicit health and readiness signals
 
-- queues are explicit
-- relay and repair are bounded
-- replay and local state are first-class concerns
-- hot paths avoid unnecessary copies and unbounded coordination
-- operational tradeoffs are documented instead of hidden behind defaults
-
-That posture is the through-line for the codebase and for this documentation set.
+That is the posture this documentation set assumes.

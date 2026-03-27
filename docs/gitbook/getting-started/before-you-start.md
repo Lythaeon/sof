@@ -1,170 +1,129 @@
 # Before You Start
 
-Read this page first if SOF makes sense conceptually but Solana network internals still feel
-opaque.
+Read this page first if SOF sounds useful but the network side of Solana still feels vague.
 
-You do not need to become a validator engineer before you can use SOF. You do need a practical
-mental model for the data SOF sees and the kinds of decisions it can make locally.
+You do not need validator-level expertise. You do need the right mental model.
 
-## What SOF Actually Sees
+## The Short Version
 
-SOF does not start from RPC responses.
+SOF does not make a host early by itself.
 
-It starts from live Solana network traffic. In practice that means:
+It makes a host useful once traffic reaches it.
 
-- packets arriving from UDP or gossip-discovered peers
-- packet payloads that contain shreds
-- shreds that belong to slots
-- slots that eventually reconstruct into datasets and transactions
+That means:
 
-That is why SOF can be lower latency than an RPC-first architecture: it is closer to the traffic
-source.
+- if your host sees shreds late, SOF starts from late data
+- if your host sees shreds early, SOF can keep parsing, local state, and downstream logic on the
+  same box with less overhead than an RPC-first or ad hoc stack
 
-## What Actually Determines Whether SOF Is Fast
+So the first question is not "is SOF fast." The first question is "what ingress reaches this host
+earliest."
 
-The biggest latency limiter is usually not SOF's local processing cost. It is shred visibility:
-how quickly the host sees useful shreds in the first place.
+## What SOF Actually Starts From
 
-That means two separate things must both be true for a genuinely low-latency setup:
+Depending on mode, SOF starts from one of two families:
 
-- SOF needs early ingress, such as direct low-latency validator or peer access, or an external
-  shred propagation network feeding the host
-- your application logic should stay on the same host or in the same process so it benefits from
-  SOF's local parsing, control-plane state, and event delivery
+- raw ingress
+  - direct UDP
+  - gossip-discovered peers
+  - external kernel-bypass or private raw shred feeds
+- processed provider ingress
+  - Yellowstone gRPC
+  - LaserStream
+  - websocket transaction feeds
+  - typed custom provider streams
 
-If the host sees traffic late, SOF can still be simpler and more controllable than RPC-first
-systems, but it will not magically become early just because the local runtime is efficient.
+Raw ingress gives SOF more of the substrate. Processed providers give SOF a narrower, already
+productized stream.
+
+## What Usually Wins On Latency
+
+If lowest latency is the goal, the usual ordering is:
+
+1. private raw shred distribution or direct validator-adjacent ingress
+2. good host placement near the source, often in the same datacenter
+3. local runtime and local consumers on the same machine or in the same process
+4. only then local runtime efficiency
+
+Public gossip is useful because it is open and independent. It is not usually the fastest source
+of shreds.
 
 ## What A Shred Is
 
-The shortest useful definition:
+A shred is one piece of a slot payload sent across the network.
 
-- a shred is one small piece of a Solana block/slot payload sent across the network
+What matters in practice:
 
-You do not need to memorize the binary layout to use SOF.
+- transactions do not arrive as one clean application object
+- raw-shred SOF first ingests packets, parses shreds, optionally verifies them, and reconstructs
+  usable data
+- only then do transaction, slot, and control-plane events appear
 
-What matters for you:
+## Why Verification And Trust Posture Matter
 
-- one transaction does not arrive as one neat application object
-- SOF first has to ingest packets, parse shreds, verify them if configured, and reassemble the
-  larger dataset they belong to
-- only after that do higher-level transaction and slot events become available
+Raw shred ingest has two very different trust postures:
 
-For plugin-based services, this is why SOF can emit transaction and dataset events without asking
-RPC for them first.
+- `public_untrusted`
+  - verification on by default
+  - strongest independence
+  - highest observer CPU cost
+- `trusted_raw_shred_provider`
+  - verification off by default
+  - intended for private, trusted raw feeds
+  - misuse can admit invalid data
 
-## What A Dataset Is
+This is not just a performance setting. It is a trust decision.
 
-In SOF docs, a dataset is the reconstructed payload for one slot/data stream after enough shreds
-arrive to make it usable.
+## What Gossip Changes
 
-What matters operationally:
+Gossip mode is not "faster mode." It is "more active cluster mode."
 
-- packets can arrive out of order
-- some shreds can be missing temporarily
-- recovery and repair can matter before a dataset becomes complete
+Use gossip when you want:
 
-You do not usually consume raw datasets directly on day one. You care because dataset
-reconstruction is the bridge between packet ingest and the transaction-level events your service
-actually uses.
+- cluster discovery
+- live topology
+- richer peer context
+- bounded relay and repair participation
+
+Do not use gossip just because you assume it is the premium path. If you only need a first
+observer bring-up or you control the packet sources already, direct UDP is simpler.
 
 ## Why Leaders And Blockhash Matter
 
-These two terms matter because they affect transaction submission.
+These matter mostly for submission, not for basic observation.
 
-### Leader
+- leader context helps direct transaction routing
+- recent blockhash matters for normal transaction construction
 
-The leader is the validator expected to produce traffic for a given slot window.
+Those inputs can come from:
 
-Why you care:
+- `sof`
+- RPC
+- your own internal control-plane service
 
-- direct transaction submission needs to know who to target
-- SOF can derive that locally when it has enough live control-plane state
+## What You Do Not Need On Day One
 
-### Recent blockhash
+You do not need:
 
-A recent blockhash is part of normal Solana transaction construction.
-
-Why you care:
-
-- if `sof-tx` is building and signing the transaction for you, it needs a current blockhash
-- that blockhash can come from RPC or from locally observed state fed by `sof`
-
-## What Changes When You Enable Gossip Bootstrap
-
-This is the most important network-behavior distinction for new users.
-
-### Direct UDP listener mode
-
-This is the quieter mode.
-
-Use it when you want:
-
-- a simpler bring-up path
-- controlled packet sources
-- a more observer-like posture
-
-### Gossip bootstrap mode
-
-This is the richer but more active mode.
-
-Use it when you want:
-
-- cluster discovery
-- live topology updates
-- richer leader and peer context
-- bounded relay and repair behavior
-
-What changes operationally:
-
-- SOF is no longer only ingesting traffic
-- it can also participate in bounded relay and bounded repair
-
-That is why the operations docs talk so much about network posture.
-
-## What Relay And Repair Mean In Plain Language
-
-### Relay
-
-Relay means SOF can forward recent useful traffic onward instead of only consuming it locally.
-
-### Repair
-
-Repair means SOF can request or serve missing pieces when traffic arrived with gaps.
-
-You should think about both as explicit posture decisions, not invisible background magic.
-
-If you want the easiest first bring-up:
-
-- start without `gossip-bootstrap`
-- or disable relay/repair first when you do enable gossip mode
-
-## What You Do Not Need To Know On Day One
-
-You do not need all of this before your first working integration:
-
-- the exact shred wire layout
+- the full shred wire format
 - validator internals
-- the full gossip protocol implementation
-- every tuning knob in the registry
+- every gossip detail
+- every tuning knob
 
-You do need to know:
+You do need:
 
-- whether you want observation, submission, or both
-- whether your host should stay mostly passive or participate in gossip/repair
-- whether your control plane comes from RPC, from `sof`, or from another internal service
+- the right product choice: `sof`, `sof-tx`, or both
+- the right ingress choice for your latency and trust goals
+- a clear answer to whether your host should stay passive or participate in gossip/repair
 
-## The Safe Learning Order
+## Safe Reading Order
 
-This order usually prevents confusion:
+1. [Choose the Right SOF Path](../use-sof/adoption-paths.md)
+2. [Common Questions](common-questions.md)
+3. [Install SOF](install-sof.md)
+4. [First Runtime Bring-Up](first-runtime.md)
 
-1. read [Choose the Right SOF Path](../use-sof/adoption-paths.md)
-2. read [Common Questions](common-questions.md)
-3. read [Install SOF](install-sof.md)
-4. run [First Runtime Bring-Up](first-runtime.md)
-5. only then go deeper into crate pages and operations
+## One Sentence To Keep In Mind
 
-## If You Want One Sentence To Remember
-
-SOF is the part that turns live Solana network traffic into local usable runtime state; `sof-tx`
-is the part that turns that state into transaction submission decisions.
+`sof` turns ingress into local runtime state; `sof-tx` turns usable control-plane state into
+transaction submission.
