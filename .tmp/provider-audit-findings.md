@@ -77,3 +77,10 @@ Follow-up findings after the readiness/readiness-class pass:
   begins only after custom health events arrive, and the remaining non-test
   `dead_code` suppressions on baseline/provider helper functions needed to be
   removed by tightening cfg boundaries instead of silencing clippy.
+
+- 2026-03-28 follow-up: deferred `Removed` delivery under queue pressure still
+  needed to keep source identities reserved until the terminal removal event is
+  actually queued, generic last-drop cleanup still needed a no-runtime path
+  that cannot panic during teardown, and the GitBook crate page still needed
+  the same explicit generic-readiness caveat that already existed in the
+  observer README.

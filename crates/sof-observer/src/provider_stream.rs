@@ -668,17 +668,66 @@ pub(crate) struct ProviderSourceReservation {
     removal_sender: Option<ProviderStreamSender>,
 }
 
+/// Deferred source-identity release that runs only after a terminal removal event is queued.
+#[derive(Debug)]
+struct ProviderSourceDeferredRelease {
+    /// Fan-in that owns the reserved identity set.
+    fan_in: ProviderStreamFanIn,
+    /// Stable source identity released when the guard drops.
+    source: ProviderSourceIdentity,
+}
+
+impl Drop for ProviderSourceDeferredRelease {
+    fn drop(&mut self) {
+        self.fan_in.release_source_identity(&self.source);
+    }
+}
+
+/// One owned release guard kept alive until terminal source cleanup completes.
+#[derive(Debug, Default)]
+struct ProviderSourceReleaseGuard {
+    /// Release one raw reserved identity directly.
+    _identity: Option<ProviderSourceDeferredRelease>,
+    /// Keep one built-in reservation alive until the delayed removal send completes.
+    _reservation: Option<Arc<ProviderSourceReservation>>,
+}
+
+impl ProviderSourceReleaseGuard {
+    /// Creates one guard that releases a reserved identity directly on drop.
+    const fn for_identity(release: ProviderSourceDeferredRelease) -> Self {
+        Self {
+            _identity: Some(release),
+            _reservation: None,
+        }
+    }
+
+    #[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
+    /// Creates one guard that keeps a built-in reservation alive until drop.
+    const fn for_reservation(reservation: Arc<ProviderSourceReservation>) -> Self {
+        Self {
+            _identity: None,
+            _reservation: Some(reservation),
+        }
+    }
+}
+
 impl Drop for ProviderSourceReservation {
     fn drop(&mut self) {
+        let release = ProviderSourceReleaseGuard::for_identity(ProviderSourceDeferredRelease {
+            fan_in: self.fan_in.clone(),
+            source: self.source.clone(),
+        });
         if let Some(sender) = self.removal_sender.clone() {
-            emit_provider_source_removed(
+            drop(emit_provider_source_removed(
                 &sender,
                 self.source.clone(),
                 ProviderSourceReadiness::Optional,
                 "reserved provider source sender dropped and was removed from tracking",
-            );
+                Some(release),
+            ));
+        } else {
+            drop(release);
         }
-        self.fan_in.release_source_identity(&self.source);
     }
 }
 
@@ -756,13 +805,15 @@ impl ProviderSourceTaskGuard {
 #[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
 impl Drop for ProviderSourceTaskGuard {
     fn drop(&mut self) {
-        let _keep_reservation_alive = self.reservation.take();
-        emit_provider_source_removed(
+        drop(emit_provider_source_removed(
             &self.sender,
             self.source.clone(),
             self.readiness,
             "provider source task stopped and was removed from tracking",
-        );
+            self.reservation
+                .take()
+                .map(ProviderSourceReleaseGuard::for_reservation),
+        ));
     }
 }
 
@@ -1008,7 +1059,8 @@ fn emit_provider_source_removed(
     source: ProviderSourceIdentity,
     readiness: ProviderSourceReadiness,
     message: &'static str,
-) {
+    release: Option<ProviderSourceReleaseGuard>,
+) -> Option<ProviderSourceReleaseGuard> {
     let event = ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
         source,
         readiness,
@@ -1017,12 +1069,22 @@ fn emit_provider_source_removed(
         message: message.to_owned(),
     });
     match sender.try_send(event) {
-        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => release,
         Err(mpsc::error::TrySendError::Full(update)) => {
             let sender = sender.clone();
-            tokio::spawn(async move {
-                drop(sender.send(update).await);
-            });
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    drop(sender.send(update).await);
+                    drop(release);
+                });
+                None
+            } else {
+                std::thread::spawn(move || {
+                    drop(sender.blocking_send(update));
+                    drop(release);
+                });
+                None
+            }
         }
     }
 }
@@ -1049,6 +1111,7 @@ mod tests {
     use solana_signer::Signer;
     use std::{sync::Arc, time::Instant};
     use tokio::runtime::Runtime;
+    use tokio::time::{Duration, timeout};
 
     fn profile_iterations(default: usize) -> usize {
         std::env::var("SOF_PROFILE_ITERATIONS")
@@ -1183,6 +1246,114 @@ mod tests {
             assert_eq!(second.source, source);
             assert_eq!(second.status, ProviderSourceHealthStatus::Removed);
             assert_eq!(second.reason, ProviderSourceHealthReason::SourceRemoved);
+        });
+    }
+
+    #[test]
+    fn reserved_provider_sender_defers_identity_reuse_until_removed_is_enqueued() {
+        let (fan_in, mut rx) = create_provider_stream_fan_in(1);
+        let source = ProviderSourceIdentity::new(
+            ProviderSourceId::Generic(Arc::<str>::from("custom")),
+            "source-a",
+        );
+        let sender = fan_in
+            .sender_for_source(source.clone())
+            .expect("reserve source");
+
+        Runtime::new().expect("runtime").block_on(async move {
+            sender
+                .send(ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
+                    source: source.clone(),
+                    readiness: ProviderSourceReadiness::Required,
+                    status: ProviderSourceHealthStatus::Healthy,
+                    reason: ProviderSourceHealthReason::SubscriptionAckReceived,
+                    message: "source subscription acknowledged".to_owned(),
+                }))
+                .await
+                .expect("send health");
+            drop(sender);
+
+            assert!(
+                fan_in.sender_for_source(source.clone()).is_err(),
+                "identity should stay reserved until removed is queued"
+            );
+
+            let first = rx.recv().await.expect("health update");
+            let ProviderStreamUpdate::Health(first) = first else {
+                panic!("expected first health update");
+            };
+            assert_eq!(first.status, ProviderSourceHealthStatus::Healthy);
+
+            let second = timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("removed update should arrive")
+                .expect("removed health update");
+            let ProviderStreamUpdate::Health(second) = second else {
+                panic!("expected removed health update");
+            };
+            assert_eq!(second.status, ProviderSourceHealthStatus::Removed);
+            assert_eq!(second.reason, ProviderSourceHealthReason::SourceRemoved);
+
+            tokio::task::yield_now().await;
+            fan_in
+                .sender_for_source(source)
+                .expect("identity released after removed is enqueued");
+        });
+    }
+
+    #[test]
+    fn reserved_provider_sender_drop_outside_runtime_does_not_panic_when_queue_is_full() {
+        let (fan_in, mut rx) = create_provider_stream_fan_in(1);
+        let source = ProviderSourceIdentity::new(
+            ProviderSourceId::Generic(Arc::<str>::from("custom")),
+            "source-a",
+        );
+        let sender = fan_in
+            .sender_for_source(source.clone())
+            .expect("reserve source");
+
+        Runtime::new().expect("runtime").block_on(async {
+            sender
+                .send(ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
+                    source: source.clone(),
+                    readiness: ProviderSourceReadiness::Required,
+                    status: ProviderSourceHealthStatus::Healthy,
+                    reason: ProviderSourceHealthReason::SubscriptionAckReceived,
+                    message: "source subscription acknowledged".to_owned(),
+                }))
+                .await
+                .expect("send health");
+        });
+
+        let mut sender = Some(sender);
+        let drop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(sender.take().expect("reserved sender"));
+        }));
+        assert!(
+            drop_result.is_ok(),
+            "dropping a reserved generic sender outside a tokio runtime should not panic"
+        );
+
+        Runtime::new().expect("runtime").block_on(async move {
+            let first = rx.recv().await.expect("health update");
+            let ProviderStreamUpdate::Health(first) = first else {
+                panic!("expected first health update");
+            };
+            assert_eq!(first.status, ProviderSourceHealthStatus::Healthy);
+
+            let second = timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("removed update should arrive")
+                .expect("removed health update");
+            let ProviderStreamUpdate::Health(second) = second else {
+                panic!("expected removed health update");
+            };
+            assert_eq!(second.status, ProviderSourceHealthStatus::Removed);
+            assert_eq!(second.reason, ProviderSourceHealthReason::SourceRemoved);
+
+            fan_in
+                .sender_for_source(source)
+                .expect("identity released after background removal send");
         });
     }
 

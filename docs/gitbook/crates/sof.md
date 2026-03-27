@@ -75,6 +75,9 @@ Important boundary:
   transactions, transaction status, accounts, block-meta, logs, and slots where
   the upstream surface supports them
 - `ProviderStreamMode::Generic` is the flexible processed-provider mode
+- custom generic producers only become source-aware for readiness after they
+  emit typed `Health` updates for their reserved sources; until then SOF can
+  only treat generic ingress as "updates are flowing"
 - `sof-tx` adapter completeness still depends on a full control-plane feed, not only transaction
   updates
 
