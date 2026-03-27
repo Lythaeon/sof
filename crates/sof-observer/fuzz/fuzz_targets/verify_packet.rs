@@ -80,7 +80,12 @@ fuzz_target!(|bytes: &[u8]| {
         let Some(packet) = take_bytes(&mut input, packet_len) else {
             break;
         };
-        let _ = verifier.verify_packet(packet, now + Duration::from_millis(index as u64));
+        let strict_unknown = take_u8(&mut input).unwrap_or(0) & 1 == 1;
+        let _ = verifier.verify_packet(
+            packet,
+            now + Duration::from_millis(index as u64),
+            strict_unknown,
+        );
         let _ = verifier.slot_leaders_snapshot();
         let _ = verifier.take_slot_leader_diff();
     }

@@ -105,9 +105,11 @@ fuzz_target!(|bytes: &[u8]| {
                 let Some(packet) = take_bytes(&mut input, packet_len) else {
                     break;
                 };
+                let strict_unknown = take_u8(&mut input).unwrap_or(0) & 1 == 1;
                 let _ = verifier.verify_packet(
                     packet,
                     now + Duration::from_millis(u64::try_from(op_index).unwrap_or(u64::MAX)),
+                    strict_unknown,
                 );
             }
             3 => {
