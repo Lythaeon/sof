@@ -1798,10 +1798,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn laserstream_local_source_delivers_transaction_update() {
+        let update = grpc::SubscribeUpdate {
+            filters: vec!["sof".to_owned()],
+            created_at: None,
+            update_oneof: Some(grpc::subscribe_update::UpdateOneof::Transaction(
+                grpc::SubscribeUpdateTransaction {
+                    transaction: Some(sample_update()),
+                    slot: 91,
+                },
+            )),
+        };
+        let (addr, shutdown_tx, server) = spawn_laserstream_test_server(MockLaserStream {
+            expected_stream: MockLaserStreamStream::Transaction,
+            expected_account: None,
+            expected_owner: None,
+            update,
+        })
+        .await;
+
+        let (tx, mut rx) = create_provider_stream_queue(8);
+        let config = LaserStreamConfig::new(format!("http://{addr}"), "token")
+            .with_stream(LaserStreamStream::Transaction)
+            .with_max_reconnect_attempts(1)
+            .with_reconnect_delay(Duration::from_millis(10))
+            .with_connect_timeout(Duration::from_secs(2));
+        let handle = spawn_laserstream_transaction_source(config, tx)
+            .await
+            .expect("spawn LaserStream transaction source");
+
+        let event = loop {
+            let update = timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("provider update timeout")
+                .expect("provider update");
+            match update {
+                ProviderStreamUpdate::Transaction(event) => break event,
+                ProviderStreamUpdate::Health(_) => continue,
+                other => panic!("expected transaction update, got {other:?}"),
+            }
+        };
+        assert_eq!(event.slot, 91);
+        assert_eq!(event.kind, TxKind::Mixed);
+        assert!(event.signature.is_some());
+
+        handle.abort();
+        handle.await.ok();
+        let _ = shutdown_tx.send(());
+        server.await.expect("LaserStream server task");
+    }
+
+    #[tokio::test]
     async fn laserstream_local_source_delivers_transaction_status_update() {
         let update = sample_status_update(91);
         let (addr, shutdown_tx, server) = spawn_laserstream_test_server(MockLaserStream {
-            expected_stream: LaserStreamStream::TransactionStatus,
+            expected_stream: MockLaserStreamStream::TransactionStatus,
             expected_account: None,
             expected_owner: None,
             update,
@@ -1845,7 +1896,7 @@ mod tests {
         let owner = Pubkey::new_unique();
         let update = sample_account_update(92, pubkey, owner);
         let (addr, shutdown_tx, server) = spawn_laserstream_test_server(MockLaserStream {
-            expected_stream: LaserStreamStream::Accounts,
+            expected_stream: MockLaserStreamStream::Accounts,
             expected_account: Some(pubkey.to_string()),
             expected_owner: Some(owner.to_string()),
             update,
@@ -1880,6 +1931,59 @@ mod tests {
         assert_eq!(event.owner, owner.into());
         assert_eq!(event.lamports, 42);
         assert_eq!(event.data.as_ref(), &[1, 2, 3, 4]);
+
+        handle.abort();
+        handle.await.ok();
+        let _ = shutdown_tx.send(());
+        server.await.expect("LaserStream server task");
+    }
+
+    #[tokio::test]
+    async fn laserstream_local_slot_source_delivers_slot_status_update() {
+        let update = grpc::SubscribeUpdate {
+            filters: vec!["sof".to_owned()],
+            created_at: None,
+            update_oneof: Some(grpc::subscribe_update::UpdateOneof::Slot(
+                grpc::SubscribeUpdateSlot {
+                    slot: 93,
+                    parent: Some(92),
+                    status: grpc::SlotStatus::SlotConfirmed as i32,
+                    dead_error: Some(String::new()),
+                },
+            )),
+        };
+        let (addr, shutdown_tx, server) = spawn_laserstream_test_server(MockLaserStream {
+            expected_stream: MockLaserStreamStream::Slots,
+            expected_account: None,
+            expected_owner: None,
+            update,
+        })
+        .await;
+
+        let (tx, mut rx) = create_provider_stream_queue(8);
+        let config = LaserStreamSlotsConfig::new(format!("http://{addr}"), "token")
+            .with_max_reconnect_attempts(1)
+            .with_reconnect_delay(Duration::from_millis(10))
+            .with_connect_timeout(Duration::from_secs(2));
+        let handle = spawn_laserstream_slot_source(config, tx)
+            .await
+            .expect("spawn LaserStream slot source");
+
+        let event = loop {
+            let update = timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("provider update timeout")
+                .expect("provider update");
+            match update {
+                ProviderStreamUpdate::SlotStatus(event) => break event,
+                ProviderStreamUpdate::Health(_) => continue,
+                other => panic!("expected slot-status update, got {other:?}"),
+            }
+        };
+        assert_eq!(event.slot, 93);
+        assert_eq!(event.parent_slot, Some(92));
+        assert_eq!(event.status, ForkSlotStatus::Confirmed);
+        assert_eq!(event.confirmed_slot, Some(93));
 
         handle.abort();
         handle.await.ok();
@@ -2047,9 +2151,17 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum MockLaserStreamStream {
+        Transaction,
+        TransactionStatus,
+        Accounts,
+        Slots,
+    }
+
     #[derive(Clone)]
     struct MockLaserStream {
-        expected_stream: LaserStreamStream,
+        expected_stream: MockLaserStreamStream,
         expected_account: Option<String>,
         expected_owner: Option<String>,
         update: grpc::SubscribeUpdate,
@@ -2073,13 +2185,13 @@ mod tests {
                 .await?
                 .ok_or_else(|| Status::invalid_argument("missing subscribe request"))?;
             match self.expected_stream {
-                LaserStreamStream::Transaction => {
+                MockLaserStreamStream::Transaction => {
                     assert!(first.transactions.contains_key("sof"));
                 }
-                LaserStreamStream::TransactionStatus => {
+                MockLaserStreamStream::TransactionStatus => {
                     assert!(first.transactions_status.contains_key("sof"));
                 }
-                LaserStreamStream::Accounts => {
+                MockLaserStreamStream::Accounts => {
                     let filter = first
                         .accounts
                         .get("sof")
@@ -2090,6 +2202,9 @@ mod tests {
                     if let Some(owner) = &self.expected_owner {
                         assert!(filter.owner.iter().any(|value| value == owner));
                     }
+                }
+                MockLaserStreamStream::Slots => {
+                    assert!(first.slots.contains_key("sof"));
                 }
             }
             let (tx, rx) = futures_mpsc::unbounded();

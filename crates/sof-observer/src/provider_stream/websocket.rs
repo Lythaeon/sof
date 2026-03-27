@@ -1963,7 +1963,7 @@ impl RpcLoadedAddresses {
 mod tests {
     use super::*;
     use crate::event::TxKind;
-    use crate::provider_stream::create_provider_stream_queue;
+    use crate::provider_stream::{create_provider_stream_fan_in, create_provider_stream_queue};
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use serde_json::json;
     use solana_keypair::Keypair;
@@ -2792,6 +2792,134 @@ mod tests {
         handle.abort();
         handle.await.ok();
         server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn websocket_fan_in_delivers_updates_from_multiple_sources() {
+        let tx_listener = TcpListener::bind("127.0.0.1:0").await.expect("tx listener");
+        let tx_addr = tx_listener.local_addr().expect("tx local addr");
+        let tx_payload = sample_notification_payload();
+
+        let logs_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("logs listener");
+        let logs_addr = logs_listener.local_addr().expect("logs local addr");
+        let log_signature = Signature::from([7_u8; 64]);
+        let logs_payload = json!({
+            "jsonrpc":"2.0",
+            "method":"logsNotification",
+            "params":{
+                "result":{
+                    "context":{"slot":101},
+                    "value":{
+                        "signature":log_signature.to_string(),
+                        "err":null,
+                        "logs":["Program log: fan-in"]
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let tx_server = tokio::spawn(async move {
+            let (stream, _) = tx_listener.accept().await.expect("accept tx");
+            let mut ws = accept_async(stream).await.expect("websocket handshake");
+            let subscribe = ws
+                .next()
+                .await
+                .expect("subscribe frame")
+                .expect("subscribe message");
+            match subscribe {
+                WsMessage::Text(text) => assert!(text.contains("transactionSubscribe")),
+                other => panic!("expected tx subscribe text frame, got {other:?}"),
+            }
+            ws.send(WsMessage::Text(
+                String::from(r#"{"jsonrpc":"2.0","id":1,"result":42}"#).into(),
+            ))
+            .await
+            .expect("tx ack");
+            ws.send(WsMessage::Text(
+                String::from_utf8(tx_payload)
+                    .expect("tx payload utf8")
+                    .into(),
+            ))
+            .await
+            .expect("tx notification");
+            ws.close(None).await.expect("tx close");
+        });
+
+        let logs_server = tokio::spawn(async move {
+            let (stream, _) = logs_listener.accept().await.expect("accept logs");
+            let mut ws = accept_async(stream).await.expect("websocket handshake");
+            let subscribe = ws
+                .next()
+                .await
+                .expect("subscribe frame")
+                .expect("subscribe message");
+            match subscribe {
+                WsMessage::Text(text) => assert!(text.contains("logsSubscribe")),
+                other => panic!("expected logs subscribe text frame, got {other:?}"),
+            }
+            ws.send(WsMessage::Text(
+                String::from(r#"{"jsonrpc":"2.0","id":1,"result":42}"#).into(),
+            ))
+            .await
+            .expect("logs ack");
+            ws.send(WsMessage::Text(logs_payload.into()))
+                .await
+                .expect("logs notification");
+            ws.close(None).await.expect("logs close");
+        });
+
+        let (fan_in, mut rx) = create_provider_stream_fan_in(8);
+        let tx_handle = fan_in
+            .spawn_websocket_transaction_source(
+                &WebsocketTransactionConfig::new(format!("ws://{tx_addr}"))
+                    .with_max_reconnect_attempts(1)
+                    .with_reconnect_delay(Duration::from_millis(10)),
+            )
+            .await
+            .expect("spawn websocket transaction source");
+        let logs_handle = fan_in
+            .spawn_websocket_logs_source(
+                &WebsocketLogsConfig::new(format!("ws://{logs_addr}"))
+                    .with_max_reconnect_attempts(1)
+                    .with_reconnect_delay(Duration::from_millis(10)),
+            )
+            .await
+            .expect("spawn websocket logs source");
+
+        let mut saw_transaction = false;
+        let mut saw_logs = false;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && (!saw_transaction || !saw_logs) {
+            let update = timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("provider update timeout")
+                .expect("provider update");
+            match update {
+                ProviderStreamUpdate::SerializedTransaction(event) => {
+                    saw_transaction = true;
+                    assert_eq!(event.slot, 55);
+                }
+                ProviderStreamUpdate::TransactionLog(event) => {
+                    saw_logs = true;
+                    assert_eq!(event.slot, 101);
+                    assert_eq!(event.signature, log_signature.into());
+                }
+                ProviderStreamUpdate::Health(_) => {}
+                other => panic!("unexpected fan-in update: {other:?}"),
+            }
+        }
+        assert!(saw_transaction);
+        assert!(saw_logs);
+
+        tx_handle.abort();
+        logs_handle.abort();
+        tx_handle.await.ok();
+        logs_handle.await.ok();
+        tx_server.await.expect("tx server task");
+        logs_server.await.expect("logs server task");
     }
 
     #[tokio::test]
