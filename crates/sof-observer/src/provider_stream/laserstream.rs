@@ -46,7 +46,7 @@ use crate::{
     provider_stream::{
         ProviderCommitmentWatermarks, ProviderReplayMode, ProviderSourceHealthEvent,
         ProviderSourceHealthReason, ProviderSourceHealthStatus, ProviderSourceId,
-        ProviderStreamFanIn, ProviderStreamSender, ProviderStreamUpdate,
+        ProviderSourceIdentity, ProviderStreamFanIn, ProviderStreamSender, ProviderStreamUpdate,
         classify_provider_transaction_kind,
     },
 };
@@ -109,6 +109,58 @@ pub struct LaserStreamConfig {
     reconnect_delay: Duration,
     max_reconnect_attempts: Option<u32>,
     replay_mode: ProviderReplayMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// One LaserStream stream-specific config option that may be invalid for a selected stream kind.
+pub enum LaserStreamConfigOption {
+    /// Vote transaction filter.
+    VoteFilter,
+    /// Failed transaction filter.
+    FailedFilter,
+    /// Single-signature filter.
+    SignatureFilter,
+    /// Account-include filter.
+    AccountIncludeFilter,
+    /// Account-exclude filter.
+    AccountExcludeFilter,
+    /// Account-required filter.
+    AccountRequiredFilter,
+    /// Explicit account pubkey filter.
+    Accounts,
+    /// Explicit owner/program filter.
+    Owners,
+    /// Require account updates to carry a transaction signature.
+    RequireTransactionSignature,
+}
+
+impl std::fmt::Display for LaserStreamConfigOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::VoteFilter => f.write_str("vote filter"),
+            Self::FailedFilter => f.write_str("failed filter"),
+            Self::SignatureFilter => f.write_str("signature filter"),
+            Self::AccountIncludeFilter => f.write_str("account-include filter"),
+            Self::AccountExcludeFilter => f.write_str("account-exclude filter"),
+            Self::AccountRequiredFilter => f.write_str("account-required filter"),
+            Self::Accounts => f.write_str("accounts filter"),
+            Self::Owners => f.write_str("owners filter"),
+            Self::RequireTransactionSignature => f.write_str("require-transaction-signature"),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+/// Typed LaserStream config validation failures for built-in stream selectors.
+pub enum LaserStreamConfigError {
+    /// The selected LaserStream stream kind does not support one configured option.
+    #[error("{option} is not supported for laserstream {stream} streams")]
+    UnsupportedOption {
+        /// Built-in LaserStream stream family receiving the invalid option.
+        stream: LaserStreamStreamKind,
+        /// Typed config option that is unsupported for that stream family.
+        option: LaserStreamConfigOption,
+    },
 }
 
 impl LaserStreamConfig {
@@ -286,6 +338,65 @@ impl LaserStreamConfig {
     pub const fn with_max_encoding_message_size(mut self, bytes: usize) -> Self {
         self.max_encoding_message_size = Some(bytes);
         self
+    }
+
+    fn validate(&self) -> Result<(), LaserStreamConfigError> {
+        match self.stream {
+            LaserStreamStream::Transaction | LaserStreamStream::TransactionStatus => {
+                self.validate_non_account_stream()?;
+            }
+            LaserStreamStream::Accounts => {
+                self.validate_accounts_stream()?;
+            }
+            LaserStreamStream::BlockMeta => {
+                self.validate_non_account_stream()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_non_account_stream(&self) -> Result<(), LaserStreamConfigError> {
+        if let Some(option) = [
+            (!self.accounts.is_empty()).then_some(LaserStreamConfigOption::Accounts),
+            (!self.owners.is_empty()).then_some(LaserStreamConfigOption::Owners),
+            self.require_txn_signature
+                .then_some(LaserStreamConfigOption::RequireTransactionSignature),
+        ]
+        .into_iter()
+        .flatten()
+        .next()
+        {
+            return Err(LaserStreamConfigError::UnsupportedOption {
+                stream: self.stream_kind(),
+                option,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_accounts_stream(&self) -> Result<(), LaserStreamConfigError> {
+        if let Some(option) = [
+            self.vote.map(|_| LaserStreamConfigOption::VoteFilter),
+            self.failed.map(|_| LaserStreamConfigOption::FailedFilter),
+            self.signature
+                .map(|_| LaserStreamConfigOption::SignatureFilter),
+            (!self.account_include.is_empty())
+                .then_some(LaserStreamConfigOption::AccountIncludeFilter),
+            (!self.account_exclude.is_empty())
+                .then_some(LaserStreamConfigOption::AccountExcludeFilter),
+            (!self.account_required.is_empty())
+                .then_some(LaserStreamConfigOption::AccountRequiredFilter),
+        ]
+        .into_iter()
+        .flatten()
+        .next()
+        {
+            return Err(LaserStreamConfigError::UnsupportedOption {
+                stream: self.stream_kind(),
+                option,
+            });
+        }
+        Ok(())
     }
 
     /// Sets the max reconnect attempts used by the SDK.
@@ -625,6 +736,9 @@ impl LaserStreamSlotsConfig {
 /// LaserStream transaction-stream error surface.
 #[derive(Debug, Error)]
 pub enum LaserStreamError {
+    /// Invalid config for the selected LaserStream stream kind.
+    #[error(transparent)]
+    Config(#[from] LaserStreamConfigError),
     /// Stream status or transport errors from the SDK.
     #[error(transparent)]
     Client(#[from] ClientError),
@@ -720,6 +834,19 @@ type LaserStreamUpdateStream = std::pin::Pin<
     >,
 >;
 
+struct LaserStreamPrimaryConnectionState<'state> {
+    tracked_slot: &'state mut u64,
+    watermarks: &'state mut ProviderCommitmentWatermarks,
+    session_established: &'state mut bool,
+}
+
+struct LaserStreamSlotConnectionState<'state> {
+    tracked_slot: &'state mut u64,
+    watermarks: &'state mut ProviderCommitmentWatermarks,
+    slot_states: &'state mut HashMap<u64, ForkSlotStatus>,
+    session_established: &'state mut bool,
+}
+
 /// Spawns one LaserStream transaction forwarder into a SOF provider-stream queue.
 ///
 /// # Examples
@@ -748,6 +875,8 @@ pub async fn spawn_laserstream_transaction_source(
     config: LaserStreamConfig,
     sender: ProviderStreamSender,
 ) -> Result<JoinHandle<Result<(), LaserStreamError>>, LaserStreamError> {
+    config.validate()?;
+    let source = ProviderSourceIdentity::generated(config.source_id(), None);
     let first_session =
         connect_and_subscribe_once(&config, config.subscribe_request_with_state(0)).await?;
     Ok(tokio::spawn(async move {
@@ -770,10 +899,13 @@ pub async fn spawn_laserstream_transaction_source(
             match session {
                 Ok((subscribe_tx, stream)) => match run_laserstream_primary_connection(
                     &config,
+                    &source,
                     &sender,
-                    &mut tracked_slot,
-                    &mut watermarks,
-                    &mut session_established,
+                    LaserStreamPrimaryConnectionState {
+                        tracked_slot: &mut tracked_slot,
+                        watermarks: &mut watermarks,
+                        session_established: &mut session_established,
+                    },
                     subscribe_tx,
                     stream,
                 )
@@ -790,7 +922,7 @@ pub async fn spawn_laserstream_transaction_source(
                             "provider stream laserstream session ended unexpectedly; reconnecting"
                         );
                         send_primary_provider_health(
-                            &config,
+                            &source,
                             &sender,
                             ProviderSourceHealthStatus::Reconnecting,
                             ProviderSourceHealthReason::UpstreamStreamClosedUnexpectedly,
@@ -808,7 +940,7 @@ pub async fn spawn_laserstream_transaction_source(
                             "provider stream laserstream session ended; reconnecting"
                         );
                         send_primary_provider_health(
-                            &config,
+                            &source,
                             &sender,
                             ProviderSourceHealthStatus::Reconnecting,
                             laserstream_health_reason(&error),
@@ -824,7 +956,7 @@ pub async fn spawn_laserstream_transaction_source(
                         "provider stream laserstream connect/subscribe failed; reconnecting"
                     );
                     send_primary_provider_health(
-                        &config,
+                        &source,
                         &sender,
                         ProviderSourceHealthStatus::Reconnecting,
                         laserstream_health_reason(&error),
@@ -844,7 +976,7 @@ pub async fn spawn_laserstream_transaction_source(
                 let detail =
                     format!("exhausted laserstream reconnect attempts after {attempts} failures");
                 send_primary_provider_health(
-                    &config,
+                    &source,
                     &sender,
                     ProviderSourceHealthStatus::Unhealthy,
                     ProviderSourceHealthReason::ReconnectBudgetExhausted,
@@ -859,10 +991,15 @@ pub async fn spawn_laserstream_transaction_source(
 }
 
 /// Spawns one LaserStream slot forwarder into a SOF provider-stream queue.
+///
+/// # Errors
+///
+/// Returns an error if the initial client connect or subscribe step fails.
 pub async fn spawn_laserstream_slot_source(
     config: LaserStreamSlotsConfig,
     sender: ProviderStreamSender,
 ) -> Result<JoinHandle<Result<(), LaserStreamError>>, LaserStreamError> {
+    let source = ProviderSourceIdentity::generated(ProviderSourceId::LaserStreamSlots, None);
     let first_session =
         connect_and_subscribe_slots_once(&config, config.subscribe_request_with_state(0)).await?;
     Ok(tokio::spawn(async move {
@@ -886,11 +1023,14 @@ pub async fn spawn_laserstream_slot_source(
             match session {
                 Ok((subscribe_tx, stream)) => match run_laserstream_slot_connection(
                     &config,
+                    &source,
                     &sender,
-                    &mut tracked_slot,
-                    &mut watermarks,
-                    &mut slot_states,
-                    &mut session_established,
+                    LaserStreamSlotConnectionState {
+                        tracked_slot: &mut tracked_slot,
+                        watermarks: &mut watermarks,
+                        slot_states: &mut slot_states,
+                        session_established: &mut session_established,
+                    },
                     subscribe_tx,
                     stream,
                 )
@@ -904,6 +1044,7 @@ pub async fn spawn_laserstream_slot_source(
                             "provider stream laserstream slot session ended unexpectedly; reconnecting"
                         );
                         send_provider_slot_health(
+                            &source,
                             &sender,
                             ProviderSourceHealthStatus::Reconnecting,
                             ProviderSourceHealthReason::UpstreamStreamClosedUnexpectedly,
@@ -921,6 +1062,7 @@ pub async fn spawn_laserstream_slot_source(
                             "provider stream laserstream slot session ended; reconnecting"
                         );
                         send_provider_slot_health(
+                            &source,
                             &sender,
                             ProviderSourceHealthStatus::Reconnecting,
                             laserstream_health_reason(&error),
@@ -936,6 +1078,7 @@ pub async fn spawn_laserstream_slot_source(
                         "provider stream laserstream slot connect/subscribe failed; reconnecting"
                     );
                     send_provider_slot_health(
+                        &source,
                         &sender,
                         ProviderSourceHealthStatus::Reconnecting,
                         laserstream_health_reason(&error),
@@ -956,6 +1099,7 @@ pub async fn spawn_laserstream_slot_source(
                     "exhausted laserstream slot reconnect attempts after {attempts} failures"
                 );
                 send_provider_slot_health(
+                    &source,
                     &sender,
                     ProviderSourceHealthStatus::Unhealthy,
                     ProviderSourceHealthReason::ReconnectBudgetExhausted,
@@ -971,18 +1115,17 @@ pub async fn spawn_laserstream_slot_source(
 
 async fn run_laserstream_primary_connection(
     config: &LaserStreamConfig,
+    source: &ProviderSourceIdentity,
     sender: &ProviderStreamSender,
-    tracked_slot: &mut u64,
-    watermarks: &mut ProviderCommitmentWatermarks,
-    session_established: &mut bool,
+    state: LaserStreamPrimaryConnectionState<'_>,
     _subscribe_tx: LaserStreamSubscribeSink,
     mut stream: LaserStreamUpdateStream,
 ) -> Result<(), LaserStreamError> {
-    *session_established = false;
+    *state.session_established = false;
     let commitment = config.commitment.as_tx_commitment();
-    *session_established = true;
+    *state.session_established = true;
     send_primary_provider_health(
-        config,
+        source,
         sender,
         ProviderSourceHealthStatus::Healthy,
         ProviderSourceHealthReason::SubscriptionAckReceived,
@@ -1014,7 +1157,7 @@ async fn run_laserstream_primary_connection(
                 last_progress = Instant::now();
                 match update.update_oneof {
                     Some(grpc::subscribe_update::UpdateOneof::Slot(slot_update)) => {
-                        *tracked_slot = (*tracked_slot).max(slot_update.slot);
+                        *state.tracked_slot = (*state.tracked_slot).max(slot_update.slot);
                         if update
                             .filters
                             .iter()
@@ -1022,10 +1165,10 @@ async fn run_laserstream_primary_connection(
                         {
                             match grpc::SlotStatus::try_from(slot_update.status).ok() {
                                 Some(grpc::SlotStatus::SlotConfirmed) => {
-                                    watermarks.observe_confirmed_slot(slot_update.slot);
+                                    state.watermarks.observe_confirmed_slot(slot_update.slot);
                                 }
                                 Some(grpc::SlotStatus::SlotFinalized) => {
-                                    watermarks.observe_finalized_slot(slot_update.slot);
+                                    state.watermarks.observe_finalized_slot(slot_update.slot);
                                 }
                                 _ => {}
                             }
@@ -1034,62 +1177,85 @@ async fn run_laserstream_primary_connection(
                     Some(grpc::subscribe_update::UpdateOneof::Transaction(tx_update))
                         if config.stream == LaserStreamStream::Transaction =>
                     {
-                        *tracked_slot = (*tracked_slot).max(tx_update.slot);
-                        watermarks.observe_transaction_commitment(tx_update.slot, commitment);
+                        *state.tracked_slot = (*state.tracked_slot).max(tx_update.slot);
+                        state
+                            .watermarks
+                            .observe_transaction_commitment(tx_update.slot, commitment);
                         let event = transaction_event_from_update(
                             tx_update.slot,
                             tx_update.transaction,
                             commitment,
-                            *watermarks,
+                            *state.watermarks,
                         )?;
                         sender
-                            .send(ProviderStreamUpdate::Transaction(event))
+                            .send(
+                                ProviderStreamUpdate::Transaction(event)
+                                    .with_provider_source(source.clone()),
+                            )
                             .await
                             .map_err(|_error| LaserStreamError::QueueClosed)?;
                     }
                     Some(grpc::subscribe_update::UpdateOneof::TransactionStatus(status_update))
                         if config.stream == LaserStreamStream::TransactionStatus =>
                     {
-                        *tracked_slot = (*tracked_slot).max(status_update.slot);
-                        watermarks.observe_transaction_commitment(status_update.slot, commitment);
+                        *state.tracked_slot = (*state.tracked_slot).max(status_update.slot);
+                        state
+                            .watermarks
+                            .observe_transaction_commitment(status_update.slot, commitment);
                         let event = transaction_status_event_from_update(
                             commitment,
-                            *watermarks,
+                            *state.watermarks,
                             status_update,
                         )?;
                         sender
-                            .send(ProviderStreamUpdate::TransactionStatus(event))
+                            .send(
+                                ProviderStreamUpdate::TransactionStatus(event)
+                                    .with_provider_source(source.clone()),
+                            )
                             .await
                             .map_err(|_error| LaserStreamError::QueueClosed)?;
                     }
                     Some(grpc::subscribe_update::UpdateOneof::Account(account_update))
                         if config.stream == LaserStreamStream::Accounts =>
                     {
-                        *tracked_slot = (*tracked_slot).max(account_update.slot);
-                        observe_non_transaction_commitment(watermarks, account_update.slot, commitment);
-                        let event =
-                            account_update_event_from_laserstream(account_update, commitment, *watermarks)?;
+                        *state.tracked_slot = (*state.tracked_slot).max(account_update.slot);
+                        observe_non_transaction_commitment(
+                            state.watermarks,
+                            account_update.slot,
+                            commitment,
+                        );
+                        let event = account_update_event_from_laserstream(
+                            account_update,
+                            commitment,
+                            *state.watermarks,
+                        )?;
                         sender
-                            .send(ProviderStreamUpdate::AccountUpdate(event))
+                            .send(
+                                ProviderStreamUpdate::AccountUpdate(event)
+                                    .with_provider_source(source.clone()),
+                            )
                             .await
                             .map_err(|_error| LaserStreamError::QueueClosed)?;
                     }
                     Some(grpc::subscribe_update::UpdateOneof::BlockMeta(block_meta_update))
                         if config.stream == LaserStreamStream::BlockMeta =>
                     {
-                        *tracked_slot = (*tracked_slot).max(block_meta_update.slot);
+                        *state.tracked_slot = (*state.tracked_slot).max(block_meta_update.slot);
                         observe_non_transaction_commitment(
-                            watermarks,
+                            state.watermarks,
                             block_meta_update.slot,
                             commitment,
                         );
                         let event = block_meta_event_from_update(
                             commitment,
-                            *watermarks,
-                            block_meta_update,
+                            *state.watermarks,
+                            &block_meta_update,
                         )?;
                         sender
-                            .send(ProviderStreamUpdate::BlockMeta(event))
+                            .send(
+                                ProviderStreamUpdate::BlockMeta(event)
+                                    .with_provider_source(source.clone()),
+                            )
                             .await
                             .map_err(|_error| LaserStreamError::QueueClosed)?;
                     }
@@ -1102,17 +1268,16 @@ async fn run_laserstream_primary_connection(
 
 async fn run_laserstream_slot_connection(
     config: &LaserStreamSlotsConfig,
+    source: &ProviderSourceIdentity,
     sender: &ProviderStreamSender,
-    tracked_slot: &mut u64,
-    watermarks: &mut ProviderCommitmentWatermarks,
-    slot_states: &mut HashMap<u64, ForkSlotStatus>,
-    session_established: &mut bool,
+    state: LaserStreamSlotConnectionState<'_>,
     _subscribe_tx: LaserStreamSubscribeSink,
     mut stream: LaserStreamUpdateStream,
 ) -> Result<(), LaserStreamError> {
-    *session_established = false;
-    *session_established = true;
+    *state.session_established = false;
+    *state.session_established = true;
     send_provider_slot_health(
+        source,
         sender,
         ProviderSourceHealthStatus::Healthy,
         ProviderSourceHealthReason::SubscriptionAckReceived,
@@ -1140,16 +1305,19 @@ async fn run_laserstream_slot_connection(
                     .map_err(|error| LaserStreamProtocolError::StreamStatus(error.to_string()))?;
                 last_progress = Instant::now();
                 if let Some(grpc::subscribe_update::UpdateOneof::Slot(slot_update)) = update.update_oneof {
-                    *tracked_slot = (*tracked_slot).max(slot_update.slot);
+                    *state.tracked_slot = (*state.tracked_slot).max(slot_update.slot);
                     if let Some(event) = slot_status_event_from_update(
                         slot_update.slot,
                         slot_update.parent,
                         grpc::SlotStatus::try_from(slot_update.status).ok(),
-                        watermarks,
-                        slot_states,
+                        state.watermarks,
+                        state.slot_states,
                     ) {
                         sender
-                            .send(ProviderStreamUpdate::SlotStatus(event))
+                            .send(
+                                ProviderStreamUpdate::SlotStatus(event)
+                                    .with_provider_source(source.clone()),
+                            )
                             .await
                             .map_err(|_error| LaserStreamError::QueueClosed)?;
                     }
@@ -1160,7 +1328,7 @@ async fn run_laserstream_slot_connection(
 }
 
 async fn send_primary_provider_health(
-    config: &LaserStreamConfig,
+    source: &ProviderSourceIdentity,
     sender: &ProviderStreamSender,
     status: ProviderSourceHealthStatus,
     reason: ProviderSourceHealthReason,
@@ -1168,7 +1336,7 @@ async fn send_primary_provider_health(
 ) -> Result<(), LaserStreamError> {
     sender
         .send(ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
-            source: config.source_id(),
+            source: source.clone(),
             status,
             reason,
             message,
@@ -1178,6 +1346,7 @@ async fn send_primary_provider_health(
 }
 
 async fn send_provider_slot_health(
+    source: &ProviderSourceIdentity,
     sender: &ProviderStreamSender,
     status: ProviderSourceHealthStatus,
     reason: ProviderSourceHealthReason,
@@ -1185,7 +1354,7 @@ async fn send_provider_slot_health(
 ) -> Result<(), LaserStreamError> {
     sender
         .send(ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
-            source: ProviderSourceId::LaserStreamSlots,
+            source: source.clone(),
             status,
             reason,
             message,
@@ -1197,9 +1366,9 @@ async fn send_provider_slot_health(
 const fn laserstream_health_reason(error: &LaserStreamError) -> ProviderSourceHealthReason {
     match error {
         LaserStreamError::Client(_) => ProviderSourceHealthReason::UpstreamTransportFailure,
-        LaserStreamError::Convert(_) | LaserStreamError::Protocol(_) => {
-            ProviderSourceHealthReason::UpstreamProtocolFailure
-        }
+        LaserStreamError::Config(_)
+        | LaserStreamError::Convert(_)
+        | LaserStreamError::Protocol(_) => ProviderSourceHealthReason::UpstreamProtocolFailure,
         LaserStreamError::QueueClosed => ProviderSourceHealthReason::UpstreamProtocolFailure,
     }
 }
@@ -1424,6 +1593,7 @@ fn transaction_event_from_update(
         confirmed_slot: watermarks.confirmed_slot,
         finalized_slot: watermarks.finalized_slot,
         signature,
+        provider_source: None,
         kind: if is_vote {
             TxKind::VoteOnly
         } else {
@@ -1451,6 +1621,7 @@ fn transaction_status_event_from_update(
         is_vote: update.is_vote,
         index: Some(update.index),
         err: update.err.map(|error| format!("{error:?}")),
+        provider_source: None,
     })
 }
 
@@ -1486,13 +1657,14 @@ fn account_update_event_from_laserstream(
         txn_signature,
         is_startup: update.is_startup,
         matched_filter: None,
+        provider_source: None,
     })
 }
 
 fn block_meta_event_from_update(
     commitment_status: TxCommitmentStatus,
     watermarks: ProviderCommitmentWatermarks,
-    update: grpc::SubscribeUpdateBlockMeta,
+    update: &grpc::SubscribeUpdateBlockMeta,
 ) -> Result<BlockMetaEvent, LaserStreamError> {
     let blockhash = Hash::from_str(&update.blockhash)
         .map_err(|_error| LaserStreamError::Convert("invalid block-meta blockhash"))?;
@@ -1510,6 +1682,7 @@ fn block_meta_event_from_update(
         block_height: update.block_height.map(|value| value.block_height),
         executed_transaction_count: update.executed_transaction_count,
         entries_count: update.entries_count,
+        provider_source: None,
     })
 }
 
@@ -1583,11 +1756,17 @@ fn slot_status_event_from_update(
         tip_slot: None,
         confirmed_slot: watermarks.confirmed_slot,
         finalized_slot: watermarks.finalized_slot,
+        provider_source: None,
     })
 }
 
 impl ProviderStreamFanIn {
     /// Spawns one LaserStream transaction source into this fan-in.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the selected config is invalid or the source cannot
+    /// be started.
     pub async fn spawn_laserstream_transaction_source(
         &self,
         config: LaserStreamConfig,
@@ -1596,6 +1775,10 @@ impl ProviderStreamFanIn {
     }
 
     /// Spawns one LaserStream slot source into this fan-in.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the source cannot be started.
     pub async fn spawn_laserstream_slot_source(
         &self,
         config: LaserStreamSlotsConfig,
@@ -1688,6 +1871,11 @@ fn convert_transaction(
 }
 
 #[cfg(all(test, feature = "provider-grpc"))]
+#[allow(
+    clippy::let_underscore_must_use,
+    clippy::shadow_unrelated,
+    clippy::wildcard_enum_match_arm
+)]
 mod tests {
     use super::*;
     use crate::provider_stream::create_provider_stream_queue;
@@ -2464,6 +2652,7 @@ mod tests {
             signature,
             kind: classify_provider_transaction_kind(&tx),
             tx: Arc::new(tx),
+            provider_source: None,
         })
     }
 
@@ -2568,6 +2757,26 @@ mod tests {
             signatures,
             message,
         })
+    }
+
+    #[tokio::test]
+    async fn laserstream_spawn_rejects_account_filters_for_block_meta_stream() {
+        let (tx, _rx) = crate::provider_stream::create_provider_stream_queue(1);
+        let config = LaserStreamConfig::new("http://127.0.0.1:1", "test-api-key")
+            .with_stream(LaserStreamStream::BlockMeta)
+            .with_accounts([Pubkey::new_unique()]);
+
+        let error = spawn_laserstream_transaction_source(config, tx)
+            .await
+            .expect_err("block-meta stream should reject account filters");
+
+        match error {
+            LaserStreamError::Config(LaserStreamConfigError::UnsupportedOption {
+                option: LaserStreamConfigOption::Accounts,
+                stream: LaserStreamStreamKind::BlockMeta,
+            }) => {}
+            other => panic!("expected accounts config rejection, got {other:?}"),
+        }
     }
 
     #[test]

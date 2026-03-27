@@ -29,8 +29,9 @@ use crate::{
     framework::{AccountUpdateEvent, TransactionEvent, pubkey_bytes, signature_bytes_opt},
     provider_stream::{
         ProviderCommitmentWatermarks, ProviderSourceHealthEvent, ProviderSourceHealthReason,
-        ProviderSourceHealthStatus, ProviderSourceId, ProviderStreamFanIn, ProviderStreamSender,
-        ProviderStreamUpdate, SerializedTransactionEvent, classify_provider_transaction_kind,
+        ProviderSourceHealthStatus, ProviderSourceId, ProviderSourceIdentity, ProviderStreamFanIn,
+        ProviderStreamSender, ProviderStreamUpdate, SerializedTransactionEvent,
+        classify_provider_transaction_kind,
     },
 };
 
@@ -83,7 +84,64 @@ pub struct WebsocketTransactionConfig {
     reconnect_delay: Duration,
     max_reconnect_attempts: Option<u32>,
     replay_on_reconnect: bool,
+    replay_on_reconnect_explicit: bool,
     replay_max_slots: u64,
+    replay_max_slots_explicit: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// One stream-specific websocket config option that may be invalid for a selected stream kind.
+pub enum WebsocketConfigOption {
+    /// HTTP companion endpoint used for reconnect backfill.
+    HttpEndpoint,
+    /// Vote transaction filter.
+    VoteFilter,
+    /// Failed transaction filter.
+    FailedFilter,
+    /// Single-signature filter.
+    SignatureFilter,
+    /// Account-include filter.
+    AccountIncludeFilter,
+    /// Account-exclude filter.
+    AccountExcludeFilter,
+    /// Account-required filter.
+    AccountRequiredFilter,
+    /// Replay-on-reconnect toggle.
+    ReplayOnReconnect,
+    /// Replay window in slots.
+    ReplayMaxSlots,
+    /// `programSubscribe` filter list.
+    ProgramFilters,
+}
+
+impl std::fmt::Display for WebsocketConfigOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HttpEndpoint => f.write_str("http replay endpoint"),
+            Self::VoteFilter => f.write_str("vote filter"),
+            Self::FailedFilter => f.write_str("failed filter"),
+            Self::SignatureFilter => f.write_str("signature filter"),
+            Self::AccountIncludeFilter => f.write_str("account-include filter"),
+            Self::AccountExcludeFilter => f.write_str("account-exclude filter"),
+            Self::AccountRequiredFilter => f.write_str("account-required filter"),
+            Self::ReplayOnReconnect => f.write_str("replay-on-reconnect"),
+            Self::ReplayMaxSlots => f.write_str("replay-max-slots"),
+            Self::ProgramFilters => f.write_str("program filters"),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+/// Typed websocket config validation failures for built-in stream selectors.
+pub enum WebsocketConfigError {
+    /// The selected websocket stream kind does not support one configured option.
+    #[error("{option} is not supported for websocket {stream} streams")]
+    UnsupportedOption {
+        /// Built-in websocket stream family receiving the invalid option.
+        stream: WebsocketStreamKind,
+        /// Typed config option that is unsupported for that stream family.
+        option: WebsocketConfigOption,
+    },
 }
 
 impl WebsocketTransactionConfig {
@@ -119,7 +177,9 @@ impl WebsocketTransactionConfig {
             reconnect_delay: Duration::from_secs(1),
             max_reconnect_attempts: None,
             replay_on_reconnect: true,
+            replay_on_reconnect_explicit: false,
             replay_max_slots: 128,
+            replay_max_slots_explicit: false,
         }
     }
 
@@ -239,6 +299,7 @@ impl WebsocketTransactionConfig {
     #[must_use]
     pub const fn with_replay_on_reconnect(mut self, replay: bool) -> Self {
         self.replay_on_reconnect = replay;
+        self.replay_on_reconnect_explicit = true;
         self
     }
 
@@ -246,6 +307,7 @@ impl WebsocketTransactionConfig {
     #[must_use]
     pub const fn with_replay_max_slots(mut self, slots: u64) -> Self {
         self.replay_max_slots = slots;
+        self.replay_max_slots_explicit = true;
         self
     }
 
@@ -257,6 +319,64 @@ impl WebsocketTransactionConfig {
     {
         self.program_filters.extend(filters);
         self
+    }
+
+    fn validate(&self) -> Result<(), WebsocketConfigError> {
+        match self.stream {
+            WebsocketPrimaryStream::Transaction => {
+                if !self.program_filters.is_empty() {
+                    return Err(WebsocketConfigError::UnsupportedOption {
+                        stream: self.stream_kind(),
+                        option: WebsocketConfigOption::ProgramFilters,
+                    });
+                }
+            }
+            WebsocketPrimaryStream::Account(_) => {
+                self.validate_non_transaction_stream()?;
+                if !self.program_filters.is_empty() {
+                    return Err(WebsocketConfigError::UnsupportedOption {
+                        stream: self.stream_kind(),
+                        option: WebsocketConfigOption::ProgramFilters,
+                    });
+                }
+            }
+            WebsocketPrimaryStream::Program(_) => {
+                self.validate_non_transaction_stream()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_non_transaction_stream(&self) -> Result<(), WebsocketConfigError> {
+        if let Some(option) = [
+            self.http_endpoint
+                .as_ref()
+                .map(|_| WebsocketConfigOption::HttpEndpoint),
+            self.vote.map(|_| WebsocketConfigOption::VoteFilter),
+            self.failed.map(|_| WebsocketConfigOption::FailedFilter),
+            self.signature
+                .map(|_| WebsocketConfigOption::SignatureFilter),
+            (!self.account_include.is_empty())
+                .then_some(WebsocketConfigOption::AccountIncludeFilter),
+            (!self.account_exclude.is_empty())
+                .then_some(WebsocketConfigOption::AccountExcludeFilter),
+            (!self.account_required.is_empty())
+                .then_some(WebsocketConfigOption::AccountRequiredFilter),
+            (self.replay_on_reconnect_explicit && self.replay_on_reconnect)
+                .then_some(WebsocketConfigOption::ReplayOnReconnect),
+            self.replay_max_slots_explicit
+                .then_some(WebsocketConfigOption::ReplayMaxSlots),
+        ]
+        .into_iter()
+        .flatten()
+        .next()
+        {
+            return Err(WebsocketConfigError::UnsupportedOption {
+                stream: self.stream_kind(),
+                option,
+            });
+        }
+        Ok(())
     }
 
     pub(crate) fn subscribe_request(&self) -> Value {
@@ -413,20 +533,15 @@ impl WebsocketProgramFilter {
 }
 
 /// Filter shape for websocket `logsSubscribe`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum WebsocketLogsFilter {
     /// Subscribe to all transaction logs except simple vote transactions.
+    #[default]
     All,
     /// Subscribe to all transaction logs including vote transactions.
     AllWithVotes,
     /// Subscribe to logs for one mentioned account/program pubkey.
     Mentions(Pubkey),
-}
-
-impl Default for WebsocketLogsFilter {
-    fn default() -> Self {
-        Self::All
-    }
 }
 
 /// Connection and filter config for websocket `logsSubscribe`.
@@ -527,6 +642,9 @@ impl WebsocketLogsConfig {
 /// Websocket `transactionSubscribe` error surface.
 #[derive(Debug, Error)]
 pub enum WebsocketTransactionError {
+    /// Invalid websocket config for the selected stream kind.
+    #[error(transparent)]
+    Config(#[from] WebsocketConfigError),
     /// Websocket transport failure.
     #[error(transparent)]
     Transport(#[from] tokio_tungstenite::tungstenite::Error),
@@ -678,7 +796,9 @@ pub async fn spawn_websocket_transaction_source(
     config: &WebsocketTransactionConfig,
     sender: ProviderStreamSender,
 ) -> Result<JoinHandle<Result<(), WebsocketTransactionError>>, WebsocketTransactionError> {
+    config.validate()?;
     let config = config.clone();
+    let source = ProviderSourceIdentity::generated(config.source_id(), None);
     let first_session = establish_websocket_primary_session(&config).await?;
     Ok(tokio::spawn(async move {
         let mut attempts = 0_u32;
@@ -694,6 +814,7 @@ pub async fn spawn_websocket_transaction_source(
             match session {
                 Ok(session) => match run_websocket_primary_connection(
                     &config,
+                    &source,
                     &sender,
                     &mut last_seen_slot,
                     &mut watermarks,
@@ -710,7 +831,7 @@ pub async fn spawn_websocket_transaction_source(
                             "provider stream websocket session ended; reconnecting"
                         );
                         send_primary_provider_health(
-                            &config,
+                            &source,
                             &sender,
                             ProviderSourceHealthStatus::Reconnecting,
                             ProviderSourceHealthReason::UpstreamStreamClosedUnexpectedly,
@@ -724,7 +845,7 @@ pub async fn spawn_websocket_transaction_source(
                     Err(error) => {
                         tracing::warn!(%error, endpoint = config.endpoint(), "provider stream websocket session ended; reconnecting");
                         send_primary_provider_health(
-                            &config,
+                            &source,
                             &sender,
                             ProviderSourceHealthStatus::Reconnecting,
                             websocket_health_reason(&error),
@@ -736,7 +857,7 @@ pub async fn spawn_websocket_transaction_source(
                 Err(error) => {
                     tracing::warn!(%error, endpoint = config.endpoint(), "provider stream websocket connect/subscribe failed; reconnecting");
                     send_primary_provider_health(
-                        &config,
+                        &source,
                         &sender,
                         ProviderSourceHealthStatus::Reconnecting,
                         websocket_health_reason(&error),
@@ -756,7 +877,7 @@ pub async fn spawn_websocket_transaction_source(
                 let detail =
                     format!("exhausted websocket reconnect attempts after {attempts} failures");
                 send_primary_provider_health(
-                    &config,
+                    &source,
                     &sender,
                     ProviderSourceHealthStatus::Unhealthy,
                     ProviderSourceHealthReason::ReconnectBudgetExhausted,
@@ -771,11 +892,16 @@ pub async fn spawn_websocket_transaction_source(
 }
 
 /// Spawns one websocket `logsSubscribe` source into a SOF provider-stream queue.
+///
+/// # Errors
+///
+/// Returns an error if the initial source connect or subscribe step fails.
 pub async fn spawn_websocket_logs_source(
     config: &WebsocketLogsConfig,
     sender: ProviderStreamSender,
 ) -> Result<JoinHandle<Result<(), WebsocketLogsError>>, WebsocketLogsError> {
     let config = config.clone();
+    let source = ProviderSourceIdentity::generated(ProviderSourceId::WebsocketLogs, None);
     let first_session = establish_websocket_logs_session(&config).await?;
     Ok(tokio::spawn(async move {
         let mut attempts = 0_u32;
@@ -790,6 +916,7 @@ pub async fn spawn_websocket_logs_source(
                 Ok(session) => {
                     match run_websocket_logs_connection(
                         &config,
+                        &source,
                         &sender,
                         &mut session_established,
                         session,
@@ -804,6 +931,7 @@ pub async fn spawn_websocket_logs_source(
                                 "provider stream websocket logs session ended; reconnecting"
                             );
                             send_provider_logs_health(
+                                &source,
                                 &sender,
                                 ProviderSourceHealthStatus::Reconnecting,
                                 ProviderSourceHealthReason::UpstreamStreamClosedUnexpectedly,
@@ -821,6 +949,7 @@ pub async fn spawn_websocket_logs_source(
                                 "provider stream websocket logs session ended; reconnecting"
                             );
                             send_provider_logs_health(
+                                &source,
                                 &sender,
                                 ProviderSourceHealthStatus::Reconnecting,
                                 websocket_logs_health_reason(&error),
@@ -837,6 +966,7 @@ pub async fn spawn_websocket_logs_source(
                         "provider stream websocket logs connect/subscribe failed; reconnecting"
                     );
                     send_provider_logs_health(
+                        &source,
                         &sender,
                         ProviderSourceHealthStatus::Reconnecting,
                         websocket_logs_health_reason(&error),
@@ -857,6 +987,7 @@ pub async fn spawn_websocket_logs_source(
                     "exhausted websocket logs reconnect attempts after {attempts} failures"
                 );
                 send_provider_logs_health(
+                    &source,
                     &sender,
                     ProviderSourceHealthStatus::Unhealthy,
                     ProviderSourceHealthReason::ReconnectBudgetExhausted,
@@ -872,6 +1003,7 @@ pub async fn spawn_websocket_logs_source(
 
 async fn run_websocket_primary_connection(
     config: &WebsocketTransactionConfig,
+    source: &ProviderSourceIdentity,
     sender: &ProviderStreamSender,
     last_seen_slot: &mut Option<u64>,
     watermarks: &mut ProviderCommitmentWatermarks,
@@ -882,7 +1014,7 @@ async fn run_websocket_primary_connection(
     let (mut write, mut read) = stream.split();
     *session_established = true;
     send_primary_provider_health(
-        config,
+        source,
         sender,
         ProviderSourceHealthStatus::Healthy,
         ProviderSourceHealthReason::SubscriptionAckReceived,
@@ -893,7 +1025,7 @@ async fn run_websocket_primary_connection(
         && config.replay_on_reconnect
         && last_seen_slot.is_some()
     {
-        replay_websocket_gap(config, sender, last_seen_slot, watermarks).await?;
+        replay_websocket_gap(config, source, sender, last_seen_slot, watermarks).await?;
     }
     let mut ping = config.ping_interval.map(tokio::time::interval);
     let mut scratch = WebsocketParseScratch::default();
@@ -931,26 +1063,34 @@ async fn run_websocket_primary_connection(
                 last_progress = tokio::time::Instant::now();
                 match frame {
                     WsMessage::Text(text) => {
-                        handle_primary_notification(
-                            config,
-                            sender,
+                        let mut state = WebsocketPrimaryNotificationState {
                             last_seen_slot,
                             watermarks,
+                            json_buffers: &mut scratch.json_buffers,
+                            tx_bytes: &mut scratch.tx_bytes,
+                        };
+                        handle_primary_notification(
+                            config,
+                            source,
+                            sender,
                             frame_bytes_mut(&mut scratch.frame_bytes, text.as_str().as_bytes()),
-                            &mut scratch.json_buffers,
-                            &mut scratch.tx_bytes,
+                            &mut state,
                         )
                         .await?;
                     }
                     WsMessage::Binary(bytes) => {
-                        handle_primary_notification(
-                            config,
-                            sender,
+                        let mut state = WebsocketPrimaryNotificationState {
                             last_seen_slot,
                             watermarks,
+                            json_buffers: &mut scratch.json_buffers,
+                            tx_bytes: &mut scratch.tx_bytes,
+                        };
+                        handle_primary_notification(
+                            config,
+                            source,
+                            sender,
                             frame_bytes_mut(&mut scratch.frame_bytes, bytes.as_ref()),
-                            &mut scratch.json_buffers,
-                            &mut scratch.tx_bytes,
+                            &mut state,
                         )
                         .await?;
                     }
@@ -969,7 +1109,7 @@ async fn run_websocket_primary_connection(
 }
 
 async fn send_primary_provider_health(
-    config: &WebsocketTransactionConfig,
+    source: &ProviderSourceIdentity,
     sender: &ProviderStreamSender,
     status: ProviderSourceHealthStatus,
     reason: ProviderSourceHealthReason,
@@ -977,7 +1117,7 @@ async fn send_primary_provider_health(
 ) -> Result<(), WebsocketTransactionError> {
     sender
         .send(ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
-            source: config.source_id(),
+            source: source.clone(),
             status,
             reason,
             message,
@@ -987,6 +1127,7 @@ async fn send_primary_provider_health(
 }
 
 async fn send_provider_logs_health(
+    source: &ProviderSourceIdentity,
     sender: &ProviderStreamSender,
     status: ProviderSourceHealthStatus,
     reason: ProviderSourceHealthReason,
@@ -994,7 +1135,7 @@ async fn send_provider_logs_health(
 ) -> Result<(), WebsocketLogsError> {
     sender
         .send(ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
-            source: ProviderSourceId::WebsocketLogs,
+            source: source.clone(),
             status,
             reason,
             message,
@@ -1005,6 +1146,7 @@ async fn send_provider_logs_health(
 
 const fn websocket_health_reason(error: &WebsocketTransactionError) -> ProviderSourceHealthReason {
     match error {
+        WebsocketTransactionError::Config(_) => ProviderSourceHealthReason::UpstreamProtocolFailure,
         WebsocketTransactionError::Transport(_) => {
             ProviderSourceHealthReason::UpstreamTransportFailure
         }
@@ -1133,6 +1275,7 @@ fn parse_transaction_notification(
         confirmed_slot: watermarks.confirmed_slot,
         finalized_slot: watermarks.finalized_slot,
         signature,
+        provider_source: None,
         bytes: tx_payload,
     }))
 }
@@ -1155,9 +1298,9 @@ fn parse_account_notification(
     };
     let (pubkey, account) = match (config.stream, notification.value) {
         (
-            WebsocketPrimaryStream::Account(pubkey),
+            WebsocketPrimaryStream::Account(account_pubkey),
             WebsocketAccountNotificationValue::Account(account),
-        ) => (pubkey, account),
+        ) => (account_pubkey, account),
         (
             WebsocketPrimaryStream::Program(_),
             WebsocketAccountNotificationValue::Program(account),
@@ -1176,10 +1319,10 @@ fn parse_account_notification(
     decode_account_update_event(
         notification.context.slot,
         pubkey,
-        account,
+        &account,
         match config.stream {
             WebsocketPrimaryStream::Program(program_id) => Some(pubkey_bytes(program_id)),
-            WebsocketPrimaryStream::Account(pubkey) => Some(pubkey_bytes(pubkey)),
+            WebsocketPrimaryStream::Account(filter_pubkey) => Some(pubkey_bytes(filter_pubkey)),
             WebsocketPrimaryStream::Transaction => None,
         },
         config.commitment,
@@ -1192,7 +1335,7 @@ fn parse_account_notification(
 fn decode_account_update_event(
     slot: u64,
     pubkey: Pubkey,
-    account: WebsocketUiAccount,
+    account: &WebsocketUiAccount,
     matched_filter: Option<sof_types::PubkeyBytes>,
     commitment: WebsocketTransactionCommitment,
     watermarks: &mut ProviderCommitmentWatermarks,
@@ -1225,6 +1368,7 @@ fn decode_account_update_event(
         txn_signature: None,
         is_startup: false,
         matched_filter,
+        provider_source: None,
     })
 }
 
@@ -1274,38 +1418,61 @@ fn parse_pubkey(input: &str) -> Result<Pubkey, WebsocketTransactionError> {
         .map_err(|_error| WebsocketTransactionError::Convert("invalid websocket pubkey"))
 }
 
+struct WebsocketPrimaryNotificationState<'state> {
+    last_seen_slot: &'state mut Option<u64>,
+    watermarks: &'state mut ProviderCommitmentWatermarks,
+    json_buffers: &'state mut SimdJsonBuffers,
+    tx_bytes: &'state mut Vec<u8>,
+}
+
 async fn handle_primary_notification(
     config: &WebsocketTransactionConfig,
+    source: &ProviderSourceIdentity,
     sender: &ProviderStreamSender,
-    last_seen_slot: &mut Option<u64>,
-    watermarks: &mut ProviderCommitmentWatermarks,
     bytes: &mut [u8],
-    json_buffers: &mut SimdJsonBuffers,
-    tx_bytes: &mut Vec<u8>,
+    state: &mut WebsocketPrimaryNotificationState<'_>,
 ) -> Result<(), WebsocketTransactionError> {
     match config.stream {
         WebsocketPrimaryStream::Transaction => {
             if let Some(update) = parse_transaction_notification(
                 bytes,
-                json_buffers,
-                tx_bytes,
+                state.json_buffers,
+                state.tx_bytes,
                 config.commitment,
-                watermarks,
+                state.watermarks,
             )? {
-                *last_seen_slot = Some((*last_seen_slot).unwrap_or(update.slot).max(update.slot));
+                *state.last_seen_slot = Some(
+                    (*state.last_seen_slot)
+                        .unwrap_or(update.slot)
+                        .max(update.slot),
+                );
                 sender
-                    .send(ProviderStreamUpdate::SerializedTransaction(update))
+                    .send(
+                        ProviderStreamUpdate::SerializedTransaction(update)
+                            .with_provider_source(source.clone()),
+                    )
                     .await
                     .map_err(|_error| WebsocketTransactionError::QueueClosed)?;
             }
         }
         WebsocketPrimaryStream::Account(_) | WebsocketPrimaryStream::Program(_) => {
-            if let Some(update) =
-                parse_account_notification(bytes, json_buffers, tx_bytes, config, watermarks)?
-            {
-                *last_seen_slot = Some((*last_seen_slot).unwrap_or(update.slot).max(update.slot));
+            if let Some(update) = parse_account_notification(
+                bytes,
+                state.json_buffers,
+                state.tx_bytes,
+                config,
+                state.watermarks,
+            )? {
+                *state.last_seen_slot = Some(
+                    (*state.last_seen_slot)
+                        .unwrap_or(update.slot)
+                        .max(update.slot),
+                );
                 sender
-                    .send(ProviderStreamUpdate::AccountUpdate(update))
+                    .send(
+                        ProviderStreamUpdate::AccountUpdate(update)
+                            .with_provider_source(source.clone()),
+                    )
                     .await
                     .map_err(|_error| WebsocketTransactionError::QueueClosed)?;
             }
@@ -1316,6 +1483,7 @@ async fn handle_primary_notification(
 
 async fn run_websocket_logs_connection(
     config: &WebsocketLogsConfig,
+    source: &ProviderSourceIdentity,
     sender: &ProviderStreamSender,
     session_established: &mut bool,
     stream: WebsocketProviderStream,
@@ -1324,6 +1492,7 @@ async fn run_websocket_logs_connection(
     let (mut write, mut read) = stream.split();
     *session_established = true;
     send_provider_logs_health(
+        source,
         sender,
         ProviderSourceHealthStatus::Healthy,
         ProviderSourceHealthReason::SubscriptionAckReceived,
@@ -1371,7 +1540,10 @@ async fn run_websocket_logs_connection(
                             config,
                         )? {
                             sender
-                                .send(ProviderStreamUpdate::TransactionLog(update))
+                                .send(
+                                    ProviderStreamUpdate::TransactionLog(update)
+                                        .with_provider_source(source.clone()),
+                                )
                                 .await
                                 .map_err(|_error| WebsocketLogsError::QueueClosed)?;
                         }
@@ -1382,7 +1554,10 @@ async fn run_websocket_logs_connection(
                             config,
                         )? {
                             sender
-                                .send(ProviderStreamUpdate::TransactionLog(update))
+                                .send(
+                                    ProviderStreamUpdate::TransactionLog(update)
+                                        .with_provider_source(source.clone()),
+                                )
                                 .await
                                 .map_err(|_error| WebsocketLogsError::QueueClosed)?;
                         }
@@ -1495,6 +1670,7 @@ fn parse_logs_notification(
                 .collect::<Vec<_>>(),
         ),
         matched_filter,
+        provider_source: None,
     }))
 }
 
@@ -1535,25 +1711,17 @@ fn materialize_transaction_baseline(
         confirmed_slot: None,
         finalized_slot: None,
         signature: signature_bytes_opt(signature),
+        provider_source: None,
         kind: classify_provider_transaction_kind(&tx),
         tx: Arc::new(tx),
     }))
 }
 
+#[derive(Default)]
 struct WebsocketParseScratch {
     frame_bytes: Vec<u8>,
     json_buffers: SimdJsonBuffers,
     tx_bytes: Vec<u8>,
-}
-
-impl Default for WebsocketParseScratch {
-    fn default() -> Self {
-        Self {
-            frame_bytes: Vec::new(),
-            json_buffers: SimdJsonBuffers::default(),
-            tx_bytes: Vec::new(),
-        }
-    }
 }
 
 fn frame_bytes_mut<'buffer>(buffer: &'buffer mut Vec<u8>, bytes: &[u8]) -> &'buffer mut [u8] {
@@ -1564,6 +1732,7 @@ fn frame_bytes_mut<'buffer>(buffer: &'buffer mut Vec<u8>, bytes: &[u8]) -> &'buf
 
 async fn replay_websocket_gap(
     config: &WebsocketTransactionConfig,
+    source: &ProviderSourceIdentity,
     sender: &ProviderStreamSender,
     last_seen_slot: &mut Option<u64>,
     watermarks: &mut ProviderCommitmentWatermarks,
@@ -1616,15 +1785,19 @@ async fn replay_websocket_gap(
             }
             watermarks.observe_transaction_commitment(slot, config.commitment.as_tx_commitment());
             sender
-                .send(ProviderStreamUpdate::Transaction(TransactionEvent {
-                    slot,
-                    commitment_status: config.commitment.as_tx_commitment(),
-                    confirmed_slot: watermarks.confirmed_slot,
-                    finalized_slot: watermarks.finalized_slot,
-                    signature: signature_bytes_opt(tx.signatures.first().copied()),
-                    kind,
-                    tx: Arc::new(tx),
-                }))
+                .send(
+                    ProviderStreamUpdate::Transaction(TransactionEvent {
+                        slot,
+                        commitment_status: config.commitment.as_tx_commitment(),
+                        confirmed_slot: watermarks.confirmed_slot,
+                        finalized_slot: watermarks.finalized_slot,
+                        signature: signature_bytes_opt(tx.signatures.first().copied()),
+                        provider_source: None,
+                        kind,
+                        tx: Arc::new(tx),
+                    })
+                    .with_provider_source(source.clone()),
+                )
                 .await
                 .map_err(|_error| WebsocketTransactionError::QueueClosed)?;
             *last_seen_slot = Some((*last_seen_slot).unwrap_or(slot).max(slot));
@@ -1895,6 +2068,11 @@ struct WebsocketUiAccount {
 
 impl ProviderStreamFanIn {
     /// Spawns one websocket `transactionSubscribe` source into this fan-in.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the selected config is invalid or the source cannot
+    /// be started.
     pub async fn spawn_websocket_transaction_source(
         &self,
         config: &WebsocketTransactionConfig,
@@ -1903,6 +2081,10 @@ impl ProviderStreamFanIn {
     }
 
     /// Spawns one websocket `logsSubscribe` source into this fan-in.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the source cannot be started.
     pub async fn spawn_websocket_logs_source(
         &self,
         config: &WebsocketLogsConfig,
@@ -1983,6 +2165,11 @@ impl RpcLoadedAddresses {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::let_underscore_must_use,
+    clippy::shadow_unrelated,
+    clippy::wildcard_enum_match_arm
+)]
 mod tests {
     use super::*;
     use crate::event::TxKind;
@@ -2423,6 +2610,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_spawn_rejects_transaction_only_options_for_program_stream() {
+        let (tx, _rx) = create_provider_stream_queue(1);
+        let config = WebsocketTransactionConfig::new("ws://127.0.0.1:1")
+            .with_stream(WebsocketPrimaryStream::Program(Pubkey::new_unique()))
+            .with_vote(true);
+
+        let error = spawn_websocket_transaction_source(&config, tx)
+            .await
+            .expect_err("program stream should reject transaction-only filters");
+
+        match error {
+            WebsocketTransactionError::Config(WebsocketConfigError::UnsupportedOption {
+                option: WebsocketConfigOption::VoteFilter,
+                stream: WebsocketStreamKind::Program,
+            }) => {}
+            other => panic!("expected vote config rejection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn websocket_logs_source_delivers_log_update() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
         let addr = listener.local_addr().expect("local addr");
@@ -2802,7 +3009,7 @@ mod tests {
                 ProviderStreamUpdate::Health(event) => {
                     saw_health = true;
                     assert_eq!(
-                        event.source,
+                        event.source.kind,
                         crate::provider_stream::ProviderSourceId::WebsocketTransaction
                     );
                     continue;
@@ -2962,6 +3169,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_fan_in_preserves_source_identity_for_same_kind_sources() {
+        let listener_a = TcpListener::bind("127.0.0.1:0").await.expect("listener a");
+        let addr_a = listener_a.local_addr().expect("addr a");
+        let payload_a = sample_notification_payload();
+
+        let listener_b = TcpListener::bind("127.0.0.1:0").await.expect("listener b");
+        let addr_b = listener_b.local_addr().expect("addr b");
+        let payload_b = sample_notification_payload();
+
+        let server_a = tokio::spawn(async move {
+            let (stream, _) = listener_a.accept().await.expect("accept a");
+            let mut ws = accept_async(stream).await.expect("websocket handshake a");
+            let subscribe = ws
+                .next()
+                .await
+                .expect("subscribe a")
+                .expect("subscribe msg a");
+            match subscribe {
+                WsMessage::Text(text) => assert!(text.contains("transactionSubscribe")),
+                other => panic!("expected subscribe text frame, got {other:?}"),
+            }
+            ws.send(WsMessage::Text(
+                String::from(r#"{"jsonrpc":"2.0","id":1,"result":42}"#).into(),
+            ))
+            .await
+            .expect("ack a");
+            ws.send(WsMessage::Text(
+                String::from_utf8(payload_a).expect("payload utf8 a").into(),
+            ))
+            .await
+            .expect("notification a");
+            ws.close(None).await.expect("close a");
+        });
+
+        let server_b = tokio::spawn(async move {
+            let (stream, _) = listener_b.accept().await.expect("accept b");
+            let mut ws = accept_async(stream).await.expect("websocket handshake b");
+            let subscribe = ws
+                .next()
+                .await
+                .expect("subscribe b")
+                .expect("subscribe msg b");
+            match subscribe {
+                WsMessage::Text(text) => assert!(text.contains("transactionSubscribe")),
+                other => panic!("expected subscribe text frame, got {other:?}"),
+            }
+            ws.send(WsMessage::Text(
+                String::from(r#"{"jsonrpc":"2.0","id":1,"result":42}"#).into(),
+            ))
+            .await
+            .expect("ack b");
+            ws.send(WsMessage::Text(
+                String::from_utf8(payload_b).expect("payload utf8 b").into(),
+            ))
+            .await
+            .expect("notification b");
+            ws.close(None).await.expect("close b");
+        });
+
+        let (fan_in, mut rx) = create_provider_stream_fan_in(8);
+        let handle_a = fan_in
+            .spawn_websocket_transaction_source(
+                &WebsocketTransactionConfig::new(format!("ws://{addr_a}"))
+                    .with_max_reconnect_attempts(1)
+                    .with_reconnect_delay(Duration::from_millis(10)),
+            )
+            .await
+            .expect("spawn source a");
+        let handle_b = fan_in
+            .spawn_websocket_transaction_source(
+                &WebsocketTransactionConfig::new(format!("ws://{addr_b}"))
+                    .with_max_reconnect_attempts(1)
+                    .with_reconnect_delay(Duration::from_millis(10)),
+            )
+            .await
+            .expect("spawn source b");
+
+        let mut sources = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && sources.len() < 2 {
+            let update = timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("provider update timeout")
+                .expect("provider update");
+            match update {
+                ProviderStreamUpdate::SerializedTransaction(event) => {
+                    sources.push(
+                        event
+                            .provider_source
+                            .expect("serialized transaction should retain provider source"),
+                    );
+                }
+                ProviderStreamUpdate::Health(_) => {}
+                other => panic!("unexpected update: {other:?}"),
+            }
+        }
+
+        assert_eq!(sources.len(), 2);
+        assert_eq!(
+            sources[0].kind,
+            crate::provider_stream::ProviderSourceId::WebsocketTransaction
+        );
+        assert_eq!(
+            sources[1].kind,
+            crate::provider_stream::ProviderSourceId::WebsocketTransaction
+        );
+        assert_ne!(sources[0], sources[1]);
+
+        handle_a.abort();
+        handle_a.await.ok();
+        handle_b.abort();
+        handle_b.await.ok();
+        server_a.await.expect("server a task");
+        server_b.await.expect("server b task");
+    }
+
+    #[tokio::test]
     async fn websocket_spawn_fails_fast_on_dead_endpoint() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
         let addr = listener.local_addr().expect("local addr");
@@ -2986,7 +3310,11 @@ mod tests {
         )
         .await
         .expect_err("missing replay http endpoint should fail during preflight");
-        assert!(error.to_string().contains("websocket replay requires"));
+        assert!(
+            error
+                .to_string()
+                .contains("websocket reconnect replay requires")
+        );
     }
 
     #[test]

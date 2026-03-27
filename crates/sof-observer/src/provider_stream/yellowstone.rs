@@ -37,7 +37,7 @@ use crate::{
     provider_stream::{
         ProviderCommitmentWatermarks, ProviderReplayMode, ProviderSourceHealthEvent,
         ProviderSourceHealthReason, ProviderSourceHealthStatus, ProviderSourceId,
-        ProviderStreamFanIn, ProviderStreamSender, ProviderStreamUpdate,
+        ProviderSourceIdentity, ProviderStreamFanIn, ProviderStreamSender, ProviderStreamUpdate,
         classify_provider_transaction_kind,
     },
 };
@@ -97,6 +97,58 @@ pub struct YellowstoneGrpcConfig {
     reconnect_delay: Duration,
     max_reconnect_attempts: Option<u32>,
     replay_mode: ProviderReplayMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// One Yellowstone stream-specific config option that may be invalid for a selected stream kind.
+pub enum YellowstoneGrpcConfigOption {
+    /// Vote transaction filter.
+    VoteFilter,
+    /// Failed transaction filter.
+    FailedFilter,
+    /// Single-signature filter.
+    SignatureFilter,
+    /// Account-include filter.
+    AccountIncludeFilter,
+    /// Account-exclude filter.
+    AccountExcludeFilter,
+    /// Account-required filter.
+    AccountRequiredFilter,
+    /// Explicit account pubkey filter.
+    Accounts,
+    /// Explicit owner/program filter.
+    Owners,
+    /// Require account updates to carry a transaction signature.
+    RequireTransactionSignature,
+}
+
+impl std::fmt::Display for YellowstoneGrpcConfigOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::VoteFilter => f.write_str("vote filter"),
+            Self::FailedFilter => f.write_str("failed filter"),
+            Self::SignatureFilter => f.write_str("signature filter"),
+            Self::AccountIncludeFilter => f.write_str("account-include filter"),
+            Self::AccountExcludeFilter => f.write_str("account-exclude filter"),
+            Self::AccountRequiredFilter => f.write_str("account-required filter"),
+            Self::Accounts => f.write_str("accounts filter"),
+            Self::Owners => f.write_str("owners filter"),
+            Self::RequireTransactionSignature => f.write_str("require-transaction-signature"),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+/// Typed Yellowstone config validation failures for built-in stream selectors.
+pub enum YellowstoneGrpcConfigError {
+    /// The selected Yellowstone stream kind does not support one configured option.
+    #[error("{option} is not supported for yellowstone {stream} streams")]
+    UnsupportedOption {
+        /// Built-in Yellowstone stream family receiving the invalid option.
+        stream: YellowstoneGrpcStreamKind,
+        /// Typed config option that is unsupported for that stream family.
+        option: YellowstoneGrpcConfigOption,
+    },
 }
 
 impl YellowstoneGrpcConfig {
@@ -277,6 +329,66 @@ impl YellowstoneGrpcConfig {
     pub const fn with_reconnect_delay(mut self, delay: Duration) -> Self {
         self.reconnect_delay = delay;
         self
+    }
+
+    fn validate(&self) -> Result<(), YellowstoneGrpcConfigError> {
+        match self.stream {
+            YellowstoneGrpcStream::Transaction | YellowstoneGrpcStream::TransactionStatus => {
+                self.validate_non_account_stream()?;
+            }
+            YellowstoneGrpcStream::Accounts => {
+                self.validate_accounts_stream()?;
+            }
+            YellowstoneGrpcStream::BlockMeta => {
+                self.validate_non_account_stream()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_non_account_stream(&self) -> Result<(), YellowstoneGrpcConfigError> {
+        if let Some(option) = [
+            (!self.accounts.is_empty()).then_some(YellowstoneGrpcConfigOption::Accounts),
+            (!self.owners.is_empty()).then_some(YellowstoneGrpcConfigOption::Owners),
+            self.require_txn_signature
+                .then_some(YellowstoneGrpcConfigOption::RequireTransactionSignature),
+        ]
+        .into_iter()
+        .flatten()
+        .next()
+        {
+            return Err(YellowstoneGrpcConfigError::UnsupportedOption {
+                stream: self.stream_kind(),
+                option,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_accounts_stream(&self) -> Result<(), YellowstoneGrpcConfigError> {
+        if let Some(option) = [
+            self.vote.map(|_| YellowstoneGrpcConfigOption::VoteFilter),
+            self.failed
+                .map(|_| YellowstoneGrpcConfigOption::FailedFilter),
+            self.signature
+                .map(|_| YellowstoneGrpcConfigOption::SignatureFilter),
+            (!self.account_include.is_empty())
+                .then_some(YellowstoneGrpcConfigOption::AccountIncludeFilter),
+            (!self.account_exclude.is_empty())
+                .then_some(YellowstoneGrpcConfigOption::AccountExcludeFilter),
+            (!self.account_required.is_empty())
+                .then_some(YellowstoneGrpcConfigOption::AccountRequiredFilter),
+        ]
+        .into_iter()
+        .flatten()
+        .next()
+        {
+            return Err(YellowstoneGrpcConfigError::UnsupportedOption {
+                stream: self.stream_kind(),
+                option,
+            });
+        }
+        Ok(())
     }
 
     /// Sets the maximum reconnect attempts. `None` keeps retrying forever.
@@ -575,6 +687,9 @@ impl YellowstoneGrpcSlotsConfig {
 /// Yellowstone transaction-stream error surface.
 #[derive(Debug, Error)]
 pub enum YellowstoneGrpcError {
+    /// Invalid config for the selected Yellowstone stream kind.
+    #[error(transparent)]
+    Config(#[from] YellowstoneGrpcConfigError),
     /// Builder/connect failure.
     #[error(transparent)]
     Build(#[from] GeyserGrpcBuilderError),
@@ -655,6 +770,19 @@ type YellowstoneUpdateStream = std::pin::Pin<
     >,
 >;
 
+struct YellowstonePrimaryConnectionState<'state> {
+    tracked_slot: &'state mut u64,
+    watermarks: &'state mut ProviderCommitmentWatermarks,
+    session_established: &'state mut bool,
+}
+
+struct YellowstoneSlotConnectionState<'state> {
+    tracked_slot: &'state mut u64,
+    watermarks: &'state mut ProviderCommitmentWatermarks,
+    slot_states: &'state mut HashMap<u64, ForkSlotStatus>,
+    session_established: &'state mut bool,
+}
+
 /// Spawns one Yellowstone gRPC transaction forwarder into a SOF provider-stream queue.
 ///
 /// # Examples
@@ -685,6 +813,8 @@ pub async fn spawn_yellowstone_grpc_transaction_source(
     config: YellowstoneGrpcConfig,
     sender: ProviderStreamSender,
 ) -> Result<JoinHandle<Result<(), YellowstoneGrpcError>>, YellowstoneGrpcError> {
+    config.validate()?;
+    let source = ProviderSourceIdentity::generated(config.source_id(), None);
     let first_session = establish_yellowstone_session(&config, 0).await?;
     Ok(tokio::spawn(async move {
         let mut attempts = 0_u32;
@@ -700,10 +830,13 @@ pub async fn spawn_yellowstone_grpc_transaction_source(
             match session {
                 Ok((subscribe_tx, stream)) => match run_yellowstone_primary_connection(
                     &config,
+                    &source,
                     &sender,
-                    &mut tracked_slot,
-                    &mut watermarks,
-                    &mut session_established,
+                    YellowstonePrimaryConnectionState {
+                        tracked_slot: &mut tracked_slot,
+                        watermarks: &mut watermarks,
+                        session_established: &mut session_established,
+                    },
                     subscribe_tx,
                     stream,
                 )
@@ -720,7 +853,7 @@ pub async fn spawn_yellowstone_grpc_transaction_source(
                             "provider stream yellowstone session ended unexpectedly; reconnecting"
                         );
                         send_primary_provider_health(
-                            &config,
+                            &source,
                             &sender,
                             ProviderSourceHealthStatus::Reconnecting,
                             ProviderSourceHealthReason::UpstreamStreamClosedUnexpectedly,
@@ -738,7 +871,7 @@ pub async fn spawn_yellowstone_grpc_transaction_source(
                             "provider stream yellowstone session ended; reconnecting"
                         );
                         send_primary_provider_health(
-                            &config,
+                            &source,
                             &sender,
                             ProviderSourceHealthStatus::Reconnecting,
                             yellowstone_health_reason(&error),
@@ -754,7 +887,7 @@ pub async fn spawn_yellowstone_grpc_transaction_source(
                         "provider stream yellowstone connect/subscribe failed; reconnecting"
                     );
                     send_primary_provider_health(
-                        &config,
+                        &source,
                         &sender,
                         ProviderSourceHealthStatus::Reconnecting,
                         yellowstone_health_reason(&error),
@@ -774,7 +907,7 @@ pub async fn spawn_yellowstone_grpc_transaction_source(
                 let detail =
                     format!("exhausted yellowstone reconnect attempts after {attempts} failures");
                 send_primary_provider_health(
-                    &config,
+                    &source,
                     &sender,
                     ProviderSourceHealthStatus::Unhealthy,
                     ProviderSourceHealthReason::ReconnectBudgetExhausted,
@@ -791,10 +924,15 @@ pub async fn spawn_yellowstone_grpc_transaction_source(
 }
 
 /// Spawns one Yellowstone gRPC slot forwarder into a SOF provider-stream queue.
+///
+/// # Errors
+///
+/// Returns an error if the initial client connect or subscribe step fails.
 pub async fn spawn_yellowstone_grpc_slot_source(
     config: YellowstoneGrpcSlotsConfig,
     sender: ProviderStreamSender,
 ) -> Result<JoinHandle<Result<(), YellowstoneGrpcError>>, YellowstoneGrpcError> {
+    let source = ProviderSourceIdentity::generated(ProviderSourceId::YellowstoneGrpcSlots, None);
     let first_session = establish_yellowstone_slot_session(&config, 0).await?;
     Ok(tokio::spawn(async move {
         let mut attempts = 0_u32;
@@ -811,11 +949,14 @@ pub async fn spawn_yellowstone_grpc_slot_source(
             match session {
                 Ok((subscribe_tx, stream)) => match run_yellowstone_slot_connection(
                     &config,
+                    &source,
                     &sender,
-                    &mut tracked_slot,
-                    &mut watermarks,
-                    &mut slot_states,
-                    &mut session_established,
+                    YellowstoneSlotConnectionState {
+                        tracked_slot: &mut tracked_slot,
+                        watermarks: &mut watermarks,
+                        slot_states: &mut slot_states,
+                        session_established: &mut session_established,
+                    },
                     subscribe_tx,
                     stream,
                 )
@@ -829,6 +970,7 @@ pub async fn spawn_yellowstone_grpc_slot_source(
                             "provider stream yellowstone slot session ended unexpectedly; reconnecting"
                         );
                         send_provider_slot_health(
+                            &source,
                             &sender,
                             ProviderSourceHealthStatus::Reconnecting,
                             ProviderSourceHealthReason::UpstreamStreamClosedUnexpectedly,
@@ -846,6 +988,7 @@ pub async fn spawn_yellowstone_grpc_slot_source(
                             "provider stream yellowstone slot session ended; reconnecting"
                         );
                         send_provider_slot_health(
+                            &source,
                             &sender,
                             ProviderSourceHealthStatus::Reconnecting,
                             yellowstone_health_reason(&error),
@@ -861,6 +1004,7 @@ pub async fn spawn_yellowstone_grpc_slot_source(
                         "provider stream yellowstone slot connect/subscribe failed; reconnecting"
                     );
                     send_provider_slot_health(
+                        &source,
                         &sender,
                         ProviderSourceHealthStatus::Reconnecting,
                         yellowstone_health_reason(&error),
@@ -881,6 +1025,7 @@ pub async fn spawn_yellowstone_grpc_slot_source(
                     "exhausted yellowstone slot reconnect attempts after {attempts} failures"
                 );
                 send_provider_slot_health(
+                    &source,
                     &sender,
                     ProviderSourceHealthStatus::Unhealthy,
                     ProviderSourceHealthReason::ReconnectBudgetExhausted,
@@ -898,18 +1043,17 @@ pub async fn spawn_yellowstone_grpc_slot_source(
 
 async fn run_yellowstone_primary_connection(
     config: &YellowstoneGrpcConfig,
+    source: &ProviderSourceIdentity,
     sender: &ProviderStreamSender,
-    tracked_slot: &mut u64,
-    watermarks: &mut ProviderCommitmentWatermarks,
-    session_established: &mut bool,
+    state: YellowstonePrimaryConnectionState<'_>,
     mut subscribe_tx: YellowstoneSubscribeSink,
     mut stream: YellowstoneUpdateStream,
 ) -> Result<(), YellowstoneGrpcError> {
     let commitment = config.commitment.as_tx_commitment();
-    *session_established = false;
-    *session_established = true;
+    *state.session_established = false;
+    *state.session_established = true;
     send_primary_provider_health(
-        config,
+        source,
         sender,
         ProviderSourceHealthStatus::Healthy,
         ProviderSourceHealthReason::SubscriptionAckReceived,
@@ -958,73 +1102,96 @@ async fn run_yellowstone_primary_connection(
                     Some(UpdateOneof::Transaction(tx_update))
                         if config.stream == YellowstoneGrpcStream::Transaction =>
                     {
-                        *tracked_slot = (*tracked_slot).max(tx_update.slot);
-                        watermarks.observe_transaction_commitment(tx_update.slot, commitment);
+                        *state.tracked_slot = (*state.tracked_slot).max(tx_update.slot);
+                        state
+                            .watermarks
+                            .observe_transaction_commitment(tx_update.slot, commitment);
                         let event = transaction_event_from_update(
                             tx_update.slot,
                             tx_update.transaction,
                             commitment,
-                            *watermarks,
+                            *state.watermarks,
                         )?;
                         sender
-                            .send(ProviderStreamUpdate::Transaction(event))
+                            .send(
+                                ProviderStreamUpdate::Transaction(event)
+                                    .with_provider_source(source.clone()),
+                            )
                             .await
                             .map_err(|_error| YellowstoneGrpcError::QueueClosed)?;
                     }
                     Some(UpdateOneof::TransactionStatus(status_update))
                         if config.stream == YellowstoneGrpcStream::TransactionStatus =>
                     {
-                        *tracked_slot = (*tracked_slot).max(status_update.slot);
-                        watermarks.observe_transaction_commitment(status_update.slot, commitment);
+                        *state.tracked_slot = (*state.tracked_slot).max(status_update.slot);
+                        state
+                            .watermarks
+                            .observe_transaction_commitment(status_update.slot, commitment);
                         let event = transaction_status_event_from_update(
                             commitment,
-                            *watermarks,
+                            *state.watermarks,
                             status_update,
                         )?;
                         sender
-                            .send(ProviderStreamUpdate::TransactionStatus(event))
+                            .send(
+                                ProviderStreamUpdate::TransactionStatus(event)
+                                    .with_provider_source(source.clone()),
+                            )
                             .await
                             .map_err(|_error| YellowstoneGrpcError::QueueClosed)?;
                     }
                     Some(UpdateOneof::Account(account_update))
                         if config.stream == YellowstoneGrpcStream::Accounts =>
                     {
-                        *tracked_slot = (*tracked_slot).max(account_update.slot);
-                        observe_non_transaction_commitment(watermarks, account_update.slot, commitment);
-                        let event =
-                            account_update_event_from_yellowstone(account_update, commitment, *watermarks)?;
+                        *state.tracked_slot = (*state.tracked_slot).max(account_update.slot);
+                        observe_non_transaction_commitment(
+                            state.watermarks,
+                            account_update.slot,
+                            commitment,
+                        );
+                        let event = account_update_event_from_yellowstone(
+                            account_update,
+                            commitment,
+                            *state.watermarks,
+                        )?;
                         sender
-                            .send(ProviderStreamUpdate::AccountUpdate(event))
+                            .send(
+                                ProviderStreamUpdate::AccountUpdate(event)
+                                    .with_provider_source(source.clone()),
+                            )
                             .await
                             .map_err(|_error| YellowstoneGrpcError::QueueClosed)?;
                     }
                     Some(UpdateOneof::BlockMeta(block_meta_update))
                         if config.stream == YellowstoneGrpcStream::BlockMeta =>
                     {
-                        *tracked_slot = (*tracked_slot).max(block_meta_update.slot);
+                        *state.tracked_slot = (*state.tracked_slot).max(block_meta_update.slot);
                         observe_non_transaction_commitment(
-                            watermarks,
+                            state.watermarks,
                             block_meta_update.slot,
                             commitment,
                         );
                         let event = block_meta_event_from_update(
                             commitment,
-                            *watermarks,
-                            block_meta_update,
+                            *state.watermarks,
+                            &block_meta_update,
                         )?;
                         sender
-                            .send(ProviderStreamUpdate::BlockMeta(event))
+                            .send(
+                                ProviderStreamUpdate::BlockMeta(event)
+                                    .with_provider_source(source.clone()),
+                            )
                             .await
                             .map_err(|_error| YellowstoneGrpcError::QueueClosed)?;
                     }
                     Some(UpdateOneof::Slot(slot_update)) => {
-                        *tracked_slot = (*tracked_slot).max(slot_update.slot);
+                        *state.tracked_slot = (*state.tracked_slot).max(slot_update.slot);
                         match SlotStatus::try_from(slot_update.status).ok() {
                             Some(SlotStatus::SlotConfirmed) => {
-                                watermarks.observe_confirmed_slot(slot_update.slot);
+                                state.watermarks.observe_confirmed_slot(slot_update.slot);
                             }
                             Some(SlotStatus::SlotFinalized) => {
-                                watermarks.observe_finalized_slot(slot_update.slot);
+                                state.watermarks.observe_finalized_slot(slot_update.slot);
                             }
                             _ => {}
                         }
@@ -1048,17 +1215,16 @@ async fn run_yellowstone_primary_connection(
 
 async fn run_yellowstone_slot_connection(
     config: &YellowstoneGrpcSlotsConfig,
+    source: &ProviderSourceIdentity,
     sender: &ProviderStreamSender,
-    tracked_slot: &mut u64,
-    watermarks: &mut ProviderCommitmentWatermarks,
-    slot_states: &mut HashMap<u64, ForkSlotStatus>,
-    session_established: &mut bool,
+    state: YellowstoneSlotConnectionState<'_>,
     mut subscribe_tx: YellowstoneSubscribeSink,
     mut stream: YellowstoneUpdateStream,
 ) -> Result<(), YellowstoneGrpcError> {
-    *session_established = false;
-    *session_established = true;
+    *state.session_established = false;
+    *state.session_established = true;
     send_provider_slot_health(
+        source,
         sender,
         ProviderSourceHealthStatus::Healthy,
         ProviderSourceHealthReason::SubscriptionAckReceived,
@@ -1102,16 +1268,19 @@ async fn run_yellowstone_slot_connection(
                 last_progress = Instant::now();
                 match update.update_oneof {
                     Some(UpdateOneof::Slot(slot_update)) => {
-                        *tracked_slot = (*tracked_slot).max(slot_update.slot);
+                        *state.tracked_slot = (*state.tracked_slot).max(slot_update.slot);
                         if let Some(event) = slot_status_event_from_update(
                             slot_update.slot,
                             slot_update.parent,
                             SlotStatus::try_from(slot_update.status).ok(),
-                            watermarks,
-                            slot_states,
+                            state.watermarks,
+                            state.slot_states,
                         ) {
                             sender
-                                .send(ProviderStreamUpdate::SlotStatus(event))
+                                .send(
+                                    ProviderStreamUpdate::SlotStatus(event)
+                                        .with_provider_source(source.clone()),
+                                )
                                 .await
                                 .map_err(|_error| YellowstoneGrpcError::QueueClosed)?;
                         }
@@ -1168,7 +1337,7 @@ async fn establish_yellowstone_slot_session(
 }
 
 async fn send_primary_provider_health(
-    config: &YellowstoneGrpcConfig,
+    source: &ProviderSourceIdentity,
     sender: &ProviderStreamSender,
     status: ProviderSourceHealthStatus,
     reason: ProviderSourceHealthReason,
@@ -1176,7 +1345,7 @@ async fn send_primary_provider_health(
 ) -> Result<(), YellowstoneGrpcError> {
     sender
         .send(ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
-            source: config.source_id(),
+            source: source.clone(),
             status,
             reason,
             message,
@@ -1186,6 +1355,7 @@ async fn send_primary_provider_health(
 }
 
 async fn send_provider_slot_health(
+    source: &ProviderSourceIdentity,
     sender: &ProviderStreamSender,
     status: ProviderSourceHealthStatus,
     reason: ProviderSourceHealthReason,
@@ -1193,7 +1363,7 @@ async fn send_provider_slot_health(
 ) -> Result<(), YellowstoneGrpcError> {
     sender
         .send(ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
-            source: ProviderSourceId::YellowstoneGrpcSlots,
+            source: source.clone(),
             status,
             reason,
             message,
@@ -1207,9 +1377,9 @@ const fn yellowstone_health_reason(error: &YellowstoneGrpcError) -> ProviderSour
         YellowstoneGrpcError::Build(_)
         | YellowstoneGrpcError::Client(_)
         | YellowstoneGrpcError::Status(_) => ProviderSourceHealthReason::UpstreamTransportFailure,
-        YellowstoneGrpcError::Convert(_) | YellowstoneGrpcError::Protocol(_) => {
-            ProviderSourceHealthReason::UpstreamProtocolFailure
-        }
+        YellowstoneGrpcError::Config(_)
+        | YellowstoneGrpcError::Convert(_)
+        | YellowstoneGrpcError::Protocol(_) => ProviderSourceHealthReason::UpstreamProtocolFailure,
         YellowstoneGrpcError::QueueClosed => ProviderSourceHealthReason::UpstreamProtocolFailure,
     }
 }
@@ -1245,6 +1415,7 @@ fn transaction_event_from_update(
         confirmed_slot: watermarks.confirmed_slot,
         finalized_slot: watermarks.finalized_slot,
         signature: signature_bytes_opt(signature.or_else(|| tx.signatures.first().copied())),
+        provider_source: None,
         kind: if is_vote {
             TxKind::VoteOnly
         } else {
@@ -1270,6 +1441,7 @@ fn transaction_status_event_from_update(
         is_vote: update.is_vote,
         index: Some(update.index),
         err: update.err.map(|error| format!("{error:?}")),
+        provider_source: None,
     })
 }
 
@@ -1307,13 +1479,14 @@ fn account_update_event_from_yellowstone(
         txn_signature: signature_bytes_opt(txn_signature),
         is_startup: update.is_startup,
         matched_filter: None,
+        provider_source: None,
     })
 }
 
 fn block_meta_event_from_update(
     commitment_status: TxCommitmentStatus,
     watermarks: ProviderCommitmentWatermarks,
-    update: yellowstone_grpc_proto::prelude::SubscribeUpdateBlockMeta,
+    update: &yellowstone_grpc_proto::prelude::SubscribeUpdateBlockMeta,
 ) -> Result<BlockMetaEvent, YellowstoneGrpcError> {
     let blockhash = Hash::from_str(&update.blockhash)
         .map_err(|_error| YellowstoneGrpcError::Convert("invalid block-meta blockhash"))?;
@@ -1331,6 +1504,7 @@ fn block_meta_event_from_update(
         block_height: update.block_height.map(|value| value.block_height),
         executed_transaction_count: update.executed_transaction_count,
         entries_count: update.entries_count,
+        provider_source: None,
     })
 }
 
@@ -1380,11 +1554,17 @@ fn slot_status_event_from_update(
         tip_slot: None,
         confirmed_slot: watermarks.confirmed_slot,
         finalized_slot: watermarks.finalized_slot,
+        provider_source: None,
     })
 }
 
 impl ProviderStreamFanIn {
     /// Spawns one Yellowstone gRPC transaction source into this fan-in.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the selected config is invalid or the source cannot
+    /// be started.
     pub async fn spawn_yellowstone_grpc_transaction_source(
         &self,
         config: YellowstoneGrpcConfig,
@@ -1393,6 +1573,10 @@ impl ProviderStreamFanIn {
     }
 
     /// Spawns one Yellowstone gRPC slot source into this fan-in.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the source cannot be started.
     pub async fn spawn_yellowstone_grpc_slot_source(
         &self,
         config: YellowstoneGrpcSlotsConfig,
@@ -1488,6 +1672,11 @@ fn convert_message(
 }
 
 #[cfg(all(test, feature = "provider-grpc"))]
+#[allow(
+    clippy::let_underscore_must_use,
+    clippy::shadow_unrelated,
+    clippy::wildcard_enum_match_arm
+)]
 mod tests {
     use super::*;
     use crate::event::TxKind;
@@ -2299,6 +2488,7 @@ mod tests {
             signature,
             kind: classify_provider_transaction_kind(&tx),
             tx: std::sync::Arc::new(tx),
+            provider_source: None,
         })
     }
 
@@ -2328,6 +2518,26 @@ mod tests {
         assert_eq!(event.slot, 56);
         assert_eq!(event.kind, TxKind::VoteOnly);
         assert!(event.signature.is_some());
+    }
+
+    #[tokio::test]
+    async fn yellowstone_spawn_rejects_transaction_filters_for_accounts_stream() {
+        let (tx, _rx) = crate::provider_stream::create_provider_stream_queue(1);
+        let config = YellowstoneGrpcConfig::new("http://127.0.0.1:1")
+            .with_stream(YellowstoneGrpcStream::Accounts)
+            .with_vote(true);
+
+        let error = spawn_yellowstone_grpc_transaction_source(config, tx)
+            .await
+            .expect_err("accounts stream should reject transaction-only filters");
+
+        match error {
+            YellowstoneGrpcError::Config(YellowstoneGrpcConfigError::UnsupportedOption {
+                option: YellowstoneGrpcConfigOption::VoteFilter,
+                stream: YellowstoneGrpcStreamKind::Accounts,
+            }) => {}
+            other => panic!("expected vote config rejection, got {other:?}"),
+        }
     }
 
     #[test]

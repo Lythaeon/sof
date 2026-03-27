@@ -1169,7 +1169,7 @@ pub(super) enum SelectedAccountUpdateDispatch {
         /// Selected plugin callback target.
         plugin: Arc<dyn ObserverPlugin>,
         /// Event payload for the selected plugin.
-        event: AccountUpdateEvent,
+        event: Box<AccountUpdateEvent>,
     },
     /// Multiple interested plugins share the same event payload.
     Multi {
@@ -1194,7 +1194,7 @@ impl SelectedAccountUpdateDispatch {
             0 => None,
             1 => Some(Self::Single {
                 plugin: interested.into_iter().next()?,
-                event,
+                event: Box::new(event),
             }),
             _ => Some(Self::Multi {
                 plugins: interested,

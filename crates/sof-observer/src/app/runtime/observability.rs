@@ -39,7 +39,7 @@ pub(crate) struct RuntimeObservabilityHandle {
 struct RuntimeObservabilityState {
     live: AtomicBool,
     ready: AtomicBool,
-    provider_sources: RwLock<HashMap<&'static str, ProviderSourceHealthEvent>>,
+    provider_sources: RwLock<HashMap<String, ProviderSourceHealthEvent>>,
     provider_capability_mode: RwLock<Option<&'static str>>,
     provider_capability_unsupported_hooks: RwLock<Vec<String>>,
 }
@@ -61,7 +61,7 @@ impl RuntimeObservabilityHandle {
         let Ok(mut sources) = self.inner.provider_sources.write() else {
             return;
         };
-        sources.insert(event.source.as_str(), event.clone());
+        sources.insert(event.source.instance_str().to_owned(), event.clone());
         let all_healthy = sources
             .values()
             .all(|source| matches!(source.status, ProviderSourceHealthStatus::Healthy));
@@ -94,7 +94,13 @@ impl RuntimeObservabilityHandle {
             |_error| Vec::new(),
             |sources| sources.values().cloned().collect(),
         );
-        provider_sources.sort_by_key(|event| (event.source.as_str(), event.reason.as_str()));
+        provider_sources.sort_by_key(|event| {
+            (
+                event.source.kind_str().to_owned(),
+                event.source.instance_str().to_owned(),
+                event.reason.as_str().to_owned(),
+            )
+        });
         let provider_capability_mode = self
             .inner
             .provider_capability_mode
@@ -335,7 +341,8 @@ fn render_metrics(
     );
     for event in &state.provider_sources {
         let labels = [
-            ("source", event.source.as_str()),
+            ("source_kind", event.source.kind_str()),
+            ("source_instance", event.source.instance_str()),
             (
                 "status",
                 match event.status {
@@ -2732,7 +2739,10 @@ mod tests {
         let handle = RuntimeObservabilityHandle::default();
         handle.mark_live();
         handle.observe_provider_source_health(&ProviderSourceHealthEvent {
-            source: crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
+            source: crate::provider_stream::ProviderSourceIdentity::new(
+                crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
+                "yellowstone_grpc-1",
+            ),
             status: ProviderSourceHealthStatus::Reconnecting,
             reason: crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
             message: "upstream stalled".to_owned(),
@@ -2748,7 +2758,7 @@ mod tests {
         assert!(metrics.contains("sof_provider_sources_reconnecting 1"));
         assert!(metrics.contains("sof_provider_sources_unhealthy 0"));
         assert!(metrics.contains(
-            "sof_provider_source_status{source=\"yellowstone_grpc\",status=\"reconnecting\",reason=\"upstream_protocol_failure\"} 1"
+            "sof_provider_source_status{source_kind=\"yellowstone_grpc\",source_instance=\"yellowstone_grpc-1\",status=\"reconnecting\",reason=\"upstream_protocol_failure\"} 1"
         ));
     }
 

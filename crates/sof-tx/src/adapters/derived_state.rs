@@ -466,6 +466,7 @@ mod tests {
                     removed_pubkeys: Vec::new(),
                     updated_nodes: Vec::new(),
                     snapshot_nodes: vec![node(leader_a, 9001), node(leader_b, 9002)],
+                    provider_source: None,
                 },
             ))),
         );
@@ -488,6 +489,7 @@ mod tests {
                             leader: leader_b,
                         },
                     ],
+                    provider_source: None,
                 },
             ))),
         );
@@ -497,6 +499,7 @@ mod tests {
                     slot: 40,
                     recent_blockhash: [5_u8; 32],
                     dataset_tx_count: 1,
+                    provider_source: None,
                 },
             ))),
         );
@@ -534,6 +537,7 @@ mod tests {
                     removed_pubkeys: Vec::new(),
                     updated_nodes: Vec::new(),
                     snapshot_nodes: vec![node(leader, 9101)],
+                    provider_source: None,
                 },
             ))),
         );
@@ -547,6 +551,7 @@ mod tests {
                     removed_slots: Vec::new(),
                     updated_leaders: Vec::new(),
                     snapshot_leaders: vec![LeaderScheduleEntry { slot: 77, leader }],
+                    provider_source: None,
                 },
             ))),
         );
@@ -581,6 +586,7 @@ mod tests {
                     removed_pubkeys: Vec::new(),
                     updated_nodes: Vec::new(),
                     snapshot_nodes: vec![node(leader, 9201)],
+                    provider_source: None,
                 },
             ))),
         );
@@ -594,6 +600,7 @@ mod tests {
                     removed_slots: Vec::new(),
                     updated_leaders: Vec::new(),
                     snapshot_leaders: vec![LeaderScheduleEntry { slot: 88, leader }],
+                    provider_source: None,
                 },
             ))),
         );
@@ -603,6 +610,7 @@ mod tests {
                     slot: 88,
                     recent_blockhash: [9_u8; 32],
                     dataset_tx_count: 3,
+                    provider_source: None,
                 },
             ))),
         );

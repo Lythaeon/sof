@@ -9,6 +9,7 @@ use solana_transaction::versioned::VersionedTransaction;
 
 use crate::{
     event::{ForkSlotStatus, TxCommitmentStatus, TxKind},
+    provider_stream::ProviderSourceIdentity,
     shred::wire::ParsedShredHeader,
 };
 
@@ -74,6 +75,8 @@ pub struct TransactionEvent {
     pub finalized_slot: Option<u64>,
     /// Transaction signature if present.
     pub signature: Option<SignatureBytes>,
+    /// Provider source instance when this transaction came from provider ingress.
+    pub provider_source: Option<ProviderSourceIdentity>,
     /// Decoded Solana transaction object.
     pub tx: Arc<VersionedTransaction>,
     /// SOF transaction kind classification.
@@ -108,6 +111,8 @@ pub struct TransactionLogEvent {
     pub logs: Arc<[String]>,
     /// Matching pubkey for one `mentions`-style subscription when present.
     pub matched_filter: Option<PubkeyBytes>,
+    /// Provider source instance when this event came from provider ingress.
+    pub provider_source: Option<ProviderSourceIdentity>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -132,9 +137,11 @@ pub struct TransactionStatusEvent {
     pub index: Option<u64>,
     /// Transaction error detail when execution failed.
     pub err: Option<String>,
+    /// Provider source instance when this event came from provider ingress.
+    pub provider_source: Option<ProviderSourceIdentity>,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 /// Runtime event emitted for one upstream block-metadata update.
 pub struct BlockMetaEvent {
     /// Slot context attached to the upstream block-meta update.
@@ -159,6 +166,8 @@ pub struct BlockMetaEvent {
     pub executed_transaction_count: u64,
     /// Number of entries in this block.
     pub entries_count: u64,
+    /// Provider source instance when this event came from provider ingress.
+    pub provider_source: Option<ProviderSourceIdentity>,
 }
 
 #[derive(Debug, Clone)]
@@ -361,6 +370,7 @@ impl TransactionEventRef<'_> {
             confirmed_slot: self.confirmed_slot,
             finalized_slot: self.finalized_slot,
             signature: self.signature,
+            provider_source: None,
             tx: Arc::new(self.tx.clone()),
             kind: self.kind,
         }
@@ -421,6 +431,8 @@ pub struct AccountUpdateEvent {
     pub is_startup: bool,
     /// Matching subscription/filter pubkey when one concrete key drove the feed.
     pub matched_filter: Option<PubkeyBytes>,
+    /// Provider source instance when this event came from provider ingress.
+    pub provider_source: Option<ProviderSourceIdentity>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -442,7 +454,7 @@ pub struct AccountTouchEventRef<'event> {
     pub lookup_table_account_key_count: usize,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 /// Runtime event emitted when local canonical classification for one slot changes.
 pub struct SlotStatusEvent {
     /// Slot number whose status changed.
@@ -459,6 +471,8 @@ pub struct SlotStatusEvent {
     pub confirmed_slot: Option<u64>,
     /// Current finalized slot watermark.
     pub finalized_slot: Option<u64>,
+    /// Provider source instance when this event came from provider ingress.
+    pub provider_source: Option<ProviderSourceIdentity>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -478,6 +492,8 @@ pub struct ReorgEvent {
     pub confirmed_slot: Option<u64>,
     /// Finalized slot watermark after the switch.
     pub finalized_slot: Option<u64>,
+    /// Provider source instance when this event came from provider ingress.
+    pub provider_source: Option<ProviderSourceIdentity>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -489,6 +505,8 @@ pub struct ObservedRecentBlockhashEvent {
     pub recent_blockhash: [u8; 32],
     /// Number of decoded transactions in the dataset that produced this observation.
     pub dataset_tx_count: u64,
+    /// Provider source instance when this event came from provider ingress.
+    pub provider_source: Option<ProviderSourceIdentity>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -550,6 +568,8 @@ pub struct ClusterTopologyEvent {
     ///
     /// Empty for diff-only events.
     pub snapshot_nodes: Vec<ClusterNodeInfo>,
+    /// Provider source instance when this event came from provider ingress.
+    pub provider_source: Option<ProviderSourceIdentity>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -580,6 +600,8 @@ pub struct LeaderScheduleEvent {
     ///
     /// Often empty for diff-only/event-driven updates.
     pub snapshot_leaders: Vec<LeaderScheduleEntry>,
+    /// Provider source instance when this event came from provider ingress.
+    pub provider_source: Option<ProviderSourceIdentity>,
 }
 
 /// Converts one Solana signature into the public SOF-owned wrapper.

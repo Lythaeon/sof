@@ -18,8 +18,8 @@ use crate::framework::{
     RuntimeExtensionHost, TransactionEvent,
 };
 use crate::provider_stream::{
-    ProviderSourceHealthEvent, ProviderSourceHealthStatus, ProviderSourceId, ProviderStreamMode,
-    ProviderStreamReceiver, ProviderStreamUpdate,
+    ProviderSourceHealthEvent, ProviderSourceHealthStatus, ProviderSourceIdentity,
+    ProviderStreamMode, ProviderStreamReceiver, ProviderStreamUpdate,
 };
 use agave_transaction_view::transaction_view::SanitizedTransactionView;
 use sof_gossip_tuning::{
@@ -1753,19 +1753,20 @@ async fn run_provider_stream_runtime(
 
 #[derive(Default)]
 struct ProviderStreamHealth {
-    sources: HashMap<ProviderSourceId, ProviderSourceHealthEvent>,
+    sources: HashMap<ProviderSourceIdentity, ProviderSourceHealthEvent>,
 }
 
 impl ProviderStreamHealth {
     fn observe(&mut self, event: &ProviderSourceHealthEvent) {
-        let previous = self.sources.insert(event.source, event.clone());
+        let previous = self.sources.insert(event.source.clone(), event.clone());
         if previous.as_ref() == Some(event) {
             return;
         }
         match event.status {
             ProviderSourceHealthStatus::Healthy => {
                 tracing::info!(
-                    source = event.source.as_str(),
+                    source_kind = event.source.kind_str(),
+                    source_instance = event.source.instance_str(),
                     reason = event.reason.as_str(),
                     message = event.message.as_str(),
                     "provider source is healthy"
@@ -1773,7 +1774,8 @@ impl ProviderStreamHealth {
             }
             ProviderSourceHealthStatus::Reconnecting => {
                 tracing::warn!(
-                    source = event.source.as_str(),
+                    source_kind = event.source.kind_str(),
+                    source_instance = event.source.instance_str(),
                     reason = event.reason.as_str(),
                     message = event.message.as_str(),
                     "provider source is reconnecting"
@@ -1781,7 +1783,8 @@ impl ProviderStreamHealth {
             }
             ProviderSourceHealthStatus::Unhealthy => {
                 tracing::error!(
-                    source = event.source.as_str(),
+                    source_kind = event.source.kind_str(),
+                    source_instance = event.source.instance_str(),
                     reason = event.reason.as_str(),
                     message = event.message.as_str(),
                     "provider source is unhealthy"
@@ -1803,7 +1806,12 @@ impl ProviderStreamHealth {
             })
             .cloned()
             .collect::<Vec<_>>();
-        degraded.sort_by_key(|event| event.source.as_str());
+        degraded.sort_by_key(|event| {
+            (
+                event.source.kind_str().to_owned(),
+                event.source.instance_str().to_owned(),
+            )
+        });
         degraded
     }
 
@@ -1819,9 +1827,10 @@ impl ProviderStreamHealth {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum ProviderReplayDedupeKey {
     Transaction {
+        source: Option<ProviderSourceIdentity>,
         slot: u64,
         signature: Signature,
         commitment_status: u8,
@@ -1829,6 +1838,7 @@ enum ProviderReplayDedupeKey {
         finalized_slot: Option<u64>,
     },
     ControlPlane {
+        source: Option<ProviderSourceIdentity>,
         slot: u64,
         kind: u8,
         fingerprint: u64,
@@ -1836,9 +1846,9 @@ enum ProviderReplayDedupeKey {
 }
 
 impl ProviderReplayDedupeKey {
-    const fn slot(self) -> u64 {
+    const fn slot(&self) -> u64 {
         match self {
-            Self::Transaction { slot, .. } | Self::ControlPlane { slot, .. } => slot,
+            Self::Transaction { slot, .. } | Self::ControlPlane { slot, .. } => *slot,
         }
     }
 }
@@ -1869,7 +1879,7 @@ impl ProviderReplayDedupe {
         if self.seen.contains(&key) {
             return true;
         }
-        self.seen.insert(key);
+        self.seen.insert(key.clone());
         self.order.push_back(key);
         self.evict();
         false
@@ -1879,7 +1889,7 @@ impl ProviderReplayDedupe {
         let min_slot = self
             .max_slot_seen
             .saturating_sub(PROVIDER_REPLAY_DEDUPE_SLOT_WINDOW);
-        while let Some(oldest) = self.order.front().copied() {
+        while let Some(oldest) = self.order.front().cloned() {
             if self.order.len() <= self.capacity && oldest.slot() >= min_slot {
                 break;
             }
@@ -1896,6 +1906,7 @@ fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderR
             .map(crate::framework::SignatureBytes::to_solana)
             .or_else(|| event.tx.signatures.first().copied())
             .map(|signature| ProviderReplayDedupeKey::Transaction {
+                source: event.provider_source.clone(),
                 slot: event.slot,
                 signature,
                 commitment_status: provider_replay_commitment_key(event.commitment_status),
@@ -1906,6 +1917,7 @@ fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderR
             .signature
             .map(crate::framework::SignatureBytes::to_solana)
             .map(|signature| ProviderReplayDedupeKey::Transaction {
+                source: event.provider_source.clone(),
                 slot: event.slot,
                 signature,
                 commitment_status: provider_replay_commitment_key(event.commitment_status),
@@ -1914,18 +1926,21 @@ fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderR
             }),
         ProviderStreamUpdate::RecentBlockhash(event) => {
             Some(ProviderReplayDedupeKey::ControlPlane {
+                source: event.provider_source.clone(),
                 slot: event.slot,
                 kind: 1,
                 fingerprint: provider_replay_fingerprint(event),
             })
         }
         ProviderStreamUpdate::SlotStatus(event) => Some(ProviderReplayDedupeKey::ControlPlane {
+            source: event.provider_source.clone(),
             slot: event.slot,
             kind: 2,
             fingerprint: provider_replay_fingerprint(event),
         }),
         ProviderStreamUpdate::ClusterTopology(event) => {
             Some(ProviderReplayDedupeKey::ControlPlane {
+                source: event.provider_source.clone(),
                 slot: event.slot.unwrap_or_default(),
                 kind: 3,
                 fingerprint: provider_replay_fingerprint(event),
@@ -1933,18 +1948,21 @@ fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderR
         }
         ProviderStreamUpdate::LeaderSchedule(event) => {
             Some(ProviderReplayDedupeKey::ControlPlane {
+                source: event.provider_source.clone(),
                 slot: event.slot.unwrap_or_default(),
                 kind: 4,
                 fingerprint: provider_replay_fingerprint(event),
             })
         }
         ProviderStreamUpdate::Reorg(event) => Some(ProviderReplayDedupeKey::ControlPlane {
+            source: event.provider_source.clone(),
             slot: event.new_tip,
             kind: 5,
             fingerprint: provider_replay_fingerprint(event),
         }),
         ProviderStreamUpdate::TransactionLog(event) => {
             Some(ProviderReplayDedupeKey::ControlPlane {
+                source: event.provider_source.clone(),
                 slot: event.slot,
                 kind: 6,
                 fingerprint: provider_replay_transaction_log_fingerprint(event),
@@ -1952,6 +1970,7 @@ fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderR
         }
         ProviderStreamUpdate::TransactionStatus(event) => {
             Some(ProviderReplayDedupeKey::ControlPlane {
+                source: event.provider_source.clone(),
                 slot: event.slot,
                 kind: 8,
                 fingerprint: provider_replay_fingerprint(event),
@@ -1959,17 +1978,20 @@ fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderR
         }
         ProviderStreamUpdate::TransactionViewBatch(event) => {
             Some(ProviderReplayDedupeKey::ControlPlane {
+                source: None,
                 slot: event.slot,
                 kind: 7,
                 fingerprint: provider_replay_transaction_view_batch_fingerprint(event),
             })
         }
         ProviderStreamUpdate::AccountUpdate(event) => Some(ProviderReplayDedupeKey::ControlPlane {
+            source: event.provider_source.clone(),
             slot: event.slot,
             kind: 9,
             fingerprint: provider_replay_fingerprint(event),
         }),
         ProviderStreamUpdate::BlockMeta(event) => Some(ProviderReplayDedupeKey::ControlPlane {
+            source: event.provider_source.clone(),
             slot: event.slot,
             kind: 10,
             fingerprint: provider_replay_fingerprint(event),
@@ -2039,6 +2061,7 @@ fn dispatch_provider_stream_update(
                     slot: event.slot,
                     recent_blockhash: event.tx.message.recent_blockhash().to_bytes(),
                     dataset_tx_count: 1,
+                    provider_source: event.provider_source.clone(),
                 });
             }
             if derived_state_host.wants_transaction_applied() {
@@ -2091,7 +2114,7 @@ fn dispatch_provider_stream_update(
         }
         ProviderStreamUpdate::SlotStatus(event) => {
             if !derived_state_host.is_empty() {
-                derived_state_host.on_slot_status(event);
+                derived_state_host.on_slot_status(event.clone());
             }
             if plugin_host.wants_slot_status() {
                 plugin_host.on_slot_status(event);
@@ -2172,6 +2195,7 @@ fn dispatch_provider_stream_serialized_transaction(
                             slot: event.slot,
                             recent_blockhash,
                             dataset_tx_count: 1,
+                            provider_source: event.provider_source.clone(),
                         },
                     );
                 }
@@ -2184,6 +2208,7 @@ fn dispatch_provider_stream_serialized_transaction(
                     slot: event.slot,
                     recent_blockhash,
                     dataset_tx_count: 1,
+                    provider_source: event.provider_source.clone(),
                 });
             }
             return;
@@ -2209,6 +2234,7 @@ fn dispatch_provider_stream_serialized_transaction(
                 .copied()
                 .map(crate::framework::SignatureBytes::from_solana)
         }),
+        provider_source: event.provider_source.clone(),
         kind: crate::provider_stream::classify_provider_transaction_kind(&tx),
         tx,
     };
@@ -2218,6 +2244,7 @@ fn dispatch_provider_stream_serialized_transaction(
             recent_blockhash: recent_blockhash
                 .unwrap_or_else(|| event.tx.message.recent_blockhash().to_bytes()),
             dataset_tx_count: 1,
+            provider_source: event.provider_source.clone(),
         });
     }
     if wants_derived_state_transaction {
@@ -2759,6 +2786,7 @@ mod tests {
                 .first()
                 .copied()
                 .map(crate::framework::SignatureBytes::from_solana),
+            provider_source: None,
             kind: crate::event::TxKind::NonVote,
             tx: Arc::new(tx),
         })
@@ -3000,6 +3028,7 @@ mod tests {
                     slot: event.slot,
                     recent_blockhash: event.tx.message.recent_blockhash().to_bytes(),
                     dataset_tx_count: 1,
+                    provider_source: event.provider_source.clone(),
                 });
                 let tx_index = derived_state_host.reserve_slot_tx_indexes(event.slot, 1);
                 derived_state_host.on_transaction(tx_index, event.clone());
@@ -3026,7 +3055,7 @@ mod tests {
                 plugin_host.on_recent_blockhash(event);
             }
             ProviderStreamUpdate::SlotStatus(event) => {
-                derived_state_host.on_slot_status(event);
+                derived_state_host.on_slot_status(event.clone());
                 plugin_host.on_slot_status(event);
             }
             ProviderStreamUpdate::ClusterTopology(event) => {
@@ -3089,6 +3118,7 @@ mod tests {
                                 slot: event.slot,
                                 recent_blockhash,
                                 dataset_tx_count: 1,
+                                provider_source: event.provider_source.clone(),
                             },
                         );
                     }
@@ -3102,6 +3132,7 @@ mod tests {
                             slot: event.slot,
                             recent_blockhash,
                             dataset_tx_count: 1,
+                            provider_source: event.provider_source.clone(),
                         },
                     );
                 }
@@ -3124,6 +3155,7 @@ mod tests {
                     .copied()
                     .map(crate::framework::SignatureBytes::from_solana)
             }),
+            provider_source: event.provider_source.clone(),
             kind: kind
                 .unwrap_or_else(|| crate::provider_stream::classify_provider_transaction_kind(&tx)),
             tx,
@@ -3134,6 +3166,7 @@ mod tests {
                 recent_blockhash: recent_blockhash
                     .unwrap_or_else(|| event.tx.message.recent_blockhash().to_bytes()),
                 dataset_tx_count: 1,
+                provider_source: event.provider_source.clone(),
             });
         }
         if wants_derived_state_transaction {
@@ -3156,6 +3189,7 @@ mod tests {
                         confirmed_slot: event.confirmed_slot,
                         finalized_slot: event.finalized_slot,
                         signature: event.signature,
+                        provider_source: event.provider_source,
                         bytes: bytes.into_boxed_slice(),
                     },
                 )
@@ -3248,6 +3282,7 @@ mod tests {
             slot,
             recent_blockhash: [slot as u8; 32],
             dataset_tx_count: 1,
+            provider_source: None,
         })
     }
 
@@ -3261,6 +3296,7 @@ mod tests {
             err: None,
             logs: Arc::from([String::from("program log: hello")]),
             matched_filter: None,
+            provider_source: None,
         })
     }
 
@@ -3899,6 +3935,24 @@ mod tests {
     }
 
     #[test]
+    fn provider_replay_dedupe_keeps_same_transaction_from_distinct_sources() {
+        let source_a = crate::provider_stream::ProviderSourceIdentity::new(
+            crate::provider_stream::ProviderSourceId::Generic("source-a".to_owned()),
+            "ws-tx-1",
+        );
+        let source_b = crate::provider_stream::ProviderSourceIdentity::new(
+            crate::provider_stream::ProviderSourceId::Generic("source-b".to_owned()),
+            "ws-tx-2",
+        );
+        let update_a = sample_provider_transaction_update().with_provider_source(source_a);
+        let update_b = sample_provider_transaction_update().with_provider_source(source_b);
+        let mut dedupe = ProviderReplayDedupe::new(8);
+
+        assert!(!dedupe.observe(&update_a));
+        assert!(!dedupe.observe(&update_b));
+    }
+
+    #[test]
     fn provider_replay_dedupe_skips_duplicate_serialized_transaction_updates() {
         let update = sample_serialized_provider_transaction_update();
         let mut dedupe = ProviderReplayDedupe::new(8);
@@ -3945,6 +3999,24 @@ mod tests {
 
         assert!(!dedupe.observe(&update));
         assert!(dedupe.observe(&update));
+    }
+
+    #[test]
+    fn provider_replay_dedupe_keeps_same_control_plane_update_from_distinct_sources() {
+        let source_a = crate::provider_stream::ProviderSourceIdentity::new(
+            crate::provider_stream::ProviderSourceId::YellowstoneGrpcSlots,
+            "yellowstone-slot-1",
+        );
+        let source_b = crate::provider_stream::ProviderSourceIdentity::new(
+            crate::provider_stream::ProviderSourceId::YellowstoneGrpcSlots,
+            "yellowstone-slot-2",
+        );
+        let update_a = sample_provider_recent_blockhash_update(42).with_provider_source(source_a);
+        let update_b = sample_provider_recent_blockhash_update(42).with_provider_source(source_b);
+        let mut dedupe = ProviderReplayDedupe::new(8);
+
+        assert!(!dedupe.observe(&update_a));
+        assert!(!dedupe.observe(&update_b));
     }
 
     #[test]
@@ -4046,7 +4118,10 @@ mod tests {
         let (tx, rx) = crate::provider_stream::create_provider_stream_queue(4);
         tx.send(
             crate::provider_stream::ProviderSourceHealthEvent {
-                source: crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
+                source: crate::provider_stream::ProviderSourceIdentity::new(
+                    crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
+                    "yellowstone-grpc-1",
+                ),
                 status: crate::provider_stream::ProviderSourceHealthStatus::Reconnecting,
                 reason: crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
                 message: "upstream stalled".to_owned(),
@@ -4075,7 +4150,10 @@ mod tests {
                 assert_eq!(degraded_sources.len(), 1);
                 assert_eq!(
                     degraded_sources[0].source,
-                    crate::provider_stream::ProviderSourceId::YellowstoneGrpc
+                    crate::provider_stream::ProviderSourceIdentity::new(
+                        crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
+                        "yellowstone-grpc-1",
+                    )
                 );
                 assert_eq!(
                     degraded_sources[0].status,
@@ -4086,6 +4164,58 @@ mod tests {
                     crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure
                 );
                 assert_eq!(degraded_sources[0].message, "upstream stalled");
+            }
+            other => panic!("expected degraded provider closure failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_stream_runtime_tracks_same_kind_sources_by_instance() {
+        let plugin_host = PluginHost::builder()
+            .add_plugin(TransactionOnlyPlugin)
+            .build();
+        let extension_host = RuntimeExtensionHost::builder().build();
+        let (tx, rx) = crate::provider_stream::create_provider_stream_queue(4);
+        for instance in ["ws-tx-1", "ws-tx-2"] {
+            tx.send(
+                crate::provider_stream::ProviderSourceHealthEvent {
+                    source: crate::provider_stream::ProviderSourceIdentity::new(
+                        crate::provider_stream::ProviderSourceId::Generic(instance.to_owned()),
+                        instance,
+                    ),
+                    status: crate::provider_stream::ProviderSourceHealthStatus::Reconnecting,
+                    reason:
+                        crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
+                    message: format!("{instance} stalled"),
+                }
+                .into(),
+            )
+            .await
+            .expect("health sent");
+        }
+        drop(tx);
+
+        let result = run_provider_stream_runtime(
+            plugin_host,
+            extension_host,
+            DerivedStateHost::builder().build(),
+            None,
+            ProviderStreamMode::Generic,
+            rx,
+        )
+        .await;
+
+        match result {
+            Err(RuntimeError::ProviderStream(ProviderStreamRuntimeError::IngressClosed {
+                degraded_sources,
+                ..
+            })) => {
+                let mut instances = degraded_sources
+                    .into_iter()
+                    .map(|event| event.source.instance_str().to_owned())
+                    .collect::<Vec<_>>();
+                instances.sort();
+                assert_eq!(instances, vec!["ws-tx-1".to_owned(), "ws-tx-2".to_owned()]);
             }
             other => panic!("expected degraded provider closure failure, got {other:?}"),
         }
@@ -4134,7 +4264,10 @@ mod tests {
         let (tx, rx) = crate::provider_stream::create_provider_stream_queue(4);
         tx.send(
             crate::provider_stream::ProviderSourceHealthEvent {
-                source: crate::provider_stream::ProviderSourceId::Generic("generic_source"),
+                source: crate::provider_stream::ProviderSourceIdentity::new(
+                    crate::provider_stream::ProviderSourceId::Generic("generic_source".to_owned()),
+                    "generic_source",
+                ),
                 status: crate::provider_stream::ProviderSourceHealthStatus::Reconnecting,
                 reason: crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
                 message: "upstream stalled".to_owned(),
@@ -4163,7 +4296,7 @@ mod tests {
             })) => {
                 assert_eq!(mode, ProviderStreamMode::Generic);
                 assert_eq!(degraded_sources.len(), 1);
-                assert_eq!(degraded_sources[0].source.as_str(), "generic_source");
+                assert_eq!(degraded_sources[0].source.instance_str(), "generic_source");
             }
             other => panic!("expected degraded generic EOF failure, got {other:?}"),
         }

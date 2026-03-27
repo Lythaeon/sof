@@ -33,7 +33,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ObserverRuntime::new()
         .with_provider_stream_ingress(ProviderStreamMode::Generic, rx)
         .run_until(async move {
-            let _ = tokio::signal::ctrl_c().await;
+            if tokio::signal::ctrl_c().await.is_err() {
+                return;
+            }
             transaction_source.abort();
             logs_source.abort();
         })

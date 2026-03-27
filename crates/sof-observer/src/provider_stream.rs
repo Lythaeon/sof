@@ -131,7 +131,11 @@
 //! # }
 //! ```
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+
+#[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::event::TxCommitmentStatus;
 use crate::event::TxKind;
@@ -277,6 +281,29 @@ pub enum ProviderStreamUpdate {
     Health(ProviderSourceHealthEvent),
 }
 
+impl ProviderStreamUpdate {
+    /// Tags one provider-origin update with the source instance that produced it.
+    #[must_use]
+    pub fn with_provider_source(mut self, source: ProviderSourceIdentity) -> Self {
+        match &mut self {
+            Self::Transaction(event) => event.provider_source = Some(source),
+            Self::SerializedTransaction(event) => event.provider_source = Some(source),
+            Self::TransactionLog(event) => event.provider_source = Some(source),
+            Self::TransactionStatus(event) => event.provider_source = Some(source),
+            Self::TransactionViewBatch(_) => {}
+            Self::AccountUpdate(event) => event.provider_source = Some(source),
+            Self::BlockMeta(event) => event.provider_source = Some(source),
+            Self::RecentBlockhash(event) => event.provider_source = Some(source),
+            Self::SlotStatus(event) => event.provider_source = Some(source),
+            Self::ClusterTopology(event) => event.provider_source = Some(source),
+            Self::LeaderSchedule(event) => event.provider_source = Some(source),
+            Self::Reorg(event) => event.provider_source = Some(source),
+            Self::Health(event) => event.source = source,
+        }
+        self
+    }
+}
+
 impl From<TransactionEvent> for ProviderStreamUpdate {
     fn from(event: TransactionEvent) -> Self {
         Self::Transaction(event)
@@ -358,8 +385,8 @@ impl From<ProviderSourceHealthEvent> for ProviderStreamUpdate {
 /// One provider source health transition observed by SOF.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ProviderSourceHealthEvent {
-    /// Stable source identifier, for example `WebsocketTransaction`.
-    pub source: ProviderSourceId,
+    /// Stable source instance identifier, for example one websocket program feed.
+    pub source: ProviderSourceIdentity,
     /// Current health state for this source.
     pub status: ProviderSourceHealthStatus,
     /// Typed reason for the transition.
@@ -368,11 +395,58 @@ pub struct ProviderSourceHealthEvent {
     pub message: String,
 }
 
+/// Stable provider source instance identity used in runtime health and provider-origin events.
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct ProviderSourceIdentity {
+    /// Stable source kind, for example `WebsocketTransaction`.
+    pub kind: ProviderSourceId,
+    /// Runtime-unique or user-supplied source instance label.
+    pub instance: String,
+}
+
+impl ProviderSourceIdentity {
+    /// Creates one provider source identity from a stable kind and instance label.
+    #[must_use]
+    pub fn new(kind: ProviderSourceId, instance: impl Into<String>) -> Self {
+        Self {
+            kind,
+            instance: instance.into(),
+        }
+    }
+
+    /// Returns the source kind label, for example `websocket_transaction`.
+    #[must_use]
+    pub const fn kind_str(&self) -> &str {
+        self.kind.as_str()
+    }
+
+    /// Returns the source instance label.
+    #[must_use]
+    pub const fn instance_str(&self) -> &str {
+        self.instance.as_str()
+    }
+
+    /// Builds a generated provider-source identity with a unique instance suffix.
+    #[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
+    #[must_use]
+    pub(crate) fn generated(kind: ProviderSourceId, label: Option<&str>) -> Self {
+        static NEXT_PROVIDER_SOURCE_INSTANCE: AtomicU64 = AtomicU64::new(1);
+        match label {
+            Some(label) => Self::new(kind, label),
+            None => {
+                let instance = NEXT_PROVIDER_SOURCE_INSTANCE.fetch_add(1, Ordering::Relaxed);
+                let kind_label = kind.as_str().to_owned();
+                Self::new(kind, format!("{kind_label}-{instance}"))
+            }
+        }
+    }
+}
+
 /// Stable provider source identifier used in runtime health reporting.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum ProviderSourceId {
     /// Generic custom provider source label supplied by the embedding app.
-    Generic(&'static str),
+    Generic(String),
     /// Built-in Yellowstone gRPC source.
     YellowstoneGrpc,
     /// Built-in Yellowstone gRPC transaction-status source.
@@ -410,9 +484,9 @@ pub enum ProviderSourceId {
 impl ProviderSourceId {
     /// Returns the stable string label used in logs and error messages.
     #[must_use]
-    pub const fn as_str(self) -> &'static str {
+    pub const fn as_str(&self) -> &str {
         match self {
-            Self::Generic(label) => label,
+            Self::Generic(label) => label.as_str(),
             Self::YellowstoneGrpc => "yellowstone_grpc",
             Self::YellowstoneGrpcTransactionStatus => "yellowstone_grpc_transaction_status",
             Self::YellowstoneGrpcAccounts => "yellowstone_grpc_accounts",
@@ -486,6 +560,7 @@ pub type ProviderStreamReceiver = mpsc::Receiver<ProviderStreamUpdate>;
 /// Helper for feeding one SOF provider queue from multiple provider sources.
 #[derive(Clone, Debug)]
 pub struct ProviderStreamFanIn {
+    /// Shared sender used to fan multiple provider sources into one ingress queue.
     sender: ProviderStreamSender,
 }
 
@@ -510,6 +585,8 @@ pub struct SerializedTransactionEvent {
     pub finalized_slot: Option<u64>,
     /// Transaction signature if present.
     pub signature: Option<SignatureBytes>,
+    /// Provider source instance when this transaction came from provider ingress.
+    pub provider_source: Option<ProviderSourceIdentity>,
     /// Serialized transaction bytes.
     pub bytes: Box<[u8]>,
 }

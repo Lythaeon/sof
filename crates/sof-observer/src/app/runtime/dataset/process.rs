@@ -337,6 +337,7 @@ pub(in crate::app::runtime) fn process_completed_dataset(
             slot,
             recent_blockhash,
             dataset_tx_count: tx_count,
+            provider_source: None,
         };
         if derived_state_recent_blockhash_enabled {
             derived_state_events.push(DerivedStateFeedEvent::RecentBlockhashObserved(
@@ -760,6 +761,7 @@ fn process_completed_dataset_from_views(
             slot,
             recent_blockhash,
             dataset_tx_count: tx_count,
+            provider_source: None,
         };
         if context.derived_state_host.wants_control_plane_observed() {
             let mut events = vec![DerivedStateFeedEvent::RecentBlockhashObserved(
@@ -968,6 +970,7 @@ fn process_decoded_transaction(
                     confirmed_slot: config.confirmed_slot,
                     finalized_slot: config.finalized_slot,
                     signature: signature_bytes_opt(signature),
+                    provider_source: None,
                     tx: Arc::new(match tx {
                         std::borrow::Cow::Borrowed(tx) => tx.clone(),
                         std::borrow::Cow::Owned(tx) => tx,
@@ -1201,6 +1204,7 @@ fn process_completed_dataset_with_prefiltered_transactions(
                 confirmed_slot,
                 finalized_slot,
                 signature: signature_bytes_opt(signature),
+                provider_source: None,
                 tx: Arc::new(tx),
                 kind,
             },
@@ -1231,6 +1235,7 @@ fn process_completed_dataset_with_prefiltered_transactions(
             slot,
             recent_blockhash,
             dataset_tx_count: tx_count,
+            provider_source: None,
         };
         if context.derived_state_host.wants_control_plane_observed() {
             let mut events = vec![DerivedStateFeedEvent::RecentBlockhashObserved(
@@ -2399,6 +2404,7 @@ mod tests {
                 tip_slot: Some(slot),
                 confirmed_slot: slot.checked_sub(1),
                 finalized_slot: slot.checked_sub(32),
+                provider_source: None,
             });
             plugin_host.on_reorg(ReorgEvent {
                 old_tip: slot.saturating_sub(1),
@@ -2408,6 +2414,7 @@ mod tests {
                 attached_slots: vec![slot],
                 confirmed_slot: slot.checked_sub(1),
                 finalized_slot: slot.checked_sub(32),
+                provider_source: None,
             });
             plugin_host.on_cluster_topology(synthetic_cluster_topology_event(slot));
             plugin_host.on_leader_schedule(synthetic_leader_schedule_event(slot));
@@ -2660,6 +2667,7 @@ mod tests {
             removed_pubkeys: Vec::new(),
             updated_nodes: Vec::new(),
             snapshot_nodes: Vec::new(),
+            provider_source: None,
         }
     }
 
@@ -2677,6 +2685,7 @@ mod tests {
             removed_slots: Vec::new(),
             updated_leaders: Vec::new(),
             snapshot_leaders: Vec::new(),
+            provider_source: None,
         }
     }
 }

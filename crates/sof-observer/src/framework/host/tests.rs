@@ -549,26 +549,31 @@ fn recent_blockhash_hook_is_deduplicated_and_stateful() {
         slot: 10,
         recent_blockhash: [1_u8; 32],
         dataset_tx_count: 8,
+        provider_source: None,
     });
     host.on_recent_blockhash(ObservedRecentBlockhashEvent {
         slot: 10,
         recent_blockhash: [1_u8; 32],
         dataset_tx_count: 8,
+        provider_source: None,
     });
     host.on_recent_blockhash(ObservedRecentBlockhashEvent {
         slot: 11,
         recent_blockhash: [1_u8; 32],
         dataset_tx_count: 9,
+        provider_source: None,
     });
     host.on_recent_blockhash(ObservedRecentBlockhashEvent {
         slot: 11,
         recent_blockhash: [2_u8; 32],
         dataset_tx_count: 9,
+        provider_source: None,
     });
     host.on_recent_blockhash(ObservedRecentBlockhashEvent {
         slot: 9,
         recent_blockhash: [3_u8; 32],
         dataset_tx_count: 4,
+        provider_source: None,
     });
 
     assert!(wait_until_counter(
@@ -601,6 +606,7 @@ fn fork_hooks_dispatch_to_plugins() {
         tip_slot: Some(42),
         confirmed_slot: Some(41),
         finalized_slot: Some(40),
+        provider_source: None,
     });
     host.on_reorg(ReorgEvent {
         old_tip: 50,
@@ -610,6 +616,7 @@ fn fork_hooks_dispatch_to_plugins() {
         attached_slots: vec![59, 60],
         confirmed_slot: Some(55),
         finalized_slot: Some(52),
+        provider_source: None,
     });
 
     assert!(wait_until_counter(
@@ -641,6 +648,7 @@ fn latest_observed_tpu_leader_is_stateful() {
         removed_slots: Vec::new(),
         updated_leaders: Vec::new(),
         snapshot_leaders: Vec::new(),
+        provider_source: None,
     });
     assert_eq!(
         host.latest_observed_tpu_leader(),
@@ -661,6 +669,7 @@ fn latest_observed_tpu_leader_is_stateful() {
         removed_slots: Vec::new(),
         updated_leaders: Vec::new(),
         snapshot_leaders: Vec::new(),
+        provider_source: None,
     });
     assert_eq!(
         host.latest_observed_tpu_leader(),
@@ -681,6 +690,7 @@ fn latest_observed_tpu_leader_is_stateful() {
             leader: pb(leader_b),
         }],
         snapshot_leaders: Vec::new(),
+        provider_source: None,
     });
     assert_eq!(
         host.latest_observed_tpu_leader(),
@@ -1107,6 +1117,7 @@ fn transaction_log_commitment_selector_filters_dispatch() {
         err: None,
         logs: Arc::from(Vec::<String>::new()),
         matched_filter: None,
+        provider_source: None,
     });
     host.on_transaction_log(TransactionLogEvent {
         slot: 11,
@@ -1115,6 +1126,7 @@ fn transaction_log_commitment_selector_filters_dispatch() {
         err: None,
         logs: Arc::from(Vec::<String>::new()),
         matched_filter: None,
+        provider_source: None,
     });
 
     assert!(wait_until_counter(
@@ -1337,6 +1349,7 @@ fn test_transaction_event_with_signature(slot: u64, signature_seed: u8) -> Trans
         finalized_slot: None,
         signature: (signature_seed != 0)
             .then(|| sb(solana_signature::Signature::from([signature_seed; 64]))),
+        provider_source: None,
         tx: Arc::new(tx),
         kind: TxKind::NonVote,
     }
