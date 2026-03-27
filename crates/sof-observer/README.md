@@ -134,15 +134,52 @@ Implemented provider-stream adapters:
 - Yellowstone gRPC
 - LaserStream gRPC
 - websocket `transactionSubscribe`
+- websocket `logsSubscribe`
+- websocket `accountSubscribe`
+- websocket `programSubscribe`
+- Yellowstone/LaserStream slot feeds
 
-Built-in hook surface by provider mode:
+Built-in runtime mode surface:
 
-- Yellowstone gRPC: `on_transaction`
-- LaserStream gRPC: `on_transaction`
-- websocket `transactionSubscribe`: `on_transaction`
-- built-in processed providers do not expose standalone control-plane hooks such
-  as `on_recent_blockhash`, `on_slot_status`, `on_cluster_topology`,
-  `on_leader_schedule`, or `on_reorg`
+- `ProviderStreamMode::YellowstoneGrpc`: built-in transaction feed
+- `ProviderStreamMode::LaserStream`: built-in transaction feed
+- `ProviderStreamMode::WebsocketTransaction`: built-in websocket
+  `transactionSubscribe` feed
+
+Those fixed runtime modes remain transaction-first compatibility labels. The
+newer built-in source selectors extend the existing config objects and should be
+fed through `ProviderStreamMode::Generic` when they emit richer typed updates.
+
+Built-in source selectors:
+
+- websocket:
+  - `WebsocketTransactionConfig::with_stream(WebsocketPrimaryStream::Transaction)`
+  - `WebsocketTransactionConfig::with_stream(WebsocketPrimaryStream::Account(pubkey))`
+  - `WebsocketTransactionConfig::with_stream(WebsocketPrimaryStream::Program(program_id))`
+  - `WebsocketLogsConfig` for `logsSubscribe`
+- Yellowstone:
+  - `YellowstoneGrpcConfig::with_stream(YellowstoneGrpcStream::Transaction)`
+  - `YellowstoneGrpcConfig::with_stream(YellowstoneGrpcStream::TransactionStatus)`
+  - `YellowstoneGrpcConfig::with_stream(YellowstoneGrpcStream::Accounts)`
+  - `YellowstoneGrpcSlotsConfig` for slot updates
+- LaserStream:
+  - `LaserStreamConfig::with_stream(LaserStreamStream::Transaction)`
+  - `LaserStreamConfig::with_stream(LaserStreamStream::TransactionStatus)`
+  - `LaserStreamConfig::with_stream(LaserStreamStream::Accounts)`
+  - `LaserStreamSlotsConfig` for slot updates
+
+Typed runtime mapping for those richer sources:
+
+- transaction feeds -> `on_transaction`
+- websocket logs -> `on_transaction_log`
+- transaction-status feeds -> `on_transaction_status`
+- account/program/account-stream feeds -> `on_account_update`
+- slot feeds -> `on_slot_status`
+
+Built-in processed providers still do not expose standalone control-plane hooks
+such as `on_recent_blockhash`, `on_cluster_topology`, `on_leader_schedule`, or
+`on_reorg` unless you feed those typed updates through
+`ProviderStreamMode::Generic`.
 
 Built-in durability behavior:
 
@@ -251,13 +288,27 @@ That update surface is:
 - `Transaction`
 - `SerializedTransaction`
 - `TransactionLog`
+- `TransactionStatus`
 - `TransactionViewBatch`
+- `AccountUpdate`
 - `RecentBlockhash`
 - `SlotStatus`
 - `ClusterTopology`
 - `LeaderSchedule`
 - `Reorg`
 - `Health`
+
+`ProviderStreamMode::Generic` is also the clean way to combine multiple
+provider sources into one runtime. Use
+`create_provider_stream_fan_in(...)` when you want one SOF runtime to consume,
+for example:
+
+- websocket transactions plus websocket logs
+- Yellowstone transactions plus Yellowstone slots
+- a websocket account/program feed plus a gRPC transaction-status feed
+
+The built-in source configs stay the same in that setup. The fan-in helper just
+gives them one typed queue.
 
 The runtime then routes those typed updates into the normal SOF surfaces:
 

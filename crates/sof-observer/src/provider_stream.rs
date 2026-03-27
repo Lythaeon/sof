@@ -7,10 +7,14 @@
 //!
 //! Built-in mode capability summary:
 //!
-//! - `YellowstoneGrpc`: built-in adapter emits `on_transaction`
-//! - `LaserStream`: built-in adapter emits `on_transaction`
-//! - `WebsocketTransaction`: built-in adapter emits `on_transaction`
-//! - built-in websocket logs and gRPC slot feeds can be fanned into
+//! - `YellowstoneGrpc`: fixed runtime mode for the built-in transaction feed
+//! - `LaserStream`: fixed runtime mode for the built-in transaction feed
+//! - `WebsocketTransaction`: fixed runtime mode for websocket
+//!   `transactionSubscribe`
+//! - richer built-in source selectors, such as websocket
+//!   `accountSubscribe` / `programSubscribe` or gRPC transaction-status /
+//!   account feeds, should be fed through `ProviderStreamMode::Generic`
+//! - built-in websocket logs and gRPC slot feeds are also intended to fan into
 //!   `ProviderStreamMode::Generic`
 //!
 //! Generic provider producers may still enqueue `TransactionViewBatch`,
@@ -20,6 +24,31 @@
 //! `ProviderStreamMode::Generic` is SOF's typed custom-adapter mode.
 //! Your producer ingests an upstream format and maps it into one of the
 //! `ProviderStreamUpdate` variants below before handing it to SOF.
+//!
+//! Built-in provider source configs extend that same typed surface:
+//!
+//! - websocket:
+//!   - [`websocket::WebsocketTransactionConfig`] can target
+//!     [`websocket::WebsocketPrimaryStream::Transaction`],
+//!     [`websocket::WebsocketPrimaryStream::Account`], or
+//!     [`websocket::WebsocketPrimaryStream::Program`]
+//!   - [`websocket::WebsocketLogsConfig`] targets `logsSubscribe`
+//! - Yellowstone:
+//!   - [`yellowstone::YellowstoneGrpcConfig`] can target
+//!     [`yellowstone::YellowstoneGrpcStream::Transaction`],
+//!     [`yellowstone::YellowstoneGrpcStream::TransactionStatus`], or
+//!     [`yellowstone::YellowstoneGrpcStream::Accounts`]
+//!   - [`yellowstone::YellowstoneGrpcSlotsConfig`] targets slot updates
+//! - LaserStream:
+//!   - [`laserstream::LaserStreamConfig`] can target
+//!     [`laserstream::LaserStreamStream::Transaction`],
+//!     [`laserstream::LaserStreamStream::TransactionStatus`], or
+//!     [`laserstream::LaserStreamStream::Accounts`]
+//!   - [`laserstream::LaserStreamSlotsConfig`] targets slot updates
+//!
+//! Those source selectors do not create a second runtime API. They extend the
+//! existing provider config objects and emit the matching `ProviderStreamUpdate`
+//! variants into the same runtime dispatch path.
 //!
 //! Variant-to-runtime mapping:
 //!
@@ -148,16 +177,25 @@ pub enum ProviderStreamMode {
     Generic,
     /// Yellowstone gRPC / Geyser-style processed transaction feeds.
     ///
-    /// Built-in adapter hook surface today: `on_transaction`.
+    /// This fixed runtime mode is for the built-in transaction feed. If you use
+    /// richer Yellowstone stream selectors such as transaction-status or
+    /// account updates, feed them through [`Self::Generic`] so SOF can dispatch
+    /// the broader typed update surface.
     YellowstoneGrpc,
     /// LaserStream-style processed transaction feeds.
     ///
-    /// Built-in adapter hook surface today: `on_transaction`.
+    /// This fixed runtime mode is for the built-in transaction feed. If you use
+    /// richer LaserStream stream selectors such as transaction-status or
+    /// account updates, feed them through [`Self::Generic`] so SOF can dispatch
+    /// the broader typed update surface.
     LaserStream,
     #[cfg(feature = "provider-websocket")]
     /// Websocket `transactionSubscribe` processed transaction feeds.
     ///
-    /// Built-in adapter hook surface today: `on_transaction`.
+    /// This fixed runtime mode is for websocket `transactionSubscribe`. If you
+    /// use websocket `logsSubscribe`, `accountSubscribe`, or `programSubscribe`,
+    /// feed them through [`Self::Generic`] so SOF can dispatch the matching
+    /// typed updates.
     WebsocketTransaction,
 }
 
