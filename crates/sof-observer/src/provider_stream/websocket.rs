@@ -1,9 +1,10 @@
 #![allow(clippy::missing_docs_in_private_items)]
 
-//! Websocket `transactionSubscribe` adapters for SOF provider-stream ingress.
+//! Websocket processed-provider adapters for SOF provider-stream ingress.
 //!
-//! This adapter keeps the same transaction semantics as Yellowstone and
-//! LaserStream by requesting full base64 transaction payloads and converting
+//! This module covers websocket transaction, logs, account, and program feeds.
+//! Transaction subscriptions keep the same transaction semantics as Yellowstone
+//! and LaserStream by requesting full base64 transaction payloads and converting
 //! them into [`crate::framework::TransactionEvent`] values before dispatch.
 
 use std::{borrow::Cow, str::FromStr, sync::Arc, time::Duration};
@@ -868,6 +869,18 @@ pub async fn spawn_websocket_transaction_source(
     let config = config.clone();
     let source = ProviderSourceIdentity::generated(config.source_id(), config.source_instance());
     let first_session = establish_websocket_primary_session(&config).await?;
+    send_primary_provider_health(
+        &source,
+        config.readiness(),
+        &sender,
+        ProviderSourceHealthStatus::Reconnecting,
+        ProviderSourceHealthReason::InitialConnectPending,
+        format!(
+            "waiting for first websocket {} session ack",
+            config.stream_kind()
+        ),
+    )
+    .await?;
     Ok(tokio::spawn(async move {
         let mut attempts = 0_u32;
         let mut last_seen_slot = None;
@@ -978,6 +991,15 @@ pub async fn spawn_websocket_logs_source(
         config.source_instance(),
     );
     let first_session = establish_websocket_logs_session(&config).await?;
+    send_provider_logs_health(
+        &source,
+        config.readiness(),
+        &sender,
+        ProviderSourceHealthStatus::Reconnecting,
+        ProviderSourceHealthReason::InitialConnectPending,
+        "waiting for first websocket logs session ack".to_owned(),
+    )
+    .await?;
     Ok(tokio::spawn(async move {
         let mut attempts = 0_u32;
         let mut first_session = Some(first_session);
@@ -2780,6 +2802,58 @@ mod tests {
         };
         assert_eq!(event.slot, 88);
         assert_eq!(event.signature, signature.into());
+
+        handle.abort();
+        handle.await.ok();
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn websocket_transaction_source_emits_initial_health_registration() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = accept_async(stream).await.expect("websocket handshake");
+            let subscribe = ws
+                .next()
+                .await
+                .expect("subscribe frame")
+                .expect("subscribe message");
+            match subscribe {
+                WsMessage::Text(text) => assert!(text.contains("transactionSubscribe")),
+                other => panic!("expected subscribe text frame, got {other:?}"),
+            }
+            ws.send(WsMessage::Text(
+                String::from(r#"{"jsonrpc":"2.0","id":1,"result":42}"#).into(),
+            ))
+            .await
+            .expect("ack");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            ws.close(None).await.expect("close");
+        });
+
+        let (tx, mut rx) = create_provider_stream_queue(8);
+        let config = WebsocketTransactionConfig::new(format!("ws://{addr}"))
+            .with_max_reconnect_attempts(1)
+            .with_reconnect_delay(Duration::from_millis(10));
+        let handle = spawn_websocket_transaction_source(&config, tx)
+            .await
+            .expect("spawn websocket transaction source");
+
+        let update = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("provider update timeout")
+            .expect("provider update");
+        let ProviderStreamUpdate::Health(event) = update else {
+            panic!("expected initial provider health update");
+        };
+        assert_eq!(event.status, ProviderSourceHealthStatus::Reconnecting);
+        assert_eq!(
+            event.reason,
+            ProviderSourceHealthReason::InitialConnectPending
+        );
 
         handle.abort();
         handle.await.ok();

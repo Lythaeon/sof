@@ -74,7 +74,7 @@ impl YellowstoneGrpcCommitment {
     }
 }
 
-/// Connection and filter config for Yellowstone transaction subscriptions.
+/// Connection and filter config for Yellowstone processed-provider subscriptions.
 #[derive(Clone, Debug)]
 pub struct YellowstoneGrpcConfig {
     endpoint: String,
@@ -887,6 +887,18 @@ pub async fn spawn_yellowstone_grpc_transaction_source(
     config.validate()?;
     let source = ProviderSourceIdentity::generated(config.source_id(), config.source_instance());
     let first_session = establish_yellowstone_session(&config, 0).await?;
+    send_primary_provider_health(
+        &source,
+        config.readiness(),
+        &sender,
+        ProviderSourceHealthStatus::Reconnecting,
+        ProviderSourceHealthReason::InitialConnectPending,
+        format!(
+            "waiting for first yellowstone {} session ack",
+            config.stream_kind()
+        ),
+    )
+    .await?;
     Ok(tokio::spawn(async move {
         let mut attempts = 0_u32;
         let mut tracked_slot = 0_u64;
@@ -1012,6 +1024,15 @@ pub async fn spawn_yellowstone_grpc_slot_source(
         config.source_instance(),
     );
     let first_session = establish_yellowstone_slot_session(&config, 0).await?;
+    send_provider_slot_health(
+        &source,
+        config.readiness(),
+        &sender,
+        ProviderSourceHealthStatus::Reconnecting,
+        ProviderSourceHealthReason::InitialConnectPending,
+        "waiting for first yellowstone slot session ack".to_owned(),
+    )
+    .await?;
     Ok(tokio::spawn(async move {
         let mut attempts = 0_u32;
         let mut tracked_slot = 0_u64;
@@ -1959,6 +1980,52 @@ mod tests {
                 .expect("provider source")
                 .instance_str(),
             "yellowstone-primary"
+        );
+
+        handle.abort();
+        handle.await.ok();
+        let _ = shutdown_tx.send(());
+        server.await.expect("Yellowstone server task");
+    }
+
+    #[tokio::test]
+    async fn yellowstone_source_emits_initial_health_registration() {
+        let update = SubscribeUpdate {
+            filters: vec!["sof".to_owned()],
+            created_at: None,
+            update_oneof: Some(UpdateOneof::Ping(
+                yellowstone_grpc_proto::prelude::SubscribeUpdatePing {},
+            )),
+        };
+        let (addr, shutdown_tx, server) = spawn_yellowstone_test_server(MockYellowstone {
+            expected_stream: MockYellowstoneStream::Transaction,
+            expected_account: None,
+            expected_owner: None,
+            update,
+        })
+        .await;
+
+        let (tx, mut rx) = create_provider_stream_queue(8);
+        let config = YellowstoneGrpcConfig::new(format!("http://{addr}"))
+            .with_stream(YellowstoneGrpcStream::Transaction)
+            .with_max_reconnect_attempts(1)
+            .with_reconnect_delay(Duration::from_millis(10))
+            .with_connect_timeout(Duration::from_secs(2));
+        let handle = spawn_yellowstone_grpc_transaction_source(config, tx)
+            .await
+            .expect("spawn Yellowstone transaction source");
+
+        let update = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("provider update timeout")
+            .expect("provider update");
+        let ProviderStreamUpdate::Health(event) = update else {
+            panic!("expected initial provider health update");
+        };
+        assert_eq!(event.status, ProviderSourceHealthStatus::Reconnecting);
+        assert_eq!(
+            event.reason,
+            ProviderSourceHealthReason::InitialConnectPending
         );
 
         handle.abort();

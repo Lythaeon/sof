@@ -584,6 +584,8 @@ impl ProviderSourceReadiness {
 /// Typed reason for one provider source health transition.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub enum ProviderSourceHealthReason {
+    /// Source is configured and waiting for its first live session acknowledgement.
+    InitialConnectPending,
     /// Subscription/setup completed and the provider acknowledged the stream.
     SubscriptionAckReceived,
     /// The provider stream ended without an explicit terminal error.
@@ -603,6 +605,7 @@ impl ProviderSourceHealthReason {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::InitialConnectPending => "initial_connect_pending",
             Self::SubscriptionAckReceived => "subscription_ack_received",
             Self::UpstreamStreamClosedUnexpectedly => "upstream_stream_closed_unexpectedly",
             Self::UpstreamTransportFailure => "upstream_transport_failure",

@@ -950,6 +950,18 @@ pub async fn spawn_laserstream_transaction_source(
     let source = ProviderSourceIdentity::generated(config.source_id(), config.source_instance());
     let first_session =
         connect_and_subscribe_once(&config, config.subscribe_request_with_state(0)).await?;
+    send_primary_provider_health(
+        &source,
+        config.readiness(),
+        &sender,
+        ProviderSourceHealthStatus::Reconnecting,
+        ProviderSourceHealthReason::InitialConnectPending,
+        format!(
+            "waiting for first laserstream {} session ack",
+            config.stream_kind()
+        ),
+    )
+    .await?;
     Ok(tokio::spawn(async move {
         let mut attempts = 0_u32;
         let mut tracked_slot = 0_u64;
@@ -1080,6 +1092,15 @@ pub async fn spawn_laserstream_slot_source(
     );
     let first_session =
         connect_and_subscribe_slots_once(&config, config.subscribe_request_with_state(0)).await?;
+    send_provider_slot_health(
+        &source,
+        config.readiness(),
+        &sender,
+        ProviderSourceHealthStatus::Reconnecting,
+        ProviderSourceHealthReason::InitialConnectPending,
+        "waiting for first laserstream slot session ack".to_owned(),
+    )
+    .await?;
     Ok(tokio::spawn(async move {
         let mut attempts = 0_u32;
         let mut tracked_slot = 0_u64;
@@ -2197,6 +2218,52 @@ mod tests {
                 .expect("provider source")
                 .instance_str(),
             "laserstream-primary"
+        );
+
+        handle.abort();
+        handle.await.ok();
+        let _ = shutdown_tx.send(());
+        server.await.expect("LaserStream server task");
+    }
+
+    #[tokio::test]
+    async fn laserstream_source_emits_initial_health_registration() {
+        let update = grpc::SubscribeUpdate {
+            filters: vec!["sof".to_owned()],
+            created_at: None,
+            update_oneof: Some(grpc::subscribe_update::UpdateOneof::Ping(
+                grpc::SubscribeUpdatePing {},
+            )),
+        };
+        let (addr, shutdown_tx, server) = spawn_laserstream_test_server(MockLaserStream {
+            expected_stream: MockLaserStreamStream::Transaction,
+            expected_account: None,
+            expected_owner: None,
+            update,
+        })
+        .await;
+
+        let (tx, mut rx) = create_provider_stream_queue(8);
+        let config = LaserStreamConfig::new(format!("http://{addr}"), "token")
+            .with_stream(LaserStreamStream::Transaction)
+            .with_max_reconnect_attempts(1)
+            .with_reconnect_delay(Duration::from_millis(10))
+            .with_connect_timeout(Duration::from_secs(2));
+        let handle = spawn_laserstream_transaction_source(config, tx)
+            .await
+            .expect("spawn LaserStream transaction source");
+
+        let update = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("provider update timeout")
+            .expect("provider update");
+        let ProviderStreamUpdate::Health(event) = update else {
+            panic!("expected initial provider health update");
+        };
+        assert_eq!(event.status, ProviderSourceHealthStatus::Reconnecting);
+        assert_eq!(
+            event.reason,
+            ProviderSourceHealthReason::InitialConnectPending
         );
 
         handle.abort();

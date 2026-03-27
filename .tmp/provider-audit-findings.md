@@ -35,3 +35,17 @@ Follow-up findings after the readiness/readiness-class pass:
 6. GitBook crate page still described built-in processed providers as transaction-first.
    - That now misstates the built-in surface after accounts, transaction status,
      block-meta, logs, program/account websocket feeds, and slots landed.
+
+7. Built-in source readiness still had a startup registration gap.
+   - Required sources only existed in readiness state after their first emitted
+     health event.
+   - A fast healthy source could briefly make `/readyz` true before another
+     configured required source had registered itself.
+
+8. Generic serialized transaction replay dedupe depended on an explicit signature.
+   - If a producer fed `SerializedTransaction` without `signature`, replay
+     dedupe silently stopped applying to that update family.
+
+9. In-code provider adapter module docs drifted.
+   - Websocket module docs still described only transaction adapters.
+   - Yellowstone config docs still described only transaction subscriptions.

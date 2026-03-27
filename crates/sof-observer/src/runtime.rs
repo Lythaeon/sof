@@ -1965,6 +1965,14 @@ enum ProviderReplayDedupeKey {
         confirmed_slot: Option<u64>,
         finalized_slot: Option<u64>,
     },
+    SerializedTransaction {
+        source: Option<crate::provider_stream::ProviderSourceRef>,
+        slot: u64,
+        commitment_status: u8,
+        confirmed_slot: Option<u64>,
+        finalized_slot: Option<u64>,
+        fingerprint: u64,
+    },
     ControlPlane {
         source: Option<crate::provider_stream::ProviderSourceRef>,
         slot: u64,
@@ -1976,7 +1984,9 @@ enum ProviderReplayDedupeKey {
 impl ProviderReplayDedupeKey {
     const fn slot(&self) -> u64 {
         match self {
-            Self::Transaction { slot, .. } | Self::ControlPlane { slot, .. } => *slot,
+            Self::Transaction { slot, .. }
+            | Self::SerializedTransaction { slot, .. }
+            | Self::ControlPlane { slot, .. } => *slot,
         }
     }
 }
@@ -2044,14 +2054,28 @@ fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderR
         ProviderStreamUpdate::SerializedTransaction(event) => event
             .signature
             .map(crate::framework::SignatureBytes::to_solana)
-            .map(|signature| ProviderReplayDedupeKey::Transaction {
-                source: event.provider_source.clone(),
-                slot: event.slot,
-                signature,
-                commitment_status: provider_replay_commitment_key(event.commitment_status),
-                confirmed_slot: event.confirmed_slot,
-                finalized_slot: event.finalized_slot,
-            }),
+            .map_or_else(
+                || {
+                    Some(ProviderReplayDedupeKey::SerializedTransaction {
+                        source: event.provider_source.clone(),
+                        slot: event.slot,
+                        commitment_status: provider_replay_commitment_key(event.commitment_status),
+                        confirmed_slot: event.confirmed_slot,
+                        finalized_slot: event.finalized_slot,
+                        fingerprint: provider_replay_fingerprint(&event.bytes),
+                    })
+                },
+                |signature| {
+                    Some(ProviderReplayDedupeKey::Transaction {
+                        source: event.provider_source.clone(),
+                        slot: event.slot,
+                        signature,
+                        commitment_status: provider_replay_commitment_key(event.commitment_status),
+                        confirmed_slot: event.confirmed_slot,
+                        finalized_slot: event.finalized_slot,
+                    })
+                },
+            ),
         ProviderStreamUpdate::RecentBlockhash(event) => {
             Some(ProviderReplayDedupeKey::ControlPlane {
                 source: event.provider_source.clone(),
@@ -4162,6 +4186,21 @@ mod tests {
     #[test]
     fn provider_replay_dedupe_skips_duplicate_serialized_transaction_updates() {
         let update = sample_serialized_provider_transaction_update();
+        let mut dedupe = ProviderReplayDedupe::new(8);
+
+        assert!(!dedupe.observe(&update));
+        assert!(dedupe.observe(&update));
+    }
+
+    #[test]
+    fn provider_replay_dedupe_skips_duplicate_serialized_updates_without_signature() {
+        let ProviderStreamUpdate::SerializedTransaction(mut event) =
+            sample_serialized_provider_transaction_update()
+        else {
+            panic!("expected serialized update fixture");
+        };
+        event.signature = None;
+        let update = ProviderStreamUpdate::SerializedTransaction(event);
         let mut dedupe = ProviderReplayDedupe::new(8);
 
         assert!(!dedupe.observe(&update));
