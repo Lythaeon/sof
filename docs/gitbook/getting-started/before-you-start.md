@@ -19,6 +19,9 @@ That means:
 So the first question is not "is SOF fast." The first question is "what ingress reaches this host
 earliest."
 
+If you only want the operator-facing mode matrix after this mental model, go to
+[Deployment Modes](../operations/deployment-modes.md).
+
 ## What SOF Actually Starts From
 
 Depending on mode, SOF starts from one of two families:

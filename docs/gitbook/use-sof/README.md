@@ -39,9 +39,10 @@ This section is for:
 ## What This Track Assumes
 
 - ingress choice matters more than slogans about being "fast"
-- public gossip is useful, but not usually the lowest-latency source
-- private raw feeds, direct validator-adjacent ingress, and good host placement usually beat it
 - SOF is most useful when you want one reusable runtime instead of rebuilding the same Solana
   ingest and correctness machinery in every service
+
+For the actual ingress/latency mental model, use
+[Before You Start](../getting-started/before-you-start.md).
 
 Repository-internal material lives under [Maintain SOF](../maintainers/README.md).

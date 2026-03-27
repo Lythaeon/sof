@@ -29,14 +29,12 @@ You may still use RPC for:
 
 Usually no.
 
-Public gossip is the independent baseline. It is useful when you want to own the public edge of
-the stack yourself. It is usually not the fastest way to receive shreds.
+Use [Before You Start](before-you-start.md) for the full ingress and latency model. The short
+answer is:
 
-If you care most about latency, the better path is usually:
-
-- private raw shred distribution
-- direct validator-adjacent or peer-adjacent ingress
-- host placement close to the source, often in the same datacenter
+- public gossip is the open, independent baseline
+- it is usually not the earliest shred source
+- private raw distribution, validator-adjacent ingress, and better host placement usually beat it
 
 ## Does SOF Behave Like A Validator?
 

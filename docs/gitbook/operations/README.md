@@ -24,3 +24,8 @@ If SOF is still new, start with:
 - understanding what SOF can and cannot change about latency
 - finding the safe baseline before expert-only tuning
 - looking up one specific runtime knob quickly in the [Knob Registry](knob-registry.md)
+
+The main split in this section is:
+
+- [Deployment Modes](deployment-modes.md) for mode and trust posture
+- [Tuning and Environment Controls](tuning-and-env.md) for what to change only after measurement
