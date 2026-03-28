@@ -32,8 +32,9 @@ use thiserror::Error;
 use crate::{
     event::{ForkSlotStatus, TxCommitmentStatus, TxKind},
     framework::{
-        AccountTouchEvent, ClusterTopologyEvent, ControlPlaneSource, LeaderScheduleEvent,
-        ObservedRecentBlockhashEvent, ReorgEvent, SlotStatusEvent, TransactionEvent,
+        AccountTouchEvent, BlockMetaEvent, ClusterTopologyEvent, ControlPlaneSource,
+        LeaderScheduleEvent, ObservedRecentBlockhashEvent, ReorgEvent, SlotStatusEvent,
+        TransactionEvent, TransactionStatusEvent,
     },
 };
 
@@ -42,6 +43,10 @@ use crate::{
 pub struct DerivedStateConsumerConfig {
     /// Enables `TransactionApplied` feed delivery.
     pub transaction_applied: bool,
+    /// Enables `TransactionStatusObserved` feed delivery.
+    pub transaction_status_observed: bool,
+    /// Enables `BlockMetaObserved` feed delivery.
+    pub block_meta_observed: bool,
     /// Enables `AccountTouchObserved` feed delivery.
     pub account_touch_observed: bool,
     /// Requests writable/read-only key partitions on account-touch events.
@@ -61,6 +66,20 @@ impl DerivedStateConsumerConfig {
     #[must_use]
     pub const fn with_transaction_applied(mut self) -> Self {
         self.transaction_applied = true;
+        self
+    }
+
+    /// Enables `TransactionStatusObserved`.
+    #[must_use]
+    pub const fn with_transaction_status_observed(mut self) -> Self {
+        self.transaction_status_observed = true;
+        self
+    }
+
+    /// Enables `BlockMetaObserved`.
+    #[must_use]
+    pub const fn with_block_meta_observed(mut self) -> Self {
+        self.block_meta_observed = true;
         self
     }
 
@@ -211,6 +230,10 @@ pub struct DerivedStateFeedEnvelope {
 pub enum DerivedStateFeedEvent {
     /// Decoded transaction apply record.
     TransactionApplied(TransactionAppliedEvent),
+    /// Transaction-status observation from processed-provider ingest.
+    TransactionStatusObserved(TransactionStatusObservedEvent),
+    /// Block-metadata observation from processed-provider ingest.
+    BlockMetaObserved(BlockMetaObservedEvent),
     /// Recent blockhash observation suitable for direct-submit consumers.
     RecentBlockhashObserved(ObservedRecentBlockhashEvent),
     /// Cluster topology diff/snapshot suitable for direct-submit consumers.
@@ -420,6 +443,87 @@ impl From<(u32, TransactionEvent)> for TransactionAppliedEvent {
             kind: event.kind,
             transaction: event.tx,
             commitment_status: event.commitment_status,
+        }
+    }
+}
+
+/// Transaction-status observation for the derived-state feed.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TransactionStatusObservedEvent {
+    /// Slot containing the observed transaction status.
+    pub slot: u64,
+    /// Commitment status at emission time.
+    pub commitment_status: TxCommitmentStatus,
+    /// Latest observed confirmed slot watermark when event was emitted.
+    pub confirmed_slot: Option<u64>,
+    /// Latest observed finalized slot watermark when event was emitted.
+    pub finalized_slot: Option<u64>,
+    /// Transaction signature carried by the upstream status update.
+    pub signature: SignatureBytes,
+    /// Whether the upstream provider marked this as a vote transaction.
+    pub is_vote: bool,
+    /// Transaction index within the slot when the provider included it.
+    pub index: Option<u64>,
+    /// Transaction error detail when execution failed.
+    pub err: Option<String>,
+}
+
+impl From<TransactionStatusEvent> for TransactionStatusObservedEvent {
+    fn from(event: TransactionStatusEvent) -> Self {
+        Self {
+            slot: event.slot,
+            commitment_status: event.commitment_status,
+            confirmed_slot: event.confirmed_slot,
+            finalized_slot: event.finalized_slot,
+            signature: event.signature,
+            is_vote: event.is_vote,
+            index: event.index,
+            err: event.err,
+        }
+    }
+}
+
+/// Block-metadata observation for the derived-state feed.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BlockMetaObservedEvent {
+    /// Slot whose block metadata was observed.
+    pub slot: u64,
+    /// Commitment status at emission time.
+    pub commitment_status: TxCommitmentStatus,
+    /// Latest observed confirmed slot watermark when event was emitted.
+    pub confirmed_slot: Option<u64>,
+    /// Latest observed finalized slot watermark when event was emitted.
+    pub finalized_slot: Option<u64>,
+    /// Current blockhash for this slot.
+    pub blockhash: [u8; 32],
+    /// Parent slot for this block.
+    pub parent_slot: u64,
+    /// Parent blockhash for this block.
+    pub parent_blockhash: [u8; 32],
+    /// Provider-reported block time when available.
+    pub block_time: Option<i64>,
+    /// Provider-reported block height when available.
+    pub block_height: Option<u64>,
+    /// Number of executed transactions in this block.
+    pub executed_transaction_count: u64,
+    /// Number of entries in this block.
+    pub entries_count: u64,
+}
+
+impl From<BlockMetaEvent> for BlockMetaObservedEvent {
+    fn from(event: BlockMetaEvent) -> Self {
+        Self {
+            slot: event.slot,
+            commitment_status: event.commitment_status,
+            confirmed_slot: event.confirmed_slot,
+            finalized_slot: event.finalized_slot,
+            blockhash: event.blockhash,
+            parent_slot: event.parent_slot,
+            parent_blockhash: event.parent_blockhash,
+            block_time: event.block_time,
+            block_height: event.block_height,
+            executed_transaction_count: event.executed_transaction_count,
+            entries_count: event.entries_count,
         }
     }
 }
@@ -2537,6 +2641,8 @@ impl DerivedStateHostBuilder {
         let config = consumer.config();
         let subscriptions = DerivedStateConsumerSubscriptions {
             transaction_applied: config.transaction_applied,
+            transaction_status_observed: config.transaction_status_observed,
+            block_meta_observed: config.block_meta_observed,
             account_touch_observed: config.account_touch_observed,
             account_touch_key_partitions: config.account_touch_key_partitions,
             control_plane_observed: config.control_plane_observed,
@@ -2704,6 +2810,24 @@ impl DerivedStateHost {
             .consumers
             .iter()
             .any(|consumer| consumer.subscriptions.transaction_applied)
+    }
+
+    /// Returns true when at least one consumer wants transaction-status observations.
+    #[must_use]
+    pub fn wants_transaction_status_observed(&self) -> bool {
+        self.inner
+            .consumers
+            .iter()
+            .any(|consumer| consumer.subscriptions.transaction_status_observed)
+    }
+
+    /// Returns true when at least one consumer wants block-meta observations.
+    #[must_use]
+    pub fn wants_block_meta_observed(&self) -> bool {
+        self.inner
+            .consumers
+            .iter()
+            .any(|consumer| consumer.subscriptions.block_meta_observed)
     }
 
     /// Returns true when at least one consumer wants account-touch events.
@@ -3054,6 +3178,38 @@ impl DerivedStateHost {
                 finalized_slot: event.finalized_slot,
             },
             DerivedStateFeedEvent::AccountTouchObserved((tx_index, event).into()),
+        );
+    }
+
+    /// Emits one transaction-status observation into the derived-state feed.
+    pub fn on_transaction_status(&self, event: TransactionStatusEvent) {
+        if self.is_empty() {
+            return;
+        }
+        self.dispatch(
+            FeedWatermarks {
+                canonical_tip_slot: Some(event.slot),
+                processed_slot: Some(event.slot),
+                confirmed_slot: event.confirmed_slot,
+                finalized_slot: event.finalized_slot,
+            },
+            DerivedStateFeedEvent::TransactionStatusObserved(event.into()),
+        );
+    }
+
+    /// Emits one block-meta observation into the derived-state feed.
+    pub fn on_block_meta(&self, event: BlockMetaEvent) {
+        if self.is_empty() {
+            return;
+        }
+        self.dispatch(
+            FeedWatermarks {
+                canonical_tip_slot: Some(event.slot),
+                processed_slot: Some(event.slot),
+                confirmed_slot: event.confirmed_slot,
+                finalized_slot: event.finalized_slot,
+            },
+            DerivedStateFeedEvent::BlockMetaObserved(event.into()),
         );
     }
 
@@ -4061,6 +4217,10 @@ struct RegisteredDerivedStateConsumer {
 struct DerivedStateConsumerSubscriptions {
     /// Whether the consumer wants `TransactionApplied` events.
     transaction_applied: bool,
+    /// Whether the consumer wants `TransactionStatusObserved` events.
+    transaction_status_observed: bool,
+    /// Whether the consumer wants `BlockMetaObserved` events.
+    block_meta_observed: bool,
     /// Whether the consumer wants `AccountTouchObserved` events.
     account_touch_observed: bool,
     /// Whether the consumer wants partitioned account-touch key sets.
@@ -4074,6 +4234,8 @@ impl RegisteredDerivedStateConsumer {
     #[must_use]
     const fn accepts_all_events(&self) -> bool {
         self.subscriptions.transaction_applied
+            && self.subscriptions.transaction_status_observed
+            && self.subscriptions.block_meta_observed
             && self.subscriptions.account_touch_observed
             && self.subscriptions.control_plane_observed
     }
@@ -4095,6 +4257,10 @@ impl RegisteredDerivedStateConsumer {
     const fn accepts_event(&self, event: &DerivedStateFeedEvent) -> bool {
         match event {
             DerivedStateFeedEvent::TransactionApplied(_) => self.subscriptions.transaction_applied,
+            DerivedStateFeedEvent::TransactionStatusObserved(_) => {
+                self.subscriptions.transaction_status_observed
+            }
+            DerivedStateFeedEvent::BlockMetaObserved(_) => self.subscriptions.block_meta_observed,
             DerivedStateFeedEvent::AccountTouchObserved(_) => {
                 self.subscriptions.account_touch_observed
             }
@@ -4230,6 +4396,7 @@ fn generate_session_id() -> FeedSessionId {
 mod tests {
     use super::*;
     use crate::framework::{ClusterNodeInfo, ControlPlaneSource, LeaderScheduleEntry};
+    use solana_signature::Signature;
     use std::{
         env, fs,
         net::SocketAddr,
@@ -4464,6 +4631,8 @@ mod tests {
         fn config(&self) -> DerivedStateConsumerConfig {
             DerivedStateConsumerConfig::new()
                 .with_transaction_applied()
+                .with_transaction_status_observed()
+                .with_block_meta_observed()
                 .with_account_touch_key_partitions()
                 .with_control_plane_observed()
         }
@@ -4745,6 +4914,60 @@ mod tests {
     }
 
     #[test]
+    fn host_dispatches_provider_observed_events_into_feed() {
+        let state = Arc::new(Mutex::new(RecordingState::default()));
+        let host = DerivedStateHost::builder()
+            .add_consumer(RecordingConsumer::new(Arc::clone(&state)))
+            .build();
+
+        host.on_transaction_status(TransactionStatusEvent {
+            slot: 91,
+            commitment_status: TxCommitmentStatus::Confirmed,
+            confirmed_slot: Some(91),
+            finalized_slot: Some(80),
+            signature: SignatureBytes::from_solana(Signature::from([9_u8; 64])),
+            is_vote: false,
+            index: Some(4),
+            err: None,
+            provider_source: None,
+        });
+        host.on_block_meta(BlockMetaEvent {
+            slot: 92,
+            commitment_status: TxCommitmentStatus::Confirmed,
+            confirmed_slot: Some(92),
+            finalized_slot: Some(81),
+            blockhash: [3_u8; 32],
+            parent_slot: 91,
+            parent_blockhash: [2_u8; 32],
+            block_time: Some(1_700_000_000),
+            block_height: Some(123),
+            executed_transaction_count: 17,
+            entries_count: 5,
+            provider_source: None,
+        });
+
+        let state = state
+            .lock()
+            .expect("recording state mutex should not be poisoned");
+        assert_eq!(state.envelopes.len(), 2);
+        assert!(matches!(
+            state.envelopes[0].event,
+            DerivedStateFeedEvent::TransactionStatusObserved(_)
+        ));
+        assert_eq!(state.envelopes[0].watermarks.processed_slot, Some(91));
+        assert_eq!(state.envelopes[0].watermarks.confirmed_slot, Some(91));
+        assert_eq!(state.envelopes[0].watermarks.finalized_slot, Some(80));
+        assert!(matches!(
+            state.envelopes[1].event,
+            DerivedStateFeedEvent::BlockMetaObserved(_)
+        ));
+        assert_eq!(state.envelopes[1].watermarks.processed_slot, Some(92));
+        assert_eq!(state.envelopes[1].watermarks.confirmed_slot, Some(92));
+        assert_eq!(state.envelopes[1].watermarks.finalized_slot, Some(81));
+        assert_eq!(host.last_emitted_sequence(), Some(FeedSequence(1)));
+    }
+
+    #[test]
     fn host_serializes_sequences_across_concurrent_producers() {
         let state = Arc::new(Mutex::new(RecordingState::default()));
         let host = DerivedStateHost::builder()
@@ -4878,6 +5101,8 @@ mod tests {
         fn config(&self) -> DerivedStateConsumerConfig {
             DerivedStateConsumerConfig::new()
                 .with_transaction_applied()
+                .with_transaction_status_observed()
+                .with_block_meta_observed()
                 .with_account_touch_key_partitions()
                 .with_control_plane_observed()
         }
@@ -4984,6 +5209,8 @@ mod tests {
         fn config(&self) -> DerivedStateConsumerConfig {
             DerivedStateConsumerConfig::new()
                 .with_transaction_applied()
+                .with_transaction_status_observed()
+                .with_block_meta_observed()
                 .with_account_touch_key_partitions()
                 .with_control_plane_observed()
         }
@@ -5101,6 +5328,8 @@ mod tests {
         fn config(&self) -> DerivedStateConsumerConfig {
             DerivedStateConsumerConfig::new()
                 .with_transaction_applied()
+                .with_transaction_status_observed()
+                .with_block_meta_observed()
                 .with_account_touch_key_partitions()
                 .with_control_plane_observed()
         }
@@ -5181,6 +5410,8 @@ mod tests {
         fn config(&self) -> DerivedStateConsumerConfig {
             DerivedStateConsumerConfig::new()
                 .with_transaction_applied()
+                .with_transaction_status_observed()
+                .with_block_meta_observed()
                 .with_account_touch_key_partitions()
                 .with_control_plane_observed()
         }

@@ -2345,6 +2345,9 @@ fn dispatch_provider_stream_update(
             }
         }
         ProviderStreamUpdate::TransactionStatus(event) => {
+            if derived_state_host.wants_transaction_status_observed() {
+                derived_state_host.on_transaction_status(event.clone());
+            }
             if plugin_host.wants_transaction_status() {
                 plugin_host.on_transaction_status(event);
             }
@@ -2360,6 +2363,9 @@ fn dispatch_provider_stream_update(
             }
         }
         ProviderStreamUpdate::BlockMeta(event) => {
+            if derived_state_host.wants_block_meta_observed() {
+                derived_state_host.on_block_meta(event.clone());
+            }
             if plugin_host.wants_block_meta() {
                 plugin_host.on_block_meta(event);
             }
@@ -2566,8 +2572,14 @@ fn provider_stream_unsupported_hooks(
     if plugin_host.wants_transaction_status() && !supports_transaction_status {
         unsupported.push("on_transaction_status");
     }
+    if derived_state_host.wants_transaction_status_observed() && !supports_transaction_status {
+        unsupported.push("derived_state.transaction_status_observed");
+    }
     if plugin_host.wants_transaction_view_batch() && !supports_transaction_view_batch {
         unsupported.push("on_transaction_view_batch");
+    }
+    if derived_state_host.wants_block_meta_observed() && !supports_block_meta {
+        unsupported.push("derived_state.block_meta_observed");
     }
     if plugin_host.wants_slot_status() && !supports_slot_status {
         unsupported.push("on_slot_status");
@@ -3081,7 +3093,7 @@ mod tests {
     use std::{
         collections::BTreeMap,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
         time::Instant,
@@ -3091,8 +3103,8 @@ mod tests {
     use crate::framework::{
         DerivedStateCheckpoint, DerivedStateConsumer, DerivedStateConsumerConfig,
         DerivedStateConsumerContext, DerivedStateConsumerFault, DerivedStateFeedEnvelope,
-        ExtensionContext, ExtensionManifest, ObserverPlugin, PluginConfig, PluginContext,
-        RawPacketEvent, RuntimeExtension, TransactionInterest, TransactionPrefilter,
+        DerivedStateFeedEvent, ExtensionContext, ExtensionManifest, ObserverPlugin, PluginConfig,
+        PluginContext, RawPacketEvent, RuntimeExtension, TransactionInterest, TransactionPrefilter,
     };
     use async_trait::async_trait;
     use sof_gossip_tuning::{GossipTuningProfile, HostProfilePreset, IngestQueueMode};
@@ -3145,9 +3157,15 @@ mod tests {
         counter: Arc<AtomicUsize>,
     }
     struct AccountTouchDerivedStateConsumer;
+    struct TransactionStatusDerivedStateConsumer;
+    struct BlockMetaDerivedStateConsumer;
     struct ControlPlaneDerivedStateConsumer;
     struct SofTxAdapterLikePlugin;
     struct SofTxDerivedStateAdapterLikeConsumer;
+    struct RecordingDerivedStateConsumer {
+        events: Arc<Mutex<Vec<DerivedStateFeedEvent>>>,
+        config: DerivedStateConsumerConfig,
+    }
 
     #[async_trait]
     impl ObserverPlugin for RawPacketPlugin {
@@ -3299,6 +3317,130 @@ mod tests {
             checkpoint: DerivedStateCheckpoint,
         ) -> Result<(), DerivedStateConsumerFault> {
             let _ = checkpoint;
+            Ok(())
+        }
+    }
+
+    impl DerivedStateConsumer for TransactionStatusDerivedStateConsumer {
+        fn name(&self) -> &'static str {
+            "transaction-status-derived-state"
+        }
+
+        fn state_version(&self) -> u32 {
+            1
+        }
+
+        fn extension_version(&self) -> &'static str {
+            "1"
+        }
+
+        fn load_checkpoint(
+            &mut self,
+        ) -> Result<Option<DerivedStateCheckpoint>, DerivedStateConsumerFault> {
+            Ok(None)
+        }
+
+        fn config(&self) -> DerivedStateConsumerConfig {
+            DerivedStateConsumerConfig::new().with_transaction_status_observed()
+        }
+
+        fn apply(
+            &mut self,
+            _envelope: &DerivedStateFeedEnvelope,
+        ) -> Result<(), DerivedStateConsumerFault> {
+            Ok(())
+        }
+
+        fn flush_checkpoint(
+            &mut self,
+            _checkpoint: DerivedStateCheckpoint,
+        ) -> Result<(), DerivedStateConsumerFault> {
+            Ok(())
+        }
+    }
+
+    impl DerivedStateConsumer for BlockMetaDerivedStateConsumer {
+        fn name(&self) -> &'static str {
+            "block-meta-derived-state"
+        }
+
+        fn state_version(&self) -> u32 {
+            1
+        }
+
+        fn extension_version(&self) -> &'static str {
+            "1"
+        }
+
+        fn load_checkpoint(
+            &mut self,
+        ) -> Result<Option<DerivedStateCheckpoint>, DerivedStateConsumerFault> {
+            Ok(None)
+        }
+
+        fn config(&self) -> DerivedStateConsumerConfig {
+            DerivedStateConsumerConfig::new().with_block_meta_observed()
+        }
+
+        fn apply(
+            &mut self,
+            _envelope: &DerivedStateFeedEnvelope,
+        ) -> Result<(), DerivedStateConsumerFault> {
+            Ok(())
+        }
+
+        fn flush_checkpoint(
+            &mut self,
+            _checkpoint: DerivedStateCheckpoint,
+        ) -> Result<(), DerivedStateConsumerFault> {
+            Ok(())
+        }
+    }
+
+    impl DerivedStateConsumer for RecordingDerivedStateConsumer {
+        fn name(&self) -> &'static str {
+            "recording-derived-state"
+        }
+
+        fn state_version(&self) -> u32 {
+            1
+        }
+
+        fn extension_version(&self) -> &'static str {
+            "1"
+        }
+
+        fn load_checkpoint(
+            &mut self,
+        ) -> Result<Option<DerivedStateCheckpoint>, DerivedStateConsumerFault> {
+            Ok(None)
+        }
+
+        fn config(&self) -> DerivedStateConsumerConfig {
+            self.config
+        }
+
+        fn apply(
+            &mut self,
+            envelope: &DerivedStateFeedEnvelope,
+        ) -> Result<(), DerivedStateConsumerFault> {
+            self.events
+                .lock()
+                .map_err(|_poison| {
+                    DerivedStateConsumerFault::new(
+                        crate::framework::DerivedStateConsumerFaultKind::ConsumerApplyFailed,
+                        Some(envelope.sequence),
+                        "recording-derived-state mutex poisoned during apply",
+                    )
+                })?
+                .push(envelope.event.clone());
+            Ok(())
+        }
+
+        fn flush_checkpoint(
+            &mut self,
+            _checkpoint: DerivedStateCheckpoint,
+        ) -> Result<(), DerivedStateConsumerFault> {
             Ok(())
         }
     }
@@ -3620,6 +3762,39 @@ mod tests {
             slot,
             recent_blockhash: [slot as u8; 32],
             dataset_tx_count: 1,
+            provider_source: None,
+        })
+    }
+
+    fn sample_provider_transaction_status_update(slot: u64) -> ProviderStreamUpdate {
+        ProviderStreamUpdate::TransactionStatus(crate::framework::TransactionStatusEvent {
+            slot,
+            commitment_status: crate::event::TxCommitmentStatus::Processed,
+            confirmed_slot: None,
+            finalized_slot: None,
+            signature: crate::framework::SignatureBytes::from_solana(Signature::from(
+                [slot as u8; 64],
+            )),
+            is_vote: false,
+            index: Some(0),
+            err: None,
+            provider_source: None,
+        })
+    }
+
+    fn sample_provider_block_meta_update(slot: u64) -> ProviderStreamUpdate {
+        ProviderStreamUpdate::BlockMeta(crate::framework::BlockMetaEvent {
+            slot,
+            commitment_status: crate::event::TxCommitmentStatus::Processed,
+            confirmed_slot: None,
+            finalized_slot: None,
+            blockhash: [slot as u8; 32],
+            parent_slot: slot.saturating_sub(1),
+            parent_blockhash: [slot.saturating_sub(1) as u8; 32],
+            block_time: Some(1_700_000_000 + slot as i64),
+            block_height: Some(slot),
+            executed_transaction_count: 3,
+            entries_count: 2,
             provider_source: None,
         })
     }
@@ -4603,6 +4778,96 @@ mod tests {
         );
 
         crate::runtime_env::clear_runtime_env_overrides();
+    }
+
+    #[test]
+    fn provider_stream_strict_policy_allows_transaction_status_and_block_meta_derived_state() {
+        crate::runtime_env::set_runtime_env_overrides([(
+            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+            String::from("strict"),
+        )]);
+
+        let plugin_host = PluginHost::builder().build();
+        let transaction_status_host = DerivedStateHost::builder()
+            .add_consumer(TransactionStatusDerivedStateConsumer)
+            .build();
+        let block_meta_host = DerivedStateHost::builder()
+            .add_consumer(BlockMetaDerivedStateConsumer)
+            .build();
+
+        assert!(
+            enforce_provider_stream_capability_policy(
+                ProviderStreamMode::YellowstoneGrpcTransactionStatus,
+                &plugin_host,
+                &transaction_status_host,
+            )
+            .is_ok()
+        );
+        assert!(
+            enforce_provider_stream_capability_policy(
+                ProviderStreamMode::YellowstoneGrpcBlockMeta,
+                &plugin_host,
+                &block_meta_host,
+            )
+            .is_ok()
+        );
+        assert!(
+            enforce_provider_stream_capability_policy(
+                ProviderStreamMode::LaserStreamTransactionStatus,
+                &plugin_host,
+                &transaction_status_host,
+            )
+            .is_ok()
+        );
+        assert!(
+            enforce_provider_stream_capability_policy(
+                ProviderStreamMode::LaserStreamBlockMeta,
+                &plugin_host,
+                &block_meta_host,
+            )
+            .is_ok()
+        );
+
+        crate::runtime_env::clear_runtime_env_overrides();
+    }
+
+    #[test]
+    fn dispatch_provider_stream_update_feeds_transaction_status_and_block_meta_into_derived_state()
+    {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let plugin_host = PluginHost::builder().build();
+        let derived_state_host = DerivedStateHost::builder()
+            .add_consumer(RecordingDerivedStateConsumer {
+                events: Arc::clone(&events),
+                config: DerivedStateConsumerConfig::new()
+                    .with_transaction_status_observed()
+                    .with_block_meta_observed(),
+            })
+            .build();
+
+        dispatch_provider_stream_update(
+            &plugin_host,
+            &derived_state_host,
+            sample_provider_transaction_status_update(77),
+        );
+        dispatch_provider_stream_update(
+            &plugin_host,
+            &derived_state_host,
+            sample_provider_block_meta_update(78),
+        );
+
+        let events = events
+            .lock()
+            .expect("recording-derived-state mutex should not be poisoned");
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0],
+            DerivedStateFeedEvent::TransactionStatusObserved(_)
+        ));
+        assert!(matches!(
+            events[1],
+            DerivedStateFeedEvent::BlockMetaObserved(_)
+        ));
     }
 
     #[tokio::test]

@@ -191,14 +191,8 @@ SOF defaults auxiliary websocket logs and slot-only feeds to optional readiness.
 Primary transaction, transaction-status, account, and block-meta feeds default
 to required readiness.
 
-Typed runtime mapping for those richer sources:
-
-- transaction feeds -> `on_transaction`
-- websocket logs -> `on_transaction_log`
-- transaction-status feeds -> `on_transaction_status`
-- account/program/account-stream feeds -> `on_account_update`
-- block-meta feeds -> `on_block_meta`
-- slot feeds -> `on_slot_status`
+Typed runtime mapping for built-in processed providers is listed in the ingest
+matrix below.
 
 Built-in processed providers still do not expose standalone control-plane hooks
 such as `on_recent_blockhash`, `on_cluster_topology`, `on_leader_schedule`, or
@@ -430,6 +424,36 @@ The runtime then routes those typed updates into the normal SOF surfaces:
 
 So `Generic` should be read as “custom provider adapter feeds SOF's typed
 provider event surface.”
+
+### Ingest Surface Matrix
+
+The same event family does not exist on every ingest path. Read this table as:
+
+- plugin surface: callbacks exposed through `ObserverPlugin`
+- derived-state surface: replayable feed families exposed through `DerivedStateHost`
+
+| Ingest type | Plugin surface | Derived-state surface | Does not emit |
+| --- | --- | --- | --- |
+| Raw shreds / gossip / trusted raw-shred provider | `on_transaction`, `on_recent_blockhash`, `on_slot_status`, `on_cluster_topology`, `on_leader_schedule`, `on_reorg`, plus raw packet/shred/dataset surfaces | `TransactionApplied`, `RecentBlockhashObserved`, `SlotStatusChanged`, `ClusterTopologyChanged`, `LeaderScheduleUpdated`, `ControlPlaneStateUpdated`, `BranchReorged`, `StateInvalidated`, `AccountTouchObserved` | `on_transaction_status`, `on_transaction_log`, `on_account_update`, `on_block_meta`, `TransactionStatusObserved`, `BlockMetaObserved` |
+| Websocket `transactionSubscribe` | `on_transaction` | `TransactionApplied` | `on_transaction_status`, `on_block_meta`, `TransactionStatusObserved`, `BlockMetaObserved`, control-plane hooks |
+| Websocket `logsSubscribe` | `on_transaction_log` | none | transaction-status, block-meta, control-plane, and derived-state provider observations |
+| Websocket `accountSubscribe` / `programSubscribe` | `on_account_update` | none | transaction-status, block-meta, control-plane, and derived-state provider observations |
+| Yellowstone / LaserStream transaction feeds | `on_transaction` | `TransactionApplied` | control-plane hooks unless supplied through `Generic` |
+| Yellowstone / LaserStream transaction-status feeds | `on_transaction_status` | `TransactionStatusObserved` | raw-shred control-plane hooks, `on_block_meta`, account/log hooks unless separately configured |
+| Yellowstone / LaserStream block-meta feeds | `on_block_meta` | `BlockMetaObserved` | raw-shred control-plane hooks, `on_transaction_status`, account/log hooks unless separately configured |
+| Yellowstone / LaserStream account feeds | `on_account_update` | none | control-plane hooks and provider-derived `TransactionStatusObserved` / `BlockMetaObserved` |
+| Yellowstone / LaserStream slot feeds | `on_slot_status` | `SlotStatusChanged` | recent-blockhash/topology/leader-schedule/reorg unless supplied through `Generic` |
+| `ProviderStreamMode::Generic` | whatever typed `ProviderStreamUpdate` variants the producer emits | whatever derived-state families SOF currently forwards from those typed updates | anything the producer does not emit |
+
+That also means:
+
+- raw shreds emit the richest local control-plane surface, but not provider-only
+  `TransactionStatus` or `BlockMeta`
+- built-in websocket emits transactions/logs/accounts, but not
+  `TransactionStatus` or `BlockMeta`
+- built-in Yellowstone/LaserStream add `TransactionStatus` and `BlockMeta`, but
+  still do not emit raw-shred control-plane families unless a custom generic
+  producer supplies them
 
 Programmatic setup uses the typed runtime API:
 
@@ -966,8 +990,33 @@ SOF also exposes a replayable derived-state feed intended for stateful official 
 - replay-based recovery after restart or transient failure
 - explicit resync/rebuild signaling
 - typed control-plane replay for recent blockhash, cluster topology, and leader schedule inputs
+- processed-provider replay for transaction-status and block-meta observations when the ingest mode supplies them
 - canonical control-plane quality snapshots through `ControlPlaneStateUpdated`
 - invalidation and tx-feedback events through `StateInvalidated` and `TxOutcomeObserved`
+
+Current derived-state feed families are:
+
+- `TransactionApplied`
+- `TransactionStatusObserved`
+- `BlockMetaObserved`
+- `RecentBlockhashObserved`
+- `ClusterTopologyChanged`
+- `LeaderScheduleUpdated`
+- `ControlPlaneStateUpdated`
+- `StateInvalidated`
+- `TxOutcomeObserved`
+- `SlotStatusChanged`
+- `BranchReorged`
+- `AccountTouchObserved`
+- `CheckpointBarrier`
+
+Important ingest boundary:
+
+- raw-shred runtimes can feed the control-plane-derived state families
+- built-in Yellowstone/LaserStream can additionally feed provider-derived
+  `TransactionStatusObserved` and `BlockMetaObserved`
+- built-in websocket can feed `TransactionApplied`, but it does not currently
+  feed `TransactionStatusObserved` or `BlockMetaObserved`
 
 This is the right substrate for local service layers that want to build a bank, query index, or gRPC stream on top of SOF without depending on validator-native Geyser.
 
