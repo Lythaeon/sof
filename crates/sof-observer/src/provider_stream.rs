@@ -158,6 +158,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::SendError;
@@ -692,6 +693,11 @@ struct ProviderSourceReleaseGuard {
     _reservation: Option<Arc<ProviderSourceReservation>>,
 }
 
+/// Maximum no-runtime retries for one terminal `Removed` event before releasing anyway.
+const SOURCE_REMOVED_NO_RUNTIME_RETRY_ATTEMPTS: usize = 64;
+/// Delay between no-runtime retries for one terminal `Removed` event.
+const SOURCE_REMOVED_NO_RUNTIME_RETRY_DELAY: Duration = Duration::from_millis(5);
+
 impl ProviderSourceReleaseGuard {
     /// Creates one guard that releases a reserved identity directly on drop.
     const fn for_identity(release: ProviderSourceDeferredRelease) -> Self {
@@ -722,7 +728,7 @@ impl Drop for ProviderSourceReservation {
                 &sender,
                 self.source.clone(),
                 ProviderSourceReadiness::Optional,
-                "reserved provider source sender dropped and was removed from tracking",
+                "reserved provider source sender dropped and was removed from tracking".to_owned(),
                 Some(release),
             ));
         } else {
@@ -809,7 +815,7 @@ impl Drop for ProviderSourceTaskGuard {
             &self.sender,
             self.source.clone(),
             self.readiness,
-            "provider source task stopped and was removed from tracking",
+            "provider source task stopped and was removed from tracking".to_owned(),
             self.reservation
                 .take()
                 .map(ProviderSourceReleaseGuard::for_reservation),
@@ -1058,7 +1064,7 @@ fn emit_provider_source_removed(
     sender: &ProviderStreamSender,
     source: ProviderSourceIdentity,
     readiness: ProviderSourceReadiness,
-    message: &'static str,
+    message: String,
     release: Option<ProviderSourceReleaseGuard>,
 ) -> Option<ProviderSourceReleaseGuard> {
     let event = ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
@@ -1066,7 +1072,7 @@ fn emit_provider_source_removed(
         readiness,
         status: ProviderSourceHealthStatus::Removed,
         reason: ProviderSourceHealthReason::SourceRemoved,
-        message: message.to_owned(),
+        message,
     });
     match sender.try_send(event) {
         Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => release,
@@ -1080,13 +1086,43 @@ fn emit_provider_source_removed(
                 None
             } else {
                 std::thread::spawn(move || {
-                    drop(sender.blocking_send(update));
+                    let mut pending_update = update;
+                    for _ in 0..SOURCE_REMOVED_NO_RUNTIME_RETRY_ATTEMPTS {
+                        match sender.try_send(pending_update) {
+                            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {
+                                drop(release);
+                                return;
+                            }
+                            Err(mpsc::error::TrySendError::Full(retry_update)) => {
+                                pending_update = retry_update;
+                                std::thread::sleep(SOURCE_REMOVED_NO_RUNTIME_RETRY_DELAY);
+                            }
+                        }
+                    }
                     drop(release);
                 });
                 None
             }
         }
     }
+}
+
+#[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
+/// Emits one terminal provider-source removal event for startup failure or early cleanup.
+pub(crate) fn emit_provider_source_removed_with_reservation(
+    sender: &ProviderStreamSender,
+    source: ProviderSourceIdentity,
+    readiness: ProviderSourceReadiness,
+    message: String,
+    reservation: Option<Arc<ProviderSourceReservation>>,
+) {
+    drop(emit_provider_source_removed(
+        sender,
+        source,
+        readiness,
+        message,
+        reservation.map(ProviderSourceReleaseGuard::for_reservation),
+    ));
 }
 
 #[cfg(feature = "provider-grpc")]

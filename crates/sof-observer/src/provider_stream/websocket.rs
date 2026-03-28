@@ -35,7 +35,7 @@ use crate::{
         ProviderSourceIdentityRegistrationError, ProviderSourceReadiness,
         ProviderSourceReservation, ProviderSourceTaskGuard, ProviderStreamFanIn,
         ProviderStreamMode, ProviderStreamSender, ProviderStreamUpdate, SerializedTransactionEvent,
-        classify_provider_transaction_kind,
+        classify_provider_transaction_kind, emit_provider_source_removed_with_reservation,
     },
 };
 
@@ -913,15 +913,12 @@ async fn spawn_websocket_source_inner(
     let first_session = match establish_websocket_primary_session(&config).await {
         Ok(session) => session,
         Err(error) => {
-            publish_websocket_health_nonblocking(
+            emit_provider_source_removed_with_reservation(
                 &sender,
-                &ProviderSourceHealthEvent {
-                    source,
-                    readiness: config.readiness(),
-                    status: ProviderSourceHealthStatus::Removed,
-                    reason: websocket_health_reason(&error),
-                    message: error.to_string(),
-                },
+                source,
+                config.readiness(),
+                error.to_string(),
+                reservation,
             );
             return Err(error);
         }
@@ -1054,15 +1051,12 @@ async fn spawn_websocket_logs_source_inner(
     let first_session = match establish_websocket_logs_session(&config).await {
         Ok(session) => session,
         Err(error) => {
-            publish_websocket_logs_health_nonblocking(
+            emit_provider_source_removed_with_reservation(
                 &sender,
-                &ProviderSourceHealthEvent {
-                    source,
-                    readiness: config.readiness(),
-                    status: ProviderSourceHealthStatus::Removed,
-                    reason: websocket_logs_health_reason(&error),
-                    message: error.to_string(),
-                },
+                source,
+                config.readiness(),
+                error.to_string(),
+                reservation,
             );
             return Err(error);
         }

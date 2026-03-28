@@ -42,7 +42,7 @@ use crate::{
         ProviderSourceIdentity, ProviderSourceIdentityRegistrationError, ProviderSourceReadiness,
         ProviderSourceReservation, ProviderSourceTaskGuard, ProviderStreamFanIn,
         ProviderStreamMode, ProviderStreamSender, ProviderStreamUpdate,
-        classify_provider_transaction_kind,
+        classify_provider_transaction_kind, emit_provider_source_removed_with_reservation,
     },
 };
 
@@ -930,15 +930,12 @@ async fn spawn_yellowstone_grpc_source_inner(
     let first_session = match establish_yellowstone_session(&config, 0).await {
         Ok(session) => session,
         Err(error) => {
-            publish_yellowstone_health_nonblocking(
+            emit_provider_source_removed_with_reservation(
                 &sender,
-                &ProviderSourceHealthEvent {
-                    source,
-                    readiness: config.readiness(),
-                    status: ProviderSourceHealthStatus::Removed,
-                    reason: yellowstone_health_reason(&error),
-                    message: error.to_string(),
-                },
+                source,
+                config.readiness(),
+                error.to_string(),
+                reservation,
             );
             return Err(error);
         }
@@ -1086,15 +1083,12 @@ async fn spawn_yellowstone_grpc_slot_source_inner(
     let first_session = match establish_yellowstone_slot_session(&config, 0).await {
         Ok(session) => session,
         Err(error) => {
-            publish_yellowstone_slot_health_nonblocking(
+            emit_provider_source_removed_with_reservation(
                 &sender,
-                &ProviderSourceHealthEvent {
-                    source,
-                    readiness: config.readiness(),
-                    status: ProviderSourceHealthStatus::Removed,
-                    reason: yellowstone_health_reason(&error),
-                    message: error.to_string(),
-                },
+                source,
+                config.readiness(),
+                error.to_string(),
+                reservation,
             );
             return Err(error);
         }

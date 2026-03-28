@@ -49,7 +49,7 @@ use crate::{
         ProviderSourceIdentity, ProviderSourceIdentityRegistrationError, ProviderSourceReadiness,
         ProviderSourceReservation, ProviderSourceTaskGuard, ProviderStreamFanIn,
         ProviderStreamMode, ProviderStreamSender, ProviderStreamUpdate,
-        classify_provider_transaction_kind,
+        classify_provider_transaction_kind, emit_provider_source_removed_with_reservation,
     },
 };
 
@@ -991,15 +991,12 @@ async fn spawn_laserstream_source_inner(
         match connect_and_subscribe_once(&config, config.subscribe_request_with_state(0)).await {
             Ok(session) => session,
             Err(error) => {
-                publish_laserstream_health_nonblocking(
+                emit_provider_source_removed_with_reservation(
                     &sender,
-                    &ProviderSourceHealthEvent {
-                        source,
-                        readiness: config.readiness(),
-                        status: ProviderSourceHealthStatus::Removed,
-                        reason: laserstream_health_reason(&error),
-                        message: error.to_string(),
-                    },
+                    source,
+                    config.readiness(),
+                    error.to_string(),
+                    reservation,
                 );
                 return Err(error);
             }
@@ -1154,15 +1151,12 @@ async fn spawn_laserstream_slot_source_inner(
         {
             Ok(session) => session,
             Err(error) => {
-                publish_laserstream_slot_health_nonblocking(
+                emit_provider_source_removed_with_reservation(
                     &sender,
-                    &ProviderSourceHealthEvent {
-                        source,
-                        readiness: config.readiness(),
-                        status: ProviderSourceHealthStatus::Removed,
-                        reason: laserstream_health_reason(&error),
-                        message: error.to_string(),
-                    },
+                    source,
+                    config.readiness(),
+                    error.to_string(),
+                    reservation,
                 );
                 return Err(error);
             }
