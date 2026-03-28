@@ -127,27 +127,31 @@ pub enum TransactionInterest {
 pub struct TransactionPrefilter {
     matched_interest: TransactionInterest,
     signature: Option<SignatureBytes>,
-    account_include: Arc<[PubkeyBytes]>,
-    account_include_solana: Arc<[solana_pubkey::Pubkey]>,
-    account_exclude: Arc<[PubkeyBytes]>,
-    account_exclude_solana: Arc<[solana_pubkey::Pubkey]>,
-    account_required: Arc<[PubkeyBytes]>,
-    account_required_solana: Arc<[solana_pubkey::Pubkey]>,
+    signature_solana: Option<solana_signature::Signature>,
+    account_include: CompiledAccountMatcher,
+    account_exclude: CompiledAccountMatcher,
+    account_required: CompiledAccountMatcher,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum CompiledAccountMatcher {
+    Empty,
+    One(solana_pubkey::Pubkey),
+    Two(solana_pubkey::Pubkey, solana_pubkey::Pubkey),
+    Many(Arc<[solana_pubkey::Pubkey]>),
 }
 
 impl TransactionPrefilter {
     /// Creates an empty prefilter that returns the provided interest on match.
     #[must_use]
-    pub fn new(matched_interest: TransactionInterest) -> Self {
+    pub const fn new(matched_interest: TransactionInterest) -> Self {
         Self {
             matched_interest,
             signature: None,
-            account_include: Arc::new([]),
-            account_include_solana: Arc::new([]),
-            account_exclude: Arc::new([]),
-            account_exclude_solana: Arc::new([]),
-            account_required: Arc::new([]),
-            account_required_solana: Arc::new([]),
+            signature_solana: None,
+            account_include: CompiledAccountMatcher::Empty,
+            account_exclude: CompiledAccountMatcher::Empty,
+            account_required: CompiledAccountMatcher::Empty,
         }
     }
 
@@ -163,7 +167,9 @@ impl TransactionPrefilter {
     where
         S: Into<SignatureBytes>,
     {
-        self.signature = Some(signature.into());
+        let signature = signature.into();
+        self.signature = Some(signature);
+        self.signature_solana = Some(signature.to_solana());
         self
     }
 
@@ -174,9 +180,7 @@ impl TransactionPrefilter {
         I: IntoIterator,
         I::Item: Into<PubkeyBytes>,
     {
-        let (bytes, solana) = compile_prefilter_keys(keys);
-        self.account_include = bytes;
-        self.account_include_solana = solana;
+        self.account_include = compile_prefilter_keys(keys);
         self
     }
 
@@ -187,9 +191,7 @@ impl TransactionPrefilter {
         I: IntoIterator,
         I::Item: Into<PubkeyBytes>,
     {
-        let (bytes, solana) = compile_prefilter_keys(keys);
-        self.account_exclude = bytes;
-        self.account_exclude_solana = solana;
+        self.account_exclude = compile_prefilter_keys(keys);
         self
     }
 
@@ -200,9 +202,7 @@ impl TransactionPrefilter {
         I: IntoIterator,
         I::Item: Into<PubkeyBytes>,
     {
-        let (bytes, solana) = compile_prefilter_keys(keys);
-        self.account_required = bytes;
-        self.account_required_solana = solana;
+        self.account_required = compile_prefilter_keys(keys);
         self
     }
 
@@ -214,26 +214,15 @@ impl TransactionPrefilter {
         {
             return TransactionInterest::Ignore;
         }
-        if !self.account_include.is_empty()
-            && !self
-                .account_include_solana
-                .iter()
-                .any(|key| transaction_mentions_account_key(event.tx, key))
+        if !matches!(self.account_include, CompiledAccountMatcher::Empty)
+            && !transaction_matches_any_keys(event.tx, &self.account_include)
         {
             return TransactionInterest::Ignore;
         }
-        if self
-            .account_exclude_solana
-            .iter()
-            .any(|key| transaction_mentions_account_key(event.tx, key))
-        {
+        if transaction_matches_any_keys(event.tx, &self.account_exclude) {
             return TransactionInterest::Ignore;
         }
-        if !self
-            .account_required_solana
-            .iter()
-            .all(|key| transaction_mentions_account_key(event.tx, key))
-        {
+        if !transaction_matches_all_keys(event.tx, &self.account_required) {
             return TransactionInterest::Ignore;
         }
         self.matched_interest
@@ -245,49 +234,42 @@ impl TransactionPrefilter {
         &self,
         view: &SanitizedTransactionView<D>,
     ) -> TransactionInterest {
-        if let Some(signature) = self.signature
-            && view.signatures().first().copied() != Some(signature.to_solana())
+        if let Some(signature) = self.signature_solana
+            && view.signatures().first().copied() != Some(signature)
         {
             return TransactionInterest::Ignore;
         }
-        if !self.account_include.is_empty()
-            && !self
-                .account_include_solana
-                .iter()
-                .any(|key| transaction_view_mentions_account_key(view, key))
+        if !matches!(self.account_include, CompiledAccountMatcher::Empty)
+            && !transaction_view_matches_any_keys(view, &self.account_include)
         {
             return TransactionInterest::Ignore;
         }
-        if self
-            .account_exclude_solana
-            .iter()
-            .any(|key| transaction_view_mentions_account_key(view, key))
-        {
+        if transaction_view_matches_any_keys(view, &self.account_exclude) {
             return TransactionInterest::Ignore;
         }
-        if !self
-            .account_required_solana
-            .iter()
-            .all(|key| transaction_view_mentions_account_key(view, key))
-        {
+        if !transaction_view_matches_all_keys(view, &self.account_required) {
             return TransactionInterest::Ignore;
         }
         self.matched_interest
     }
 }
 
-fn compile_prefilter_keys<I>(keys: I) -> (Arc<[PubkeyBytes]>, Arc<[solana_pubkey::Pubkey]>)
+fn compile_prefilter_keys<I>(keys: I) -> CompiledAccountMatcher
 where
     I: IntoIterator,
     I::Item: Into<PubkeyBytes>,
 {
-    let bytes = keys.into_iter().map(Into::into).collect::<Vec<_>>();
-    let solana = bytes
-        .iter()
-        .copied()
+    let keys = keys
+        .into_iter()
+        .map(Into::into)
         .map(PubkeyBytes::to_solana)
         .collect::<Vec<_>>();
-    (Arc::from(bytes), Arc::from(solana))
+    match keys.as_slice() {
+        [] => CompiledAccountMatcher::Empty,
+        [key] => CompiledAccountMatcher::One(*key),
+        [first, second] => CompiledAccountMatcher::Two(*first, *second),
+        _ => CompiledAccountMatcher::Many(Arc::from(keys)),
+    }
 }
 
 fn transaction_mentions_account_key(
@@ -301,6 +283,40 @@ fn transaction_mentions_account_key(
             .is_some_and(|lookups| lookups.iter().any(|lookup| lookup.account_key == *key))
 }
 
+fn transaction_matches_any_keys(
+    tx: &solana_transaction::versioned::VersionedTransaction,
+    matcher: &CompiledAccountMatcher,
+) -> bool {
+    match matcher {
+        CompiledAccountMatcher::Empty => false,
+        CompiledAccountMatcher::One(key) => transaction_mentions_account_key(tx, key),
+        CompiledAccountMatcher::Two(first, second) => {
+            transaction_mentions_account_key(tx, first)
+                || transaction_mentions_account_key(tx, second)
+        }
+        CompiledAccountMatcher::Many(keys) => keys
+            .iter()
+            .any(|key| transaction_mentions_account_key(tx, key)),
+    }
+}
+
+fn transaction_matches_all_keys(
+    tx: &solana_transaction::versioned::VersionedTransaction,
+    matcher: &CompiledAccountMatcher,
+) -> bool {
+    match matcher {
+        CompiledAccountMatcher::Empty => true,
+        CompiledAccountMatcher::One(key) => transaction_mentions_account_key(tx, key),
+        CompiledAccountMatcher::Two(first, second) => {
+            transaction_mentions_account_key(tx, first)
+                && transaction_mentions_account_key(tx, second)
+        }
+        CompiledAccountMatcher::Many(keys) => keys
+            .iter()
+            .all(|key| transaction_mentions_account_key(tx, key)),
+    }
+}
+
 fn transaction_view_mentions_account_key<D: TransactionData>(
     view: &SanitizedTransactionView<D>,
     key: &solana_pubkey::Pubkey,
@@ -309,6 +325,40 @@ fn transaction_view_mentions_account_key<D: TransactionData>(
         || view
             .address_table_lookup_iter()
             .any(|lookup| lookup.account_key == key)
+}
+
+fn transaction_view_matches_any_keys<D: TransactionData>(
+    view: &SanitizedTransactionView<D>,
+    matcher: &CompiledAccountMatcher,
+) -> bool {
+    match matcher {
+        CompiledAccountMatcher::Empty => false,
+        CompiledAccountMatcher::One(key) => transaction_view_mentions_account_key(view, key),
+        CompiledAccountMatcher::Two(first, second) => {
+            transaction_view_mentions_account_key(view, first)
+                || transaction_view_mentions_account_key(view, second)
+        }
+        CompiledAccountMatcher::Many(keys) => keys
+            .iter()
+            .any(|key| transaction_view_mentions_account_key(view, key)),
+    }
+}
+
+fn transaction_view_matches_all_keys<D: TransactionData>(
+    view: &SanitizedTransactionView<D>,
+    matcher: &CompiledAccountMatcher,
+) -> bool {
+    match matcher {
+        CompiledAccountMatcher::Empty => true,
+        CompiledAccountMatcher::One(key) => transaction_view_mentions_account_key(view, key),
+        CompiledAccountMatcher::Two(first, second) => {
+            transaction_view_mentions_account_key(view, first)
+                && transaction_view_mentions_account_key(view, second)
+        }
+        CompiledAccountMatcher::Many(keys) => keys
+            .iter()
+            .all(|key| transaction_view_mentions_account_key(view, key)),
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
