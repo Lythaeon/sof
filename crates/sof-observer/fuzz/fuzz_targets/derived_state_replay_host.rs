@@ -180,6 +180,7 @@ fuzz_target!(|bytes: &[u8]| {
                     tip_slot,
                     confirmed_slot,
                     finalized_slot,
+                    provider_source: None,
                 });
             }
             1 => {
@@ -203,6 +204,7 @@ fuzz_target!(|bytes: &[u8]| {
                     attached_slots,
                     confirmed_slot: take_u64(&mut input),
                     finalized_slot: take_u64(&mut input),
+                    provider_source: None,
                 });
             }
             2 => {
