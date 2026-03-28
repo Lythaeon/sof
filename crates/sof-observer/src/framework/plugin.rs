@@ -128,8 +128,11 @@ pub struct TransactionPrefilter {
     matched_interest: TransactionInterest,
     signature: Option<SignatureBytes>,
     account_include: Arc<[PubkeyBytes]>,
+    account_include_solana: Arc<[solana_pubkey::Pubkey]>,
     account_exclude: Arc<[PubkeyBytes]>,
+    account_exclude_solana: Arc<[solana_pubkey::Pubkey]>,
     account_required: Arc<[PubkeyBytes]>,
+    account_required_solana: Arc<[solana_pubkey::Pubkey]>,
 }
 
 impl TransactionPrefilter {
@@ -140,8 +143,11 @@ impl TransactionPrefilter {
             matched_interest,
             signature: None,
             account_include: Arc::new([]),
+            account_include_solana: Arc::new([]),
             account_exclude: Arc::new([]),
+            account_exclude_solana: Arc::new([]),
             account_required: Arc::new([]),
+            account_required_solana: Arc::new([]),
         }
     }
 
@@ -168,7 +174,9 @@ impl TransactionPrefilter {
         I: IntoIterator,
         I::Item: Into<PubkeyBytes>,
     {
-        self.account_include = Arc::from(keys.into_iter().map(Into::into).collect::<Vec<_>>());
+        let (bytes, solana) = compile_prefilter_keys(keys);
+        self.account_include = bytes;
+        self.account_include_solana = solana;
         self
     }
 
@@ -179,7 +187,9 @@ impl TransactionPrefilter {
         I: IntoIterator,
         I::Item: Into<PubkeyBytes>,
     {
-        self.account_exclude = Arc::from(keys.into_iter().map(Into::into).collect::<Vec<_>>());
+        let (bytes, solana) = compile_prefilter_keys(keys);
+        self.account_exclude = bytes;
+        self.account_exclude_solana = solana;
         self
     }
 
@@ -190,7 +200,9 @@ impl TransactionPrefilter {
         I: IntoIterator,
         I::Item: Into<PubkeyBytes>,
     {
-        self.account_required = Arc::from(keys.into_iter().map(Into::into).collect::<Vec<_>>());
+        let (bytes, solana) = compile_prefilter_keys(keys);
+        self.account_required = bytes;
+        self.account_required_solana = solana;
         self
     }
 
@@ -204,25 +216,22 @@ impl TransactionPrefilter {
         }
         if !self.account_include.is_empty()
             && !self
-                .account_include
+                .account_include_solana
                 .iter()
-                .copied()
                 .any(|key| transaction_mentions_account_key(event.tx, key))
         {
             return TransactionInterest::Ignore;
         }
         if self
-            .account_exclude
+            .account_exclude_solana
             .iter()
-            .copied()
             .any(|key| transaction_mentions_account_key(event.tx, key))
         {
             return TransactionInterest::Ignore;
         }
         if !self
-            .account_required
+            .account_required_solana
             .iter()
-            .copied()
             .all(|key| transaction_mentions_account_key(event.tx, key))
         {
             return TransactionInterest::Ignore;
@@ -243,25 +252,22 @@ impl TransactionPrefilter {
         }
         if !self.account_include.is_empty()
             && !self
-                .account_include
+                .account_include_solana
                 .iter()
-                .copied()
                 .any(|key| transaction_view_mentions_account_key(view, key))
         {
             return TransactionInterest::Ignore;
         }
         if self
-            .account_exclude
+            .account_exclude_solana
             .iter()
-            .copied()
             .any(|key| transaction_view_mentions_account_key(view, key))
         {
             return TransactionInterest::Ignore;
         }
         if !self
-            .account_required
+            .account_required_solana
             .iter()
-            .copied()
             .all(|key| transaction_view_mentions_account_key(view, key))
         {
             return TransactionInterest::Ignore;
@@ -270,27 +276,39 @@ impl TransactionPrefilter {
     }
 }
 
+fn compile_prefilter_keys<I>(keys: I) -> (Arc<[PubkeyBytes]>, Arc<[solana_pubkey::Pubkey]>)
+where
+    I: IntoIterator,
+    I::Item: Into<PubkeyBytes>,
+{
+    let bytes = keys.into_iter().map(Into::into).collect::<Vec<_>>();
+    let solana = bytes
+        .iter()
+        .copied()
+        .map(PubkeyBytes::to_solana)
+        .collect::<Vec<_>>();
+    (Arc::from(bytes), Arc::from(solana))
+}
+
 fn transaction_mentions_account_key(
     tx: &solana_transaction::versioned::VersionedTransaction,
-    key: PubkeyBytes,
+    key: &solana_pubkey::Pubkey,
 ) -> bool {
-    let key = key.to_solana();
-    tx.message.static_account_keys().contains(&key)
+    tx.message.static_account_keys().contains(key)
         || tx
             .message
             .address_table_lookups()
-            .is_some_and(|lookups| lookups.iter().any(|lookup| lookup.account_key == key))
+            .is_some_and(|lookups| lookups.iter().any(|lookup| lookup.account_key == *key))
 }
 
 fn transaction_view_mentions_account_key<D: TransactionData>(
     view: &SanitizedTransactionView<D>,
-    key: PubkeyBytes,
+    key: &solana_pubkey::Pubkey,
 ) -> bool {
-    let key = key.to_solana();
-    view.static_account_keys().contains(&key)
+    view.static_account_keys().contains(key)
         || view
             .address_table_lookup_iter()
-            .any(|lookup| *lookup.account_key == key)
+            .any(|lookup| lookup.account_key == key)
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]

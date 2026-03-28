@@ -551,14 +551,13 @@ impl PluginHost {
             if !commitment_selector.matches(event.commitment_status) {
                 continue;
             }
-            dispatch.push(
-                prefilter.as_ref().map_or_else(
-                    || plugin.transaction_interest_ref(&event),
-                    |filter| filter.classify_ref(&event),
-                ),
-                inline_requested,
-                Arc::clone(plugin),
+            let interest = prefilter.as_ref().map_or_else(
+                || plugin.transaction_interest_ref(&event),
+                |filter| filter.classify_ref(&event),
             );
+            if interest != crate::framework::TransactionInterest::Ignore {
+                dispatch.push(interest, inline_requested, Arc::clone(plugin));
+            }
         }
         dispatch
     }
@@ -591,11 +590,10 @@ impl PluginHost {
                 continue;
             }
             if let Some(filter) = prefilter.as_ref() {
-                dispatch.push(
-                    filter.classify_view_ref(view),
-                    inline_requested,
-                    Arc::clone(plugin),
-                );
+                let interest = filter.classify_view_ref(view);
+                if interest != crate::framework::TransactionInterest::Ignore {
+                    dispatch.push(interest, inline_requested, Arc::clone(plugin));
+                }
             } else {
                 needs_full_classification = true;
             }
