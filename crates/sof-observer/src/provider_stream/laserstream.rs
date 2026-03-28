@@ -34,7 +34,6 @@ use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 use thiserror::Error;
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 
 use crate::{
@@ -986,7 +985,18 @@ async fn spawn_laserstream_source_inner(
 ) -> Result<JoinHandle<Result<(), LaserStreamError>>, LaserStreamError> {
     config.validate()?;
     let source = ProviderSourceIdentity::generated(config.source_id(), config.source_instance());
-    register_laserstream_primary_initial_health(&source, config.readiness(), &sender);
+    send_primary_provider_health(
+        &source,
+        config.readiness(),
+        &sender,
+        ProviderSourceHealthStatus::Reconnecting,
+        ProviderSourceHealthReason::InitialConnectPending,
+        format!(
+            "waiting for first laserstream {} session ack",
+            source.kind_str().trim_start_matches("laserstream_")
+        ),
+    )
+    .await?;
     let first_session =
         match connect_and_subscribe_once(&config, config.subscribe_request_with_state(0)).await {
             Ok(session) => session,
@@ -1144,7 +1154,15 @@ async fn spawn_laserstream_slot_source_inner(
         ProviderSourceId::LaserStreamSlots,
         config.source_instance(),
     );
-    register_laserstream_slot_initial_health(&source, config.readiness(), &sender);
+    send_provider_slot_health(
+        &source,
+        config.readiness(),
+        &sender,
+        ProviderSourceHealthStatus::Reconnecting,
+        ProviderSourceHealthReason::InitialConnectPending,
+        "waiting for first laserstream slot session ack".to_owned(),
+    )
+    .await?;
     let first_session =
         match connect_and_subscribe_slots_once(&config, config.subscribe_request_with_state(0))
             .await
@@ -1519,41 +1537,6 @@ async fn send_primary_provider_health(
         .map_err(|_error| LaserStreamError::QueueClosed)
 }
 
-fn register_laserstream_primary_initial_health(
-    source: &ProviderSourceIdentity,
-    readiness: ProviderSourceReadiness,
-    sender: &ProviderStreamSender,
-) {
-    publish_laserstream_health_nonblocking(
-        sender,
-        &ProviderSourceHealthEvent {
-            source: source.clone(),
-            readiness,
-            status: ProviderSourceHealthStatus::Reconnecting,
-            reason: ProviderSourceHealthReason::InitialConnectPending,
-            message: format!(
-                "waiting for first laserstream {} session ack",
-                source.kind_str().trim_start_matches("laserstream_")
-            ),
-        },
-    );
-}
-
-fn publish_laserstream_health_nonblocking(
-    sender: &ProviderStreamSender,
-    event: &ProviderSourceHealthEvent,
-) {
-    match sender.try_send(ProviderStreamUpdate::Health(event.clone())) {
-        Ok(()) | Err(TrySendError::Closed(_)) => {}
-        Err(TrySendError::Full(update)) => {
-            let sender = sender.clone();
-            tokio::spawn(async move {
-                drop(sender.send(update).await);
-            });
-        }
-    }
-}
-
 async fn send_provider_slot_health(
     source: &ProviderSourceIdentity,
     readiness: ProviderSourceReadiness,
@@ -1572,38 +1555,6 @@ async fn send_provider_slot_health(
         }))
         .await
         .map_err(|_error| LaserStreamError::QueueClosed)
-}
-
-fn register_laserstream_slot_initial_health(
-    source: &ProviderSourceIdentity,
-    readiness: ProviderSourceReadiness,
-    sender: &ProviderStreamSender,
-) {
-    publish_laserstream_slot_health_nonblocking(
-        sender,
-        &ProviderSourceHealthEvent {
-            source: source.clone(),
-            readiness,
-            status: ProviderSourceHealthStatus::Reconnecting,
-            reason: ProviderSourceHealthReason::InitialConnectPending,
-            message: "waiting for first laserstream slot session ack".to_owned(),
-        },
-    );
-}
-
-fn publish_laserstream_slot_health_nonblocking(
-    sender: &ProviderStreamSender,
-    event: &ProviderSourceHealthEvent,
-) {
-    match sender.try_send(ProviderStreamUpdate::Health(event.clone())) {
-        Ok(()) | Err(TrySendError::Closed(_)) => {}
-        Err(TrySendError::Full(update)) => {
-            let sender = sender.clone();
-            tokio::spawn(async move {
-                drop(sender.send(update).await);
-            });
-        }
-    }
 }
 
 const fn laserstream_health_reason(error: &LaserStreamError) -> ProviderSourceHealthReason {

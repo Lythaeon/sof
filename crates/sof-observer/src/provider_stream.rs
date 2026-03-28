@@ -157,7 +157,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -653,6 +653,10 @@ pub type ProviderStreamReceiver = mpsc::Receiver<ProviderStreamUpdate>;
 /// Shared provider source identity carried by provider-origin events.
 pub type ProviderSourceRef = Arc<ProviderSourceIdentity>;
 
+/// Out-of-band source tombstones used when terminal removal cannot reach the runtime queue.
+static PRUNED_PROVIDER_SOURCES: LazyLock<Mutex<HashSet<ProviderSourceIdentity>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
 /// Duplicate provider source identity registration failure for multi-source fan-in.
 #[derive(Debug, Error)]
 #[error("provider fan-in already contains source identity {0}")]
@@ -715,6 +719,28 @@ impl ProviderSourceReleaseGuard {
             _reservation: Some(reservation),
         }
     }
+}
+
+/// Marks one provider source as pruned even if a terminal `Removed` update could not be queued.
+pub(crate) fn mark_provider_source_pruned(source: &ProviderSourceIdentity) {
+    if let Ok(mut pruned) = PRUNED_PROVIDER_SOURCES.lock() {
+        pruned.insert(source.clone());
+    }
+}
+
+/// Clears one out-of-band provider source prune marker after a new live health event arrives.
+pub(crate) fn clear_provider_source_pruned(source: &ProviderSourceIdentity) {
+    if let Ok(mut pruned) = PRUNED_PROVIDER_SOURCES.lock() {
+        pruned.remove(source);
+    }
+}
+
+/// Returns whether one provider source was pruned out of band.
+#[must_use]
+pub(crate) fn provider_source_is_pruned(source: &ProviderSourceIdentity) -> bool {
+    PRUNED_PROVIDER_SOURCES
+        .lock()
+        .is_ok_and(|pruned| pruned.contains(source))
 }
 
 impl Drop for ProviderSourceReservation {
@@ -1067,6 +1093,7 @@ fn emit_provider_source_removed(
     message: String,
     release: Option<ProviderSourceReleaseGuard>,
 ) -> Option<ProviderSourceReleaseGuard> {
+    let prune_source = source.clone();
     let event = ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
         source,
         readiness,
@@ -1099,6 +1126,7 @@ fn emit_provider_source_removed(
                             }
                         }
                     }
+                    mark_provider_source_pruned(&prune_source);
                     drop(release);
                 });
                 None

@@ -20,7 +20,6 @@ use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 use thiserror::Error;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async, tungstenite::protocol::Message as WsMessage,
@@ -909,7 +908,18 @@ async fn spawn_websocket_source_inner(
     config.validate()?;
     let config = config.clone();
     let source = ProviderSourceIdentity::generated(config.source_id(), config.source_instance());
-    register_websocket_initial_health(&source, config.readiness(), &sender);
+    send_primary_provider_health(
+        &source,
+        config.readiness(),
+        &sender,
+        ProviderSourceHealthStatus::Reconnecting,
+        ProviderSourceHealthReason::InitialConnectPending,
+        format!(
+            "waiting for first websocket {} session ack",
+            source.kind_str().trim_start_matches("websocket_")
+        ),
+    )
+    .await?;
     let first_session = match establish_websocket_primary_session(&config).await {
         Ok(session) => session,
         Err(error) => {
@@ -1047,7 +1057,15 @@ async fn spawn_websocket_logs_source_inner(
         ProviderSourceId::WebsocketLogs,
         config.source_instance(),
     );
-    register_websocket_logs_initial_health(&source, config.readiness(), &sender);
+    send_provider_logs_health(
+        &source,
+        config.readiness(),
+        &sender,
+        ProviderSourceHealthStatus::Reconnecting,
+        ProviderSourceHealthReason::InitialConnectPending,
+        "waiting for first websocket logs session ack".to_owned(),
+    )
+    .await?;
     let first_session = match establish_websocket_logs_session(&config).await {
         Ok(session) => session,
         Err(error) => {
@@ -1296,73 +1314,6 @@ async fn send_primary_provider_health(
         }))
         .await
         .map_err(|_error| WebsocketTransactionError::QueueClosed)
-}
-
-fn register_websocket_initial_health(
-    source: &ProviderSourceIdentity,
-    readiness: ProviderSourceReadiness,
-    sender: &ProviderStreamSender,
-) {
-    publish_websocket_health_nonblocking(
-        sender,
-        &ProviderSourceHealthEvent {
-            source: source.clone(),
-            readiness,
-            status: ProviderSourceHealthStatus::Reconnecting,
-            reason: ProviderSourceHealthReason::InitialConnectPending,
-            message: format!(
-                "waiting for first websocket {} session ack",
-                source.kind_str().trim_start_matches("websocket_")
-            ),
-        },
-    );
-}
-
-fn publish_websocket_health_nonblocking(
-    sender: &ProviderStreamSender,
-    event: &ProviderSourceHealthEvent,
-) {
-    match sender.try_send(ProviderStreamUpdate::Health(event.clone())) {
-        Ok(()) | Err(TrySendError::Closed(_)) => {}
-        Err(TrySendError::Full(update)) => {
-            let sender = sender.clone();
-            tokio::spawn(async move {
-                drop(sender.send(update).await);
-            });
-        }
-    }
-}
-
-fn register_websocket_logs_initial_health(
-    source: &ProviderSourceIdentity,
-    readiness: ProviderSourceReadiness,
-    sender: &ProviderStreamSender,
-) {
-    publish_websocket_logs_health_nonblocking(
-        sender,
-        &ProviderSourceHealthEvent {
-            source: source.clone(),
-            readiness,
-            status: ProviderSourceHealthStatus::Reconnecting,
-            reason: ProviderSourceHealthReason::InitialConnectPending,
-            message: "waiting for first websocket logs session ack".to_owned(),
-        },
-    );
-}
-
-fn publish_websocket_logs_health_nonblocking(
-    sender: &ProviderStreamSender,
-    event: &ProviderSourceHealthEvent,
-) {
-    match sender.try_send(ProviderStreamUpdate::Health(event.clone())) {
-        Ok(()) | Err(TrySendError::Closed(_)) => {}
-        Err(TrySendError::Full(update)) => {
-            let sender = sender.clone();
-            tokio::spawn(async move {
-                drop(sender.send(update).await);
-            });
-        }
-    }
 }
 
 async fn send_provider_logs_health(

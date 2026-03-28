@@ -20,7 +20,6 @@ use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 use thiserror::Error;
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 use yellowstone_grpc_client::{GeyserGrpcBuilderError, GeyserGrpcClient, GeyserGrpcClientError};
 use yellowstone_grpc_proto::prelude::{
@@ -926,7 +925,18 @@ async fn spawn_yellowstone_grpc_source_inner(
 ) -> Result<JoinHandle<Result<(), YellowstoneGrpcError>>, YellowstoneGrpcError> {
     config.validate()?;
     let source = ProviderSourceIdentity::generated(config.source_id(), config.source_instance());
-    register_yellowstone_primary_initial_health(&source, config.readiness(), &sender);
+    send_primary_provider_health(
+        &source,
+        config.readiness(),
+        &sender,
+        ProviderSourceHealthStatus::Reconnecting,
+        ProviderSourceHealthReason::InitialConnectPending,
+        format!(
+            "waiting for first yellowstone {} session ack",
+            source.kind_str().trim_start_matches("yellowstone_grpc_")
+        ),
+    )
+    .await?;
     let first_session = match establish_yellowstone_session(&config, 0).await {
         Ok(session) => session,
         Err(error) => {
@@ -1079,7 +1089,15 @@ async fn spawn_yellowstone_grpc_slot_source_inner(
         ProviderSourceId::YellowstoneGrpcSlots,
         config.source_instance(),
     );
-    register_yellowstone_slot_initial_health(&source, config.readiness(), &sender);
+    send_provider_slot_health(
+        &source,
+        config.readiness(),
+        &sender,
+        ProviderSourceHealthStatus::Reconnecting,
+        ProviderSourceHealthReason::InitialConnectPending,
+        "waiting for first yellowstone slot session ack".to_owned(),
+    )
+    .await?;
     let first_session = match establish_yellowstone_slot_session(&config, 0).await {
         Ok(session) => session,
         Err(error) => {
@@ -1526,73 +1544,6 @@ async fn send_primary_provider_health(
         }))
         .await
         .map_err(|_error| YellowstoneGrpcError::QueueClosed)
-}
-
-fn register_yellowstone_primary_initial_health(
-    source: &ProviderSourceIdentity,
-    readiness: ProviderSourceReadiness,
-    sender: &ProviderStreamSender,
-) {
-    publish_yellowstone_health_nonblocking(
-        sender,
-        &ProviderSourceHealthEvent {
-            source: source.clone(),
-            readiness,
-            status: ProviderSourceHealthStatus::Reconnecting,
-            reason: ProviderSourceHealthReason::InitialConnectPending,
-            message: format!(
-                "waiting for first yellowstone {} session ack",
-                source.kind_str().trim_start_matches("yellowstone_grpc_")
-            ),
-        },
-    );
-}
-
-fn publish_yellowstone_health_nonblocking(
-    sender: &ProviderStreamSender,
-    event: &ProviderSourceHealthEvent,
-) {
-    match sender.try_send(ProviderStreamUpdate::Health(event.clone())) {
-        Ok(()) | Err(TrySendError::Closed(_)) => {}
-        Err(TrySendError::Full(update)) => {
-            let sender = sender.clone();
-            tokio::spawn(async move {
-                drop(sender.send(update).await);
-            });
-        }
-    }
-}
-
-fn register_yellowstone_slot_initial_health(
-    source: &ProviderSourceIdentity,
-    readiness: ProviderSourceReadiness,
-    sender: &ProviderStreamSender,
-) {
-    publish_yellowstone_slot_health_nonblocking(
-        sender,
-        &ProviderSourceHealthEvent {
-            source: source.clone(),
-            readiness,
-            status: ProviderSourceHealthStatus::Reconnecting,
-            reason: ProviderSourceHealthReason::InitialConnectPending,
-            message: "waiting for first yellowstone slot session ack".to_owned(),
-        },
-    );
-}
-
-fn publish_yellowstone_slot_health_nonblocking(
-    sender: &ProviderStreamSender,
-    event: &ProviderSourceHealthEvent,
-) {
-    match sender.try_send(ProviderStreamUpdate::Health(event.clone())) {
-        Ok(()) | Err(TrySendError::Closed(_)) => {}
-        Err(TrySendError::Full(update)) => {
-            let sender = sender.clone();
-            tokio::spawn(async move {
-                drop(sender.send(update).await);
-            });
-        }
-    }
 }
 
 async fn send_provider_slot_health(
