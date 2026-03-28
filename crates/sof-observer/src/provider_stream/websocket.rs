@@ -30,12 +30,13 @@ use crate::{
     event::TxCommitmentStatus,
     framework::{AccountUpdateEvent, TransactionEvent, pubkey_bytes, signature_bytes_opt},
     provider_stream::{
-        ProviderCommitmentWatermarks, ProviderSourceHealthEvent, ProviderSourceHealthReason,
-        ProviderSourceHealthStatus, ProviderSourceId, ProviderSourceIdentity,
-        ProviderSourceIdentityRegistrationError, ProviderSourceReadiness,
-        ProviderSourceReservation, ProviderSourceTaskGuard, ProviderStreamFanIn,
-        ProviderStreamMode, ProviderStreamSender, ProviderStreamUpdate, SerializedTransactionEvent,
-        classify_provider_transaction_kind, emit_provider_source_removed_with_reservation,
+        ProviderCommitmentWatermarks, ProviderSourceArbitrationMode, ProviderSourceHealthEvent,
+        ProviderSourceHealthReason, ProviderSourceHealthStatus, ProviderSourceId,
+        ProviderSourceIdentity, ProviderSourceIdentityRegistrationError, ProviderSourceReadiness,
+        ProviderSourceReservation, ProviderSourceRole, ProviderSourceTaskGuard,
+        ProviderStreamFanIn, ProviderStreamMode, ProviderStreamSender, ProviderStreamUpdate,
+        SerializedTransactionEvent, classify_provider_transaction_kind,
+        emit_provider_source_removed_with_reservation,
     },
 };
 
@@ -76,6 +77,9 @@ pub struct WebsocketTransactionConfig {
     http_endpoint: Option<String>,
     source_instance: Option<Arc<str>>,
     readiness: ProviderSourceReadiness,
+    source_role: ProviderSourceRole,
+    source_priority: u16,
+    source_arbitration: ProviderSourceArbitrationMode,
     stream: WebsocketPrimaryStream,
     program_filters: Vec<WebsocketProgramFilter>,
     commitment: WebsocketTransactionCommitment,
@@ -171,6 +175,9 @@ impl WebsocketTransactionConfig {
             http_endpoint: None,
             source_instance: None,
             readiness: ProviderSourceReadiness::Required,
+            source_role: ProviderSourceRole::Primary,
+            source_priority: ProviderSourceRole::Primary.default_priority(),
+            source_arbitration: ProviderSourceArbitrationMode::EmitAll,
             stream: WebsocketPrimaryStream::Transaction,
             program_filters: Vec::new(),
             commitment: WebsocketTransactionCommitment::Processed,
@@ -214,6 +221,31 @@ impl WebsocketTransactionConfig {
     #[must_use]
     pub const fn with_readiness(mut self, readiness: ProviderSourceReadiness) -> Self {
         self.readiness = readiness;
+        self
+    }
+
+    /// Sets the operational role for this source inside one fan-in graph.
+    #[must_use]
+    pub const fn with_source_role(mut self, role: ProviderSourceRole) -> Self {
+        self.source_role = role;
+        self.source_priority = role.default_priority();
+        self
+    }
+
+    /// Sets one explicit arbitration priority for this source.
+    #[must_use]
+    pub const fn with_source_priority(mut self, priority: u16) -> Self {
+        self.source_priority = priority;
+        self
+    }
+
+    /// Sets duplicate arbitration policy for this source.
+    #[must_use]
+    pub const fn with_source_arbitration(
+        mut self,
+        arbitration: ProviderSourceArbitrationMode,
+    ) -> Self {
+        self.source_arbitration = arbitration;
         self
     }
 
@@ -524,8 +556,19 @@ impl WebsocketTransactionConfig {
     }
 
     fn source_identity(&self) -> Option<ProviderSourceIdentity> {
-        self.source_instance()
-            .map(|instance| ProviderSourceIdentity::new(self.source_id(), instance))
+        self.source_instance().map(|instance| {
+            ProviderSourceIdentity::new(self.source_id(), instance)
+                .with_role(self.source_role)
+                .with_priority(self.source_priority)
+                .with_arbitration(self.source_arbitration)
+        })
+    }
+
+    fn resolved_source_identity(&self) -> ProviderSourceIdentity {
+        ProviderSourceIdentity::generated(self.source_id(), self.source_instance())
+            .with_role(self.source_role)
+            .with_priority(self.source_priority)
+            .with_arbitration(self.source_arbitration)
     }
 
     const fn stream_kind(&self) -> WebsocketStreamKind {
@@ -595,6 +638,9 @@ pub struct WebsocketLogsConfig {
     endpoint: String,
     source_instance: Option<Arc<str>>,
     readiness: ProviderSourceReadiness,
+    source_role: ProviderSourceRole,
+    source_priority: u16,
+    source_arbitration: ProviderSourceArbitrationMode,
     commitment: WebsocketTransactionCommitment,
     filter: WebsocketLogsFilter,
     ping_interval: Option<Duration>,
@@ -611,6 +657,9 @@ impl WebsocketLogsConfig {
             endpoint: endpoint.into(),
             source_instance: None,
             readiness: ProviderSourceReadiness::Optional,
+            source_role: ProviderSourceRole::Secondary,
+            source_priority: ProviderSourceRole::Secondary.default_priority(),
+            source_arbitration: ProviderSourceArbitrationMode::EmitAll,
             commitment: WebsocketTransactionCommitment::Processed,
             filter: WebsocketLogsFilter::All,
             ping_interval: Some(Duration::from_secs(60)),
@@ -637,6 +686,31 @@ impl WebsocketLogsConfig {
     #[must_use]
     pub const fn with_readiness(mut self, readiness: ProviderSourceReadiness) -> Self {
         self.readiness = readiness;
+        self
+    }
+
+    /// Sets the operational role for this source inside one fan-in graph.
+    #[must_use]
+    pub const fn with_source_role(mut self, role: ProviderSourceRole) -> Self {
+        self.source_role = role;
+        self.source_priority = role.default_priority();
+        self
+    }
+
+    /// Sets one explicit arbitration priority for this source.
+    #[must_use]
+    pub const fn with_source_priority(mut self, priority: u16) -> Self {
+        self.source_priority = priority;
+        self
+    }
+
+    /// Sets duplicate arbitration policy for this source.
+    #[must_use]
+    pub const fn with_source_arbitration(
+        mut self,
+        arbitration: ProviderSourceArbitrationMode,
+    ) -> Self {
+        self.source_arbitration = arbitration;
         self
     }
 
@@ -716,8 +790,19 @@ impl WebsocketLogsConfig {
     }
 
     fn source_identity(&self) -> Option<ProviderSourceIdentity> {
-        self.source_instance()
-            .map(|instance| ProviderSourceIdentity::new(ProviderSourceId::WebsocketLogs, instance))
+        self.source_instance().map(|instance| {
+            ProviderSourceIdentity::new(ProviderSourceId::WebsocketLogs, instance)
+                .with_role(self.source_role)
+                .with_priority(self.source_priority)
+                .with_arbitration(self.source_arbitration)
+        })
+    }
+
+    fn resolved_source_identity(&self) -> ProviderSourceIdentity {
+        ProviderSourceIdentity::generated(ProviderSourceId::WebsocketLogs, self.source_instance())
+            .with_role(self.source_role)
+            .with_priority(self.source_priority)
+            .with_arbitration(self.source_arbitration)
     }
 }
 
@@ -908,7 +993,7 @@ async fn spawn_websocket_source_inner(
 ) -> Result<JoinHandle<Result<(), WebsocketTransactionError>>, WebsocketTransactionError> {
     config.validate()?;
     let config = config.clone();
-    let source = ProviderSourceIdentity::generated(config.source_id(), config.source_instance());
+    let source = config.resolved_source_identity();
     let initial_health = queue_primary_provider_health(
         &source,
         config.readiness(),
@@ -1059,10 +1144,7 @@ async fn spawn_websocket_logs_source_inner(
     reservation: Option<Arc<ProviderSourceReservation>>,
 ) -> Result<JoinHandle<Result<(), WebsocketLogsError>>, WebsocketLogsError> {
     let config = config.clone();
-    let source = ProviderSourceIdentity::generated(
-        ProviderSourceId::WebsocketLogs,
-        config.source_instance(),
-    );
+    let source = config.resolved_source_identity();
     let initial_health = queue_logs_provider_health(
         &source,
         config.readiness(),

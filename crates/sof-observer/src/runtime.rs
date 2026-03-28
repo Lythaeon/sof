@@ -1,7 +1,7 @@
 #![allow(clippy::missing_docs_in_private_items)]
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher},
+    collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher, hash_map::Entry},
     future::Future,
     hash::{Hash, Hasher},
     net::SocketAddr,
@@ -1970,9 +1970,8 @@ const fn provider_stream_mode_accepts_source_kind(
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-enum ProviderReplayDedupeKey {
+enum ProviderReplayLogicalKey {
     Transaction {
-        source: Option<crate::provider_stream::ProviderSourceRef>,
         slot: u64,
         signature: Signature,
         commitment_status: u8,
@@ -1980,7 +1979,6 @@ enum ProviderReplayDedupeKey {
         finalized_slot: Option<u64>,
     },
     SerializedTransaction {
-        source: Option<crate::provider_stream::ProviderSourceRef>,
         slot: u64,
         commitment_status: u8,
         confirmed_slot: Option<u64>,
@@ -1988,14 +1986,13 @@ enum ProviderReplayDedupeKey {
         fingerprint: u64,
     },
     ControlPlane {
-        source: Option<crate::provider_stream::ProviderSourceRef>,
         slot: u64,
         kind: u8,
         fingerprint: u64,
     },
 }
 
-impl ProviderReplayDedupeKey {
+impl ProviderReplayLogicalKey {
     const fn slot(&self) -> u64 {
         match self {
             Self::Transaction { slot, .. }
@@ -2005,10 +2002,30 @@ impl ProviderReplayDedupeKey {
     }
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ProviderReplayObservedKey {
+    source: Option<crate::provider_stream::ProviderSourceRef>,
+    logical: ProviderReplayLogicalKey,
+}
+
+impl ProviderReplayObservedKey {
+    const fn slot(&self) -> u64 {
+        self.logical.slot()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ProviderReplayArbitratedWinner {
+    priority: u16,
+    source: crate::provider_stream::ProviderSourceRef,
+}
+
 #[derive(Default)]
 struct ProviderReplayDedupe {
-    seen: HashSet<ProviderReplayDedupeKey>,
-    order: VecDeque<ProviderReplayDedupeKey>,
+    seen: HashSet<ProviderReplayObservedKey>,
+    order: VecDeque<ProviderReplayObservedKey>,
+    arbitrated: HashMap<ProviderReplayLogicalKey, ProviderReplayArbitratedWinner>,
+    arbitrated_order: VecDeque<ProviderReplayLogicalKey>,
     capacity: usize,
     max_slot_seen: u64,
 }
@@ -2018,23 +2035,81 @@ impl ProviderReplayDedupe {
         Self {
             seen: HashSet::with_capacity(capacity),
             order: VecDeque::with_capacity(capacity),
+            arbitrated: HashMap::with_capacity(capacity),
+            arbitrated_order: VecDeque::with_capacity(capacity),
             capacity: capacity.max(1),
             max_slot_seen: 0,
         }
     }
 
     fn observe(&mut self, update: &ProviderStreamUpdate) -> bool {
-        let Some(key) = provider_replay_dedupe_key(update) else {
+        let Some(logical) = provider_replay_dedupe_key(update) else {
             return false;
         };
-        self.max_slot_seen = self.max_slot_seen.max(key.slot());
-        if self.seen.contains(&key) {
+        self.max_slot_seen = self.max_slot_seen.max(logical.slot());
+        let source = provider_stream_update_source_ref(update);
+        let observed = ProviderReplayObservedKey {
+            source: source.clone(),
+            logical: logical.clone(),
+        };
+        if !self.seen.insert(observed.clone()) {
             return true;
         }
-        self.seen.insert(key.clone());
-        self.order.push_back(key);
-        self.evict();
-        false
+        self.order.push_back(observed);
+
+        let Some(source) = source else {
+            self.evict();
+            return false;
+        };
+
+        match source.arbitration() {
+            crate::provider_stream::ProviderSourceArbitrationMode::EmitAll => {
+                self.evict();
+                false
+            }
+            crate::provider_stream::ProviderSourceArbitrationMode::FirstSeen => {
+                match self.arbitrated.entry(logical.clone()) {
+                    Entry::Occupied(_) => {
+                        self.evict();
+                        true
+                    }
+                    Entry::Vacant(entry) => {
+                        entry.insert(ProviderReplayArbitratedWinner {
+                            priority: source.priority(),
+                            source,
+                        });
+                        self.arbitrated_order.push_back(logical);
+                        self.evict();
+                        false
+                    }
+                }
+            }
+            crate::provider_stream::ProviderSourceArbitrationMode::FirstSeenThenPromote => {
+                match self.arbitrated.entry(logical.clone()) {
+                    Entry::Occupied(mut entry) => {
+                        let winner = entry.get_mut();
+                        if source.priority() > winner.priority {
+                            winner.priority = source.priority();
+                            winner.source = source;
+                            self.evict();
+                            false
+                        } else {
+                            self.evict();
+                            true
+                        }
+                    }
+                    Entry::Vacant(entry) => {
+                        entry.insert(ProviderReplayArbitratedWinner {
+                            priority: source.priority(),
+                            source,
+                        });
+                        self.arbitrated_order.push_back(logical);
+                        self.evict();
+                        false
+                    }
+                }
+            }
+        }
     }
 
     fn evict(&mut self) {
@@ -2048,17 +2123,43 @@ impl ProviderReplayDedupe {
             let _ = self.order.pop_front();
             self.seen.remove(&oldest);
         }
+        while let Some(oldest) = self.arbitrated_order.front().cloned() {
+            if self.arbitrated_order.len() <= self.capacity && oldest.slot() >= min_slot {
+                break;
+            }
+            let _ = self.arbitrated_order.pop_front();
+            self.arbitrated.remove(&oldest);
+        }
     }
 }
 
-fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderReplayDedupeKey> {
+fn provider_stream_update_source_ref(
+    update: &ProviderStreamUpdate,
+) -> Option<crate::provider_stream::ProviderSourceRef> {
+    match update {
+        ProviderStreamUpdate::Transaction(event) => event.provider_source.clone(),
+        ProviderStreamUpdate::SerializedTransaction(event) => event.provider_source.clone(),
+        ProviderStreamUpdate::TransactionLog(event) => event.provider_source.clone(),
+        ProviderStreamUpdate::TransactionStatus(event) => event.provider_source.clone(),
+        ProviderStreamUpdate::TransactionViewBatch(event) => event.provider_source.clone(),
+        ProviderStreamUpdate::AccountUpdate(event) => event.provider_source.clone(),
+        ProviderStreamUpdate::BlockMeta(event) => event.provider_source.clone(),
+        ProviderStreamUpdate::RecentBlockhash(event) => event.provider_source.clone(),
+        ProviderStreamUpdate::SlotStatus(event) => event.provider_source.clone(),
+        ProviderStreamUpdate::ClusterTopology(event) => event.provider_source.clone(),
+        ProviderStreamUpdate::LeaderSchedule(event) => event.provider_source.clone(),
+        ProviderStreamUpdate::Reorg(event) => event.provider_source.clone(),
+        ProviderStreamUpdate::Health(_) => None,
+    }
+}
+
+fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderReplayLogicalKey> {
     match update {
         ProviderStreamUpdate::Transaction(event) => event
             .signature
             .map(crate::framework::SignatureBytes::to_solana)
             .or_else(|| event.tx.signatures.first().copied())
-            .map(|signature| ProviderReplayDedupeKey::Transaction {
-                source: event.provider_source.clone(),
+            .map(|signature| ProviderReplayLogicalKey::Transaction {
                 slot: event.slot,
                 signature,
                 commitment_status: provider_replay_commitment_key(event.commitment_status),
@@ -2070,8 +2171,7 @@ fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderR
             .map(crate::framework::SignatureBytes::to_solana)
             .map_or_else(
                 || {
-                    Some(ProviderReplayDedupeKey::SerializedTransaction {
-                        source: event.provider_source.clone(),
+                    Some(ProviderReplayLogicalKey::SerializedTransaction {
                         slot: event.slot,
                         commitment_status: provider_replay_commitment_key(event.commitment_status),
                         confirmed_slot: event.confirmed_slot,
@@ -2080,8 +2180,7 @@ fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderR
                     })
                 },
                 |signature| {
-                    Some(ProviderReplayDedupeKey::Transaction {
-                        source: event.provider_source.clone(),
+                    Some(ProviderReplayLogicalKey::Transaction {
                         slot: event.slot,
                         signature,
                         commitment_status: provider_replay_commitment_key(event.commitment_status),
@@ -2091,73 +2190,65 @@ fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderR
                 },
             ),
         ProviderStreamUpdate::RecentBlockhash(event) => {
-            Some(ProviderReplayDedupeKey::ControlPlane {
-                source: event.provider_source.clone(),
+            Some(ProviderReplayLogicalKey::ControlPlane {
                 slot: event.slot,
                 kind: 1,
                 fingerprint: provider_replay_fingerprint(event),
             })
         }
-        ProviderStreamUpdate::SlotStatus(event) => Some(ProviderReplayDedupeKey::ControlPlane {
-            source: event.provider_source.clone(),
+        ProviderStreamUpdate::SlotStatus(event) => Some(ProviderReplayLogicalKey::ControlPlane {
             slot: event.slot,
             kind: 2,
             fingerprint: provider_replay_fingerprint(event),
         }),
         ProviderStreamUpdate::ClusterTopology(event) => {
-            Some(ProviderReplayDedupeKey::ControlPlane {
-                source: event.provider_source.clone(),
+            Some(ProviderReplayLogicalKey::ControlPlane {
                 slot: event.slot.unwrap_or_default(),
                 kind: 3,
                 fingerprint: provider_replay_fingerprint(event),
             })
         }
         ProviderStreamUpdate::LeaderSchedule(event) => {
-            Some(ProviderReplayDedupeKey::ControlPlane {
-                source: event.provider_source.clone(),
+            Some(ProviderReplayLogicalKey::ControlPlane {
                 slot: event.slot.unwrap_or_default(),
                 kind: 4,
                 fingerprint: provider_replay_fingerprint(event),
             })
         }
-        ProviderStreamUpdate::Reorg(event) => Some(ProviderReplayDedupeKey::ControlPlane {
-            source: event.provider_source.clone(),
+        ProviderStreamUpdate::Reorg(event) => Some(ProviderReplayLogicalKey::ControlPlane {
             slot: event.new_tip,
             kind: 5,
             fingerprint: provider_replay_fingerprint(event),
         }),
         ProviderStreamUpdate::TransactionLog(event) => {
-            Some(ProviderReplayDedupeKey::ControlPlane {
-                source: event.provider_source.clone(),
+            Some(ProviderReplayLogicalKey::ControlPlane {
                 slot: event.slot,
                 kind: 6,
                 fingerprint: provider_replay_transaction_log_fingerprint(event),
             })
         }
         ProviderStreamUpdate::TransactionStatus(event) => {
-            Some(ProviderReplayDedupeKey::ControlPlane {
-                source: event.provider_source.clone(),
+            Some(ProviderReplayLogicalKey::ControlPlane {
                 slot: event.slot,
                 kind: 8,
                 fingerprint: provider_replay_fingerprint(event),
             })
         }
         ProviderStreamUpdate::TransactionViewBatch(event) => {
-            Some(ProviderReplayDedupeKey::ControlPlane {
-                source: event.provider_source.clone(),
+            Some(ProviderReplayLogicalKey::ControlPlane {
                 slot: event.slot,
                 kind: 7,
                 fingerprint: provider_replay_transaction_view_batch_fingerprint(event),
             })
         }
-        ProviderStreamUpdate::AccountUpdate(event) => Some(ProviderReplayDedupeKey::ControlPlane {
-            source: event.provider_source.clone(),
-            slot: event.slot,
-            kind: 9,
-            fingerprint: provider_replay_fingerprint(event),
-        }),
-        ProviderStreamUpdate::BlockMeta(event) => Some(ProviderReplayDedupeKey::ControlPlane {
-            source: event.provider_source.clone(),
+        ProviderStreamUpdate::AccountUpdate(event) => {
+            Some(ProviderReplayLogicalKey::ControlPlane {
+                slot: event.slot,
+                kind: 9,
+                fingerprint: provider_replay_fingerprint(event),
+            })
+        }
+        ProviderStreamUpdate::BlockMeta(event) => Some(ProviderReplayLogicalKey::ControlPlane {
             slot: event.slot,
             kind: 10,
             fingerprint: provider_replay_fingerprint(event),
@@ -2333,10 +2424,11 @@ fn dispatch_provider_stream_serialized_transaction(
 
     let mut signature = event.signature;
     let mut recent_blockhash = None;
+    let mut kind = None;
     let needs_view_prefilter = wants_transaction
         && plugin_host.has_transaction_prefilter_at_commitment(event.commitment_status)
         && !wants_derived_state_transaction;
-    let should_try_view = wants_recent_blockhash || needs_view_prefilter;
+    let should_try_view = wants_recent_blockhash || needs_view_prefilter || wants_transaction;
     if should_try_view
         && let Ok(view) = SanitizedTransactionView::try_new_sanitized(event.bytes.as_ref(), true)
     {
@@ -2347,6 +2439,7 @@ fn dispatch_provider_stream_serialized_transaction(
                 .copied()
                 .map(crate::framework::SignatureBytes::from_solana);
         }
+        kind = Some(crate::provider_stream::classify_provider_transaction_kind_view(&view));
         if wants_recent_blockhash {
             recent_blockhash = Some(view.recent_blockhash().to_bytes());
         }
@@ -2406,7 +2499,8 @@ fn dispatch_provider_stream_serialized_transaction(
                 .map(crate::framework::SignatureBytes::from_solana)
         }),
         provider_source: event.provider_source.clone(),
-        kind: crate::provider_stream::classify_provider_transaction_kind(&tx),
+        kind: kind
+            .unwrap_or_else(|| crate::provider_stream::classify_provider_transaction_kind(&tx)),
         tx,
     };
     if wants_recent_blockhash {
@@ -4189,12 +4283,65 @@ mod tests {
             crate::provider_stream::ProviderSourceId::Generic("source-b".to_owned().into()),
             "ws-tx-2",
         );
-        let update_a = sample_provider_transaction_update().with_provider_source(source_a);
-        let update_b = sample_provider_transaction_update().with_provider_source(source_b);
+        let update = sample_provider_transaction_update();
+        let update_a = update.clone().with_provider_source(source_a);
+        let update_b = update.with_provider_source(source_b);
         let mut dedupe = ProviderReplayDedupe::new(8);
 
         assert!(!dedupe.observe(&update_a));
         assert!(!dedupe.observe(&update_b));
+    }
+
+    #[test]
+    fn provider_replay_dedupe_first_seen_suppresses_later_overlapping_source() {
+        let source_a = crate::provider_stream::ProviderSourceIdentity::new(
+            crate::provider_stream::ProviderSourceId::Generic("source-a".to_owned().into()),
+            "primary",
+        )
+        .with_arbitration(crate::provider_stream::ProviderSourceArbitrationMode::FirstSeen)
+        .with_priority(100);
+        let source_b = crate::provider_stream::ProviderSourceIdentity::new(
+            crate::provider_stream::ProviderSourceId::Generic("source-b".to_owned().into()),
+            "secondary",
+        )
+        .with_arbitration(crate::provider_stream::ProviderSourceArbitrationMode::FirstSeen)
+        .with_priority(300);
+        let update = sample_provider_transaction_update();
+        let update_a = update.clone().with_provider_source(source_a);
+        let update_b = update.with_provider_source(source_b);
+        let mut dedupe = ProviderReplayDedupe::new(8);
+
+        assert!(!dedupe.observe(&update_a));
+        assert!(dedupe.observe(&update_b));
+    }
+
+    #[test]
+    fn provider_replay_dedupe_promotes_higher_priority_source() {
+        let source_a = crate::provider_stream::ProviderSourceIdentity::new(
+            crate::provider_stream::ProviderSourceId::Generic("source-a".to_owned().into()),
+            "fallback",
+        )
+        .with_arbitration(
+            crate::provider_stream::ProviderSourceArbitrationMode::FirstSeenThenPromote,
+        )
+        .with_priority(100);
+        let source_b = crate::provider_stream::ProviderSourceIdentity::new(
+            crate::provider_stream::ProviderSourceId::Generic("source-b".to_owned().into()),
+            "primary",
+        )
+        .with_arbitration(
+            crate::provider_stream::ProviderSourceArbitrationMode::FirstSeenThenPromote,
+        )
+        .with_priority(300);
+        let update = sample_provider_transaction_update();
+        let update_a = update.clone().with_provider_source(source_a);
+        let update_b = update.with_provider_source(source_b);
+        let mut dedupe = ProviderReplayDedupe::new(8);
+
+        assert!(!dedupe.observe(&update_a));
+        assert!(!dedupe.observe(&update_b));
+        assert!(dedupe.observe(&update_a));
+        assert!(dedupe.observe(&update_b));
     }
 
     #[test]
@@ -4271,8 +4418,9 @@ mod tests {
             crate::provider_stream::ProviderSourceId::YellowstoneGrpcSlots,
             "yellowstone-slot-2",
         );
-        let update_a = sample_provider_recent_blockhash_update(42).with_provider_source(source_a);
-        let update_b = sample_provider_recent_blockhash_update(42).with_provider_source(source_b);
+        let update = sample_provider_recent_blockhash_update(42);
+        let update_a = update.clone().with_provider_source(source_a);
+        let update_b = update.with_provider_source(source_b);
         let mut dedupe = ProviderReplayDedupe::new(8);
 
         assert!(!dedupe.observe(&update_a));
@@ -4307,10 +4455,9 @@ mod tests {
             crate::provider_stream::ProviderSourceId::LaserStream,
             "laserstream-view-batch-1",
         );
-        let update_a =
-            sample_provider_transaction_view_batch_update(42).with_provider_source(source_a);
-        let update_b =
-            sample_provider_transaction_view_batch_update(42).with_provider_source(source_b);
+        let update = sample_provider_transaction_view_batch_update(42);
+        let update_a = update.clone().with_provider_source(source_a);
+        let update_b = update.with_provider_source(source_b);
         let mut dedupe = ProviderReplayDedupe::new(8);
 
         assert!(!dedupe.observe(&update_a));

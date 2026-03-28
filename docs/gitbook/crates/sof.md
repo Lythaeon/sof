@@ -75,6 +75,10 @@ Important boundary:
   transactions, transaction status, accounts, block-meta, logs, and slots where
   the upstream surface supports them
 - `ProviderStreamMode::Generic` is the flexible processed-provider mode
+- multi-source fan-in can now arbitrate overlapping duplicates by policy:
+  - `EmitAll`
+  - `FirstSeen`
+  - `FirstSeenThenPromote`
 - custom generic producers only become source-aware for readiness after they
   emit typed `Health` updates for their reserved sources; until then SOF can
   only treat generic ingress as "updates are flowing"

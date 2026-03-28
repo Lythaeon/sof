@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
         mpsc,
     },
     thread::JoinHandle,
@@ -24,7 +24,6 @@ use std::{
 use arcshift::ArcShift;
 use crossbeam_channel as channel;
 use crossbeam_queue::ArrayQueue;
-use crossbeam_skiplist::SkipMap;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sof_types::{PubkeyBytes, SignatureBytes};
 use solana_transaction::versioned::VersionedTransaction;
@@ -2593,7 +2592,7 @@ impl DerivedStateHostBuilder {
                 control_plane_state: ArcShift::new(DerivedStateControlPlaneTracker::default()),
                 fault_count: AtomicU64::new(0),
                 initialized: AtomicBool::new(false),
-                slot_tx_indexes: SkipMap::new(),
+                slot_tx_indexes: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -3015,11 +3014,15 @@ impl DerivedStateHost {
     /// transaction on the dataset hot path.
     #[must_use]
     pub fn reserve_slot_tx_indexes(&self, slot: u64, count: u32) -> u32 {
-        let entry = self
+        let mut slot_tx_indexes = self
             .inner
             .slot_tx_indexes
-            .get_or_insert(slot, AtomicU32::new(0));
-        entry.value().fetch_add(count, Ordering::Relaxed)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next = slot_tx_indexes.entry(slot).or_insert(0);
+        let start = *next;
+        *next = next.saturating_add(count);
+        start
     }
 
     /// Emits one transaction-applied record into the derived-state feed.
@@ -3202,7 +3205,12 @@ impl DerivedStateHost {
             event.status,
             ForkSlotStatus::Finalized | ForkSlotStatus::Orphaned
         ) {
-            let _ = self.inner.slot_tx_indexes.remove(&event.slot);
+            let mut slot_tx_indexes = self
+                .inner
+                .slot_tx_indexes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = slot_tx_indexes.remove(&event.slot);
         }
         let watermarks = FeedWatermarks::from_slot_status(&event);
         self.dispatch_with_control_plane_update(
@@ -3620,7 +3628,7 @@ struct DerivedStateHostInner {
     /// Ensures checkpoint loading runs only once per host.
     initialized: AtomicBool,
     /// Per-slot transaction indexes used to stabilize event ordering.
-    slot_tx_indexes: SkipMap<u64, AtomicU32>,
+    slot_tx_indexes: Mutex<HashMap<u64, u32>>,
 }
 
 /// Atomically published watermarks snapshot shared across dispatch paths.
