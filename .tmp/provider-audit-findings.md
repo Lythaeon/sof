@@ -92,3 +92,6 @@ Follow-up findings after the readiness/readiness-class pass:
   on a full queue. Existing reservation-lifecycle tests were tightened to check
   eventual identity reuse after delayed `Removed` delivery instead of assuming
   same-tick release timing.
+- Fixed reserved generic sender lifecycle gaps:
+  - live reserved senders now reject `Health(Removed, ...)` so callers cannot prune a source while its reservation is still active
+  - no-runtime full-queue generic shutdown now uses bounded retry and then releases the identity instead of risking an unbounded reservation leak

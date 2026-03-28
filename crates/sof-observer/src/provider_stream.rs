@@ -158,6 +158,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::SendError;
@@ -711,6 +712,11 @@ impl ProviderSourceReleaseGuard {
     }
 }
 
+/// Maximum no-runtime retries for one terminal `Removed` event before releasing anyway.
+const SOURCE_REMOVED_NO_RUNTIME_RETRY_ATTEMPTS: usize = 64;
+/// Delay between no-runtime retries for one terminal `Removed` event.
+const SOURCE_REMOVED_NO_RUNTIME_RETRY_DELAY: Duration = Duration::from_millis(5);
+
 impl Drop for ProviderSourceReservation {
     fn drop(&mut self) {
         let release = ProviderSourceReleaseGuard::for_identity(ProviderSourceDeferredRelease {
@@ -765,6 +771,15 @@ impl ReservedProviderStreamSender {
         &self,
         update: ProviderStreamUpdate,
     ) -> Result<(), SendError<ProviderStreamUpdate>> {
+        if matches!(
+            update,
+            ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
+                status: ProviderSourceHealthStatus::Removed,
+                ..
+            })
+        ) {
+            return Err(SendError(self.bind_update(update)));
+        }
         self.sender.send(self.bind_update(update)).await
     }
 }
@@ -1080,7 +1095,19 @@ fn emit_provider_source_removed(
                 None
             } else {
                 std::thread::spawn(move || {
-                    drop(sender.blocking_send(update));
+                    let mut pending_update = update;
+                    for _ in 0..SOURCE_REMOVED_NO_RUNTIME_RETRY_ATTEMPTS {
+                        match sender.try_send(pending_update) {
+                            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {
+                                drop(release);
+                                return;
+                            }
+                            Err(mpsc::error::TrySendError::Full(retried_update)) => {
+                                pending_update = retried_update;
+                                std::thread::sleep(SOURCE_REMOVED_NO_RUNTIME_RETRY_DELAY);
+                            }
+                        }
+                    }
                     drop(release);
                 });
                 None
@@ -1386,6 +1413,81 @@ mod tests {
             .await
             .expect("identity released after background removal send");
         });
+    }
+
+    #[test]
+    fn reserved_provider_sender_rejects_removed_health_while_alive() {
+        let (fan_in, mut rx) = create_provider_stream_fan_in(4);
+        let source = ProviderSourceIdentity::new(
+            ProviderSourceId::Generic(Arc::<str>::from("custom")),
+            "source-a",
+        );
+        let sender = fan_in
+            .sender_for_source(source.clone())
+            .expect("reserve source");
+
+        Runtime::new().expect("runtime").block_on(async move {
+            let error = sender
+                .send(ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
+                    source: source.clone(),
+                    readiness: ProviderSourceReadiness::Required,
+                    status: ProviderSourceHealthStatus::Removed,
+                    reason: ProviderSourceHealthReason::SourceRemoved,
+                    message: "should be rejected".to_owned(),
+                }))
+                .await
+                .expect_err("reserved sender should reject removed health while alive");
+            let removed_update = error.0;
+            let ProviderStreamUpdate::Health(removed) = removed_update else {
+                panic!("expected removed health update in send error");
+            };
+            assert_eq!(removed.source, source);
+            assert_eq!(removed.status, ProviderSourceHealthStatus::Removed);
+
+            assert!(
+                timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
+                "rejected removed update must not reach the provider queue"
+            );
+        });
+    }
+
+    #[test]
+    fn reserved_provider_sender_releases_identity_after_bounded_no_runtime_cleanup_retry() {
+        let (fan_in, _rx) = create_provider_stream_fan_in(1);
+        let source = ProviderSourceIdentity::new(
+            ProviderSourceId::Generic(Arc::<str>::from("custom")),
+            "source-a",
+        );
+        let sender = fan_in
+            .sender_for_source(source.clone())
+            .expect("reserve source");
+
+        fan_in
+            .sender()
+            .try_send(ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
+                source: ProviderSourceIdentity::new(
+                    ProviderSourceId::Generic(Arc::<str>::from("other")),
+                    "other-source",
+                ),
+                readiness: ProviderSourceReadiness::Optional,
+                status: ProviderSourceHealthStatus::Healthy,
+                reason: ProviderSourceHealthReason::SubscriptionAckReceived,
+                message: "occupied".to_owned(),
+            }))
+            .expect("fill provider queue");
+
+        let drop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(sender);
+        }));
+        assert!(drop_result.is_ok(), "drop outside runtime should not panic");
+
+        std::thread::sleep(Duration::from_millis(
+            (SOURCE_REMOVED_NO_RUNTIME_RETRY_ATTEMPTS as u64 * 5) + 100,
+        ));
+
+        fan_in
+            .sender_for_source(source)
+            .expect("identity released after bounded no-runtime cleanup retry");
     }
 
     #[test]
