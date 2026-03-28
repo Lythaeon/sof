@@ -66,11 +66,17 @@
 //!
 //! - a stable source instance label for observability via `with_source_instance(...)`
 //! - whether one source is readiness-gating or optional via `with_readiness(...)`
+//! - an operational role via `with_source_role(...)`
+//! - an explicit arbitration priority via `with_source_priority(...)`
+//! - duplicate handling via `with_source_arbitration(...)`
 //!
 //! Generic multi-source producers can reserve one stable source identity with
 //! [`ProviderStreamFanIn::sender_for_source`]. The returned
 //! [`ReservedProviderStreamSender`] automatically attributes every update it
 //! sends to that reserved provider source.
+//! Generic producers can set the same source policy directly on
+//! [`ProviderSourceIdentity`] with `with_role(...)`, `with_priority(...)`, and
+//! `with_arbitration(...)`.
 //!
 //! Generic readiness becomes source-aware only after a custom producer emits
 //! [`ProviderStreamUpdate::Health`] for that reserved source. Until then,
@@ -157,6 +163,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
@@ -453,12 +460,18 @@ pub struct ProviderSourceHealthEvent {
 }
 
 /// Stable provider source instance identity used in runtime health and provider-origin events.
-#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderSourceIdentity {
     /// Stable source kind, for example `WebsocketTransaction`.
     pub kind: ProviderSourceId,
     /// Runtime-unique or user-supplied source instance label.
     pub instance: Arc<str>,
+    /// Relative arbitration priority for this source.
+    pub priority: u16,
+    /// Operational role for this source within one multi-source fan-in.
+    pub role: ProviderSourceRole,
+    /// Duplicate arbitration policy for this source.
+    pub arbitration: ProviderSourceArbitrationMode,
 }
 
 impl ProviderSourceIdentity {
@@ -468,6 +481,9 @@ impl ProviderSourceIdentity {
         Self {
             kind,
             instance: instance.into(),
+            priority: ProviderSourceRole::Primary.default_priority(),
+            role: ProviderSourceRole::Primary,
+            arbitration: ProviderSourceArbitrationMode::EmitAll,
         }
     }
 
@@ -481,6 +497,49 @@ impl ProviderSourceIdentity {
     #[must_use]
     pub fn instance_str(&self) -> &str {
         self.instance.as_ref()
+    }
+
+    /// Returns the relative arbitration priority for this source.
+    #[must_use]
+    pub const fn priority(&self) -> u16 {
+        self.priority
+    }
+
+    /// Returns the configured source role.
+    #[must_use]
+    pub const fn role(&self) -> ProviderSourceRole {
+        self.role
+    }
+
+    /// Returns the configured duplicate arbitration policy.
+    #[must_use]
+    pub const fn arbitration(&self) -> ProviderSourceArbitrationMode {
+        self.arbitration
+    }
+
+    /// Sets one explicit arbitration priority.
+    #[must_use]
+    pub const fn with_priority(mut self, priority: u16) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    /// Sets one source role and updates the default priority when the source still uses
+    /// that role's previous default.
+    #[must_use]
+    pub const fn with_role(mut self, role: ProviderSourceRole) -> Self {
+        if self.priority == self.role.default_priority() {
+            self.priority = role.default_priority();
+        }
+        self.role = role;
+        self
+    }
+
+    /// Sets one duplicate arbitration policy.
+    #[must_use]
+    pub const fn with_arbitration(mut self, arbitration: ProviderSourceArbitrationMode) -> Self {
+        self.arbitration = arbitration;
+        self
     }
 
     /// Builds a generated provider-source identity with a unique instance suffix.
@@ -501,6 +560,21 @@ impl ProviderSourceIdentity {
 impl std::fmt::Display for ProviderSourceIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}:{}", self.kind.as_str(), self.instance)
+    }
+}
+
+impl PartialEq for ProviderSourceIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.instance == other.instance
+    }
+}
+
+impl Eq for ProviderSourceIdentity {}
+
+impl Hash for ProviderSourceIdentity {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.kind.hash(state);
+        self.instance.hash(state);
     }
 }
 
@@ -541,6 +615,66 @@ pub enum ProviderSourceId {
     #[cfg(feature = "provider-websocket")]
     /// Built-in websocket `programSubscribe` source.
     WebsocketProgram,
+}
+
+/// Relative operational role for one provider source inside a fan-in graph.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub enum ProviderSourceRole {
+    /// Lowest-latency or best-effort primary feed.
+    Primary,
+    /// Secondary feed expected to be healthy and often overlap the primary.
+    Secondary,
+    /// Lower-priority fallback feed.
+    Fallback,
+    /// Confirmation-only feed used mainly for richer or more trusted overlap.
+    ConfirmOnly,
+}
+
+impl ProviderSourceRole {
+    /// Returns the stable string label used in logs and docs.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Secondary => "secondary",
+            Self::Fallback => "fallback",
+            Self::ConfirmOnly => "confirm_only",
+        }
+    }
+
+    /// Returns the default arbitration priority for this role.
+    #[must_use]
+    pub const fn default_priority(self) -> u16 {
+        match self {
+            Self::Primary => 300,
+            Self::Secondary => 200,
+            Self::Fallback => 100,
+            Self::ConfirmOnly => 400,
+        }
+    }
+}
+
+/// Duplicate arbitration mode for one provider source inside fan-in.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub enum ProviderSourceArbitrationMode {
+    /// Keep the current SOF behavior and emit overlapping duplicates from every source.
+    EmitAll,
+    /// First source wins for one logical event key; later duplicates are dropped.
+    FirstSeen,
+    /// First source wins immediately, but a later higher-priority duplicate may promote and emit.
+    FirstSeenThenPromote,
+}
+
+impl ProviderSourceArbitrationMode {
+    /// Returns the stable string label used in logs and docs.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EmitAll => "emit_all",
+            Self::FirstSeen => "first_seen",
+            Self::FirstSeenThenPromote => "first_seen_then_promote",
+        }
+    }
 }
 
 impl ProviderSourceId {

@@ -344,6 +344,20 @@ for example:
 The built-in source configs stay the same in that setup. The fan-in helper just
 gives them one typed queue.
 
+Fan-in sources can also carry policy, not just identity:
+
+- `with_source_role(...)`
+  - `Primary`, `Secondary`, `Fallback`, or `ConfirmOnly`
+- `with_source_priority(...)`
+  - explicit numeric tie-break when overlapping sources race
+- `with_source_arbitration(...)`
+  - `EmitAll`
+  - `FirstSeen`
+  - `FirstSeenThenPromote`
+
+That keeps the fast path immediate while letting overlapping sources suppress
+or promote duplicates by policy instead of treating every provider equally.
+
 If you build a generic source directly, reserve one stable source identity with
 `sender_for_source(...)`. The returned sender binds that reserved source to
 every update it emits, so replay dedupe, readiness, and observability all stay
@@ -354,6 +368,13 @@ starts once the producer emits `ProviderStreamUpdate::Health` for that reserved
 source. Until then, `ProviderStreamMode::Generic` falls back to progress-based
 readiness and only knows that typed updates are flowing, not whether each
 expected source instance is healthy.
+
+Custom generic sources can use the same source policy by building
+`ProviderSourceIdentity` with:
+
+- `.with_role(...)`
+- `.with_priority(...)`
+- `.with_arbitration(...)`
 
 The runtime then routes those typed updates into the normal SOF surfaces:
 

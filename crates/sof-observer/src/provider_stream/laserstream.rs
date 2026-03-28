@@ -44,12 +44,13 @@ use crate::{
         TransactionStatusEvent,
     },
     provider_stream::{
-        ProviderCommitmentWatermarks, ProviderReplayMode, ProviderSourceHealthEvent,
-        ProviderSourceHealthReason, ProviderSourceHealthStatus, ProviderSourceId,
-        ProviderSourceIdentity, ProviderSourceIdentityRegistrationError, ProviderSourceReadiness,
-        ProviderSourceReservation, ProviderSourceTaskGuard, ProviderStreamFanIn,
-        ProviderStreamMode, ProviderStreamSender, ProviderStreamUpdate,
-        classify_provider_transaction_kind, emit_provider_source_removed_with_reservation,
+        ProviderCommitmentWatermarks, ProviderReplayMode, ProviderSourceArbitrationMode,
+        ProviderSourceHealthEvent, ProviderSourceHealthReason, ProviderSourceHealthStatus,
+        ProviderSourceId, ProviderSourceIdentity, ProviderSourceIdentityRegistrationError,
+        ProviderSourceReadiness, ProviderSourceReservation, ProviderSourceRole,
+        ProviderSourceTaskGuard, ProviderStreamFanIn, ProviderStreamMode, ProviderStreamSender,
+        ProviderStreamUpdate, classify_provider_transaction_kind,
+        emit_provider_source_removed_with_reservation,
     },
 };
 
@@ -94,6 +95,9 @@ pub struct LaserStreamConfig {
     api_key: String,
     source_instance: Option<Arc<str>>,
     readiness: ProviderSourceReadiness,
+    source_role: ProviderSourceRole,
+    source_priority: u16,
+    source_arbitration: ProviderSourceArbitrationMode,
     stream: LaserStreamStream,
     commitment: LaserStreamCommitment,
     vote: Option<bool>,
@@ -191,6 +195,9 @@ impl LaserStreamConfig {
             api_key: api_key.into(),
             source_instance: None,
             readiness: ProviderSourceReadiness::Required,
+            source_role: ProviderSourceRole::Primary,
+            source_priority: ProviderSourceRole::Primary.default_priority(),
+            source_arbitration: ProviderSourceArbitrationMode::EmitAll,
             stream: LaserStreamStream::Transaction,
             commitment: LaserStreamCommitment::Processed,
             vote: None,
@@ -230,6 +237,31 @@ impl LaserStreamConfig {
     #[must_use]
     pub const fn with_readiness(mut self, readiness: ProviderSourceReadiness) -> Self {
         self.readiness = readiness;
+        self
+    }
+
+    /// Sets the operational role for this source inside one fan-in graph.
+    #[must_use]
+    pub const fn with_source_role(mut self, role: ProviderSourceRole) -> Self {
+        self.source_role = role;
+        self.source_priority = role.default_priority();
+        self
+    }
+
+    /// Sets one explicit arbitration priority for this source.
+    #[must_use]
+    pub const fn with_source_priority(mut self, priority: u16) -> Self {
+        self.source_priority = priority;
+        self
+    }
+
+    /// Sets duplicate arbitration policy for this source.
+    #[must_use]
+    pub const fn with_source_arbitration(
+        mut self,
+        arbitration: ProviderSourceArbitrationMode,
+    ) -> Self {
+        self.source_arbitration = arbitration;
         self
     }
 
@@ -574,8 +606,19 @@ impl LaserStreamConfig {
     }
 
     fn source_identity(&self) -> Option<ProviderSourceIdentity> {
-        self.source_instance()
-            .map(|instance| ProviderSourceIdentity::new(self.source_id(), instance))
+        self.source_instance().map(|instance| {
+            ProviderSourceIdentity::new(self.source_id(), instance)
+                .with_role(self.source_role)
+                .with_priority(self.source_priority)
+                .with_arbitration(self.source_arbitration)
+        })
+    }
+
+    fn resolved_source_identity(&self) -> ProviderSourceIdentity {
+        ProviderSourceIdentity::generated(self.source_id(), self.source_instance())
+            .with_role(self.source_role)
+            .with_priority(self.source_priority)
+            .with_arbitration(self.source_arbitration)
     }
 
     /// Returns the runtime mode matching this built-in LaserStream stream selection.
@@ -622,6 +665,9 @@ pub struct LaserStreamSlotsConfig {
     api_key: String,
     source_instance: Option<Arc<str>>,
     readiness: ProviderSourceReadiness,
+    source_role: ProviderSourceRole,
+    source_priority: u16,
+    source_arbitration: ProviderSourceArbitrationMode,
     commitment: LaserStreamCommitment,
     connect_timeout: Option<Duration>,
     timeout: Option<Duration>,
@@ -642,6 +688,9 @@ impl LaserStreamSlotsConfig {
             api_key: api_key.into(),
             source_instance: None,
             readiness: ProviderSourceReadiness::Optional,
+            source_role: ProviderSourceRole::Secondary,
+            source_priority: ProviderSourceRole::Secondary.default_priority(),
+            source_arbitration: ProviderSourceArbitrationMode::EmitAll,
             commitment: LaserStreamCommitment::Processed,
             connect_timeout: Some(Duration::from_secs(10)),
             timeout: Some(Duration::from_secs(30)),
@@ -674,6 +723,31 @@ impl LaserStreamSlotsConfig {
         self
     }
 
+    /// Sets the operational role for this source inside one fan-in graph.
+    #[must_use]
+    pub const fn with_source_role(mut self, role: ProviderSourceRole) -> Self {
+        self.source_role = role;
+        self.source_priority = role.default_priority();
+        self
+    }
+
+    /// Sets one explicit arbitration priority for this source.
+    #[must_use]
+    pub const fn with_source_priority(mut self, priority: u16) -> Self {
+        self.source_priority = priority;
+        self
+    }
+
+    /// Sets duplicate arbitration policy for this source.
+    #[must_use]
+    pub const fn with_source_arbitration(
+        mut self,
+        arbitration: ProviderSourceArbitrationMode,
+    ) -> Self {
+        self.source_arbitration = arbitration;
+        self
+    }
+
     /// Returns the runtime mode matching this built-in LaserStream slot stream.
     #[must_use]
     pub const fn runtime_mode(&self) -> ProviderStreamMode {
@@ -691,7 +765,20 @@ impl LaserStreamSlotsConfig {
     fn source_identity(&self) -> Option<ProviderSourceIdentity> {
         self.source_instance().map(|instance| {
             ProviderSourceIdentity::new(ProviderSourceId::LaserStreamSlots, instance)
+                .with_role(self.source_role)
+                .with_priority(self.source_priority)
+                .with_arbitration(self.source_arbitration)
         })
+    }
+
+    fn resolved_source_identity(&self) -> ProviderSourceIdentity {
+        ProviderSourceIdentity::generated(
+            ProviderSourceId::LaserStreamSlots,
+            self.source_instance(),
+        )
+        .with_role(self.source_role)
+        .with_priority(self.source_priority)
+        .with_arbitration(self.source_arbitration)
     }
 
     /// Sets the LaserStream commitment.
@@ -985,7 +1072,7 @@ async fn spawn_laserstream_source_inner(
     reservation: Option<Arc<ProviderSourceReservation>>,
 ) -> Result<JoinHandle<Result<(), LaserStreamError>>, LaserStreamError> {
     config.validate()?;
-    let source = ProviderSourceIdentity::generated(config.source_id(), config.source_instance());
+    let source = config.resolved_source_identity();
     let initial_health = queue_primary_provider_health(
         &source,
         config.readiness(),
@@ -1156,10 +1243,7 @@ async fn spawn_laserstream_slot_source_inner(
     sender: ProviderStreamSender,
     reservation: Option<Arc<ProviderSourceReservation>>,
 ) -> Result<JoinHandle<Result<(), LaserStreamError>>, LaserStreamError> {
-    let source = ProviderSourceIdentity::generated(
-        ProviderSourceId::LaserStreamSlots,
-        config.source_instance(),
-    );
+    let source = config.resolved_source_identity();
     let initial_health = queue_provider_slot_health(
         &source,
         config.readiness(),
