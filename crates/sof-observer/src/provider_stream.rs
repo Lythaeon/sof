@@ -69,6 +69,11 @@
 //! - an operational role via `with_source_role(...)`
 //! - an explicit arbitration priority via `with_source_priority(...)`
 //! - duplicate handling via `with_source_arbitration(...)`
+//!   - `EmitAll` keeps the historical behavior and forwards overlapping
+//!     provider events from every source
+//!   - `FirstSeen` suppresses later overlapping duplicates across sources
+//!   - `FirstSeenThenPromote` keeps the first event immediate, but allows one
+//!     later higher-priority duplicate to promote through
 //!
 //! Generic multi-source producers can reserve one stable source identity with
 //! [`ProviderStreamFanIn::sender_for_source`]. The returned
@@ -82,6 +87,15 @@
 //! [`ProviderStreamUpdate::Health`] for that reserved source. Until then,
 //! `ProviderStreamMode::Generic` falls back to progress-based readiness and
 //! only knows that typed updates are flowing at all.
+//!
+//! Fan-in duplicate arbitration is source-aware and keyed by the logical event,
+//! not just by queue position. That means two sources carrying the same
+//! transaction or control-plane item can now either:
+//!
+//! - both dispatch (`EmitAll`, the default)
+//! - dispatch once (`FirstSeen`)
+//! - dispatch once immediately and then allow one later higher-priority source
+//!   to promote (`FirstSeenThenPromote`)
 //!
 //! Variant-to-runtime mapping:
 //!

@@ -358,6 +358,34 @@ Fan-in sources can also carry policy, not just identity:
 That keeps the fast path immediate while letting overlapping sources suppress
 or promote duplicates by policy instead of treating every provider equally.
 
+Duplicate behavior is explicit:
+
+- `EmitAll`
+  - default
+  - overlapping feeds still both dispatch to plugins
+- `FirstSeen`
+  - first source for the same logical event wins
+  - later overlapping duplicates are dropped
+- `FirstSeenThenPromote`
+  - first source still dispatches immediately
+  - one later higher-priority duplicate may also dispatch as a promotion
+  - lower/equal-priority duplicates are dropped
+
+So if you want multi-source fan-in to avoid dispatching the same transaction
+twice across overlapping providers, set:
+
+```rust
+use sof::provider_stream::ProviderSourceArbitrationMode;
+
+let config = config.with_source_arbitration(ProviderSourceArbitrationMode::FirstSeen);
+```
+
+That arbitration is keyed by the logical event:
+
+- transaction updates: signature + slot + commitment/watermark shape
+- serialized transactions without signature: slot + bytes fingerprint + commitment shape
+- control-plane updates: slot + event kind + payload fingerprint
+
 If you build a generic source directly, reserve one stable source identity with
 `sender_for_source(...)`. The returned sender binds that reserved source to
 every update it emits, so replay dedupe, readiness, and observability all stay
