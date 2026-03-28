@@ -1,4 +1,7 @@
 //! Demonstrates fanning multiple provider sources into one SOF generic ingress.
+//!
+//! Multi-source fan-in intentionally uses `ProviderStreamMode::Generic` because
+//! one runtime is consuming multiple typed provider feeds at once.
 
 #[cfg(not(feature = "provider-websocket"))]
 fn main() {}
@@ -18,14 +21,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (fan_in, rx) = create_provider_stream_fan_in(1024);
 
     let transaction_source = fan_in
-        .spawn_websocket_source(&WebsocketTransactionConfig::new(
-            "wss://mainnet.helius-rpc.com/?api-key=example",
-        ))
+        .spawn_websocket_source(
+            &WebsocketTransactionConfig::new("wss://mainnet.helius-rpc.com/?api-key=example")
+                .with_source_instance("helius-websocket-tx-primary"),
+        )
         .await?;
 
     let logs_source = fan_in
         .spawn_websocket_logs_source(
             &WebsocketLogsConfig::new("wss://mainnet.helius-rpc.com/?api-key=example")
+                .with_source_instance("helius-websocket-logs-aux")
                 .with_filter(WebsocketLogsFilter::Mentions(Pubkey::new_unique())),
         )
         .await?;

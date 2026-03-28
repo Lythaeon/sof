@@ -1,4 +1,7 @@
 //! SOF runtime example for Helius LaserStream processed provider-stream ingress.
+//!
+//! The built-in config selects the matching runtime mode through `runtime_mode()`.
+//! Stable source labels are optional but useful for readiness and observability.
 #![allow(clippy::missing_docs_in_private_items)]
 
 use async_trait::async_trait;
@@ -58,8 +61,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let account_required = maybe_parse_pubkeys("SOF_LASERSTREAM_ACCOUNT_REQUIRED")?;
     let (provider_tx, provider_rx) = create_provider_stream_queue(4_096);
 
-    let mut config =
-        LaserStreamConfig::new(endpoint, api_key).with_commitment(LaserStreamCommitment::Processed);
+    let mut config = LaserStreamConfig::new(endpoint, api_key)
+        .with_commitment(LaserStreamCommitment::Processed)
+        .with_source_instance("laserstream-primary");
     if !account_include.is_empty() {
         config = config.with_account_include(account_include);
     }

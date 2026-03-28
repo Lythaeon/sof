@@ -1,4 +1,7 @@
 //! SOF runtime example for websocket `transactionSubscribe` provider-stream ingress.
+//!
+//! The built-in config selects the matching runtime mode through `runtime_mode()`.
+//! Stable source labels are optional but useful for readiness and observability.
 #![allow(clippy::missing_docs_in_private_items)]
 
 use async_trait::async_trait;
@@ -64,6 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut config = WebsocketTransactionConfig::new(endpoint)
         .with_commitment(WebsocketTransactionCommitment::Processed)
+        .with_source_instance("websocket-tx-primary")
         .with_vote(include_votes)
         .with_failed(include_failed);
     if !include.is_empty() {
