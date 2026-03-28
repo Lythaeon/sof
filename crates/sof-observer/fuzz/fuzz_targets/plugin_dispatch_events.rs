@@ -289,6 +289,7 @@ fuzz_target!(|bytes: &[u8]| {
                     slot,
                     recent_blockhash,
                     dataset_tx_count,
+                    provider_source: None,
                 });
                 assert_eq!(host.latest_observed_recent_blockhash(), expected_recent);
             }
@@ -338,6 +339,7 @@ fuzz_target!(|bytes: &[u8]| {
                     removed_pubkeys,
                     updated_nodes,
                     snapshot_nodes,
+                    provider_source: None,
                 });
             }
             _ => {
@@ -386,6 +388,7 @@ fuzz_target!(|bytes: &[u8]| {
                     removed_slots,
                     updated_leaders,
                     snapshot_leaders,
+                    provider_source: None,
                 });
                 assert_eq!(host.latest_observed_tpu_leader(), expected_leader);
             }

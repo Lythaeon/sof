@@ -9,7 +9,7 @@ for plugins, derived state, and local control-plane consumers.
 
 - packet ingress from direct UDP, gossip bootstrap, or external kernel-bypass receivers
 - processed provider ingress from Yellowstone gRPC, LaserStream gRPC, websocket
-  `transactionSubscribe`, or `ProviderStreamMode::Generic`
+  transaction/logs/account/program feeds, or `ProviderStreamMode::Generic`
 - shred parse, optional verification, recovery, and dataset reconstruction
 - plugin-driven event emission for transactions, slots, topology, and blockhash observations
 - runtime extension hosting for filtered packet or resource consumers
@@ -71,8 +71,13 @@ Best for:
 
 Important boundary:
 
-- built-in Yellowstone, LaserStream, and websocket adapters are transaction-first
+- built-in Yellowstone, LaserStream, and websocket adapters now cover
+  transactions, transaction status, accounts, block-meta, logs, and slots where
+  the upstream surface supports them
 - `ProviderStreamMode::Generic` is the flexible processed-provider mode
+- custom generic producers only become source-aware for readiness after they
+  emit typed `Health` updates for their reserved sources; until then SOF can
+  only treat generic ingress as "updates are flowing"
 - `sof-tx` adapter completeness still depends on a full control-plane feed, not only transaction
   updates
 

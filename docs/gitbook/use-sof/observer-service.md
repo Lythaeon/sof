@@ -84,7 +84,7 @@ Once this works, the normal next step is one of these:
 - switch ingress mode when you have a real reason
   - gossip for cluster discovery and topology
   - private raw ingress for earlier shreds
-  - processed providers when you want a transaction-first stream
+  - processed providers when you want typed transaction, account, block-meta, log, or slot feeds
 
 ## What To Avoid In The First Version
 

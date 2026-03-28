@@ -57,8 +57,8 @@ Tradeoff:
 
 - strongest restart posture
 - more moving parts and more integration work
-- assumes a runtime that emits the full control-plane feed, not only transaction-first provider
-  updates
+- assumes a runtime that emits the full control-plane feed, not only the narrower built-in
+  processed-provider event surface
 
 ## Recommended Starting Point
 

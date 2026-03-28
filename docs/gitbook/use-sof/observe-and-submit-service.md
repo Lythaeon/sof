@@ -26,8 +26,9 @@ That adapter consumes blockhash, leader, and topology events from `sof`, then ex
 the provider traits that `sof-tx` already understands.
 
 That path is complete today in raw-shred and gossip-backed SOF runtimes. Built-in processed
-provider adapters such as Yellowstone, LaserStream, and websocket are transaction-first today, so
-they do not yet form a complete built-in `sof-tx` control-plane source on their own.
+provider adapters such as Yellowstone, LaserStream, and websocket now cover transactions,
+transaction status, accounts, block-meta, logs, and slots, but they still do not form a complete
+built-in `sof-tx` control-plane source on their own.
 
 ## Minimal Integration Skeleton
 

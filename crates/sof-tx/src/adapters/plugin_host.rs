@@ -232,6 +232,7 @@ mod tests {
             removed_pubkeys: Vec::new(),
             updated_nodes: Vec::new(),
             snapshot_nodes: nodes,
+            provider_source: None,
         }
     }
 
@@ -247,6 +248,7 @@ mod tests {
             removed_slots: Vec::new(),
             updated_leaders: Vec::new(),
             snapshot_leaders,
+            provider_source: None,
         }
     }
 
@@ -269,6 +271,7 @@ mod tests {
                 slot: 10,
                 recent_blockhash: [7_u8; 32],
                 dataset_tx_count: 1,
+                provider_source: None,
             })
             .await;
 
@@ -446,6 +449,7 @@ mod tests {
             slot: 42,
             recent_blockhash: [11_u8; 32],
             dataset_tx_count: 3,
+            provider_source: None,
         });
         host.on_leader_schedule(LeaderScheduleEvent {
             source: ControlPlaneSource::Direct,
@@ -455,6 +459,7 @@ mod tests {
             removed_slots: Vec::new(),
             updated_leaders: Vec::new(),
             snapshot_leaders: Vec::new(),
+            provider_source: None,
         });
 
         let adapter = PluginHostTxProviderAdapter::default();
@@ -481,6 +486,7 @@ mod tests {
                 slot: 10,
                 recent_blockhash: [9_u8; 32],
                 dataset_tx_count: 1,
+                provider_source: None,
             })
             .await;
         adapter

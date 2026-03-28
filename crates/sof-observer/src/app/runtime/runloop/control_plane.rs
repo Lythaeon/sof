@@ -100,6 +100,7 @@ impl ClusterTopologyTracker {
             removed_pubkeys,
             updated_nodes,
             snapshot_nodes,
+            provider_source: None,
         })
     }
 
@@ -167,6 +168,7 @@ pub(super) fn emit_slot_leader_diff_event(
         removed_slots,
         updated_leaders,
         snapshot_leaders: Vec::new(),
+        provider_source: None,
     };
     if !derived_state_host.is_empty() {
         derived_state_host.on_leader_schedule(event.clone());
@@ -214,6 +216,7 @@ pub(super) fn emit_observed_slot_leader_bytes_event(
         removed_slots: Vec::new(),
         updated_leaders,
         snapshot_leaders: Vec::new(),
+        provider_source: None,
     };
     if !derived_state_host.is_empty() {
         derived_state_host.on_leader_schedule(event.clone());

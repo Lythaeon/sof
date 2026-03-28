@@ -4561,6 +4561,7 @@ impl PacketWorkerResultContext<'_> {
                         confirmed_slot: commitment_snapshot.confirmed_slot,
                         finalized_slot: commitment_snapshot.finalized_slot,
                         signature: signature_bytes_opt(prepared_tx.signature),
+                        provider_source: None,
                         tx: prepared_tx.tx,
                         kind: prepared_tx.kind,
                     },
@@ -4989,9 +4990,10 @@ fn apply_fork_update(update: &ForkTrackerUpdate, context: &mut ForkUpdateDispatc
             tip_slot: update.snapshot.tip_slot,
             confirmed_slot: update.snapshot.confirmed_slot,
             finalized_slot: update.snapshot.finalized_slot,
+            provider_source: None,
         };
         if derived_slot_status_enabled {
-            context.derived_state_host.on_slot_status(event);
+            context.derived_state_host.on_slot_status(event.clone());
         }
         if plugin_slot_status_enabled {
             context.plugin_host.on_slot_status(event);
@@ -5012,6 +5014,7 @@ fn apply_fork_update(update: &ForkTrackerUpdate, context: &mut ForkUpdateDispatc
             attached_slots: reorg.attached_slots.clone(),
             confirmed_slot: update.snapshot.confirmed_slot,
             finalized_slot: update.snapshot.finalized_slot,
+            provider_source: None,
         };
         if derived_reorg_enabled {
             context.derived_state_host.on_reorg(event.clone());
@@ -5387,6 +5390,7 @@ mod tests {
                             signature: signature.map(crate::framework::SignatureBytes::from_solana),
                             tx: Arc::new(tx),
                             kind,
+                            provider_source: None,
                         },
                         tx_ready_observed_at,
                         tx_first_observed_at,

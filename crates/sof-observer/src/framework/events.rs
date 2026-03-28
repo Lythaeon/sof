@@ -9,6 +9,7 @@ use solana_transaction::versioned::VersionedTransaction;
 
 use crate::{
     event::{ForkSlotStatus, TxCommitmentStatus, TxKind},
+    provider_stream::ProviderSourceRef,
     shred::wire::ParsedShredHeader,
 };
 
@@ -74,6 +75,8 @@ pub struct TransactionEvent {
     pub finalized_slot: Option<u64>,
     /// Transaction signature if present.
     pub signature: Option<SignatureBytes>,
+    /// Provider source instance when this transaction came from provider ingress.
+    pub provider_source: Option<ProviderSourceRef>,
     /// Decoded Solana transaction object.
     pub tx: Arc<VersionedTransaction>,
     /// SOF transaction kind classification.
@@ -108,6 +111,63 @@ pub struct TransactionLogEvent {
     pub logs: Arc<[String]>,
     /// Matching pubkey for one `mentions`-style subscription when present.
     pub matched_filter: Option<PubkeyBytes>,
+    /// Provider source instance when this event came from provider ingress.
+    pub provider_source: Option<ProviderSourceRef>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+/// Runtime event emitted for one provider/websocket transaction-status update.
+///
+/// This is intended for feeds that surface signature-level execution status
+/// without carrying a full decoded transaction object.
+pub struct TransactionStatusEvent {
+    /// Slot context attached to the upstream status update.
+    pub slot: u64,
+    /// Commitment status configured for the upstream subscription.
+    pub commitment_status: TxCommitmentStatus,
+    /// Latest observed confirmed slot watermark when event was emitted.
+    pub confirmed_slot: Option<u64>,
+    /// Latest observed finalized slot watermark when event was emitted.
+    pub finalized_slot: Option<u64>,
+    /// Transaction signature carried by the status update.
+    pub signature: SignatureBytes,
+    /// Whether the upstream provider marked this as a vote transaction.
+    pub is_vote: bool,
+    /// Transaction index within the slot when the provider included it.
+    pub index: Option<u64>,
+    /// Transaction error detail when execution failed.
+    pub err: Option<String>,
+    /// Provider source instance when this event came from provider ingress.
+    pub provider_source: Option<ProviderSourceRef>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+/// Runtime event emitted for one upstream block-metadata update.
+pub struct BlockMetaEvent {
+    /// Slot context attached to the upstream block-meta update.
+    pub slot: u64,
+    /// Commitment status configured for the upstream subscription.
+    pub commitment_status: TxCommitmentStatus,
+    /// Latest observed confirmed slot watermark when event was emitted.
+    pub confirmed_slot: Option<u64>,
+    /// Latest observed finalized slot watermark when event was emitted.
+    pub finalized_slot: Option<u64>,
+    /// Current blockhash for this slot.
+    pub blockhash: [u8; 32],
+    /// Parent slot for this block.
+    pub parent_slot: u64,
+    /// Parent blockhash for this block.
+    pub parent_blockhash: [u8; 32],
+    /// Provider-reported block time when available.
+    pub block_time: Option<i64>,
+    /// Provider-reported block height when available.
+    pub block_height: Option<u64>,
+    /// Number of executed transactions in this block.
+    pub executed_transaction_count: u64,
+    /// Number of entries in this block.
+    pub entries_count: u64,
+    /// Provider source instance when this event came from provider ingress.
+    pub provider_source: Option<ProviderSourceRef>,
 }
 
 #[derive(Debug, Clone)]
@@ -217,6 +277,8 @@ pub struct TransactionViewBatchEvent {
     pub confirmed_slot: Option<u64>,
     /// Latest observed finalized slot watermark when event was emitted.
     pub finalized_slot: Option<u64>,
+    /// Provider source instance when this view batch came from provider ingress.
+    pub provider_source: Option<ProviderSourceRef>,
     /// Shared contiguous completed-dataset payload bytes.
     pub payload: Arc<[u8]>,
     /// Serialized transaction byte ranges in dataset order.
@@ -310,6 +372,7 @@ impl TransactionEventRef<'_> {
             confirmed_slot: self.confirmed_slot,
             finalized_slot: self.finalized_slot,
             signature: self.signature,
+            provider_source: None,
             tx: Arc::new(self.tx.clone()),
             kind: self.kind,
         }
@@ -339,6 +402,41 @@ pub struct AccountTouchEvent {
     pub lookup_table_account_keys: Arc<[PubkeyBytes]>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+/// Runtime event emitted for one upstream account update.
+pub struct AccountUpdateEvent {
+    /// Slot context attached to the upstream account update.
+    pub slot: u64,
+    /// Commitment status configured for the upstream subscription.
+    pub commitment_status: TxCommitmentStatus,
+    /// Latest observed confirmed slot watermark when event was emitted.
+    pub confirmed_slot: Option<u64>,
+    /// Latest observed finalized slot watermark when event was emitted.
+    pub finalized_slot: Option<u64>,
+    /// Updated account pubkey.
+    pub pubkey: PubkeyBytes,
+    /// Account owner program id.
+    pub owner: PubkeyBytes,
+    /// Current lamport balance.
+    pub lamports: u64,
+    /// Whether the account is executable.
+    pub executable: bool,
+    /// Current rent epoch.
+    pub rent_epoch: u64,
+    /// Raw account data bytes.
+    pub data: Arc<[u8]>,
+    /// Provider write-version when available.
+    pub write_version: Option<u64>,
+    /// Transaction signature that produced the write when available.
+    pub txn_signature: Option<SignatureBytes>,
+    /// True when the provider marked this as startup/backfill state.
+    pub is_startup: bool,
+    /// Matching subscription/filter pubkey when one concrete key drove the feed.
+    pub matched_filter: Option<PubkeyBytes>,
+    /// Provider source instance when this event came from provider ingress.
+    pub provider_source: Option<ProviderSourceRef>,
+}
+
 #[derive(Debug, Clone, Copy)]
 /// Borrowed transaction account-touch view used for cheap hot-path preclassification.
 pub struct AccountTouchEventRef<'event> {
@@ -358,7 +456,7 @@ pub struct AccountTouchEventRef<'event> {
     pub lookup_table_account_key_count: usize,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 /// Runtime event emitted when local canonical classification for one slot changes.
 pub struct SlotStatusEvent {
     /// Slot number whose status changed.
@@ -375,6 +473,8 @@ pub struct SlotStatusEvent {
     pub confirmed_slot: Option<u64>,
     /// Current finalized slot watermark.
     pub finalized_slot: Option<u64>,
+    /// Provider source instance when this event came from provider ingress.
+    pub provider_source: Option<ProviderSourceRef>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -394,6 +494,8 @@ pub struct ReorgEvent {
     pub confirmed_slot: Option<u64>,
     /// Finalized slot watermark after the switch.
     pub finalized_slot: Option<u64>,
+    /// Provider source instance when this event came from provider ingress.
+    pub provider_source: Option<ProviderSourceRef>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -405,6 +507,8 @@ pub struct ObservedRecentBlockhashEvent {
     pub recent_blockhash: [u8; 32],
     /// Number of decoded transactions in the dataset that produced this observation.
     pub dataset_tx_count: u64,
+    /// Provider source instance when this event came from provider ingress.
+    pub provider_source: Option<ProviderSourceRef>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -466,6 +570,8 @@ pub struct ClusterTopologyEvent {
     ///
     /// Empty for diff-only events.
     pub snapshot_nodes: Vec<ClusterNodeInfo>,
+    /// Provider source instance when this event came from provider ingress.
+    pub provider_source: Option<ProviderSourceRef>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -496,6 +602,8 @@ pub struct LeaderScheduleEvent {
     ///
     /// Often empty for diff-only/event-driven updates.
     pub snapshot_leaders: Vec<LeaderScheduleEntry>,
+    /// Provider source instance when this event came from provider ingress.
+    pub provider_source: Option<ProviderSourceRef>,
 }
 
 /// Converts one Solana signature into the public SOF-owned wrapper.

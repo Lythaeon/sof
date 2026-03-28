@@ -1,4 +1,7 @@
 //! SOF runtime example for Helius LaserStream processed provider-stream ingress.
+//!
+//! The built-in config selects the matching runtime mode through `runtime_mode()`.
+//! Stable source labels are optional but useful for readiness and observability.
 #![allow(clippy::missing_docs_in_private_items)]
 
 use async_trait::async_trait;
@@ -9,10 +12,8 @@ use sof::{
     event::TxKind,
     framework::{ObserverPlugin, PluginConfig, PluginHost, TransactionEvent},
     provider_stream::{
-        ProviderStreamMode, create_provider_stream_queue,
-        laserstream::{
-            LaserStreamCommitment, LaserStreamConfig, spawn_laserstream_transaction_source,
-        },
+        create_provider_stream_queue,
+        laserstream::{LaserStreamCommitment, LaserStreamConfig, spawn_laserstream_source},
     },
     runtime::ObserverRuntime,
 };
@@ -60,8 +61,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let account_required = maybe_parse_pubkeys("SOF_LASERSTREAM_ACCOUNT_REQUIRED")?;
     let (provider_tx, provider_rx) = create_provider_stream_queue(4_096);
 
-    let mut config =
-        LaserStreamConfig::new(endpoint, api_key).with_commitment(LaserStreamCommitment::Processed);
+    let mut config = LaserStreamConfig::new(endpoint, api_key)
+        .with_commitment(LaserStreamCommitment::Processed)
+        .with_source_instance("laserstream-primary");
     if !account_include.is_empty() {
         config = config.with_account_include(account_include);
     }
@@ -69,13 +71,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config = config.with_account_required(account_required);
     }
 
-    let source = spawn_laserstream_transaction_source(config, provider_tx).await?;
+    let mode = config.runtime_mode();
+    let source = spawn_laserstream_source(config, provider_tx).await?;
     let host = PluginHost::builder()
         .add_plugin(LaserStreamTransactionLogger)
         .build();
     let runtime_result = ObserverRuntime::new()
         .with_plugin_host(host)
-        .with_provider_stream_ingress(ProviderStreamMode::LaserStream, provider_rx)
+        .with_provider_stream_ingress(mode, provider_rx)
         .run_until_termination_signal()
         .await;
     source.abort();

@@ -9,10 +9,11 @@ use std::{cell::RefCell, sync::Arc};
 use thiserror::Error;
 
 use crate::framework::events::{
-    AccountTouchEvent, AccountTouchEventRef, ClusterTopologyEvent, DatasetEvent,
-    LeaderScheduleEvent, ObservedRecentBlockhashEvent, RawPacketEvent, ReorgEvent, ShredEvent,
-    SlotStatusEvent, TransactionBatchEvent, TransactionEvent, TransactionEventRef,
-    TransactionLogEvent, TransactionViewBatchEvent,
+    AccountTouchEvent, AccountTouchEventRef, AccountUpdateEvent, BlockMetaEvent,
+    ClusterTopologyEvent, DatasetEvent, LeaderScheduleEvent, ObservedRecentBlockhashEvent,
+    RawPacketEvent, ReorgEvent, ShredEvent, SlotStatusEvent, TransactionBatchEvent,
+    TransactionEvent, TransactionEventRef, TransactionLogEvent, TransactionStatusEvent,
+    TransactionViewBatchEvent,
 };
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -126,21 +127,31 @@ pub enum TransactionInterest {
 pub struct TransactionPrefilter {
     matched_interest: TransactionInterest,
     signature: Option<SignatureBytes>,
-    account_include: Arc<[PubkeyBytes]>,
-    account_exclude: Arc<[PubkeyBytes]>,
-    account_required: Arc<[PubkeyBytes]>,
+    signature_solana: Option<solana_signature::Signature>,
+    account_include: CompiledAccountMatcher,
+    account_exclude: CompiledAccountMatcher,
+    account_required: CompiledAccountMatcher,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum CompiledAccountMatcher {
+    Empty,
+    One(solana_pubkey::Pubkey),
+    Two(solana_pubkey::Pubkey, solana_pubkey::Pubkey),
+    Many(Arc<[solana_pubkey::Pubkey]>),
 }
 
 impl TransactionPrefilter {
     /// Creates an empty prefilter that returns the provided interest on match.
     #[must_use]
-    pub fn new(matched_interest: TransactionInterest) -> Self {
+    pub const fn new(matched_interest: TransactionInterest) -> Self {
         Self {
             matched_interest,
             signature: None,
-            account_include: Arc::new([]),
-            account_exclude: Arc::new([]),
-            account_required: Arc::new([]),
+            signature_solana: None,
+            account_include: CompiledAccountMatcher::Empty,
+            account_exclude: CompiledAccountMatcher::Empty,
+            account_required: CompiledAccountMatcher::Empty,
         }
     }
 
@@ -156,7 +167,9 @@ impl TransactionPrefilter {
     where
         S: Into<SignatureBytes>,
     {
-        self.signature = Some(signature.into());
+        let signature = signature.into();
+        self.signature = Some(signature);
+        self.signature_solana = Some(signature.to_solana());
         self
     }
 
@@ -167,7 +180,7 @@ impl TransactionPrefilter {
         I: IntoIterator,
         I::Item: Into<PubkeyBytes>,
     {
-        self.account_include = Arc::from(keys.into_iter().map(Into::into).collect::<Vec<_>>());
+        self.account_include = compile_prefilter_keys(keys);
         self
     }
 
@@ -178,7 +191,7 @@ impl TransactionPrefilter {
         I: IntoIterator,
         I::Item: Into<PubkeyBytes>,
     {
-        self.account_exclude = Arc::from(keys.into_iter().map(Into::into).collect::<Vec<_>>());
+        self.account_exclude = compile_prefilter_keys(keys);
         self
     }
 
@@ -189,7 +202,7 @@ impl TransactionPrefilter {
         I: IntoIterator,
         I::Item: Into<PubkeyBytes>,
     {
-        self.account_required = Arc::from(keys.into_iter().map(Into::into).collect::<Vec<_>>());
+        self.account_required = compile_prefilter_keys(keys);
         self
     }
 
@@ -201,29 +214,15 @@ impl TransactionPrefilter {
         {
             return TransactionInterest::Ignore;
         }
-        if !self.account_include.is_empty()
-            && !self
-                .account_include
-                .iter()
-                .copied()
-                .any(|key| transaction_mentions_account_key(event.tx, key))
+        if !matches!(self.account_include, CompiledAccountMatcher::Empty)
+            && !transaction_matches_any_keys(event.tx, &self.account_include)
         {
             return TransactionInterest::Ignore;
         }
-        if self
-            .account_exclude
-            .iter()
-            .copied()
-            .any(|key| transaction_mentions_account_key(event.tx, key))
-        {
+        if transaction_matches_any_keys(event.tx, &self.account_exclude) {
             return TransactionInterest::Ignore;
         }
-        if !self
-            .account_required
-            .iter()
-            .copied()
-            .all(|key| transaction_mentions_account_key(event.tx, key))
-        {
+        if !transaction_matches_all_keys(event.tx, &self.account_required) {
             return TransactionInterest::Ignore;
         }
         self.matched_interest
@@ -235,61 +234,131 @@ impl TransactionPrefilter {
         &self,
         view: &SanitizedTransactionView<D>,
     ) -> TransactionInterest {
-        if let Some(signature) = self.signature
-            && view.signatures().first().copied() != Some(signature.to_solana())
+        if let Some(signature) = self.signature_solana
+            && view.signatures().first().copied() != Some(signature)
         {
             return TransactionInterest::Ignore;
         }
-        if !self.account_include.is_empty()
-            && !self
-                .account_include
-                .iter()
-                .copied()
-                .any(|key| transaction_view_mentions_account_key(view, key))
+        if !matches!(self.account_include, CompiledAccountMatcher::Empty)
+            && !transaction_view_matches_any_keys(view, &self.account_include)
         {
             return TransactionInterest::Ignore;
         }
-        if self
-            .account_exclude
-            .iter()
-            .copied()
-            .any(|key| transaction_view_mentions_account_key(view, key))
-        {
+        if transaction_view_matches_any_keys(view, &self.account_exclude) {
             return TransactionInterest::Ignore;
         }
-        if !self
-            .account_required
-            .iter()
-            .copied()
-            .all(|key| transaction_view_mentions_account_key(view, key))
-        {
+        if !transaction_view_matches_all_keys(view, &self.account_required) {
             return TransactionInterest::Ignore;
         }
         self.matched_interest
     }
 }
 
+fn compile_prefilter_keys<I>(keys: I) -> CompiledAccountMatcher
+where
+    I: IntoIterator,
+    I::Item: Into<PubkeyBytes>,
+{
+    let keys = keys
+        .into_iter()
+        .map(Into::into)
+        .map(PubkeyBytes::to_solana)
+        .collect::<Vec<_>>();
+    match keys.as_slice() {
+        [] => CompiledAccountMatcher::Empty,
+        [key] => CompiledAccountMatcher::One(*key),
+        [first, second] => CompiledAccountMatcher::Two(*first, *second),
+        _ => CompiledAccountMatcher::Many(Arc::from(keys)),
+    }
+}
+
 fn transaction_mentions_account_key(
     tx: &solana_transaction::versioned::VersionedTransaction,
-    key: PubkeyBytes,
+    key: &solana_pubkey::Pubkey,
 ) -> bool {
-    let key = key.to_solana();
-    tx.message.static_account_keys().contains(&key)
+    tx.message.static_account_keys().contains(key)
         || tx
             .message
             .address_table_lookups()
-            .is_some_and(|lookups| lookups.iter().any(|lookup| lookup.account_key == key))
+            .is_some_and(|lookups| lookups.iter().any(|lookup| lookup.account_key == *key))
+}
+
+fn transaction_matches_any_keys(
+    tx: &solana_transaction::versioned::VersionedTransaction,
+    matcher: &CompiledAccountMatcher,
+) -> bool {
+    match matcher {
+        CompiledAccountMatcher::Empty => false,
+        CompiledAccountMatcher::One(key) => transaction_mentions_account_key(tx, key),
+        CompiledAccountMatcher::Two(first, second) => {
+            transaction_mentions_account_key(tx, first)
+                || transaction_mentions_account_key(tx, second)
+        }
+        CompiledAccountMatcher::Many(keys) => keys
+            .iter()
+            .any(|key| transaction_mentions_account_key(tx, key)),
+    }
+}
+
+fn transaction_matches_all_keys(
+    tx: &solana_transaction::versioned::VersionedTransaction,
+    matcher: &CompiledAccountMatcher,
+) -> bool {
+    match matcher {
+        CompiledAccountMatcher::Empty => true,
+        CompiledAccountMatcher::One(key) => transaction_mentions_account_key(tx, key),
+        CompiledAccountMatcher::Two(first, second) => {
+            transaction_mentions_account_key(tx, first)
+                && transaction_mentions_account_key(tx, second)
+        }
+        CompiledAccountMatcher::Many(keys) => keys
+            .iter()
+            .all(|key| transaction_mentions_account_key(tx, key)),
+    }
 }
 
 fn transaction_view_mentions_account_key<D: TransactionData>(
     view: &SanitizedTransactionView<D>,
-    key: PubkeyBytes,
+    key: &solana_pubkey::Pubkey,
 ) -> bool {
-    let key = key.to_solana();
-    view.static_account_keys().contains(&key)
+    view.static_account_keys().contains(key)
         || view
             .address_table_lookup_iter()
-            .any(|lookup| *lookup.account_key == key)
+            .any(|lookup| lookup.account_key == key)
+}
+
+fn transaction_view_matches_any_keys<D: TransactionData>(
+    view: &SanitizedTransactionView<D>,
+    matcher: &CompiledAccountMatcher,
+) -> bool {
+    match matcher {
+        CompiledAccountMatcher::Empty => false,
+        CompiledAccountMatcher::One(key) => transaction_view_mentions_account_key(view, key),
+        CompiledAccountMatcher::Two(first, second) => {
+            transaction_view_mentions_account_key(view, first)
+                || transaction_view_mentions_account_key(view, second)
+        }
+        CompiledAccountMatcher::Many(keys) => keys
+            .iter()
+            .any(|key| transaction_view_mentions_account_key(view, key)),
+    }
+}
+
+fn transaction_view_matches_all_keys<D: TransactionData>(
+    view: &SanitizedTransactionView<D>,
+    matcher: &CompiledAccountMatcher,
+) -> bool {
+    match matcher {
+        CompiledAccountMatcher::Empty => true,
+        CompiledAccountMatcher::One(key) => transaction_view_mentions_account_key(view, key),
+        CompiledAccountMatcher::Two(first, second) => {
+            transaction_view_mentions_account_key(view, first)
+                && transaction_view_mentions_account_key(view, second)
+        }
+        CompiledAccountMatcher::Many(keys) => keys
+            .iter()
+            .all(|key| transaction_view_mentions_account_key(view, key)),
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -384,6 +453,8 @@ pub struct PluginConfig {
     pub transaction: bool,
     /// Enables `on_transaction_log`.
     pub transaction_log: bool,
+    /// Enables `on_transaction_status`.
+    pub transaction_status: bool,
     /// Commitment selector applied to transaction-family hooks.
     pub transaction_commitment: TransactionCommitmentSelector,
     /// Requested delivery path for `on_transaction`.
@@ -398,6 +469,10 @@ pub struct PluginConfig {
     pub transaction_view_batch_dispatch_mode: TransactionDispatchMode,
     /// Enables `on_account_touch`.
     pub account_touch: bool,
+    /// Enables `on_account_update`.
+    pub account_update: bool,
+    /// Enables `on_block_meta`.
+    pub block_meta: bool,
     /// Enables `on_slot_status`.
     pub slot_status: bool,
     /// Enables `on_reorg`.
@@ -455,11 +530,19 @@ impl PluginConfig {
         self
     }
 
+    /// Enables `on_transaction_status`.
+    #[must_use]
+    pub const fn with_transaction_status(mut self) -> Self {
+        self.transaction_status = true;
+        self
+    }
+
     /// Sets the minimum commitment required before transaction-family hooks are delivered.
     ///
     /// This applies uniformly to:
     /// - `on_transaction`
     /// - `on_transaction_log`
+    /// - `on_transaction_status`
     /// - `on_transaction_batch`
     /// - `on_transaction_view_batch`
     ///
@@ -559,6 +642,20 @@ impl PluginConfig {
     #[must_use]
     pub const fn with_account_touch(mut self) -> Self {
         self.account_touch = true;
+        self
+    }
+
+    /// Enables `on_account_update`.
+    #[must_use]
+    pub const fn with_account_update(mut self) -> Self {
+        self.account_update = true;
+        self
+    }
+
+    /// Enables `on_block_meta`.
+    #[must_use]
+    pub const fn with_block_meta(mut self) -> Self {
+        self.block_meta = true;
         self
     }
 
@@ -750,6 +847,15 @@ pub trait ObserverPlugin: Send + Sync + 'static {
         true
     }
 
+    /// Called for one provider transaction-status update that does not carry a
+    /// full decoded transaction object.
+    async fn on_transaction_status(&self, _event: &TransactionStatusEvent) {}
+
+    /// Returns true when this plugin wants a specific transaction-status callback.
+    fn accepts_transaction_status(&self, _event: &TransactionStatusEvent) -> bool {
+        true
+    }
+
     /// Called once per completed dataset with all decoded transactions in dataset order.
     ///
     /// This hook is non-speculative. SOF invokes it only after a contiguous dataset is fully
@@ -787,6 +893,22 @@ pub trait ObserverPlugin: Send + Sync + 'static {
 
     /// Called for each decoded transaction's static touched-account set.
     async fn on_account_touch(&self, _event: &AccountTouchEvent) {}
+
+    /// Called for one upstream account update.
+    async fn on_account_update(&self, _event: &AccountUpdateEvent) {}
+
+    /// Returns true when this plugin wants a specific block-meta callback.
+    fn accepts_block_meta(&self, _event: &BlockMetaEvent) -> bool {
+        true
+    }
+
+    /// Called for one upstream block-meta update.
+    async fn on_block_meta(&self, _event: &BlockMetaEvent) {}
+
+    /// Returns true when this plugin wants a specific account-update callback.
+    fn accepts_account_update(&self, _event: &AccountUpdateEvent) -> bool {
+        true
+    }
 
     /// Called when local slot status transitions (processed/confirmed/finalized/orphaned).
     async fn on_slot_status(&self, _event: SlotStatusEvent) {}

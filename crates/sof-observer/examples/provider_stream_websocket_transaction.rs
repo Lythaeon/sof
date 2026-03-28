@@ -1,4 +1,7 @@
 //! SOF runtime example for websocket `transactionSubscribe` provider-stream ingress.
+//!
+//! The built-in config selects the matching runtime mode through `runtime_mode()`.
+//! Stable source labels are optional but useful for readiness and observability.
 #![allow(clippy::missing_docs_in_private_items)]
 
 use async_trait::async_trait;
@@ -8,10 +11,9 @@ use std::{env, str::FromStr};
 use sof::{
     framework::{ObserverPlugin, PluginConfig, PluginHost, TransactionEvent},
     provider_stream::{
-        ProviderStreamMode, create_provider_stream_queue,
+        create_provider_stream_queue,
         websocket::{
-            WebsocketTransactionCommitment, WebsocketTransactionConfig,
-            spawn_websocket_transaction_source,
+            WebsocketTransactionCommitment, WebsocketTransactionConfig, spawn_websocket_source,
         },
     },
     runtime::ObserverRuntime,
@@ -65,6 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut config = WebsocketTransactionConfig::new(endpoint)
         .with_commitment(WebsocketTransactionCommitment::Processed)
+        .with_source_instance("websocket-tx-primary")
         .with_vote(include_votes)
         .with_failed(include_failed);
     if !include.is_empty() {
@@ -77,13 +80,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config = config.with_account_required(required);
     }
 
-    let source = spawn_websocket_transaction_source(&config, provider_tx).await?;
+    let mode = config.runtime_mode();
+    let source = spawn_websocket_source(&config, provider_tx).await?;
     let host = PluginHost::builder()
         .add_plugin(WebsocketTransactionPlugin)
         .build();
     let runtime_result = ObserverRuntime::new()
         .with_plugin_host(host)
-        .with_provider_stream_ingress(ProviderStreamMode::WebsocketTransaction, provider_rx)
+        .with_provider_stream_ingress(mode, provider_rx)
         .run_until_termination_signal()
         .await;
     source.abort();

@@ -223,6 +223,7 @@ fn dispatch_scenario_event(host: &sof::framework::PluginHost, scenario: HookScen
             slot: 91_000_u64.saturating_add(seed),
             recent_blockhash: synthetic_blockhash(seed),
             dataset_tx_count: 64,
+            provider_source: None,
         }),
         HookScenario::SlotStatus => host.on_slot_status(SlotStatusEvent {
             slot: 91_000_u64.saturating_add(seed),
@@ -232,6 +233,7 @@ fn dispatch_scenario_event(host: &sof::framework::PluginHost, scenario: HookScen
             tip_slot: Some(91_000_u64.saturating_add(seed)),
             confirmed_slot: Some(91_000_u64.saturating_add(seed)),
             finalized_slot: Some(90_992_u64.saturating_add(seed)),
+            provider_source: None,
         }),
         HookScenario::ClusterTopology => host.on_cluster_topology(ClusterTopologyEvent {
             source: ControlPlaneSource::GossipBootstrap,
@@ -243,6 +245,7 @@ fn dispatch_scenario_event(host: &sof::framework::PluginHost, scenario: HookScen
             removed_pubkeys: vec![],
             updated_nodes: vec![],
             snapshot_nodes: vec![],
+            provider_source: None,
         }),
     }
 }

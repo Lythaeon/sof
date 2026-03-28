@@ -34,11 +34,12 @@ pub use derived_state::{
     InMemoryDerivedStateReplaySource, SlotStatusChangedEvent, TransactionAppliedEvent,
 };
 pub use events::{
-    AccountTouchEvent, AccountTouchEventRef, ClusterNodeInfo, ClusterTopologyEvent,
-    ControlPlaneSource, DatasetEvent, LeaderScheduleEntry, LeaderScheduleEvent,
-    ObservedRecentBlockhashEvent, RawPacketEvent, ReorgEvent, SerializedTransactionRange,
-    ShredEvent, SlotStatusEvent, TransactionBatchEvent, TransactionEvent, TransactionEventRef,
-    TransactionLogEvent, TransactionViewBatchEvent,
+    AccountTouchEvent, AccountTouchEventRef, AccountUpdateEvent, BlockMetaEvent, ClusterNodeInfo,
+    ClusterTopologyEvent, ControlPlaneSource, DatasetEvent, LeaderScheduleEntry,
+    LeaderScheduleEvent, ObservedRecentBlockhashEvent, RawPacketEvent, ReorgEvent,
+    SerializedTransactionRange, ShredEvent, SlotStatusEvent, TransactionBatchEvent,
+    TransactionEvent, TransactionEventRef, TransactionLogEvent, TransactionStatusEvent,
+    TransactionViewBatchEvent,
 };
 pub use extension::{
     ExtensionCapability, ExtensionContext, ExtensionManifest, ExtensionResourceSpec,

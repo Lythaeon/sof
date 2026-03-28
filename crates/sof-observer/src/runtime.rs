@@ -18,8 +18,8 @@ use crate::framework::{
     RuntimeExtensionHost, TransactionEvent,
 };
 use crate::provider_stream::{
-    ProviderSourceHealthEvent, ProviderSourceHealthStatus, ProviderSourceId, ProviderStreamMode,
-    ProviderStreamReceiver, ProviderStreamUpdate,
+    ProviderSourceHealthEvent, ProviderSourceHealthStatus, ProviderSourceId,
+    ProviderSourceIdentity, ProviderStreamMode, ProviderStreamReceiver, ProviderStreamUpdate,
 };
 use agave_transaction_view::transaction_view::SanitizedTransactionView;
 use sof_gossip_tuning::{
@@ -79,7 +79,7 @@ pub enum ProviderStreamRuntimeError {
     },
     /// Built-in provider modes rejected unsupported hooks that only generic producers can satisfy.
     #[error(
-        "built-in provider-stream mode {mode} does not support requested hooks: {unsupported_hooks:?}; use raw-shred/gossip mode or ProviderStreamMode::Generic with a custom producer for richer control-plane surfaces",
+        "built-in provider-stream mode {mode} does not support requested hooks: {unsupported_hooks:?}; use the built-in config's runtime_mode() for matching built-in feeds, or ProviderStreamMode::Generic for custom or multi-source typed provider ingress",
         mode = .mode.as_str()
     )]
     BuiltInUnsupportedHooks {
@@ -87,6 +87,32 @@ pub enum ProviderStreamRuntimeError {
         mode: ProviderStreamMode,
         /// Unsupported hook or feed labels.
         unsupported_hooks: Vec<String>,
+    },
+    /// Built-in provider runtime mode received an update from a mismatched source kind.
+    #[error(
+        "built-in provider-stream mode {mode} received {update_kind} from source kind {source_kind} ({source_instance})",
+        mode = .mode.as_str()
+    )]
+    MismatchedSourceKind {
+        /// Active provider-stream mode.
+        mode: ProviderStreamMode,
+        /// Incoming provider update family.
+        update_kind: &'static str,
+        /// Actual source kind label carried by the update.
+        source_kind: String,
+        /// Actual source instance label carried by the update.
+        source_instance: String,
+    },
+    /// Built-in provider runtime mode received an update with no source identity.
+    #[error(
+        "built-in provider-stream mode {mode} received unattributed {update_kind}; built-in provider updates must carry source identity",
+        mode = .mode.as_str()
+    )]
+    UnattributedBuiltInUpdate {
+        /// Active provider-stream mode.
+        mode: ProviderStreamMode,
+        /// Incoming provider update family.
+        update_kind: &'static str,
     },
     /// Provider ingress channel closed unexpectedly.
     #[error(
@@ -1507,7 +1533,7 @@ impl ObserverRuntime {
     ///
     /// let (_tx, rx) = create_provider_stream_queue(128);
     /// let _runtime = ObserverRuntime::new()
-    ///     .with_provider_stream_ingress(ProviderStreamMode::YellowstoneGrpc, rx);
+    ///     .with_provider_stream_ingress(ProviderStreamMode::Generic, rx);
     /// ```
     #[must_use]
     pub fn with_provider_stream_ingress(
@@ -1716,6 +1742,10 @@ async fn run_provider_stream_runtime(
                     tracing::error!(mode = mode.as_str(), error = %error, "SOF provider-stream runtime stopped after provider ingress closed unexpectedly");
                     break Err(RuntimeError::ProviderStream(error));
                 };
+                if let Err(error) = validate_provider_stream_update_mode(mode, &update) {
+                    tracing::error!(mode = mode.as_str(), error = %error, "SOF provider-stream runtime received an update incompatible with the active provider mode");
+                    break Err(RuntimeError::ProviderStream(error));
+                }
                 if let ProviderStreamUpdate::Health(event) = &update {
                     provider_health.observe(event);
                     if let Some(handle) = observability_handle.as_ref() {
@@ -1753,19 +1783,33 @@ async fn run_provider_stream_runtime(
 
 #[derive(Default)]
 struct ProviderStreamHealth {
-    sources: HashMap<ProviderSourceId, ProviderSourceHealthEvent>,
+    sources: HashMap<ProviderSourceIdentity, ProviderSourceHealthEvent>,
 }
 
 impl ProviderStreamHealth {
     fn observe(&mut self, event: &ProviderSourceHealthEvent) {
-        let previous = self.sources.insert(event.source, event.clone());
+        if matches!(event.status, ProviderSourceHealthStatus::Removed) {
+            let removed = self.sources.remove(&event.source);
+            if removed.is_some() {
+                tracing::info!(
+                    source_kind = event.source.kind_str(),
+                    source_instance = event.source.instance_str(),
+                    reason = event.reason.as_str(),
+                    message = event.message.as_str(),
+                    "provider source was removed from tracking"
+                );
+            }
+            return;
+        }
+        let previous = self.sources.insert(event.source.clone(), event.clone());
         if previous.as_ref() == Some(event) {
             return;
         }
         match event.status {
             ProviderSourceHealthStatus::Healthy => {
                 tracing::info!(
-                    source = event.source.as_str(),
+                    source_kind = event.source.kind_str(),
+                    source_instance = event.source.instance_str(),
                     reason = event.reason.as_str(),
                     message = event.message.as_str(),
                     "provider source is healthy"
@@ -1773,7 +1817,8 @@ impl ProviderStreamHealth {
             }
             ProviderSourceHealthStatus::Reconnecting => {
                 tracing::warn!(
-                    source = event.source.as_str(),
+                    source_kind = event.source.kind_str(),
+                    source_instance = event.source.instance_str(),
                     reason = event.reason.as_str(),
                     message = event.message.as_str(),
                     "provider source is reconnecting"
@@ -1781,12 +1826,14 @@ impl ProviderStreamHealth {
             }
             ProviderSourceHealthStatus::Unhealthy => {
                 tracing::error!(
-                    source = event.source.as_str(),
+                    source_kind = event.source.kind_str(),
+                    source_instance = event.source.instance_str(),
                     reason = event.reason.as_str(),
                     message = event.message.as_str(),
                     "provider source is unhealthy"
                 );
             }
+            ProviderSourceHealthStatus::Removed => {}
         }
     }
 
@@ -1803,7 +1850,12 @@ impl ProviderStreamHealth {
             })
             .cloned()
             .collect::<Vec<_>>();
-        degraded.sort_by_key(|event| event.source.as_str());
+        degraded.sort_by_key(|event| {
+            (
+                event.source.kind_str().to_owned(),
+                event.source.instance_str().to_owned(),
+            )
+        });
         degraded
     }
 
@@ -1819,16 +1871,124 @@ impl ProviderStreamHealth {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+fn validate_provider_stream_update_mode(
+    mode: ProviderStreamMode,
+    update: &ProviderStreamUpdate,
+) -> Result<(), ProviderStreamRuntimeError> {
+    if mode == ProviderStreamMode::Generic {
+        return Ok(());
+    }
+    let update_kind = provider_stream_update_kind(update);
+    let Some(source) = provider_stream_update_source(update) else {
+        return Err(ProviderStreamRuntimeError::UnattributedBuiltInUpdate { mode, update_kind });
+    };
+    if provider_stream_mode_accepts_source_kind(mode, &source.kind) {
+        return Ok(());
+    }
+    Err(ProviderStreamRuntimeError::MismatchedSourceKind {
+        mode,
+        update_kind,
+        source_kind: source.kind_str().to_owned(),
+        source_instance: source.instance_str().to_owned(),
+    })
+}
+
+const fn provider_stream_update_kind(update: &ProviderStreamUpdate) -> &'static str {
+    match update {
+        ProviderStreamUpdate::Transaction(_) => "transaction update",
+        ProviderStreamUpdate::SerializedTransaction(_) => "serialized transaction update",
+        ProviderStreamUpdate::TransactionLog(_) => "transaction log update",
+        ProviderStreamUpdate::TransactionStatus(_) => "transaction-status update",
+        ProviderStreamUpdate::TransactionViewBatch(_) => "transaction view-batch update",
+        ProviderStreamUpdate::AccountUpdate(_) => "account update",
+        ProviderStreamUpdate::BlockMeta(_) => "block-meta update",
+        ProviderStreamUpdate::RecentBlockhash(_) => "recent-blockhash update",
+        ProviderStreamUpdate::SlotStatus(_) => "slot-status update",
+        ProviderStreamUpdate::ClusterTopology(_) => "cluster-topology update",
+        ProviderStreamUpdate::LeaderSchedule(_) => "leader-schedule update",
+        ProviderStreamUpdate::Reorg(_) => "reorg update",
+        ProviderStreamUpdate::Health(_) => "health update",
+    }
+}
+
+fn provider_stream_update_source(update: &ProviderStreamUpdate) -> Option<&ProviderSourceIdentity> {
+    match update {
+        ProviderStreamUpdate::Transaction(event) => event.provider_source.as_deref(),
+        ProviderStreamUpdate::SerializedTransaction(event) => event.provider_source.as_deref(),
+        ProviderStreamUpdate::TransactionLog(event) => event.provider_source.as_deref(),
+        ProviderStreamUpdate::TransactionStatus(event) => event.provider_source.as_deref(),
+        ProviderStreamUpdate::TransactionViewBatch(event) => event.provider_source.as_deref(),
+        ProviderStreamUpdate::AccountUpdate(event) => event.provider_source.as_deref(),
+        ProviderStreamUpdate::BlockMeta(event) => event.provider_source.as_deref(),
+        ProviderStreamUpdate::RecentBlockhash(event) => event.provider_source.as_deref(),
+        ProviderStreamUpdate::SlotStatus(event) => event.provider_source.as_deref(),
+        ProviderStreamUpdate::ClusterTopology(event) => event.provider_source.as_deref(),
+        ProviderStreamUpdate::LeaderSchedule(event) => event.provider_source.as_deref(),
+        ProviderStreamUpdate::Reorg(event) => event.provider_source.as_deref(),
+        ProviderStreamUpdate::Health(event) => Some(&event.source),
+    }
+}
+
+const fn provider_stream_mode_accepts_source_kind(
+    mode: ProviderStreamMode,
+    source_kind: &ProviderSourceId,
+) -> bool {
+    match (mode, source_kind) {
+        (ProviderStreamMode::Generic, _) => true,
+        (ProviderStreamMode::YellowstoneGrpc, ProviderSourceId::YellowstoneGrpc) => true,
+        (
+            ProviderStreamMode::YellowstoneGrpcTransactionStatus,
+            ProviderSourceId::YellowstoneGrpcTransactionStatus,
+        ) => true,
+        (
+            ProviderStreamMode::YellowstoneGrpcAccounts,
+            ProviderSourceId::YellowstoneGrpcAccounts,
+        ) => true,
+        (
+            ProviderStreamMode::YellowstoneGrpcBlockMeta,
+            ProviderSourceId::YellowstoneGrpcBlockMeta,
+        ) => true,
+        (ProviderStreamMode::YellowstoneGrpcSlots, ProviderSourceId::YellowstoneGrpcSlots) => true,
+        (ProviderStreamMode::LaserStream, ProviderSourceId::LaserStream) => true,
+        (
+            ProviderStreamMode::LaserStreamTransactionStatus,
+            ProviderSourceId::LaserStreamTransactionStatus,
+        ) => true,
+        (ProviderStreamMode::LaserStreamAccounts, ProviderSourceId::LaserStreamAccounts) => true,
+        (ProviderStreamMode::LaserStreamBlockMeta, ProviderSourceId::LaserStreamBlockMeta) => true,
+        (ProviderStreamMode::LaserStreamSlots, ProviderSourceId::LaserStreamSlots) => true,
+        #[cfg(feature = "provider-websocket")]
+        (ProviderStreamMode::WebsocketTransaction, ProviderSourceId::WebsocketTransaction) => true,
+        #[cfg(feature = "provider-websocket")]
+        (ProviderStreamMode::WebsocketLogs, ProviderSourceId::WebsocketLogs) => true,
+        #[cfg(feature = "provider-websocket")]
+        (ProviderStreamMode::WebsocketAccount, ProviderSourceId::WebsocketAccount) => true,
+        #[cfg(feature = "provider-websocket")]
+        (ProviderStreamMode::WebsocketProgram, ProviderSourceId::WebsocketProgram) => true,
+        _ => false,
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum ProviderReplayDedupeKey {
     Transaction {
+        source: Option<crate::provider_stream::ProviderSourceRef>,
         slot: u64,
         signature: Signature,
         commitment_status: u8,
         confirmed_slot: Option<u64>,
         finalized_slot: Option<u64>,
     },
+    SerializedTransaction {
+        source: Option<crate::provider_stream::ProviderSourceRef>,
+        slot: u64,
+        commitment_status: u8,
+        confirmed_slot: Option<u64>,
+        finalized_slot: Option<u64>,
+        fingerprint: u64,
+    },
     ControlPlane {
+        source: Option<crate::provider_stream::ProviderSourceRef>,
         slot: u64,
         kind: u8,
         fingerprint: u64,
@@ -1836,9 +1996,11 @@ enum ProviderReplayDedupeKey {
 }
 
 impl ProviderReplayDedupeKey {
-    const fn slot(self) -> u64 {
+    const fn slot(&self) -> u64 {
         match self {
-            Self::Transaction { slot, .. } | Self::ControlPlane { slot, .. } => slot,
+            Self::Transaction { slot, .. }
+            | Self::SerializedTransaction { slot, .. }
+            | Self::ControlPlane { slot, .. } => *slot,
         }
     }
 }
@@ -1869,7 +2031,7 @@ impl ProviderReplayDedupe {
         if self.seen.contains(&key) {
             return true;
         }
-        self.seen.insert(key);
+        self.seen.insert(key.clone());
         self.order.push_back(key);
         self.evict();
         false
@@ -1879,7 +2041,7 @@ impl ProviderReplayDedupe {
         let min_slot = self
             .max_slot_seen
             .saturating_sub(PROVIDER_REPLAY_DEDUPE_SLOT_WINDOW);
-        while let Some(oldest) = self.order.front().copied() {
+        while let Some(oldest) = self.order.front().cloned() {
             if self.order.len() <= self.capacity && oldest.slot() >= min_slot {
                 break;
             }
@@ -1896,6 +2058,7 @@ fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderR
             .map(crate::framework::SignatureBytes::to_solana)
             .or_else(|| event.tx.signatures.first().copied())
             .map(|signature| ProviderReplayDedupeKey::Transaction {
+                source: event.provider_source.clone(),
                 slot: event.slot,
                 signature,
                 commitment_status: provider_replay_commitment_key(event.commitment_status),
@@ -1905,27 +2068,45 @@ fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderR
         ProviderStreamUpdate::SerializedTransaction(event) => event
             .signature
             .map(crate::framework::SignatureBytes::to_solana)
-            .map(|signature| ProviderReplayDedupeKey::Transaction {
-                slot: event.slot,
-                signature,
-                commitment_status: provider_replay_commitment_key(event.commitment_status),
-                confirmed_slot: event.confirmed_slot,
-                finalized_slot: event.finalized_slot,
-            }),
+            .map_or_else(
+                || {
+                    Some(ProviderReplayDedupeKey::SerializedTransaction {
+                        source: event.provider_source.clone(),
+                        slot: event.slot,
+                        commitment_status: provider_replay_commitment_key(event.commitment_status),
+                        confirmed_slot: event.confirmed_slot,
+                        finalized_slot: event.finalized_slot,
+                        fingerprint: provider_replay_fingerprint(&event.bytes),
+                    })
+                },
+                |signature| {
+                    Some(ProviderReplayDedupeKey::Transaction {
+                        source: event.provider_source.clone(),
+                        slot: event.slot,
+                        signature,
+                        commitment_status: provider_replay_commitment_key(event.commitment_status),
+                        confirmed_slot: event.confirmed_slot,
+                        finalized_slot: event.finalized_slot,
+                    })
+                },
+            ),
         ProviderStreamUpdate::RecentBlockhash(event) => {
             Some(ProviderReplayDedupeKey::ControlPlane {
+                source: event.provider_source.clone(),
                 slot: event.slot,
                 kind: 1,
                 fingerprint: provider_replay_fingerprint(event),
             })
         }
         ProviderStreamUpdate::SlotStatus(event) => Some(ProviderReplayDedupeKey::ControlPlane {
+            source: event.provider_source.clone(),
             slot: event.slot,
             kind: 2,
             fingerprint: provider_replay_fingerprint(event),
         }),
         ProviderStreamUpdate::ClusterTopology(event) => {
             Some(ProviderReplayDedupeKey::ControlPlane {
+                source: event.provider_source.clone(),
                 slot: event.slot.unwrap_or_default(),
                 kind: 3,
                 fingerprint: provider_replay_fingerprint(event),
@@ -1933,30 +2114,54 @@ fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderR
         }
         ProviderStreamUpdate::LeaderSchedule(event) => {
             Some(ProviderReplayDedupeKey::ControlPlane {
+                source: event.provider_source.clone(),
                 slot: event.slot.unwrap_or_default(),
                 kind: 4,
                 fingerprint: provider_replay_fingerprint(event),
             })
         }
         ProviderStreamUpdate::Reorg(event) => Some(ProviderReplayDedupeKey::ControlPlane {
+            source: event.provider_source.clone(),
             slot: event.new_tip,
             kind: 5,
             fingerprint: provider_replay_fingerprint(event),
         }),
         ProviderStreamUpdate::TransactionLog(event) => {
             Some(ProviderReplayDedupeKey::ControlPlane {
+                source: event.provider_source.clone(),
                 slot: event.slot,
                 kind: 6,
                 fingerprint: provider_replay_transaction_log_fingerprint(event),
             })
         }
+        ProviderStreamUpdate::TransactionStatus(event) => {
+            Some(ProviderReplayDedupeKey::ControlPlane {
+                source: event.provider_source.clone(),
+                slot: event.slot,
+                kind: 8,
+                fingerprint: provider_replay_fingerprint(event),
+            })
+        }
         ProviderStreamUpdate::TransactionViewBatch(event) => {
             Some(ProviderReplayDedupeKey::ControlPlane {
+                source: event.provider_source.clone(),
                 slot: event.slot,
                 kind: 7,
                 fingerprint: provider_replay_transaction_view_batch_fingerprint(event),
             })
         }
+        ProviderStreamUpdate::AccountUpdate(event) => Some(ProviderReplayDedupeKey::ControlPlane {
+            source: event.provider_source.clone(),
+            slot: event.slot,
+            kind: 9,
+            fingerprint: provider_replay_fingerprint(event),
+        }),
+        ProviderStreamUpdate::BlockMeta(event) => Some(ProviderReplayDedupeKey::ControlPlane {
+            source: event.provider_source.clone(),
+            slot: event.slot,
+            kind: 10,
+            fingerprint: provider_replay_fingerprint(event),
+        }),
         ProviderStreamUpdate::Health(_) => None,
     }
 }
@@ -2015,6 +2220,9 @@ fn dispatch_provider_stream_update(
     derived_state_host: &DerivedStateHost,
     update: ProviderStreamUpdate,
 ) {
+    if plugin_host.is_empty() && derived_state_host.is_empty() {
+        return;
+    }
     match update {
         ProviderStreamUpdate::Transaction(event) => {
             if plugin_host.wants_recent_blockhash() {
@@ -2022,6 +2230,7 @@ fn dispatch_provider_stream_update(
                     slot: event.slot,
                     recent_blockhash: event.tx.message.recent_blockhash().to_bytes(),
                     dataset_tx_count: 1,
+                    provider_source: event.provider_source.clone(),
                 });
             }
             if derived_state_host.wants_transaction_applied() {
@@ -2044,9 +2253,24 @@ fn dispatch_provider_stream_update(
                 plugin_host.on_transaction_log(event);
             }
         }
+        ProviderStreamUpdate::TransactionStatus(event) => {
+            if plugin_host.wants_transaction_status() {
+                plugin_host.on_transaction_status(event);
+            }
+        }
         ProviderStreamUpdate::TransactionViewBatch(event) => {
             if plugin_host.wants_transaction_view_batch() {
                 plugin_host.on_transaction_view_batch(event, Instant::now());
+            }
+        }
+        ProviderStreamUpdate::AccountUpdate(event) => {
+            if plugin_host.wants_account_update() {
+                plugin_host.on_account_update(event);
+            }
+        }
+        ProviderStreamUpdate::BlockMeta(event) => {
+            if plugin_host.wants_block_meta() {
+                plugin_host.on_block_meta(event);
             }
         }
         ProviderStreamUpdate::RecentBlockhash(event) => {
@@ -2059,7 +2283,7 @@ fn dispatch_provider_stream_update(
         }
         ProviderStreamUpdate::SlotStatus(event) => {
             if !derived_state_host.is_empty() {
-                derived_state_host.on_slot_status(event);
+                derived_state_host.on_slot_status(event.clone());
             }
             if plugin_host.wants_slot_status() {
                 plugin_host.on_slot_status(event);
@@ -2098,9 +2322,11 @@ fn dispatch_provider_stream_serialized_transaction(
     derived_state_host: &DerivedStateHost,
     event: &crate::provider_stream::SerializedTransactionEvent,
 ) {
+    let derived_state_empty = derived_state_host.is_empty();
     let wants_transaction = plugin_host.transaction_enabled_at_commitment(event.commitment_status);
     let wants_recent_blockhash = plugin_host.wants_recent_blockhash();
-    let wants_derived_state_transaction = derived_state_host.wants_transaction_applied();
+    let wants_derived_state_transaction =
+        !derived_state_empty && derived_state_host.wants_transaction_applied();
     if !wants_transaction && !wants_recent_blockhash && !wants_derived_state_transaction {
         return;
     }
@@ -2140,6 +2366,7 @@ fn dispatch_provider_stream_serialized_transaction(
                             slot: event.slot,
                             recent_blockhash,
                             dataset_tx_count: 1,
+                            provider_source: event.provider_source.clone(),
                         },
                     );
                 }
@@ -2152,6 +2379,7 @@ fn dispatch_provider_stream_serialized_transaction(
                     slot: event.slot,
                     recent_blockhash,
                     dataset_tx_count: 1,
+                    provider_source: event.provider_source.clone(),
                 });
             }
             return;
@@ -2177,6 +2405,7 @@ fn dispatch_provider_stream_serialized_transaction(
                 .copied()
                 .map(crate::framework::SignatureBytes::from_solana)
         }),
+        provider_source: event.provider_source.clone(),
         kind: crate::provider_stream::classify_provider_transaction_kind(&tx),
         tx,
     };
@@ -2186,6 +2415,7 @@ fn dispatch_provider_stream_serialized_transaction(
             recent_blockhash: recent_blockhash
                 .unwrap_or_else(|| event.tx.message.recent_blockhash().to_bytes()),
             dataset_tx_count: 1,
+            provider_source: event.provider_source.clone(),
         });
     }
     if wants_derived_state_transaction {
@@ -2202,6 +2432,15 @@ fn provider_stream_unsupported_hooks(
     plugin_host: &PluginHost,
     derived_state_host: &DerivedStateHost,
 ) -> Vec<&'static str> {
+    let supports_account_update = provider_stream_mode_supports_account_update(mode);
+    let supports_block_meta = provider_stream_mode_supports_block_meta(mode);
+    let supports_recent_blockhash = provider_stream_mode_supports_recent_blockhash(mode);
+    let supports_transaction_log = provider_stream_mode_supports_transaction_log(mode);
+    let supports_transaction_status = provider_stream_mode_supports_transaction_status(mode);
+    let supports_transaction_view_batch =
+        provider_stream_mode_supports_transaction_view_batch(mode);
+    let supports_slot_status = provider_stream_mode_supports_slot_status(mode);
+    let supports_control_plane = provider_stream_mode_supports_control_plane(mode);
     let mut unsupported = Vec::new();
     if plugin_host.wants_raw_packet() {
         unsupported.push("on_raw_packet");
@@ -2215,39 +2454,112 @@ fn provider_stream_unsupported_hooks(
     if plugin_host.wants_account_touch() {
         unsupported.push("on_account_touch");
     }
+    if plugin_host.wants_account_update() && !supports_account_update {
+        unsupported.push("on_account_update");
+    }
+    if plugin_host.wants_block_meta() && !supports_block_meta {
+        unsupported.push("on_block_meta");
+    }
     if plugin_host.wants_transaction_batch() {
         unsupported.push("on_transaction_batch");
     }
-    if mode != ProviderStreamMode::Generic {
-        if plugin_host.wants_recent_blockhash() {
-            unsupported.push("on_recent_blockhash");
-        }
-        if plugin_host.wants_transaction_log() {
-            unsupported.push("on_transaction_log");
-        }
-        if plugin_host.wants_transaction_view_batch() {
-            unsupported.push("on_transaction_view_batch");
-        }
-        if plugin_host.wants_slot_status() {
-            unsupported.push("on_slot_status");
-        }
-        if plugin_host.wants_cluster_topology() {
-            unsupported.push("on_cluster_topology");
-        }
-        if plugin_host.wants_leader_schedule() {
-            unsupported.push("on_leader_schedule");
-        }
-        if plugin_host.wants_reorg() {
-            unsupported.push("on_reorg");
-        }
+    if plugin_host.wants_recent_blockhash() && !supports_recent_blockhash {
+        unsupported.push("on_recent_blockhash");
+    }
+    if plugin_host.wants_transaction_log() && !supports_transaction_log {
+        unsupported.push("on_transaction_log");
+    }
+    if plugin_host.wants_transaction_status() && !supports_transaction_status {
+        unsupported.push("on_transaction_status");
+    }
+    if plugin_host.wants_transaction_view_batch() && !supports_transaction_view_batch {
+        unsupported.push("on_transaction_view_batch");
+    }
+    if plugin_host.wants_slot_status() && !supports_slot_status {
+        unsupported.push("on_slot_status");
+    }
+    if plugin_host.wants_cluster_topology() && !supports_control_plane {
+        unsupported.push("on_cluster_topology");
+    }
+    if plugin_host.wants_leader_schedule() && !supports_control_plane {
+        unsupported.push("on_leader_schedule");
+    }
+    if plugin_host.wants_reorg() && !supports_control_plane {
+        unsupported.push("on_reorg");
     }
     if derived_state_host.wants_account_touch_observed() {
         unsupported.push("derived_state.account_touch_observed");
     }
-    if mode != ProviderStreamMode::Generic && derived_state_host.wants_control_plane_observed() {
+    if !supports_control_plane && derived_state_host.wants_control_plane_observed() {
         unsupported.push("derived_state.control_plane_observed");
     }
     unsupported
+}
+
+const fn provider_stream_mode_supports_account_update(mode: ProviderStreamMode) -> bool {
+    match mode {
+        ProviderStreamMode::Generic
+        | ProviderStreamMode::YellowstoneGrpcAccounts
+        | ProviderStreamMode::LaserStreamAccounts => true,
+        #[cfg(feature = "provider-websocket")]
+        ProviderStreamMode::WebsocketAccount | ProviderStreamMode::WebsocketProgram => true,
+        _ => false,
+    }
+}
+
+const fn provider_stream_mode_supports_block_meta(mode: ProviderStreamMode) -> bool {
+    matches!(
+        mode,
+        ProviderStreamMode::Generic
+            | ProviderStreamMode::YellowstoneGrpcBlockMeta
+            | ProviderStreamMode::LaserStreamBlockMeta
+    )
+}
+
+const fn provider_stream_mode_supports_recent_blockhash(mode: ProviderStreamMode) -> bool {
+    match mode {
+        ProviderStreamMode::Generic
+        | ProviderStreamMode::YellowstoneGrpc
+        | ProviderStreamMode::LaserStream => true,
+        #[cfg(feature = "provider-websocket")]
+        ProviderStreamMode::WebsocketTransaction => true,
+        _ => false,
+    }
+}
+
+const fn provider_stream_mode_supports_transaction_log(mode: ProviderStreamMode) -> bool {
+    match mode {
+        ProviderStreamMode::Generic => true,
+        #[cfg(feature = "provider-websocket")]
+        ProviderStreamMode::WebsocketLogs => true,
+        _ => false,
+    }
+}
+
+const fn provider_stream_mode_supports_transaction_status(mode: ProviderStreamMode) -> bool {
+    matches!(
+        mode,
+        ProviderStreamMode::Generic
+            | ProviderStreamMode::YellowstoneGrpcTransactionStatus
+            | ProviderStreamMode::LaserStreamTransactionStatus
+    )
+}
+
+const fn provider_stream_mode_supports_transaction_view_batch(mode: ProviderStreamMode) -> bool {
+    matches!(mode, ProviderStreamMode::Generic)
+}
+
+const fn provider_stream_mode_supports_slot_status(mode: ProviderStreamMode) -> bool {
+    matches!(
+        mode,
+        ProviderStreamMode::Generic
+            | ProviderStreamMode::YellowstoneGrpcSlots
+            | ProviderStreamMode::LaserStreamSlots
+    )
+}
+
+const fn provider_stream_mode_supports_control_plane(mode: ProviderStreamMode) -> bool {
+    matches!(mode, ProviderStreamMode::Generic)
 }
 
 fn enforce_provider_stream_capability_policy(
@@ -2718,6 +3030,7 @@ mod tests {
                 .first()
                 .copied()
                 .map(crate::framework::SignatureBytes::from_solana),
+            provider_source: None,
             kind: crate::event::TxKind::NonVote,
             tx: Arc::new(tx),
         })
@@ -2959,6 +3272,7 @@ mod tests {
                     slot: event.slot,
                     recent_blockhash: event.tx.message.recent_blockhash().to_bytes(),
                     dataset_tx_count: 1,
+                    provider_source: event.provider_source.clone(),
                 });
                 let tx_index = derived_state_host.reserve_slot_tx_indexes(event.slot, 1);
                 derived_state_host.on_transaction(tx_index, event.clone());
@@ -2968,15 +3282,24 @@ mod tests {
             ProviderStreamUpdate::TransactionLog(event) => {
                 plugin_host.on_transaction_log(event);
             }
+            ProviderStreamUpdate::TransactionStatus(event) => {
+                plugin_host.on_transaction_status(event);
+            }
             ProviderStreamUpdate::TransactionViewBatch(event) => {
                 plugin_host.on_transaction_view_batch(event, Instant::now());
+            }
+            ProviderStreamUpdate::AccountUpdate(event) => {
+                plugin_host.on_account_update(event);
+            }
+            ProviderStreamUpdate::BlockMeta(event) => {
+                plugin_host.on_block_meta(event);
             }
             ProviderStreamUpdate::RecentBlockhash(event) => {
                 derived_state_host.on_recent_blockhash(event.clone());
                 plugin_host.on_recent_blockhash(event);
             }
             ProviderStreamUpdate::SlotStatus(event) => {
-                derived_state_host.on_slot_status(event);
+                derived_state_host.on_slot_status(event.clone());
                 plugin_host.on_slot_status(event);
             }
             ProviderStreamUpdate::ClusterTopology(event) => {
@@ -3039,6 +3362,7 @@ mod tests {
                                 slot: event.slot,
                                 recent_blockhash,
                                 dataset_tx_count: 1,
+                                provider_source: event.provider_source.clone(),
                             },
                         );
                     }
@@ -3052,6 +3376,7 @@ mod tests {
                             slot: event.slot,
                             recent_blockhash,
                             dataset_tx_count: 1,
+                            provider_source: event.provider_source.clone(),
                         },
                     );
                 }
@@ -3074,6 +3399,7 @@ mod tests {
                     .copied()
                     .map(crate::framework::SignatureBytes::from_solana)
             }),
+            provider_source: event.provider_source.clone(),
             kind: kind
                 .unwrap_or_else(|| crate::provider_stream::classify_provider_transaction_kind(&tx)),
             tx,
@@ -3084,6 +3410,7 @@ mod tests {
                 recent_blockhash: recent_blockhash
                     .unwrap_or_else(|| event.tx.message.recent_blockhash().to_bytes()),
                 dataset_tx_count: 1,
+                provider_source: event.provider_source.clone(),
             });
         }
         if wants_derived_state_transaction {
@@ -3106,13 +3433,17 @@ mod tests {
                         confirmed_slot: event.confirmed_slot,
                         finalized_slot: event.finalized_slot,
                         signature: event.signature,
+                        provider_source: event.provider_source,
                         bytes: bytes.into_boxed_slice(),
                     },
                 )
             }
             other @ ProviderStreamUpdate::SerializedTransaction(_)
             | other @ ProviderStreamUpdate::TransactionLog(_)
+            | other @ ProviderStreamUpdate::TransactionStatus(_)
             | other @ ProviderStreamUpdate::TransactionViewBatch(_)
+            | other @ ProviderStreamUpdate::AccountUpdate(_)
+            | other @ ProviderStreamUpdate::BlockMeta(_)
             | other @ ProviderStreamUpdate::RecentBlockhash(_)
             | other @ ProviderStreamUpdate::SlotStatus(_)
             | other @ ProviderStreamUpdate::ClusterTopology(_)
@@ -3131,7 +3462,10 @@ mod tests {
             }
             other @ ProviderStreamUpdate::SerializedTransaction(_)
             | other @ ProviderStreamUpdate::TransactionLog(_)
+            | other @ ProviderStreamUpdate::TransactionStatus(_)
             | other @ ProviderStreamUpdate::TransactionViewBatch(_)
+            | other @ ProviderStreamUpdate::AccountUpdate(_)
+            | other @ ProviderStreamUpdate::BlockMeta(_)
             | other @ ProviderStreamUpdate::RecentBlockhash(_)
             | other @ ProviderStreamUpdate::SlotStatus(_)
             | other @ ProviderStreamUpdate::ClusterTopology(_)
@@ -3150,7 +3484,10 @@ mod tests {
             }
             other @ ProviderStreamUpdate::Transaction(_)
             | other @ ProviderStreamUpdate::TransactionLog(_)
+            | other @ ProviderStreamUpdate::TransactionStatus(_)
             | other @ ProviderStreamUpdate::TransactionViewBatch(_)
+            | other @ ProviderStreamUpdate::AccountUpdate(_)
+            | other @ ProviderStreamUpdate::BlockMeta(_)
             | other @ ProviderStreamUpdate::RecentBlockhash(_)
             | other @ ProviderStreamUpdate::SlotStatus(_)
             | other @ ProviderStreamUpdate::ClusterTopology(_)
@@ -3171,7 +3508,10 @@ mod tests {
             }
             other @ ProviderStreamUpdate::SerializedTransaction(_)
             | other @ ProviderStreamUpdate::TransactionLog(_)
+            | other @ ProviderStreamUpdate::TransactionStatus(_)
             | other @ ProviderStreamUpdate::TransactionViewBatch(_)
+            | other @ ProviderStreamUpdate::AccountUpdate(_)
+            | other @ ProviderStreamUpdate::BlockMeta(_)
             | other @ ProviderStreamUpdate::RecentBlockhash(_)
             | other @ ProviderStreamUpdate::SlotStatus(_)
             | other @ ProviderStreamUpdate::ClusterTopology(_)
@@ -3186,6 +3526,7 @@ mod tests {
             slot,
             recent_blockhash: [slot as u8; 32],
             dataset_tx_count: 1,
+            provider_source: None,
         })
     }
 
@@ -3199,6 +3540,7 @@ mod tests {
             err: None,
             logs: Arc::from([String::from("program log: hello")]),
             matched_filter: None,
+            provider_source: None,
         })
     }
 
@@ -3216,6 +3558,7 @@ mod tests {
             commitment_status: crate::event::TxCommitmentStatus::Processed,
             confirmed_slot: None,
             finalized_slot: None,
+            provider_source: None,
             payload,
             transactions,
         })
@@ -3592,7 +3935,7 @@ mod tests {
     }
 
     #[test]
-    fn built_in_provider_modes_reject_recent_blockhash_even_under_warn() {
+    fn built_in_non_transaction_provider_modes_reject_recent_blockhash_even_under_warn() {
         crate::runtime_env::set_runtime_env_overrides([(
             String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
             String::from("warn"),
@@ -3602,7 +3945,7 @@ mod tests {
             .build();
         let derived_state_host = DerivedStateHost::builder().build();
         let result = enforce_provider_stream_capability_policy(
-            ProviderStreamMode::YellowstoneGrpc,
+            ProviderStreamMode::YellowstoneGrpcAccounts,
             &plugin_host,
             &derived_state_host,
         );
@@ -3837,8 +4180,41 @@ mod tests {
     }
 
     #[test]
+    fn provider_replay_dedupe_keeps_same_transaction_from_distinct_sources() {
+        let source_a = crate::provider_stream::ProviderSourceIdentity::new(
+            crate::provider_stream::ProviderSourceId::Generic("source-a".to_owned().into()),
+            "ws-tx-1",
+        );
+        let source_b = crate::provider_stream::ProviderSourceIdentity::new(
+            crate::provider_stream::ProviderSourceId::Generic("source-b".to_owned().into()),
+            "ws-tx-2",
+        );
+        let update_a = sample_provider_transaction_update().with_provider_source(source_a);
+        let update_b = sample_provider_transaction_update().with_provider_source(source_b);
+        let mut dedupe = ProviderReplayDedupe::new(8);
+
+        assert!(!dedupe.observe(&update_a));
+        assert!(!dedupe.observe(&update_b));
+    }
+
+    #[test]
     fn provider_replay_dedupe_skips_duplicate_serialized_transaction_updates() {
         let update = sample_serialized_provider_transaction_update();
+        let mut dedupe = ProviderReplayDedupe::new(8);
+
+        assert!(!dedupe.observe(&update));
+        assert!(dedupe.observe(&update));
+    }
+
+    #[test]
+    fn provider_replay_dedupe_skips_duplicate_serialized_updates_without_signature() {
+        let ProviderStreamUpdate::SerializedTransaction(mut event) =
+            sample_serialized_provider_transaction_update()
+        else {
+            panic!("expected serialized update fixture");
+        };
+        event.signature = None;
+        let update = ProviderStreamUpdate::SerializedTransaction(event);
         let mut dedupe = ProviderReplayDedupe::new(8);
 
         assert!(!dedupe.observe(&update));
@@ -3886,6 +4262,24 @@ mod tests {
     }
 
     #[test]
+    fn provider_replay_dedupe_keeps_same_control_plane_update_from_distinct_sources() {
+        let source_a = crate::provider_stream::ProviderSourceIdentity::new(
+            crate::provider_stream::ProviderSourceId::YellowstoneGrpcSlots,
+            "yellowstone-slot-1",
+        );
+        let source_b = crate::provider_stream::ProviderSourceIdentity::new(
+            crate::provider_stream::ProviderSourceId::YellowstoneGrpcSlots,
+            "yellowstone-slot-2",
+        );
+        let update_a = sample_provider_recent_blockhash_update(42).with_provider_source(source_a);
+        let update_b = sample_provider_recent_blockhash_update(42).with_provider_source(source_b);
+        let mut dedupe = ProviderReplayDedupe::new(8);
+
+        assert!(!dedupe.observe(&update_a));
+        assert!(!dedupe.observe(&update_b));
+    }
+
+    #[test]
     fn provider_replay_dedupe_skips_duplicate_transaction_log_updates() {
         let update = sample_provider_transaction_log_update(42);
         let mut dedupe = ProviderReplayDedupe::new(8);
@@ -3901,6 +4295,167 @@ mod tests {
 
         assert!(!dedupe.observe(&update));
         assert!(dedupe.observe(&update));
+    }
+
+    #[test]
+    fn provider_replay_dedupe_keeps_same_transaction_view_batch_from_distinct_sources() {
+        let source_a = crate::provider_stream::ProviderSourceIdentity::new(
+            crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
+            "yellowstone-view-batch-1",
+        );
+        let source_b = crate::provider_stream::ProviderSourceIdentity::new(
+            crate::provider_stream::ProviderSourceId::LaserStream,
+            "laserstream-view-batch-1",
+        );
+        let update_a =
+            sample_provider_transaction_view_batch_update(42).with_provider_source(source_a);
+        let update_b =
+            sample_provider_transaction_view_batch_update(42).with_provider_source(source_b);
+        let mut dedupe = ProviderReplayDedupe::new(8);
+
+        assert!(!dedupe.observe(&update_a));
+        assert!(!dedupe.observe(&update_b));
+    }
+
+    #[test]
+    fn built_in_provider_mode_rejects_mismatched_source_kind() {
+        let update = sample_provider_transaction_update().with_provider_source(
+            crate::provider_stream::ProviderSourceIdentity::new(
+                crate::provider_stream::ProviderSourceId::LaserStream,
+                "laserstream-1",
+            ),
+        );
+        let error =
+            validate_provider_stream_update_mode(ProviderStreamMode::YellowstoneGrpc, &update)
+                .expect_err("expected mismatched built-in source kind");
+        let ProviderStreamRuntimeError::MismatchedSourceKind {
+            mode,
+            source_kind,
+            source_instance,
+            ..
+        } = error
+        else {
+            panic!("expected mismatched source-kind error");
+        };
+        assert_eq!(mode, ProviderStreamMode::YellowstoneGrpc);
+        assert_eq!(source_kind, "laserstream");
+        assert_eq!(source_instance, "laserstream-1");
+    }
+
+    #[test]
+    fn built_in_provider_mode_rejects_unattributed_update() {
+        let update = sample_provider_transaction_update();
+        let error =
+            validate_provider_stream_update_mode(ProviderStreamMode::YellowstoneGrpc, &update)
+                .expect_err("expected unattributed built-in update failure");
+        let ProviderStreamRuntimeError::UnattributedBuiltInUpdate { mode, update_kind } = error
+        else {
+            panic!("expected unattributed built-in update error");
+        };
+        assert_eq!(mode, ProviderStreamMode::YellowstoneGrpc);
+        assert_eq!(update_kind, "transaction update");
+    }
+
+    #[test]
+    fn provider_stream_strict_policy_allows_transaction_status_account_block_meta_and_slot_modes() {
+        struct TransactionStatusPlugin;
+        struct AccountUpdatePlugin;
+        struct BlockMetaPlugin;
+        struct SlotStatusPlugin;
+
+        #[async_trait]
+        impl ObserverPlugin for TransactionStatusPlugin {
+            fn name(&self) -> &'static str {
+                "transaction-status-plugin"
+            }
+
+            fn config(&self) -> PluginConfig {
+                PluginConfig::new().with_transaction_status()
+            }
+        }
+
+        #[async_trait]
+        impl ObserverPlugin for AccountUpdatePlugin {
+            fn name(&self) -> &'static str {
+                "account-update-plugin"
+            }
+
+            fn config(&self) -> PluginConfig {
+                PluginConfig::new().with_account_update()
+            }
+        }
+
+        #[async_trait]
+        impl ObserverPlugin for BlockMetaPlugin {
+            fn name(&self) -> &'static str {
+                "block-meta-plugin"
+            }
+
+            fn config(&self) -> PluginConfig {
+                PluginConfig::new().with_block_meta()
+            }
+        }
+
+        #[async_trait]
+        impl ObserverPlugin for SlotStatusPlugin {
+            fn name(&self) -> &'static str {
+                "slot-status-plugin"
+            }
+
+            fn config(&self) -> PluginConfig {
+                PluginConfig::new().with_slot_status()
+            }
+        }
+
+        crate::runtime_env::set_runtime_env_overrides([(
+            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+            String::from("strict"),
+        )]);
+
+        let transaction_status_host = PluginHost::builder()
+            .add_plugin(TransactionStatusPlugin)
+            .build();
+        let account_update_host = PluginHost::builder()
+            .add_plugin(AccountUpdatePlugin)
+            .build();
+        let block_meta_host = PluginHost::builder().add_plugin(BlockMetaPlugin).build();
+        let slot_status_host = PluginHost::builder().add_plugin(SlotStatusPlugin).build();
+        let derived_state_host = DerivedStateHost::builder().build();
+
+        assert!(
+            enforce_provider_stream_capability_policy(
+                ProviderStreamMode::YellowstoneGrpcTransactionStatus,
+                &transaction_status_host,
+                &derived_state_host,
+            )
+            .is_ok()
+        );
+        assert!(
+            enforce_provider_stream_capability_policy(
+                ProviderStreamMode::YellowstoneGrpcAccounts,
+                &account_update_host,
+                &derived_state_host,
+            )
+            .is_ok()
+        );
+        assert!(
+            enforce_provider_stream_capability_policy(
+                ProviderStreamMode::YellowstoneGrpcBlockMeta,
+                &block_meta_host,
+                &derived_state_host,
+            )
+            .is_ok()
+        );
+        assert!(
+            enforce_provider_stream_capability_policy(
+                ProviderStreamMode::YellowstoneGrpcSlots,
+                &slot_status_host,
+                &derived_state_host,
+            )
+            .is_ok()
+        );
+
+        crate::runtime_env::clear_runtime_env_overrides();
     }
 
     #[tokio::test]
@@ -3984,7 +4539,11 @@ mod tests {
         let (tx, rx) = crate::provider_stream::create_provider_stream_queue(4);
         tx.send(
             crate::provider_stream::ProviderSourceHealthEvent {
-                source: crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
+                source: crate::provider_stream::ProviderSourceIdentity::new(
+                    crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
+                    "yellowstone-grpc-1",
+                ),
+                readiness: crate::provider_stream::ProviderSourceReadiness::Required,
                 status: crate::provider_stream::ProviderSourceHealthStatus::Reconnecting,
                 reason: crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
                 message: "upstream stalled".to_owned(),
@@ -4013,7 +4572,10 @@ mod tests {
                 assert_eq!(degraded_sources.len(), 1);
                 assert_eq!(
                     degraded_sources[0].source,
-                    crate::provider_stream::ProviderSourceId::YellowstoneGrpc
+                    crate::provider_stream::ProviderSourceIdentity::new(
+                        crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
+                        "yellowstone-grpc-1",
+                    )
                 );
                 assert_eq!(
                     degraded_sources[0].status,
@@ -4024,6 +4586,61 @@ mod tests {
                     crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure
                 );
                 assert_eq!(degraded_sources[0].message, "upstream stalled");
+            }
+            other => panic!("expected degraded provider closure failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_stream_runtime_tracks_same_kind_sources_by_instance() {
+        let plugin_host = PluginHost::builder()
+            .add_plugin(TransactionOnlyPlugin)
+            .build();
+        let extension_host = RuntimeExtensionHost::builder().build();
+        let (tx, rx) = crate::provider_stream::create_provider_stream_queue(4);
+        for instance in ["ws-tx-1", "ws-tx-2"] {
+            tx.send(
+                crate::provider_stream::ProviderSourceHealthEvent {
+                    source: crate::provider_stream::ProviderSourceIdentity::new(
+                        crate::provider_stream::ProviderSourceId::Generic(
+                            instance.to_owned().into(),
+                        ),
+                        instance,
+                    ),
+                    readiness: crate::provider_stream::ProviderSourceReadiness::Required,
+                    status: crate::provider_stream::ProviderSourceHealthStatus::Reconnecting,
+                    reason:
+                        crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
+                    message: format!("{instance} stalled"),
+                }
+                .into(),
+            )
+            .await
+            .expect("health sent");
+        }
+        drop(tx);
+
+        let result = run_provider_stream_runtime(
+            plugin_host,
+            extension_host,
+            DerivedStateHost::builder().build(),
+            None,
+            ProviderStreamMode::Generic,
+            rx,
+        )
+        .await;
+
+        match result {
+            Err(RuntimeError::ProviderStream(ProviderStreamRuntimeError::IngressClosed {
+                degraded_sources,
+                ..
+            })) => {
+                let mut instances = degraded_sources
+                    .into_iter()
+                    .map(|event| event.source.instance_str().to_owned())
+                    .collect::<Vec<_>>();
+                instances.sort();
+                assert_eq!(instances, vec!["ws-tx-1".to_owned(), "ws-tx-2".to_owned()]);
             }
             other => panic!("expected degraded provider closure failure, got {other:?}"),
         }
@@ -4072,7 +4689,13 @@ mod tests {
         let (tx, rx) = crate::provider_stream::create_provider_stream_queue(4);
         tx.send(
             crate::provider_stream::ProviderSourceHealthEvent {
-                source: crate::provider_stream::ProviderSourceId::Generic("generic_source"),
+                source: crate::provider_stream::ProviderSourceIdentity::new(
+                    crate::provider_stream::ProviderSourceId::Generic(
+                        "generic_source".to_owned().into(),
+                    ),
+                    "generic_source",
+                ),
+                readiness: crate::provider_stream::ProviderSourceReadiness::Required,
                 status: crate::provider_stream::ProviderSourceHealthStatus::Reconnecting,
                 reason: crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
                 message: "upstream stalled".to_owned(),
@@ -4101,7 +4724,7 @@ mod tests {
             })) => {
                 assert_eq!(mode, ProviderStreamMode::Generic);
                 assert_eq!(degraded_sources.len(), 1);
-                assert_eq!(degraded_sources[0].source.as_str(), "generic_source");
+                assert_eq!(degraded_sources[0].source.instance_str(), "generic_source");
             }
             other => panic!("expected degraded generic EOF failure, got {other:?}"),
         }

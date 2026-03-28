@@ -5553,7 +5553,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sof",
- "sof-solana-compat",
  "sof-types",
  "solana-compute-budget-interface",
  "solana-connection-cache",

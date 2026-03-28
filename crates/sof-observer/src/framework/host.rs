@@ -143,6 +143,8 @@ struct PluginHookSubscriptions {
     transaction_prefilter: bool,
     /// At least one plugin wants transaction-log callbacks.
     transaction_log: bool,
+    /// At least one plugin wants transaction-status callbacks.
+    transaction_status: bool,
     /// At least one plugin requested inline transaction dispatch.
     inline_transaction: bool,
     /// At least one plugin wants transaction batch callbacks.
@@ -155,6 +157,10 @@ struct PluginHookSubscriptions {
     inline_transaction_view_batch: bool,
     /// At least one plugin wants account-touch callbacks.
     account_touch: bool,
+    /// At least one plugin wants account-update callbacks.
+    account_update: bool,
+    /// At least one plugin wants block-meta callbacks.
+    block_meta: bool,
     /// At least one plugin wants slot-status callbacks.
     slot_status: bool,
     /// At least one plugin wants reorg callbacks.
@@ -177,6 +183,7 @@ impl From<&PluginConfig> for PluginHookSubscriptions {
             transaction_min_commitment: config.transaction_commitment.minimum_required(),
             transaction_prefilter: false,
             transaction_log: config.transaction_log,
+            transaction_status: config.transaction_status,
             inline_transaction: config.transaction
                 && matches!(
                     config.transaction_dispatch_mode,
@@ -195,6 +202,8 @@ impl From<&PluginConfig> for PluginHookSubscriptions {
                     crate::framework::plugin::TransactionDispatchMode::Inline
                 ),
             account_touch: config.account_touch,
+            account_update: config.account_update,
+            block_meta: config.block_meta,
             slot_status: config.slot_status,
             reorg: config.reorg,
             recent_blockhash: config.recent_blockhash,

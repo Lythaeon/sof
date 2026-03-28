@@ -157,7 +157,7 @@ impl FeedWatermarks {
 
     /// Builds watermark state from a slot-status transition event.
     #[must_use]
-    pub const fn from_slot_status(event: SlotStatusEvent) -> Self {
+    pub const fn from_slot_status(event: &SlotStatusEvent) -> Self {
         Self {
             canonical_tip_slot: event.tip_slot,
             processed_slot: match event.status {
@@ -3204,7 +3204,7 @@ impl DerivedStateHost {
         ) {
             let _ = self.inner.slot_tx_indexes.remove(&event.slot);
         }
-        let watermarks = FeedWatermarks::from_slot_status(event);
+        let watermarks = FeedWatermarks::from_slot_status(&event);
         self.dispatch_with_control_plane_update(
             watermarks,
             DerivedStateFeedEvent::SlotStatusChanged(event.into()),
@@ -4409,6 +4409,7 @@ mod tests {
             attached_slots: vec![118, 119, 120],
             confirmed_slot: Some(110),
             finalized_slot: Some(90),
+            provider_source: None,
         });
 
         assert_eq!(watermarks.canonical_tip_slot, Some(120));
@@ -4589,6 +4590,7 @@ mod tests {
             tip_slot: Some(10),
             confirmed_slot: None,
             finalized_slot: None,
+            provider_source: None,
         });
         host.on_reorg(ReorgEvent {
             old_tip: 10,
@@ -4598,6 +4600,7 @@ mod tests {
             attached_slots: vec![11, 12],
             confirmed_slot: Some(7),
             finalized_slot: Some(6),
+            provider_source: None,
         });
 
         let state = state
@@ -4642,6 +4645,7 @@ mod tests {
             slot: 70,
             recent_blockhash: [7_u8; 32],
             dataset_tx_count: 3,
+            provider_source: None,
         });
         host.on_cluster_topology(ClusterTopologyEvent {
             source: ControlPlaneSource::GossipBootstrap,
@@ -4665,6 +4669,7 @@ mod tests {
                 rpc: None,
             }],
             snapshot_nodes: Vec::new(),
+            provider_source: None,
         });
         host.on_leader_schedule(LeaderScheduleEvent {
             source: ControlPlaneSource::GossipBootstrap,
@@ -4677,6 +4682,7 @@ mod tests {
                 leader: [2_u8; 32].into(),
             }],
             snapshot_leaders: Vec::new(),
+            provider_source: None,
         });
 
         let state = state
@@ -4749,6 +4755,7 @@ mod tests {
                         tip_slot: Some(slot),
                         confirmed_slot: None,
                         finalized_slot: None,
+                        provider_source: None,
                     });
                 });
             }
@@ -4783,6 +4790,7 @@ mod tests {
             tip_slot: Some(44),
             confirmed_slot: Some(40),
             finalized_slot: Some(39),
+            provider_source: None,
         });
         let watermarks = FeedWatermarks {
             canonical_tip_slot: Some(44),
@@ -4903,6 +4911,7 @@ mod tests {
             tip_slot: Some(1),
             confirmed_slot: None,
             finalized_slot: None,
+            provider_source: None,
         });
         host.on_reorg(ReorgEvent {
             old_tip: 1,
@@ -4912,6 +4921,7 @@ mod tests {
             attached_slots: vec![2],
             confirmed_slot: None,
             finalized_slot: None,
+            provider_source: None,
         });
 
         assert_eq!(apply_calls.load(AtomicOrdering::Relaxed), 1);
@@ -5010,6 +5020,7 @@ mod tests {
             tip_slot: Some(11),
             confirmed_slot: Some(9),
             finalized_slot: Some(8),
+            provider_source: None,
         });
         host.emit_checkpoint_barrier(
             CheckpointBarrierReason::Periodic,
@@ -5028,6 +5039,7 @@ mod tests {
             attached_slots: vec![12],
             confirmed_slot: Some(9),
             finalized_slot: Some(8),
+            provider_source: None,
         });
 
         assert_eq!(apply_calls.load(AtomicOrdering::Relaxed), 6);
@@ -5483,6 +5495,7 @@ mod tests {
             parent_slot: Some(39),
             status: ForkSlotStatus::Processed,
             previous_status: None,
+            provider_source: None,
         });
 
         assert_eq!(
@@ -5518,6 +5531,7 @@ mod tests {
             parent_slot: Some(9),
             status: ForkSlotStatus::Processed,
             previous_status: None,
+            provider_source: None,
         });
         host.emit_checkpoint_barrier(
             CheckpointBarrierReason::Periodic,
@@ -5536,6 +5550,7 @@ mod tests {
             parent_slot: Some(10),
             status: ForkSlotStatus::Processed,
             previous_status: None,
+            provider_source: None,
         });
 
         assert_eq!(

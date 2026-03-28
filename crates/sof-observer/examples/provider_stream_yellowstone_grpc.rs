@@ -1,4 +1,7 @@
 //! SOF runtime example for Yellowstone gRPC processed provider-stream ingress.
+//!
+//! The built-in config selects the matching runtime mode through `runtime_mode()`.
+//! Stable source labels are optional but useful for readiness and observability.
 #![allow(clippy::missing_docs_in_private_items)]
 
 use async_trait::async_trait;
@@ -9,10 +12,9 @@ use sof::{
     event::TxKind,
     framework::{ObserverPlugin, PluginConfig, PluginHost, TransactionEvent},
     provider_stream::{
-        ProviderStreamMode, create_provider_stream_queue,
+        create_provider_stream_queue,
         yellowstone::{
-            YellowstoneGrpcCommitment, YellowstoneGrpcConfig,
-            spawn_yellowstone_grpc_transaction_source,
+            YellowstoneGrpcCommitment, YellowstoneGrpcConfig, spawn_yellowstone_grpc_source,
         },
     },
     runtime::ObserverRuntime,
@@ -61,8 +63,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let account_required = maybe_parse_pubkeys("SOF_YELLOWSTONE_ACCOUNT_REQUIRED")?;
     let (provider_tx, provider_rx) = create_provider_stream_queue(4_096);
 
-    let mut config =
-        YellowstoneGrpcConfig::new(endpoint).with_commitment(YellowstoneGrpcCommitment::Processed);
+    let mut config = YellowstoneGrpcConfig::new(endpoint)
+        .with_commitment(YellowstoneGrpcCommitment::Processed)
+        .with_source_instance("yellowstone-primary");
     if let Some(x_token) = x_token {
         config = config.with_x_token(x_token);
     }
@@ -73,13 +76,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config = config.with_account_required(account_required);
     }
 
-    let source = spawn_yellowstone_grpc_transaction_source(config, provider_tx).await?;
+    let mode = config.runtime_mode();
+    let source = spawn_yellowstone_grpc_source(config, provider_tx).await?;
     let host = PluginHost::builder()
         .add_plugin(YellowstoneTransactionLogger)
         .build();
     let runtime_result = ObserverRuntime::new()
         .with_plugin_host(host)
-        .with_provider_stream_ingress(ProviderStreamMode::YellowstoneGrpc, provider_rx)
+        .with_provider_stream_ingress(mode, provider_rx)
         .run_until_termination_signal()
         .await;
     source.abort();

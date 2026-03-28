@@ -487,10 +487,8 @@ mod tests {
 
     #[derive(Debug)]
     struct LegacyRawPacket {
-        #[allow(dead_code)]
-        source: SocketAddr,
-        #[allow(dead_code)]
-        bytes: Arc<[u8]>,
+        _source: SocketAddr,
+        _bytes: Arc<[u8]>,
     }
 
     fn send_burst(
@@ -748,8 +746,8 @@ mod tests {
             let mut batch = Vec::with_capacity(packet_count);
             for payload in &payloads {
                 batch.push(LegacyRawPacket {
-                    source,
-                    bytes: Arc::from(payload.as_slice()),
+                    _source: source,
+                    _bytes: Arc::from(payload.as_slice()),
                 });
             }
             assert_eq!(batch.len(), packet_count);
