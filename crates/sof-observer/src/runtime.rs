@@ -1,7 +1,7 @@
 #![allow(clippy::missing_docs_in_private_items)]
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher},
+    collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher, hash_map::Entry},
     future::Future,
     hash::{Hash, Hasher},
     net::SocketAddr,
@@ -2047,17 +2047,14 @@ impl ProviderReplayDedupe {
             return false;
         };
         self.max_slot_seen = self.max_slot_seen.max(logical.slot());
-        let source = provider_stream_update_source(update)
-            .cloned()
-            .map(std::sync::Arc::new);
+        let source = provider_stream_update_source_ref(update);
         let observed = ProviderReplayObservedKey {
             source: source.clone(),
             logical: logical.clone(),
         };
-        if self.seen.contains(&observed) {
+        if !self.seen.insert(observed.clone()) {
             return true;
         }
-        self.seen.insert(observed.clone());
         self.order.push_back(observed);
 
         let Some(source) = source else {
@@ -2071,25 +2068,26 @@ impl ProviderReplayDedupe {
                 false
             }
             crate::provider_stream::ProviderSourceArbitrationMode::FirstSeen => {
-                if self.arbitrated.contains_key(&logical) {
-                    self.evict();
-                    true
-                } else {
-                    self.arbitrated.insert(
-                        logical.clone(),
-                        ProviderReplayArbitratedWinner {
+                match self.arbitrated.entry(logical.clone()) {
+                    Entry::Occupied(_) => {
+                        self.evict();
+                        true
+                    }
+                    Entry::Vacant(entry) => {
+                        entry.insert(ProviderReplayArbitratedWinner {
                             priority: source.priority(),
                             source,
-                        },
-                    );
-                    self.arbitrated_order.push_back(logical);
-                    self.evict();
-                    false
+                        });
+                        self.arbitrated_order.push_back(logical);
+                        self.evict();
+                        false
+                    }
                 }
             }
             crate::provider_stream::ProviderSourceArbitrationMode::FirstSeenThenPromote => {
-                match self.arbitrated.get_mut(&logical) {
-                    Some(winner) => {
+                match self.arbitrated.entry(logical.clone()) {
+                    Entry::Occupied(mut entry) => {
+                        let winner = entry.get_mut();
                         if source.priority() > winner.priority {
                             winner.priority = source.priority();
                             winner.source = source;
@@ -2100,14 +2098,11 @@ impl ProviderReplayDedupe {
                             true
                         }
                     }
-                    None => {
-                        self.arbitrated.insert(
-                            logical.clone(),
-                            ProviderReplayArbitratedWinner {
-                                priority: source.priority(),
-                                source,
-                            },
-                        );
+                    Entry::Vacant(entry) => {
+                        entry.insert(ProviderReplayArbitratedWinner {
+                            priority: source.priority(),
+                            source,
+                        });
                         self.arbitrated_order.push_back(logical);
                         self.evict();
                         false
@@ -2135,6 +2130,26 @@ impl ProviderReplayDedupe {
             let _ = self.arbitrated_order.pop_front();
             self.arbitrated.remove(&oldest);
         }
+    }
+}
+
+fn provider_stream_update_source_ref(
+    update: &ProviderStreamUpdate,
+) -> Option<crate::provider_stream::ProviderSourceRef> {
+    match update {
+        ProviderStreamUpdate::Transaction(event) => event.provider_source.clone(),
+        ProviderStreamUpdate::SerializedTransaction(event) => event.provider_source.clone(),
+        ProviderStreamUpdate::TransactionLog(event) => event.provider_source.clone(),
+        ProviderStreamUpdate::TransactionStatus(event) => event.provider_source.clone(),
+        ProviderStreamUpdate::TransactionViewBatch(event) => event.provider_source.clone(),
+        ProviderStreamUpdate::AccountUpdate(event) => event.provider_source.clone(),
+        ProviderStreamUpdate::BlockMeta(event) => event.provider_source.clone(),
+        ProviderStreamUpdate::RecentBlockhash(event) => event.provider_source.clone(),
+        ProviderStreamUpdate::SlotStatus(event) => event.provider_source.clone(),
+        ProviderStreamUpdate::ClusterTopology(event) => event.provider_source.clone(),
+        ProviderStreamUpdate::LeaderSchedule(event) => event.provider_source.clone(),
+        ProviderStreamUpdate::Reorg(event) => event.provider_source.clone(),
+        ProviderStreamUpdate::Health(_) => None,
     }
 }
 
