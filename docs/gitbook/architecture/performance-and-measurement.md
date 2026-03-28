@@ -46,7 +46,7 @@ This is where much of the basic runtime-efficiency foundation came from.
 `0.12.0` tightened the shred-to-plugin path and made inline transaction visibility explicit,
 measurable, and easier to profile.
 
-Validated VPS latency improved from:
+Validated VPS latency on the `0.12.0` line improved from:
 
 - `59.978 / 8.007 / 6.415 ms`
 
@@ -80,7 +80,7 @@ on the final validated branch state.
 `0.13.0` carried the largest single concentration of measured provider/runtime hot-path work so
 far.
 
-Representative validated fixture results on that line:
+Representative validated fixture results on the `0.13.0` line:
 
 - provider transaction-kind classification:
   - `34112us -> 4487us`
@@ -97,7 +97,7 @@ Representative validated fixture results on that line:
 
 That line also matters because it combined hardening with performance work. Replay, health,
 capability, and observability improvements were kept without giving back the main provider/runtime
-ingest wins.
+ingest wins on the validated `0.13.0` release branch.
 
 ## What The Optimizations Usually Look Like
 
@@ -137,7 +137,9 @@ The claim is:
 
 That claim is intentionally scoped:
 
-- the measurements above are from validated release fixtures, live checks, and profiled slices
+- the measurements above are historical validated release-line results, live checks, and profiled
+  slices
+- they are not a promise that every later branch will reproduce the exact same absolute numbers
 - they are not a claim about every mixed workload or every host topology
 - ingress still determines how early a host sees the data
 
