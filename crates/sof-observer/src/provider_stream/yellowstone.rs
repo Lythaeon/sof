@@ -20,6 +20,7 @@ use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 use thiserror::Error;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use yellowstone_grpc_client::{GeyserGrpcBuilderError, GeyserGrpcClient, GeyserGrpcClientError};
 use yellowstone_grpc_proto::prelude::{
@@ -925,7 +926,7 @@ async fn spawn_yellowstone_grpc_source_inner(
 ) -> Result<JoinHandle<Result<(), YellowstoneGrpcError>>, YellowstoneGrpcError> {
     config.validate()?;
     let source = ProviderSourceIdentity::generated(config.source_id(), config.source_instance());
-    send_primary_provider_health(
+    let initial_health = queue_primary_provider_health(
         &source,
         config.readiness(),
         &sender,
@@ -935,8 +936,7 @@ async fn spawn_yellowstone_grpc_source_inner(
             "waiting for first yellowstone {} session ack",
             source.kind_str().trim_start_matches("yellowstone_grpc_")
         ),
-    )
-    .await?;
+    )?;
     let first_session = match establish_yellowstone_session(&config, 0).await {
         Ok(session) => session,
         Err(error) => {
@@ -958,6 +958,12 @@ async fn spawn_yellowstone_grpc_source_inner(
     );
     Ok(tokio::spawn(async move {
         let _source_task = source_task;
+        if let Some(update) = initial_health {
+            sender
+                .send(update)
+                .await
+                .map_err(|_error| YellowstoneGrpcError::QueueClosed)?;
+        }
         let mut attempts = 0_u32;
         let mut tracked_slot = 0_u64;
         let mut watermarks = ProviderCommitmentWatermarks::default();
@@ -1089,15 +1095,14 @@ async fn spawn_yellowstone_grpc_slot_source_inner(
         ProviderSourceId::YellowstoneGrpcSlots,
         config.source_instance(),
     );
-    send_provider_slot_health(
+    let initial_health = queue_provider_slot_health(
         &source,
         config.readiness(),
         &sender,
         ProviderSourceHealthStatus::Reconnecting,
         ProviderSourceHealthReason::InitialConnectPending,
         "waiting for first yellowstone slot session ack".to_owned(),
-    )
-    .await?;
+    )?;
     let first_session = match establish_yellowstone_slot_session(&config, 0).await {
         Ok(session) => session,
         Err(error) => {
@@ -1119,6 +1124,12 @@ async fn spawn_yellowstone_grpc_slot_source_inner(
     );
     Ok(tokio::spawn(async move {
         let _source_task = source_task;
+        if let Some(update) = initial_health {
+            sender
+                .send(update)
+                .await
+                .map_err(|_error| YellowstoneGrpcError::QueueClosed)?;
+        }
         let mut attempts = 0_u32;
         let mut tracked_slot = 0_u64;
         let mut watermarks = ProviderCommitmentWatermarks::default();
@@ -1546,6 +1557,25 @@ async fn send_primary_provider_health(
         .map_err(|_error| YellowstoneGrpcError::QueueClosed)
 }
 
+fn queue_primary_provider_health(
+    source: &ProviderSourceIdentity,
+    readiness: ProviderSourceReadiness,
+    sender: &ProviderStreamSender,
+    status: ProviderSourceHealthStatus,
+    reason: ProviderSourceHealthReason,
+    message: String,
+) -> Result<Option<ProviderStreamUpdate>, YellowstoneGrpcError> {
+    queue_provider_health_update(
+        source,
+        readiness,
+        sender,
+        status,
+        reason,
+        message,
+        YellowstoneGrpcError::QueueClosed,
+    )
+}
+
 async fn send_provider_slot_health(
     source: &ProviderSourceIdentity,
     readiness: ProviderSourceReadiness,
@@ -1564,6 +1594,48 @@ async fn send_provider_slot_health(
         }))
         .await
         .map_err(|_error| YellowstoneGrpcError::QueueClosed)
+}
+
+fn queue_provider_slot_health(
+    source: &ProviderSourceIdentity,
+    readiness: ProviderSourceReadiness,
+    sender: &ProviderStreamSender,
+    status: ProviderSourceHealthStatus,
+    reason: ProviderSourceHealthReason,
+    message: String,
+) -> Result<Option<ProviderStreamUpdate>, YellowstoneGrpcError> {
+    queue_provider_health_update(
+        source,
+        readiness,
+        sender,
+        status,
+        reason,
+        message,
+        YellowstoneGrpcError::QueueClosed,
+    )
+}
+
+fn queue_provider_health_update<E>(
+    source: &ProviderSourceIdentity,
+    readiness: ProviderSourceReadiness,
+    sender: &ProviderStreamSender,
+    status: ProviderSourceHealthStatus,
+    reason: ProviderSourceHealthReason,
+    message: String,
+    queue_closed: E,
+) -> Result<Option<ProviderStreamUpdate>, E> {
+    let update = ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
+        source: source.clone(),
+        readiness,
+        status,
+        reason,
+        message,
+    });
+    match sender.try_send(update) {
+        Ok(()) => Ok(None),
+        Err(mpsc::error::TrySendError::Closed(_update)) => Err(queue_closed),
+        Err(mpsc::error::TrySendError::Full(update)) => Ok(Some(update)),
+    }
 }
 
 const fn yellowstone_health_reason(error: &YellowstoneGrpcError) -> ProviderSourceHealthReason {

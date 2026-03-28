@@ -20,7 +20,6 @@ use crate::framework::{
 use crate::provider_stream::{
     ProviderSourceHealthEvent, ProviderSourceHealthStatus, ProviderSourceId,
     ProviderSourceIdentity, ProviderStreamMode, ProviderStreamReceiver, ProviderStreamUpdate,
-    clear_provider_source_pruned, provider_source_is_pruned,
 };
 use agave_transaction_view::transaction_view::SanitizedTransactionView;
 use sof_gossip_tuning::{
@@ -1788,11 +1787,6 @@ struct ProviderStreamHealth {
 }
 
 impl ProviderStreamHealth {
-    fn prune_tombstoned(&mut self) {
-        self.sources
-            .retain(|source, _event| !provider_source_is_pruned(source));
-    }
-
     fn observe(&mut self, event: &ProviderSourceHealthEvent) {
         if matches!(event.status, ProviderSourceHealthStatus::Removed) {
             let removed = self.sources.remove(&event.source);
@@ -1807,7 +1801,6 @@ impl ProviderStreamHealth {
             }
             return;
         }
-        clear_provider_source_pruned(&event.source);
         let previous = self.sources.insert(event.source.clone(), event.clone());
         if previous.as_ref() == Some(event) {
             return;
@@ -1844,8 +1837,7 @@ impl ProviderStreamHealth {
         }
     }
 
-    fn degraded_sources(&mut self) -> Vec<ProviderSourceHealthEvent> {
-        self.prune_tombstoned();
+    fn degraded_sources(&self) -> Vec<ProviderSourceHealthEvent> {
         let mut degraded = self
             .sources
             .values()
@@ -1867,12 +1859,11 @@ impl ProviderStreamHealth {
         degraded
     }
 
-    fn has_sources(&mut self) -> bool {
-        self.prune_tombstoned();
+    fn has_sources(&self) -> bool {
         !self.sources.is_empty()
     }
 
-    fn closed_error(&mut self, mode: ProviderStreamMode) -> ProviderStreamRuntimeError {
+    fn closed_error(&self, mode: ProviderStreamMode) -> ProviderStreamRuntimeError {
         ProviderStreamRuntimeError::IngressClosed {
             mode,
             degraded_sources: self.degraded_sources(),

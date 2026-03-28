@@ -20,6 +20,7 @@ use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 use thiserror::Error;
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async, tungstenite::protocol::Message as WsMessage,
@@ -908,7 +909,7 @@ async fn spawn_websocket_source_inner(
     config.validate()?;
     let config = config.clone();
     let source = ProviderSourceIdentity::generated(config.source_id(), config.source_instance());
-    send_primary_provider_health(
+    let initial_health = queue_primary_provider_health(
         &source,
         config.readiness(),
         &sender,
@@ -918,8 +919,7 @@ async fn spawn_websocket_source_inner(
             "waiting for first websocket {} session ack",
             source.kind_str().trim_start_matches("websocket_")
         ),
-    )
-    .await?;
+    )?;
     let first_session = match establish_websocket_primary_session(&config).await {
         Ok(session) => session,
         Err(error) => {
@@ -941,6 +941,12 @@ async fn spawn_websocket_source_inner(
     );
     Ok(tokio::spawn(async move {
         let _source_task = source_task;
+        if let Some(update) = initial_health {
+            sender
+                .send(update)
+                .await
+                .map_err(|_error| WebsocketTransactionError::QueueClosed)?;
+        }
         let mut attempts = 0_u32;
         let mut last_seen_slot = None;
         let mut watermarks = ProviderCommitmentWatermarks::default();
@@ -1057,15 +1063,14 @@ async fn spawn_websocket_logs_source_inner(
         ProviderSourceId::WebsocketLogs,
         config.source_instance(),
     );
-    send_provider_logs_health(
+    let initial_health = queue_logs_provider_health(
         &source,
         config.readiness(),
         &sender,
         ProviderSourceHealthStatus::Reconnecting,
         ProviderSourceHealthReason::InitialConnectPending,
         "waiting for first websocket logs session ack".to_owned(),
-    )
-    .await?;
+    )?;
     let first_session = match establish_websocket_logs_session(&config).await {
         Ok(session) => session,
         Err(error) => {
@@ -1087,6 +1092,12 @@ async fn spawn_websocket_logs_source_inner(
     );
     Ok(tokio::spawn(async move {
         let _source_task = source_task;
+        if let Some(update) = initial_health {
+            sender
+                .send(update)
+                .await
+                .map_err(|_error| WebsocketLogsError::QueueClosed)?;
+        }
         let mut attempts = 0_u32;
         let mut first_session = Some(first_session);
         loop {
@@ -1316,6 +1327,25 @@ async fn send_primary_provider_health(
         .map_err(|_error| WebsocketTransactionError::QueueClosed)
 }
 
+fn queue_primary_provider_health(
+    source: &ProviderSourceIdentity,
+    readiness: ProviderSourceReadiness,
+    sender: &ProviderStreamSender,
+    status: ProviderSourceHealthStatus,
+    reason: ProviderSourceHealthReason,
+    message: String,
+) -> Result<Option<ProviderStreamUpdate>, WebsocketTransactionError> {
+    queue_provider_health_update(
+        source,
+        readiness,
+        sender,
+        status,
+        reason,
+        message,
+        WebsocketTransactionError::QueueClosed,
+    )
+}
+
 async fn send_provider_logs_health(
     source: &ProviderSourceIdentity,
     readiness: ProviderSourceReadiness,
@@ -1334,6 +1364,48 @@ async fn send_provider_logs_health(
         }))
         .await
         .map_err(|_error| WebsocketLogsError::QueueClosed)
+}
+
+fn queue_logs_provider_health(
+    source: &ProviderSourceIdentity,
+    readiness: ProviderSourceReadiness,
+    sender: &ProviderStreamSender,
+    status: ProviderSourceHealthStatus,
+    reason: ProviderSourceHealthReason,
+    message: String,
+) -> Result<Option<ProviderStreamUpdate>, WebsocketLogsError> {
+    queue_provider_health_update(
+        source,
+        readiness,
+        sender,
+        status,
+        reason,
+        message,
+        WebsocketLogsError::QueueClosed,
+    )
+}
+
+fn queue_provider_health_update<E>(
+    source: &ProviderSourceIdentity,
+    readiness: ProviderSourceReadiness,
+    sender: &ProviderStreamSender,
+    status: ProviderSourceHealthStatus,
+    reason: ProviderSourceHealthReason,
+    message: String,
+    queue_closed: E,
+) -> Result<Option<ProviderStreamUpdate>, E> {
+    let update = ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
+        source: source.clone(),
+        readiness,
+        status,
+        reason,
+        message,
+    });
+    match sender.try_send(update) {
+        Ok(()) => Ok(None),
+        Err(mpsc::error::TrySendError::Closed(_update)) => Err(queue_closed),
+        Err(mpsc::error::TrySendError::Full(update)) => Ok(Some(update)),
+    }
 }
 
 const fn websocket_health_reason(error: &WebsocketTransactionError) -> ProviderSourceHealthReason {
@@ -3718,6 +3790,50 @@ mod tests {
             panic!("expected removal health update");
         };
         assert_eq!(second.status, ProviderSourceHealthStatus::Removed);
+    }
+
+    #[tokio::test]
+    async fn websocket_spawn_fails_fast_on_dead_endpoint_with_full_queue() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+        drop(listener);
+
+        let (tx, mut rx) = create_provider_stream_queue(1);
+        tx.try_send(ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
+            source: ProviderSourceIdentity::new(ProviderSourceId::WebsocketTransaction, "busy"),
+            readiness: ProviderSourceReadiness::Optional,
+            status: ProviderSourceHealthStatus::Healthy,
+            reason: ProviderSourceHealthReason::SubscriptionAckReceived,
+            message: "occupied".to_owned(),
+        }))
+        .expect("fill provider queue");
+
+        let error = timeout(
+            Duration::from_secs(1),
+            spawn_websocket_source(&WebsocketTransactionConfig::new(format!("ws://{addr}")), tx),
+        )
+        .await
+        .expect("spawn should not block on full queue")
+        .expect_err("dead endpoint should still fail during preflight");
+        assert!(error.to_string().contains("IO error") || error.to_string().contains("Connection"));
+
+        let occupied = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("occupied update timeout")
+            .expect("occupied update");
+        let ProviderStreamUpdate::Health(occupied) = occupied else {
+            panic!("expected occupied health update");
+        };
+        assert_eq!(occupied.message, "occupied");
+
+        let removed = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("removed update timeout")
+            .expect("removed update");
+        let ProviderStreamUpdate::Health(removed) = removed else {
+            panic!("expected removal health update");
+        };
+        assert_eq!(removed.status, ProviderSourceHealthStatus::Removed);
     }
 
     #[tokio::test]

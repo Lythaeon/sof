@@ -21,7 +21,7 @@ use crate::{
     },
     provider_stream::{
         ProviderSourceHealthEvent, ProviderSourceHealthStatus, ProviderSourceIdentity,
-        ProviderSourceReadiness, clear_provider_source_pruned, provider_source_is_pruned,
+        ProviderSourceReadiness,
     },
     runtime_metrics,
 };
@@ -48,14 +48,6 @@ struct RuntimeObservabilityState {
 }
 
 impl RuntimeObservabilityHandle {
-    fn prune_removed_sources(
-        sources: &mut HashMap<ProviderSourceIdentity, ProviderSourceHealthEvent>,
-    ) -> bool {
-        let initial_len = sources.len();
-        sources.retain(|source, _event| !provider_source_is_pruned(source));
-        sources.len() != initial_len
-    }
-
     fn provider_sources_ready(
         sources: &HashMap<ProviderSourceIdentity, ProviderSourceHealthEvent>,
     ) -> bool {
@@ -94,10 +86,8 @@ impl RuntimeObservabilityHandle {
         if matches!(event.status, ProviderSourceHealthStatus::Removed) {
             sources.remove(&event.source);
         } else {
-            clear_provider_source_pruned(&event.source);
             sources.insert(event.source.clone(), event.clone());
         }
-        let _ = Self::prune_removed_sources(&mut sources);
         let ready = Self::provider_sources_ready(&sources);
         self.inner.ready.store(ready, Ordering::Relaxed);
     }
@@ -124,21 +114,10 @@ impl RuntimeObservabilityHandle {
     }
 
     fn snapshot(&self) -> RuntimeObservabilitySnapshot {
-        let previous_ready = self.inner.ready.load(Ordering::Relaxed);
-        let (mut provider_sources, ready) = self.inner.provider_sources.write().map_or_else(
-            |_error| (Vec::new(), false),
-            |mut sources| {
-                let pruned_any = Self::prune_removed_sources(&mut sources);
-                let ready = if sources.is_empty() && !pruned_any {
-                    previous_ready
-                } else {
-                    Self::provider_sources_ready(&sources)
-                };
-                let snapshot = sources.values().cloned().collect();
-                (snapshot, ready)
-            },
+        let mut provider_sources = self.inner.provider_sources.read().map_or_else(
+            |_error| Vec::new(),
+            |sources| sources.values().cloned().collect(),
         );
-        self.inner.ready.store(ready, Ordering::Relaxed);
         provider_sources.sort_by_key(|event| {
             (
                 event.source.kind_str().to_owned(),
@@ -160,7 +139,7 @@ impl RuntimeObservabilityHandle {
             .map_or_else(|_error| Vec::new(), |hooks| hooks.clone());
         RuntimeObservabilitySnapshot {
             live: self.inner.live.load(Ordering::Relaxed),
-            ready,
+            ready: self.inner.ready.load(Ordering::Relaxed),
             provider_sources,
             provider_capability_mode,
             provider_capability_unsupported_hooks,
@@ -2963,34 +2942,6 @@ mod tests {
         assert!(metrics.contains("sof_provider_sources_reconnecting 0"));
         assert!(metrics.contains("sof_provider_sources_unhealthy 0"));
         assert!(!metrics.contains("yellowstone-primary"));
-    }
-
-    #[test]
-    fn out_of_band_pruned_provider_sources_are_removed_from_metrics() {
-        let handle = RuntimeObservabilityHandle::default();
-        handle.mark_live();
-        let source = crate::provider_stream::ProviderSourceIdentity::new(
-            crate::provider_stream::ProviderSourceId::Generic(Arc::<str>::from("custom")),
-            "source-a",
-        );
-        handle.observe_provider_source_health(&ProviderSourceHealthEvent {
-            source: source.clone(),
-            readiness: ProviderSourceReadiness::Required,
-            status: ProviderSourceHealthStatus::Healthy,
-            reason: crate::provider_stream::ProviderSourceHealthReason::SubscriptionAckReceived,
-            message: "healthy".to_owned(),
-        });
-        crate::provider_stream::mark_provider_source_pruned(&source);
-
-        let metrics = render_metrics(
-            &handle,
-            &PluginHost::builder().build(),
-            &RuntimeExtensionHost::builder().build(),
-            &DerivedStateHost::builder().build(),
-        );
-
-        assert!(metrics.contains("sof_runtime_ready 0"));
-        assert!(!metrics.contains("source-a"));
     }
 
     #[test]

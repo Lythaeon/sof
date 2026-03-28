@@ -84,3 +84,11 @@ Follow-up findings after the readiness/readiness-class pass:
   that cannot panic during teardown, and the GitBook crate page still needed
   the same explicit generic-readiness caveat that already existed in the
   observer README.
+
+- 2026-03-28 follow-up: process-global prune tombstones were removed; built-in
+  websocket / Yellowstone / LaserStream startup now queues initial
+  `InitialConnectPending` health non-blockingly before first bootstrap and
+  flushes it from the spawned task to preserve ordering without blocking spawn
+  on a full queue. Existing reservation-lifecycle tests were tightened to check
+  eventual identity reuse after delayed `Removed` delivery instead of assuming
+  same-tick release timing.

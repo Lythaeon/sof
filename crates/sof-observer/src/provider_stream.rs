@@ -157,8 +157,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::SendError;
@@ -653,10 +652,6 @@ pub type ProviderStreamReceiver = mpsc::Receiver<ProviderStreamUpdate>;
 /// Shared provider source identity carried by provider-origin events.
 pub type ProviderSourceRef = Arc<ProviderSourceIdentity>;
 
-/// Out-of-band source tombstones used when terminal removal cannot reach the runtime queue.
-static PRUNED_PROVIDER_SOURCES: LazyLock<Mutex<HashSet<ProviderSourceIdentity>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
-
 /// Duplicate provider source identity registration failure for multi-source fan-in.
 #[derive(Debug, Error)]
 #[error("provider fan-in already contains source identity {0}")]
@@ -697,11 +692,6 @@ struct ProviderSourceReleaseGuard {
     _reservation: Option<Arc<ProviderSourceReservation>>,
 }
 
-/// Maximum no-runtime retries for one terminal `Removed` event before releasing anyway.
-const SOURCE_REMOVED_NO_RUNTIME_RETRY_ATTEMPTS: usize = 64;
-/// Delay between no-runtime retries for one terminal `Removed` event.
-const SOURCE_REMOVED_NO_RUNTIME_RETRY_DELAY: Duration = Duration::from_millis(5);
-
 impl ProviderSourceReleaseGuard {
     /// Creates one guard that releases a reserved identity directly on drop.
     const fn for_identity(release: ProviderSourceDeferredRelease) -> Self {
@@ -719,28 +709,6 @@ impl ProviderSourceReleaseGuard {
             _reservation: Some(reservation),
         }
     }
-}
-
-/// Marks one provider source as pruned even if a terminal `Removed` update could not be queued.
-pub(crate) fn mark_provider_source_pruned(source: &ProviderSourceIdentity) {
-    if let Ok(mut pruned) = PRUNED_PROVIDER_SOURCES.lock() {
-        pruned.insert(source.clone());
-    }
-}
-
-/// Clears one out-of-band provider source prune marker after a new live health event arrives.
-pub(crate) fn clear_provider_source_pruned(source: &ProviderSourceIdentity) {
-    if let Ok(mut pruned) = PRUNED_PROVIDER_SOURCES.lock() {
-        pruned.remove(source);
-    }
-}
-
-/// Returns whether one provider source was pruned out of band.
-#[must_use]
-pub(crate) fn provider_source_is_pruned(source: &ProviderSourceIdentity) -> bool {
-    PRUNED_PROVIDER_SOURCES
-        .lock()
-        .is_ok_and(|pruned| pruned.contains(source))
 }
 
 impl Drop for ProviderSourceReservation {
@@ -1093,7 +1061,6 @@ fn emit_provider_source_removed(
     message: String,
     release: Option<ProviderSourceReleaseGuard>,
 ) -> Option<ProviderSourceReleaseGuard> {
-    let prune_source = source.clone();
     let event = ProviderStreamUpdate::Health(ProviderSourceHealthEvent {
         source,
         readiness,
@@ -1113,20 +1080,7 @@ fn emit_provider_source_removed(
                 None
             } else {
                 std::thread::spawn(move || {
-                    let mut pending_update = update;
-                    for _ in 0..SOURCE_REMOVED_NO_RUNTIME_RETRY_ATTEMPTS {
-                        match sender.try_send(pending_update) {
-                            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {
-                                drop(release);
-                                return;
-                            }
-                            Err(mpsc::error::TrySendError::Full(retry_update)) => {
-                                pending_update = retry_update;
-                                std::thread::sleep(SOURCE_REMOVED_NO_RUNTIME_RETRY_DELAY);
-                            }
-                        }
-                    }
-                    mark_provider_source_pruned(&prune_source);
+                    drop(sender.blocking_send(update));
                     drop(release);
                 });
                 None
@@ -1175,7 +1129,7 @@ mod tests {
     use solana_signer::Signer;
     use std::{sync::Arc, time::Instant};
     use tokio::runtime::Runtime;
-    use tokio::time::{Duration, timeout};
+    use tokio::time::{Duration, sleep, timeout};
 
     fn profile_iterations(default: usize) -> usize {
         std::env::var("SOF_PROFILE_ITERATIONS")
@@ -1358,10 +1312,16 @@ mod tests {
             assert_eq!(second.status, ProviderSourceHealthStatus::Removed);
             assert_eq!(second.reason, ProviderSourceHealthReason::SourceRemoved);
 
-            tokio::task::yield_now().await;
-            fan_in
-                .sender_for_source(source)
-                .expect("identity released after removed is enqueued");
+            timeout(Duration::from_secs(1), async {
+                loop {
+                    if fan_in.sender_for_source(source.clone()).is_ok() {
+                        break;
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("identity released after removed is enqueued");
         });
     }
 
@@ -1415,9 +1375,16 @@ mod tests {
             assert_eq!(second.status, ProviderSourceHealthStatus::Removed);
             assert_eq!(second.reason, ProviderSourceHealthReason::SourceRemoved);
 
-            fan_in
-                .sender_for_source(source)
-                .expect("identity released after background removal send");
+            timeout(Duration::from_secs(1), async {
+                loop {
+                    if fan_in.sender_for_source(source.clone()).is_ok() {
+                        break;
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("identity released after background removal send");
         });
     }
 
