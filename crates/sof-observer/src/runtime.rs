@@ -2424,10 +2424,11 @@ fn dispatch_provider_stream_serialized_transaction(
 
     let mut signature = event.signature;
     let mut recent_blockhash = None;
+    let mut kind = None;
     let needs_view_prefilter = wants_transaction
         && plugin_host.has_transaction_prefilter_at_commitment(event.commitment_status)
         && !wants_derived_state_transaction;
-    let should_try_view = wants_recent_blockhash || needs_view_prefilter;
+    let should_try_view = wants_recent_blockhash || needs_view_prefilter || wants_transaction;
     if should_try_view
         && let Ok(view) = SanitizedTransactionView::try_new_sanitized(event.bytes.as_ref(), true)
     {
@@ -2438,6 +2439,7 @@ fn dispatch_provider_stream_serialized_transaction(
                 .copied()
                 .map(crate::framework::SignatureBytes::from_solana);
         }
+        kind = Some(crate::provider_stream::classify_provider_transaction_kind_view(&view));
         if wants_recent_blockhash {
             recent_blockhash = Some(view.recent_blockhash().to_bytes());
         }
@@ -2497,7 +2499,8 @@ fn dispatch_provider_stream_serialized_transaction(
                 .map(crate::framework::SignatureBytes::from_solana)
         }),
         provider_source: event.provider_source.clone(),
-        kind: crate::provider_stream::classify_provider_transaction_kind(&tx),
+        kind: kind
+            .unwrap_or_else(|| crate::provider_stream::classify_provider_transaction_kind(&tx)),
         tx,
     };
     if wants_recent_blockhash {

@@ -194,7 +194,6 @@ use crate::framework::{
     ObservedRecentBlockhashEvent, ReorgEvent, SlotStatusEvent, TransactionEvent,
     TransactionLogEvent, TransactionStatusEvent, TransactionViewBatchEvent,
 };
-#[cfg(test)]
 use agave_transaction_view::{
     transaction_data::TransactionData, transaction_view::SanitizedTransactionView,
 };
@@ -1185,7 +1184,6 @@ pub(crate) fn classify_provider_transaction_kind(tx: &VersionedTransaction) -> T
     }
 }
 
-#[cfg(test)]
 /// Classifies provider-fed transaction views consistently across built-in adapters.
 pub(crate) fn classify_provider_transaction_kind_view<D: TransactionData>(
     view: &SanitizedTransactionView<D>,
