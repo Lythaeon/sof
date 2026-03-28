@@ -331,10 +331,10 @@ cargo add sof-gossip-tuning
 Useful feature sets:
 
 ```toml
-sof = { version = "0.13.1", features = ["gossip-bootstrap"] }
-sof = { version = "0.13.1", features = ["provider-grpc"] }
-sof = { version = "0.13.1", features = ["provider-websocket"] }
-sof-tx = { version = "0.13.1", features = ["sof-adapters"] }
+sof = { version = "0.14.0", features = ["gossip-bootstrap"] }
+sof = { version = "0.14.0", features = ["provider-grpc"] }
+sof = { version = "0.14.0", features = ["provider-websocket"] }
+sof-tx = { version = "0.14.0", features = ["sof-adapters"] }
 ```
 
 Run the basic observer example:
