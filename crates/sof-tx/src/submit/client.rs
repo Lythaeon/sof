@@ -8,7 +8,6 @@ use std::{
 };
 
 use sof_types::SignatureBytes;
-use solana_transaction::versioned::VersionedTransaction;
 use tokio::{
     net::TcpStream,
     task::JoinSet,
@@ -313,13 +312,7 @@ impl TxSubmitClient {
             SignedTx::VersionedTransactionBytes(bytes) => bytes,
             SignedTx::WireTransactionBytes(bytes) => bytes,
         };
-        let tx: VersionedTransaction = bincode::deserialize(&tx_bytes)
-            .map_err(|source| SubmitError::DecodeSignedBytes { source })?;
-        let signature = tx
-            .signatures
-            .first()
-            .copied()
-            .map(SignatureBytes::from_solana);
+        let signature = extract_first_signature(&tx_bytes)?;
         self.submit_bytes(tx_bytes, signature, plan, context).await
     }
 
@@ -354,10 +347,11 @@ impl TxSubmitClient {
         plan: SubmitPlan,
         context: TxSubmitContext,
     ) -> Result<SubmitResult, SubmitError> {
-        let plan = plan.normalized();
+        let plan = plan.into_normalized();
         self.validate_submit_plan(&plan)?;
         self.enforce_toxic_flow_guards(signature, &plan, &context)?;
         self.enforce_dedupe(signature)?;
+        let tx_bytes = Arc::<[u8]>::from(tx_bytes);
         match plan.strategy {
             SubmitStrategy::OrderedFallback => {
                 self.submit_routes_in_order(tx_bytes, signature, plan).await
@@ -548,13 +542,13 @@ impl TxSubmitClient {
     /// Executes one route plan in order and returns the first successful route.
     async fn submit_routes_in_order(
         &self,
-        tx_bytes: Vec<u8>,
+        tx_bytes: Arc<[u8]>,
         signature: Option<SignatureBytes>,
         plan: SubmitPlan,
     ) -> Result<SubmitResult, SubmitError> {
         let legacy_mode = plan.legacy_mode();
         let mut last_error = None;
-        let tx_bytes_arc = Arc::<[u8]>::from(tx_bytes.clone());
+        let task_context = self.route_task_context();
         for (route_idx, route) in plan.routes.iter().copied().enumerate() {
             let next_idx = route_idx.saturating_add(1);
             let has_later_routes = plan.routes.get(next_idx).is_some();
@@ -563,16 +557,20 @@ impl TxSubmitClient {
             } else {
                 DirectExecutionMode::Standalone
             };
-            match self
-                .submit_one_route(route, tx_bytes.clone(), direct_mode)
-                .await
+            match submit_one_route_task(
+                route,
+                Arc::clone(&tx_bytes),
+                task_context.clone(),
+                direct_mode,
+            )
+            .await
             {
                 Ok(outcome) => {
                     self.record_route_outcome(signature, &plan, outcome.route);
                     let mut rpc_signature = outcome.rpc_signature;
                     if matches!(outcome.route, SubmitRoute::Direct) {
                         self.spawn_agave_rebroadcast(
-                            Arc::clone(&tx_bytes_arc),
+                            Arc::clone(&tx_bytes),
                             &self.direct_config.clone().normalized(),
                         );
                         if has_later_routes
@@ -583,9 +581,8 @@ impl TxSubmitClient {
                                 .skip(next_idx)
                                 .any(|next| *next == SubmitRoute::Rpc)
                             && let Some(rpc) = &self.rpc_transport
-                            && let Ok(broadcast_signature) = rpc
-                                .submit_rpc(tx_bytes_arc.as_ref(), &self.rpc_config)
-                                .await
+                            && let Ok(broadcast_signature) =
+                                rpc.submit_rpc(tx_bytes.as_ref(), &self.rpc_config).await
                         {
                             rpc_signature = Some(broadcast_signature);
                         }
@@ -616,13 +613,12 @@ impl TxSubmitClient {
     /// Executes every configured route at once and aggregates the successful outcomes.
     async fn submit_routes_all_at_once(
         &self,
-        tx_bytes: Vec<u8>,
+        tx_bytes: Arc<[u8]>,
         signature: Option<SignatureBytes>,
         plan: SubmitPlan,
     ) -> Result<SubmitResult, SubmitError> {
         let legacy_mode = plan.legacy_mode();
         let mut join_set = JoinSet::new();
-        let tx_bytes = Arc::<[u8]>::from(tx_bytes);
         let tx_bytes_for_rebroadcast = Arc::clone(&tx_bytes);
         for route in plan.routes.iter().copied() {
             let task_context = self.route_task_context();
@@ -722,23 +718,6 @@ impl TxSubmitClient {
             }))
     }
 
-    /// Executes one configured route using the current client wiring.
-    async fn submit_one_route(
-        &self,
-        route: SubmitRoute,
-        tx_bytes: Vec<u8>,
-        direct_mode: DirectExecutionMode,
-    ) -> Result<RouteSubmitOutcome, SubmitError> {
-        let outcome = submit_one_route_task(
-            route,
-            Arc::<[u8]>::from(tx_bytes),
-            self.route_task_context(),
-            direct_mode,
-        )
-        .await?;
-        Ok(outcome)
-    }
-
     /// Records one accepted route as a terminal telemetry outcome.
     fn record_route_outcome(
         &self,
@@ -771,7 +750,7 @@ impl TxSubmitClient {
             jito_transport: self.jito_transport.clone(),
             direct_transport: self.direct_transport.clone(),
             leader_provider: self.leader_provider.clone(),
-            backups: self.backups.clone(),
+            backups: Arc::from(self.backups.clone()),
             policy: self.policy,
             rpc_config: self.rpc_config.clone(),
             jito_config: self.jito_config.clone(),
@@ -827,7 +806,7 @@ struct RouteTaskContext {
     /// Source of leader targets.
     leader_provider: Arc<dyn LeaderProvider>,
     /// Backup targets configured alongside the leader provider.
-    backups: Vec<LeaderTarget>,
+    backups: Arc<[LeaderTarget]>,
     /// Route selection policy for direct submission.
     policy: RoutingPolicy,
     /// RPC submit tuning.
@@ -864,6 +843,48 @@ struct RouteSubmitOutcome {
     selected_target_count: usize,
     /// Number of unique identities represented by the direct targets.
     selected_identity_count: usize,
+}
+
+/// Extracts the first transaction signature from serialized transaction bytes.
+fn extract_first_signature(tx_bytes: &[u8]) -> Result<Option<SignatureBytes>, SubmitError> {
+    let Some((signature_count, offset)) = decode_short_vec_len(tx_bytes) else {
+        return Err(decode_signed_bytes_error(
+            "transaction bytes did not contain a valid signature vector prefix",
+        ));
+    };
+    if signature_count == 0 {
+        return Ok(None);
+    }
+    let signature_end = offset.saturating_add(64);
+    let Some(signature_bytes) = tx_bytes.get(offset..signature_end) else {
+        return Err(decode_signed_bytes_error(
+            "transaction bytes ended before the first signature completed",
+        ));
+    };
+    let mut signature = [0_u8; 64];
+    signature.copy_from_slice(signature_bytes);
+    Ok(Some(SignatureBytes::new(signature)))
+}
+
+/// Decodes Solana's short-vec length prefix and returns the decoded length plus payload offset.
+fn decode_short_vec_len(bytes: &[u8]) -> Option<(usize, usize)> {
+    let mut value = 0_usize;
+    let mut shift = 0_u32;
+    for (idx, byte) in bytes.iter().copied().take(3).enumerate() {
+        value |= usize::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some((value, idx.saturating_add(1)));
+        }
+        shift = shift.saturating_add(7);
+    }
+    None
+}
+
+/// Builds one signed-byte decode error from a static message.
+fn decode_signed_bytes_error(message: &'static str) -> SubmitError {
+    SubmitError::DecodeSignedBytes {
+        source: Box::new(bincode::ErrorKind::Custom(message.to_owned())),
+    }
 }
 
 /// Executes one concrete submit route with the cloned task context for that attempt.
@@ -925,7 +946,7 @@ async fn submit_one_route_task(
             for attempt_idx in 0..attempt_count {
                 let mut targets = select_and_rank_targets(
                     task_context.leader_provider.as_ref(),
-                    task_context.backups.as_slice(),
+                    task_context.backups.as_ref(),
                     task_context.policy,
                     &task_context.direct_config,
                 )

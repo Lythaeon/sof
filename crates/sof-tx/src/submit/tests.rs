@@ -8,7 +8,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use async_trait::async_trait;
@@ -188,6 +188,47 @@ fn signed_transfer_bytes() -> (Vec<u8>, Signature) {
 /// Returns a static leader target.
 fn target(port: u16) -> LeaderTarget {
     LeaderTarget::new(None, SocketAddr::from(([127, 0, 0, 1], port)))
+}
+
+/// Decodes the first short-vec length prefix in a serialized transaction.
+fn decode_short_vec_len(bytes: &[u8]) -> Option<(usize, usize)> {
+    let mut value = 0_usize;
+    let mut shift = 0_u32;
+    for (idx, byte) in bytes.iter().copied().take(3).enumerate() {
+        value |= usize::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some((value, idx.saturating_add(1)));
+        }
+        shift = shift.saturating_add(7);
+    }
+    None
+}
+
+/// Rewrites the first signature bytes so repeated profile iterations do not trip dedupe.
+fn rewrite_first_signature(bytes: &mut [u8], seed: u64) {
+    const BYTE_SHIFTS: [u32; 64] = [
+        0, 8, 16, 24, 32, 40, 48, 56, 0, 8, 16, 24, 32, 40, 48, 56, 0, 8, 16, 24, 32, 40, 48, 56,
+        0, 8, 16, 24, 32, 40, 48, 56, 0, 8, 16, 24, 32, 40, 48, 56, 0, 8, 16, 24, 32, 40, 48, 56,
+        0, 8, 16, 24, 32, 40, 48, 56, 0, 8, 16, 24, 32, 40, 48, 56,
+    ];
+    let decoded = decode_short_vec_len(bytes);
+    assert!(decoded.is_some());
+    let (signature_count, offset) = decoded.unwrap_or((0, 0));
+    assert!(signature_count > 0);
+    let end = offset.saturating_add(64);
+    assert!(bytes.get(offset..end).is_some());
+    for (idx, byte) in bytes[offset..end].iter_mut().enumerate() {
+        let shift = BYTE_SHIFTS[idx];
+        let lane = ((seed >> shift) & 0xff) as u8;
+        *byte = lane.wrapping_add(idx as u8);
+    }
+}
+
+/// Clones one prebuilt serialized transaction and rewrites the first signature for uniqueness.
+fn profiled_tx_bytes(base_bytes: &[u8], seed: u64) -> Vec<u8> {
+    let mut bytes = base_bytes.to_vec();
+    rewrite_first_signature(&mut bytes, seed);
+    bytes
 }
 
 #[tokio::test]
@@ -997,4 +1038,189 @@ async fn all_at_once_plan_submits_across_jito_and_direct() {
 
     assert_eq!(direct.calls.load(Ordering::Relaxed), 1);
     assert_eq!(jito.calls.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+#[ignore]
+async fn submit_rpc_only_profile_fixture() {
+    let rpc = Arc::new(MockRpcTransport {
+        result: Ok("rpc-signature".to_owned()),
+        calls: AtomicU64::new(0),
+    });
+    let mut client = TxSubmitClient::new(
+        Arc::new(StaticRecentBlockhashProvider::new(Some([30_u8; 32]))),
+        Arc::new(StaticLeaderProvider::new(None, Vec::new())),
+    )
+    .with_rpc_transport(rpc.clone());
+
+    let (base_bytes, _) = signed_transfer_bytes();
+    let iterations = 5_000_u64;
+    let start = Instant::now();
+    for idx in 0..iterations {
+        let bytes = profiled_tx_bytes(&base_bytes, idx);
+        let result = client
+            .submit_signed(
+                SignedTx::VersionedTransactionBytes(bytes),
+                SubmitMode::RpcOnly,
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+    println!("rpc_only_us={}", start.elapsed().as_micros());
+}
+
+#[tokio::test]
+#[ignore]
+async fn submit_jito_only_profile_fixture() {
+    let jito = Arc::new(MockJitoTransport {
+        result: Ok(JitoSubmitResponse {
+            transaction_signature: Some("jito-signature".to_owned()),
+            bundle_id: Some("bundle-1".to_owned()),
+        }),
+        calls: AtomicU64::new(0),
+    });
+    let mut client = TxSubmitClient::new(
+        Arc::new(StaticRecentBlockhashProvider::new(Some([31_u8; 32]))),
+        Arc::new(StaticLeaderProvider::new(None, Vec::new())),
+    )
+    .with_jito_transport(jito.clone());
+
+    let (base_bytes, _) = signed_transfer_bytes();
+    let iterations = 5_000_u64;
+    let start = Instant::now();
+    for idx in 0..iterations {
+        let bytes = profiled_tx_bytes(&base_bytes, idx);
+        let result = client
+            .submit_signed(
+                SignedTx::VersionedTransactionBytes(bytes),
+                SubmitMode::JitoOnly,
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+    println!("jito_only_us={}", start.elapsed().as_micros());
+}
+
+#[tokio::test]
+#[ignore]
+async fn submit_direct_only_profile_fixture() {
+    let direct_target = target(9101);
+    let direct = Arc::new(MockDirectTransport {
+        result: Ok(direct_target.clone()),
+        calls: AtomicU64::new(0),
+    });
+    let mut client = TxSubmitClient::new(
+        Arc::new(StaticRecentBlockhashProvider::new(Some([32_u8; 32]))),
+        Arc::new(StaticLeaderProvider::new(
+            Some(direct_target.clone()),
+            Vec::new(),
+        )),
+    )
+    .with_direct_transport(direct.clone());
+
+    let (base_bytes, _) = signed_transfer_bytes();
+    let iterations = 5_000_u64;
+    let start = Instant::now();
+    for idx in 0..iterations {
+        let bytes = profiled_tx_bytes(&base_bytes, idx);
+        let result = client
+            .submit_signed(
+                SignedTx::VersionedTransactionBytes(bytes),
+                SubmitMode::DirectOnly,
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+    println!("direct_only_us={}", start.elapsed().as_micros());
+}
+
+#[tokio::test]
+#[ignore]
+async fn submit_hybrid_fallback_profile_fixture() {
+    let rpc = Arc::new(MockRpcTransport {
+        result: Ok("rpc-fallback-signature".to_owned()),
+        calls: AtomicU64::new(0),
+    });
+    let direct = Arc::new(MockDirectTransport {
+        result: Err(SubmitTransportError::Failure {
+            message: "direct failed".to_owned(),
+        }),
+        calls: AtomicU64::new(0),
+    });
+    let mut client = TxSubmitClient::new(
+        Arc::new(StaticRecentBlockhashProvider::new(Some([33_u8; 32]))),
+        Arc::new(StaticLeaderProvider::new(Some(target(9102)), Vec::new())),
+    )
+    .with_rpc_transport(rpc.clone())
+    .with_direct_transport(direct.clone())
+    .with_direct_config(DirectSubmitConfig {
+        direct_submit_attempts: 1,
+        hybrid_direct_attempts: 1,
+        rebroadcast_interval: Duration::from_nanos(1),
+        agave_rebroadcast_enabled: false,
+        hybrid_rpc_broadcast: false,
+        latency_aware_targeting: false,
+        ..DirectSubmitConfig::default()
+    });
+
+    let (base_bytes, _) = signed_transfer_bytes();
+    let iterations = 3_000_u64;
+    let start = Instant::now();
+    for idx in 0..iterations {
+        let bytes = profiled_tx_bytes(&base_bytes, idx);
+        let result = client
+            .submit_signed(
+                SignedTx::VersionedTransactionBytes(bytes),
+                SubmitMode::Hybrid,
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+    println!("hybrid_fallback_us={}", start.elapsed().as_micros());
+}
+
+#[tokio::test]
+#[ignore]
+async fn submit_all_at_once_profile_fixture() {
+    let direct = Arc::new(MockDirectTransport {
+        result: Ok(target(9103)),
+        calls: AtomicU64::new(0),
+    });
+    let rpc = Arc::new(MockRpcTransport {
+        result: Ok("rpc-signature".to_owned()),
+        calls: AtomicU64::new(0),
+    });
+    let jito = Arc::new(MockJitoTransport {
+        result: Ok(JitoSubmitResponse {
+            transaction_signature: Some("jito-signature".to_owned()),
+            bundle_id: Some("bundle-1".to_owned()),
+        }),
+        calls: AtomicU64::new(0),
+    });
+    let mut client = TxSubmitClient::new(
+        Arc::new(StaticRecentBlockhashProvider::new(Some([34_u8; 32]))),
+        Arc::new(StaticLeaderProvider::new(Some(target(9103)), Vec::new())),
+    )
+    .with_direct_transport(direct.clone())
+    .with_rpc_transport(rpc.clone())
+    .with_jito_transport(jito.clone());
+
+    let (base_bytes, _) = signed_transfer_bytes();
+    let iterations = 3_000_u64;
+    let start = Instant::now();
+    for idx in 0..iterations {
+        let bytes = profiled_tx_bytes(&base_bytes, idx);
+        let result = client
+            .submit_signed_via(
+                SignedTx::VersionedTransactionBytes(bytes),
+                SubmitPlan::all_at_once(vec![
+                    SubmitRoute::Direct,
+                    SubmitRoute::Rpc,
+                    SubmitRoute::Jito,
+                ]),
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+    println!("all_at_once_us={}", start.elapsed().as_micros());
 }

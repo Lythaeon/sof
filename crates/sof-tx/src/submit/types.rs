@@ -64,22 +64,39 @@ impl SubmitPlan {
     /// Creates one normalized plan.
     #[must_use]
     pub fn new(routes: Vec<SubmitRoute>, strategy: SubmitStrategy) -> Self {
-        let mut normalized = Vec::with_capacity(routes.len());
-        for route in routes {
-            if !normalized.contains(&route) {
-                normalized.push(route);
+        Self { routes, strategy }.into_normalized()
+    }
+
+    /// Normalizes this plan in place while preserving route order.
+    #[must_use]
+    pub fn into_normalized(mut self) -> Self {
+        let mut seen_rpc = false;
+        let mut seen_jito = false;
+        let mut seen_direct = false;
+        self.routes.retain(|route| match route {
+            SubmitRoute::Rpc if seen_rpc => false,
+            SubmitRoute::Rpc => {
+                seen_rpc = true;
+                true
             }
-        }
-        Self {
-            routes: normalized,
-            strategy,
-        }
+            SubmitRoute::Jito if seen_jito => false,
+            SubmitRoute::Jito => {
+                seen_jito = true;
+                true
+            }
+            SubmitRoute::Direct if seen_direct => false,
+            SubmitRoute::Direct => {
+                seen_direct = true;
+                true
+            }
+        });
+        self
     }
 
     /// Returns a normalized clone of this plan.
     #[must_use]
     pub fn normalized(&self) -> Self {
-        Self::new(self.routes.clone(), self.strategy)
+        self.clone().into_normalized()
     }
 
     /// Builds a single-route RPC fallback plan.
