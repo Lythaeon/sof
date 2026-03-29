@@ -27,6 +27,8 @@ You will usually start with:
 - `gossip-bootstrap` with `SOF_GOSSIP_RUNTIME_MODE=control_plane_only` when you only need
   topology/leader inputs for `sof-tx` and your actual ingress or blockhash source lives elsewhere
   ; in typed setup, use `RuntimeSetup::with_gossip_runtime_mode(GossipRuntimeMode::ControlPlaneOnly)`
+- built-in websocket or Yellowstone/LaserStream transaction feeds when you want SOF to keep
+  recent blockhash fresh from observed provider transactions without using gossip for data ingress
 
 ## Submitter With External Control Plane
 

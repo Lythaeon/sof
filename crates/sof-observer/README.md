@@ -435,10 +435,10 @@ The same event family does not exist on every ingest path. Read this table as:
 | Ingest type | Plugin surface | Derived-state surface | Does not emit |
 | --- | --- | --- | --- |
 | Raw shreds / gossip / trusted raw-shred provider | `on_transaction`, `on_recent_blockhash`, `on_slot_status`, `on_cluster_topology`, `on_leader_schedule`, `on_reorg`, plus raw packet/shred/dataset surfaces | `TransactionApplied`, `RecentBlockhashObserved`, `SlotStatusChanged`, `ClusterTopologyChanged`, `LeaderScheduleUpdated`, `ControlPlaneStateUpdated`, `BranchReorged`, `StateInvalidated`, `AccountTouchObserved` | `on_transaction_status`, `on_transaction_log`, `on_account_update`, `on_block_meta`, `TransactionStatusObserved`, `BlockMetaObserved` |
-| Websocket `transactionSubscribe` | `on_transaction` | `TransactionApplied` | `on_transaction_status`, `on_block_meta`, `TransactionStatusObserved`, `BlockMetaObserved`, control-plane hooks |
+| Websocket `transactionSubscribe` | `on_transaction`, synthesized `on_recent_blockhash` when requested | `TransactionApplied` | `on_transaction_status`, `on_block_meta`, `TransactionStatusObserved`, `BlockMetaObserved`, topology/leader/reorg control-plane hooks |
 | Websocket `logsSubscribe` | `on_transaction_log` | none | transaction-status, block-meta, control-plane, and derived-state provider observations |
 | Websocket `accountSubscribe` / `programSubscribe` | `on_account_update` | none | transaction-status, block-meta, control-plane, and derived-state provider observations |
-| Yellowstone / LaserStream transaction feeds | `on_transaction` | `TransactionApplied` | control-plane hooks unless supplied through `Generic` |
+| Yellowstone / LaserStream transaction feeds | `on_transaction`, synthesized `on_recent_blockhash` when requested | `TransactionApplied` | topology/leader/reorg control-plane hooks unless supplied through `Generic` |
 | Yellowstone / LaserStream transaction-status feeds | `on_transaction_status` | `TransactionStatusObserved` | raw-shred control-plane hooks, `on_block_meta`, account/log hooks unless separately configured |
 | Yellowstone / LaserStream block-meta feeds | `on_block_meta` | `BlockMetaObserved` | raw-shred control-plane hooks, `on_transaction_status`, account/log hooks unless separately configured |
 | Yellowstone / LaserStream account feeds | `on_account_update` | none | control-plane hooks and provider-derived `TransactionStatusObserved` / `BlockMetaObserved` |
@@ -449,11 +449,15 @@ That also means:
 
 - raw shreds emit the richest local control-plane surface, but not provider-only
   `TransactionStatus` or `BlockMeta`
-- built-in websocket emits transactions/logs/accounts, but not
-  `TransactionStatus` or `BlockMeta`
+- built-in websocket emits transactions/logs/accounts and can synthesize recent
+  blockhash from observed transactions, but not `TransactionStatus`, `BlockMeta`,
+  or topology/leader control-plane hooks
 - built-in Yellowstone/LaserStream add `TransactionStatus` and `BlockMeta`, but
   still do not emit raw-shred control-plane families unless a custom generic
   producer supplies them
+- built-in websocket and transaction-feed gRPC can therefore feed recent
+  blockhash into `sof-tx` adapters, but direct routing still needs gossip,
+  manual targets, or another control-plane source
 
 Programmatic setup uses the typed runtime API:
 

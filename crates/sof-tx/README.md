@@ -183,7 +183,18 @@ same `evaluate_flow_safety(...)` helper for control-plane freshness checks.
 
 Those SOF adapter paths are complete today with raw-shred or gossip-backed observer runtimes.
 Built-in processed provider adapters such as Yellowstone, LaserStream, and websocket are
-transaction-first today and do not, by themselves, provide the full `sof-tx` control-plane feed.
+transaction-first today:
+
+- they can drive recent blockhash state through observed provider transactions
+- they do not, by themselves, provide the full `sof-tx` control-plane feed for direct routing
+- direct submit still needs leaders/topology from gossip, manual target injection, or another
+  control-plane source
+
+So a mixed setup is already valid:
+
+- provider-stream transactions for recent blockhash freshness
+- gossip full or `control_plane_only` for topology/leaders
+- one shared SOF adapter feeding both into `sof-tx`
 
 The observer-side feed now also emits canonical control-plane quality snapshots, so services can
 source freshness and confidence metadata from `sof` first and keep `sof-tx` focused on send-time
