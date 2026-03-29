@@ -180,6 +180,29 @@ impl TxSubmitOutcomeReporter for RecordingOutcomeReporter {
     }
 }
 
+/// Reporter that panics whenever one outcome is delivered.
+#[derive(Debug, Default)]
+struct PanicOutcomeReporter;
+
+impl TxSubmitOutcomeReporter for PanicOutcomeReporter {
+    fn record_outcome(&self, _outcome: &TxSubmitOutcome) {
+        panic!("reporter panic");
+    }
+}
+
+/// Reporter that blocks long enough to expose caller-path latency coupling.
+#[derive(Debug)]
+struct SlowOutcomeReporter {
+    /// Delay injected into every callback.
+    delay: Duration,
+}
+
+impl TxSubmitOutcomeReporter for SlowOutcomeReporter {
+    fn record_outcome(&self, _outcome: &TxSubmitOutcome) {
+        std::thread::sleep(self.delay);
+    }
+}
+
 #[async_trait]
 impl DirectSubmitTransport for SequencedDirectTransport {
     async fn submit_direct(
@@ -924,11 +947,22 @@ async fn toxic_flow_guard_rejects_reorg_risk_before_submit() {
     ));
     assert_eq!(rpc.calls.load(Ordering::Relaxed), 0);
     assert_eq!(client.toxic_flow_telemetry().rejected_due_to_reorg_risk, 1);
-    let outcomes = reporter
-        .outcomes
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
+    let outcomes = timeout(Duration::from_millis(100), async {
+        loop {
+            let outcomes = reporter
+                .outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            if outcomes.len() == 1 {
+                break outcomes;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(outcomes.is_ok());
+    let outcomes = outcomes.unwrap_or_default();
     assert_eq!(outcomes.len(), 1);
     let first = outcomes.first();
     assert!(first.is_some());
@@ -1190,6 +1224,10 @@ async fn hybrid_direct_success_with_rpc_broadcast_returns_before_rpc_completes()
     })
     .await;
     assert!(late_result.is_ok());
+
+    let telemetry = client.toxic_flow_telemetry();
+    assert_eq!(telemetry.direct_accepted, 1);
+    assert_eq!(telemetry.rpc_accepted, 1);
 }
 
 #[tokio::test]
@@ -1228,6 +1266,79 @@ async fn all_at_once_returns_first_configured_error_when_all_routes_fail() {
             source: SubmitTransportError::Failure { ref message }
         }) if message == "jito failed"
     ));
+}
+
+#[tokio::test]
+async fn all_at_once_with_slow_reporter_still_returns_on_first_success() {
+    let direct = Arc::new(MockDirectTransport {
+        result: Ok(target(9002)),
+        calls: AtomicU64::new(0),
+    });
+    let jito = Arc::new(DelayedJitoTransport {
+        result: Ok(JitoSubmitResponse {
+            transaction_signature: Some("jito-signature".to_owned()),
+            bundle_id: Some("bundle-slow".to_owned()),
+        }),
+        delay: Duration::from_millis(200),
+        calls: AtomicU64::new(0),
+    });
+    let reporter = Arc::new(SlowOutcomeReporter {
+        delay: Duration::from_millis(200),
+    });
+    let mut client = TxSubmitClient::new(
+        Arc::new(StaticRecentBlockhashProvider::new(Some([42_u8; 32]))),
+        Arc::new(StaticLeaderProvider::new(Some(target(9002)), Vec::new())),
+    )
+    .with_direct_transport(direct)
+    .with_jito_transport(jito)
+    .with_outcome_reporter(reporter);
+
+    let (bytes, _) = signed_transfer_bytes();
+    let result = timeout(
+        Duration::from_millis(50),
+        client.submit_signed_via(
+            SignedTx::VersionedTransactionBytes(bytes),
+            SubmitPlan::all_at_once(vec![SubmitRoute::Direct, SubmitRoute::Jito]),
+        ),
+    )
+    .await;
+
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn reporter_panic_does_not_abort_successful_submit() {
+    let direct_target = target(9044);
+    let direct = Arc::new(MockDirectTransport {
+        result: Ok(direct_target.clone()),
+        calls: AtomicU64::new(0),
+    });
+    let mut client = TxSubmitClient::new(
+        Arc::new(StaticRecentBlockhashProvider::new(Some([43_u8; 32]))),
+        Arc::new(StaticLeaderProvider::new(
+            Some(direct_target.clone()),
+            Vec::new(),
+        )),
+    )
+    .with_direct_transport(direct)
+    .with_outcome_reporter(Arc::new(PanicOutcomeReporter));
+
+    let (bytes, _) = signed_transfer_bytes();
+    let result = client
+        .submit_signed(
+            SignedTx::VersionedTransactionBytes(bytes),
+            SubmitMode::DirectOnly,
+        )
+        .await;
+
+    assert!(result.is_ok());
+    if let Ok(result) = result {
+        assert_eq!(result.first_success_route, Some(SubmitRoute::Direct));
+        assert_eq!(result.direct_target, Some(direct_target));
+    }
+
+    let telemetry = client.toxic_flow_telemetry();
+    assert_eq!(telemetry.direct_accepted, 1);
 }
 
 #[tokio::test]

@@ -3,6 +3,7 @@
 use std::{
     collections::HashSet,
     net::SocketAddr,
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
@@ -873,8 +874,24 @@ fn record_external_outcome_shared(
 ) {
     telemetry.record(outcome);
     if let Some(reporter) = reporter {
-        reporter.record_outcome(outcome);
+        dispatch_reporter_outcome(reporter.clone(), outcome.clone());
     }
+}
+
+/// Delivers one outcome to the optional external reporter without extending the submit hot path.
+fn dispatch_reporter_outcome(reporter: Arc<dyn TxSubmitOutcomeReporter>, outcome: TxSubmitOutcome) {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        drop(handle.spawn(async move {
+            drop(catch_unwind(AssertUnwindSafe(|| {
+                reporter.record_outcome(&outcome);
+            })));
+        }));
+        return;
+    }
+
+    drop(catch_unwind(AssertUnwindSafe(|| {
+        reporter.record_outcome(&outcome);
+    })));
 }
 
 /// Records one accepted route as a terminal telemetry outcome using shared sinks.

@@ -191,7 +191,8 @@ It shows one full process shape with:
 - `SubmitPlan::all_at_once(vec![...])`: preferred multi-route shape when you want to maximize the
   chance that one of several configured routes accepts the same transaction quickly. The submit
   call returns on the first accepted route; later background accepts are surfaced through
-  `TxSubmitOutcomeReporter` / built-in telemetry instead of mutating the original `SubmitResult`.
+  `TxSubmitOutcomeReporter`, and built-in telemetry still counts those accepts instead of mutating
+  the original `SubmitResult`.
 
 Arbitrary plans are first-class:
 

@@ -463,8 +463,8 @@ pub struct SubmitResult {
     pub first_success_route: Option<SubmitRoute>,
     ///
     /// Later background accepts from concurrently configured routes are reported through
-    /// [`TxSubmitOutcomeReporter`] / built-in telemetry, including any route-specific acceptance
-    /// metadata, rather than retroactively mutating this synchronous result.
+    /// [`TxSubmitOutcomeReporter`] and counted by built-in telemetry, including any route-specific
+    /// acceptance metadata, rather than retroactively mutating this synchronous result.
     pub successful_routes: Vec<SubmitRoute>,
     /// Target chosen by direct path when applicable.
     pub direct_target: Option<LeaderTarget>,
@@ -728,6 +728,12 @@ pub trait TxSubmitOutcomeReporter: Send + Sync {
 /// Snapshot of built-in toxic-flow counters collected by [`TxSubmitClient`](crate::submit::TxSubmitClient).
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TxToxicFlowTelemetrySnapshot {
+    /// Number of direct-route accepts observed.
+    pub direct_accepted: u64,
+    /// Number of RPC-route accepts observed.
+    pub rpc_accepted: u64,
+    /// Number of Jito-route accepts observed.
+    pub jito_accepted: u64,
     /// Number of submit attempts rejected due to stale inputs.
     pub rejected_due_to_staleness: u64,
     /// Number of submit attempts rejected due to reorg risk.
@@ -771,6 +777,12 @@ impl CacheAlignedAtomicU64 {
 /// In-memory telemetry counters for toxic-flow outcomes.
 #[derive(Debug, Default)]
 pub struct TxToxicFlowTelemetry {
+    /// Number of direct-route accepts.
+    direct_accepted: CacheAlignedAtomicU64,
+    /// Number of RPC-route accepts.
+    rpc_accepted: CacheAlignedAtomicU64,
+    /// Number of Jito-route accepts.
+    jito_accepted: CacheAlignedAtomicU64,
     /// Number of stale-input rejections.
     rejected_due_to_staleness: CacheAlignedAtomicU64,
     /// Number of reorg-risk rejections.
@@ -804,6 +816,15 @@ impl TxToxicFlowTelemetry {
                 .swap(age_ms, Ordering::Relaxed);
         }
         match outcome.kind {
+            TxSubmitOutcomeKind::DirectAccepted => {
+                let _ = self.direct_accepted.fetch_add(1, Ordering::Relaxed);
+            }
+            TxSubmitOutcomeKind::RpcAccepted => {
+                let _ = self.rpc_accepted.fetch_add(1, Ordering::Relaxed);
+            }
+            TxSubmitOutcomeKind::JitoAccepted => {
+                let _ = self.jito_accepted.fetch_add(1, Ordering::Relaxed);
+            }
             TxSubmitOutcomeKind::RejectedDueToStaleness => {
                 let _ = self
                     .rejected_due_to_staleness
@@ -830,10 +851,7 @@ impl TxToxicFlowTelemetry {
             TxSubmitOutcomeKind::LeaderMissed => {
                 let _ = self.leader_route_miss_rate.fetch_add(1, Ordering::Relaxed);
             }
-            TxSubmitOutcomeKind::DirectAccepted
-            | TxSubmitOutcomeKind::RpcAccepted
-            | TxSubmitOutcomeKind::JitoAccepted
-            | TxSubmitOutcomeKind::Landed
+            TxSubmitOutcomeKind::Landed
             | TxSubmitOutcomeKind::Expired
             | TxSubmitOutcomeKind::Dropped
             | TxSubmitOutcomeKind::UnhealthyRoute => {}
@@ -850,6 +868,9 @@ impl TxToxicFlowTelemetry {
     pub fn snapshot(&self) -> TxToxicFlowTelemetrySnapshot {
         let age_ms = self.opportunity_age_at_send_ms.load(Ordering::Relaxed);
         TxToxicFlowTelemetrySnapshot {
+            direct_accepted: self.direct_accepted.load(Ordering::Relaxed),
+            rpc_accepted: self.rpc_accepted.load(Ordering::Relaxed),
+            jito_accepted: self.jito_accepted.load(Ordering::Relaxed),
             rejected_due_to_staleness: self.rejected_due_to_staleness.load(Ordering::Relaxed),
             rejected_due_to_reorg_risk: self.rejected_due_to_reorg_risk.load(Ordering::Relaxed),
             rejected_due_to_state_drift: self.rejected_due_to_state_drift.load(Ordering::Relaxed),
