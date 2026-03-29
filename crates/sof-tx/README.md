@@ -43,20 +43,20 @@ cargo add sof-tx
 Enable SOF runtime adapters when you want provider values from live `sof` plugin events:
 
 ```toml
-sof-tx = { version = "0.16.0", features = ["sof-adapters"] }
+sof-tx = { version = "0.17.0", features = ["sof-adapters"] }
 ```
 
 Enable `kernel-bypass` transport hooks for kernel-bypass direct submit integrations:
 
 ```toml
-sof-tx = { version = "0.16.0", features = ["kernel-bypass"] }
+sof-tx = { version = "0.17.0", features = ["kernel-bypass"] }
 ```
 
 Use `sof-solana-compat` when you want the Solana-native `TxBuilder` plus unsigned convenience
 submission helpers on top of `sof-tx`:
 
 ```toml
-sof-solana-compat = "0.16.0"
+sof-solana-compat = "0.17.0"
 ```
 
 ## Quick Start
