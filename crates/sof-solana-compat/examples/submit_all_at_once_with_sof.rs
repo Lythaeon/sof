@@ -1,33 +1,19 @@
-#![cfg_attr(not(feature = "sof-adapters"), allow(unused))]
 //! Full multi-route submit example using SOF control-plane adapters.
 
-#[cfg(not(feature = "sof-adapters"))]
-fn main() {
-    eprintln!("This example requires --features sof-adapters");
-}
-
-#[cfg(feature = "sof-adapters")]
 use std::{sync::Arc, time::Duration};
 
-#[cfg(feature = "sof-adapters")]
 use sof::framework::PluginHost;
-#[cfg(feature = "sof-adapters")]
 use sof_solana_compat::{TxBuilder, TxSubmitClientSolanaExt};
-#[cfg(feature = "sof-adapters")]
 use sof_tx::{
     JitoJsonRpcTransport, JitoSubmitConfig, RpcRecentBlockhashProvider, RpcSubmitConfig,
     SubmitPlan, SubmitReliability, SubmitRoute, TxSubmitClient,
     adapters::PluginHostTxProviderAdapter,
     submit::{DirectSubmitConfig, JsonRpcTransport, UdpDirectTransport},
 };
-#[cfg(feature = "sof-adapters")]
 use solana_keypair::Keypair;
-#[cfg(feature = "sof-adapters")]
 use solana_signer::Signer;
-#[cfg(feature = "sof-adapters")]
 use solana_system_interface::instruction as system_instruction;
 
-#[cfg(feature = "sof-adapters")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let adapter = Arc::new(PluginHostTxProviderAdapter::default());
