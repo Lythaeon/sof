@@ -1,6 +1,32 @@
 use super::*;
 use thiserror::Error;
 
+#[cfg(feature = "gossip-bootstrap")]
+pub(crate) struct ProviderStreamGossipControlPlane {
+    gossip_receiver_handles: Vec<JoinHandle<()>>,
+    gossip_runtime: GossipRuntime,
+    active_gossip_entrypoint: Option<String>,
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+impl ProviderStreamGossipControlPlane {
+    pub(crate) fn cluster_info(&self) -> &ClusterInfo {
+        self.gossip_runtime.cluster_info.as_ref()
+    }
+
+    pub(crate) fn active_entrypoint(&self) -> Option<String> {
+        self.active_gossip_entrypoint.clone()
+    }
+
+    pub(crate) async fn shutdown(self) {
+        crate::app::runtime::bootstrap::gossip::stop_gossip_runtime_components(
+            self.gossip_receiver_handles,
+            Some(self.gossip_runtime),
+        )
+        .await;
+    }
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum ReceiverBootstrapError {
     #[error("bind address configuration failed: {reason}")]
@@ -307,10 +333,138 @@ pub(crate) async fn start_receiver(
         let active_entrypoint = runtime.active_gossip_entrypoint.clone().unwrap_or_default();
         tracing::info!(
             entrypoint = %active_entrypoint,
-            "gossip control-plane-only mode enabled; kept cluster topology and leader schedule state without gossip shred ingest"
+            "gossip control-plane-only mode enabled; kept gossip topology state without gossip shred ingest"
         );
     }
     Ok(runtime)
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+pub(crate) async fn start_provider_stream_gossip_control_plane()
+-> Result<Option<ProviderStreamGossipControlPlane>, ReceiverBootstrapError> {
+    let gossip_entrypoints = read_gossip_entrypoints();
+    if gossip_entrypoints.is_empty() {
+        return Ok(None);
+    }
+
+    let log_startup_steps = read_log_startup_steps();
+    let gossip_identity = Arc::new(Keypair::new());
+    let (tx, _rx) = ingest::create_raw_packet_batch_queue();
+    let port_plan = build_gossip_runtime_port_plan().map_err(|source| {
+        ReceiverBootstrapError::GossipPortPlan {
+            reason: source.to_string(),
+        }
+    })?;
+    let prioritized_entrypoints = prioritize_gossip_entrypoints(&gossip_entrypoints, None).await;
+    let bootstrap_stabilize_min_packets = read_gossip_runtime_switch_stabilize_min_packets();
+    let bootstrap_stabilize_sustain =
+        Duration::from_millis(read_gossip_runtime_switch_stabilize_ms());
+    let bootstrap_stabilize_max_wait =
+        Duration::from_millis(read_gossip_bootstrap_stabilize_max_wait_ms());
+    let bootstrap_stabilize_min_peers = effective_bootstrap_stabilize_min_peers(
+        true,
+        read_gossip_bootstrap_stabilize_min_peers_override(),
+    );
+    let mut last_error: Option<String> = None;
+
+    if log_startup_steps {
+        tracing::info!(
+            step = "provider_gossip_bootstrap_prioritized",
+            total_candidates = prioritized_entrypoints.len(),
+            "provider-stream gossip control-plane bootstrap ordering computed"
+        );
+    }
+
+    for (attempt, entrypoint) in prioritized_entrypoints.iter().enumerate() {
+        if log_startup_steps {
+            tracing::info!(
+                step = "provider_gossip_bootstrap_attempt",
+                attempt = attempt.saturating_add(1),
+                entrypoint = %entrypoint,
+                "attempting provider-stream gossip control-plane bootstrap"
+            );
+        }
+        match start_gossip_bootstrapped_receiver_guarded(
+            entrypoint,
+            tx.clone(),
+            gossip_identity.clone(),
+            Some(port_plan.primary),
+            true,
+        )
+        .await
+        {
+            Ok((gossip_receivers, runtime, _repair_client)) => {
+                let stabilization = wait_for_runtime_stabilization_or_peer_discovery(
+                    runtime.ingest_telemetry.clone(),
+                    bootstrap_stabilize_sustain,
+                    bootstrap_stabilize_min_packets,
+                    bootstrap_stabilize_max_wait,
+                    || runtime.cluster_info.all_peers().len(),
+                    bootstrap_stabilize_min_peers,
+                )
+                .await;
+                let discovered_peers = stabilization.discovered_peers;
+                let accepted = stabilization.stabilized || stabilization.stabilized_by_peers;
+                if !accepted {
+                    let candidate_receivers = gossip_receivers.len();
+                    tracing::warn!(
+                        entrypoint = %entrypoint,
+                        waited_ms = duration_to_ms_u64(stabilization.elapsed),
+                        packets_seen = stabilization.packets_seen,
+                        peers_discovered = discovered_peers,
+                        min_peers = bootstrap_stabilize_min_peers,
+                        "provider-stream gossip control-plane bootstrap did not stabilize; trying next entrypoint"
+                    );
+                    stop_gossip_runtime_components(gossip_receivers, Some(runtime)).await;
+                    tracing::warn!(
+                        entrypoint = %entrypoint,
+                        receiver_tasks_stopped = candidate_receivers,
+                        "stopped unstable provider-stream gossip control-plane bootstrap; continuing with next entrypoint"
+                    );
+                    last_error = Some(format!(
+                        "entrypoint {entrypoint} did not discover enough peers during provider-stream gossip bootstrap"
+                    ));
+                    continue;
+                }
+                if !stabilization.stabilized && stabilization.stabilized_by_peers {
+                    tracing::info!(
+                        entrypoint = %entrypoint,
+                        packets_seen = stabilization.packets_seen,
+                        peers_discovered = discovered_peers,
+                        min_peers = bootstrap_stabilize_min_peers,
+                        "accepting provider-stream gossip control-plane bootstrap via peer discovery"
+                    );
+                }
+                if attempt > 0 {
+                    tracing::info!(
+                        entrypoint = %entrypoint,
+                        attempt = attempt.saturating_add(1),
+                        "provider-stream gossip control-plane bootstrap succeeded after fallback"
+                    );
+                }
+                return Ok(Some(ProviderStreamGossipControlPlane {
+                    gossip_receiver_handles: gossip_receivers,
+                    gossip_runtime: runtime,
+                    active_gossip_entrypoint: Some(entrypoint.clone()),
+                }));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    entrypoint = %entrypoint,
+                    attempt = attempt.saturating_add(1),
+                    error = %error,
+                    "failed provider-stream gossip control-plane entrypoint; trying next"
+                );
+                last_error = Some(error.to_string());
+            }
+        }
+    }
+
+    if let Some(error) = last_error {
+        return Err(ReceiverBootstrapError::GossipBootstrapExhausted { reason: error });
+    }
+
+    Ok(None)
 }
 
 #[cfg(feature = "gossip-bootstrap")]

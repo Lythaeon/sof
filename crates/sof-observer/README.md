@@ -292,9 +292,30 @@ raw-shred/gossip runtimes, or on `ProviderStreamMode::Generic` when the custom
 producer also supplies the full control-plane feed. Built-in Yellowstone,
 LaserStream, and websocket adapters now cover transactions, transaction status,
 accounts, block-meta, logs, and slots, but they still do not form a complete
-built-in `sof-tx` control-plane source on their own. SOF therefore still
-rejects those adapters for the existing `sof-tx` live/replay adapters at
-runtime/config validation time.
+built-in `sof-tx` control-plane source on their own.
+
+The packaged runtime now supports one mixed built-in shape:
+
+- built-in provider-stream transaction ingress
+- gossip bootstrap for cluster topology in the same runtime
+
+That mixed packaged mode is enough for:
+
+- recent blockhash from provider transactions
+- cluster topology from gossip
+- `PluginHostTxProviderAdapter::topology_only(...)`
+
+It is still not enough for:
+
+- `on_leader_schedule`
+- `on_reorg`
+- derived-state `control_plane_observed`
+- the default `PluginHostTxProviderAdapter`, which still expects leader-schedule hooks
+
+So the full built-in `sof-tx` adapter path remains:
+
+- raw-shred/gossip runtimes, or
+- `ProviderStreamMode::Generic` when the custom producer supplies the full control-plane feed
 
 That tradeoff should be explicit: public gossip is the independent baseline, trusted raw shred
 distribution is the fast path, and processed provider streams are a different observer model.

@@ -87,8 +87,11 @@ Important boundary:
 - built-in websocket and transaction-feed gRPC can still supply recent blockhash to `sof-tx`
   adapters through observed transactions; direct routing still needs leaders/topology from gossip,
   manual targets, or another control-plane source
-- that mixed-source shape is available in custom embedding, not as one packaged built-in runtime
-  mode today
+- the packaged runtime now supports one narrower mixed-source shape:
+  built-in provider transactions plus gossip-derived cluster topology
+- use `PluginHostTxProviderAdapter::topology_only(...)` for that packaged mixed mode
+- use raw-shred/gossip runtimes or `ProviderStreamMode::Generic` when you also need
+  leader-schedule or reorg hooks
 
 ### Plugin vs Derived-State Surface
 

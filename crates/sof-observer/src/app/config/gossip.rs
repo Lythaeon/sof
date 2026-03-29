@@ -283,29 +283,35 @@ mod tests {
 
     #[test]
     fn explicit_gossip_runtime_mode_prefers_control_plane_only() {
-        crate::runtime_env::set_runtime_env_overrides([(
-            String::from("SOF_GOSSIP_RUNTIME_MODE"),
-            String::from("control_plane_only"),
-        )]);
-        assert_eq!(
-            read_gossip_runtime_mode(),
-            GossipRuntimeMode::ControlPlaneOnly
+        crate::runtime_env::with_runtime_env_overrides_for_test(
+            [(
+                String::from("SOF_GOSSIP_RUNTIME_MODE"),
+                String::from("control_plane_only"),
+            )],
+            || {
+                assert_eq!(
+                    read_gossip_runtime_mode(),
+                    GossipRuntimeMode::ControlPlaneOnly
+                );
+                assert!(read_gossip_control_plane_only());
+                assert!(!read_gossip_bootstrap_only());
+            },
         );
-        assert!(read_gossip_control_plane_only());
-        assert!(!read_gossip_bootstrap_only());
-        crate::runtime_env::clear_runtime_env_overrides();
     }
 
     #[test]
     fn legacy_gossip_bootstrap_only_maps_to_runtime_mode() {
-        crate::runtime_env::set_runtime_env_overrides([(
-            String::from("SOF_GOSSIP_BOOTSTRAP_ONLY"),
-            String::from("true"),
-        )]);
-        assert_eq!(read_gossip_runtime_mode(), GossipRuntimeMode::BootstrapOnly);
-        assert!(read_gossip_bootstrap_only());
-        assert!(!read_gossip_control_plane_only());
-        crate::runtime_env::clear_runtime_env_overrides();
+        crate::runtime_env::with_runtime_env_overrides_for_test(
+            [(
+                String::from("SOF_GOSSIP_BOOTSTRAP_ONLY"),
+                String::from("true"),
+            )],
+            || {
+                assert_eq!(read_gossip_runtime_mode(), GossipRuntimeMode::BootstrapOnly);
+                assert!(read_gossip_bootstrap_only());
+                assert!(!read_gossip_control_plane_only());
+            },
+        );
     }
 }
 

@@ -248,6 +248,16 @@ processed provider adapters such as Yellowstone, LaserStream, and websocket can 
 typed processed-event families, but they still do not by themselves provide the full `sof-tx`
 control-plane feed.
 
+The packaged runtime now also supports one narrower mixed built-in shape:
+
+- built-in provider-stream transaction ingress
+- gossip bootstrap for cluster topology in the same runtime
+- `PluginHostTxProviderAdapter::topology_only(...)`
+
+That mixed mode is intentionally topology-backed only. It does not synthesize leader-schedule or
+reorg hooks; use raw-shred/gossip runtimes or `ProviderStreamMode::Generic` when you need the
+full control-plane surface.
+
 That split matters:
 
 - live adapter for fast local runtime coupling
@@ -264,7 +274,7 @@ Practical fit:
 
 - missing recent blockhash
 - stale tip slot
-- missing leader schedule
+- missing leader schedule when that input is enabled
 - missing TPU addresses for targeted leaders
 - degraded cluster topology freshness
 

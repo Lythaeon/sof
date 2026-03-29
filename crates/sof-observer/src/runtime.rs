@@ -1,5 +1,7 @@
 #![allow(clippy::missing_docs_in_private_items)]
 
+#[cfg(feature = "gossip-bootstrap")]
+use std::time::Duration;
 use std::{
     collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher, hash_map::Entry},
     future::Future,
@@ -14,6 +16,11 @@ use std::{
 pub use crate::app::config::GossipRuntimeMode;
 use crate::app::config::read_observability_bind_addr;
 use crate::app::runtime::RuntimeObservabilityService;
+#[cfg(feature = "gossip-bootstrap")]
+use crate::app::runtime::{
+    ClusterTopologyTracker, ProviderStreamGossipControlPlane,
+    start_provider_stream_gossip_control_plane,
+};
 use crate::framework::host::TransactionDispatchScope;
 use crate::framework::{
     DerivedStateHost, DerivedStateReplayBackend, DerivedStateReplayDurability, PluginHost,
@@ -36,6 +43,10 @@ use thiserror::Error;
 type ShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 const PROVIDER_REPLAY_DEDUPE_CAPACITY: usize = 65_536;
 const PROVIDER_REPLAY_DEDUPE_SLOT_WINDOW: u64 = 4_096;
+#[cfg(feature = "gossip-bootstrap")]
+const PROVIDER_GOSSIP_CONTROL_PLANE_POLL_MS: u64 = 250;
+#[cfg(feature = "gossip-bootstrap")]
+const PROVIDER_GOSSIP_CONTROL_PLANE_SNAPSHOT_SECS: u64 = 30;
 
 /// Public runtime error surface for packaged SOF entrypoints.
 #[derive(Debug, Error)]
@@ -1676,6 +1687,9 @@ async fn run_provider_stream_runtime(
 ) -> Result<(), RuntimeError> {
     let capability_check =
         enforce_provider_stream_capability_policy(mode, &plugin_host, &derived_state_host)?;
+    let mut gossip_control_plane =
+        bootstrap_provider_stream_gossip_control_plane(mode, &plugin_host, &derived_state_host)
+            .await?;
     let observability = if let Some(bind_addr) = read_observability_bind_addr() {
         let service = RuntimeObservabilityService::start(
             bind_addr,
@@ -1729,6 +1743,7 @@ async fn run_provider_stream_runtime(
     let allow_eof =
         mode == ProviderStreamMode::Generic && provider_stream_allow_eof_from_runtime_env();
     let mut generic_progress_ready = false;
+    let mut latest_control_plane_slot = None;
     let result = loop {
         tokio::select! {
             biased;
@@ -1740,6 +1755,12 @@ async fn run_provider_stream_runtime(
                 }
             } => {
                 break Ok(());
+            }
+            () = gossip_control_plane.tick_and_dispatch(
+                &plugin_host,
+                &derived_state_host,
+                latest_control_plane_slot,
+            ), if gossip_control_plane.is_enabled() => {
             }
             update = provider_stream_rx.recv() => {
                 let Some(update) = update else {
@@ -1777,6 +1798,10 @@ async fn run_provider_stream_runtime(
                 if replay_dedupe.observe(&update) {
                     continue;
                 }
+                latest_control_plane_slot = max_observed_slot(
+                    latest_control_plane_slot,
+                    provider_stream_update_slot(&update),
+                );
                 dispatch_provider_stream_update(&plugin_host, &derived_state_host, update);
             }
         }
@@ -1787,10 +1812,129 @@ async fn run_provider_stream_runtime(
     if let Some(service) = observability {
         service.shutdown().await;
     }
+    gossip_control_plane.shutdown().await;
     if result.is_ok() {
         tracing::info!(mode = mode.as_str(), "SOF provider-stream runtime stopped");
     }
     result
+}
+
+enum ProviderRuntimeGossipControlPlane {
+    #[cfg(feature = "gossip-bootstrap")]
+    Enabled {
+        control_plane: Box<ProviderStreamGossipControlPlane>,
+        topology_tracker: ClusterTopologyTracker,
+        tick: tokio::time::Interval,
+    },
+    Disabled,
+}
+
+impl ProviderRuntimeGossipControlPlane {
+    const fn is_enabled(&self) -> bool {
+        match self {
+            #[cfg(feature = "gossip-bootstrap")]
+            Self::Enabled { .. } => true,
+            Self::Disabled => false,
+        }
+    }
+
+    async fn tick_and_dispatch(
+        &mut self,
+        _plugin_host: &PluginHost,
+        _derived_state_host: &DerivedStateHost,
+        _latest_control_plane_slot: Option<u64>,
+    ) {
+        match self {
+            #[cfg(feature = "gossip-bootstrap")]
+            Self::Enabled {
+                control_plane,
+                topology_tracker,
+                tick,
+            } => {
+                tick.tick().await;
+                if let Some(event) = topology_tracker.maybe_build_event(
+                    control_plane.cluster_info(),
+                    _latest_control_plane_slot,
+                    control_plane.active_entrypoint(),
+                    Instant::now(),
+                ) {
+                    if !_derived_state_host.is_empty() {
+                        _derived_state_host.on_cluster_topology(event.clone());
+                    }
+                    if _plugin_host.wants_cluster_topology() {
+                        _plugin_host.on_cluster_topology(event);
+                    }
+                }
+            }
+            Self::Disabled => futures_util::future::pending::<()>().await,
+        }
+    }
+
+    async fn shutdown(self) {
+        match self {
+            #[cfg(feature = "gossip-bootstrap")]
+            Self::Enabled { control_plane, .. } => control_plane.shutdown().await,
+            Self::Disabled => {}
+        }
+    }
+}
+
+async fn bootstrap_provider_stream_gossip_control_plane(
+    _mode: ProviderStreamMode,
+    _plugin_host: &PluginHost,
+    _derived_state_host: &DerivedStateHost,
+) -> Result<ProviderRuntimeGossipControlPlane, RuntimeError> {
+    #[cfg(feature = "gossip-bootstrap")]
+    {
+        if _mode != ProviderStreamMode::Generic
+            && provider_stream_mode_supports_gossip_cluster_topology(_mode)
+            && provider_stream_runtime_wants_gossip_cluster_topology(
+                _plugin_host,
+                _derived_state_host,
+            )
+        {
+            let control_plane =
+                start_provider_stream_gossip_control_plane()
+                    .await
+                    .map_err(|source| ProviderStreamRuntimeError::Startup {
+                        message: format!(
+                            "failed to bootstrap provider-stream gossip control plane: {source}"
+                        ),
+                    })?;
+            if let Some(control_plane) = control_plane {
+                let mut tick = tokio::time::interval(Duration::from_millis(
+                    PROVIDER_GOSSIP_CONTROL_PLANE_POLL_MS,
+                ));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                return Ok(ProviderRuntimeGossipControlPlane::Enabled {
+                    control_plane: Box::new(control_plane),
+                    topology_tracker: ClusterTopologyTracker::new(
+                        Duration::from_millis(PROVIDER_GOSSIP_CONTROL_PLANE_POLL_MS),
+                        Duration::from_secs(PROVIDER_GOSSIP_CONTROL_PLANE_SNAPSHOT_SECS),
+                    ),
+                    tick,
+                });
+            }
+        }
+    }
+    Ok(ProviderRuntimeGossipControlPlane::Disabled)
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+const fn provider_stream_runtime_wants_gossip_cluster_topology(
+    plugin_host: &PluginHost,
+    _derived_state_host: &DerivedStateHost,
+) -> bool {
+    plugin_host.wants_cluster_topology()
+}
+
+fn max_observed_slot(current: Option<u64>, candidate: Option<u64>) -> Option<u64> {
+    match (current, candidate) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
 }
 
 #[derive(Default)]
@@ -1938,6 +2082,24 @@ fn provider_stream_update_source(update: &ProviderStreamUpdate) -> Option<&Provi
         ProviderStreamUpdate::LeaderSchedule(event) => event.provider_source.as_deref(),
         ProviderStreamUpdate::Reorg(event) => event.provider_source.as_deref(),
         ProviderStreamUpdate::Health(event) => Some(&event.source),
+    }
+}
+
+const fn provider_stream_update_slot(update: &ProviderStreamUpdate) -> Option<u64> {
+    match update {
+        ProviderStreamUpdate::Transaction(event) => Some(event.slot),
+        ProviderStreamUpdate::SerializedTransaction(event) => Some(event.slot),
+        ProviderStreamUpdate::TransactionLog(event) => Some(event.slot),
+        ProviderStreamUpdate::TransactionStatus(event) => Some(event.slot),
+        ProviderStreamUpdate::TransactionViewBatch(event) => Some(event.slot),
+        ProviderStreamUpdate::AccountUpdate(event) => Some(event.slot),
+        ProviderStreamUpdate::BlockMeta(event) => Some(event.slot),
+        ProviderStreamUpdate::RecentBlockhash(event) => Some(event.slot),
+        ProviderStreamUpdate::SlotStatus(event) => Some(event.slot),
+        ProviderStreamUpdate::ClusterTopology(event) => event.slot,
+        ProviderStreamUpdate::LeaderSchedule(event) => event.slot,
+        ProviderStreamUpdate::Reorg(event) => Some(event.new_tip),
+        ProviderStreamUpdate::Health(_) => None,
     }
 }
 
@@ -2552,7 +2714,9 @@ fn provider_stream_unsupported_hooks(
     let supports_transaction_view_batch =
         provider_stream_mode_supports_transaction_view_batch(mode);
     let supports_slot_status = provider_stream_mode_supports_slot_status(mode);
-    let supports_control_plane = provider_stream_mode_supports_control_plane(mode);
+    let supports_cluster_topology = provider_stream_mode_supports_cluster_topology(mode);
+    let supports_leader_schedule = provider_stream_mode_supports_leader_schedule(mode);
+    let supports_reorg = provider_stream_mode_supports_reorg(mode);
     let mut unsupported = Vec::new();
     if plugin_host.wants_raw_packet() {
         unsupported.push("on_raw_packet");
@@ -2596,19 +2760,21 @@ fn provider_stream_unsupported_hooks(
     if plugin_host.wants_slot_status() && !supports_slot_status {
         unsupported.push("on_slot_status");
     }
-    if plugin_host.wants_cluster_topology() && !supports_control_plane {
+    if plugin_host.wants_cluster_topology() && !supports_cluster_topology {
         unsupported.push("on_cluster_topology");
     }
-    if plugin_host.wants_leader_schedule() && !supports_control_plane {
+    if plugin_host.wants_leader_schedule() && !supports_leader_schedule {
         unsupported.push("on_leader_schedule");
     }
-    if plugin_host.wants_reorg() && !supports_control_plane {
+    if plugin_host.wants_reorg() && !supports_reorg {
         unsupported.push("on_reorg");
     }
     if derived_state_host.wants_account_touch_observed() {
         unsupported.push("derived_state.account_touch_observed");
     }
-    if !supports_control_plane && derived_state_host.wants_control_plane_observed() {
+    if derived_state_host.wants_control_plane_observed()
+        && !(supports_cluster_topology && supports_leader_schedule && supports_reorg)
+    {
         unsupported.push("derived_state.control_plane_observed");
     }
     unsupported
@@ -2676,8 +2842,28 @@ const fn provider_stream_mode_supports_slot_status(mode: ProviderStreamMode) -> 
     )
 }
 
-const fn provider_stream_mode_supports_control_plane(mode: ProviderStreamMode) -> bool {
+#[cfg(feature = "gossip-bootstrap")]
+fn provider_stream_mode_supports_cluster_topology(mode: ProviderStreamMode) -> bool {
     matches!(mode, ProviderStreamMode::Generic)
+        || provider_stream_mode_supports_gossip_cluster_topology(mode)
+}
+
+#[cfg(not(feature = "gossip-bootstrap"))]
+const fn provider_stream_mode_supports_cluster_topology(mode: ProviderStreamMode) -> bool {
+    matches!(mode, ProviderStreamMode::Generic)
+}
+
+const fn provider_stream_mode_supports_leader_schedule(mode: ProviderStreamMode) -> bool {
+    matches!(mode, ProviderStreamMode::Generic)
+}
+
+const fn provider_stream_mode_supports_reorg(mode: ProviderStreamMode) -> bool {
+    matches!(mode, ProviderStreamMode::Generic)
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+fn provider_stream_mode_supports_gossip_cluster_topology(mode: ProviderStreamMode) -> bool {
+    mode != ProviderStreamMode::Generic
 }
 
 fn enforce_provider_stream_capability_policy(
@@ -3133,6 +3319,23 @@ mod tests {
             .unwrap_or(default)
     }
 
+    fn with_runtime_env_overrides<T>(
+        overrides: impl IntoIterator<Item = (String, String)>,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        crate::runtime_env::with_runtime_env_overrides_for_test(overrides, f)
+    }
+
+    async fn with_runtime_env_overrides_async<T, Fut>(
+        overrides: impl IntoIterator<Item = (String, String)>,
+        f: impl FnOnce() -> Fut,
+    ) -> T
+    where
+        Fut: std::future::Future<Output = T>,
+    {
+        crate::runtime_env::with_runtime_env_overrides_for_test_async(overrides, f).await
+    }
+
     fn sample_provider_transaction_update() -> ProviderStreamUpdate {
         let signer = Keypair::new();
         let message = Message::new(&[], Some(&signer.pubkey()));
@@ -3162,6 +3365,8 @@ mod tests {
 
     struct TransactionOnlyPlugin;
     struct RecentBlockhashPlugin;
+    #[cfg(feature = "gossip-bootstrap")]
+    struct ClusterTopologyOnlyPlugin;
     struct StartupCounterPlugin {
         counter: Arc<AtomicUsize>,
     }
@@ -3186,6 +3391,18 @@ mod tests {
         }
 
         async fn on_raw_packet(&self, _event: RawPacketEvent) {}
+    }
+
+    #[cfg(feature = "gossip-bootstrap")]
+    #[async_trait]
+    impl ObserverPlugin for ClusterTopologyOnlyPlugin {
+        fn name(&self) -> &'static str {
+            "cluster-topology-only-plugin"
+        }
+
+        fn config(&self) -> PluginConfig {
+            PluginConfig::new().with_cluster_topology()
+        }
     }
 
     #[async_trait]
@@ -4167,138 +4384,185 @@ mod tests {
 
     #[test]
     fn provider_stream_warn_policy_allows_unsupported_hooks() {
-        crate::runtime_env::set_runtime_env_overrides([(
-            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
-            String::from("warn"),
-        )]);
-        let plugin_host = PluginHost::builder().add_plugin(RawPacketPlugin).build();
-        let derived_state_host = DerivedStateHost::builder().build();
-        let result = enforce_provider_stream_capability_policy(
-            ProviderStreamMode::Generic,
-            &plugin_host,
-            &derived_state_host,
+        with_runtime_env_overrides(
+            [(
+                String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+                String::from("warn"),
+            )],
+            || {
+                let plugin_host = PluginHost::builder().add_plugin(RawPacketPlugin).build();
+                let derived_state_host = DerivedStateHost::builder().build();
+                let result = enforce_provider_stream_capability_policy(
+                    ProviderStreamMode::Generic,
+                    &plugin_host,
+                    &derived_state_host,
+                );
+                assert!(result.is_ok());
+            },
         );
-        crate::runtime_env::clear_runtime_env_overrides();
-        assert!(result.is_ok());
     }
 
     #[test]
     fn provider_stream_strict_policy_rejects_unsupported_hooks() {
-        crate::runtime_env::set_runtime_env_overrides([(
-            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
-            String::from("strict"),
-        )]);
-        let plugin_host = PluginHost::builder().add_plugin(RawPacketPlugin).build();
-        let derived_state_host = DerivedStateHost::builder().build();
-        let result = enforce_provider_stream_capability_policy(
-            ProviderStreamMode::YellowstoneGrpc,
-            &plugin_host,
-            &derived_state_host,
+        with_runtime_env_overrides(
+            [(
+                String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+                String::from("strict"),
+            )],
+            || {
+                let plugin_host = PluginHost::builder().add_plugin(RawPacketPlugin).build();
+                let derived_state_host = DerivedStateHost::builder().build();
+                let result = enforce_provider_stream_capability_policy(
+                    ProviderStreamMode::YellowstoneGrpc,
+                    &plugin_host,
+                    &derived_state_host,
+                );
+                match result {
+                    Err(RuntimeError::ProviderStream(
+                        ProviderStreamRuntimeError::BuiltInUnsupportedHooks {
+                            mode,
+                            unsupported_hooks,
+                        },
+                    )) => {
+                        assert_eq!(mode, ProviderStreamMode::YellowstoneGrpc);
+                        assert!(unsupported_hooks.contains(&String::from("on_raw_packet")));
+                    }
+                    other => panic!("expected strict provider capability failure, got {other:?}"),
+                }
+            },
         );
-        crate::runtime_env::clear_runtime_env_overrides();
-        match result {
-            Err(RuntimeError::ProviderStream(
-                ProviderStreamRuntimeError::BuiltInUnsupportedHooks {
-                    mode,
-                    unsupported_hooks,
-                },
-            )) => {
-                assert_eq!(mode, ProviderStreamMode::YellowstoneGrpc);
-                assert!(unsupported_hooks.contains(&String::from("on_raw_packet")));
-            }
-            other => panic!("expected strict provider capability failure, got {other:?}"),
-        }
     }
 
     #[test]
     fn provider_stream_strict_policy_allows_supported_provider_updates() {
-        crate::runtime_env::set_runtime_env_overrides([(
-            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
-            String::from("strict"),
-        )]);
-        let plugin_host = PluginHost::builder()
-            .add_plugin(TransactionOnlyPlugin)
-            .build();
-        let derived_state_host = DerivedStateHost::builder().build();
-        let result = enforce_provider_stream_capability_policy(
-            ProviderStreamMode::YellowstoneGrpc,
-            &plugin_host,
-            &derived_state_host,
+        with_runtime_env_overrides(
+            [(
+                String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+                String::from("strict"),
+            )],
+            || {
+                let plugin_host = PluginHost::builder()
+                    .add_plugin(TransactionOnlyPlugin)
+                    .build();
+                let derived_state_host = DerivedStateHost::builder().build();
+                let result = enforce_provider_stream_capability_policy(
+                    ProviderStreamMode::YellowstoneGrpc,
+                    &plugin_host,
+                    &derived_state_host,
+                );
+                assert!(result.is_ok());
+            },
         );
-        crate::runtime_env::clear_runtime_env_overrides();
-        assert!(result.is_ok());
     }
 
     #[test]
     fn built_in_non_transaction_provider_modes_reject_recent_blockhash_even_under_warn() {
-        crate::runtime_env::set_runtime_env_overrides([(
-            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
-            String::from("warn"),
-        )]);
-        let plugin_host = PluginHost::builder()
-            .add_plugin(RecentBlockhashPlugin)
-            .build();
-        let derived_state_host = DerivedStateHost::builder().build();
-        let result = enforce_provider_stream_capability_policy(
-            ProviderStreamMode::YellowstoneGrpcAccounts,
-            &plugin_host,
-            &derived_state_host,
+        with_runtime_env_overrides(
+            [(
+                String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+                String::from("warn"),
+            )],
+            || {
+                let plugin_host = PluginHost::builder()
+                    .add_plugin(RecentBlockhashPlugin)
+                    .build();
+                let derived_state_host = DerivedStateHost::builder().build();
+                let result = enforce_provider_stream_capability_policy(
+                    ProviderStreamMode::YellowstoneGrpcAccounts,
+                    &plugin_host,
+                    &derived_state_host,
+                );
+                match result {
+                    Err(RuntimeError::ProviderStream(
+                        ProviderStreamRuntimeError::BuiltInUnsupportedHooks {
+                            unsupported_hooks,
+                            ..
+                        },
+                    )) => {
+                        assert!(unsupported_hooks.contains(&String::from("on_recent_blockhash")));
+                    }
+                    other => {
+                        panic!(
+                            "expected built-in recent-blockhash capability failure, got {other:?}"
+                        )
+                    }
+                }
+            },
         );
-        crate::runtime_env::clear_runtime_env_overrides();
-        match result {
-            Err(RuntimeError::ProviderStream(
-                ProviderStreamRuntimeError::BuiltInUnsupportedHooks {
-                    unsupported_hooks, ..
-                },
-            )) => {
-                assert!(unsupported_hooks.contains(&String::from("on_recent_blockhash")));
-            }
-            other => panic!("expected built-in recent-blockhash capability failure, got {other:?}"),
-        }
     }
 
     #[test]
     fn provider_stream_strict_policy_rejects_unsupported_derived_state_subscriptions() {
-        crate::runtime_env::set_runtime_env_overrides([(
-            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
-            String::from("strict"),
-        )]);
-        let plugin_host = PluginHost::builder().build();
-        let derived_state_host = DerivedStateHost::builder()
-            .add_consumer(AccountTouchDerivedStateConsumer)
-            .add_consumer(ControlPlaneDerivedStateConsumer)
-            .build();
-        let result = enforce_provider_stream_capability_policy(
-            ProviderStreamMode::YellowstoneGrpc,
-            &plugin_host,
-            &derived_state_host,
+        with_runtime_env_overrides(
+            [(
+                String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+                String::from("strict"),
+            )],
+            || {
+                let plugin_host = PluginHost::builder().build();
+                let derived_state_host = DerivedStateHost::builder()
+                    .add_consumer(AccountTouchDerivedStateConsumer)
+                    .add_consumer(ControlPlaneDerivedStateConsumer)
+                    .build();
+                let result = enforce_provider_stream_capability_policy(
+                    ProviderStreamMode::YellowstoneGrpc,
+                    &plugin_host,
+                    &derived_state_host,
+                );
+                match result {
+                    Err(RuntimeError::ProviderStream(
+                        ProviderStreamRuntimeError::BuiltInUnsupportedHooks {
+                            unsupported_hooks,
+                            ..
+                        },
+                    )) => {
+                        assert!(
+                            unsupported_hooks
+                                .contains(&String::from("derived_state.account_touch_observed"))
+                        );
+                        assert!(
+                            unsupported_hooks
+                                .contains(&String::from("derived_state.control_plane_observed"))
+                        );
+                    }
+                    other => panic!("expected strict provider capability failure, got {other:?}"),
+                }
+            },
         );
-        crate::runtime_env::clear_runtime_env_overrides();
-        match result {
-            Err(RuntimeError::ProviderStream(
-                ProviderStreamRuntimeError::BuiltInUnsupportedHooks {
-                    unsupported_hooks, ..
-                },
-            )) => {
-                assert!(
-                    unsupported_hooks
-                        .contains(&String::from("derived_state.account_touch_observed"))
-                );
-                assert!(
-                    unsupported_hooks
-                        .contains(&String::from("derived_state.control_plane_observed"))
-                );
-            }
-            other => panic!("expected strict provider capability failure, got {other:?}"),
-        }
     }
 
+    #[cfg(feature = "gossip-bootstrap")]
+    #[test]
+    fn built_in_provider_modes_allow_cluster_topology_when_gossip_is_configured() {
+        with_runtime_env_overrides(
+            [
+                (
+                    String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+                    String::from("strict"),
+                ),
+                (
+                    String::from("SOF_GOSSIP_ENTRYPOINT"),
+                    String::from("entrypoint.mainnet-beta.solana.com:8001"),
+                ),
+            ],
+            || {
+                let plugin_host = PluginHost::builder()
+                    .add_plugin(ClusterTopologyOnlyPlugin)
+                    .build();
+                let derived_state_host = DerivedStateHost::builder().build();
+                let result = enforce_provider_stream_capability_policy(
+                    ProviderStreamMode::YellowstoneGrpc,
+                    &plugin_host,
+                    &derived_state_host,
+                );
+                assert!(result.is_ok());
+            },
+        );
+    }
+
+    #[cfg(feature = "gossip-bootstrap")]
     #[test]
     fn built_in_provider_modes_reject_control_plane_hooks_even_under_warn() {
-        crate::runtime_env::set_runtime_env_overrides([(
-            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
-            String::from("warn"),
-        )]);
         struct ControlPlanePlugin;
 
         #[async_trait]
@@ -4315,40 +4579,50 @@ mod tests {
             }
         }
 
-        let plugin_host = PluginHost::builder().add_plugin(ControlPlanePlugin).build();
-        let derived_state_host = DerivedStateHost::builder()
-            .add_consumer(ControlPlaneDerivedStateConsumer)
-            .build();
-        let result = enforce_provider_stream_capability_policy(
-            ProviderStreamMode::YellowstoneGrpc,
-            &plugin_host,
-            &derived_state_host,
-        );
-        crate::runtime_env::clear_runtime_env_overrides();
-        match result {
-            Err(RuntimeError::ProviderStream(
-                ProviderStreamRuntimeError::BuiltInUnsupportedHooks {
-                    unsupported_hooks, ..
-                },
-            )) => {
-                assert!(unsupported_hooks.contains(&String::from("on_cluster_topology")));
-                assert!(unsupported_hooks.contains(&String::from("on_leader_schedule")));
-                assert!(unsupported_hooks.contains(&String::from("on_reorg")));
-                assert!(
-                    unsupported_hooks
-                        .contains(&String::from("derived_state.control_plane_observed"))
+        with_runtime_env_overrides(
+            [
+                (
+                    String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+                    String::from("warn"),
+                ),
+                (
+                    String::from("SOF_GOSSIP_ENTRYPOINT"),
+                    String::from("entrypoint.mainnet-beta.solana.com:8001"),
+                ),
+            ],
+            || {
+                let plugin_host = PluginHost::builder().add_plugin(ControlPlanePlugin).build();
+                let derived_state_host = DerivedStateHost::builder()
+                    .add_consumer(ControlPlaneDerivedStateConsumer)
+                    .build();
+                let result = enforce_provider_stream_capability_policy(
+                    ProviderStreamMode::YellowstoneGrpc,
+                    &plugin_host,
+                    &derived_state_host,
                 );
-            }
-            other => panic!("expected built-in provider capability failure, got {other:?}"),
-        }
+                match result {
+                    Err(RuntimeError::ProviderStream(
+                        ProviderStreamRuntimeError::BuiltInUnsupportedHooks {
+                            unsupported_hooks,
+                            ..
+                        },
+                    )) => {
+                        assert!(!unsupported_hooks.contains(&String::from("on_cluster_topology")));
+                        assert!(unsupported_hooks.contains(&String::from("on_leader_schedule")));
+                        assert!(unsupported_hooks.contains(&String::from("on_reorg")));
+                        assert!(
+                            unsupported_hooks
+                                .contains(&String::from("derived_state.control_plane_observed"))
+                        );
+                    }
+                    other => panic!("expected built-in provider capability failure, got {other:?}"),
+                }
+            },
+        );
     }
 
     #[test]
     fn provider_stream_strict_policy_allows_generic_leader_schedule_reorg_and_control_plane() {
-        crate::runtime_env::set_runtime_env_overrides([(
-            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
-            String::from("strict"),
-        )]);
         struct LeaderScheduleReorgPlugin;
 
         #[async_trait]
@@ -4362,79 +4636,103 @@ mod tests {
             }
         }
 
-        let plugin_host = PluginHost::builder()
-            .add_plugin(LeaderScheduleReorgPlugin)
-            .build();
-        let derived_state_host = DerivedStateHost::builder()
-            .add_consumer(ControlPlaneDerivedStateConsumer)
-            .build();
-        let result = enforce_provider_stream_capability_policy(
-            ProviderStreamMode::Generic,
-            &plugin_host,
-            &derived_state_host,
+        with_runtime_env_overrides(
+            [(
+                String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+                String::from("strict"),
+            )],
+            || {
+                let plugin_host = PluginHost::builder()
+                    .add_plugin(LeaderScheduleReorgPlugin)
+                    .build();
+                let derived_state_host = DerivedStateHost::builder()
+                    .add_consumer(ControlPlaneDerivedStateConsumer)
+                    .build();
+                let result = enforce_provider_stream_capability_policy(
+                    ProviderStreamMode::Generic,
+                    &plugin_host,
+                    &derived_state_host,
+                );
+                assert!(result.is_ok());
+            },
         );
-        crate::runtime_env::clear_runtime_env_overrides();
-        assert!(result.is_ok());
     }
 
     #[test]
     fn provider_stream_rejects_sof_tx_live_adapter_even_under_warn() {
-        crate::runtime_env::set_runtime_env_overrides([(
-            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
-            String::from("warn"),
-        )]);
-        let plugin_host = PluginHost::builder()
-            .add_plugin(SofTxAdapterLikePlugin)
-            .build();
-        let derived_state_host = DerivedStateHost::builder().build();
-        let result = enforce_provider_stream_capability_policy(
-            ProviderStreamMode::YellowstoneGrpc,
-            &plugin_host,
-            &derived_state_host,
+        with_runtime_env_overrides(
+            [
+                (
+                    String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+                    String::from("warn"),
+                ),
+                (
+                    String::from("SOF_GOSSIP_ENTRYPOINT"),
+                    String::from("entrypoint.mainnet-beta.solana.com:8001"),
+                ),
+                (
+                    String::from("SOF_GOSSIP_RUNTIME_MODE"),
+                    String::from("control_plane_only"),
+                ),
+            ],
+            || {
+                let plugin_host = PluginHost::builder()
+                    .add_plugin(SofTxAdapterLikePlugin)
+                    .build();
+                let derived_state_host = DerivedStateHost::builder().build();
+                let result = enforce_provider_stream_capability_policy(
+                    ProviderStreamMode::YellowstoneGrpc,
+                    &plugin_host,
+                    &derived_state_host,
+                );
+                match result {
+                    Err(RuntimeError::ProviderStream(
+                        ProviderStreamRuntimeError::BuiltInUnsupportedHooks {
+                            unsupported_hooks,
+                            ..
+                        },
+                    )) => {
+                        assert!(unsupported_hooks.contains(&String::from("on_leader_schedule")));
+                    }
+                    other => panic!("expected sof-tx live adapter failure, got {other:?}"),
+                }
+            },
         );
-        crate::runtime_env::clear_runtime_env_overrides();
-        match result {
-            Err(RuntimeError::ProviderStream(
-                ProviderStreamRuntimeError::BuiltInUnsupportedHooks {
-                    unsupported_hooks, ..
-                },
-            )) => {
-                assert!(unsupported_hooks.contains(&String::from("on_cluster_topology")));
-                assert!(unsupported_hooks.contains(&String::from("on_leader_schedule")));
-            }
-            other => panic!("expected sof-tx live adapter failure, got {other:?}"),
-        }
     }
 
     #[test]
     fn provider_stream_rejects_sof_tx_replay_adapter_even_under_warn() {
-        crate::runtime_env::set_runtime_env_overrides([(
-            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
-            String::from("warn"),
-        )]);
-        let plugin_host = PluginHost::builder().build();
-        let derived_state_host = DerivedStateHost::builder()
-            .add_consumer(SofTxDerivedStateAdapterLikeConsumer)
-            .build();
-        let result = enforce_provider_stream_capability_policy(
-            ProviderStreamMode::YellowstoneGrpc,
-            &plugin_host,
-            &derived_state_host,
-        );
-        crate::runtime_env::clear_runtime_env_overrides();
-        match result {
-            Err(RuntimeError::ProviderStream(
-                ProviderStreamRuntimeError::BuiltInUnsupportedHooks {
-                    unsupported_hooks, ..
-                },
-            )) => {
-                assert!(
-                    unsupported_hooks
-                        .contains(&String::from("derived_state.control_plane_observed"))
+        with_runtime_env_overrides(
+            [(
+                String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+                String::from("warn"),
+            )],
+            || {
+                let plugin_host = PluginHost::builder().build();
+                let derived_state_host = DerivedStateHost::builder()
+                    .add_consumer(SofTxDerivedStateAdapterLikeConsumer)
+                    .build();
+                let result = enforce_provider_stream_capability_policy(
+                    ProviderStreamMode::YellowstoneGrpc,
+                    &plugin_host,
+                    &derived_state_host,
                 );
-            }
-            other => panic!("expected sof-tx replay adapter failure, got {other:?}"),
-        }
+                match result {
+                    Err(RuntimeError::ProviderStream(
+                        ProviderStreamRuntimeError::BuiltInUnsupportedHooks {
+                            unsupported_hooks,
+                            ..
+                        },
+                    )) => {
+                        assert!(
+                            unsupported_hooks
+                                .contains(&String::from("derived_state.control_plane_observed"))
+                        );
+                    }
+                    other => panic!("expected sof-tx replay adapter failure, got {other:?}"),
+                }
+            },
+        );
     }
 
     #[test]
@@ -4755,106 +5053,108 @@ mod tests {
             }
         }
 
-        crate::runtime_env::set_runtime_env_overrides([(
-            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
-            String::from("strict"),
-        )]);
+        with_runtime_env_overrides(
+            [(
+                String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+                String::from("strict"),
+            )],
+            || {
+                let transaction_status_host = PluginHost::builder()
+                    .add_plugin(TransactionStatusPlugin)
+                    .build();
+                let account_update_host = PluginHost::builder()
+                    .add_plugin(AccountUpdatePlugin)
+                    .build();
+                let block_meta_host = PluginHost::builder().add_plugin(BlockMetaPlugin).build();
+                let slot_status_host = PluginHost::builder().add_plugin(SlotStatusPlugin).build();
+                let derived_state_host = DerivedStateHost::builder().build();
 
-        let transaction_status_host = PluginHost::builder()
-            .add_plugin(TransactionStatusPlugin)
-            .build();
-        let account_update_host = PluginHost::builder()
-            .add_plugin(AccountUpdatePlugin)
-            .build();
-        let block_meta_host = PluginHost::builder().add_plugin(BlockMetaPlugin).build();
-        let slot_status_host = PluginHost::builder().add_plugin(SlotStatusPlugin).build();
-        let derived_state_host = DerivedStateHost::builder().build();
-
-        assert!(
-            enforce_provider_stream_capability_policy(
-                ProviderStreamMode::YellowstoneGrpcTransactionStatus,
-                &transaction_status_host,
-                &derived_state_host,
-            )
-            .is_ok()
+                assert!(
+                    enforce_provider_stream_capability_policy(
+                        ProviderStreamMode::YellowstoneGrpcTransactionStatus,
+                        &transaction_status_host,
+                        &derived_state_host,
+                    )
+                    .is_ok()
+                );
+                assert!(
+                    enforce_provider_stream_capability_policy(
+                        ProviderStreamMode::YellowstoneGrpcAccounts,
+                        &account_update_host,
+                        &derived_state_host,
+                    )
+                    .is_ok()
+                );
+                assert!(
+                    enforce_provider_stream_capability_policy(
+                        ProviderStreamMode::YellowstoneGrpcBlockMeta,
+                        &block_meta_host,
+                        &derived_state_host,
+                    )
+                    .is_ok()
+                );
+                assert!(
+                    enforce_provider_stream_capability_policy(
+                        ProviderStreamMode::YellowstoneGrpcSlots,
+                        &slot_status_host,
+                        &derived_state_host,
+                    )
+                    .is_ok()
+                );
+            },
         );
-        assert!(
-            enforce_provider_stream_capability_policy(
-                ProviderStreamMode::YellowstoneGrpcAccounts,
-                &account_update_host,
-                &derived_state_host,
-            )
-            .is_ok()
-        );
-        assert!(
-            enforce_provider_stream_capability_policy(
-                ProviderStreamMode::YellowstoneGrpcBlockMeta,
-                &block_meta_host,
-                &derived_state_host,
-            )
-            .is_ok()
-        );
-        assert!(
-            enforce_provider_stream_capability_policy(
-                ProviderStreamMode::YellowstoneGrpcSlots,
-                &slot_status_host,
-                &derived_state_host,
-            )
-            .is_ok()
-        );
-
-        crate::runtime_env::clear_runtime_env_overrides();
     }
 
     #[test]
     fn provider_stream_strict_policy_allows_transaction_status_and_block_meta_derived_state() {
-        crate::runtime_env::set_runtime_env_overrides([(
-            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
-            String::from("strict"),
-        )]);
+        with_runtime_env_overrides(
+            [(
+                String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+                String::from("strict"),
+            )],
+            || {
+                let plugin_host = PluginHost::builder().build();
+                let transaction_status_host = DerivedStateHost::builder()
+                    .add_consumer(TransactionStatusDerivedStateConsumer)
+                    .build();
+                let block_meta_host = DerivedStateHost::builder()
+                    .add_consumer(BlockMetaDerivedStateConsumer)
+                    .build();
 
-        let plugin_host = PluginHost::builder().build();
-        let transaction_status_host = DerivedStateHost::builder()
-            .add_consumer(TransactionStatusDerivedStateConsumer)
-            .build();
-        let block_meta_host = DerivedStateHost::builder()
-            .add_consumer(BlockMetaDerivedStateConsumer)
-            .build();
-
-        assert!(
-            enforce_provider_stream_capability_policy(
-                ProviderStreamMode::YellowstoneGrpcTransactionStatus,
-                &plugin_host,
-                &transaction_status_host,
-            )
-            .is_ok()
+                assert!(
+                    enforce_provider_stream_capability_policy(
+                        ProviderStreamMode::YellowstoneGrpcTransactionStatus,
+                        &plugin_host,
+                        &transaction_status_host,
+                    )
+                    .is_ok()
+                );
+                assert!(
+                    enforce_provider_stream_capability_policy(
+                        ProviderStreamMode::YellowstoneGrpcBlockMeta,
+                        &plugin_host,
+                        &block_meta_host,
+                    )
+                    .is_ok()
+                );
+                assert!(
+                    enforce_provider_stream_capability_policy(
+                        ProviderStreamMode::LaserStreamTransactionStatus,
+                        &plugin_host,
+                        &transaction_status_host,
+                    )
+                    .is_ok()
+                );
+                assert!(
+                    enforce_provider_stream_capability_policy(
+                        ProviderStreamMode::LaserStreamBlockMeta,
+                        &plugin_host,
+                        &block_meta_host,
+                    )
+                    .is_ok()
+                );
+            },
         );
-        assert!(
-            enforce_provider_stream_capability_policy(
-                ProviderStreamMode::YellowstoneGrpcBlockMeta,
-                &plugin_host,
-                &block_meta_host,
-            )
-            .is_ok()
-        );
-        assert!(
-            enforce_provider_stream_capability_policy(
-                ProviderStreamMode::LaserStreamTransactionStatus,
-                &plugin_host,
-                &transaction_status_host,
-            )
-            .is_ok()
-        );
-        assert!(
-            enforce_provider_stream_capability_policy(
-                ProviderStreamMode::LaserStreamBlockMeta,
-                &plugin_host,
-                &block_meta_host,
-            )
-            .is_ok()
-        );
-
-        crate::runtime_env::clear_runtime_env_overrides();
     }
 
     #[test]
@@ -4898,43 +5198,47 @@ mod tests {
 
     #[tokio::test]
     async fn provider_stream_strict_policy_fails_before_plugin_and_extension_startup() {
-        crate::runtime_env::set_runtime_env_overrides([(
-            String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
-            String::from("strict"),
-        )]);
-        let plugin_counter = Arc::new(AtomicUsize::new(0));
-        let extension_counter = Arc::new(AtomicUsize::new(0));
-        let plugin_host = PluginHost::builder()
-            .add_plugin(StartupCounterPlugin {
-                counter: Arc::clone(&plugin_counter),
-            })
-            .build();
-        let extension_host = RuntimeExtensionHost::builder()
-            .add_extension(StartupCounterExtension {
-                counter: Arc::clone(&extension_counter),
-            })
-            .build();
-        let (_tx, rx) = crate::provider_stream::create_provider_stream_queue(1);
+        with_runtime_env_overrides_async(
+            [(
+                String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
+                String::from("strict"),
+            )],
+            || async {
+                let plugin_counter = Arc::new(AtomicUsize::new(0));
+                let extension_counter = Arc::new(AtomicUsize::new(0));
+                let plugin_host = PluginHost::builder()
+                    .add_plugin(StartupCounterPlugin {
+                        counter: Arc::clone(&plugin_counter),
+                    })
+                    .build();
+                let extension_host = RuntimeExtensionHost::builder()
+                    .add_extension(StartupCounterExtension {
+                        counter: Arc::clone(&extension_counter),
+                    })
+                    .build();
+                let (_tx, rx) = crate::provider_stream::create_provider_stream_queue(1);
 
-        let result = run_provider_stream_runtime(
-            plugin_host,
-            extension_host,
-            DerivedStateHost::builder().build(),
-            None,
-            ProviderStreamMode::YellowstoneGrpc,
-            rx,
+                let result = run_provider_stream_runtime(
+                    plugin_host,
+                    extension_host,
+                    DerivedStateHost::builder().build(),
+                    None,
+                    ProviderStreamMode::YellowstoneGrpc,
+                    rx,
+                )
+                .await;
+
+                assert!(matches!(
+                    result,
+                    Err(RuntimeError::ProviderStream(
+                        ProviderStreamRuntimeError::BuiltInUnsupportedHooks { .. }
+                    ))
+                ));
+                assert_eq!(plugin_counter.load(Ordering::Relaxed), 0);
+                assert_eq!(extension_counter.load(Ordering::Relaxed), 0);
+            },
         )
         .await;
-        crate::runtime_env::clear_runtime_env_overrides();
-
-        assert!(matches!(
-            result,
-            Err(RuntimeError::ProviderStream(
-                ProviderStreamRuntimeError::BuiltInUnsupportedHooks { .. }
-            ))
-        ));
-        assert_eq!(plugin_counter.load(Ordering::Relaxed), 0);
-        assert_eq!(extension_counter.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -5086,86 +5390,94 @@ mod tests {
 
     #[tokio::test]
     async fn provider_stream_runtime_allows_generic_eof_when_configured() {
-        crate::runtime_env::set_runtime_env_overrides([(
-            String::from("SOF_PROVIDER_STREAM_ALLOW_EOF"),
-            String::from("true"),
-        )]);
-        let plugin_host = PluginHost::builder()
-            .add_plugin(TransactionOnlyPlugin)
-            .build();
-        let extension_host = RuntimeExtensionHost::builder().build();
-        let (tx, rx) = crate::provider_stream::create_provider_stream_queue(1);
-        drop(tx);
+        with_runtime_env_overrides_async(
+            [(
+                String::from("SOF_PROVIDER_STREAM_ALLOW_EOF"),
+                String::from("true"),
+            )],
+            || async {
+                let plugin_host = PluginHost::builder()
+                    .add_plugin(TransactionOnlyPlugin)
+                    .build();
+                let extension_host = RuntimeExtensionHost::builder().build();
+                let (tx, rx) = crate::provider_stream::create_provider_stream_queue(1);
+                drop(tx);
 
-        let result = run_provider_stream_runtime(
-            plugin_host,
-            extension_host,
-            DerivedStateHost::builder().build(),
-            None,
-            ProviderStreamMode::Generic,
-            rx,
+                let result = run_provider_stream_runtime(
+                    plugin_host,
+                    extension_host,
+                    DerivedStateHost::builder().build(),
+                    None,
+                    ProviderStreamMode::Generic,
+                    rx,
+                )
+                .await;
+
+                assert!(
+                    result.is_ok(),
+                    "expected configured generic EOF to stop cleanly"
+                );
+            },
         )
         .await;
-        crate::runtime_env::clear_runtime_env_overrides();
-
-        assert!(
-            result.is_ok(),
-            "expected configured generic EOF to stop cleanly"
-        );
     }
 
     #[tokio::test]
     async fn provider_stream_runtime_rejects_generic_eof_after_degraded_health() {
-        crate::runtime_env::set_runtime_env_overrides([(
-            String::from("SOF_PROVIDER_STREAM_ALLOW_EOF"),
-            String::from("true"),
-        )]);
-        let plugin_host = PluginHost::builder()
-            .add_plugin(TransactionOnlyPlugin)
-            .build();
-        let extension_host = RuntimeExtensionHost::builder().build();
-        let (tx, rx) = crate::provider_stream::create_provider_stream_queue(4);
-        tx.send(
-            crate::provider_stream::ProviderSourceHealthEvent {
-                source: crate::provider_stream::ProviderSourceIdentity::new(
-                    crate::provider_stream::ProviderSourceId::Generic(
-                        "generic_source".to_owned().into(),
-                    ),
-                    "generic_source",
-                ),
-                readiness: crate::provider_stream::ProviderSourceReadiness::Required,
-                status: crate::provider_stream::ProviderSourceHealthStatus::Reconnecting,
-                reason: crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
-                message: "upstream stalled".to_owned(),
-            }
-            .into(),
-        )
-        .await
-        .expect("health sent");
-        drop(tx);
+        with_runtime_env_overrides_async(
+            [(
+                String::from("SOF_PROVIDER_STREAM_ALLOW_EOF"),
+                String::from("true"),
+            )],
+            || async {
+                let plugin_host = PluginHost::builder()
+                    .add_plugin(TransactionOnlyPlugin)
+                    .build();
+                let extension_host = RuntimeExtensionHost::builder().build();
+                let (tx, rx) = crate::provider_stream::create_provider_stream_queue(4);
+                tx.send(
+                    crate::provider_stream::ProviderSourceHealthEvent {
+                        source: crate::provider_stream::ProviderSourceIdentity::new(
+                            crate::provider_stream::ProviderSourceId::Generic(
+                                "generic_source".to_owned().into(),
+                            ),
+                            "generic_source",
+                        ),
+                        readiness: crate::provider_stream::ProviderSourceReadiness::Required,
+                        status: crate::provider_stream::ProviderSourceHealthStatus::Reconnecting,
+                        reason: crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
+                        message: "upstream stalled".to_owned(),
+                    }
+                    .into(),
+                )
+                .await
+                .expect("health sent");
+                drop(tx);
 
-        let result = run_provider_stream_runtime(
-            plugin_host,
-            extension_host,
-            DerivedStateHost::builder().build(),
-            None,
-            ProviderStreamMode::Generic,
-            rx,
+                let result = run_provider_stream_runtime(
+                    plugin_host,
+                    extension_host,
+                    DerivedStateHost::builder().build(),
+                    None,
+                    ProviderStreamMode::Generic,
+                    rx,
+                )
+                .await;
+
+                match result {
+                    Err(RuntimeError::ProviderStream(ProviderStreamRuntimeError::IngressClosed {
+                        mode,
+                        degraded_sources,
+                    })) => {
+                        assert_eq!(mode, ProviderStreamMode::Generic);
+                        assert_eq!(degraded_sources.len(), 1);
+                        assert_eq!(degraded_sources[0].source.instance_str(), "generic_source");
+                    }
+                    other => panic!("expected degraded generic EOF failure, got {other:?}"),
+                }
+            },
         )
         .await;
-        crate::runtime_env::clear_runtime_env_overrides();
-
-        match result {
-            Err(RuntimeError::ProviderStream(ProviderStreamRuntimeError::IngressClosed {
-                mode,
-                degraded_sources,
-            })) => {
-                assert_eq!(mode, ProviderStreamMode::Generic);
-                assert_eq!(degraded_sources.len(), 1);
-                assert_eq!(degraded_sources[0].source.instance_str(), "generic_source");
-            }
-            other => panic!("expected degraded generic EOF failure, got {other:?}"),
-        }
     }
 
     #[test]

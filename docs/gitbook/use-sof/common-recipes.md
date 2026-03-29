@@ -25,12 +25,12 @@ You will usually start with:
 - direct UDP for controlled bring-up
 - `gossip-bootstrap` only once you need richer cluster context
 - `gossip-bootstrap` with `SOF_GOSSIP_RUNTIME_MODE=control_plane_only` when you only need
-  topology/leader inputs for `sof-tx` and your actual ingress or blockhash source lives elsewhere
+  topology inputs for `sof-tx` and your actual ingress or blockhash source lives elsewhere
   ; in typed setup, use `RuntimeSetup::with_gossip_runtime_mode(GossipRuntimeMode::ControlPlaneOnly)`
 - built-in websocket or Yellowstone/LaserStream transaction feeds when you want SOF to keep
   recent blockhash fresh from observed provider transactions without using gossip for data ingress
-  ; combine this with gossip topology/leaders only in a custom embedding, not in one packaged
-  built-in runtime mode today
+  ; the packaged runtime can now combine this with gossip topology in the same process, but
+  leader-schedule/reorg hooks still require raw-shred/gossip or `ProviderStreamMode::Generic`
 
 ## Submitter With External Control Plane
 

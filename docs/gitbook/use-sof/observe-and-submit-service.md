@@ -30,6 +30,16 @@ provider adapters such as Yellowstone, LaserStream, and websocket now cover tran
 transaction status, accounts, block-meta, logs, and slots, but they still do not form a complete
 built-in `sof-tx` control-plane source on their own.
 
+The packaged runtime now supports one mixed built-in shape:
+
+- built-in provider-stream transaction ingress
+- gossip bootstrap for cluster topology in the same runtime
+- `PluginHostTxProviderAdapter::topology_only(...)`
+
+That mixed mode is enough for topology-backed direct routing, but it still does not provide
+leader-schedule or reorg hooks. When you need the full control-plane surface, keep using
+raw-shred/gossip runtimes or `ProviderStreamMode::Generic`.
+
 ## Canonical Example
 
 Use the full example in:
