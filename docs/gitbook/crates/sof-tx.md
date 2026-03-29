@@ -15,7 +15,7 @@ leaders by itself.
 
 - message and transaction construction
 - signing boundary types
-- submit mode orchestration
+- submit route-plan orchestration
 - routing policy and signature dedupe
 - direct leader-target submission
 - optional Jito and kernel-bypass transports
@@ -43,12 +43,18 @@ Those responsibilities belong to `sof` or to your own external control plane.
 
 | Type | Purpose |
 | --- | --- |
-| `TxBuilder` | build legacy or `V0` transactions |
+| `sof-solana-compat::TxBuilder` | build legacy or `V0` transactions |
 | `TxSubmitClient` | configure transports and submit policy |
-| `SubmitMode` | choose `RpcOnly`, `JitoOnly`, `DirectOnly`, or `Hybrid` |
+| `SubmitPlan` | choose one or more routes plus execution strategy |
+| `SubmitRoute` | one concrete route: `Rpc`, `Jito`, or `Direct` |
+| `SubmitStrategy` | ordered fallback or all-at-once execution |
+| `SubmitMode` | legacy preset compatibility layer |
 | `RoutingPolicy` | choose primary and fallback fanout behavior |
 | `SignatureDeduper` | avoid duplicate sends at signature granularity |
 | `LeaderProvider` / `RecentBlockhashProvider` | abstract control-plane sources |
+
+Use `sof-solana-compat` when you want the Solana-native `TxBuilder` plus unsigned convenience
+submission helpers on top of `sof-tx`.
 
 ## The First Three Code Paths You Will Usually Need
 
@@ -58,7 +64,8 @@ Start here when you want RPC submission and you want the client to source recent
 that same RPC endpoint.
 
 ```rust
-use sof_tx::{SubmitMode, TxBuilder, TxSubmitClient};
+use sof_solana_compat::{TxBuilder, TxSubmitClientSolanaExt};
+use sof_tx::{SubmitPlan, TxSubmitClient};
 use solana_keypair::Keypair;
 use solana_signer::Signer;
 use solana_system_interface::instruction as system_instruction;
@@ -77,7 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let _ = client
-        .submit_unsigned(builder, &[&payer], SubmitMode::RpcOnly)
+        .submit_unsigned_via(builder, &[&payer], SubmitPlan::rpc_only())
         .await?;
 
     Ok(())
@@ -96,10 +103,8 @@ unsigned submit path still needs a recent blockhash even when the submit itself 
 ```rust
 use std::sync::Arc;
 
-use sof_tx::{
-    SubmitMode, TxBuilder, TxSubmitClient,
-    submit::JitoJsonRpcTransport,
-};
+use sof_solana_compat::{TxBuilder, TxSubmitClientSolanaExt};
+use sof_tx::{SubmitPlan, TxSubmitClient, submit::JitoJsonRpcTransport};
 use solana_keypair::Keypair;
 use solana_signer::Signer;
 use solana_system_interface::instruction as system_instruction;
@@ -119,7 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let _ = client
-        .submit_unsigned(builder, &[&payer], SubmitMode::JitoOnly)
+        .submit_unsigned_via(builder, &[&payer], SubmitPlan::jito_only())
         .await?;
 
     Ok(())
@@ -133,10 +138,7 @@ Start here when your signer already lives elsewhere and you only need the submit
 ```rust
 use std::sync::Arc;
 
-use sof_tx::{
-    SignedTx, SubmitMode, TxSubmitClient,
-    submit::JsonRpcTransport,
-};
+use sof_tx::{SignedTx, SubmitPlan, SubmitRoute, TxSubmitClient, submit::JsonRpcTransport};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -148,72 +150,83 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let tx_bytes = Vec::new();
     let _ = client
-        .submit_signed(SignedTx::WireTransactionBytes(tx_bytes), SubmitMode::RpcOnly)
+        .submit_signed_via(
+            SignedTx::WireTransactionBytes(tx_bytes),
+            SubmitPlan::all_at_once(vec![SubmitRoute::Rpc, SubmitRoute::Jito]),
+        )
         .await?;
 
     Ok(())
 }
 ```
 
-Use this path when you already have signed transaction bytes. `submit_signed(...)` does not build
+Use this path when you already have signed transaction bytes. `submit_signed_via(...)` does not build
 the transaction inside the client, so there is no blockhash lookup step here.
 
 ### 3. Use `sof-tx` with live control-plane state from `sof`
 
 Start here when one process owns both observation and submission.
 
+See the full example in:
+
+- `crates/sof-tx/examples/submit_all_at_once_with_sof.rs`
+
+It shows one full process shape with:
+
+- `PluginHostTxProviderAdapter`
+- SOF plugin-host wiring
+- RPC blockhash refresh plus SOF-backed leader routing
+- direct, RPC, and Jito transports configured together
+- `SubmitPlan::all_at_once(vec![Direct, Rpc, Jito])`
+
+## Submit Plans
+
+`SubmitPlan` is the primary API:
+
+- `SubmitPlan::rpc_only()`: simplest operational path when you can accept RPC dependency
+- `SubmitPlan::jito_only()`: block-engine only submission
+- `SubmitPlan::direct_only()`: lowest-latency path when local leader and TPU state are reliable
+- `SubmitPlan::ordered(vec![...])`: custom ordered-fallback route plan
+- `SubmitPlan::hybrid()`: direct first with RPC fallback
+- `SubmitPlan::all_at_once(vec![...])`: preferred multi-route shape when you want to maximize the
+  chance that one of several configured routes accepts the same transaction quickly. The submit
+  call returns on the first accepted route; later background accepts are surfaced through
+  `TxSubmitOutcomeReporter`, and built-in telemetry still counts those accepts instead of mutating
+  the original `SubmitResult`.
+
+Arbitrary plans are first-class:
+
 ```rust
-use std::sync::Arc;
+use sof_tx::{SubmitPlan, SubmitRoute};
 
-use sof::framework::{ObserverPlugin, PluginHost};
-use sof_tx::{
-    SubmitMode, TxBuilder, TxSubmitClient,
-    adapters::PluginHostTxProviderAdapter,
-};
+let ordered = SubmitPlan::ordered(vec![
+    SubmitRoute::Direct,
+    SubmitRoute::Jito,
+    SubmitRoute::Rpc,
+]);
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let adapter = Arc::new(PluginHostTxProviderAdapter::default());
-    let host = PluginHost::builder()
-        .add_shared_plugin(adapter.clone() as Arc<dyn ObserverPlugin>)
-        .build();
+let concurrent = SubmitPlan::all_at_once(vec![
+    SubmitRoute::Direct,
+    SubmitRoute::Jito,
+]);
 
-    adapter.prime_from_plugin_host(&host);
-    let _client = TxSubmitClient::new(adapter.clone(), adapter.clone());
-
-    // Start `sof` with the plugin host in the same process, then submit with `sof-tx`.
-    let _ = SubmitMode::Hybrid;
-    let _ = TxBuilder::new(solana_pubkey::Pubkey::new_unique());
-
-    Ok(())
-}
+let _ = (ordered, concurrent);
 ```
 
-This is the shortest path to the “one process observes and sends” architecture.
+When you intentionally configure more than one route, prefer `SubmitPlan::all_at_once(...)`
+unless you specifically need ordered fallback semantics.
 
-## Submission Modes
+`SubmitMode` still exists, but only as a legacy preset layer:
 
-### `RpcOnly`
+- `RpcOnly` -> `SubmitPlan::rpc_only()`
+- `JitoOnly` -> `SubmitPlan::jito_only()`
+- `DirectOnly` -> `SubmitPlan::direct_only()`
+- `Hybrid` -> `SubmitPlan::hybrid()`
 
-Use when you want the simplest operational path and can accept RPC dependency for delivery.
-
-### `DirectOnly`
-
-Use when you have confidence in local leader and TPU endpoint state and want the lowest-latency
-path.
-
-### `Hybrid`
-
-Use when you want direct leader targeting first with an RPC fallback path. This is the normal
-upgrade path after a service has already proven its RPC or Jito flow and now wants to add
-lower-latency direct routing on top.
-
-### `JitoOnly`
-
-Use when your flow is built explicitly around block-engine submission.
-
-If you only want Jito submission, start with `TxSubmitClient::builder()` and
-`.with_jito_defaults(...)`.
+If a plan includes `SubmitRoute::Jito`, remember that Jito is not just a transport toggle. The
+transaction still needs the right fee and tip shape for that path. Jito's current transaction
+docs describe a minimum bundle tip of `1000` lamports, and that floor may still be too low during
+competitive periods.
 
 ## Integration With `sof`
 
@@ -262,10 +275,17 @@ in implicit retries.
 
 1. start with `TxBuilder` and `TxSubmitClient`
 2. wire in RPC transport first, or Jito if that is already the intended execution path
-3. use `submit_signed(...)` when signing and blockhash sourcing already live elsewhere
-4. add direct transport and `Hybrid` mode only after local routing state is available and measured
+3. use `submit_signed_via(...)` when signing already lives elsewhere
+4. add direct transport and `SubmitPlan::hybrid()` only after local routing state is available and measured
 5. attach `sof` adapters only when you want locally observed control-plane state to drive those
    direct or hybrid decisions
+
+If you intentionally configure more than one route, prefer `SubmitPlan::all_at_once(...)` as the
+multi-route shape. It returns on the first accepted route, while later accepts are surfaced
+through the external outcome reporter. That reporter path is asynchronous and best-effort through
+one bounded FIFO dispatcher per reporter instance, shared across clients that use that same
+reporter, while built-in telemetry still counts every outcome inline. If reporter delivery drops
+or becomes unavailable, that is surfaced through the built-in telemetry snapshot.
 
 ## What To Open In The Repository
 

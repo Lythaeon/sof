@@ -36,8 +36,9 @@ pub use rpc::JsonRpcTransport;
 pub use types::{
     DirectSubmitConfig, DirectSubmitTransport, JitoSubmitConfig, JitoSubmitResponse,
     JitoSubmitTransport, RpcSubmitConfig, RpcSubmitTransport, SignedTx, SubmitError, SubmitMode,
-    SubmitReliability, SubmitResult, SubmitTransportError, TxFlowSafetyIssue, TxFlowSafetyQuality,
-    TxFlowSafetySnapshot, TxFlowSafetySource, TxSubmitContext, TxSubmitGuardPolicy,
-    TxSubmitOutcome, TxSubmitOutcomeKind, TxSubmitOutcomeReporter, TxSubmitSuppressionKey,
-    TxToxicFlowRejectionReason, TxToxicFlowTelemetry, TxToxicFlowTelemetrySnapshot,
+    SubmitPlan, SubmitReliability, SubmitResult, SubmitRoute, SubmitStrategy, SubmitTransportError,
+    TxFlowSafetyIssue, TxFlowSafetyQuality, TxFlowSafetySnapshot, TxFlowSafetySource,
+    TxSubmitContext, TxSubmitGuardPolicy, TxSubmitOutcome, TxSubmitOutcomeKind,
+    TxSubmitOutcomeReporter, TxSubmitSuppressionKey, TxToxicFlowRejectionReason,
+    TxToxicFlowTelemetry, TxToxicFlowTelemetrySnapshot,
 };

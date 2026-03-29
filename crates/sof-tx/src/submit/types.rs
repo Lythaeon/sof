@@ -17,7 +17,7 @@ use thiserror::Error;
 
 use crate::{providers::LeaderTarget, routing::RoutingPolicy};
 
-/// Runtime submit mode.
+/// Legacy runtime submit presets.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SubmitMode {
     /// Submit only through JSON-RPC.
@@ -28,6 +28,145 @@ pub enum SubmitMode {
     DirectOnly,
     /// Submit direct first, then RPC fallback on failure.
     Hybrid,
+}
+
+/// One concrete submit route.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum SubmitRoute {
+    /// JSON-RPC submission.
+    Rpc,
+    /// Jito block-engine submission.
+    Jito,
+    /// Direct leader/validator submission.
+    Direct,
+}
+
+/// Route execution policy for one submission attempt.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default, Serialize, Deserialize)]
+pub enum SubmitStrategy {
+    /// Execute routes in order and stop at the first accepted route.
+    #[default]
+    OrderedFallback,
+    /// Execute all configured routes at the same time.
+    AllAtOnce,
+}
+
+/// Route-plan based submission configuration.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SubmitPlan {
+    /// Configured submit routes.
+    pub routes: Vec<SubmitRoute>,
+    /// Route execution strategy.
+    pub strategy: SubmitStrategy,
+}
+
+impl SubmitPlan {
+    /// Creates one normalized plan.
+    #[must_use]
+    pub fn new(routes: Vec<SubmitRoute>, strategy: SubmitStrategy) -> Self {
+        Self { routes, strategy }.into_normalized()
+    }
+
+    /// Normalizes this plan in place while preserving route order.
+    #[must_use]
+    pub fn into_normalized(mut self) -> Self {
+        let mut seen_rpc = false;
+        let mut seen_jito = false;
+        let mut seen_direct = false;
+        self.routes.retain(|route| match route {
+            SubmitRoute::Rpc if seen_rpc => false,
+            SubmitRoute::Rpc => {
+                seen_rpc = true;
+                true
+            }
+            SubmitRoute::Jito if seen_jito => false,
+            SubmitRoute::Jito => {
+                seen_jito = true;
+                true
+            }
+            SubmitRoute::Direct if seen_direct => false,
+            SubmitRoute::Direct => {
+                seen_direct = true;
+                true
+            }
+        });
+        self
+    }
+
+    /// Returns a normalized clone of this plan.
+    #[must_use]
+    pub fn normalized(&self) -> Self {
+        self.clone().into_normalized()
+    }
+
+    /// Builds a single-route RPC fallback plan.
+    #[must_use]
+    pub fn rpc_only() -> Self {
+        Self::new(vec![SubmitRoute::Rpc], SubmitStrategy::OrderedFallback)
+    }
+
+    /// Builds a single-route Jito plan.
+    #[must_use]
+    pub fn jito_only() -> Self {
+        Self::new(vec![SubmitRoute::Jito], SubmitStrategy::OrderedFallback)
+    }
+
+    /// Builds a single-route direct plan.
+    #[must_use]
+    pub fn direct_only() -> Self {
+        Self::new(vec![SubmitRoute::Direct], SubmitStrategy::OrderedFallback)
+    }
+
+    /// Builds one custom ordered-fallback plan.
+    #[must_use]
+    pub fn ordered(routes: Vec<SubmitRoute>) -> Self {
+        Self::new(routes, SubmitStrategy::OrderedFallback)
+    }
+
+    /// Builds the legacy direct-then-RPC fallback plan.
+    #[must_use]
+    pub fn hybrid() -> Self {
+        Self::ordered(vec![SubmitRoute::Direct, SubmitRoute::Rpc])
+    }
+
+    /// Builds one concurrent all-route plan.
+    #[must_use]
+    pub fn all_at_once(routes: Vec<SubmitRoute>) -> Self {
+        Self::new(routes, SubmitStrategy::AllAtOnce)
+    }
+
+    /// Returns the matching legacy preset when this plan is one exact legacy shape.
+    #[must_use]
+    pub fn legacy_mode(&self) -> Option<SubmitMode> {
+        match (self.strategy, self.routes.as_slice()) {
+            (SubmitStrategy::OrderedFallback, [SubmitRoute::Rpc]) => Some(SubmitMode::RpcOnly),
+            (SubmitStrategy::OrderedFallback, [SubmitRoute::Jito]) => Some(SubmitMode::JitoOnly),
+            (SubmitStrategy::OrderedFallback, [SubmitRoute::Direct]) => {
+                Some(SubmitMode::DirectOnly)
+            }
+            (SubmitStrategy::OrderedFallback, [SubmitRoute::Direct, SubmitRoute::Rpc]) => {
+                Some(SubmitMode::Hybrid)
+            }
+            _ => None,
+        }
+    }
+}
+
+impl Default for SubmitPlan {
+    fn default() -> Self {
+        Self::rpc_only()
+    }
+}
+
+impl From<SubmitMode> for SubmitPlan {
+    fn from(value: SubmitMode) -> Self {
+        match value {
+            SubmitMode::RpcOnly => Self::rpc_only(),
+            SubmitMode::JitoOnly => Self::jito_only(),
+            SubmitMode::DirectOnly => Self::direct_only(),
+            SubmitMode::Hybrid => Self::hybrid(),
+        }
+    }
 }
 
 /// Reliability profile for direct and hybrid submission behavior.
@@ -316,18 +455,31 @@ pub enum SubmitError {
 pub struct SubmitResult {
     /// Signature parsed from submitted transaction bytes.
     pub signature: Option<SignatureBytes>,
-    /// Mode selected by caller.
-    pub mode: SubmitMode,
+    /// Route plan selected by caller.
+    pub plan: SubmitPlan,
+    /// Legacy preset used by caller when one exact preset was selected.
+    pub legacy_mode: Option<SubmitMode>,
+    /// First successful route observed before this submit call returned.
+    pub first_success_route: Option<SubmitRoute>,
+    ///
+    /// Later background accepts from concurrently configured routes are counted by built-in
+    /// telemetry and are best-effort through [`TxSubmitOutcomeReporter`], including any
+    /// route-specific acceptance metadata, rather than retroactively mutating this synchronous
+    /// result. Reporter delivery failures are reflected in
+    /// [`TxToxicFlowTelemetrySnapshot::reporter_outcomes_dropped`] and
+    /// [`TxToxicFlowTelemetrySnapshot::reporter_outcomes_unavailable`].
+    pub successful_routes: Vec<SubmitRoute>,
     /// Target chosen by direct path when applicable.
     pub direct_target: Option<LeaderTarget>,
-    /// RPC-returned signature string when RPC path succeeded.
+    /// RPC-returned signature string when RPC path succeeded before return.
     pub rpc_signature: Option<String>,
-    /// Jito block-engine returned transaction signature when the JSON-RPC path succeeded.
+    /// Jito block-engine returned transaction signature when the JSON-RPC path succeeded before
+    /// return.
     pub jito_signature: Option<String>,
-    /// Jito block-engine returned bundle UUID when the gRPC bundle path succeeded.
+    /// Jito block-engine returned bundle UUID when the gRPC bundle path succeeded before return.
     pub jito_bundle_id: Option<String>,
-    /// True when RPC fallback was used from hybrid mode.
-    pub used_rpc_fallback: bool,
+    /// True when one later ordered-fallback route accepted the submit before return.
+    pub used_fallback_route: bool,
     /// Number of direct targets selected for submit attempt that succeeded.
     pub selected_target_count: usize,
     /// Number of unique validator identities in selected direct targets.
@@ -542,14 +694,28 @@ pub enum TxSubmitOutcomeKind {
 }
 
 /// Structured outcome record for toxic-flow telemetry/reporting.
+///
+/// Route-level accepts may carry richer metadata than the synchronous [`SubmitResult`] when one
+/// different route already returned first. Consumers that care about later accepts should observe
+/// this surface rather than expecting the original [`SubmitResult`] to mutate.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TxSubmitOutcome {
     /// Outcome classification.
     pub kind: TxSubmitOutcomeKind,
     /// Transaction signature when available.
     pub signature: Option<SignatureBytes>,
-    /// Mode selected for the submit attempt.
-    pub mode: SubmitMode,
+    /// Concrete accepted route when the outcome came from one route-level success.
+    pub route: Option<SubmitRoute>,
+    /// Route plan selected for the submit attempt.
+    pub plan: SubmitPlan,
+    /// Legacy preset used for the submit attempt when applicable.
+    pub legacy_mode: Option<SubmitMode>,
+    /// RPC-returned signature metadata when the RPC route accepted.
+    pub rpc_signature: Option<String>,
+    /// Jito-returned transaction signature metadata when the Jito route accepted.
+    pub jito_signature: Option<String>,
+    /// Jito-returned bundle UUID when the gRPC bundle route accepted.
+    pub jito_bundle_id: Option<String>,
     /// Current state version at outcome time when known.
     pub state_version: Option<u64>,
     /// Opportunity age in milliseconds when known.
@@ -557,6 +723,13 @@ pub struct TxSubmitOutcome {
 }
 
 /// Callback surface for external outcome sinks.
+///
+/// `TxSubmitClient` delivers these callbacks asynchronously through one bounded FIFO dispatcher per
+/// reporter instance, shared across clients that use that same reporter. That keeps the reporter
+/// off the synchronous submit hot path while preserving outcome order for events that are
+/// successfully queued. Under sustained pressure or dispatcher startup failure, reporter delivery
+/// is best-effort and built-in telemetry remains the authoritative always-inline outcome counter
+/// surface.
 pub trait TxSubmitOutcomeReporter: Send + Sync {
     /// Records one structured outcome.
     fn record_outcome(&self, outcome: &TxSubmitOutcome);
@@ -565,6 +738,16 @@ pub trait TxSubmitOutcomeReporter: Send + Sync {
 /// Snapshot of built-in toxic-flow counters collected by [`TxSubmitClient`](crate::submit::TxSubmitClient).
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TxToxicFlowTelemetrySnapshot {
+    /// Number of external reporter outcomes dropped because the reporter queue was full.
+    pub reporter_outcomes_dropped: u64,
+    /// Number of outcomes that could not reach the external reporter because the worker was unavailable.
+    pub reporter_outcomes_unavailable: u64,
+    /// Number of direct-route accepts observed.
+    pub direct_accepted: u64,
+    /// Number of RPC-route accepts observed.
+    pub rpc_accepted: u64,
+    /// Number of Jito-route accepts observed.
+    pub jito_accepted: u64,
     /// Number of submit attempts rejected due to stale inputs.
     pub rejected_due_to_staleness: u64,
     /// Number of submit attempts rejected due to reorg risk.
@@ -608,6 +791,16 @@ impl CacheAlignedAtomicU64 {
 /// In-memory telemetry counters for toxic-flow outcomes.
 #[derive(Debug, Default)]
 pub struct TxToxicFlowTelemetry {
+    /// Number of external reporter outcomes dropped because the reporter queue was full.
+    reporter_outcomes_dropped: CacheAlignedAtomicU64,
+    /// Number of outcomes that could not reach the external reporter because the worker was unavailable.
+    reporter_outcomes_unavailable: CacheAlignedAtomicU64,
+    /// Number of direct-route accepts.
+    direct_accepted: CacheAlignedAtomicU64,
+    /// Number of RPC-route accepts.
+    rpc_accepted: CacheAlignedAtomicU64,
+    /// Number of Jito-route accepts.
+    jito_accepted: CacheAlignedAtomicU64,
     /// Number of stale-input rejections.
     rejected_due_to_staleness: CacheAlignedAtomicU64,
     /// Number of reorg-risk rejections.
@@ -641,6 +834,15 @@ impl TxToxicFlowTelemetry {
                 .swap(age_ms, Ordering::Relaxed);
         }
         match outcome.kind {
+            TxSubmitOutcomeKind::DirectAccepted => {
+                let _ = self.direct_accepted.fetch_add(1, Ordering::Relaxed);
+            }
+            TxSubmitOutcomeKind::RpcAccepted => {
+                let _ = self.rpc_accepted.fetch_add(1, Ordering::Relaxed);
+            }
+            TxSubmitOutcomeKind::JitoAccepted => {
+                let _ = self.jito_accepted.fetch_add(1, Ordering::Relaxed);
+            }
             TxSubmitOutcomeKind::RejectedDueToStaleness => {
                 let _ = self
                     .rejected_due_to_staleness
@@ -667,10 +869,7 @@ impl TxToxicFlowTelemetry {
             TxSubmitOutcomeKind::LeaderMissed => {
                 let _ = self.leader_route_miss_rate.fetch_add(1, Ordering::Relaxed);
             }
-            TxSubmitOutcomeKind::DirectAccepted
-            | TxSubmitOutcomeKind::RpcAccepted
-            | TxSubmitOutcomeKind::JitoAccepted
-            | TxSubmitOutcomeKind::Landed
+            TxSubmitOutcomeKind::Landed
             | TxSubmitOutcomeKind::Expired
             | TxSubmitOutcomeKind::Dropped
             | TxSubmitOutcomeKind::UnhealthyRoute => {}
@@ -682,11 +881,32 @@ impl TxToxicFlowTelemetry {
         }
     }
 
+    /// Records one dropped external-reporter outcome.
+    pub(crate) fn record_reporter_drop(&self) {
+        let _ = self
+            .reporter_outcomes_dropped
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records one unavailable external-reporter outcome.
+    pub(crate) fn record_reporter_unavailable(&self) {
+        let _ = self
+            .reporter_outcomes_unavailable
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Returns the current telemetry snapshot.
     #[must_use]
     pub fn snapshot(&self) -> TxToxicFlowTelemetrySnapshot {
         let age_ms = self.opportunity_age_at_send_ms.load(Ordering::Relaxed);
         TxToxicFlowTelemetrySnapshot {
+            reporter_outcomes_dropped: self.reporter_outcomes_dropped.load(Ordering::Relaxed),
+            reporter_outcomes_unavailable: self
+                .reporter_outcomes_unavailable
+                .load(Ordering::Relaxed),
+            direct_accepted: self.direct_accepted.load(Ordering::Relaxed),
+            rpc_accepted: self.rpc_accepted.load(Ordering::Relaxed),
+            jito_accepted: self.jito_accepted.load(Ordering::Relaxed),
             rejected_due_to_staleness: self.rejected_due_to_staleness.load(Ordering::Relaxed),
             rejected_due_to_reorg_risk: self.rejected_due_to_reorg_risk.load(Ordering::Relaxed),
             rejected_due_to_state_drift: self.rejected_due_to_state_drift.load(Ordering::Relaxed),

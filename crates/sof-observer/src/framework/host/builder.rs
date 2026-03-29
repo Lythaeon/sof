@@ -131,7 +131,10 @@ impl PluginHostBuilder {
 
     /// Adds one already-shared plugin.
     #[must_use]
-    pub fn add_shared_plugin(mut self, plugin: Arc<dyn ObserverPlugin>) -> Self {
+    pub fn add_shared_plugin<P>(mut self, plugin: Arc<P>) -> Self
+    where
+        P: ObserverPlugin + 'static,
+    {
         self.plugins.push(plugin);
         self
     }
@@ -153,11 +156,16 @@ impl PluginHostBuilder {
 
     /// Adds many already-shared plugins.
     #[must_use]
-    pub fn add_shared_plugins<I>(mut self, plugins: I) -> Self
+    pub fn add_shared_plugins<P, I>(mut self, plugins: I) -> Self
     where
-        I: IntoIterator<Item = Arc<dyn ObserverPlugin>>,
+        P: ObserverPlugin + 'static,
+        I: IntoIterator<Item = Arc<P>>,
     {
-        self.plugins.extend(plugins);
+        self.plugins.extend(
+            plugins
+                .into_iter()
+                .map(|plugin| plugin as Arc<dyn ObserverPlugin>),
+        );
         self
     }
 
@@ -173,7 +181,10 @@ impl PluginHostBuilder {
 
     /// Compatibility alias for [`Self::add_shared_plugin`].
     #[must_use]
-    pub fn with_plugin_arc(mut self, plugin: Arc<dyn ObserverPlugin>) -> Self {
+    pub fn with_plugin_arc<P>(mut self, plugin: Arc<P>) -> Self
+    where
+        P: ObserverPlugin + 'static,
+    {
         self = self.add_shared_plugin(plugin);
         self
     }
@@ -191,9 +202,10 @@ impl PluginHostBuilder {
 
     /// Compatibility alias for [`Self::add_shared_plugins`].
     #[must_use]
-    pub fn with_plugin_arcs<I>(mut self, plugins: I) -> Self
+    pub fn with_plugin_arcs<P, I>(mut self, plugins: I) -> Self
     where
-        I: IntoIterator<Item = Arc<dyn ObserverPlugin>>,
+        P: ObserverPlugin + 'static,
+        I: IntoIterator<Item = Arc<P>>,
     {
         self = self.add_shared_plugins(plugins);
         self

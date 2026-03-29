@@ -9,7 +9,7 @@ use solana_keypair::Keypair;
 use solana_signer::Signer;
 use sof_solana_compat::TxBuilder;
 use sof_tx::{
-    JitoSubmitConfig, JitoSubmitResponse, SignedTx, SubmitMode, SubmitTransportError,
+    JitoSubmitConfig, JitoSubmitResponse, SignedTx, SubmitMode, SubmitPlan, SubmitTransportError,
     TxSubmitClient,
     providers::{StaticLeaderProvider, StaticRecentBlockhashProvider},
     submit::JitoSubmitTransport,
@@ -113,10 +113,11 @@ fuzz_target!(|bytes: &[u8]| {
     match result {
         Ok(result) => {
             assert!(calls <= 1);
-            assert_eq!(result.mode, SubmitMode::JitoOnly);
+            assert_eq!(result.legacy_mode, Some(SubmitMode::JitoOnly));
+            assert_eq!(result.plan, SubmitPlan::jito_only());
             assert_eq!(result.rpc_signature, None);
             assert_eq!(result.direct_target, None);
-            assert!(!result.used_rpc_fallback);
+            assert!(!result.used_fallback_route);
             assert!(result.jito_signature.is_some());
             assert_eq!(result.jito_bundle_id, None);
         }

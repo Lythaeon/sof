@@ -30,50 +30,19 @@ provider adapters such as Yellowstone, LaserStream, and websocket now cover tran
 transaction status, accounts, block-meta, logs, and slots, but they still do not form a complete
 built-in `sof-tx` control-plane source on their own.
 
-## Minimal Integration Skeleton
+## Canonical Example
 
-```rust
-use std::sync::Arc;
+Use the full example in:
 
-use sof::framework::{ObserverPlugin, PluginHost};
-use sof::runtime::ObserverRuntime;
-use sof_tx::{
-    SubmitMode, TxBuilder, TxSubmitClient,
-    adapters::PluginHostTxProviderAdapter,
-};
-use solana_keypair::Keypair;
-use solana_signer::Signer;
-use solana_system_interface::instruction as system_instruction;
+- `crates/sof-tx/examples/submit_all_at_once_with_sof.rs`
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let adapter = Arc::new(PluginHostTxProviderAdapter::default());
+It shows the whole shape cleanly:
 
-    let host = PluginHost::builder()
-        .add_shared_plugin(adapter.clone() as Arc<dyn ObserverPlugin>)
-        .build();
-
-    adapter.prime_from_plugin_host(&host);
-
-    let mut client = TxSubmitClient::new(adapter.clone(), adapter.clone())
-        .with_rpc_transport(Arc::new(sof_tx::submit::JsonRpcTransport::new(
-            "https://api.mainnet-beta.solana.com",
-        )?));
-
-    let payer = Keypair::new();
-    let recipient = Keypair::new();
-
-    let builder = TxBuilder::new(payer.pubkey()).add_instruction(
-        system_instruction::transfer(&payer.pubkey(), &recipient.pubkey(), 1),
-    );
-
-    let _ = (builder, &mut client, SubmitMode::Hybrid);
-
-    let _ = ObserverRuntime::new().with_plugin_host(host).run().await;
-
-    Ok(())
-}
-```
+- `PluginHostTxProviderAdapter` registered on a `PluginHost`
+- RPC-backed blockhash refresh plus SOF-backed leader routing
+- direct, RPC, and Jito transports configured together
+- `SubmitPlan::all_at_once(vec![Direct, Rpc, Jito])`
+- `sof-solana-compat::TxBuilder` and unsigned submit helpers on top of `sof-tx`
 
 ## Why This Shape Is Useful
 
@@ -90,7 +59,7 @@ freshness first.
 
 ## What You Usually Add Next
 
-- `Hybrid` mode with direct transport once TPU target quality is good enough
+- add `SubmitRoute::Direct` once TPU target quality is good enough
 - flow-safety checks before submit
 - your own strategy loop around `TxBuilder`
 - metrics around stale control plane, blockhash freshness, and submit outcomes

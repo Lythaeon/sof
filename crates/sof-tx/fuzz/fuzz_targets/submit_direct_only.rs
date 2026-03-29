@@ -9,7 +9,7 @@ use solana_keypair::Keypair;
 use solana_signer::Signer;
 use sof_solana_compat::TxBuilder;
 use sof_tx::{
-    DirectSubmitConfig, SignedTx, SubmitMode, SubmitTransportError, TxSubmitClient,
+    DirectSubmitConfig, SignedTx, SubmitMode, SubmitPlan, SubmitTransportError, TxSubmitClient,
     providers::{LeaderTarget, StaticLeaderProvider, StaticRecentBlockhashProvider},
     routing::RoutingPolicy,
     submit::DirectSubmitTransport,
@@ -80,7 +80,8 @@ fuzz_target!(|bytes: &[u8]| {
     let result = runtime.block_on(client.submit_signed(signed_tx, SubmitMode::DirectOnly));
     match result {
         Ok(result) => {
-            assert_eq!(result.mode, SubmitMode::DirectOnly);
+            assert_eq!(result.legacy_mode, Some(SubmitMode::DirectOnly));
+            assert_eq!(result.plan, SubmitPlan::direct_only());
             assert_eq!(result.rpc_signature, None);
             assert_eq!(result.jito_signature, None);
             assert!(result.direct_target.is_some());
