@@ -14,6 +14,12 @@ struct RecordingPort {
     window: Option<ReceiverCoalesceWindow>,
     pin_by_port: Option<bool>,
     sockets: Option<TvuReceiveSocketCount>,
+    gossip_channel_consume_capacity: Option<QueueCapacity>,
+    gossip_consume_threads: Option<usize>,
+    gossip_listen_threads: Option<usize>,
+    gossip_run_threads: Option<usize>,
+    shred_dedup_capacity: Option<usize>,
+    gossip_channels: Option<sof_gossip_tuning::GossipChannelTuning>,
 }
 
 impl RuntimeTuningPort for RecordingPort {
@@ -42,6 +48,30 @@ impl RuntimeTuningPort for RecordingPort {
     fn set_tvu_receive_sockets(&mut self, sockets: TvuReceiveSocketCount) {
         self.sockets = Some(sockets);
     }
+
+    fn set_gossip_channel_consume_capacity(&mut self, capacity: QueueCapacity) {
+        self.gossip_channel_consume_capacity = Some(capacity);
+    }
+
+    fn set_gossip_consume_threads(&mut self, thread_count: usize) {
+        self.gossip_consume_threads = Some(thread_count);
+    }
+
+    fn set_gossip_listen_threads(&mut self, thread_count: usize) {
+        self.gossip_listen_threads = Some(thread_count);
+    }
+
+    fn set_gossip_run_threads(&mut self, thread_count: usize) {
+        self.gossip_run_threads = Some(thread_count);
+    }
+
+    fn set_shred_dedup_capacity(&mut self, dedupe_capacity: usize) {
+        self.shred_dedup_capacity = Some(dedupe_capacity);
+    }
+
+    fn set_gossip_channel_tuning(&mut self, tuning: sof_gossip_tuning::GossipChannelTuning) {
+        self.gossip_channels = Some(tuning);
+    }
 }
 
 fn preset_from_byte(byte: u8) -> HostProfilePreset {
@@ -65,6 +95,25 @@ fuzz_target!(|bytes: &[u8]| {
     assert_eq!(port.window, Some(runtime.receiver_coalesce_window));
     assert_eq!(port.pin_by_port, Some(runtime.udp_receiver_pin_by_port));
     assert_eq!(port.sockets, Some(runtime.tvu_receive_sockets));
+    assert_eq!(
+        port.gossip_channel_consume_capacity,
+        Some(runtime.gossip_channel_consume_capacity)
+    );
+    assert_eq!(port.gossip_consume_threads, Some(runtime.gossip_consume_threads));
+    assert_eq!(port.gossip_listen_threads, Some(runtime.gossip_listen_threads));
+    assert_eq!(port.gossip_run_threads, Some(runtime.gossip_run_threads));
+    assert_eq!(port.shred_dedup_capacity, Some(runtime.shred_dedup_capacity));
+    assert_eq!(port.gossip_channels, Some(profile.channels));
     assert!(port.capacity.map(QueueCapacity::get).unwrap_or(0) > 0);
     assert!(port.sockets.map(TvuReceiveSocketCount::get).unwrap_or(0) > 0);
+    assert!(
+        port.gossip_channel_consume_capacity
+            .map(QueueCapacity::get)
+            .unwrap_or(0)
+            > 0
+    );
+    assert!(port.gossip_consume_threads.unwrap_or(0) > 0);
+    assert!(port.gossip_listen_threads.unwrap_or(0) > 0);
+    assert!(port.gossip_run_threads.unwrap_or(0) > 0);
+    assert!(port.shred_dedup_capacity.unwrap_or(0) > 0);
 });
