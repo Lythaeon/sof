@@ -83,8 +83,10 @@ impl DerivedStateConsumer for PersistedCheckpointConsumer {
             | DerivedStateFeedEvent::ControlPlaneStateUpdated(_)
             | DerivedStateFeedEvent::StateInvalidated(_)
             | DerivedStateFeedEvent::TxOutcomeObserved(_)
+            | DerivedStateFeedEvent::TransactionStatusObserved(_)
             | DerivedStateFeedEvent::BranchReorged(_)
-            | DerivedStateFeedEvent::AccountTouchObserved(_) => return Ok(()),
+            | DerivedStateFeedEvent::AccountTouchObserved(_)
+            | DerivedStateFeedEvent::BlockMetaObserved(_) => return Ok(()),
         };
         self.state
             .lock()

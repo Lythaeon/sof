@@ -19,10 +19,10 @@ pub(crate) use events::{arc_pubkey_bytes, pubkey_bytes, signature_bytes, signatu
 
 pub use crate::event::{ForkSlotStatus, TxCommitmentStatus};
 pub use derived_state::{
-    AccountTouchObservedEvent, BranchReorgedEvent, CheckpointBarrierEvent, CheckpointBarrierReason,
-    DerivedStateCheckpoint, DerivedStateCheckpointStore, DerivedStateConsumer,
-    DerivedStateConsumerConfig, DerivedStateConsumerContext, DerivedStateConsumerFault,
-    DerivedStateConsumerFaultKind, DerivedStateConsumerRecoveryState,
+    AccountTouchObservedEvent, BlockMetaObservedEvent, BranchReorgedEvent, CheckpointBarrierEvent,
+    CheckpointBarrierReason, DerivedStateCheckpoint, DerivedStateCheckpointStore,
+    DerivedStateConsumer, DerivedStateConsumerConfig, DerivedStateConsumerContext,
+    DerivedStateConsumerFault, DerivedStateConsumerFaultKind, DerivedStateConsumerRecoveryState,
     DerivedStateConsumerSetupError, DerivedStateConsumerTelemetry, DerivedStateControlPlaneQuality,
     DerivedStateControlPlaneStateEvent, DerivedStateFeedEnvelope, DerivedStateFeedEvent,
     DerivedStateFreshnessState, DerivedStateHost, DerivedStateHostBuilder,
@@ -32,6 +32,7 @@ pub use derived_state::{
     DerivedStateReplayTelemetry, DerivedStateTxOutcomeEvent, DerivedStateTxOutcomeKind,
     DiskDerivedStateReplaySource, FeedSequence, FeedSessionId, FeedWatermarks,
     InMemoryDerivedStateReplaySource, SlotStatusChangedEvent, TransactionAppliedEvent,
+    TransactionStatusObservedEvent,
 };
 pub use events::{
     AccountTouchEvent, AccountTouchEventRef, AccountUpdateEvent, BlockMetaEvent, ClusterNodeInfo,

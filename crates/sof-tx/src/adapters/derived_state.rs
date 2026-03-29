@@ -335,7 +335,9 @@ impl DerivedStateConsumer for DerivedStateTxProviderAdapter {
             DerivedStateFeedEvent::StateInvalidated(_)
             | DerivedStateFeedEvent::TxOutcomeObserved(_)
             | DerivedStateFeedEvent::TransactionApplied(_)
+            | DerivedStateFeedEvent::TransactionStatusObserved(_)
             | DerivedStateFeedEvent::AccountTouchObserved(_)
+            | DerivedStateFeedEvent::BlockMetaObserved(_)
             | DerivedStateFeedEvent::CheckpointBarrier(_) => {}
         }
         Ok(())

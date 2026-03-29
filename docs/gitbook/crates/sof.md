@@ -85,6 +85,31 @@ Important boundary:
 - `sof-tx` adapter completeness still depends on a full control-plane feed, not only transaction
   updates
 
+### Plugin vs Derived-State Surface
+
+SOF intentionally does not mirror every plugin callback into derived state.
+
+| Ingest type | Plugin surface | Derived-state surface | Does not emit |
+| --- | --- | --- | --- |
+| Raw shreds / gossip / trusted raw-shred provider | transactions, recent blockhash, slot status, cluster topology, leader schedule, reorg, plus raw packet/shred/dataset surfaces | transaction apply, recent-blockhash observation, slot status, topology, leader schedule, control-plane state, reorg/invalidation, account-touch | transaction-status, transaction-log, account-update, block-meta, provider-derived `TransactionStatusObserved`, provider-derived `BlockMetaObserved` |
+| Websocket `transactionSubscribe` | `on_transaction` | `TransactionApplied` | transaction-status, block-meta, and raw-shred control-plane families |
+| Websocket `logsSubscribe` | `on_transaction_log` | none | transaction-status, block-meta, control-plane, and derived-state provider observations |
+| Websocket `accountSubscribe` / `programSubscribe` | `on_account_update` | none | transaction-status, block-meta, control-plane, and derived-state provider observations |
+| Yellowstone / LaserStream transaction feeds | `on_transaction` | `TransactionApplied` | raw-shred control-plane families unless supplied through `Generic` |
+| Yellowstone / LaserStream transaction-status feeds | `on_transaction_status` | `TransactionStatusObserved` | block-meta and raw-shred control-plane families unless separately supplied |
+| Yellowstone / LaserStream block-meta feeds | `on_block_meta` | `BlockMetaObserved` | transaction-status and raw-shred control-plane families unless separately supplied |
+| Yellowstone / LaserStream account feeds | `on_account_update` | none | provider-derived transaction-status/block-meta observations and raw-shred control-plane families |
+| Yellowstone / LaserStream slot feeds | `on_slot_status` | `SlotStatusChanged` | recent-blockhash/topology/leader-schedule/reorg unless supplied through `Generic` |
+| `ProviderStreamMode::Generic` | any typed `ProviderStreamUpdate` variant the producer emits | the derived-state families SOF currently forwards from those typed updates | anything the producer does not emit |
+
+So the clean split is:
+
+- raw shreds emit the richest local control-plane surface
+- built-in websocket emits transactions/logs/accounts, but not transaction
+  status or block meta
+- built-in Yellowstone/LaserStream add transaction status and block meta, but
+  still do not replace the raw-shred control-plane surface on their own
+
 ## When To Use Plugins vs Runtime Extensions
 
 Use plugins when you want decoded semantic events:
