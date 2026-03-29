@@ -420,10 +420,15 @@ pub fn read_gossip_bootstrap_stabilize_max_wait_ms() -> u64 {
 }
 
 #[cfg(feature = "gossip-bootstrap")]
-pub fn read_gossip_bootstrap_stabilize_min_peers() -> usize {
+pub fn read_gossip_bootstrap_stabilize_min_peers_override() -> Option<usize> {
     read_env_var("SOF_GOSSIP_BOOTSTRAP_STABILIZE_MIN_PEERS")
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+pub fn read_gossip_bootstrap_stabilize_min_peers() -> usize {
+    read_gossip_bootstrap_stabilize_min_peers_override()
         .unwrap_or(DEFAULT_BOOTSTRAP_STABILIZE_MIN_PEERS)
 }
 

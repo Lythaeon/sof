@@ -98,14 +98,10 @@ pub(crate) async fn start_receiver(
                 Duration::from_millis(read_gossip_runtime_switch_stabilize_ms());
             let bootstrap_stabilize_max_wait =
                 Duration::from_millis(read_gossip_bootstrap_stabilize_max_wait_ms());
-            let bootstrap_stabilize_min_peers = {
-                let configured = read_gossip_bootstrap_stabilize_min_peers();
-                if control_plane_only_bootstrap {
-                    1
-                } else {
-                    configured
-                }
-            };
+            let bootstrap_stabilize_min_peers = effective_bootstrap_stabilize_min_peers(
+                control_plane_only_bootstrap,
+                read_gossip_bootstrap_stabilize_min_peers_override(),
+            );
             for (attempt, entrypoint) in prioritized_entrypoints.iter().enumerate() {
                 if log_startup_steps {
                     tracing::info!(
@@ -318,6 +314,18 @@ pub(crate) async fn start_receiver(
 }
 
 #[cfg(feature = "gossip-bootstrap")]
+fn effective_bootstrap_stabilize_min_peers(
+    control_plane_only_bootstrap: bool,
+    configured_min_peers: Option<usize>,
+) -> usize {
+    if control_plane_only_bootstrap {
+        configured_min_peers.unwrap_or(1)
+    } else {
+        configured_min_peers.unwrap_or_else(read_gossip_bootstrap_stabilize_min_peers)
+    }
+}
+
+#[cfg(feature = "gossip-bootstrap")]
 const fn gossip_bootstrap_accepts_peer_discovery(
     control_plane_only_bootstrap: bool,
     packets_seen: u64,
@@ -333,7 +341,7 @@ const fn gossip_bootstrap_accepts_peer_discovery(
 
 #[cfg(all(test, feature = "gossip-bootstrap"))]
 mod tests {
-    use super::gossip_bootstrap_accepts_peer_discovery;
+    use super::{effective_bootstrap_stabilize_min_peers, gossip_bootstrap_accepts_peer_discovery};
 
     #[test]
     fn control_plane_only_bootstrap_accepts_peer_discovery_without_packets() {
@@ -345,6 +353,21 @@ mod tests {
     fn full_gossip_bootstrap_still_requires_packets_for_peer_discovery_fallback() {
         assert!(!gossip_bootstrap_accepts_peer_discovery(false, 0, 8, 8));
         assert!(gossip_bootstrap_accepts_peer_discovery(false, 1, 8, 8));
+    }
+
+    #[test]
+    fn control_plane_only_bootstrap_uses_low_default_min_peers() {
+        assert_eq!(effective_bootstrap_stabilize_min_peers(true, None), 1);
+    }
+
+    #[test]
+    fn control_plane_only_bootstrap_respects_explicit_min_peers_override() {
+        assert_eq!(effective_bootstrap_stabilize_min_peers(true, Some(7)), 7);
+    }
+
+    #[test]
+    fn full_gossip_bootstrap_keeps_workspace_default_min_peers() {
+        assert_eq!(effective_bootstrap_stabilize_min_peers(false, None), 128);
     }
 }
 
