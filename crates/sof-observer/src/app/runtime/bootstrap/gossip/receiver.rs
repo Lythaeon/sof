@@ -44,6 +44,14 @@ pub(crate) async fn start_receiver(
     let mut gossip_runtime_secondary_port_range: Option<PortRange> = None;
     #[cfg(feature = "gossip-bootstrap")]
     let gossip_identity = Arc::new(Keypair::new());
+    #[cfg(feature = "gossip-bootstrap")]
+    let gossip_runtime_mode = read_gossip_runtime_mode();
+    #[cfg(all(feature = "gossip-bootstrap", feature = "kernel-bypass"))]
+    let control_plane_only_bootstrap = _control_plane_only_bootstrap
+        || matches!(gossip_runtime_mode, GossipRuntimeMode::ControlPlaneOnly);
+    #[cfg(all(feature = "gossip-bootstrap", not(feature = "kernel-bypass")))]
+    let control_plane_only_bootstrap =
+        matches!(gossip_runtime_mode, GossipRuntimeMode::ControlPlaneOnly);
     let gossip_entrypoints = read_gossip_entrypoints();
     if !gossip_entrypoints.is_empty() {
         if log_startup_steps {
@@ -92,16 +100,9 @@ pub(crate) async fn start_receiver(
                 Duration::from_millis(read_gossip_bootstrap_stabilize_max_wait_ms());
             let bootstrap_stabilize_min_peers = {
                 let configured = read_gossip_bootstrap_stabilize_min_peers();
-                #[cfg(feature = "kernel-bypass")]
-                {
-                    if _control_plane_only_bootstrap {
-                        1
-                    } else {
-                        configured
-                    }
-                }
-                #[cfg(not(feature = "kernel-bypass"))]
-                {
+                if control_plane_only_bootstrap {
+                    1
+                } else {
                     configured
                 }
             };
@@ -119,6 +120,7 @@ pub(crate) async fn start_receiver(
                     tx.clone(),
                     gossip_identity.clone(),
                     Some(port_plan.primary),
+                    control_plane_only_bootstrap,
                 )
                 .await
                 {
@@ -163,14 +165,13 @@ pub(crate) async fn start_receiver(
                             continue;
                         }
                         if !stabilization.stabilized && stabilized_by_peers {
-                            #[cfg(feature = "kernel-bypass")]
-                            if _control_plane_only_bootstrap {
+                            if control_plane_only_bootstrap {
                                 tracing::info!(
                                     entrypoint = %entrypoint,
                                     packets_seen = stabilization.packets_seen,
                                     peers_discovered = discovered_peers,
                                     min_peers = bootstrap_stabilize_min_peers,
-                                    "accepting gossip bootstrap runtime via peer discovery for external kernel-bypass ingress"
+                                    "accepting gossip bootstrap runtime via peer discovery for control-plane-only gossip mode"
                                 );
                             } else {
                                 tracing::warn!(
@@ -181,14 +182,6 @@ pub(crate) async fn start_receiver(
                                     "accepting gossip bootstrap runtime via peer discovery despite low packet flow"
                                 );
                             }
-                            #[cfg(not(feature = "kernel-bypass"))]
-                            tracing::warn!(
-                                entrypoint = %entrypoint,
-                                packets_seen = stabilization.packets_seen,
-                                peers_discovered = discovered_peers,
-                                min_peers = bootstrap_stabilize_min_peers,
-                                "accepting gossip bootstrap runtime via peer discovery despite low packet flow"
-                            );
                         }
                         let mut gossip_receivers = gossip_receivers;
                         if attempt > 0 {
@@ -231,7 +224,14 @@ pub(crate) async fn start_receiver(
         }
     }
 
-    if static_receiver_handles.is_empty() && gossip_receiver_handles.is_empty() {
+    #[cfg(feature = "gossip-bootstrap")]
+    let skip_direct_listener_fallback = control_plane_only_bootstrap && gossip_runtime.is_some();
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let skip_direct_listener_fallback = false;
+    if static_receiver_handles.is_empty()
+        && gossip_receiver_handles.is_empty()
+        && !skip_direct_listener_fallback
+    {
         let bind_addr = read_bind_addr().map_err(|source| ReceiverBootstrapError::BindAddress {
             reason: source.to_string(),
         })?;
@@ -284,6 +284,14 @@ pub(crate) async fn start_receiver(
             entrypoint = %active_entrypoint,
             gossip_receivers,
             "gossip bootstrap-only mode enabled; detached gossip control-plane and kept direct receivers"
+        );
+    }
+    #[cfg(feature = "gossip-bootstrap")]
+    if read_gossip_control_plane_only() && runtime.gossip_runtime.is_some() {
+        let active_entrypoint = runtime.active_gossip_entrypoint.clone().unwrap_or_default();
+        tracing::info!(
+            entrypoint = %active_entrypoint,
+            "gossip control-plane-only mode enabled; kept cluster topology and leader schedule state without gossip shred ingest"
         );
     }
     Ok(runtime)

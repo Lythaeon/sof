@@ -368,6 +368,7 @@ async fn start_gossip_bootstrapped_receiver(
     tx: ingest::RawPacketBatchSender,
     gossip_identity: Arc<Keypair>,
     port_range_override: Option<PortRange>,
+    control_plane_only_bootstrap: bool,
 ) -> Result<GossipBootstrapRuntime, GossipBootstrapStartError> {
     let log_startup_steps = read_log_startup_steps();
     let entrypoint = resolve_socket_addr(entrypoint)?;
@@ -487,42 +488,43 @@ async fn start_gossip_bootstrapped_receiver(
     // "healthy" packet flow.
     let ingest_telemetry = ingest::ReceiverTelemetry::default();
     let mut receiver_handles = Vec::with_capacity(node.sockets.tvu.len().saturating_add(1));
-    for socket in &node.sockets.tvu {
-        let std_socket = socket
-            .try_clone()
-            .map_err(|source| GossipBootstrapStartError::CloneTvuSocket { source })?;
-        std_socket
+    if !control_plane_only_bootstrap {
+        for socket in &node.sockets.tvu {
+            let std_socket = socket
+                .try_clone()
+                .map_err(|source| GossipBootstrapStartError::CloneTvuSocket { source })?;
+            std_socket
+                .set_nonblocking(true)
+                .map_err(|source| GossipBootstrapStartError::SetTvuSocketNonblocking { source })?;
+            receiver_handles.push(
+                ingest::spawn_udp_receiver_from_std_with_telemetry_and_shutdown(
+                    std_socket,
+                    tx.clone(),
+                    Some(ingest_telemetry.clone()),
+                    Some(exit.clone()),
+                ),
+            );
+        }
+        let repair_receiver_socket =
+            node.sockets.repair.try_clone().map_err(|source| {
+                GossipBootstrapStartError::CloneRepairReceiverSocket { source }
+            })?;
+        repair_receiver_socket
             .set_nonblocking(true)
-            .map_err(|source| GossipBootstrapStartError::SetTvuSocketNonblocking { source })?;
+            .map_err(
+                |source| GossipBootstrapStartError::SetRepairReceiverSocketNonblocking { source },
+            )?;
         receiver_handles.push(
             ingest::spawn_udp_receiver_from_std_with_telemetry_and_shutdown(
-                std_socket,
-                tx.clone(),
-                Some(ingest_telemetry.clone()),
+                repair_receiver_socket,
+                tx,
+                None,
                 Some(exit.clone()),
             ),
         );
     }
-    let repair_receiver_socket = node
-        .sockets
-        .repair
-        .try_clone()
-        .map_err(|source| GossipBootstrapStartError::CloneRepairReceiverSocket { source })?;
-    repair_receiver_socket
-        .set_nonblocking(true)
-        .map_err(
-            |source| GossipBootstrapStartError::SetRepairReceiverSocketNonblocking { source },
-        )?;
-    receiver_handles.push(
-        ingest::spawn_udp_receiver_from_std_with_telemetry_and_shutdown(
-            repair_receiver_socket,
-            tx,
-            None,
-            Some(exit.clone()),
-        ),
-    );
 
-    let repair_client = if read_repair_enabled() {
+    let repair_client = if !control_plane_only_bootstrap && read_repair_enabled() {
         let repair_sender_socket = node
             .sockets
             .repair
@@ -571,6 +573,7 @@ pub(super) async fn start_gossip_bootstrapped_receiver_guarded(
     tx: ingest::RawPacketBatchSender,
     gossip_identity: Arc<Keypair>,
     port_range_override: Option<PortRange>,
+    control_plane_only_bootstrap: bool,
 ) -> Result<GossipBootstrapRuntime, GossipBootstrapGuardError> {
     let entrypoint_owned = entrypoint.to_owned();
     let join = tokio::spawn(async move {
@@ -579,6 +582,7 @@ pub(super) async fn start_gossip_bootstrapped_receiver_guarded(
             tx,
             gossip_identity,
             port_range_override,
+            control_plane_only_bootstrap,
         )
         .await
     });

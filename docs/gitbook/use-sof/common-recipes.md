@@ -24,6 +24,9 @@ You will usually start with:
 
 - direct UDP for controlled bring-up
 - `gossip-bootstrap` only once you need richer cluster context
+- `gossip-bootstrap` with `SOF_GOSSIP_RUNTIME_MODE=control_plane_only` when you only need
+  topology/leader inputs for `sof-tx` and your actual ingress or blockhash source lives elsewhere
+  ; in typed setup, use `RuntimeSetup::with_gossip_runtime_mode(GossipRuntimeMode::ControlPlaneOnly)`
 
 ## Submitter With External Control Plane
 

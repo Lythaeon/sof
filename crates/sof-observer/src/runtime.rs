@@ -10,6 +10,8 @@ use std::{
     time::Instant,
 };
 
+#[cfg(feature = "gossip-bootstrap")]
+pub use crate::app::config::GossipRuntimeMode;
 use crate::app::config::read_observability_bind_addr;
 use crate::app::runtime::RuntimeObservabilityService;
 use crate::framework::host::TransactionDispatchScope;
@@ -384,6 +386,16 @@ impl RuntimeSetup {
     #[must_use]
     pub fn with_gossip_entrypoint_pinned(self, pinned: bool) -> Self {
         self.with_env("SOF_GOSSIP_ENTRYPOINT_PINNED", pinned.to_string())
+    }
+
+    /// Sets `SOF_GOSSIP_RUNTIME_MODE`.
+    ///
+    /// Use `ControlPlaneOnly` when you only want gossip-derived topology and leader state without
+    /// gossip-backed shred ingest, relay, or repair.
+    #[cfg(feature = "gossip-bootstrap")]
+    #[must_use]
+    pub fn with_gossip_runtime_mode(self, mode: GossipRuntimeMode) -> Self {
+        self.with_env("SOF_GOSSIP_RUNTIME_MODE", mode.as_str())
     }
 
     /// Sets `SOF_GOSSIP_VALIDATORS` from a list of validator identity pubkeys.
@@ -3957,6 +3969,20 @@ mod tests {
             String::from("SOF_UDP_RECEIVER_PIN_BY_PORT"),
             String::from("false")
         )));
+    }
+
+    #[cfg(feature = "gossip-bootstrap")]
+    #[test]
+    fn typed_gossip_runtime_mode_uses_expected_strings() {
+        let setup =
+            RuntimeSetup::new().with_gossip_runtime_mode(GossipRuntimeMode::ControlPlaneOnly);
+        assert_eq!(
+            setup.env_overrides.last(),
+            Some(&(
+                String::from("SOF_GOSSIP_RUNTIME_MODE"),
+                String::from("control_plane_only"),
+            ))
+        );
     }
 
     #[test]

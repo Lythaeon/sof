@@ -556,7 +556,7 @@ cargo add sof
 Optional gossip bootstrap support at compile time:
 
 ```toml
-sof = { version = "0.17.1", features = ["gossip-bootstrap"] }
+sof = { version = "0.17.2", features = ["gossip-bootstrap"] }
 ```
 
 `gossip-bootstrap` uses the vendored `sof-solana-gossip` backend, but it no longer exact-pins the
@@ -565,7 +565,7 @@ Solana `3.1.8` patch line. Downstream crates can resolve newer compatible `3.1.x
 Optional external `kernel-bypass` ingress support:
 
 ```toml
-sof = { version = "0.17.1", features = ["kernel-bypass"] }
+sof = { version = "0.17.2", features = ["kernel-bypass"] }
 ```
 
 The bundled `sof-solana-gossip` backend defaults to SOF's lightweight in-memory duplicate/conflict
@@ -1053,6 +1053,8 @@ Design references:
 - WebSocket close frames emit `RuntimePacketEventClass::ConnectionClosed` in `on_packet_received`.
 - WebSocket packet events expose `websocket_frame_type` (`Text`/`Binary`/`Ping`/`Pong`) for startup-time filtering and runtime routing.
 - In gossip mode, SOF runs as an active bounded relay client by default (UDP relay + repair serve), not as an observer-only passive consumer.
+- `SOF_GOSSIP_RUNTIME_MODE=control_plane_only` is the exception when you only need gossip-derived topology and leader state without gossip shred ingest.
+- In typed setup, the same mode is `RuntimeSetup::with_gossip_runtime_mode(GossipRuntimeMode::ControlPlaneOnly)`.
 - `SOF_LIVE_SHREDS_ENABLED=false` enables control-plane-only mode.
 
 ## Examples

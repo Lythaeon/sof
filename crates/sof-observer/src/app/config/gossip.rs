@@ -83,6 +83,31 @@ const DEFAULT_GOSSIP_LOAD_SHED_KEEP_TOP_SOURCES: usize = 4;
 #[cfg(feature = "gossip-bootstrap")]
 const GOSSIP_VALIDATORS_MAX: usize = 2_048;
 
+/// Gossip runtime posture for the optional gossip bootstrap backend.
+#[cfg(feature = "gossip-bootstrap")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GossipRuntimeMode {
+    /// Bootstrap gossip and keep gossip-backed shred ingest active.
+    Full,
+    /// Bootstrap gossip, then detach the gossip control plane and continue with non-gossip ingress.
+    BootstrapOnly,
+    /// Keep gossip control-plane state active, but never start gossip-backed shred ingest, relay, or repair.
+    ControlPlaneOnly,
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+impl GossipRuntimeMode {
+    /// Returns the env-string representation used by `SOF_GOSSIP_RUNTIME_MODE`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::BootstrapOnly => "bootstrap_only",
+            Self::ControlPlaneOnly => "control_plane_only",
+        }
+    }
+}
+
 fn parse_comma_separated_endpoints(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -229,8 +254,59 @@ pub fn read_gossip_entrypoint_pinned() -> bool {
 }
 
 #[cfg(feature = "gossip-bootstrap")]
+pub fn read_gossip_runtime_mode() -> GossipRuntimeMode {
+    match read_env_var("SOF_GOSSIP_RUNTIME_MODE").as_deref() {
+        Some("full") => GossipRuntimeMode::Full,
+        Some("bootstrap_only") => GossipRuntimeMode::BootstrapOnly,
+        Some("control_plane_only") => GossipRuntimeMode::ControlPlaneOnly,
+        _ if read_bool_env("SOF_GOSSIP_BOOTSTRAP_ONLY", false) => GossipRuntimeMode::BootstrapOnly,
+        _ => GossipRuntimeMode::Full,
+    }
+}
+
+#[cfg(feature = "gossip-bootstrap")]
 pub fn read_gossip_bootstrap_only() -> bool {
-    read_bool_env("SOF_GOSSIP_BOOTSTRAP_ONLY", false)
+    matches!(read_gossip_runtime_mode(), GossipRuntimeMode::BootstrapOnly)
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+pub fn read_gossip_control_plane_only() -> bool {
+    matches!(
+        read_gossip_runtime_mode(),
+        GossipRuntimeMode::ControlPlaneOnly
+    )
+}
+
+#[cfg(all(test, feature = "gossip-bootstrap"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_gossip_runtime_mode_prefers_control_plane_only() {
+        crate::runtime_env::set_runtime_env_overrides([(
+            String::from("SOF_GOSSIP_RUNTIME_MODE"),
+            String::from("control_plane_only"),
+        )]);
+        assert_eq!(
+            read_gossip_runtime_mode(),
+            GossipRuntimeMode::ControlPlaneOnly
+        );
+        assert!(read_gossip_control_plane_only());
+        assert!(!read_gossip_bootstrap_only());
+        crate::runtime_env::clear_runtime_env_overrides();
+    }
+
+    #[test]
+    fn legacy_gossip_bootstrap_only_maps_to_runtime_mode() {
+        crate::runtime_env::set_runtime_env_overrides([(
+            String::from("SOF_GOSSIP_BOOTSTRAP_ONLY"),
+            String::from("true"),
+        )]);
+        assert_eq!(read_gossip_runtime_mode(), GossipRuntimeMode::BootstrapOnly);
+        assert!(read_gossip_bootstrap_only());
+        assert!(!read_gossip_control_plane_only());
+        crate::runtime_env::clear_runtime_env_overrides();
+    }
 }
 
 #[cfg(feature = "gossip-bootstrap")]

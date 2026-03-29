@@ -19,6 +19,28 @@ When `gossip-bootstrap` is enabled, SOF can:
 This is cluster-participating behavior. Use it because you need it, not because you assume gossip
 is the premium path.
 
+## Control Plane Only
+
+If you only need gossip-derived cluster topology and leader schedule state, use:
+
+```bash
+SOF_GOSSIP_RUNTIME_MODE=control_plane_only
+```
+
+Or in typed runtime setup:
+
+```rust
+use sof::runtime::{GossipRuntimeMode, RuntimeSetup};
+
+let setup = RuntimeSetup::new()
+    .with_gossip_runtime_mode(GossipRuntimeMode::ControlPlaneOnly);
+```
+
+That mode keeps the gossip control plane alive but does not start gossip-backed shred ingest,
+relay, repair, or runtime switching. It is useful when `sof-tx` needs topology/leader inputs but
+your actual data ingress comes from somewhere else. You still need a recent-blockhash source from
+SOF's other ingest paths, RPC, or your own control plane.
+
 ## Reduce Outbound Activity
 
 If your goal is to keep ingest while cutting outward network activity, start here:

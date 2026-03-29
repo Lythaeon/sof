@@ -2403,7 +2403,7 @@ dependencies = [
 
 [[package]]
 name = "sof-solana-compat"
-version = "0.17.1"
+version = "0.17.2"
 dependencies = [
  "async-trait",
  "bincode",
@@ -2422,7 +2422,7 @@ dependencies = [
 
 [[package]]
 name = "sof-tx"
-version = "0.17.1"
+version = "0.17.2"
 dependencies = [
  "arcshift",
  "async-trait",
@@ -2468,7 +2468,7 @@ dependencies = [
 
 [[package]]
 name = "sof-types"
-version = "0.17.1"
+version = "0.17.2"
 dependencies = [
  "bs58",
  "serde",
