@@ -125,20 +125,40 @@ pub(crate) async fn start_receiver(
                 .await
                 {
                     Ok((gossip_receivers, runtime, client)) => {
-                        let stabilization = wait_for_runtime_stabilization(
-                            runtime.ingest_telemetry.clone(),
-                            bootstrap_stabilize_sustain,
-                            bootstrap_stabilize_min_packets,
-                            bootstrap_stabilize_max_wait,
-                        )
-                        .await;
-                        let discovered_peers = runtime.cluster_info.all_peers().len();
-                        let stabilized_by_peers = gossip_bootstrap_accepts_peer_discovery(
-                            control_plane_only_bootstrap,
-                            stabilization.packets_seen,
-                            discovered_peers,
-                            bootstrap_stabilize_min_peers,
-                        );
+                        let stabilization = if control_plane_only_bootstrap {
+                            wait_for_runtime_stabilization_or_peer_discovery(
+                                runtime.ingest_telemetry.clone(),
+                                bootstrap_stabilize_sustain,
+                                bootstrap_stabilize_min_packets,
+                                bootstrap_stabilize_max_wait,
+                                || runtime.cluster_info.all_peers().len(),
+                                bootstrap_stabilize_min_peers,
+                            )
+                            .await
+                        } else {
+                            wait_for_runtime_stabilization(
+                                runtime.ingest_telemetry.clone(),
+                                bootstrap_stabilize_sustain,
+                                bootstrap_stabilize_min_packets,
+                                bootstrap_stabilize_max_wait,
+                            )
+                            .await
+                        };
+                        let discovered_peers = if control_plane_only_bootstrap {
+                            stabilization.discovered_peers
+                        } else {
+                            runtime.cluster_info.all_peers().len()
+                        };
+                        let stabilized_by_peers = if control_plane_only_bootstrap {
+                            stabilization.stabilized_by_peers
+                        } else {
+                            gossip_bootstrap_accepts_peer_discovery(
+                                false,
+                                stabilization.packets_seen,
+                                discovered_peers,
+                                bootstrap_stabilize_min_peers,
+                            )
+                        };
                         let accepted = stabilization.stabilized || stabilized_by_peers;
                         if !accepted {
                             let candidate_receivers = gossip_receivers.len();

@@ -25,4 +25,5 @@ use entrypoints::{
 use handoff::{
     build_gossip_runtime_port_plan, format_port_range, is_bind_conflict_error,
     start_gossip_bootstrapped_receiver_guarded, wait_for_runtime_stabilization,
+    wait_for_runtime_stabilization_or_peer_discovery,
 };
