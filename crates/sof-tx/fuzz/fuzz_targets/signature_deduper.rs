@@ -34,7 +34,7 @@ fuzz_target!(|bytes: &[u8]| {
     for op_index in 0..op_count {
         let signature = take_signature(&mut input).unwrap_or_else(|| Signature::from([0_u8; 64]));
         let at = now + Duration::from_millis(u64::try_from(op_index).unwrap_or(0));
-        let _ = deduper.check_and_insert(signature, at);
+        let _ = deduper.check_and_insert(signature.into(), at);
         assert!(deduper.len() <= op_count);
     }
 });

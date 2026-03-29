@@ -279,9 +279,9 @@ If the conceptual docs stop too early for what you need to build, open these nex
 ## Feature Flags
 
 ```toml
-sof-tx = { version = "0.15.0", features = ["sof-adapters"] }
-sof-tx = { version = "0.15.0", features = ["kernel-bypass"] }
-sof-tx = { version = "0.15.0", features = ["jito-grpc"] }
+sof-tx = { version = "0.16.0", features = ["sof-adapters"] }
+sof-tx = { version = "0.16.0", features = ["kernel-bypass"] }
+sof-tx = { version = "0.16.0", features = ["jito-grpc"] }
 ```
 
 ## Good Fit
