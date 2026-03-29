@@ -87,6 +87,8 @@ Important boundary:
 - built-in websocket and transaction-feed gRPC can still supply recent blockhash to `sof-tx`
   adapters through observed transactions; direct routing still needs leaders/topology from gossip,
   manual targets, or another control-plane source
+- that mixed-source shape is available in custom embedding, not as one packaged built-in runtime
+  mode today
 
 ### Plugin vs Derived-State Surface
 

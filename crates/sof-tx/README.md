@@ -194,7 +194,14 @@ So a mixed setup is already valid:
 
 - provider-stream transactions for recent blockhash freshness
 - gossip full or `control_plane_only` for topology/leaders
-- one shared SOF adapter feeding both into `sof-tx`
+- one shared SOF adapter feeding both into `sof-tx` in a custom embedding where
+  your host/runtime composition supplies both surfaces together
+
+The packaged observer runtime does not yet combine built-in provider-stream
+ingress and gossip/raw-shred ingest in one ready-made mode. For the packaged
+runtime, the complete built-in `sof-tx` adapter path is still raw-shred/gossip,
+or `ProviderStreamMode::Generic` when your custom producer supplies the full
+control-plane feed.
 
 The observer-side feed now also emits canonical control-plane quality snapshots, so services can
 source freshness and confidence metadata from `sof` first and keep `sof-tx` focused on send-time

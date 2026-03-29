@@ -29,6 +29,8 @@ You will usually start with:
   ; in typed setup, use `RuntimeSetup::with_gossip_runtime_mode(GossipRuntimeMode::ControlPlaneOnly)`
 - built-in websocket or Yellowstone/LaserStream transaction feeds when you want SOF to keep
   recent blockhash fresh from observed provider transactions without using gossip for data ingress
+  ; combine this with gossip topology/leaders only in a custom embedding, not in one packaged
+  built-in runtime mode today
 
 ## Submitter With External Control Plane
 

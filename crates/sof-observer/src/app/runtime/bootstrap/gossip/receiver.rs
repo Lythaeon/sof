@@ -133,12 +133,12 @@ pub(crate) async fn start_receiver(
                         )
                         .await;
                         let discovered_peers = runtime.cluster_info.all_peers().len();
-                        #[cfg(feature = "kernel-bypass")]
-                        let stabilized_by_peers = stabilization.packets_seen > 0
-                            && discovered_peers >= bootstrap_stabilize_min_peers;
-                        #[cfg(not(feature = "kernel-bypass"))]
-                        let stabilized_by_peers = stabilization.packets_seen > 0
-                            && discovered_peers >= bootstrap_stabilize_min_peers;
+                        let stabilized_by_peers = gossip_bootstrap_accepts_peer_discovery(
+                            control_plane_only_bootstrap,
+                            stabilization.packets_seen,
+                            discovered_peers,
+                            bootstrap_stabilize_min_peers,
+                        );
                         let accepted = stabilization.stabilized || stabilized_by_peers;
                         if !accepted {
                             let candidate_receivers = gossip_receivers.len();
@@ -295,6 +295,37 @@ pub(crate) async fn start_receiver(
         );
     }
     Ok(runtime)
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+const fn gossip_bootstrap_accepts_peer_discovery(
+    control_plane_only_bootstrap: bool,
+    packets_seen: u64,
+    discovered_peers: usize,
+    bootstrap_stabilize_min_peers: usize,
+) -> bool {
+    if control_plane_only_bootstrap {
+        discovered_peers >= bootstrap_stabilize_min_peers
+    } else {
+        packets_seen > 0 && discovered_peers >= bootstrap_stabilize_min_peers
+    }
+}
+
+#[cfg(all(test, feature = "gossip-bootstrap"))]
+mod tests {
+    use super::gossip_bootstrap_accepts_peer_discovery;
+
+    #[test]
+    fn control_plane_only_bootstrap_accepts_peer_discovery_without_packets() {
+        assert!(gossip_bootstrap_accepts_peer_discovery(true, 0, 1, 1));
+        assert!(!gossip_bootstrap_accepts_peer_discovery(true, 0, 0, 1));
+    }
+
+    #[test]
+    fn full_gossip_bootstrap_still_requires_packets_for_peer_discovery_fallback() {
+        assert!(!gossip_bootstrap_accepts_peer_discovery(false, 0, 8, 8));
+        assert!(gossip_bootstrap_accepts_peer_discovery(false, 1, 8, 8));
+    }
 }
 
 #[cfg(feature = "kernel-bypass")]
