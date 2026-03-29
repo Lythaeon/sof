@@ -1059,7 +1059,7 @@ Design references:
 - In gossip mode, SOF runs as an active bounded relay client by default (UDP relay + repair serve), not as an observer-only passive consumer.
 - `SOF_GOSSIP_RUNTIME_MODE=control_plane_only` is the exception when you only need gossip-derived topology and leader state without gossip shred ingest.
 - In typed setup, the same mode is `RuntimeSetup::with_gossip_runtime_mode(GossipRuntimeMode::ControlPlaneOnly)`.
-- `SOF_LIVE_SHREDS_ENABLED=false` enables control-plane-only mode.
+- `SOF_LIVE_SHREDS_ENABLED=false` disables live shred processing; it is not the same thing as `SOF_GOSSIP_RUNTIME_MODE=control_plane_only`.
 
 ## Examples
 
