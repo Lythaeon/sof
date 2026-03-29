@@ -43,7 +43,7 @@ Those responsibilities belong to `sof` or to your own external control plane.
 
 | Type | Purpose |
 | --- | --- |
-| `TxBuilder` | build legacy or `V0` transactions |
+| `sof-solana-compat::TxBuilder` | build legacy or `V0` transactions |
 | `TxSubmitClient` | configure transports and submit policy |
 | `SubmitPlan` | choose one or more routes plus execution strategy |
 | `SubmitRoute` | one concrete route: `Rpc`, `Jito`, or `Direct` |
@@ -53,6 +53,9 @@ Those responsibilities belong to `sof` or to your own external control plane.
 | `SignatureDeduper` | avoid duplicate sends at signature granularity |
 | `LeaderProvider` / `RecentBlockhashProvider` | abstract control-plane sources |
 
+Use `sof-solana-compat` when you want the Solana-native `TxBuilder` plus unsigned convenience
+submission helpers on top of `sof-tx`.
+
 ## The First Three Code Paths You Will Usually Need
 
 ### 1. Use `sof-tx` with RPC-sourced blockhash
@@ -61,7 +64,8 @@ Start here when you want RPC submission and you want the client to source recent
 that same RPC endpoint.
 
 ```rust
-use sof_tx::{SubmitPlan, TxBuilder, TxSubmitClient};
+use sof_solana_compat::{TxBuilder, TxSubmitClientSolanaExt};
+use sof_tx::{SubmitPlan, TxSubmitClient};
 use solana_keypair::Keypair;
 use solana_signer::Signer;
 use solana_system_interface::instruction as system_instruction;
@@ -99,7 +103,8 @@ unsigned submit path still needs a recent blockhash even when the submit itself 
 ```rust
 use std::sync::Arc;
 
-use sof_tx::{SubmitPlan, TxBuilder, TxSubmitClient, submit::JitoJsonRpcTransport};
+use sof_solana_compat::{TxBuilder, TxSubmitClientSolanaExt};
+use sof_tx::{SubmitPlan, TxSubmitClient, submit::JitoJsonRpcTransport};
 use solana_keypair::Keypair;
 use solana_signer::Signer;
 use solana_system_interface::instruction as system_instruction;
@@ -162,31 +167,17 @@ the transaction inside the client, so there is no blockhash lookup step here.
 
 Start here when one process owns both observation and submission.
 
-```rust
-use std::sync::Arc;
+See the full example in:
 
-use sof::framework::{ObserverPlugin, PluginHost};
-use sof_tx::{SubmitPlan, TxBuilder, TxSubmitClient, adapters::PluginHostTxProviderAdapter};
+- `crates/sof-tx/examples/submit_all_at_once_with_sof.rs`
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let adapter = Arc::new(PluginHostTxProviderAdapter::default());
-    let host = PluginHost::builder()
-        .add_shared_plugin(adapter.clone() as Arc<dyn ObserverPlugin>)
-        .build();
+It shows one full process shape with:
 
-    adapter.prime_from_plugin_host(&host);
-    let _client = TxSubmitClient::new(adapter.clone(), adapter.clone());
-
-    // Start `sof` with the plugin host in the same process, then submit with `sof-tx`.
-    let _ = SubmitPlan::hybrid();
-    let _ = TxBuilder::new(solana_pubkey::Pubkey::new_unique());
-
-    Ok(())
-}
-```
-
-This is the shortest path to the “one process observes and sends” architecture.
+- `PluginHostTxProviderAdapter`
+- SOF plugin-host wiring
+- RPC blockhash refresh plus SOF-backed leader routing
+- direct, RPC, and Jito transports configured together
+- `SubmitPlan::all_at_once(vec![Direct, Rpc, Jito])`
 
 ## Submit Plans
 

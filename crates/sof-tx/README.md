@@ -52,12 +52,20 @@ Enable `kernel-bypass` transport hooks for kernel-bypass direct submit integrati
 sof-tx = { version = "0.16.0", features = ["kernel-bypass"] }
 ```
 
+Use `sof-solana-compat` when you want the Solana-native `TxBuilder` plus unsigned convenience
+submission helpers on top of `sof-tx`:
+
+```toml
+sof-solana-compat = "0.16.0"
+```
+
 ## Quick Start
 
 Start with the simplest unsigned-submit path:
 
 ```rust
-use sof_tx::{SubmitPlan, TxBuilder, TxSubmitClient};
+use sof_solana_compat::{TxBuilder, TxSubmitClientSolanaExt};
+use sof_tx::{SubmitPlan, TxSubmitClient};
 use solana_keypair::Keypair;
 use solana_signer::Signer;
 use solana_system_interface::instruction as system_instruction;
@@ -126,7 +134,7 @@ For most services, the practical order is:
 
 - `TxSubmitClientBuilder`: configure common RPC, Jito, direct, and control-plane paths without
   wiring providers by hand first.
-- `TxBuilder`: compose transaction instructions and signing inputs.
+- `sof_solana_compat::TxBuilder`: compose transaction instructions and signing inputs.
 - `TxSubmitClient`: submit through one or more configured routes.
 - `SubmitPlan`: primary route-plan API.
 - `SubmitRoute`: one concrete route (`Rpc`, `Jito`, `Direct`).
@@ -158,52 +166,16 @@ With `sof-adapters` enabled, `PluginHostTxProviderAdapter` can be:
 - passed directly into `TxSubmitClient` as both providers.
 - evaluated with `evaluate_flow_safety(...)` before using its control-plane state for direct send decisions.
 
-```rust
-use std::sync::Arc;
+See the full example:
 
-use sof::framework::{ObserverPlugin, PluginHost};
-use sof_tx::{
-    SubmitPlan, SubmitReliability, TxBuilder, TxSubmitClient,
-    adapters::PluginHostTxProviderAdapter,
-    submit::{JitoJsonRpcTransport, JsonRpcTransport, UdpDirectTransport},
-};
-use solana_keypair::Keypair;
-use solana_signer::Signer;
+- `crates/sof-tx/examples/submit_all_at_once_with_sof.rs`
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let adapter = Arc::new(PluginHostTxProviderAdapter::default());
-    let host = PluginHost::builder()
-        .add_shared_plugin(adapter.clone() as Arc<dyn ObserverPlugin>)
-        .build();
+That example shows:
 
-    // If SOF runtime was already running, optionally seed from host snapshots.
-    adapter.prime_from_plugin_host(&host);
-
-    let mut client = TxSubmitClient::new(adapter.clone(), adapter.clone())
-        .with_reliability(SubmitReliability::Balanced)
-        .with_rpc_transport(Arc::new(JsonRpcTransport::new("https://api.mainnet-beta.solana.com")?))
-        .with_jito_transport(Arc::new(JitoJsonRpcTransport::new()?))
-        .with_direct_transport(Arc::new(UdpDirectTransport::new()));
-
-    let payer = Keypair::new();
-    let recipient = Keypair::new();
-    let builder = TxBuilder::new(payer.pubkey())
-        .with_compute_unit_limit(450_000)
-        .with_priority_fee_micro_lamports(100_000)
-        .add_instruction(solana_system_interface::instruction::transfer(
-            &payer.pubkey(),
-            &recipient.pubkey(),
-            1,
-        ));
-
-    let _ = client
-        .submit_unsigned_via(builder, &[&payer], SubmitPlan::hybrid())
-        .await?;
-
-    Ok(())
-}
-```
+- `PluginHostTxProviderAdapter` wired into a `PluginHost`
+- RPC blockhash refresh plus SOF-backed leader routing
+- direct, RPC, and Jito transports configured together
+- `SubmitPlan::all_at_once(vec![Direct, Rpc, Jito])`
 
 For restart-safe services built on SOF derived-state, use `DerivedStateTxProviderAdapter` instead.
 It consumes the replayable derived-state feed, supports checkpoint persistence, and exposes the
@@ -220,8 +192,8 @@ guard decisions.
 For services that do not want to maintain a parallel checkpoint file format, use the adapter
 persistence helper backed by SOF's generic `DerivedStateCheckpointStore`.
 
-Direct submit needs TPU endpoints for scheduled leaders. That requirement applies only to
-`DirectOnly` and the direct leg of `Hybrid`. The adapter gets those from `on_cluster_topology`
+Direct submit needs TPU endpoints for scheduled leaders. That requirement applies to any submit
+plan that includes `SubmitRoute::Direct`. The adapter gets those from `on_cluster_topology`
 events, or you can inject them manually with:
 
 - `set_leader_tpu_addr(pubkey, tpu_addr)`
@@ -236,53 +208,13 @@ driving direct or hybrid sends. Typical checks include:
 - missing TPU addresses for targeted leaders
 - degraded topology freshness
 
-## Expanded Quickstart
-
-```rust
-use std::sync::Arc;
-
-use sof_tx::{
-    SubmitPlan, TxBuilder, TxSubmitClient,
-    submit::JitoJsonRpcTransport,
-};
-use solana_keypair::Keypair;
-use solana_signer::Signer;
-use solana_system_interface::instruction as system_instruction;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let payer = Keypair::new();
-    let recipient = Keypair::new();
-
-    let mut client = TxSubmitClient::builder()
-        .with_rpc_defaults("https://api.mainnet-beta.solana.com")?
-        .with_jito_transport(Arc::new(JitoJsonRpcTransport::new()?))
-        .build();
-
-    let builder = TxBuilder::new(payer.pubkey())
-        .with_compute_unit_limit(450_000)
-        .with_priority_fee_micro_lamports(100_000)
-        .tip_developer()
-        .add_instruction(system_instruction::transfer(
-            &payer.pubkey(),
-            &recipient.pubkey(),
-            1,
-        ));
-
-    let _result = client
-        .submit_unsigned_via(builder, &[&payer], SubmitPlan::jito_only())
-        .await?;
-
-    Ok(())
-}
-```
-
 ## Simplifying OpenBook + CPMM Flows
 
 The recommended pattern is to keep strategy-specific instruction creation separate, and route both through one shared SDK pipeline.
 
 ```rust
-use sof_tx::{SubmitPlan, TxBuilder, TxSubmitClient};
+use sof_solana_compat::{TxBuilder, TxSubmitClientSolanaExt};
+use sof_tx::{SubmitPlan, TxSubmitClient};
 use solana_instruction::Instruction;
 use solana_keypair::Keypair;
 use solana_signer::Signer;
