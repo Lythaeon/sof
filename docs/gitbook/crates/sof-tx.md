@@ -280,6 +280,13 @@ in implicit retries.
 5. attach `sof` adapters only when you want locally observed control-plane state to drive those
    direct or hybrid decisions
 
+If you intentionally configure more than one route, prefer `SubmitPlan::all_at_once(...)` as the
+multi-route shape. It returns on the first accepted route, while later accepts are surfaced
+through the external outcome reporter. That reporter path is asynchronous and best-effort through
+one bounded FIFO dispatcher per reporter instance, shared across clients that use that same
+reporter, while built-in telemetry still counts every outcome inline. If reporter delivery drops
+or becomes unavailable, that is surfaced through the built-in telemetry snapshot.
+
 ## What To Open In The Repository
 
 If the conceptual docs stop too early for what you need to build, open these next:

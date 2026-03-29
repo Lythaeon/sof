@@ -1,10 +1,16 @@
 //! Submission client implementation and mode orchestration.
 
 use std::{
+    collections::HashMap,
     collections::HashSet,
     net::SocketAddr,
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::Arc,
+    sync::{
+        Arc, Mutex, OnceLock, Weak,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self as std_mpsc, SyncSender, TrySendError},
+    },
+    thread,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -67,8 +73,8 @@ pub struct TxSubmitClient {
     suppression: TxSuppressionCache,
     /// Built-in toxic-flow telemetry sink.
     telemetry: Arc<TxToxicFlowTelemetry>,
-    /// Optional external outcome reporter.
-    outcome_reporter: Option<Arc<dyn TxSubmitOutcomeReporter>>,
+    /// Optional external outcome reporter handle.
+    outcome_reporter: Option<OutcomeReporterHandle>,
 }
 
 impl TxSubmitClient {
@@ -225,7 +231,7 @@ impl TxSubmitClient {
     /// Sets an optional external outcome reporter.
     #[must_use]
     pub fn with_outcome_reporter(mut self, reporter: Arc<dyn TxSubmitOutcomeReporter>) -> Self {
-        self.outcome_reporter = Some(reporter);
+        self.outcome_reporter = Some(OutcomeReporterHandle::new(reporter));
         self
     }
 
@@ -869,35 +875,19 @@ struct RouteSubmitOutcome {
 /// Records one structured outcome through built-in telemetry and any external reporter.
 fn record_external_outcome_shared(
     telemetry: &Arc<TxToxicFlowTelemetry>,
-    reporter: Option<&Arc<dyn TxSubmitOutcomeReporter>>,
+    reporter: Option<&OutcomeReporterHandle>,
     outcome: &TxSubmitOutcome,
 ) {
     telemetry.record(outcome);
     if let Some(reporter) = reporter {
-        dispatch_reporter_outcome(reporter.clone(), outcome.clone());
+        reporter.dispatch(telemetry, outcome.clone());
     }
-}
-
-/// Delivers one outcome to the optional external reporter without extending the submit hot path.
-fn dispatch_reporter_outcome(reporter: Arc<dyn TxSubmitOutcomeReporter>, outcome: TxSubmitOutcome) {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        drop(handle.spawn(async move {
-            drop(catch_unwind(AssertUnwindSafe(|| {
-                reporter.record_outcome(&outcome);
-            })));
-        }));
-        return;
-    }
-
-    drop(catch_unwind(AssertUnwindSafe(|| {
-        reporter.record_outcome(&outcome);
-    })));
 }
 
 /// Records one accepted route as a terminal telemetry outcome using shared sinks.
 fn record_route_outcome_shared(
     telemetry: &Arc<TxToxicFlowTelemetry>,
-    reporter: Option<&Arc<dyn TxSubmitOutcomeReporter>>,
+    reporter: Option<&OutcomeReporterHandle>,
     flow_safety_source: Option<&Arc<dyn TxFlowSafetySource>>,
     signature: Option<SignatureBytes>,
     plan: &SubmitPlan,
@@ -922,6 +912,144 @@ fn record_route_outcome_shared(
         opportunity_age_ms: None,
     };
     record_external_outcome_shared(telemetry, reporter, &outcome);
+}
+
+/// Outcome reporter lifecycle state stored by one client.
+#[derive(Clone)]
+enum OutcomeReporterHandle {
+    /// Ready shared dispatcher for this reporter instance.
+    Ready(Arc<OutcomeReporterDispatcher>),
+    /// Reporter worker could not be created.
+    Unavailable,
+}
+
+impl OutcomeReporterHandle {
+    /// Creates one handle for the provided reporter.
+    fn new(reporter: Arc<dyn TxSubmitOutcomeReporter>) -> Self {
+        match OutcomeReporterDispatcher::shared(reporter) {
+            Ok(dispatcher) => Self::Ready(dispatcher),
+            Err(error) => {
+                eprintln!("sof-tx: failed to start external outcome reporter worker: {error}");
+                Self::Unavailable
+            }
+        }
+    }
+
+    /// Dispatches one outcome without extending the submit hot path.
+    fn dispatch(&self, telemetry: &Arc<TxToxicFlowTelemetry>, outcome: TxSubmitOutcome) {
+        match self {
+            Self::Ready(dispatcher) => match dispatcher.dispatch(outcome) {
+                ReporterDispatchStatus::Enqueued => {}
+                ReporterDispatchStatus::DroppedFull => telemetry.record_reporter_drop(),
+                ReporterDispatchStatus::Unavailable => telemetry.record_reporter_unavailable(),
+            },
+            Self::Unavailable => telemetry.record_reporter_unavailable(),
+        }
+    }
+}
+
+/// Shared worker state for one concrete reporter instance.
+struct OutcomeReporterDispatcher {
+    /// Bounded FIFO channel to the reporter worker.
+    tx: SyncSender<TxSubmitOutcome>,
+    /// Ensures queue saturation is surfaced without spamming stderr.
+    queue_full_warned: AtomicBool,
+    /// Ensures worker disconnect is surfaced without spamming stderr.
+    unavailable_warned: AtomicBool,
+}
+
+impl OutcomeReporterDispatcher {
+    /// Maximum number of pending outcomes kept for the external reporter.
+    #[cfg(not(test))]
+    const QUEUE_CAPACITY: usize = 1024;
+    #[cfg(test)]
+    const QUEUE_CAPACITY: usize = 8;
+
+    /// Creates one shared dispatcher and worker thread.
+    fn shared(reporter: Arc<dyn TxSubmitOutcomeReporter>) -> Result<Arc<Self>, std::io::Error> {
+        let key = reporter_identity(&reporter);
+        let registry = outcome_reporter_registry();
+        {
+            let registry = registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
+                return Ok(existing);
+            }
+        }
+
+        let (tx, rx) = std_mpsc::sync_channel::<TxSubmitOutcome>(Self::QUEUE_CAPACITY);
+        thread::Builder::new()
+            .name("sof-tx-outcome-reporter".to_owned())
+            .spawn(move || {
+                while let Ok(outcome) = rx.recv() {
+                    drop(catch_unwind(AssertUnwindSafe(|| {
+                        reporter.record_outcome(&outcome);
+                    })));
+                }
+            })?;
+
+        let dispatcher = Arc::new(Self {
+            tx,
+            queue_full_warned: AtomicBool::new(false),
+            unavailable_warned: AtomicBool::new(false),
+        });
+        let mut registry = registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = registry.insert(key, Arc::downgrade(&dispatcher));
+        Ok(dispatcher)
+    }
+
+    /// Enqueues one outcome without blocking the submit caller.
+    fn dispatch(&self, outcome: TxSubmitOutcome) -> ReporterDispatchStatus {
+        match self.tx.try_send(outcome) {
+            Ok(()) => {
+                self.queue_full_warned.store(false, Ordering::Relaxed);
+                ReporterDispatchStatus::Enqueued
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                if !self.unavailable_warned.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "sof-tx: external outcome reporter worker stopped; dropping reporter outcomes"
+                    );
+                }
+                ReporterDispatchStatus::Unavailable
+            }
+            Err(TrySendError::Full(_)) => {
+                if !self.queue_full_warned.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "sof-tx: external outcome reporter queue is full; dropping reporter outcomes until it drains"
+                    );
+                }
+                ReporterDispatchStatus::DroppedFull
+            }
+        }
+    }
+}
+
+/// Result of one best-effort reporter dispatch attempt.
+enum ReporterDispatchStatus {
+    /// Outcome was queued successfully.
+    Enqueued,
+    /// Outcome was dropped because the queue was full.
+    DroppedFull,
+    /// Outcome could not be queued because the reporter worker was unavailable.
+    Unavailable,
+}
+
+/// Shared registry of per-reporter dispatchers.
+static OUTCOME_REPORTER_REGISTRY: OnceLock<Mutex<HashMap<usize, Weak<OutcomeReporterDispatcher>>>> =
+    OnceLock::new();
+
+/// Returns the shared dispatcher registry.
+fn outcome_reporter_registry() -> &'static Mutex<HashMap<usize, Weak<OutcomeReporterDispatcher>>> {
+    OUTCOME_REPORTER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Stable identity key for one reporter instance.
+fn reporter_identity(reporter: &Arc<dyn TxSubmitOutcomeReporter>) -> usize {
+    Arc::as_ptr(reporter) as *const () as usize
 }
 
 /// Extracts the first transaction signature from serialized transaction bytes.

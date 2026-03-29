@@ -298,7 +298,12 @@ Use `SubmitPlan` as the primary API:
   depending on any single route's transient latency or availability. The submit call returns on
   the first accepted route; later background accepts are reported through
   `TxSubmitOutcomeReporter`, and built-in telemetry counts those accepts without mutating the
-  returned `SubmitResult`.
+  returned `SubmitResult`. The reporter path is asynchronous and best-effort through one
+  bounded FIFO dispatcher per reporter instance, shared across clients that use that same
+  reporter, so it stays off the submit hot path while preserving callback order for queued
+  outcomes. If that reporter path drops or cannot deliver outcomes, the built-in telemetry
+  snapshot surfaces it through `reporter_outcomes_dropped` and
+  `reporter_outcomes_unavailable`.
 
 Arbitrary plans are first-class:
 
@@ -405,7 +410,8 @@ With the `jito-grpc` feature enabled, `sof-tx` also exposes `JitoGrpcTransport`.
 transactions as single-transaction bundles over Jito searcher gRPC. If Jito is the route that
 accepts before return, the bundle UUID is available in `SubmitResult.jito_bundle_id`; if another
 route wins first, the later Jito accept still carries its bundle UUID through
-`TxSubmitOutcomeReporter`, while built-in telemetry still counts that Jito accept.
+`TxSubmitOutcomeReporter`, while built-in telemetry still counts that Jito accept even if the
+reporter queue drops it under sustained pressure.
 
 ## Reliability Profiles
 

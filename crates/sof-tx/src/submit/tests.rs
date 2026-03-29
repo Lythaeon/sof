@@ -1307,6 +1307,61 @@ async fn all_at_once_with_slow_reporter_still_returns_on_first_success() {
 }
 
 #[tokio::test]
+async fn reporter_preserves_accept_order_for_late_background_successes() {
+    let direct = Arc::new(MockDirectTransport {
+        result: Ok(target(9005)),
+        calls: AtomicU64::new(0),
+    });
+    let jito = Arc::new(DelayedJitoTransport {
+        result: Ok(JitoSubmitResponse {
+            transaction_signature: Some("jito-signature".to_owned()),
+            bundle_id: Some("bundle-ordered".to_owned()),
+        }),
+        delay: Duration::from_millis(40),
+        calls: AtomicU64::new(0),
+    });
+    let reporter = Arc::new(RecordingOutcomeReporter::default());
+    let mut client = TxSubmitClient::new(
+        Arc::new(StaticRecentBlockhashProvider::new(Some([44_u8; 32]))),
+        Arc::new(StaticLeaderProvider::new(Some(target(9005)), Vec::new())),
+    )
+    .with_direct_transport(direct)
+    .with_jito_transport(jito)
+    .with_outcome_reporter(reporter.clone());
+
+    let (bytes, _) = signed_transfer_bytes();
+    let result = client
+        .submit_signed_via(
+            SignedTx::VersionedTransactionBytes(bytes),
+            SubmitPlan::all_at_once(vec![SubmitRoute::Direct, SubmitRoute::Jito]),
+        )
+        .await;
+
+    assert!(result.is_ok());
+
+    let ordered = timeout(Duration::from_millis(300), async {
+        loop {
+            let outcomes = reporter
+                .outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            if outcomes.len() >= 2 {
+                break outcomes;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(ordered.is_ok());
+    let outcomes = ordered.unwrap_or_default();
+    assert_eq!(outcomes[0].kind, TxSubmitOutcomeKind::DirectAccepted);
+    assert_eq!(outcomes[0].route, Some(SubmitRoute::Direct));
+    assert_eq!(outcomes[1].kind, TxSubmitOutcomeKind::JitoAccepted);
+    assert_eq!(outcomes[1].route, Some(SubmitRoute::Jito));
+}
+
+#[tokio::test]
 async fn reporter_panic_does_not_abort_successful_submit() {
     let direct_target = target(9044);
     let direct = Arc::new(MockDirectTransport {
@@ -1339,6 +1394,137 @@ async fn reporter_panic_does_not_abort_successful_submit() {
 
     let telemetry = client.toxic_flow_telemetry();
     assert_eq!(telemetry.direct_accepted, 1);
+}
+
+#[test]
+fn record_external_outcome_outside_tokio_returns_without_waiting_for_reporter() {
+    let reporter = Arc::new(SlowOutcomeReporter {
+        delay: Duration::from_millis(200),
+    });
+    let client = TxSubmitClient::blockhash_only(Arc::new(StaticRecentBlockhashProvider::new(
+        Some([45_u8; 32]),
+    )))
+    .with_outcome_reporter(reporter);
+    let outcome = TxSubmitOutcome {
+        kind: TxSubmitOutcomeKind::Suppressed,
+        signature: None,
+        route: None,
+        plan: SubmitPlan::rpc_only(),
+        legacy_mode: Some(SubmitMode::RpcOnly),
+        rpc_signature: None,
+        jito_signature: None,
+        jito_bundle_id: None,
+        state_version: None,
+        opportunity_age_ms: None,
+    };
+
+    let started = Instant::now();
+    client.record_external_outcome(&outcome);
+
+    assert!(started.elapsed() < Duration::from_millis(50));
+}
+
+#[test]
+fn reporter_queue_pressure_updates_telemetry_counters() {
+    let reporter = Arc::new(SlowOutcomeReporter {
+        delay: Duration::from_millis(200),
+    });
+    let client = TxSubmitClient::blockhash_only(Arc::new(StaticRecentBlockhashProvider::new(
+        Some([46_u8; 32]),
+    )))
+    .with_outcome_reporter(reporter);
+    let outcome = TxSubmitOutcome {
+        kind: TxSubmitOutcomeKind::Suppressed,
+        signature: None,
+        route: None,
+        plan: SubmitPlan::rpc_only(),
+        legacy_mode: Some(SubmitMode::RpcOnly),
+        rpc_signature: None,
+        jito_signature: None,
+        jito_bundle_id: None,
+        state_version: None,
+        opportunity_age_ms: None,
+    };
+
+    for _ in 0..64 {
+        client.record_external_outcome(&outcome);
+    }
+
+    let telemetry = client.toxic_flow_telemetry();
+    assert!(telemetry.reporter_outcomes_dropped > 0);
+}
+
+#[tokio::test]
+async fn reporter_queue_pressure_isolated_per_reporter_instance() {
+    let slow_reporter = Arc::new(SlowOutcomeReporter {
+        delay: Duration::from_millis(200),
+    });
+    let fast_reporter = Arc::new(RecordingOutcomeReporter::default());
+    let slow_client = TxSubmitClient::blockhash_only(Arc::new(StaticRecentBlockhashProvider::new(
+        Some([47_u8; 32]),
+    )))
+    .with_outcome_reporter(slow_reporter);
+    let fast_client = TxSubmitClient::blockhash_only(Arc::new(StaticRecentBlockhashProvider::new(
+        Some([48_u8; 32]),
+    )))
+    .with_outcome_reporter(fast_reporter.clone());
+    let slow_outcome = TxSubmitOutcome {
+        kind: TxSubmitOutcomeKind::Suppressed,
+        signature: None,
+        route: None,
+        plan: SubmitPlan::rpc_only(),
+        legacy_mode: Some(SubmitMode::RpcOnly),
+        rpc_signature: None,
+        jito_signature: None,
+        jito_bundle_id: None,
+        state_version: None,
+        opportunity_age_ms: None,
+    };
+    let fast_outcome = TxSubmitOutcome {
+        kind: TxSubmitOutcomeKind::RejectedDueToStaleness,
+        signature: None,
+        route: None,
+        plan: SubmitPlan::direct_only(),
+        legacy_mode: Some(SubmitMode::DirectOnly),
+        rpc_signature: None,
+        jito_signature: None,
+        jito_bundle_id: None,
+        state_version: None,
+        opportunity_age_ms: None,
+    };
+
+    for _ in 0..64 {
+        slow_client.record_external_outcome(&slow_outcome);
+    }
+
+    fast_client.record_external_outcome(&fast_outcome);
+
+    let observed = timeout(Duration::from_millis(50), async {
+        loop {
+            let outcomes = fast_reporter
+                .outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            if !outcomes.is_empty() {
+                break outcomes;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(observed.is_ok());
+    let outcomes = observed.unwrap_or_default();
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(
+        outcomes[0].kind,
+        TxSubmitOutcomeKind::RejectedDueToStaleness
+    );
+    assert_eq!(
+        fast_client.toxic_flow_telemetry().reporter_outcomes_dropped,
+        0
+    );
+    assert!(slow_client.toxic_flow_telemetry().reporter_outcomes_dropped > 0);
 }
 
 #[tokio::test]

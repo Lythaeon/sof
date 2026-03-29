@@ -462,9 +462,12 @@ pub struct SubmitResult {
     /// First successful route observed before this submit call returned.
     pub first_success_route: Option<SubmitRoute>,
     ///
-    /// Later background accepts from concurrently configured routes are reported through
-    /// [`TxSubmitOutcomeReporter`] and counted by built-in telemetry, including any route-specific
-    /// acceptance metadata, rather than retroactively mutating this synchronous result.
+    /// Later background accepts from concurrently configured routes are counted by built-in
+    /// telemetry and are best-effort through [`TxSubmitOutcomeReporter`], including any
+    /// route-specific acceptance metadata, rather than retroactively mutating this synchronous
+    /// result. Reporter delivery failures are reflected in
+    /// [`TxToxicFlowTelemetrySnapshot::reporter_outcomes_dropped`] and
+    /// [`TxToxicFlowTelemetrySnapshot::reporter_outcomes_unavailable`].
     pub successful_routes: Vec<SubmitRoute>,
     /// Target chosen by direct path when applicable.
     pub direct_target: Option<LeaderTarget>,
@@ -720,6 +723,13 @@ pub struct TxSubmitOutcome {
 }
 
 /// Callback surface for external outcome sinks.
+///
+/// `TxSubmitClient` delivers these callbacks asynchronously through one bounded FIFO dispatcher per
+/// reporter instance, shared across clients that use that same reporter. That keeps the reporter
+/// off the synchronous submit hot path while preserving outcome order for events that are
+/// successfully queued. Under sustained pressure or dispatcher startup failure, reporter delivery
+/// is best-effort and built-in telemetry remains the authoritative always-inline outcome counter
+/// surface.
 pub trait TxSubmitOutcomeReporter: Send + Sync {
     /// Records one structured outcome.
     fn record_outcome(&self, outcome: &TxSubmitOutcome);
@@ -728,6 +738,10 @@ pub trait TxSubmitOutcomeReporter: Send + Sync {
 /// Snapshot of built-in toxic-flow counters collected by [`TxSubmitClient`](crate::submit::TxSubmitClient).
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TxToxicFlowTelemetrySnapshot {
+    /// Number of external reporter outcomes dropped because the reporter queue was full.
+    pub reporter_outcomes_dropped: u64,
+    /// Number of outcomes that could not reach the external reporter because the worker was unavailable.
+    pub reporter_outcomes_unavailable: u64,
     /// Number of direct-route accepts observed.
     pub direct_accepted: u64,
     /// Number of RPC-route accepts observed.
@@ -777,6 +791,10 @@ impl CacheAlignedAtomicU64 {
 /// In-memory telemetry counters for toxic-flow outcomes.
 #[derive(Debug, Default)]
 pub struct TxToxicFlowTelemetry {
+    /// Number of external reporter outcomes dropped because the reporter queue was full.
+    reporter_outcomes_dropped: CacheAlignedAtomicU64,
+    /// Number of outcomes that could not reach the external reporter because the worker was unavailable.
+    reporter_outcomes_unavailable: CacheAlignedAtomicU64,
     /// Number of direct-route accepts.
     direct_accepted: CacheAlignedAtomicU64,
     /// Number of RPC-route accepts.
@@ -863,11 +881,29 @@ impl TxToxicFlowTelemetry {
         }
     }
 
+    /// Records one dropped external-reporter outcome.
+    pub(crate) fn record_reporter_drop(&self) {
+        let _ = self
+            .reporter_outcomes_dropped
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records one unavailable external-reporter outcome.
+    pub(crate) fn record_reporter_unavailable(&self) {
+        let _ = self
+            .reporter_outcomes_unavailable
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Returns the current telemetry snapshot.
     #[must_use]
     pub fn snapshot(&self) -> TxToxicFlowTelemetrySnapshot {
         let age_ms = self.opportunity_age_at_send_ms.load(Ordering::Relaxed);
         TxToxicFlowTelemetrySnapshot {
+            reporter_outcomes_dropped: self.reporter_outcomes_dropped.load(Ordering::Relaxed),
+            reporter_outcomes_unavailable: self
+                .reporter_outcomes_unavailable
+                .load(Ordering::Relaxed),
             direct_accepted: self.direct_accepted.load(Ordering::Relaxed),
             rpc_accepted: self.rpc_accepted.load(Ordering::Relaxed),
             jito_accepted: self.jito_accepted.load(Ordering::Relaxed),
