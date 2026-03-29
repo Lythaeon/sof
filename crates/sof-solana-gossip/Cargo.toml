@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "sof-solana-gossip"
-version = "3.1.8-sof.6"
+version = "3.1.8-sof.7"
 authors = ["Anza Maintainers <maintainers@anza.xyz>"]
 build = false
 exclude = ["Cargo.toml.orig"]
@@ -76,11 +76,11 @@ path = "benches/weighted_shuffle.rs"
 harness = false
 
 [dependencies.agave-feature-set]
-version = "=3.1.8"
+version = "3.1.8"
 features = ["agave-unstable-api"]
 
 [dependencies.agave-logger]
-version = "=3.1.8"
+version = "3.1.8"
 features = ["agave-unstable-api"]
 
 [dependencies.arc-swap]
@@ -157,15 +157,15 @@ version = "0.11.19"
 version = "1.0.1"
 
 [dependencies.solana-bloom]
-version = "=3.1.8"
+version = "3.1.8"
 features = ["agave-unstable-api"]
 
 [dependencies.solana-clap-utils]
-version = "=3.1.8"
+version = "3.1.8"
 features = ["agave-unstable-api"]
 
 [dependencies.solana-client]
-version = "=3.1.8"
+version = "3.1.8"
 
 [dependencies.solana-clock]
 version = "=3.0.0"
@@ -174,12 +174,12 @@ version = "=3.0.0"
 version = "=3.0.0"
 
 [dependencies.solana-connection-cache]
-version = "=3.1.8"
+version = "3.1.8"
 features = ["agave-unstable-api"]
 default-features = false
 
 [dependencies.solana-entry]
-version = "=3.1.8"
+version = "3.1.8"
 features = ["agave-unstable-api"]
 
 [dependencies.solana-epoch-schedule]
@@ -192,7 +192,7 @@ version = "=3.1.0"
 version = "=3.0.1"
 
 [dependencies.solana-ledger]
-version = "=3.1.8"
+version = "3.1.8"
 optional = true
 features = [
     "agave-unstable-api",
@@ -200,18 +200,18 @@ features = [
 ]
 
 [dependencies.solana-measure]
-version = "=3.1.8"
+version = "3.1.8"
 features = ["agave-unstable-api"]
 
 [dependencies.solana-metrics]
-version = "=3.1.8"
+version = "3.1.8"
 features = ["agave-unstable-api"]
 
 [dependencies.solana-native-token]
 version = "=3.0.0"
 
 [dependencies.solana-net-utils]
-version = "=3.1.8"
+version = "3.1.8"
 features = [
     "agave-unstable-api",
     "agave-unstable-api",
@@ -221,7 +221,7 @@ features = [
 version = "=3.0.0"
 
 [dependencies.solana-perf]
-version = "=3.1.8"
+version = "3.1.8"
 features = ["agave-unstable-api"]
 
 [dependencies.solana-pubkey]
@@ -232,15 +232,15 @@ features = ["rand"]
 version = "=3.0.0"
 
 [dependencies.solana-rayon-threadlimit]
-version = "=3.1.8"
+version = "3.1.8"
 features = ["agave-unstable-api"]
 
 [dependencies.solana-rpc-client]
-version = "=3.1.8"
+version = "3.1.8"
 default-features = false
 
 [dependencies.solana-runtime]
-version = "=3.1.8"
+version = "3.1.8"
 features = ["agave-unstable-api"]
 
 [dependencies.solana-sanitize]
@@ -263,14 +263,14 @@ default-features = false
 version = "=3.0.0"
 
 [dependencies.solana-streamer]
-version = "=3.1.8"
+version = "3.1.8"
 features = ["agave-unstable-api"]
 
 [dependencies.solana-time-utils]
 version = "=3.0.0"
 
 [dependencies.solana-tpu-client]
-version = "=3.1.8"
+version = "3.1.8"
 features = ["agave-unstable-api"]
 default-features = false
 
@@ -278,15 +278,15 @@ default-features = false
 version = "=3.0.2"
 
 [dependencies.solana-version]
-version = "=3.1.8"
+version = "3.1.8"
 features = ["agave-unstable-api"]
 
 [dependencies.solana-vote]
-version = "=3.1.8"
+version = "3.1.8"
 features = ["agave-unstable-api"]
 
 [dependencies.solana-vote-program]
-version = "=3.1.8"
+version = "3.1.8"
 features = ["agave-unstable-api"]
 default-features = false
 
@@ -321,21 +321,21 @@ package = "rand_chacha"
 version = "2.0.0"
 
 [dev-dependencies.solana-net-utils]
-version = "=3.1.8"
+version = "3.1.8"
 features = [
     "agave-unstable-api",
     "dev-context-only-utils",
 ]
 
 [dev-dependencies.solana-perf]
-version = "=3.1.8"
+version = "3.1.8"
 features = [
     "agave-unstable-api",
     "dev-context-only-utils",
 ]
 
 [dev-dependencies.solana-runtime]
-version = "=3.1.8"
+version = "3.1.8"
 features = [
     "agave-unstable-api",
     "dev-context-only-utils",
