@@ -65,8 +65,10 @@ pub(crate) async fn stop_gossip_runtime_components(
 #[derive(Debug, Clone, Copy)]
 pub(super) struct RuntimeStabilization {
     pub(super) stabilized: bool,
+    pub(super) stabilized_by_peers: bool,
     pub(super) elapsed: Duration,
     pub(super) packets_seen: u64,
+    pub(super) discovered_peers: usize,
 }
 
 #[cfg(feature = "gossip-bootstrap")]
@@ -101,18 +103,129 @@ pub(super) async fn wait_for_runtime_stabilization(
         if sustained && fresh && packets_seen >= min_packets {
             return RuntimeStabilization {
                 stabilized: true,
+                stabilized_by_peers: false,
                 elapsed,
                 packets_seen,
+                discovered_peers: 0,
             };
         }
         if elapsed >= max_wait {
             return RuntimeStabilization {
                 stabilized: false,
+                stabilized_by_peers: false,
                 elapsed,
                 packets_seen,
+                discovered_peers: 0,
             };
         }
         ticker.tick().await;
+    }
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+pub(super) async fn wait_for_runtime_stabilization_or_peer_discovery<F>(
+    telemetry: ingest::ReceiverTelemetry,
+    sustain: Duration,
+    min_packets: u64,
+    max_wait: Duration,
+    peer_counter: F,
+    min_peers: usize,
+) -> RuntimeStabilization
+where
+    F: Fn() -> usize,
+{
+    let started_at = Instant::now();
+    let (baseline_packets, _) = telemetry.snapshot();
+    let mut first_packet_at: Option<Instant> = None;
+    let mut ticker = tokio::time::interval(Duration::from_millis(100));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        let (packets, last_packet_unix_ms) = telemetry.snapshot();
+        let packets_seen = packets.saturating_sub(baseline_packets);
+        if packets_seen > 0 && first_packet_at.is_none() {
+            first_packet_at = Some(Instant::now());
+        }
+        let discovered_peers = peer_counter();
+        let elapsed = started_at.elapsed();
+        let last_packet_age_ms = if last_packet_unix_ms == 0 {
+            u64::MAX
+        } else {
+            current_unix_ms().saturating_sub(last_packet_unix_ms)
+        };
+        let sustained = first_packet_at
+            .map(|first_seen| Instant::now().saturating_duration_since(first_seen) >= sustain)
+            .unwrap_or(false);
+        let fresh = last_packet_age_ms <= 500;
+        if sustained && fresh && packets_seen >= min_packets {
+            return RuntimeStabilization {
+                stabilized: true,
+                stabilized_by_peers: false,
+                elapsed,
+                packets_seen,
+                discovered_peers,
+            };
+        }
+        if discovered_peers >= min_peers {
+            return RuntimeStabilization {
+                stabilized: false,
+                stabilized_by_peers: true,
+                elapsed,
+                packets_seen,
+                discovered_peers,
+            };
+        }
+        if elapsed >= max_wait {
+            return RuntimeStabilization {
+                stabilized: false,
+                stabilized_by_peers: false,
+                elapsed,
+                packets_seen,
+                discovered_peers,
+            };
+        }
+        ticker.tick().await;
+    }
+}
+
+#[cfg(all(test, feature = "gossip-bootstrap"))]
+mod tests {
+    use super::wait_for_runtime_stabilization_or_peer_discovery;
+    use crate::ingest::ReceiverTelemetry;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn control_plane_only_stabilization_returns_on_peer_discovery_without_packets() {
+        let telemetry = ReceiverTelemetry::default();
+        let discovered_peers = Arc::new(AtomicUsize::new(0));
+        let peers_for_probe = discovered_peers.clone();
+
+        let peer_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            peers_for_probe.store(1, Ordering::Relaxed);
+        });
+
+        let stabilization = wait_for_runtime_stabilization_or_peer_discovery(
+            telemetry,
+            Duration::from_millis(250),
+            8,
+            Duration::from_secs(2),
+            || discovered_peers.load(Ordering::Relaxed),
+            1,
+        )
+        .await;
+
+        peer_task.await.expect("peer task should complete");
+
+        assert!(!stabilization.stabilized);
+        assert!(stabilization.stabilized_by_peers);
+        assert_eq!(stabilization.packets_seen, 0);
+        assert_eq!(stabilization.discovered_peers, 1);
+        assert!(stabilization.elapsed < Duration::from_secs(2));
     }
 }
 
@@ -368,6 +481,7 @@ async fn start_gossip_bootstrapped_receiver(
     tx: ingest::RawPacketBatchSender,
     gossip_identity: Arc<Keypair>,
     port_range_override: Option<PortRange>,
+    control_plane_only_bootstrap: bool,
 ) -> Result<GossipBootstrapRuntime, GossipBootstrapStartError> {
     let log_startup_steps = read_log_startup_steps();
     let entrypoint = resolve_socket_addr(entrypoint)?;
@@ -487,42 +601,43 @@ async fn start_gossip_bootstrapped_receiver(
     // "healthy" packet flow.
     let ingest_telemetry = ingest::ReceiverTelemetry::default();
     let mut receiver_handles = Vec::with_capacity(node.sockets.tvu.len().saturating_add(1));
-    for socket in &node.sockets.tvu {
-        let std_socket = socket
-            .try_clone()
-            .map_err(|source| GossipBootstrapStartError::CloneTvuSocket { source })?;
-        std_socket
+    if !control_plane_only_bootstrap {
+        for socket in &node.sockets.tvu {
+            let std_socket = socket
+                .try_clone()
+                .map_err(|source| GossipBootstrapStartError::CloneTvuSocket { source })?;
+            std_socket
+                .set_nonblocking(true)
+                .map_err(|source| GossipBootstrapStartError::SetTvuSocketNonblocking { source })?;
+            receiver_handles.push(
+                ingest::spawn_udp_receiver_from_std_with_telemetry_and_shutdown(
+                    std_socket,
+                    tx.clone(),
+                    Some(ingest_telemetry.clone()),
+                    Some(exit.clone()),
+                ),
+            );
+        }
+        let repair_receiver_socket =
+            node.sockets.repair.try_clone().map_err(|source| {
+                GossipBootstrapStartError::CloneRepairReceiverSocket { source }
+            })?;
+        repair_receiver_socket
             .set_nonblocking(true)
-            .map_err(|source| GossipBootstrapStartError::SetTvuSocketNonblocking { source })?;
+            .map_err(
+                |source| GossipBootstrapStartError::SetRepairReceiverSocketNonblocking { source },
+            )?;
         receiver_handles.push(
             ingest::spawn_udp_receiver_from_std_with_telemetry_and_shutdown(
-                std_socket,
-                tx.clone(),
-                Some(ingest_telemetry.clone()),
+                repair_receiver_socket,
+                tx,
+                None,
                 Some(exit.clone()),
             ),
         );
     }
-    let repair_receiver_socket = node
-        .sockets
-        .repair
-        .try_clone()
-        .map_err(|source| GossipBootstrapStartError::CloneRepairReceiverSocket { source })?;
-    repair_receiver_socket
-        .set_nonblocking(true)
-        .map_err(
-            |source| GossipBootstrapStartError::SetRepairReceiverSocketNonblocking { source },
-        )?;
-    receiver_handles.push(
-        ingest::spawn_udp_receiver_from_std_with_telemetry_and_shutdown(
-            repair_receiver_socket,
-            tx,
-            None,
-            Some(exit.clone()),
-        ),
-    );
 
-    let repair_client = if read_repair_enabled() {
+    let repair_client = if !control_plane_only_bootstrap && read_repair_enabled() {
         let repair_sender_socket = node
             .sockets
             .repair
@@ -571,6 +686,7 @@ pub(super) async fn start_gossip_bootstrapped_receiver_guarded(
     tx: ingest::RawPacketBatchSender,
     gossip_identity: Arc<Keypair>,
     port_range_override: Option<PortRange>,
+    control_plane_only_bootstrap: bool,
 ) -> Result<GossipBootstrapRuntime, GossipBootstrapGuardError> {
     let entrypoint_owned = entrypoint.to_owned();
     let join = tokio::spawn(async move {
@@ -579,6 +695,7 @@ pub(super) async fn start_gossip_bootstrapped_receiver_guarded(
             tx,
             gossip_identity,
             port_range_override,
+            control_plane_only_bootstrap,
         )
         .await
     });

@@ -722,15 +722,23 @@ async fn run_async_with_hosts_inner(
             let (insert_tx, counters, handle) = spawn_relay_cache_insert_worker(cache.clone());
             (Some(insert_tx), Some(counters), Some(handle))
         });
+    #[cfg(feature = "gossip-bootstrap")]
+    let gossip_runtime_mode = read_gossip_runtime_mode();
     #[cfg(all(feature = "gossip-bootstrap", feature = "kernel-bypass"))]
-    let udp_relay_enabled =
-        if kernel_bypass_ingress_enabled && !kernel_bypass_gossip_control_plane_enabled {
-            false
-        } else {
-            read_udp_relay_enabled()
-        };
+    let udp_relay_enabled = if (kernel_bypass_ingress_enabled
+        && !kernel_bypass_gossip_control_plane_enabled)
+        || matches!(gossip_runtime_mode, GossipRuntimeMode::ControlPlaneOnly)
+    {
+        false
+    } else {
+        read_udp_relay_enabled()
+    };
     #[cfg(all(feature = "gossip-bootstrap", not(feature = "kernel-bypass")))]
-    let udp_relay_enabled = read_udp_relay_enabled();
+    let udp_relay_enabled = if matches!(gossip_runtime_mode, GossipRuntimeMode::ControlPlaneOnly) {
+        false
+    } else {
+        read_udp_relay_enabled()
+    };
     #[cfg(not(feature = "gossip-bootstrap"))]
     let udp_relay_enabled = false;
     #[cfg(feature = "gossip-bootstrap")]
@@ -858,17 +866,38 @@ async fn run_async_with_hosts_inner(
     );
 
     #[cfg(all(feature = "gossip-bootstrap", feature = "kernel-bypass"))]
+    let repair_enabled_configured = if (kernel_bypass_ingress_enabled
+        && !kernel_bypass_gossip_control_plane_enabled)
+        || matches!(gossip_runtime_mode, GossipRuntimeMode::ControlPlaneOnly)
+    {
+        false
+    } else {
+        read_repair_enabled()
+    };
+    #[cfg(all(feature = "gossip-bootstrap", not(feature = "kernel-bypass")))]
     let repair_enabled_configured =
-        if kernel_bypass_ingress_enabled && !kernel_bypass_gossip_control_plane_enabled {
+        if matches!(gossip_runtime_mode, GossipRuntimeMode::ControlPlaneOnly) {
             false
         } else {
             read_repair_enabled()
         };
-    #[cfg(all(feature = "gossip-bootstrap", not(feature = "kernel-bypass")))]
-    let repair_enabled_configured = read_repair_enabled();
     #[cfg(feature = "gossip-bootstrap")]
     if !live_shreds_enabled && repair_enabled_configured {
         tracing::warn!("SOF_REPAIR_ENABLED=true ignored because SOF_LIVE_SHREDS_ENABLED=false");
+    }
+    #[cfg(feature = "gossip-bootstrap")]
+    if matches!(gossip_runtime_mode, GossipRuntimeMode::ControlPlaneOnly)
+        && read_udp_relay_enabled()
+    {
+        tracing::warn!(
+            "SOF_UDP_RELAY_ENABLED=true ignored because SOF_GOSSIP_RUNTIME_MODE=control_plane_only"
+        );
+    }
+    #[cfg(feature = "gossip-bootstrap")]
+    if matches!(gossip_runtime_mode, GossipRuntimeMode::ControlPlaneOnly) && read_repair_enabled() {
+        tracing::warn!(
+            "SOF_REPAIR_ENABLED=true ignored because SOF_GOSSIP_RUNTIME_MODE=control_plane_only"
+        );
     }
     #[cfg(feature = "gossip-bootstrap")]
     let repair_enabled = live_shreds_enabled && repair_enabled_configured;
@@ -992,8 +1021,9 @@ async fn run_async_with_hosts_inner(
     #[cfg(feature = "gossip-bootstrap")]
     let gossip_entrypoints = read_gossip_entrypoints();
     #[cfg(feature = "gossip-bootstrap")]
-    let gossip_runtime_switch_enabled =
-        repair_enabled && read_gossip_runtime_switch_enabled() && !read_gossip_bootstrap_only();
+    let gossip_runtime_switch_enabled = repair_enabled
+        && read_gossip_runtime_switch_enabled()
+        && matches!(gossip_runtime_mode, GossipRuntimeMode::Full);
     #[cfg(feature = "gossip-bootstrap")]
     let gossip_runtime_switch_proactive_enabled =
         gossip_runtime_switch_enabled && read_gossip_runtime_switch_proactive_enabled();

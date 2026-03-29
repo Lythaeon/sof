@@ -44,6 +44,14 @@ pub(crate) async fn start_receiver(
     let mut gossip_runtime_secondary_port_range: Option<PortRange> = None;
     #[cfg(feature = "gossip-bootstrap")]
     let gossip_identity = Arc::new(Keypair::new());
+    #[cfg(feature = "gossip-bootstrap")]
+    let gossip_runtime_mode = read_gossip_runtime_mode();
+    #[cfg(all(feature = "gossip-bootstrap", feature = "kernel-bypass"))]
+    let control_plane_only_bootstrap = _control_plane_only_bootstrap
+        || matches!(gossip_runtime_mode, GossipRuntimeMode::ControlPlaneOnly);
+    #[cfg(all(feature = "gossip-bootstrap", not(feature = "kernel-bypass")))]
+    let control_plane_only_bootstrap =
+        matches!(gossip_runtime_mode, GossipRuntimeMode::ControlPlaneOnly);
     let gossip_entrypoints = read_gossip_entrypoints();
     if !gossip_entrypoints.is_empty() {
         if log_startup_steps {
@@ -90,21 +98,10 @@ pub(crate) async fn start_receiver(
                 Duration::from_millis(read_gossip_runtime_switch_stabilize_ms());
             let bootstrap_stabilize_max_wait =
                 Duration::from_millis(read_gossip_bootstrap_stabilize_max_wait_ms());
-            let bootstrap_stabilize_min_peers = {
-                let configured = read_gossip_bootstrap_stabilize_min_peers();
-                #[cfg(feature = "kernel-bypass")]
-                {
-                    if _control_plane_only_bootstrap {
-                        1
-                    } else {
-                        configured
-                    }
-                }
-                #[cfg(not(feature = "kernel-bypass"))]
-                {
-                    configured
-                }
-            };
+            let bootstrap_stabilize_min_peers = effective_bootstrap_stabilize_min_peers(
+                control_plane_only_bootstrap,
+                read_gossip_bootstrap_stabilize_min_peers_override(),
+            );
             for (attempt, entrypoint) in prioritized_entrypoints.iter().enumerate() {
                 if log_startup_steps {
                     tracing::info!(
@@ -119,24 +116,45 @@ pub(crate) async fn start_receiver(
                     tx.clone(),
                     gossip_identity.clone(),
                     Some(port_plan.primary),
+                    control_plane_only_bootstrap,
                 )
                 .await
                 {
                     Ok((gossip_receivers, runtime, client)) => {
-                        let stabilization = wait_for_runtime_stabilization(
-                            runtime.ingest_telemetry.clone(),
-                            bootstrap_stabilize_sustain,
-                            bootstrap_stabilize_min_packets,
-                            bootstrap_stabilize_max_wait,
-                        )
-                        .await;
-                        let discovered_peers = runtime.cluster_info.all_peers().len();
-                        #[cfg(feature = "kernel-bypass")]
-                        let stabilized_by_peers = stabilization.packets_seen > 0
-                            && discovered_peers >= bootstrap_stabilize_min_peers;
-                        #[cfg(not(feature = "kernel-bypass"))]
-                        let stabilized_by_peers = stabilization.packets_seen > 0
-                            && discovered_peers >= bootstrap_stabilize_min_peers;
+                        let stabilization = if control_plane_only_bootstrap {
+                            wait_for_runtime_stabilization_or_peer_discovery(
+                                runtime.ingest_telemetry.clone(),
+                                bootstrap_stabilize_sustain,
+                                bootstrap_stabilize_min_packets,
+                                bootstrap_stabilize_max_wait,
+                                || runtime.cluster_info.all_peers().len(),
+                                bootstrap_stabilize_min_peers,
+                            )
+                            .await
+                        } else {
+                            wait_for_runtime_stabilization(
+                                runtime.ingest_telemetry.clone(),
+                                bootstrap_stabilize_sustain,
+                                bootstrap_stabilize_min_packets,
+                                bootstrap_stabilize_max_wait,
+                            )
+                            .await
+                        };
+                        let discovered_peers = if control_plane_only_bootstrap {
+                            stabilization.discovered_peers
+                        } else {
+                            runtime.cluster_info.all_peers().len()
+                        };
+                        let stabilized_by_peers = if control_plane_only_bootstrap {
+                            stabilization.stabilized_by_peers
+                        } else {
+                            gossip_bootstrap_accepts_peer_discovery(
+                                false,
+                                stabilization.packets_seen,
+                                discovered_peers,
+                                bootstrap_stabilize_min_peers,
+                            )
+                        };
                         let accepted = stabilization.stabilized || stabilized_by_peers;
                         if !accepted {
                             let candidate_receivers = gossip_receivers.len();
@@ -163,14 +181,13 @@ pub(crate) async fn start_receiver(
                             continue;
                         }
                         if !stabilization.stabilized && stabilized_by_peers {
-                            #[cfg(feature = "kernel-bypass")]
-                            if _control_plane_only_bootstrap {
+                            if control_plane_only_bootstrap {
                                 tracing::info!(
                                     entrypoint = %entrypoint,
                                     packets_seen = stabilization.packets_seen,
                                     peers_discovered = discovered_peers,
                                     min_peers = bootstrap_stabilize_min_peers,
-                                    "accepting gossip bootstrap runtime via peer discovery for external kernel-bypass ingress"
+                                    "accepting gossip bootstrap runtime via peer discovery for control-plane-only gossip mode"
                                 );
                             } else {
                                 tracing::warn!(
@@ -181,14 +198,6 @@ pub(crate) async fn start_receiver(
                                     "accepting gossip bootstrap runtime via peer discovery despite low packet flow"
                                 );
                             }
-                            #[cfg(not(feature = "kernel-bypass"))]
-                            tracing::warn!(
-                                entrypoint = %entrypoint,
-                                packets_seen = stabilization.packets_seen,
-                                peers_discovered = discovered_peers,
-                                min_peers = bootstrap_stabilize_min_peers,
-                                "accepting gossip bootstrap runtime via peer discovery despite low packet flow"
-                            );
                         }
                         let mut gossip_receivers = gossip_receivers;
                         if attempt > 0 {
@@ -231,7 +240,14 @@ pub(crate) async fn start_receiver(
         }
     }
 
-    if static_receiver_handles.is_empty() && gossip_receiver_handles.is_empty() {
+    #[cfg(feature = "gossip-bootstrap")]
+    let skip_direct_listener_fallback = control_plane_only_bootstrap && gossip_runtime.is_some();
+    #[cfg(not(feature = "gossip-bootstrap"))]
+    let skip_direct_listener_fallback = false;
+    if static_receiver_handles.is_empty()
+        && gossip_receiver_handles.is_empty()
+        && !skip_direct_listener_fallback
+    {
         let bind_addr = read_bind_addr().map_err(|source| ReceiverBootstrapError::BindAddress {
             reason: source.to_string(),
         })?;
@@ -286,7 +302,73 @@ pub(crate) async fn start_receiver(
             "gossip bootstrap-only mode enabled; detached gossip control-plane and kept direct receivers"
         );
     }
+    #[cfg(feature = "gossip-bootstrap")]
+    if read_gossip_control_plane_only() && runtime.gossip_runtime.is_some() {
+        let active_entrypoint = runtime.active_gossip_entrypoint.clone().unwrap_or_default();
+        tracing::info!(
+            entrypoint = %active_entrypoint,
+            "gossip control-plane-only mode enabled; kept cluster topology and leader schedule state without gossip shred ingest"
+        );
+    }
     Ok(runtime)
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+fn effective_bootstrap_stabilize_min_peers(
+    control_plane_only_bootstrap: bool,
+    configured_min_peers: Option<usize>,
+) -> usize {
+    if control_plane_only_bootstrap {
+        configured_min_peers.unwrap_or(1)
+    } else {
+        configured_min_peers.unwrap_or_else(read_gossip_bootstrap_stabilize_min_peers)
+    }
+}
+
+#[cfg(feature = "gossip-bootstrap")]
+const fn gossip_bootstrap_accepts_peer_discovery(
+    control_plane_only_bootstrap: bool,
+    packets_seen: u64,
+    discovered_peers: usize,
+    bootstrap_stabilize_min_peers: usize,
+) -> bool {
+    if control_plane_only_bootstrap {
+        discovered_peers >= bootstrap_stabilize_min_peers
+    } else {
+        packets_seen > 0 && discovered_peers >= bootstrap_stabilize_min_peers
+    }
+}
+
+#[cfg(all(test, feature = "gossip-bootstrap"))]
+mod tests {
+    use super::{effective_bootstrap_stabilize_min_peers, gossip_bootstrap_accepts_peer_discovery};
+
+    #[test]
+    fn control_plane_only_bootstrap_accepts_peer_discovery_without_packets() {
+        assert!(gossip_bootstrap_accepts_peer_discovery(true, 0, 1, 1));
+        assert!(!gossip_bootstrap_accepts_peer_discovery(true, 0, 0, 1));
+    }
+
+    #[test]
+    fn full_gossip_bootstrap_still_requires_packets_for_peer_discovery_fallback() {
+        assert!(!gossip_bootstrap_accepts_peer_discovery(false, 0, 8, 8));
+        assert!(gossip_bootstrap_accepts_peer_discovery(false, 1, 8, 8));
+    }
+
+    #[test]
+    fn control_plane_only_bootstrap_uses_low_default_min_peers() {
+        assert_eq!(effective_bootstrap_stabilize_min_peers(true, None), 1);
+    }
+
+    #[test]
+    fn control_plane_only_bootstrap_respects_explicit_min_peers_override() {
+        assert_eq!(effective_bootstrap_stabilize_min_peers(true, Some(7)), 7);
+    }
+
+    #[test]
+    fn full_gossip_bootstrap_keeps_workspace_default_min_peers() {
+        assert_eq!(effective_bootstrap_stabilize_min_peers(false, None), 128);
+    }
 }
 
 #[cfg(feature = "kernel-bypass")]

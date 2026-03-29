@@ -435,10 +435,10 @@ The same event family does not exist on every ingest path. Read this table as:
 | Ingest type | Plugin surface | Derived-state surface | Does not emit |
 | --- | --- | --- | --- |
 | Raw shreds / gossip / trusted raw-shred provider | `on_transaction`, `on_recent_blockhash`, `on_slot_status`, `on_cluster_topology`, `on_leader_schedule`, `on_reorg`, plus raw packet/shred/dataset surfaces | `TransactionApplied`, `RecentBlockhashObserved`, `SlotStatusChanged`, `ClusterTopologyChanged`, `LeaderScheduleUpdated`, `ControlPlaneStateUpdated`, `BranchReorged`, `StateInvalidated`, `AccountTouchObserved` | `on_transaction_status`, `on_transaction_log`, `on_account_update`, `on_block_meta`, `TransactionStatusObserved`, `BlockMetaObserved` |
-| Websocket `transactionSubscribe` | `on_transaction` | `TransactionApplied` | `on_transaction_status`, `on_block_meta`, `TransactionStatusObserved`, `BlockMetaObserved`, control-plane hooks |
+| Websocket `transactionSubscribe` | `on_transaction`, synthesized `on_recent_blockhash` when requested | `TransactionApplied` | `on_transaction_status`, `on_block_meta`, `TransactionStatusObserved`, `BlockMetaObserved`, topology/leader/reorg control-plane hooks |
 | Websocket `logsSubscribe` | `on_transaction_log` | none | transaction-status, block-meta, control-plane, and derived-state provider observations |
 | Websocket `accountSubscribe` / `programSubscribe` | `on_account_update` | none | transaction-status, block-meta, control-plane, and derived-state provider observations |
-| Yellowstone / LaserStream transaction feeds | `on_transaction` | `TransactionApplied` | control-plane hooks unless supplied through `Generic` |
+| Yellowstone / LaserStream transaction feeds | `on_transaction`, synthesized `on_recent_blockhash` when requested | `TransactionApplied` | topology/leader/reorg control-plane hooks unless supplied through `Generic` |
 | Yellowstone / LaserStream transaction-status feeds | `on_transaction_status` | `TransactionStatusObserved` | raw-shred control-plane hooks, `on_block_meta`, account/log hooks unless separately configured |
 | Yellowstone / LaserStream block-meta feeds | `on_block_meta` | `BlockMetaObserved` | raw-shred control-plane hooks, `on_transaction_status`, account/log hooks unless separately configured |
 | Yellowstone / LaserStream account feeds | `on_account_update` | none | control-plane hooks and provider-derived `TransactionStatusObserved` / `BlockMetaObserved` |
@@ -449,11 +449,15 @@ That also means:
 
 - raw shreds emit the richest local control-plane surface, but not provider-only
   `TransactionStatus` or `BlockMeta`
-- built-in websocket emits transactions/logs/accounts, but not
-  `TransactionStatus` or `BlockMeta`
+- built-in websocket emits transactions/logs/accounts and can synthesize recent
+  blockhash from observed transactions, but not `TransactionStatus`, `BlockMeta`,
+  or topology/leader control-plane hooks
 - built-in Yellowstone/LaserStream add `TransactionStatus` and `BlockMeta`, but
   still do not emit raw-shred control-plane families unless a custom generic
   producer supplies them
+- built-in websocket and transaction-feed gRPC can therefore feed recent
+  blockhash into `sof-tx` adapters, but direct routing still needs gossip,
+  manual targets, or another control-plane source
 
 Programmatic setup uses the typed runtime API:
 
@@ -556,7 +560,7 @@ cargo add sof
 Optional gossip bootstrap support at compile time:
 
 ```toml
-sof = { version = "0.17.1", features = ["gossip-bootstrap"] }
+sof = { version = "0.17.2", features = ["gossip-bootstrap"] }
 ```
 
 `gossip-bootstrap` uses the vendored `sof-solana-gossip` backend, but it no longer exact-pins the
@@ -565,7 +569,7 @@ Solana `3.1.8` patch line. Downstream crates can resolve newer compatible `3.1.x
 Optional external `kernel-bypass` ingress support:
 
 ```toml
-sof = { version = "0.17.1", features = ["kernel-bypass"] }
+sof = { version = "0.17.2", features = ["kernel-bypass"] }
 ```
 
 The bundled `sof-solana-gossip` backend defaults to SOF's lightweight in-memory duplicate/conflict
@@ -1053,7 +1057,9 @@ Design references:
 - WebSocket close frames emit `RuntimePacketEventClass::ConnectionClosed` in `on_packet_received`.
 - WebSocket packet events expose `websocket_frame_type` (`Text`/`Binary`/`Ping`/`Pong`) for startup-time filtering and runtime routing.
 - In gossip mode, SOF runs as an active bounded relay client by default (UDP relay + repair serve), not as an observer-only passive consumer.
-- `SOF_LIVE_SHREDS_ENABLED=false` enables control-plane-only mode.
+- `SOF_GOSSIP_RUNTIME_MODE=control_plane_only` is the exception when you only need gossip-derived topology and leader state without gossip shred ingest.
+- In typed setup, the same mode is `RuntimeSetup::with_gossip_runtime_mode(GossipRuntimeMode::ControlPlaneOnly)`.
+- `SOF_LIVE_SHREDS_ENABLED=false` disables live shred processing; it is not the same thing as `SOF_GOSSIP_RUNTIME_MODE=control_plane_only`.
 
 ## Examples
 

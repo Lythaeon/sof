@@ -43,20 +43,20 @@ cargo add sof-tx
 Enable SOF runtime adapters when you want provider values from live `sof` plugin events:
 
 ```toml
-sof-tx = { version = "0.17.1", features = ["sof-adapters"] }
+sof-tx = { version = "0.17.2", features = ["sof-adapters"] }
 ```
 
 Enable `kernel-bypass` transport hooks for kernel-bypass direct submit integrations:
 
 ```toml
-sof-tx = { version = "0.17.1", features = ["kernel-bypass"] }
+sof-tx = { version = "0.17.2", features = ["kernel-bypass"] }
 ```
 
 Use `sof-solana-compat` when you want the Solana-native `TxBuilder` plus unsigned convenience
 submission helpers on top of `sof-tx`:
 
 ```toml
-sof-solana-compat = "0.17.1"
+sof-solana-compat = "0.17.2"
 ```
 
 ## Quick Start
@@ -183,7 +183,25 @@ same `evaluate_flow_safety(...)` helper for control-plane freshness checks.
 
 Those SOF adapter paths are complete today with raw-shred or gossip-backed observer runtimes.
 Built-in processed provider adapters such as Yellowstone, LaserStream, and websocket are
-transaction-first today and do not, by themselves, provide the full `sof-tx` control-plane feed.
+transaction-first today:
+
+- they can drive recent blockhash state through observed provider transactions
+- they do not, by themselves, provide the full `sof-tx` control-plane feed for direct routing
+- direct submit still needs leaders/topology from gossip, manual target injection, or another
+  control-plane source
+
+So a mixed setup is already valid:
+
+- provider-stream transactions for recent blockhash freshness
+- gossip full or `control_plane_only` for topology/leaders
+- one shared SOF adapter feeding both into `sof-tx` in a custom embedding where
+  your host/runtime composition supplies both surfaces together
+
+The packaged observer runtime does not yet combine built-in provider-stream
+ingress and gossip/raw-shred ingest in one ready-made mode. For the packaged
+runtime, the complete built-in `sof-tx` adapter path is still raw-shred/gossip,
+or `ProviderStreamMode::Generic` when your custom producer supplies the full
+control-plane feed.
 
 The observer-side feed now also emits canonical control-plane quality snapshots, so services can
 source freshness and confidence metadata from `sof` first and keep `sof-tx` focused on send-time

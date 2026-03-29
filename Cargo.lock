@@ -5509,7 +5509,7 @@ dependencies = [
 
 [[package]]
 name = "sof"
-version = "0.17.1"
+version = "0.17.2"
 dependencies = [
  "agave-transaction-view",
  "arcshift",
@@ -5572,11 +5572,11 @@ dependencies = [
 
 [[package]]
 name = "sof-gossip-tuning"
-version = "0.17.1"
+version = "0.17.2"
 
 [[package]]
 name = "sof-solana-compat"
-version = "0.17.1"
+version = "0.17.2"
 dependencies = [
  "async-trait",
  "bincode",
@@ -5664,7 +5664,7 @@ dependencies = [
 
 [[package]]
 name = "sof-tx"
-version = "0.17.1"
+version = "0.17.2"
 dependencies = [
  "arcshift",
  "async-trait",
@@ -5696,7 +5696,7 @@ dependencies = [
 
 [[package]]
 name = "sof-types"
-version = "0.17.1"
+version = "0.17.2"
 dependencies = [
  "bs58",
  "serde",

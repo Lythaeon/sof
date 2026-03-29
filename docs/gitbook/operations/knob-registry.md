@@ -45,7 +45,8 @@ Snapshot date:
 | `SOF_BIND` | `0.0.0.0:8001` | all builds | Direct UDP bind address for the packaged runtime. |
 | `SOF_OBSERVABILITY_BIND` | unset | all builds | TCP bind address for SOF's runtime-owned `/metrics`, `/healthz`, and `/readyz` endpoint. |
 | `SOF_GOSSIP_ENTRYPOINT` | mainnet bootstrap set with `gossip-bootstrap`, otherwise unset | `gossip-bootstrap` affects behavior | Comma-separated gossip entrypoints used for bootstrap discovery. |
-| `SOF_GOSSIP_BOOTSTRAP_ONLY` | `false` | `gossip-bootstrap` | Bootstrap gossip control-plane state, then detach it and keep direct receivers active. |
+| `SOF_GOSSIP_RUNTIME_MODE` | `full` | `gossip-bootstrap` | Gossip runtime posture: `full`, `bootstrap_only`, or `control_plane_only`. `control_plane_only` keeps topology/leader state without gossip shred ingest, relay, or repair. |
+| `SOF_GOSSIP_BOOTSTRAP_ONLY` | `false` | `gossip-bootstrap` | Legacy compatibility knob for `SOF_GOSSIP_RUNTIME_MODE=bootstrap_only`. |
 | `SOF_LIVE_SHREDS_ENABLED` | `true` | all builds | Enables live shred processing paths required by parts of the control plane. |
 | `SOF_INGEST_QUEUE_MODE` | `bounded` | all builds | Selects ingest queue implementation: `bounded`, `unbounded`, or `lockfree`. |
 | `SOF_INGEST_QUEUE_CAPACITY` | `16384` | all builds | Capacity for bounded or lock-free ingest queue modes. |

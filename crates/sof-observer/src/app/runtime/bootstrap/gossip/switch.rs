@@ -98,6 +98,7 @@ pub(crate) async fn maybe_switch_gossip_runtime(
                 packet_ingest_tx.clone(),
                 runtime.gossip_identity.clone(),
                 selected_port_range,
+                false,
             )
             .await
             {
@@ -172,6 +173,7 @@ pub(crate) async fn maybe_switch_gossip_runtime(
             packet_ingest_tx.clone(),
             runtime.gossip_identity.clone(),
             Some(target_port_range),
+            false,
         )
         .await
         {

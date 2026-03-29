@@ -331,10 +331,10 @@ cargo add sof-gossip-tuning
 Useful feature sets:
 
 ```toml
-sof = { version = "0.17.1", features = ["gossip-bootstrap"] }
-sof = { version = "0.17.1", features = ["provider-grpc"] }
-sof = { version = "0.17.1", features = ["provider-websocket"] }
-sof-tx = { version = "0.17.1", features = ["sof-adapters"] }
+sof = { version = "0.17.2", features = ["gossip-bootstrap"] }
+sof = { version = "0.17.2", features = ["provider-grpc"] }
+sof = { version = "0.17.2", features = ["provider-websocket"] }
+sof-tx = { version = "0.17.2", features = ["sof-adapters"] }
 ```
 
 `gossip-bootstrap` does not exact-pin the Solana `3.1.8` patch line. If your workspace already
