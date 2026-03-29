@@ -2434,7 +2434,7 @@ fn dispatch_provider_stream_serialized_transaction(
     let needs_view_prefilter = wants_transaction
         && plugin_host.has_transaction_prefilter_at_commitment(event.commitment_status)
         && !wants_derived_state_transaction;
-    let should_try_view = wants_recent_blockhash || needs_view_prefilter || wants_transaction;
+    let should_try_view = wants_recent_blockhash || needs_view_prefilter;
     if should_try_view
         && let Ok(view) = SanitizedTransactionView::try_new_sanitized(event.bytes.as_ref(), true)
     {
