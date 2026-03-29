@@ -19,6 +19,7 @@ use solana_signer::Signer;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
+    time::{sleep, timeout},
 };
 
 use super::*;
@@ -46,6 +47,28 @@ struct MockJitoTransport {
     calls: AtomicU64,
 }
 
+/// Mock RPC transport that waits before returning.
+#[derive(Debug)]
+struct DelayedRpcTransport {
+    /// Return value to use.
+    result: Result<String, SubmitTransportError>,
+    /// Artificial delay before returning.
+    delay: Duration,
+    /// Number of submit calls.
+    calls: AtomicU64,
+}
+
+/// Mock Jito transport that waits before returning.
+#[derive(Debug)]
+struct DelayedJitoTransport {
+    /// Return value to use.
+    result: Result<JitoSubmitResponse, SubmitTransportError>,
+    /// Artificial delay before returning.
+    delay: Duration,
+    /// Number of submit calls.
+    calls: AtomicU64,
+}
+
 #[async_trait]
 impl RpcSubmitTransport for MockRpcTransport {
     async fn submit_rpc(
@@ -66,6 +89,32 @@ impl JitoSubmitTransport for MockJitoTransport {
         _config: &JitoSubmitConfig,
     ) -> Result<JitoSubmitResponse, SubmitTransportError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
+        self.result.clone()
+    }
+}
+
+#[async_trait]
+impl RpcSubmitTransport for DelayedRpcTransport {
+    async fn submit_rpc(
+        &self,
+        _tx_bytes: &[u8],
+        _config: &RpcSubmitConfig,
+    ) -> Result<String, SubmitTransportError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        sleep(self.delay).await;
+        self.result.clone()
+    }
+}
+
+#[async_trait]
+impl JitoSubmitTransport for DelayedJitoTransport {
+    async fn submit_jito(
+        &self,
+        _tx_bytes: &[u8],
+        _config: &JitoSubmitConfig,
+    ) -> Result<JitoSubmitResponse, SubmitTransportError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        sleep(self.delay).await;
         self.result.clone()
     }
 }
@@ -683,10 +732,7 @@ async fn hybrid_uses_second_direct_attempt_before_rpc() {
     assert!(result.is_ok());
     if let Ok(result) = result {
         assert_eq!(result.direct_target, Some(direct_target));
-        assert_eq!(
-            result.rpc_signature,
-            Some("rpc-fallback-signature".to_owned())
-        );
+        assert_eq!(result.rpc_signature, None);
         assert_eq!(result.jito_signature, None);
         assert_eq!(result.jito_bundle_id, None);
         assert_eq!(result.legacy_mode, Some(SubmitMode::Hybrid));
@@ -694,8 +740,19 @@ async fn hybrid_uses_second_direct_attempt_before_rpc() {
         assert!(!result.used_fallback_route);
     }
 
-    let rpc_calls = rpc.calls.load(Ordering::Relaxed);
     let direct_calls = direct.calls.load(Ordering::Relaxed);
+    let rpc_calls = timeout(Duration::from_millis(100), async {
+        loop {
+            let calls = rpc.calls.load(Ordering::Relaxed);
+            if calls > 0 {
+                break calls;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(rpc_calls.is_ok());
+    let rpc_calls = rpc_calls.unwrap_or(0);
     assert_eq!(direct_calls, 2);
     assert_eq!(rpc_calls, 1);
 }
@@ -987,30 +1044,35 @@ async fn all_at_once_plan_submits_across_jito_and_direct() {
         result: Ok(target(9001)),
         calls: AtomicU64::new(0),
     });
-    let jito = Arc::new(MockJitoTransport {
+    let jito = Arc::new(DelayedJitoTransport {
         result: Ok(JitoSubmitResponse {
             transaction_signature: Some("jito-signature".to_owned()),
             bundle_id: Some("bundle-1".to_owned()),
         }),
+        delay: Duration::from_millis(200),
         calls: AtomicU64::new(0),
     });
+    let reporter = Arc::new(RecordingOutcomeReporter::default());
     let mut client = TxSubmitClient::new(
         Arc::new(StaticRecentBlockhashProvider::new(Some([29_u8; 32]))),
         Arc::new(StaticLeaderProvider::new(Some(target(9001)), Vec::new())),
     )
     .with_direct_transport(direct.clone())
-    .with_jito_transport(jito.clone());
+    .with_jito_transport(jito.clone())
+    .with_outcome_reporter(reporter.clone());
 
     let (bytes, signature) = signed_transfer_bytes();
-    let result = client
-        .submit_signed_via(
+    let result = timeout(
+        Duration::from_millis(50),
+        client.submit_signed_via(
             SignedTx::VersionedTransactionBytes(bytes),
             SubmitPlan::all_at_once(vec![SubmitRoute::Direct, SubmitRoute::Jito]),
-        )
-        .await;
+        ),
+    )
+    .await;
 
     assert!(result.is_ok());
-    if let Ok(result) = result {
+    if let Ok(Ok(result)) = result {
         assert_eq!(
             result.signature,
             Some(SignatureBytes::from_solana(signature))
@@ -1021,23 +1083,108 @@ async fn all_at_once_plan_submits_across_jito_and_direct() {
             vec![SubmitRoute::Direct, SubmitRoute::Jito]
         );
         assert_eq!(result.legacy_mode, None);
-        assert_eq!(
-            result.successful_routes,
-            vec![SubmitRoute::Direct, SubmitRoute::Jito]
-        );
-        assert!(matches!(
-            result.first_success_route,
-            Some(SubmitRoute::Direct) | Some(SubmitRoute::Jito)
-        ));
+        assert_eq!(result.successful_routes, vec![SubmitRoute::Direct]);
+        assert_eq!(result.first_success_route, Some(SubmitRoute::Direct));
         assert_eq!(result.direct_target, Some(target(9001)));
-        assert_eq!(result.jito_signature, Some("jito-signature".to_owned()));
-        assert_eq!(result.jito_bundle_id, Some("bundle-1".to_owned()));
+        assert_eq!(result.jito_signature, None);
+        assert_eq!(result.jito_bundle_id, None);
         assert_eq!(result.rpc_signature, None);
         assert!(!result.used_fallback_route);
     }
 
     assert_eq!(direct.calls.load(Ordering::Relaxed), 1);
     assert_eq!(jito.calls.load(Ordering::Relaxed), 1);
+
+    let late_result = timeout(Duration::from_millis(300), async {
+        loop {
+            let outcomes = reporter
+                .outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            if outcomes
+                .iter()
+                .any(|outcome| outcome.kind == TxSubmitOutcomeKind::JitoAccepted)
+            {
+                break outcomes;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(late_result.is_ok());
+}
+
+#[tokio::test]
+async fn hybrid_direct_success_with_rpc_broadcast_returns_before_rpc_completes() {
+    let direct_target = target(9043);
+    let direct = Arc::new(MockDirectTransport {
+        result: Ok(direct_target.clone()),
+        calls: AtomicU64::new(0),
+    });
+    let rpc = Arc::new(DelayedRpcTransport {
+        result: Ok("rpc-broadcast-signature".to_owned()),
+        delay: Duration::from_millis(200),
+        calls: AtomicU64::new(0),
+    });
+    let reporter = Arc::new(RecordingOutcomeReporter::default());
+    let mut client = TxSubmitClient::new(
+        Arc::new(StaticRecentBlockhashProvider::new(Some([37_u8; 32]))),
+        Arc::new(StaticLeaderProvider::new(
+            Some(direct_target.clone()),
+            Vec::new(),
+        )),
+    )
+    .with_direct_transport(direct.clone())
+    .with_rpc_transport(rpc.clone())
+    .with_outcome_reporter(reporter.clone())
+    .with_direct_config(DirectSubmitConfig {
+        hybrid_rpc_broadcast: true,
+        agave_rebroadcast_enabled: false,
+        latency_aware_targeting: false,
+        ..DirectSubmitConfig::default()
+    });
+
+    let (bytes, _) = signed_transfer_bytes();
+    let result = timeout(
+        Duration::from_millis(50),
+        client.submit_signed(
+            SignedTx::VersionedTransactionBytes(bytes),
+            SubmitMode::Hybrid,
+        ),
+    )
+    .await;
+
+    assert!(result.is_ok());
+    if let Ok(Ok(result)) = result {
+        assert_eq!(result.first_success_route, Some(SubmitRoute::Direct));
+        assert_eq!(result.successful_routes, vec![SubmitRoute::Direct]);
+        assert_eq!(result.direct_target, Some(direct_target));
+        assert_eq!(result.rpc_signature, None);
+        assert!(!result.used_fallback_route);
+    }
+
+    let late_result = timeout(Duration::from_millis(300), async {
+        loop {
+            let outcomes = reporter
+                .outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let saw_direct = outcomes
+                .iter()
+                .any(|outcome| outcome.kind == TxSubmitOutcomeKind::DirectAccepted);
+            let saw_rpc = outcomes
+                .iter()
+                .any(|outcome| outcome.kind == TxSubmitOutcomeKind::RpcAccepted);
+            if saw_direct && saw_rpc {
+                break outcomes;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(late_result.is_ok());
 }
 
 #[tokio::test]

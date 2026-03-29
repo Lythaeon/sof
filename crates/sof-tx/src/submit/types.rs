@@ -459,19 +459,23 @@ pub struct SubmitResult {
     pub plan: SubmitPlan,
     /// Legacy preset used by caller when one exact preset was selected.
     pub legacy_mode: Option<SubmitMode>,
-    /// First successful route observed for this submit.
+    /// First successful route observed before this submit call returned.
     pub first_success_route: Option<SubmitRoute>,
-    /// All successful routes observed for this submit.
+    ///
+    /// Later background accepts from concurrently configured routes are reported through
+    /// [`TxSubmitOutcomeReporter`] / built-in telemetry rather than retroactively mutating this
+    /// synchronous result.
     pub successful_routes: Vec<SubmitRoute>,
     /// Target chosen by direct path when applicable.
     pub direct_target: Option<LeaderTarget>,
-    /// RPC-returned signature string when RPC path succeeded.
+    /// RPC-returned signature string when RPC path succeeded before return.
     pub rpc_signature: Option<String>,
-    /// Jito block-engine returned transaction signature when the JSON-RPC path succeeded.
+    /// Jito block-engine returned transaction signature when the JSON-RPC path succeeded before
+    /// return.
     pub jito_signature: Option<String>,
-    /// Jito block-engine returned bundle UUID when the gRPC bundle path succeeded.
+    /// Jito block-engine returned bundle UUID when the gRPC bundle path succeeded before return.
     pub jito_bundle_id: Option<String>,
-    /// True when one later ordered-fallback route accepted the submit.
+    /// True when one later ordered-fallback route accepted the submit before return.
     pub used_fallback_route: bool,
     /// Number of direct targets selected for submit attempt that succeeded.
     pub selected_target_count: usize,
