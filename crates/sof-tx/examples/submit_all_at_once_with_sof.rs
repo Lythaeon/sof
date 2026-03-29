@@ -10,7 +10,7 @@ fn main() {
 use std::{sync::Arc, time::Duration};
 
 #[cfg(feature = "sof-adapters")]
-use sof::framework::{ObserverPlugin, PluginHost};
+use sof::framework::PluginHost;
 #[cfg(feature = "sof-adapters")]
 use sof_solana_compat::{TxBuilder, TxSubmitClientSolanaExt};
 #[cfg(feature = "sof-adapters")]
@@ -32,7 +32,7 @@ use solana_system_interface::instruction as system_instruction;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let adapter = Arc::new(PluginHostTxProviderAdapter::default());
     let mut host = PluginHost::builder()
-        .add_shared_plugin(adapter.clone() as Arc<dyn ObserverPlugin>)
+        .add_shared_plugin(adapter.clone())
         .build();
 
     // If the host already contains snapshots from a running SOF runtime, seed the adapter first.
