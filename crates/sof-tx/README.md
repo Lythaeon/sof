@@ -43,20 +43,20 @@ cargo add sof-tx
 Enable SOF runtime adapters when you want provider values from live `sof` plugin events:
 
 ```toml
-sof-tx = { version = "0.17.2", features = ["sof-adapters"] }
+sof-tx = { version = "0.17.3", features = ["sof-adapters"] }
 ```
 
 Enable `kernel-bypass` transport hooks for kernel-bypass direct submit integrations:
 
 ```toml
-sof-tx = { version = "0.17.2", features = ["kernel-bypass"] }
+sof-tx = { version = "0.17.3", features = ["kernel-bypass"] }
 ```
 
 Use `sof-solana-compat` when you want the Solana-native `TxBuilder` plus unsigned convenience
 submission helpers on top of `sof-tx`:
 
 ```toml
-sof-solana-compat = "0.17.2"
+sof-solana-compat = "0.17.3"
 ```
 
 ## Quick Start
@@ -193,15 +193,25 @@ transaction-first today:
 So a mixed setup is already valid:
 
 - provider-stream transactions for recent blockhash freshness
-- gossip full or `control_plane_only` for topology/leaders
+- gossip full or `control_plane_only` for cluster topology
+- `PluginHostTxProviderAdapter::topology_only(...)` when that mixed setup is topology-backed but
+  does not also emit leader-schedule hooks
 - one shared SOF adapter feeding both into `sof-tx` in a custom embedding where
   your host/runtime composition supplies both surfaces together
 
-The packaged observer runtime does not yet combine built-in provider-stream
-ingress and gossip/raw-shred ingest in one ready-made mode. For the packaged
-runtime, the complete built-in `sof-tx` adapter path is still raw-shred/gossip,
-or `ProviderStreamMode::Generic` when your custom producer supplies the full
-control-plane feed.
+The packaged observer runtime now supports one honest mixed built-in shape:
+
+- built-in websocket / Yellowstone / LaserStream transaction ingress
+- gossip bootstrap for cluster topology in the same runtime
+
+That mixed packaged mode still does not synthesize leader-schedule or reorg hooks.
+So:
+
+- use `PluginHostTxProviderAdapter::default()` when SOF emits recent blockhash, topology, and
+  leader schedule
+- use `PluginHostTxProviderAdapter::topology_only(...)` when SOF emits recent blockhash plus
+  topology, but not leader schedule
+- use `ProviderStreamMode::Generic` when your custom producer supplies the full control-plane feed
 
 The observer-side feed now also emits canonical control-plane quality snapshots, so services can
 source freshness and confidence metadata from `sof` first and keep `sof-tx` focused on send-time
@@ -222,7 +232,7 @@ driving direct or hybrid sends. Typical checks include:
 
 - missing recent blockhash
 - stale tip slot
-- missing leader schedule
+- missing leader schedule when that input is enabled
 - missing TPU addresses for targeted leaders
 - degraded topology freshness
 

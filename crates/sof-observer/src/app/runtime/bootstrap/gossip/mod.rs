@@ -8,8 +8,12 @@ mod switch;
 pub(crate) use entrypoints::GossipEntrypointBias;
 #[cfg(feature = "gossip-bootstrap")]
 pub(crate) use handoff::stop_gossip_runtime_components;
+#[cfg(feature = "gossip-bootstrap")]
+pub(crate) use receiver::ProviderStreamGossipControlPlane;
 #[cfg(feature = "kernel-bypass")]
 pub(crate) use receiver::start_external_receiver;
+#[cfg(feature = "gossip-bootstrap")]
+pub(crate) use receiver::start_provider_stream_gossip_control_plane;
 pub(crate) use receiver::{ReceiverBootstrapError, start_receiver};
 #[cfg(feature = "gossip-bootstrap")]
 pub(crate) use switch::maybe_switch_gossip_runtime;

@@ -30,6 +30,8 @@ pub type PluginHostTxProviderAdapterConfig = TxProviderAdapterConfig;
 pub struct PluginHostTxProviderAdapter {
     /// Shared tx-provider state and reduction logic.
     core: TxProviderAdapterCore,
+    /// Whether leader-schedule hooks are required for this adapter instance.
+    leader_schedule_enabled: bool,
 }
 
 impl PluginHostTxProviderAdapter {
@@ -38,7 +40,27 @@ impl PluginHostTxProviderAdapter {
     pub fn new(config: PluginHostTxProviderAdapterConfig) -> Self {
         Self {
             core: TxProviderAdapterCore::new(config),
+            leader_schedule_enabled: true,
         }
+    }
+
+    /// Creates an adapter that relies on recent blockhash plus cluster topology only.
+    ///
+    /// This is useful when SOF is combining provider-stream transaction ingress with
+    /// gossip-derived topology in environments that do not also emit leader-schedule hooks.
+    #[must_use]
+    pub fn topology_only(config: PluginHostTxProviderAdapterConfig) -> Self {
+        Self {
+            core: TxProviderAdapterCore::new(config),
+            leader_schedule_enabled: false,
+        }
+    }
+
+    /// Disables leader-schedule hook requirements on this adapter instance.
+    #[must_use]
+    pub const fn without_leader_schedule(mut self) -> Self {
+        self.leader_schedule_enabled = false;
+        self
     }
 
     /// Seeds adapter state from already-observed values in `PluginHost`.
@@ -112,7 +134,10 @@ impl LeaderProvider for PluginHostTxProviderAdapter {
 
 impl TxFlowSafetySource for PluginHostTxProviderAdapter {
     fn toxic_flow_snapshot(&self) -> TxFlowSafetySnapshot {
-        let report = self.evaluate_flow_safety(TxProviderFlowSafetyPolicy::default());
+        let report = self.evaluate_flow_safety(TxProviderFlowSafetyPolicy {
+            require_leader_schedule: self.leader_schedule_enabled,
+            ..TxProviderFlowSafetyPolicy::default()
+        });
         let quality = match report.quality {
             crate::adapters::TxProviderControlPlaneQuality::Stable => TxFlowSafetyQuality::Stable,
             crate::adapters::TxProviderControlPlaneQuality::Degraded => {
@@ -153,10 +178,14 @@ impl ObserverPlugin for PluginHostTxProviderAdapter {
     }
 
     fn config(&self) -> sof::framework::PluginConfig {
-        sof::framework::PluginConfig::new()
+        let config = sof::framework::PluginConfig::new()
             .with_recent_blockhash()
-            .with_cluster_topology()
-            .with_leader_schedule()
+            .with_cluster_topology();
+        if self.leader_schedule_enabled {
+            config.with_leader_schedule()
+        } else {
+            config
+        }
     }
 
     async fn on_recent_blockhash(&self, event: ObservedRecentBlockhashEvent) {
@@ -259,6 +288,17 @@ mod tests {
         assert!(config.recent_blockhash);
         assert!(config.cluster_topology);
         assert!(config.leader_schedule);
+    }
+
+    #[tokio::test]
+    async fn topology_only_adapter_disables_leader_schedule_hook() {
+        let adapter = PluginHostTxProviderAdapter::topology_only(
+            PluginHostTxProviderAdapterConfig::default(),
+        );
+        let config = adapter.config();
+        assert!(config.recent_blockhash);
+        assert!(config.cluster_topology);
+        assert!(!config.leader_schedule);
     }
 
     #[tokio::test]
@@ -519,5 +559,41 @@ mod tests {
                 max_allowed: 16,
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn topology_only_adapter_can_be_safe_without_leader_schedule() {
+        let adapter = PluginHostTxProviderAdapter::topology_only(
+            PluginHostTxProviderAdapterConfig::default(),
+        );
+        let leader: PubkeyBytes = Pubkey::new_unique().into();
+
+        adapter
+            .on_recent_blockhash(ObservedRecentBlockhashEvent {
+                slot: 100,
+                recent_blockhash: [5_u8; 32],
+                dataset_tx_count: 1,
+                provider_source: None,
+            })
+            .await;
+        adapter
+            .on_cluster_topology(topology_snapshot(vec![node(leader, 9441)]))
+            .await;
+        adapter
+            .core
+            .apply_slot_status(sof::framework::SlotStatusChangedEvent {
+                slot: 100,
+                parent_slot: Some(99),
+                previous_status: Some(sof::event::ForkSlotStatus::Processed),
+                status: sof::event::ForkSlotStatus::Confirmed,
+            });
+
+        let snapshot = adapter.toxic_flow_snapshot();
+        assert_eq!(snapshot.quality, crate::submit::TxFlowSafetyQuality::Stable);
+        assert!(snapshot.issues.is_empty());
+        assert_eq!(
+            adapter.current_leader(),
+            Some(LeaderTarget::new(Some(leader), addr(9447)))
+        );
     }
 }

@@ -21,7 +21,7 @@ is the premium path.
 
 ## Control Plane Only
 
-If you only need gossip-derived cluster topology and leader schedule state, use:
+If you only need gossip-derived cluster topology without gossip shred ingest, use:
 
 ```bash
 SOF_GOSSIP_RUNTIME_MODE=control_plane_only

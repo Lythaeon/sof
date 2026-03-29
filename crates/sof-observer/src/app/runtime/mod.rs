@@ -25,9 +25,13 @@ pub(crate) use observability::{RuntimeObservabilityHandle, RuntimeObservabilityS
 use prelude::*;
 
 #[cfg(feature = "gossip-bootstrap")]
+pub(crate) use bootstrap::gossip::ProviderStreamGossipControlPlane;
+#[cfg(feature = "gossip-bootstrap")]
 use bootstrap::gossip::maybe_switch_gossip_runtime;
 #[cfg(feature = "kernel-bypass")]
 use bootstrap::gossip::start_external_receiver;
+#[cfg(feature = "gossip-bootstrap")]
+pub(crate) use bootstrap::gossip::start_provider_stream_gossip_control_plane;
 use bootstrap::gossip::start_receiver;
 #[cfg(feature = "gossip-bootstrap")]
 use bootstrap::repair::{RepairCommand, RepairOutcome};
@@ -37,3 +41,5 @@ use bootstrap::repair::{
     stop_repair_driver,
 };
 use dataset::*;
+#[cfg(feature = "gossip-bootstrap")]
+pub(crate) use runloop::ClusterTopologyTracker;

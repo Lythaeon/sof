@@ -42,8 +42,10 @@ Tradeoff:
 
 - best in-process freshness for that host
 - adapter state is process-local unless you add your own persistence
-- complete today with raw-shred and gossip SOF runtimes; built-in processed provider adapters are
-  not yet a full `sof-tx` control-plane source by themselves
+- complete today with raw-shred and gossip SOF runtimes
+- built-in processed provider adapters are still not a full `sof-tx` control-plane source by
+  themselves, but the packaged runtime can now combine built-in provider transactions with
+  gossip-derived cluster topology when you use `PluginHostTxProviderAdapter::topology_only(...)`
 
 ### 4. Replayable SOF-derived control plane
 

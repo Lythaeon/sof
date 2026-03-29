@@ -7,7 +7,7 @@ use crate::framework::{
 };
 
 #[cfg(feature = "gossip-bootstrap")]
-pub(super) struct ClusterTopologyTracker {
+pub(crate) struct ClusterTopologyTracker {
     last_nodes: HashMap<crate::framework::PubkeyBytes, ClusterNodeInfo>,
     last_polled_at: Option<Instant>,
     last_snapshot_at: Option<Instant>,
@@ -17,7 +17,7 @@ pub(super) struct ClusterTopologyTracker {
 
 #[cfg(feature = "gossip-bootstrap")]
 impl ClusterTopologyTracker {
-    pub(super) fn new(poll_interval: Duration, snapshot_interval: Duration) -> Self {
+    pub(crate) fn new(poll_interval: Duration, snapshot_interval: Duration) -> Self {
         Self {
             last_nodes: HashMap::new(),
             last_polled_at: None,
@@ -27,7 +27,7 @@ impl ClusterTopologyTracker {
         }
     }
 
-    pub(super) fn maybe_build_event(
+    pub(crate) fn maybe_build_event(
         &mut self,
         cluster_info: &ClusterInfo,
         latest_slot: Option<u64>,
