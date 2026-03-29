@@ -559,6 +559,9 @@ Optional gossip bootstrap support at compile time:
 sof = { version = "0.17.0", features = ["gossip-bootstrap"] }
 ```
 
+`gossip-bootstrap` uses the vendored `sof-solana-gossip` backend, but it no longer exact-pins the
+Solana `3.1.8` patch line. Downstream crates can resolve newer compatible `3.1.x` releases.
+
 Optional external `kernel-bypass` ingress support:
 
 ```toml

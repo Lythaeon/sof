@@ -34,7 +34,7 @@ provider-websocket = []
 agave-transaction-view = { version = "3.1.8", features = ["agave-unstable-api"] }
 sof-gossip-tuning = { version = "0.17.0", path = "../sof-gossip-tuning" }
 sof-types = { version = "0.17.0", path = "../sof-types", features = ["solana-compat"] }
-solana-gossip = { package = "sof-solana-gossip", version = "3.1.8-sof.6", optional = true, features = ["agave-unstable-api"] }
+solana-gossip = { package = "sof-solana-gossip", version = "3.1.8-sof.7", optional = true, features = ["agave-unstable-api"] }
 solana-entry = { version = "3.1.8", features = ["agave-unstable-api"] }
 solana-hash = "3.1.0"
 solana-keypair = "3.0.1"

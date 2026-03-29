@@ -337,6 +337,9 @@ sof = { version = "0.17.0", features = ["provider-websocket"] }
 sof-tx = { version = "0.17.0", features = ["sof-adapters"] }
 ```
 
+`gossip-bootstrap` does not exact-pin the Solana `3.1.8` patch line. If your workspace already
+uses newer compatible `3.1.x` Solana crates, Cargo can resolve that feature set onto them.
+
 Run the basic observer example:
 
 ```bash
