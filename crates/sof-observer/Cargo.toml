@@ -1,6 +1,6 @@
 [package]
 name = "sof"
-version = "0.17.2"
+version = "0.17.3"
 edition.workspace = true
 description = "Solana Observer Framework for low-latency shred ingestion and plugin-driven transaction observation"
 license = "Apache-2.0 OR MIT"
@@ -32,9 +32,9 @@ provider-websocket = []
 
 [dependencies]
 agave-transaction-view = { version = "3.1.8", features = ["agave-unstable-api"] }
-sof-gossip-tuning = { version = "0.17.2", path = "../sof-gossip-tuning" }
-sof-types = { version = "0.17.2", path = "../sof-types", features = ["solana-compat"] }
-solana-gossip = { package = "sof-solana-gossip", version = "3.1.8-sof.7", optional = true, features = ["agave-unstable-api"] }
+sof-gossip-tuning = { version = "0.17.3", path = "../sof-gossip-tuning" }
+sof-types = { version = "0.17.3", path = "../sof-types", features = ["solana-compat"] }
+solana-gossip = { package = "sof-solana-gossip", version = "3.1.8-sof.8", optional = true, features = ["agave-unstable-api"] }
 solana-entry = { version = "3.1.8", features = ["agave-unstable-api"] }
 solana-hash = "3.1.0"
 solana-keypair = "3.0.1"

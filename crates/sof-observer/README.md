@@ -581,7 +581,7 @@ cargo add sof
 Optional gossip bootstrap support at compile time:
 
 ```toml
-sof = { version = "0.17.2", features = ["gossip-bootstrap"] }
+sof = { version = "0.17.3", features = ["gossip-bootstrap"] }
 ```
 
 `gossip-bootstrap` uses the vendored `sof-solana-gossip` backend, but it no longer exact-pins the
@@ -590,7 +590,7 @@ Solana `3.1.8` patch line. Downstream crates can resolve newer compatible `3.1.x
 Optional external `kernel-bypass` ingress support:
 
 ```toml
-sof = { version = "0.17.2", features = ["kernel-bypass"] }
+sof = { version = "0.17.3", features = ["kernel-bypass"] }
 ```
 
 The bundled `sof-solana-gossip` backend defaults to SOF's lightweight in-memory duplicate/conflict
