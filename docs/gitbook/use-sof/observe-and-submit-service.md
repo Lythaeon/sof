@@ -34,7 +34,7 @@ built-in `sof-tx` control-plane source on their own.
 
 Use the full example in:
 
-- `crates/sof-tx/examples/submit_all_at_once_with_sof.rs`
+- `crates/sof-solana-compat/examples/submit_all_at_once_with_sof.rs`
 
 It shows the whole shape cleanly:
 

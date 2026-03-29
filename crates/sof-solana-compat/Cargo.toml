@@ -28,3 +28,8 @@ solana-signer = "3.0.0"
 solana-system-interface = { version = "3.0.0", features = ["bincode"] }
 solana-transaction = { version = "3.0.2", features = ["bincode"] }
 thiserror = "2.0"
+
+[dev-dependencies]
+sof = { path = "../sof-observer", version = "0.17.0", default-features = false }
+sof-tx = { path = "../sof-tx", version = "0.17.0", features = ["sof-adapters"] }
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread"] }

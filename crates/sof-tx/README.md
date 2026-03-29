@@ -168,7 +168,7 @@ With `sof-adapters` enabled, `PluginHostTxProviderAdapter` can be:
 
 See the full example:
 
-- `crates/sof-tx/examples/submit_all_at_once_with_sof.rs`
+- `crates/sof-solana-compat/examples/submit_all_at_once_with_sof.rs`
 
 That example shows:
 

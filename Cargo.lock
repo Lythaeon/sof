@@ -5539,6 +5539,7 @@ version = "0.17.0"
 dependencies = [
  "async-trait",
  "bincode",
+ "sof",
  "sof-tx",
  "sof-types",
  "solana-compute-budget-interface",
@@ -5550,6 +5551,7 @@ dependencies = [
  "solana-system-interface 3.1.0",
  "solana-transaction",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
@@ -5633,7 +5635,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sof",
- "sof-solana-compat",
  "sof-types",
  "solana-compute-budget-interface",
  "solana-connection-cache",

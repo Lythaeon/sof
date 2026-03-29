@@ -169,7 +169,7 @@ Start here when one process owns both observation and submission.
 
 See the full example in:
 
-- `crates/sof-tx/examples/submit_all_at_once_with_sof.rs`
+- `crates/sof-solana-compat/examples/submit_all_at_once_with_sof.rs`
 
 It shows one full process shape with:
 
