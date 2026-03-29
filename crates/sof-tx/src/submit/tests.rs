@@ -233,7 +233,9 @@ async fn rpc_only_uses_rpc_transport() {
         assert_eq!(result.jito_signature, None);
         assert_eq!(result.jito_bundle_id, None);
         assert_eq!(result.direct_target, None);
-        assert!(!result.used_rpc_fallback);
+        assert_eq!(result.legacy_mode, Some(SubmitMode::RpcOnly));
+        assert_eq!(result.plan, SubmitPlan::rpc_only());
+        assert!(!result.used_fallback_route);
     }
 
     let rpc_calls = rpc.calls.load(Ordering::Relaxed);
@@ -316,7 +318,9 @@ async fn jito_only_uses_jito_transport() {
         assert_eq!(result.jito_signature, Some("jito-signature".to_owned()));
         assert_eq!(result.jito_bundle_id, None);
         assert_eq!(result.direct_target, None);
-        assert!(!result.used_rpc_fallback);
+        assert_eq!(result.legacy_mode, Some(SubmitMode::JitoOnly));
+        assert_eq!(result.plan, SubmitPlan::jito_only());
+        assert!(!result.used_fallback_route);
     }
 
     let rpc_calls = rpc.calls.load(Ordering::Relaxed);
@@ -360,7 +364,9 @@ async fn jito_only_accepts_bundle_id_from_grpc_transport() {
         assert_eq!(result.jito_signature, None);
         assert_eq!(result.jito_bundle_id, Some("bundle-uuid".to_owned()));
         assert_eq!(result.direct_target, None);
-        assert!(!result.used_rpc_fallback);
+        assert_eq!(result.legacy_mode, Some(SubmitMode::JitoOnly));
+        assert_eq!(result.plan, SubmitPlan::jito_only());
+        assert!(!result.used_fallback_route);
     }
 
     assert_eq!(jito.calls.load(Ordering::Relaxed), 1);
@@ -541,7 +547,9 @@ async fn direct_only_uses_direct_transport() {
         assert_eq!(result.rpc_signature, None);
         assert_eq!(result.jito_signature, None);
         assert_eq!(result.jito_bundle_id, None);
-        assert!(!result.used_rpc_fallback);
+        assert_eq!(result.legacy_mode, Some(SubmitMode::DirectOnly));
+        assert_eq!(result.plan, SubmitPlan::direct_only());
+        assert!(!result.used_fallback_route);
     }
 
     let rpc_calls = rpc.calls.load(Ordering::Relaxed);
@@ -586,7 +594,9 @@ async fn hybrid_falls_back_to_rpc_when_direct_fails() {
         );
         assert_eq!(result.jito_signature, None);
         assert_eq!(result.jito_bundle_id, None);
-        assert!(result.used_rpc_fallback);
+        assert_eq!(result.legacy_mode, Some(SubmitMode::Hybrid));
+        assert_eq!(result.plan, SubmitPlan::hybrid());
+        assert!(result.used_fallback_route);
     }
 
     let rpc_calls = rpc.calls.load(Ordering::Relaxed);
@@ -638,7 +648,9 @@ async fn hybrid_uses_second_direct_attempt_before_rpc() {
         );
         assert_eq!(result.jito_signature, None);
         assert_eq!(result.jito_bundle_id, None);
-        assert!(!result.used_rpc_fallback);
+        assert_eq!(result.legacy_mode, Some(SubmitMode::Hybrid));
+        assert_eq!(result.plan, SubmitPlan::hybrid());
+        assert!(!result.used_fallback_route);
     }
 
     let rpc_calls = rpc.calls.load(Ordering::Relaxed);
@@ -684,7 +696,9 @@ async fn low_latency_reliability_uses_single_hybrid_attempt() {
         );
         assert_eq!(result.jito_signature, None);
         assert_eq!(result.jito_bundle_id, None);
-        assert!(result.used_rpc_fallback);
+        assert_eq!(result.legacy_mode, Some(SubmitMode::Hybrid));
+        assert_eq!(result.plan, SubmitPlan::hybrid());
+        assert!(result.used_fallback_route);
     }
 
     let rpc_calls = rpc.calls.load(Ordering::Relaxed);
@@ -729,7 +743,9 @@ async fn low_latency_hybrid_direct_success_skips_rpc_broadcast() {
         assert_eq!(result.rpc_signature, None);
         assert_eq!(result.jito_signature, None);
         assert_eq!(result.jito_bundle_id, None);
-        assert!(!result.used_rpc_fallback);
+        assert_eq!(result.legacy_mode, Some(SubmitMode::Hybrid));
+        assert_eq!(result.plan, SubmitPlan::hybrid());
+        assert!(!result.used_fallback_route);
     }
 
     let rpc_calls = rpc.calls.load(Ordering::Relaxed);
@@ -922,4 +938,63 @@ async fn toxic_flow_suppression_keys_block_repeated_opportunities() {
         })
     ));
     assert_eq!(client.toxic_flow_telemetry().suppressed_submissions, 1);
+}
+
+#[tokio::test]
+async fn all_at_once_plan_submits_across_jito_and_direct() {
+    let direct = Arc::new(MockDirectTransport {
+        result: Ok(target(9001)),
+        calls: AtomicU64::new(0),
+    });
+    let jito = Arc::new(MockJitoTransport {
+        result: Ok(JitoSubmitResponse {
+            transaction_signature: Some("jito-signature".to_owned()),
+            bundle_id: Some("bundle-1".to_owned()),
+        }),
+        calls: AtomicU64::new(0),
+    });
+    let mut client = TxSubmitClient::new(
+        Arc::new(StaticRecentBlockhashProvider::new(Some([29_u8; 32]))),
+        Arc::new(StaticLeaderProvider::new(Some(target(9001)), Vec::new())),
+    )
+    .with_direct_transport(direct.clone())
+    .with_jito_transport(jito.clone());
+
+    let (bytes, signature) = signed_transfer_bytes();
+    let result = client
+        .submit_signed_via(
+            SignedTx::VersionedTransactionBytes(bytes),
+            SubmitPlan::all_at_once(vec![SubmitRoute::Direct, SubmitRoute::Jito]),
+        )
+        .await;
+
+    assert!(result.is_ok());
+    if let Ok(result) = result {
+        assert_eq!(
+            result.signature,
+            Some(SignatureBytes::from_solana(signature))
+        );
+        assert_eq!(result.plan.strategy, SubmitStrategy::AllAtOnce);
+        assert_eq!(
+            result.plan.routes,
+            vec![SubmitRoute::Direct, SubmitRoute::Jito]
+        );
+        assert_eq!(result.legacy_mode, None);
+        assert_eq!(
+            result.successful_routes,
+            vec![SubmitRoute::Direct, SubmitRoute::Jito]
+        );
+        assert!(matches!(
+            result.first_success_route,
+            Some(SubmitRoute::Direct) | Some(SubmitRoute::Jito)
+        ));
+        assert_eq!(result.direct_target, Some(target(9001)));
+        assert_eq!(result.jito_signature, Some("jito-signature".to_owned()));
+        assert_eq!(result.jito_bundle_id, Some("bundle-1".to_owned()));
+        assert_eq!(result.rpc_signature, None);
+        assert!(!result.used_fallback_route);
+    }
+
+    assert_eq!(direct.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(jito.calls.load(Ordering::Relaxed), 1);
 }

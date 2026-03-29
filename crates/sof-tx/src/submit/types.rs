@@ -17,7 +17,7 @@ use thiserror::Error;
 
 use crate::{providers::LeaderTarget, routing::RoutingPolicy};
 
-/// Runtime submit mode.
+/// Legacy runtime submit presets.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SubmitMode {
     /// Submit only through JSON-RPC.
@@ -28,6 +28,128 @@ pub enum SubmitMode {
     DirectOnly,
     /// Submit direct first, then RPC fallback on failure.
     Hybrid,
+}
+
+/// One concrete submit route.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum SubmitRoute {
+    /// JSON-RPC submission.
+    Rpc,
+    /// Jito block-engine submission.
+    Jito,
+    /// Direct leader/validator submission.
+    Direct,
+}
+
+/// Route execution policy for one submission attempt.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default, Serialize, Deserialize)]
+pub enum SubmitStrategy {
+    /// Execute routes in order and stop at the first accepted route.
+    #[default]
+    OrderedFallback,
+    /// Execute all configured routes at the same time.
+    AllAtOnce,
+}
+
+/// Route-plan based submission configuration.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SubmitPlan {
+    /// Configured submit routes.
+    pub routes: Vec<SubmitRoute>,
+    /// Route execution strategy.
+    pub strategy: SubmitStrategy,
+}
+
+impl SubmitPlan {
+    /// Creates one normalized plan.
+    #[must_use]
+    pub fn new(routes: Vec<SubmitRoute>, strategy: SubmitStrategy) -> Self {
+        let mut normalized = Vec::with_capacity(routes.len());
+        for route in routes {
+            if !normalized.contains(&route) {
+                normalized.push(route);
+            }
+        }
+        Self {
+            routes: normalized,
+            strategy,
+        }
+    }
+
+    /// Returns a normalized clone of this plan.
+    #[must_use]
+    pub fn normalized(&self) -> Self {
+        Self::new(self.routes.clone(), self.strategy)
+    }
+
+    /// Builds a single-route RPC fallback plan.
+    #[must_use]
+    pub fn rpc_only() -> Self {
+        Self::new(vec![SubmitRoute::Rpc], SubmitStrategy::OrderedFallback)
+    }
+
+    /// Builds a single-route Jito plan.
+    #[must_use]
+    pub fn jito_only() -> Self {
+        Self::new(vec![SubmitRoute::Jito], SubmitStrategy::OrderedFallback)
+    }
+
+    /// Builds a single-route direct plan.
+    #[must_use]
+    pub fn direct_only() -> Self {
+        Self::new(vec![SubmitRoute::Direct], SubmitStrategy::OrderedFallback)
+    }
+
+    /// Builds one custom ordered-fallback plan.
+    #[must_use]
+    pub fn ordered(routes: Vec<SubmitRoute>) -> Self {
+        Self::new(routes, SubmitStrategy::OrderedFallback)
+    }
+
+    /// Builds the legacy direct-then-RPC fallback plan.
+    #[must_use]
+    pub fn hybrid() -> Self {
+        Self::ordered(vec![SubmitRoute::Direct, SubmitRoute::Rpc])
+    }
+
+    /// Builds one concurrent all-route plan.
+    #[must_use]
+    pub fn all_at_once(routes: Vec<SubmitRoute>) -> Self {
+        Self::new(routes, SubmitStrategy::AllAtOnce)
+    }
+
+    /// Returns the matching legacy preset when this plan is one exact legacy shape.
+    #[must_use]
+    pub fn legacy_mode(&self) -> Option<SubmitMode> {
+        match (self.strategy, self.routes.as_slice()) {
+            (SubmitStrategy::OrderedFallback, [SubmitRoute::Rpc]) => Some(SubmitMode::RpcOnly),
+            (SubmitStrategy::OrderedFallback, [SubmitRoute::Jito]) => Some(SubmitMode::JitoOnly),
+            (SubmitStrategy::OrderedFallback, [SubmitRoute::Direct]) => {
+                Some(SubmitMode::DirectOnly)
+            }
+            (SubmitStrategy::OrderedFallback, [SubmitRoute::Direct, SubmitRoute::Rpc]) => {
+                Some(SubmitMode::Hybrid)
+            }
+            _ => None,
+        }
+    }
+}
+
+impl Default for SubmitPlan {
+    fn default() -> Self {
+        Self::rpc_only()
+    }
+}
+
+impl From<SubmitMode> for SubmitPlan {
+    fn from(value: SubmitMode) -> Self {
+        match value {
+            SubmitMode::RpcOnly => Self::rpc_only(),
+            SubmitMode::JitoOnly => Self::jito_only(),
+            SubmitMode::DirectOnly => Self::direct_only(),
+            SubmitMode::Hybrid => Self::hybrid(),
+        }
+    }
 }
 
 /// Reliability profile for direct and hybrid submission behavior.
@@ -316,8 +438,14 @@ pub enum SubmitError {
 pub struct SubmitResult {
     /// Signature parsed from submitted transaction bytes.
     pub signature: Option<SignatureBytes>,
-    /// Mode selected by caller.
-    pub mode: SubmitMode,
+    /// Route plan selected by caller.
+    pub plan: SubmitPlan,
+    /// Legacy preset used by caller when one exact preset was selected.
+    pub legacy_mode: Option<SubmitMode>,
+    /// First successful route observed for this submit.
+    pub first_success_route: Option<SubmitRoute>,
+    /// All successful routes observed for this submit.
+    pub successful_routes: Vec<SubmitRoute>,
     /// Target chosen by direct path when applicable.
     pub direct_target: Option<LeaderTarget>,
     /// RPC-returned signature string when RPC path succeeded.
@@ -326,8 +454,8 @@ pub struct SubmitResult {
     pub jito_signature: Option<String>,
     /// Jito block-engine returned bundle UUID when the gRPC bundle path succeeded.
     pub jito_bundle_id: Option<String>,
-    /// True when RPC fallback was used from hybrid mode.
-    pub used_rpc_fallback: bool,
+    /// True when one later ordered-fallback route accepted the submit.
+    pub used_fallback_route: bool,
     /// Number of direct targets selected for submit attempt that succeeded.
     pub selected_target_count: usize,
     /// Number of unique validator identities in selected direct targets.
@@ -548,8 +676,10 @@ pub struct TxSubmitOutcome {
     pub kind: TxSubmitOutcomeKind,
     /// Transaction signature when available.
     pub signature: Option<SignatureBytes>,
-    /// Mode selected for the submit attempt.
-    pub mode: SubmitMode,
+    /// Route plan selected for the submit attempt.
+    pub plan: SubmitPlan,
+    /// Legacy preset used for the submit attempt when applicable.
+    pub legacy_mode: Option<SubmitMode>,
     /// Current state version at outcome time when known.
     pub state_version: Option<u64>,
     /// Opportunity age in milliseconds when known.

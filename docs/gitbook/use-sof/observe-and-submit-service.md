@@ -38,7 +38,7 @@ use std::sync::Arc;
 use sof::framework::{ObserverPlugin, PluginHost};
 use sof::runtime::ObserverRuntime;
 use sof_tx::{
-    SubmitMode, TxBuilder, TxSubmitClient,
+    SubmitPlan, TxBuilder, TxSubmitClient,
     adapters::PluginHostTxProviderAdapter,
 };
 use solana_keypair::Keypair;
@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         system_instruction::transfer(&payer.pubkey(), &recipient.pubkey(), 1),
     );
 
-    let _ = (builder, &mut client, SubmitMode::Hybrid);
+    let _ = (builder, &mut client, SubmitPlan::hybrid());
 
     let _ = ObserverRuntime::new().with_plugin_host(host).run().await;
 

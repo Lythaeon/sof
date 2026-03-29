@@ -32,12 +32,33 @@ pub enum SolanaCompatSubmitError {
 /// Solana-coupled convenience methods layered on top of `sof-tx` core byte submission.
 #[async_trait]
 pub trait TxSubmitClientSolanaExt {
+    /// Builds, signs, and submits a transaction through one route plan.
+    async fn submit_unsigned_via<T>(
+        &mut self,
+        builder: TxBuilder,
+        signers: &T,
+        plan: sof_tx::SubmitPlan,
+    ) -> Result<sof_tx::SubmitResult, SolanaCompatSubmitError>
+    where
+        T: Signers + Sync + ?Sized;
+
     /// Builds, signs, and submits a transaction in one API call.
     async fn submit_unsigned<T>(
         &mut self,
         builder: TxBuilder,
         signers: &T,
         mode: sof_tx::SubmitMode,
+    ) -> Result<sof_tx::SubmitResult, SolanaCompatSubmitError>
+    where
+        T: Signers + Sync + ?Sized;
+
+    /// Builds, signs, and submits a transaction with explicit toxic-flow context and route plan.
+    async fn submit_unsigned_with_context_via<T>(
+        &mut self,
+        builder: TxBuilder,
+        signers: &T,
+        plan: sof_tx::SubmitPlan,
+        context: sof_tx::TxSubmitContext,
     ) -> Result<sof_tx::SubmitResult, SolanaCompatSubmitError>
     where
         T: Signers + Sync + ?Sized;
@@ -53,11 +74,26 @@ pub trait TxSubmitClientSolanaExt {
     where
         T: Signers + Sync + ?Sized;
 
+    /// Submits one signed `VersionedTransaction` through one route plan.
+    async fn submit_transaction_via(
+        &mut self,
+        tx: VersionedTransaction,
+        plan: sof_tx::SubmitPlan,
+    ) -> Result<sof_tx::SubmitResult, SolanaCompatSubmitError>;
+
     /// Submits one signed `VersionedTransaction`.
     async fn submit_transaction(
         &mut self,
         tx: VersionedTransaction,
         mode: sof_tx::SubmitMode,
+    ) -> Result<sof_tx::SubmitResult, SolanaCompatSubmitError>;
+
+    /// Submits one signed `VersionedTransaction` with explicit toxic-flow context and route plan.
+    async fn submit_transaction_with_context_via(
+        &mut self,
+        tx: VersionedTransaction,
+        plan: sof_tx::SubmitPlan,
+        context: sof_tx::TxSubmitContext,
     ) -> Result<sof_tx::SubmitResult, SolanaCompatSubmitError>;
 
     /// Submits one signed `VersionedTransaction` with explicit toxic-flow context.
@@ -71,6 +107,24 @@ pub trait TxSubmitClientSolanaExt {
 
 #[async_trait]
 impl TxSubmitClientSolanaExt for sof_tx::TxSubmitClient {
+    async fn submit_unsigned_via<T>(
+        &mut self,
+        builder: TxBuilder,
+        signers: &T,
+        plan: sof_tx::SubmitPlan,
+    ) -> Result<sof_tx::SubmitResult, SolanaCompatSubmitError>
+    where
+        T: Signers + Sync + ?Sized,
+    {
+        self.submit_unsigned_with_context_via(
+            builder,
+            signers,
+            plan,
+            sof_tx::TxSubmitContext::default(),
+        )
+        .await
+    }
+
     async fn submit_unsigned<T>(
         &mut self,
         builder: TxBuilder,
@@ -80,20 +134,20 @@ impl TxSubmitClientSolanaExt for sof_tx::TxSubmitClient {
     where
         T: Signers + Sync + ?Sized,
     {
-        self.submit_unsigned_with_context(
+        self.submit_unsigned_with_context_via(
             builder,
             signers,
-            mode,
+            sof_tx::SubmitPlan::from(mode),
             sof_tx::TxSubmitContext::default(),
         )
         .await
     }
 
-    async fn submit_unsigned_with_context<T>(
+    async fn submit_unsigned_with_context_via<T>(
         &mut self,
         builder: TxBuilder,
         signers: &T,
-        mode: sof_tx::SubmitMode,
+        plan: sof_tx::SubmitPlan,
         context: sof_tx::TxSubmitContext,
     ) -> Result<sof_tx::SubmitResult, SolanaCompatSubmitError>
     where
@@ -111,7 +165,35 @@ impl TxSubmitClientSolanaExt for sof_tx::TxSubmitClient {
         let tx = builder
             .build_and_sign(blockhash, signers)
             .map_err(|source| SolanaCompatSubmitError::Build { source })?;
-        self.submit_transaction_with_context(tx, mode, context)
+        self.submit_transaction_with_context_via(tx, plan, context)
+            .await
+    }
+
+    async fn submit_unsigned_with_context<T>(
+        &mut self,
+        builder: TxBuilder,
+        signers: &T,
+        mode: sof_tx::SubmitMode,
+        context: sof_tx::TxSubmitContext,
+    ) -> Result<sof_tx::SubmitResult, SolanaCompatSubmitError>
+    where
+        T: Signers + Sync + ?Sized,
+    {
+        self.submit_unsigned_with_context_via(
+            builder,
+            signers,
+            sof_tx::SubmitPlan::from(mode),
+            context,
+        )
+        .await
+    }
+
+    async fn submit_transaction_via(
+        &mut self,
+        tx: VersionedTransaction,
+        plan: sof_tx::SubmitPlan,
+    ) -> Result<sof_tx::SubmitResult, SolanaCompatSubmitError> {
+        self.submit_transaction_with_context_via(tx, plan, sof_tx::TxSubmitContext::default())
             .await
     }
 
@@ -120,8 +202,30 @@ impl TxSubmitClientSolanaExt for sof_tx::TxSubmitClient {
         tx: VersionedTransaction,
         mode: sof_tx::SubmitMode,
     ) -> Result<sof_tx::SubmitResult, SolanaCompatSubmitError> {
-        self.submit_transaction_with_context(tx, mode, sof_tx::TxSubmitContext::default())
-            .await
+        self.submit_transaction_with_context_via(
+            tx,
+            sof_tx::SubmitPlan::from(mode),
+            sof_tx::TxSubmitContext::default(),
+        )
+        .await
+    }
+
+    async fn submit_transaction_with_context_via(
+        &mut self,
+        tx: VersionedTransaction,
+        plan: sof_tx::SubmitPlan,
+        context: sof_tx::TxSubmitContext,
+    ) -> Result<sof_tx::SubmitResult, SolanaCompatSubmitError> {
+        let tx_bytes = serialize(&tx).map_err(|error| SolanaCompatSubmitError::Encode {
+            message: error.to_string(),
+        })?;
+        self.submit_signed_with_context_via(
+            sof_tx::SignedTx::VersionedTransactionBytes(tx_bytes),
+            plan,
+            context,
+        )
+        .await
+        .map_err(|source| SolanaCompatSubmitError::Submit { source })
     }
 
     async fn submit_transaction_with_context(
@@ -130,15 +234,7 @@ impl TxSubmitClientSolanaExt for sof_tx::TxSubmitClient {
         mode: sof_tx::SubmitMode,
         context: sof_tx::TxSubmitContext,
     ) -> Result<sof_tx::SubmitResult, SolanaCompatSubmitError> {
-        let tx_bytes = serialize(&tx).map_err(|error| SolanaCompatSubmitError::Encode {
-            message: error.to_string(),
-        })?;
-        self.submit_signed_with_context(
-            sof_tx::SignedTx::VersionedTransactionBytes(tx_bytes),
-            mode,
-            context,
-        )
-        .await
-        .map_err(|source| SolanaCompatSubmitError::Submit { source })
+        self.submit_transaction_with_context_via(tx, sof_tx::SubmitPlan::from(mode), context)
+            .await
     }
 }

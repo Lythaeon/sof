@@ -9,7 +9,7 @@ use solana_keypair::Keypair;
 use solana_signer::Signer;
 use sof_solana_compat::TxBuilder;
 use sof_tx::{
-    RpcSubmitConfig, SignedTx, SubmitMode, SubmitTransportError, TxSubmitClient,
+    RpcSubmitConfig, SignedTx, SubmitMode, SubmitPlan, SubmitTransportError, TxSubmitClient,
     providers::{StaticLeaderProvider, StaticRecentBlockhashProvider},
     submit::RpcSubmitTransport,
 };
@@ -76,7 +76,8 @@ fuzz_target!(|bytes: &[u8]| {
     let result = runtime.block_on(client.submit_signed(signed_tx, SubmitMode::RpcOnly));
     match result {
         Ok(result) => {
-            assert_eq!(result.mode, SubmitMode::RpcOnly);
+            assert_eq!(result.legacy_mode, Some(SubmitMode::RpcOnly));
+            assert_eq!(result.plan, SubmitPlan::rpc_only());
             assert!(result.rpc_signature.is_some());
             assert_eq!(result.jito_signature, None);
             assert_eq!(result.direct_target, None);

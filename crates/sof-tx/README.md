@@ -6,11 +6,13 @@ It provides:
 
 - ergonomic transaction/message building
 - signed and pre-signed submission APIs
-- runtime mode selection:
-  - `RpcOnly`
-  - `JitoOnly`
-  - `DirectOnly` (leader-targeted UDP send)
-  - `Hybrid` (direct first, RPC fallback)
+- route-plan based submission:
+  - `SubmitPlan::rpc_only()`
+  - `SubmitPlan::jito_only()`
+  - `SubmitPlan::direct_only()`
+  - `SubmitPlan::ordered(...)`
+  - `SubmitPlan::hybrid()`
+  - `SubmitPlan::all_at_once(...)`
 - routing policy and signature-level dedupe
 
 It works both as:
@@ -55,7 +57,7 @@ sof-tx = { version = "0.16.0", features = ["kernel-bypass"] }
 Start with the simplest unsigned-submit path:
 
 ```rust
-use sof_tx::{SubmitMode, TxBuilder, TxSubmitClient};
+use sof_tx::{SubmitPlan, TxBuilder, TxSubmitClient};
 use solana_keypair::Keypair;
 use solana_signer::Signer;
 use solana_system_interface::instruction as system_instruction;
@@ -74,7 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let _ = client
-        .submit_unsigned(builder, &[&payer], SubmitMode::RpcOnly)
+        .submit_unsigned_via(builder, &[&payer], SubmitPlan::rpc_only())
         .await?;
 
     Ok(())
@@ -106,9 +108,9 @@ let mut signed_only_client = TxSubmitClient::builder()
     .build();
 ```
 
-- `with_rpc_defaults(...)`: use one RPC URL for unsigned `RpcOnly` submission.
-- `with_jito_defaults(...)`: use one RPC URL for blockhash plus Jito for `JitoOnly` submission.
-- `with_rpc_transport(...)`: enough for `submit_signed(...)` because that path does not build the
+- `with_rpc_defaults(...)`: use one RPC URL for unsigned RPC-route submission.
+- `with_jito_defaults(...)`: use one RPC URL for blockhash plus Jito transport for Jito-route submission.
+- `with_rpc_transport(...)`: enough for `submit_signed_via(...)` because that path does not build the
   transaction inside the client and does not need a blockhash provider.
 
 The builder gives you the product-level paths first. Drop down to the provider APIs only when you
@@ -116,7 +118,7 @@ need custom control-plane wiring.
 
 For most services, the practical order is:
 
-- start with `RpcOnly`, `JitoOnly`, or `submit_signed(...)`
+- start with `SubmitPlan::rpc_only()`, `SubmitPlan::jito_only()`, or `submit_signed_via(...)`
 - add direct or hybrid only when you have a trustworthy local routing source and a measured reason
   to use it
 
@@ -125,8 +127,11 @@ For most services, the practical order is:
 - `TxSubmitClientBuilder`: configure common RPC, Jito, direct, and control-plane paths without
   wiring providers by hand first.
 - `TxBuilder`: compose transaction instructions and signing inputs.
-- `TxSubmitClient`: submit through RPC/Jito/direct/hybrid.
-- `SubmitMode`: runtime mode switch.
+- `TxSubmitClient`: submit through one or more configured routes.
+- `SubmitPlan`: primary route-plan API.
+- `SubmitRoute`: one concrete route (`Rpc`, `Jito`, `Direct`).
+- `SubmitStrategy`: ordered fallback or all-at-once execution.
+- `SubmitMode`: legacy preset compatibility surface.
 - `SignedTx`: submit externally signed transaction bytes.
 - `RoutingPolicy`: leader/backup fanout controls.
 - `LeaderProvider` and `RecentBlockhashProvider`: provider boundaries.
@@ -158,7 +163,7 @@ use std::sync::Arc;
 
 use sof::framework::{ObserverPlugin, PluginHost};
 use sof_tx::{
-    SubmitMode, SubmitReliability, TxBuilder, TxSubmitClient,
+    SubmitPlan, SubmitReliability, TxBuilder, TxSubmitClient,
     adapters::PluginHostTxProviderAdapter,
     submit::{JitoJsonRpcTransport, JsonRpcTransport, UdpDirectTransport},
 };
@@ -193,7 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
 
     let _ = client
-        .submit_unsigned(builder, &[&payer], SubmitMode::Hybrid)
+        .submit_unsigned_via(builder, &[&payer], SubmitPlan::hybrid())
         .await?;
 
     Ok(())
@@ -237,7 +242,7 @@ driving direct or hybrid sends. Typical checks include:
 use std::sync::Arc;
 
 use sof_tx::{
-    SubmitMode, TxBuilder, TxSubmitClient,
+    SubmitPlan, TxBuilder, TxSubmitClient,
     submit::JitoJsonRpcTransport,
 };
 use solana_keypair::Keypair;
@@ -265,7 +270,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
 
     let _result = client
-        .submit_unsigned(builder, &[&payer], SubmitMode::JitoOnly)
+        .submit_unsigned_via(builder, &[&payer], SubmitPlan::jito_only())
         .await?;
 
     Ok(())
@@ -277,7 +282,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 The recommended pattern is to keep strategy-specific instruction creation separate, and route both through one shared SDK pipeline.
 
 ```rust
-use sof_tx::{SubmitMode, TxBuilder, TxSubmitClient};
+use sof_tx::{SubmitPlan, TxBuilder, TxSubmitClient};
 use solana_instruction::Instruction;
 use solana_keypair::Keypair;
 use solana_signer::Signer;
@@ -304,7 +309,7 @@ async fn submit_strategy_ixs(
         .add_instructions(ixs);
 
     let _ = client
-        .submit_unsigned(builder, &[payer], SubmitMode::Hybrid)
+        .submit_unsigned_via(builder, &[payer], SubmitPlan::hybrid())
         .await?;
 
     Ok(())
@@ -319,14 +324,17 @@ If your signer is external (wallet/HSM/offline), submit bytes directly. This pat
 blockhash provider inside `TxSubmitClient` because the transaction is already signed before submit:
 
 ```rust
-use sof_tx::{SignedTx, SubmitMode, TxSubmitClient};
+use sof_tx::{SignedTx, SubmitPlan, SubmitRoute, TxSubmitClient};
 
 async fn send_presigned(
     client: &mut TxSubmitClient,
     tx_bytes: Vec<u8>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = client
-        .submit_signed(SignedTx::WireTransactionBytes(tx_bytes), SubmitMode::Hybrid)
+        .submit_signed_via(
+            SignedTx::WireTransactionBytes(tx_bytes),
+            SubmitPlan::all_at_once(vec![SubmitRoute::Direct, SubmitRoute::Jito]),
+        )
         .await?;
     Ok(())
 }
@@ -343,13 +351,51 @@ async fn send_presigned(
 
 Thanks in advance for supporting continued SDK development.
 
-## Mode Guidance
+## Submit Plans
 
-- `RpcOnly`: maximum compatibility.
-- `JitoOnly`: send through Jito block engine only when your strategy already includes the
-  right fee/tip shape for that path.
-- `DirectOnly`: lowest path latency when leader targets are reliable.
-- `Hybrid`: practical default for latency + fallback resilience.
+Use `SubmitPlan` as the primary API:
+
+- `SubmitPlan::rpc_only()`: maximum compatibility.
+- `SubmitPlan::jito_only()`: Jito block-engine only when your strategy already includes the right
+  fee/tip shape for that path.
+- `SubmitPlan::direct_only()`: lowest path latency when leader targets are reliable.
+- `SubmitPlan::ordered(vec![...])`: custom ordered-fallback route plan.
+- `SubmitPlan::hybrid()`: practical default for latency plus RPC fallback resilience.
+- `SubmitPlan::all_at_once(vec![...])`: preferred multi-route shape when you want to maximize the
+  chance that one of several configured routes accepts the same transaction quickly, without
+  depending on any single route's transient latency or availability.
+
+Arbitrary plans are first-class:
+
+```rust
+use sof_tx::{SubmitPlan, SubmitRoute, TxSubmitClient};
+
+let plan = SubmitPlan::ordered(vec![
+    SubmitRoute::Direct,
+    SubmitRoute::Jito,
+    SubmitRoute::Rpc,
+]);
+
+let burst_plan = SubmitPlan::all_at_once(vec![
+    SubmitRoute::Direct,
+    SubmitRoute::Jito,
+]);
+
+let _ = (plan, burst_plan, TxSubmitClient::builder());
+```
+
+When you intentionally configure more than one route, prefer `SubmitPlan::all_at_once(...)`
+unless you specifically need ordered fallback semantics.
+
+`SubmitMode` still exists as a legacy preset surface. It maps to exact ordered-fallback plans:
+
+- `RpcOnly` -> `SubmitPlan::rpc_only()`
+- `JitoOnly` -> `SubmitPlan::jito_only()`
+- `DirectOnly` -> `SubmitPlan::direct_only()`
+- `Hybrid` -> `SubmitPlan::hybrid()`
+
+Use `submit_*_via(...)` when you want explicit multi-route behavior. Keep `submit_* (...)` with
+`SubmitMode` only for compatibility or when one legacy preset is enough.
 
 ## Jito Configuration
 
@@ -403,6 +449,12 @@ let client = TxSubmitClient::blockhash_only(blockhash_provider)
 
 Use `bundle_only = true` when you want Jito’s revert-protection behavior. Leave it `false` when
 you want the default `sendTransaction` path.
+
+If your submit plan includes `SubmitRoute::Jito`, make sure the transaction also includes the
+economic shape that path expects. Jito's current transaction path documents a minimum tip of
+`1000` lamports for bundles, and during competitive periods that floor may still be too low for
+good landing probability. In practice, Jito should be treated as both a transport choice and a
+fee/tip policy choice, not just another endpoint toggle.
 
 Regional endpoint selection is available for the documented Jito mainnet regions:
 
