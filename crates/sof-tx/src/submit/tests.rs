@@ -1102,10 +1102,12 @@ async fn all_at_once_plan_submits_across_jito_and_direct() {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
-            if outcomes
-                .iter()
-                .any(|outcome| outcome.kind == TxSubmitOutcomeKind::JitoAccepted)
-            {
+            if outcomes.iter().any(|outcome| {
+                outcome.kind == TxSubmitOutcomeKind::JitoAccepted
+                    && outcome.route == Some(SubmitRoute::Jito)
+                    && outcome.jito_signature.as_deref() == Some("jito-signature")
+                    && outcome.jito_bundle_id.as_deref() == Some("bundle-1")
+            }) {
                 break outcomes;
             }
             sleep(Duration::from_millis(10)).await;
@@ -1171,12 +1173,15 @@ async fn hybrid_direct_success_with_rpc_broadcast_returns_before_rpc_completes()
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
-            let saw_direct = outcomes
-                .iter()
-                .any(|outcome| outcome.kind == TxSubmitOutcomeKind::DirectAccepted);
-            let saw_rpc = outcomes
-                .iter()
-                .any(|outcome| outcome.kind == TxSubmitOutcomeKind::RpcAccepted);
+            let saw_direct = outcomes.iter().any(|outcome| {
+                outcome.kind == TxSubmitOutcomeKind::DirectAccepted
+                    && outcome.route == Some(SubmitRoute::Direct)
+            });
+            let saw_rpc = outcomes.iter().any(|outcome| {
+                outcome.kind == TxSubmitOutcomeKind::RpcAccepted
+                    && outcome.route == Some(SubmitRoute::Rpc)
+                    && outcome.rpc_signature.as_deref() == Some("rpc-broadcast-signature")
+            });
             if saw_direct && saw_rpc {
                 break outcomes;
             }
@@ -1185,6 +1190,44 @@ async fn hybrid_direct_success_with_rpc_broadcast_returns_before_rpc_completes()
     })
     .await;
     assert!(late_result.is_ok());
+}
+
+#[tokio::test]
+async fn all_at_once_returns_first_configured_error_when_all_routes_fail() {
+    let jito = Arc::new(DelayedJitoTransport {
+        result: Err(SubmitTransportError::Failure {
+            message: "jito failed".to_owned(),
+        }),
+        delay: Duration::from_millis(40),
+        calls: AtomicU64::new(0),
+    });
+    let direct = Arc::new(MockDirectTransport {
+        result: Err(SubmitTransportError::Failure {
+            message: "direct failed".to_owned(),
+        }),
+        calls: AtomicU64::new(0),
+    });
+    let mut client = TxSubmitClient::new(
+        Arc::new(StaticRecentBlockhashProvider::new(Some([41_u8; 32]))),
+        Arc::new(StaticLeaderProvider::new(Some(target(9001)), Vec::new())),
+    )
+    .with_jito_transport(jito.clone())
+    .with_direct_transport(direct.clone());
+
+    let (bytes, _) = signed_transfer_bytes();
+    let result = client
+        .submit_signed_via(
+            SignedTx::VersionedTransactionBytes(bytes),
+            SubmitPlan::all_at_once(vec![SubmitRoute::Jito, SubmitRoute::Direct]),
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(SubmitError::Jito {
+            source: SubmitTransportError::Failure { ref message }
+        }) if message == "jito failed"
+    ));
 }
 
 #[tokio::test]

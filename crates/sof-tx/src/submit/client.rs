@@ -504,8 +504,12 @@ impl TxSubmitClient {
         let outcome = TxSubmitOutcome {
             kind: outcome_kind,
             signature: metadata.signature,
+            route: None,
             plan: metadata.plan,
             legacy_mode: metadata.legacy_mode,
+            rpc_signature: None,
+            jito_signature: None,
+            jito_bundle_id: None,
             state_version: metadata.state_version,
             opportunity_age_ms: metadata.opportunity_age_ms,
         };
@@ -564,7 +568,7 @@ impl TxSubmitClient {
             .await
             {
                 Ok(outcome) => {
-                    self.record_route_outcome(signature, &plan, outcome.route);
+                    self.record_route_outcome(signature, &plan, &outcome);
                     if matches!(outcome.route, SubmitRoute::Direct) {
                         self.spawn_agave_rebroadcast(
                             Arc::clone(&tx_bytes),
@@ -608,7 +612,7 @@ impl TxSubmitClient {
         }))
     }
 
-    /// Executes every configured route at once and aggregates the successful outcomes.
+    /// Executes every configured route at once and returns on the first successful route.
     async fn submit_routes_all_at_once(
         &self,
         tx_bytes: Arc<[u8]>,
@@ -617,7 +621,7 @@ impl TxSubmitClient {
     ) -> Result<SubmitResult, SubmitError> {
         let legacy_mode = plan.legacy_mode();
         let (result_tx, mut result_rx) = mpsc::unbounded_channel();
-        for route in plan.routes.iter().copied() {
+        for (route_idx, route) in plan.routes.iter().copied().enumerate() {
             let task_context = self.route_task_context();
             let tx_bytes = Arc::clone(&tx_bytes);
             let result_tx = result_tx.clone();
@@ -645,7 +649,7 @@ impl TxSubmitClient {
                         flow_safety_source.as_ref(),
                         signature,
                         &plan_for_task,
-                        outcome.route,
+                        outcome,
                     );
                     if matches!(outcome.route, SubmitRoute::Direct)
                         && direct_config.agave_rebroadcast_enabled
@@ -662,13 +666,15 @@ impl TxSubmitClient {
                         );
                     }
                 }
-                drop(result_tx.send(result));
+                drop(result_tx.send((route_idx, result)));
             });
         }
         drop(result_tx);
 
-        let mut first_error = None;
-        while let Some(result) = result_rx.recv().await {
+        let mut errors_by_route: Vec<Option<SubmitError>> = std::iter::repeat_with(|| None)
+            .take(plan.routes.len())
+            .collect();
+        while let Some((route_idx, result)) = result_rx.recv().await {
             match result {
                 Ok(outcome) => {
                     return Ok(SubmitResult {
@@ -687,16 +693,20 @@ impl TxSubmitClient {
                     });
                 }
                 Err(error) => {
-                    if first_error.is_none() {
-                        first_error = Some(error);
+                    if let Some(slot) = errors_by_route.get_mut(route_idx) {
+                        *slot = Some(error);
                     }
                 }
             }
         }
 
-        Err(first_error.unwrap_or_else(|| SubmitError::InternalSync {
-            message: "all-at-once submit plan completed without a route outcome".to_owned(),
-        }))
+        Err(errors_by_route
+            .into_iter()
+            .flatten()
+            .next()
+            .unwrap_or_else(|| SubmitError::InternalSync {
+                message: "all-at-once submit plan completed without a route outcome".to_owned(),
+            }))
     }
 
     /// Records one accepted route as a terminal telemetry outcome.
@@ -704,7 +714,7 @@ impl TxSubmitClient {
         &self,
         signature: Option<SignatureBytes>,
         plan: &SubmitPlan,
-        route: SubmitRoute,
+        outcome: &RouteSubmitOutcome,
     ) {
         record_route_outcome_shared(
             &self.telemetry,
@@ -712,7 +722,7 @@ impl TxSubmitClient {
             self.flow_safety_source.as_ref(),
             signature,
             plan,
-            route,
+            outcome,
         );
     }
 
@@ -766,14 +776,23 @@ impl TxSubmitClient {
         let reporter = self.outcome_reporter.clone();
         let flow_safety_source = self.flow_safety_source.clone();
         tokio::spawn(async move {
-            if rpc.submit_rpc(tx_bytes.as_ref(), &rpc_config).await.is_ok() {
+            if let Ok(rpc_signature) = rpc.submit_rpc(tx_bytes.as_ref(), &rpc_config).await {
+                let outcome = RouteSubmitOutcome {
+                    route: SubmitRoute::Rpc,
+                    direct_target: None,
+                    rpc_signature: Some(rpc_signature),
+                    jito_signature: None,
+                    jito_bundle_id: None,
+                    selected_target_count: 0,
+                    selected_identity_count: 0,
+                };
                 record_route_outcome_shared(
                     &telemetry,
                     reporter.as_ref(),
                     flow_safety_source.as_ref(),
                     signature,
                     &plan,
-                    SubmitRoute::Rpc,
+                    &outcome,
                 );
             }
         });
@@ -865,9 +884,9 @@ fn record_route_outcome_shared(
     flow_safety_source: Option<&Arc<dyn TxFlowSafetySource>>,
     signature: Option<SignatureBytes>,
     plan: &SubmitPlan,
-    route: SubmitRoute,
+    outcome: &RouteSubmitOutcome,
 ) {
-    let kind = match route {
+    let kind = match outcome.route {
         SubmitRoute::Rpc => TxSubmitOutcomeKind::RpcAccepted,
         SubmitRoute::Jito => TxSubmitOutcomeKind::JitoAccepted,
         SubmitRoute::Direct => TxSubmitOutcomeKind::DirectAccepted,
@@ -875,8 +894,12 @@ fn record_route_outcome_shared(
     let outcome = TxSubmitOutcome {
         kind,
         signature,
+        route: Some(outcome.route),
         plan: plan.clone(),
         legacy_mode: plan.legacy_mode(),
+        rpc_signature: outcome.rpc_signature.clone(),
+        jito_signature: outcome.jito_signature.clone(),
+        jito_bundle_id: outcome.jito_bundle_id.clone(),
         state_version: flow_safety_source
             .and_then(|source| source.toxic_flow_snapshot().current_state_version),
         opportunity_age_ms: None,

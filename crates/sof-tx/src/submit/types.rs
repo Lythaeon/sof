@@ -463,8 +463,8 @@ pub struct SubmitResult {
     pub first_success_route: Option<SubmitRoute>,
     ///
     /// Later background accepts from concurrently configured routes are reported through
-    /// [`TxSubmitOutcomeReporter`] / built-in telemetry rather than retroactively mutating this
-    /// synchronous result.
+    /// [`TxSubmitOutcomeReporter`] / built-in telemetry, including any route-specific acceptance
+    /// metadata, rather than retroactively mutating this synchronous result.
     pub successful_routes: Vec<SubmitRoute>,
     /// Target chosen by direct path when applicable.
     pub direct_target: Option<LeaderTarget>,
@@ -691,16 +691,28 @@ pub enum TxSubmitOutcomeKind {
 }
 
 /// Structured outcome record for toxic-flow telemetry/reporting.
+///
+/// Route-level accepts may carry richer metadata than the synchronous [`SubmitResult`] when one
+/// different route already returned first. Consumers that care about later accepts should observe
+/// this surface rather than expecting the original [`SubmitResult`] to mutate.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TxSubmitOutcome {
     /// Outcome classification.
     pub kind: TxSubmitOutcomeKind,
     /// Transaction signature when available.
     pub signature: Option<SignatureBytes>,
+    /// Concrete accepted route when the outcome came from one route-level success.
+    pub route: Option<SubmitRoute>,
     /// Route plan selected for the submit attempt.
     pub plan: SubmitPlan,
     /// Legacy preset used for the submit attempt when applicable.
     pub legacy_mode: Option<SubmitMode>,
+    /// RPC-returned signature metadata when the RPC route accepted.
+    pub rpc_signature: Option<String>,
+    /// Jito-returned transaction signature metadata when the Jito route accepted.
+    pub jito_signature: Option<String>,
+    /// Jito-returned bundle UUID when the gRPC bundle route accepted.
+    pub jito_bundle_id: Option<String>,
     /// Current state version at outcome time when known.
     pub state_version: Option<u64>,
     /// Opportunity age in milliseconds when known.

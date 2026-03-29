@@ -295,7 +295,9 @@ Use `SubmitPlan` as the primary API:
 - `SubmitPlan::hybrid()`: practical default for latency plus RPC fallback resilience.
 - `SubmitPlan::all_at_once(vec![...])`: preferred multi-route shape when you want to maximize the
   chance that one of several configured routes accepts the same transaction quickly, without
-  depending on any single route's transient latency or availability.
+  depending on any single route's transient latency or availability. The submit call returns on
+  the first accepted route; later background accepts are reported through `TxSubmitOutcomeReporter`
+  / built-in telemetry instead of mutating the returned `SubmitResult`.
 
 Arbitrary plans are first-class:
 
@@ -399,8 +401,10 @@ let jito_transport = JitoJsonRpcTransport::with_endpoint(
 ```
 
 With the `jito-grpc` feature enabled, `sof-tx` also exposes `JitoGrpcTransport`. That path sends
-transactions as single-transaction bundles over Jito searcher gRPC and returns a bundle UUID in
-`SubmitResult.jito_bundle_id`.
+transactions as single-transaction bundles over Jito searcher gRPC. If Jito is the route that
+accepts before return, the bundle UUID is available in `SubmitResult.jito_bundle_id`; if another
+route wins first, the later Jito accept still carries its bundle UUID through
+`TxSubmitOutcomeReporter` / built-in telemetry.
 
 ## Reliability Profiles
 
