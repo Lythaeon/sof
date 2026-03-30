@@ -5405,7 +5405,20 @@ mod tests {
             .rev()
             .find_map(|envelope| match envelope.event {
                 DerivedStateFeedEvent::ControlPlaneStateUpdated(event) => Some(event),
-                _ => None,
+                DerivedStateFeedEvent::TransactionApplied(_)
+                | DerivedStateFeedEvent::TransactionStatusObserved(_)
+                | DerivedStateFeedEvent::BlockMetaObserved(_)
+                | DerivedStateFeedEvent::RootedAccountObserved(_)
+                | DerivedStateFeedEvent::RecentBlockhashObserved(_)
+                | DerivedStateFeedEvent::ClusterTopologyChanged(_)
+                | DerivedStateFeedEvent::LeaderScheduleUpdated(_)
+                | DerivedStateFeedEvent::StateInvalidated(_)
+                | DerivedStateFeedEvent::TxOutcomeObserved(_)
+                | DerivedStateFeedEvent::SlotStatusChanged(_)
+                | DerivedStateFeedEvent::EpochBoundaryObserved(_)
+                | DerivedStateFeedEvent::BranchReorged(_)
+                | DerivedStateFeedEvent::AccountTouchObserved(_)
+                | DerivedStateFeedEvent::CheckpointBarrier(_) => None,
             })
             .expect("expected trailing control-plane snapshot");
         assert!(last_control_plane.conflicts_detected);
