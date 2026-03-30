@@ -455,15 +455,15 @@ The same event family does not exist on every ingest path. Read this table as:
 
 | Ingest type | Plugin surface | Derived-state surface | Does not emit |
 | --- | --- | --- | --- |
-| Raw shreds / gossip / trusted raw-shred provider | `on_transaction`, `on_recent_blockhash`, `on_slot_status`, `on_cluster_topology`, `on_leader_schedule`, `on_reorg`, plus raw packet/shred/dataset surfaces | `TransactionApplied`, `RecentBlockhashObserved`, `SlotStatusChanged`, `ClusterTopologyChanged`, `LeaderScheduleUpdated`, `ControlPlaneStateUpdated`, `BranchReorged`, `StateInvalidated`, `AccountTouchObserved` | `on_transaction_status`, `on_transaction_log`, `on_account_update`, `on_block_meta`, `TransactionStatusObserved`, `BlockMetaObserved` |
+| Raw shreds / gossip / trusted raw-shred provider | `on_transaction`, `on_recent_blockhash`, `on_slot_status`, `on_cluster_topology`, `on_leader_schedule`, `on_reorg`, plus raw packet/shred/dataset surfaces | `TransactionApplied`, `RecentBlockhashObserved`, `SlotStatusChanged`, `EpochBoundaryObserved`, `ClusterTopologyChanged`, `LeaderScheduleUpdated`, `ControlPlaneStateUpdated`, `BranchReorged`, `StateInvalidated`, `AccountTouchObserved` | `on_transaction_status`, `on_transaction_log`, `on_account_update`, `on_block_meta`, `TransactionStatusObserved`, `BlockMetaObserved`, `RootedAccountObserved` |
 | Websocket `transactionSubscribe` | `on_transaction`, synthesized `on_recent_blockhash` when requested | `TransactionApplied` | `on_transaction_status`, `on_block_meta`, `TransactionStatusObserved`, `BlockMetaObserved`, topology/leader/reorg control-plane hooks |
 | Websocket `logsSubscribe` | `on_transaction_log` | none | transaction-status, block-meta, control-plane, and derived-state provider observations |
-| Websocket `accountSubscribe` / `programSubscribe` | `on_account_update` | none | transaction-status, block-meta, control-plane, and derived-state provider observations |
+| Websocket `accountSubscribe` / `programSubscribe` | `on_account_update` | `RootedAccountObserved` when the upstream feed is finalized | transaction-status, block-meta, and raw-shred control-plane families |
 | Yellowstone / LaserStream transaction feeds | `on_transaction`, synthesized `on_recent_blockhash` when requested | `TransactionApplied` | topology/leader/reorg control-plane hooks unless supplied through `Generic` |
 | Yellowstone / LaserStream transaction-status feeds | `on_transaction_status` | `TransactionStatusObserved` | raw-shred control-plane hooks, `on_block_meta`, account/log hooks unless separately configured |
 | Yellowstone / LaserStream block-meta feeds | `on_block_meta` | `BlockMetaObserved` | raw-shred control-plane hooks, `on_transaction_status`, account/log hooks unless separately configured |
-| Yellowstone / LaserStream account feeds | `on_account_update` | none | control-plane hooks and provider-derived `TransactionStatusObserved` / `BlockMetaObserved` |
-| Yellowstone / LaserStream slot feeds | `on_slot_status` | `SlotStatusChanged` | recent-blockhash/topology/leader-schedule/reorg unless supplied through `Generic` |
+| Yellowstone / LaserStream account feeds | `on_account_update` | `RootedAccountObserved` when the upstream feed is finalized; built-in account configs default to `finalized` unless explicitly overridden | control-plane hooks and provider-derived `TransactionStatusObserved` / `BlockMetaObserved` |
+| Yellowstone / LaserStream slot feeds | `on_slot_status` | `SlotStatusChanged`, `EpochBoundaryObserved` | recent-blockhash/topology/leader-schedule/reorg unless supplied through `Generic` |
 | `ProviderStreamMode::Generic` | whatever typed `ProviderStreamUpdate` variants the producer emits | whatever derived-state families SOF currently forwards from those typed updates | anything the producer does not emit |
 
 That also means:
@@ -581,7 +581,7 @@ cargo add sof
 Optional gossip bootstrap support at compile time:
 
 ```toml
-sof = { version = "0.17.3", features = ["gossip-bootstrap"] }
+sof = { version = "0.18.0", features = ["gossip-bootstrap"] }
 ```
 
 `gossip-bootstrap` uses the vendored `sof-solana-gossip` backend, but it no longer exact-pins the
@@ -590,7 +590,7 @@ Solana `3.1.8` patch line. Downstream crates can resolve newer compatible `3.1.x
 Optional external `kernel-bypass` ingress support:
 
 ```toml
-sof = { version = "0.17.3", features = ["kernel-bypass"] }
+sof = { version = "0.18.0", features = ["kernel-bypass"] }
 ```
 
 The bundled `sof-solana-gossip` backend defaults to SOF's lightweight in-memory duplicate/conflict
@@ -1019,7 +1019,9 @@ SOF also exposes a replayable derived-state feed intended for stateful official 
 - explicit resync/rebuild signaling
 - typed control-plane replay for recent blockhash, cluster topology, and leader schedule inputs
 - processed-provider replay for transaction-status and block-meta observations when the ingest mode supplies them
+- finalized provider-account replay for rooted vote/stake/sysvar/account observations when the ingest mode supplies them
 - canonical control-plane quality snapshots through `ControlPlaneStateUpdated`
+- explicit finalized epoch-boundary notifications through `EpochBoundaryObserved`
 - invalidation and tx-feedback events through `StateInvalidated` and `TxOutcomeObserved`
 
 Current derived-state feed families are:
@@ -1027,6 +1029,7 @@ Current derived-state feed families are:
 - `TransactionApplied`
 - `TransactionStatusObserved`
 - `BlockMetaObserved`
+- `RootedAccountObserved`
 - `RecentBlockhashObserved`
 - `ClusterTopologyChanged`
 - `LeaderScheduleUpdated`
@@ -1034,6 +1037,7 @@ Current derived-state feed families are:
 - `StateInvalidated`
 - `TxOutcomeObserved`
 - `SlotStatusChanged`
+- `EpochBoundaryObserved`
 - `BranchReorged`
 - `AccountTouchObserved`
 - `CheckpointBarrier`
@@ -1042,9 +1046,18 @@ Important ingest boundary:
 
 - raw-shred runtimes can feed the control-plane-derived state families
 - built-in Yellowstone/LaserStream can additionally feed provider-derived
-  `TransactionStatusObserved` and `BlockMetaObserved`
+  `TransactionStatusObserved`, `BlockMetaObserved`, and finalized
+  `RootedAccountObserved`
 - built-in websocket can feed `TransactionApplied`, but it does not currently
-  feed `TransactionStatusObserved` or `BlockMetaObserved`
+  feed `TransactionStatusObserved` or `BlockMetaObserved`; websocket
+  account/program subscriptions can still feed finalized `RootedAccountObserved`
+- built-in websocket account/program subscriptions default to `finalized`
+  commitment unless the config explicitly overrides it
+- built-in Yellowstone/LaserStream account feeds also default to `finalized`
+  commitment unless the config explicitly overrides it
+- `EpochBoundaryObserved` is derived from finalized slot progression using the
+  standard Solana epoch schedule and is a control-plane boundary signal, not a
+  vote/stake-derived leader-schedule authority source
 
 This is the right substrate for local service layers that want to build a bank, query index, or gRPC stream on top of SOF without depending on validator-native Geyser.
 

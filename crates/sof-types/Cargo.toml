@@ -1,6 +1,6 @@
 [package]
 name = "sof-types"
-version = "0.17.3"
+version = "0.18.0"
 edition.workspace = true
 description = "Stable SOF-owned primitive types shared across SOF crates"
 license = "Apache-2.0 OR MIT"

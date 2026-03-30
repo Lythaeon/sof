@@ -26,15 +26,17 @@ use crossbeam_channel as channel;
 use crossbeam_queue::ArrayQueue;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sof_types::{PubkeyBytes, SignatureBytes};
+use solana_epoch_schedule::EpochSchedule;
+use solana_sdk_ids::{stake, sysvar, vote};
 use solana_transaction::versioned::VersionedTransaction;
 use thiserror::Error;
 
 use crate::{
     event::{ForkSlotStatus, TxCommitmentStatus, TxKind},
     framework::{
-        AccountTouchEvent, BlockMetaEvent, ClusterTopologyEvent, ControlPlaneSource,
-        LeaderScheduleEvent, ObservedRecentBlockhashEvent, ReorgEvent, SlotStatusEvent,
-        TransactionEvent, TransactionStatusEvent,
+        AccountTouchEvent, AccountUpdateEvent, BlockMetaEvent, ClusterTopologyEvent,
+        ControlPlaneSource, LeaderScheduleEvent, ObservedRecentBlockhashEvent, ReorgEvent,
+        SlotStatusEvent, TransactionEvent, TransactionStatusEvent,
     },
 };
 
@@ -47,6 +49,8 @@ pub struct DerivedStateConsumerConfig {
     pub transaction_status_observed: bool,
     /// Enables `BlockMetaObserved` feed delivery.
     pub block_meta_observed: bool,
+    /// Enables rooted provider-account observations for authoritative state engines.
+    pub rooted_authoritative_observed: bool,
     /// Enables `AccountTouchObserved` feed delivery.
     pub account_touch_observed: bool,
     /// Requests writable/read-only key partitions on account-touch events.
@@ -80,6 +84,13 @@ impl DerivedStateConsumerConfig {
     #[must_use]
     pub const fn with_block_meta_observed(mut self) -> Self {
         self.block_meta_observed = true;
+        self
+    }
+
+    /// Enables rooted authoritative account observations.
+    #[must_use]
+    pub const fn with_rooted_authoritative_observed(mut self) -> Self {
+        self.rooted_authoritative_observed = true;
         self
     }
 
@@ -234,6 +245,8 @@ pub enum DerivedStateFeedEvent {
     TransactionStatusObserved(TransactionStatusObservedEvent),
     /// Block-metadata observation from processed-provider ingest.
     BlockMetaObserved(BlockMetaObservedEvent),
+    /// Finalized provider-backed account update suitable for rooted state engines.
+    RootedAccountObserved(RootedAccountObservedEvent),
     /// Recent blockhash observation suitable for direct-submit consumers.
     RecentBlockhashObserved(ObservedRecentBlockhashEvent),
     /// Cluster topology diff/snapshot suitable for direct-submit consumers.
@@ -248,6 +261,8 @@ pub enum DerivedStateFeedEvent {
     TxOutcomeObserved(DerivedStateTxOutcomeEvent),
     /// Slot lifecycle transition.
     SlotStatusChanged(SlotStatusChangedEvent),
+    /// Finalized epoch-boundary observation derived from slot progression.
+    EpochBoundaryObserved(EpochBoundaryObservedEvent),
     /// Canonical branch switch requiring consumer rollback/reconciliation.
     BranchReorged(BranchReorgedEvent),
     /// Transaction-derived account-touch metadata.
@@ -331,6 +346,8 @@ pub struct DerivedStateControlPlaneStateEvent {
     pub cluster_topology_source: Option<ControlPlaneSource>,
     /// Latest leader-schedule source when known.
     pub leader_schedule_source: Option<ControlPlaneSource>,
+    /// Latest finalized epoch derived from rooted slot progression when known.
+    pub finalized_epoch: Option<u64>,
     /// Wallclock skew budget observed across topology nodes when known.
     pub cluster_topology_max_wallclock_skew_ms: Option<u64>,
     /// Freshness metadata for the recent blockhash input.
@@ -528,6 +545,79 @@ impl From<BlockMetaEvent> for BlockMetaObservedEvent {
     }
 }
 
+/// Rooted authoritative account classification for finalized provider-account updates.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RootedAccountObservedKind {
+    /// Vote account owned by the vote program.
+    VoteAccount,
+    /// Stake account owned by the stake program.
+    StakeAccount,
+    /// Epoch-schedule sysvar account.
+    EpochScheduleSysvar,
+    /// Stake-history sysvar account.
+    StakeHistorySysvar,
+    /// Finalized account that does not match a special rooted classification.
+    Other,
+}
+
+/// Finalized provider-backed account observation for rooted state engines.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RootedAccountObservedEvent {
+    /// Slot context attached to the upstream account update.
+    pub slot: u64,
+    /// Commitment status at emission time. This feed only emits finalized updates.
+    pub commitment_status: TxCommitmentStatus,
+    /// Latest observed finalized slot watermark when event was emitted.
+    pub finalized_slot: Option<u64>,
+    /// Updated account pubkey.
+    pub pubkey: PubkeyBytes,
+    /// Account owner program id.
+    pub owner: PubkeyBytes,
+    /// Current lamport balance.
+    pub lamports: u64,
+    /// Whether the account is executable.
+    pub executable: bool,
+    /// Current rent epoch.
+    pub rent_epoch: u64,
+    /// Raw account data bytes.
+    pub data: Arc<[u8]>,
+    /// Provider write-version when available.
+    pub write_version: Option<u64>,
+    /// Transaction signature that produced the write when available.
+    pub txn_signature: Option<SignatureBytes>,
+    /// True when the provider marked this as startup/backfill state.
+    pub is_startup: bool,
+    /// Matching subscription/filter pubkey when one concrete key drove the feed.
+    pub matched_filter: Option<PubkeyBytes>,
+    /// Provider source instance when this event came from provider ingress.
+    pub provider_source: Option<crate::provider_stream::ProviderSourceRef>,
+    /// Rooted authoritative classification derived from pubkey/owner.
+    pub kind: RootedAccountObservedKind,
+}
+
+impl From<AccountUpdateEvent> for RootedAccountObservedEvent {
+    fn from(event: AccountUpdateEvent) -> Self {
+        let kind = classify_rooted_account_observed_kind(&event);
+        Self {
+            slot: event.slot,
+            commitment_status: event.commitment_status,
+            finalized_slot: event.finalized_slot,
+            pubkey: event.pubkey,
+            owner: event.owner,
+            lamports: event.lamports,
+            executable: event.executable,
+            rent_epoch: event.rent_epoch,
+            data: event.data,
+            write_version: event.write_version,
+            txn_signature: event.txn_signature,
+            is_startup: event.is_startup,
+            matched_filter: event.matched_filter,
+            provider_source: event.provider_source,
+            kind,
+        }
+    }
+}
+
 /// Slot lifecycle transition record for the derived-state feed.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SlotStatusChangedEvent {
@@ -550,6 +640,19 @@ impl From<SlotStatusEvent> for SlotStatusChangedEvent {
             status: event.status,
         }
     }
+}
+
+/// Finalized epoch-boundary observation derived from rooted slot progression.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EpochBoundaryObservedEvent {
+    /// Newly finalized epoch.
+    pub epoch: u64,
+    /// First slot in the finalized epoch.
+    pub first_slot: u64,
+    /// Finalized slot that confirmed the boundary.
+    pub rooted_slot: u64,
+    /// Previously tracked finalized epoch when known.
+    pub previous_epoch: Option<u64>,
 }
 
 /// Canonical branch switch record for the derived-state feed.
@@ -2643,6 +2746,7 @@ impl DerivedStateHostBuilder {
             transaction_applied: config.transaction_applied,
             transaction_status_observed: config.transaction_status_observed,
             block_meta_observed: config.block_meta_observed,
+            rooted_authoritative_observed: config.rooted_authoritative_observed,
             account_touch_observed: config.account_touch_observed,
             account_touch_key_partitions: config.account_touch_key_partitions,
             control_plane_observed: config.control_plane_observed,
@@ -2828,6 +2932,15 @@ impl DerivedStateHost {
             .consumers
             .iter()
             .any(|consumer| consumer.subscriptions.block_meta_observed)
+    }
+
+    /// Returns true when at least one consumer wants rooted authoritative account observations.
+    #[must_use]
+    pub fn wants_rooted_authoritative_observed(&self) -> bool {
+        self.inner
+            .consumers
+            .iter()
+            .any(|consumer| consumer.subscriptions.rooted_authoritative_observed)
     }
 
     /// Returns true when at least one consumer wants account-touch events.
@@ -3213,6 +3326,29 @@ impl DerivedStateHost {
         );
     }
 
+    /// Emits one finalized provider-backed account observation into the derived-state feed.
+    pub fn on_rooted_account(&self, event: AccountUpdateEvent) {
+        if self.is_empty() || event.commitment_status != TxCommitmentStatus::Finalized {
+            return;
+        }
+        let current_watermarks = self.current_watermarks();
+        self.dispatch(
+            FeedWatermarks {
+                canonical_tip_slot: current_watermarks.canonical_tip_slot,
+                processed_slot: current_watermarks.processed_slot,
+                confirmed_slot: max_optional_u64(
+                    current_watermarks.confirmed_slot,
+                    event.confirmed_slot,
+                ),
+                finalized_slot: max_optional_u64(
+                    current_watermarks.finalized_slot,
+                    event.finalized_slot,
+                ),
+            },
+            DerivedStateFeedEvent::RootedAccountObserved(event.into()),
+        );
+    }
+
     /// Emits a prebuilt batch of derived-state events using shared watermarks and one dispatch turn.
     pub fn on_events(&self, watermarks: FeedWatermarks, events: Vec<DerivedStateFeedEvent>) {
         if self.is_empty() || events.is_empty() {
@@ -3369,11 +3505,34 @@ impl DerivedStateHost {
             let _ = slot_tx_indexes.remove(&event.slot);
         }
         let watermarks = FeedWatermarks::from_slot_status(&event);
-        self.dispatch_with_control_plane_update(
-            watermarks,
-            DerivedStateFeedEvent::SlotStatusChanged(event.into()),
-            |_| {},
+        let dispatch_ticket = self.reserve_dispatch_ticket();
+        self.wait_for_dispatch_turn(dispatch_ticket);
+        let mut control_plane_state = self.inner.control_plane_state.clone();
+        let mut next_control_plane_state = control_plane_state.shared_get().clone();
+        let epoch_boundary = if event.status == ForkSlotStatus::Finalized {
+            next_control_plane_state.apply_finalized_slot(event.slot)
+        } else {
+            None
+        };
+        let control_plane_event = next_control_plane_state.snapshot(watermarks);
+        let invalidation_event = invalidation_from_control_plane_state(
+            &mut next_control_plane_state,
+            control_plane_event,
         );
+        control_plane_state.update(next_control_plane_state);
+        let mut events = Vec::with_capacity(4);
+        events.push(DerivedStateFeedEvent::SlotStatusChanged(event.into()));
+        if let Some(epoch_boundary) = epoch_boundary {
+            events.push(DerivedStateFeedEvent::EpochBoundaryObserved(epoch_boundary));
+        }
+        events.push(DerivedStateFeedEvent::ControlPlaneStateUpdated(
+            control_plane_event,
+        ));
+        if let Some(invalidation_event) = invalidation_event {
+            events.push(DerivedStateFeedEvent::StateInvalidated(invalidation_event));
+        }
+        let first_sequence = self.reserve_sequence_block(events.len());
+        self.dispatch_vec_unlocked(watermarks, dispatch_ticket, first_sequence, events);
     }
 
     /// Emits one canonical branch reorg record into the derived-state feed.
@@ -3857,6 +4016,16 @@ fn decode_optional_u64(value: u64) -> Option<u64> {
     (value != AtomicFeedWatermarks::UNSET).then_some(value)
 }
 
+/// Returns the greater of two optional watermark values, preserving `None` when both are absent.
+const fn max_optional_u64(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(if left >= right { left } else { right }),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
+}
+
 /// Computes one sequence inside a reserved contiguous dispatch block.
 fn sequence_offset(first_sequence: FeedSequence, offset: usize) -> FeedSequence {
     let offset = u64::try_from(offset).unwrap_or(0);
@@ -3882,6 +4051,12 @@ struct DerivedStateControlPlaneTracker {
     cluster_topology_source: Option<ControlPlaneSource>,
     /// Source of the latest leader-schedule update.
     leader_schedule_source: Option<ControlPlaneSource>,
+    /// Epoch schedule used to classify finalized epoch boundaries.
+    epoch_schedule: EpochSchedule,
+    /// Latest finalized epoch derived from slot progression.
+    finalized_epoch: Option<u64>,
+    /// Highest finalized slot derived from slot progression.
+    finalized_slot: Option<u64>,
     /// Maximum wallclock skew observed across the latest topology payload.
     cluster_topology_max_wallclock_skew_ms: Option<u64>,
     /// Number of source or slot conflicts seen in this host session.
@@ -3988,6 +4163,33 @@ impl DerivedStateControlPlaneTracker {
         self.leader_schedule_source = Some(source);
     }
 
+    /// Updates the tracker from one finalized slot and returns an epoch-boundary event when one
+    /// finalized transition crossed into the first slot of a new epoch.
+    fn apply_finalized_slot(&mut self, slot: u64) -> Option<EpochBoundaryObservedEvent> {
+        let epoch = self.epoch_schedule.get_epoch(slot);
+        if self.finalized_slot.is_some_and(|previous| slot < previous) {
+            self.conflict_count = self.conflict_count.saturating_add(1);
+        }
+        if self
+            .finalized_epoch
+            .is_some_and(|previous| epoch < previous)
+        {
+            self.conflict_count = self.conflict_count.saturating_add(1);
+        }
+        let previous_epoch = self.finalized_epoch;
+        self.finalized_slot = Some(slot);
+        self.finalized_epoch = Some(epoch);
+        let first_slot = self.epoch_schedule.get_first_slot_in_epoch(epoch);
+        (slot == first_slot && previous_epoch != Some(epoch)).then_some(
+            EpochBoundaryObservedEvent {
+                epoch,
+                first_slot,
+                rooted_slot: slot,
+                previous_epoch,
+            },
+        )
+    }
+
     /// Builds the canonical control-plane state snapshot for one watermark boundary.
     fn snapshot(&self, watermarks: FeedWatermarks) -> DerivedStateControlPlaneStateEvent {
         let tip_slot = watermarks.canonical_tip_slot.or(watermarks.processed_slot);
@@ -4033,6 +4235,7 @@ impl DerivedStateControlPlaneTracker {
             known_leader_slots: self.known_leader_slots,
             cluster_topology_source: self.cluster_topology_source,
             leader_schedule_source: self.leader_schedule_source,
+            finalized_epoch: self.finalized_epoch,
             cluster_topology_max_wallclock_skew_ms: self.cluster_topology_max_wallclock_skew_ms,
             recent_blockhash_freshness,
             cluster_topology_freshness,
@@ -4168,6 +4371,26 @@ fn invalidation_from_control_plane_state(
     }
 }
 
+/// Classifies a finalized provider-backed account update into one rooted-account family.
+fn classify_rooted_account_observed_kind(event: &AccountUpdateEvent) -> RootedAccountObservedKind {
+    let vote_program = vote::id().to_bytes();
+    let stake_program = stake::id().to_bytes();
+    let epoch_schedule_sysvar = sysvar::epoch_schedule::id().to_bytes();
+    let stake_history_sysvar = sysvar::stake_history::id().to_bytes();
+
+    if event.owner == vote_program.into() {
+        RootedAccountObservedKind::VoteAccount
+    } else if event.owner == stake_program.into() {
+        RootedAccountObservedKind::StakeAccount
+    } else if event.pubkey == epoch_schedule_sysvar.into() {
+        RootedAccountObservedKind::EpochScheduleSysvar
+    } else if event.pubkey == stake_history_sysvar.into() {
+        RootedAccountObservedKind::StakeHistorySysvar
+    } else {
+        RootedAccountObservedKind::Other
+    }
+}
+
 /// Returns the maximum wallclock skew across topology nodes when present.
 fn topology_max_wallclock_skew_ms(event: &ClusterTopologyEvent) -> Option<u64> {
     let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
@@ -4221,6 +4444,8 @@ struct DerivedStateConsumerSubscriptions {
     transaction_status_observed: bool,
     /// Whether the consumer wants `BlockMetaObserved` events.
     block_meta_observed: bool,
+    /// Whether the consumer wants `RootedAccountObserved` events.
+    rooted_authoritative_observed: bool,
     /// Whether the consumer wants `AccountTouchObserved` events.
     account_touch_observed: bool,
     /// Whether the consumer wants partitioned account-touch key sets.
@@ -4236,6 +4461,7 @@ impl RegisteredDerivedStateConsumer {
         self.subscriptions.transaction_applied
             && self.subscriptions.transaction_status_observed
             && self.subscriptions.block_meta_observed
+            && self.subscriptions.rooted_authoritative_observed
             && self.subscriptions.account_touch_observed
             && self.subscriptions.control_plane_observed
     }
@@ -4261,6 +4487,9 @@ impl RegisteredDerivedStateConsumer {
                 self.subscriptions.transaction_status_observed
             }
             DerivedStateFeedEvent::BlockMetaObserved(_) => self.subscriptions.block_meta_observed,
+            DerivedStateFeedEvent::RootedAccountObserved(_) => {
+                self.subscriptions.rooted_authoritative_observed
+            }
             DerivedStateFeedEvent::AccountTouchObserved(_) => {
                 self.subscriptions.account_touch_observed
             }
@@ -4269,7 +4498,8 @@ impl RegisteredDerivedStateConsumer {
             | DerivedStateFeedEvent::LeaderScheduleUpdated(_)
             | DerivedStateFeedEvent::ControlPlaneStateUpdated(_)
             | DerivedStateFeedEvent::StateInvalidated(_)
-            | DerivedStateFeedEvent::TxOutcomeObserved(_) => {
+            | DerivedStateFeedEvent::TxOutcomeObserved(_)
+            | DerivedStateFeedEvent::EpochBoundaryObserved(_) => {
                 self.subscriptions.control_plane_observed
             }
             DerivedStateFeedEvent::SlotStatusChanged(_)
@@ -4633,6 +4863,7 @@ mod tests {
                 .with_transaction_applied()
                 .with_transaction_status_observed()
                 .with_block_meta_observed()
+                .with_rooted_authoritative_observed()
                 .with_account_touch_key_partitions()
                 .with_control_plane_observed()
         }
@@ -4968,6 +5199,237 @@ mod tests {
     }
 
     #[test]
+    fn host_dispatches_rooted_account_and_epoch_boundary_events_into_feed() {
+        let state = Arc::new(Mutex::new(RecordingState::default()));
+        let host = DerivedStateHost::builder()
+            .add_consumer(RecordingConsumer::new(Arc::clone(&state)))
+            .build();
+
+        host.on_rooted_account(AccountUpdateEvent {
+            slot: 200,
+            commitment_status: TxCommitmentStatus::Finalized,
+            confirmed_slot: Some(200),
+            finalized_slot: Some(200),
+            pubkey: PubkeyBytes::from_solana(vote::id()),
+            owner: PubkeyBytes::from_solana(vote::id()),
+            lamports: 123,
+            executable: false,
+            rent_epoch: 0,
+            data: Arc::from([1_u8, 2, 3, 4]),
+            write_version: Some(9),
+            txn_signature: Some(SignatureBytes::from_solana(Signature::from([7_u8; 64]))),
+            is_startup: false,
+            matched_filter: None,
+            provider_source: None,
+        });
+        host.on_slot_status(SlotStatusEvent {
+            slot: 31,
+            parent_slot: Some(30),
+            previous_status: Some(ForkSlotStatus::Confirmed),
+            status: ForkSlotStatus::Finalized,
+            tip_slot: Some(31),
+            confirmed_slot: Some(31),
+            finalized_slot: Some(31),
+            provider_source: None,
+        });
+        host.on_slot_status(SlotStatusEvent {
+            slot: 32,
+            parent_slot: Some(31),
+            previous_status: Some(ForkSlotStatus::Confirmed),
+            status: ForkSlotStatus::Finalized,
+            tip_slot: Some(32),
+            confirmed_slot: Some(32),
+            finalized_slot: Some(32),
+            provider_source: None,
+        });
+
+        let state = state
+            .lock()
+            .expect("recording state mutex should not be poisoned");
+        assert!(matches!(
+            state.envelopes[0].event,
+            DerivedStateFeedEvent::RootedAccountObserved(_)
+        ));
+        let DerivedStateFeedEvent::RootedAccountObserved(rooted_account) =
+            state.envelopes[0].event.clone()
+        else {
+            panic!("expected rooted-account observed event");
+        };
+        assert_eq!(rooted_account.kind, RootedAccountObservedKind::VoteAccount);
+        assert_eq!(rooted_account.finalized_slot, Some(200));
+
+        let epoch_boundaries = state
+            .envelopes
+            .iter()
+            .filter_map(|envelope| match &envelope.event {
+                DerivedStateFeedEvent::EpochBoundaryObserved(event) => Some(*event),
+                DerivedStateFeedEvent::TransactionApplied(_)
+                | DerivedStateFeedEvent::TransactionStatusObserved(_)
+                | DerivedStateFeedEvent::BlockMetaObserved(_)
+                | DerivedStateFeedEvent::RootedAccountObserved(_)
+                | DerivedStateFeedEvent::RecentBlockhashObserved(_)
+                | DerivedStateFeedEvent::ClusterTopologyChanged(_)
+                | DerivedStateFeedEvent::LeaderScheduleUpdated(_)
+                | DerivedStateFeedEvent::ControlPlaneStateUpdated(_)
+                | DerivedStateFeedEvent::StateInvalidated(_)
+                | DerivedStateFeedEvent::TxOutcomeObserved(_)
+                | DerivedStateFeedEvent::SlotStatusChanged(_)
+                | DerivedStateFeedEvent::BranchReorged(_)
+                | DerivedStateFeedEvent::AccountTouchObserved(_)
+                | DerivedStateFeedEvent::CheckpointBarrier(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            epoch_boundaries,
+            vec![EpochBoundaryObservedEvent {
+                epoch: 1,
+                first_slot: 32,
+                rooted_slot: 32,
+                previous_epoch: Some(0),
+            }]
+        );
+
+        let last_control_plane = state
+            .envelopes
+            .iter()
+            .rev()
+            .find_map(|envelope| match envelope.event {
+                DerivedStateFeedEvent::ControlPlaneStateUpdated(event) => Some(event),
+                DerivedStateFeedEvent::TransactionApplied(_)
+                | DerivedStateFeedEvent::TransactionStatusObserved(_)
+                | DerivedStateFeedEvent::BlockMetaObserved(_)
+                | DerivedStateFeedEvent::RootedAccountObserved(_)
+                | DerivedStateFeedEvent::RecentBlockhashObserved(_)
+                | DerivedStateFeedEvent::ClusterTopologyChanged(_)
+                | DerivedStateFeedEvent::LeaderScheduleUpdated(_)
+                | DerivedStateFeedEvent::StateInvalidated(_)
+                | DerivedStateFeedEvent::TxOutcomeObserved(_)
+                | DerivedStateFeedEvent::SlotStatusChanged(_)
+                | DerivedStateFeedEvent::EpochBoundaryObserved(_)
+                | DerivedStateFeedEvent::BranchReorged(_)
+                | DerivedStateFeedEvent::AccountTouchObserved(_)
+                | DerivedStateFeedEvent::CheckpointBarrier(_) => None,
+            })
+            .expect("expected trailing control-plane snapshot");
+        assert_eq!(last_control_plane.finalized_epoch, Some(1));
+    }
+
+    #[test]
+    fn rooted_account_events_preserve_current_runtime_watermarks() {
+        let state = Arc::new(Mutex::new(RecordingState::default()));
+        let host = DerivedStateHost::builder()
+            .add_consumer(RecordingConsumer::new(Arc::clone(&state)))
+            .build();
+
+        host.on_slot_status(SlotStatusEvent {
+            slot: 500,
+            parent_slot: Some(499),
+            previous_status: None,
+            status: ForkSlotStatus::Processed,
+            tip_slot: Some(500),
+            confirmed_slot: Some(499),
+            finalized_slot: Some(498),
+            provider_source: None,
+        });
+        host.on_rooted_account(AccountUpdateEvent {
+            slot: 200,
+            commitment_status: TxCommitmentStatus::Finalized,
+            confirmed_slot: Some(200),
+            finalized_slot: Some(200),
+            pubkey: PubkeyBytes::from_solana(vote::id()),
+            owner: PubkeyBytes::from_solana(vote::id()),
+            lamports: 321,
+            executable: false,
+            rent_epoch: 0,
+            data: Arc::from([9_u8, 8, 7, 6]),
+            write_version: Some(10),
+            txn_signature: Some(SignatureBytes::from_solana(Signature::from([5_u8; 64]))),
+            is_startup: true,
+            matched_filter: None,
+            provider_source: None,
+        });
+
+        let state = state
+            .lock()
+            .expect("recording state mutex should not be poisoned");
+        let rooted_account = state
+            .envelopes
+            .iter()
+            .find(|envelope| {
+                matches!(
+                    envelope.event,
+                    DerivedStateFeedEvent::RootedAccountObserved(_)
+                )
+            })
+            .expect("expected rooted-account observed envelope");
+        assert_eq!(rooted_account.watermarks.canonical_tip_slot, Some(500));
+        assert_eq!(rooted_account.watermarks.processed_slot, Some(500));
+        assert_eq!(rooted_account.watermarks.confirmed_slot, Some(499));
+        assert_eq!(rooted_account.watermarks.finalized_slot, Some(498));
+    }
+
+    #[test]
+    fn finalized_slot_regressions_increment_control_plane_conflict_count() {
+        let state = Arc::new(Mutex::new(RecordingState::default()));
+        let host = DerivedStateHost::builder()
+            .add_consumer(RecordingConsumer::new(Arc::clone(&state)))
+            .build();
+
+        host.on_slot_status(SlotStatusEvent {
+            slot: 500,
+            parent_slot: Some(499),
+            previous_status: Some(ForkSlotStatus::Confirmed),
+            status: ForkSlotStatus::Finalized,
+            tip_slot: Some(500),
+            confirmed_slot: Some(500),
+            finalized_slot: Some(500),
+            provider_source: None,
+        });
+        host.on_slot_status(SlotStatusEvent {
+            slot: 450,
+            parent_slot: Some(449),
+            previous_status: Some(ForkSlotStatus::Confirmed),
+            status: ForkSlotStatus::Finalized,
+            tip_slot: Some(500),
+            confirmed_slot: Some(500),
+            finalized_slot: Some(450),
+            provider_source: None,
+        });
+
+        let state = state
+            .lock()
+            .expect("recording state mutex should not be poisoned");
+        let last_control_plane = state
+            .envelopes
+            .iter()
+            .rev()
+            .find_map(|envelope| match envelope.event {
+                DerivedStateFeedEvent::ControlPlaneStateUpdated(event) => Some(event),
+                DerivedStateFeedEvent::TransactionApplied(_)
+                | DerivedStateFeedEvent::TransactionStatusObserved(_)
+                | DerivedStateFeedEvent::BlockMetaObserved(_)
+                | DerivedStateFeedEvent::RootedAccountObserved(_)
+                | DerivedStateFeedEvent::RecentBlockhashObserved(_)
+                | DerivedStateFeedEvent::ClusterTopologyChanged(_)
+                | DerivedStateFeedEvent::LeaderScheduleUpdated(_)
+                | DerivedStateFeedEvent::StateInvalidated(_)
+                | DerivedStateFeedEvent::TxOutcomeObserved(_)
+                | DerivedStateFeedEvent::SlotStatusChanged(_)
+                | DerivedStateFeedEvent::EpochBoundaryObserved(_)
+                | DerivedStateFeedEvent::BranchReorged(_)
+                | DerivedStateFeedEvent::AccountTouchObserved(_)
+                | DerivedStateFeedEvent::CheckpointBarrier(_) => None,
+            })
+            .expect("expected trailing control-plane snapshot");
+        assert!(last_control_plane.conflicts_detected);
+        assert!(last_control_plane.conflict_count >= 1);
+        assert_eq!(
+            last_control_plane.finalized_epoch,
+            Some(EpochSchedule::default().get_epoch(450))
+        );
+    }
+
+    #[test]
     fn host_serializes_sequences_across_concurrent_producers() {
         let state = Arc::new(Mutex::new(RecordingState::default()));
         let host = DerivedStateHost::builder()
@@ -5103,6 +5565,7 @@ mod tests {
                 .with_transaction_applied()
                 .with_transaction_status_observed()
                 .with_block_meta_observed()
+                .with_rooted_authoritative_observed()
                 .with_account_touch_key_partitions()
                 .with_control_plane_observed()
         }
@@ -5211,6 +5674,7 @@ mod tests {
                 .with_transaction_applied()
                 .with_transaction_status_observed()
                 .with_block_meta_observed()
+                .with_rooted_authoritative_observed()
                 .with_account_touch_key_partitions()
                 .with_control_plane_observed()
         }
@@ -5330,6 +5794,7 @@ mod tests {
                 .with_transaction_applied()
                 .with_transaction_status_observed()
                 .with_block_meta_observed()
+                .with_rooted_authoritative_observed()
                 .with_account_touch_key_partitions()
                 .with_control_plane_observed()
         }
@@ -5412,6 +5877,7 @@ mod tests {
                 .with_transaction_applied()
                 .with_transaction_status_observed()
                 .with_block_meta_observed()
+                .with_rooted_authoritative_observed()
                 .with_account_touch_key_partitions()
                 .with_control_plane_observed()
         }
@@ -5490,12 +5956,39 @@ mod tests {
                 confirmed_slot: Some(9),
                 finalized_slot: Some(8),
             },
-            event: DerivedStateFeedEvent::BranchReorged(BranchReorgedEvent {
-                old_tip: 10,
-                new_tip: 11,
-                common_ancestor: Some(9),
-                detached_slots: Arc::from([10]),
-                attached_slots: Arc::from([11]),
+            event: DerivedStateFeedEvent::RootedAccountObserved(RootedAccountObservedEvent {
+                slot: 8,
+                commitment_status: TxCommitmentStatus::Finalized,
+                finalized_slot: Some(8),
+                pubkey: PubkeyBytes::from_solana(vote::id()),
+                owner: PubkeyBytes::from_solana(vote::id()),
+                lamports: 99,
+                executable: false,
+                rent_epoch: 0,
+                data: Arc::from([1_u8, 2, 3]),
+                write_version: Some(7),
+                txn_signature: Some(SignatureBytes::from_solana(Signature::from([4_u8; 64]))),
+                is_startup: true,
+                matched_filter: None,
+                provider_source: None,
+                kind: RootedAccountObservedKind::VoteAccount,
+            }),
+        });
+        replay_source.append(DerivedStateFeedEnvelope {
+            session_id,
+            sequence: FeedSequence(2),
+            emitted_at: SystemTime::UNIX_EPOCH,
+            watermarks: FeedWatermarks {
+                canonical_tip_slot: Some(32),
+                processed_slot: Some(32),
+                confirmed_slot: Some(32),
+                finalized_slot: Some(32),
+            },
+            event: DerivedStateFeedEvent::EpochBoundaryObserved(EpochBoundaryObservedEvent {
+                epoch: 1,
+                first_slot: 32,
+                rooted_slot: 32,
+                previous_epoch: Some(0),
             }),
         });
 
@@ -5525,8 +6018,23 @@ mod tests {
         let state = state
             .lock()
             .expect("replay recording state mutex should not be poisoned");
-        assert_eq!(state.envelopes.len(), 1);
-        assert_eq!(state.envelopes[0].sequence, FeedSequence(1));
+        assert_eq!(state.envelopes.len(), 2);
+        assert_eq!(
+            state
+                .envelopes
+                .iter()
+                .map(|envelope| envelope.sequence)
+                .collect::<Vec<_>>(),
+            vec![FeedSequence(1), FeedSequence(2)]
+        );
+        assert!(matches!(
+            state.envelopes[0].event,
+            DerivedStateFeedEvent::RootedAccountObserved(_)
+        ));
+        assert!(matches!(
+            state.envelopes[1].event,
+            DerivedStateFeedEvent::EpochBoundaryObserved(_)
+        ));
         assert_eq!(host.healthy_consumer_count(), 1);
         assert_eq!(host.fault_count(), 0);
         assert_eq!(
@@ -5535,10 +6043,10 @@ mod tests {
                 name: "replay-checkpoint",
                 unhealthy: false,
                 recovery_state: DerivedStateConsumerRecoveryState::Live,
-                applied_events: 1,
+                applied_events: 2,
                 checkpoint_flushes: 0,
                 fault_count: 0,
-                last_applied_sequence: Some(FeedSequence(1)),
+                last_applied_sequence: Some(FeedSequence(2)),
                 last_fault_sequence: None,
                 last_fault_kind: None,
             }]

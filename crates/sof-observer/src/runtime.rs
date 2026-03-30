@@ -24,7 +24,7 @@ use crate::app::runtime::{
 use crate::framework::host::TransactionDispatchScope;
 use crate::framework::{
     DerivedStateHost, DerivedStateReplayBackend, DerivedStateReplayDurability, PluginHost,
-    RuntimeExtensionHost, TransactionEvent,
+    RuntimeExtensionHost, TransactionEvent, TxCommitmentStatus,
 };
 use crate::provider_stream::{
     ProviderSourceHealthEvent, ProviderSourceHealthStatus, ProviderSourceId,
@@ -2532,6 +2532,11 @@ fn dispatch_provider_stream_update(
             }
         }
         ProviderStreamUpdate::AccountUpdate(event) => {
+            if derived_state_host.wants_rooted_authoritative_observed()
+                && event.commitment_status == TxCommitmentStatus::Finalized
+            {
+                derived_state_host.on_rooted_account(event.clone());
+            }
             if plugin_host.wants_account_update() {
                 plugin_host.on_account_update(event);
             }
@@ -2756,6 +2761,9 @@ fn provider_stream_unsupported_hooks(
     }
     if derived_state_host.wants_block_meta_observed() && !supports_block_meta {
         unsupported.push("derived_state.block_meta_observed");
+    }
+    if derived_state_host.wants_rooted_authoritative_observed() && !supports_account_update {
+        unsupported.push("derived_state.rooted_authoritative_observed");
     }
     if plugin_host.wants_slot_status() && !supports_slot_status {
         unsupported.push("on_slot_status");
@@ -3379,6 +3387,7 @@ mod tests {
     struct ControlPlaneDerivedStateConsumer;
     struct SofTxAdapterLikePlugin;
     struct SofTxDerivedStateAdapterLikeConsumer;
+    struct RootedAuthoritativeDerivedStateConsumer;
     struct RecordingDerivedStateConsumer {
         events: Arc<Mutex<Vec<DerivedStateFeedEvent>>>,
         config: DerivedStateConsumerConfig,
@@ -3609,6 +3618,44 @@ mod tests {
 
         fn config(&self) -> DerivedStateConsumerConfig {
             DerivedStateConsumerConfig::new().with_block_meta_observed()
+        }
+
+        fn apply(
+            &mut self,
+            _envelope: &DerivedStateFeedEnvelope,
+        ) -> Result<(), DerivedStateConsumerFault> {
+            Ok(())
+        }
+
+        fn flush_checkpoint(
+            &mut self,
+            _checkpoint: DerivedStateCheckpoint,
+        ) -> Result<(), DerivedStateConsumerFault> {
+            Ok(())
+        }
+    }
+
+    impl DerivedStateConsumer for RootedAuthoritativeDerivedStateConsumer {
+        fn name(&self) -> &'static str {
+            "rooted-authoritative-derived-state"
+        }
+
+        fn state_version(&self) -> u32 {
+            1
+        }
+
+        fn extension_version(&self) -> &'static str {
+            "1"
+        }
+
+        fn load_checkpoint(
+            &mut self,
+        ) -> Result<Option<DerivedStateCheckpoint>, DerivedStateConsumerFault> {
+            Ok(None)
+        }
+
+        fn config(&self) -> DerivedStateConsumerConfig {
+            DerivedStateConsumerConfig::new().with_rooted_authoritative_observed()
         }
 
         fn apply(
@@ -4024,6 +4071,33 @@ mod tests {
             block_height: Some(slot),
             executed_transaction_count: 3,
             entries_count: 2,
+            provider_source: None,
+        })
+    }
+
+    fn sample_provider_account_update(
+        slot: u64,
+        commitment_status: crate::event::TxCommitmentStatus,
+    ) -> ProviderStreamUpdate {
+        ProviderStreamUpdate::AccountUpdate(crate::framework::AccountUpdateEvent {
+            slot,
+            commitment_status,
+            confirmed_slot: (commitment_status != crate::event::TxCommitmentStatus::Processed)
+                .then_some(slot),
+            finalized_slot: (commitment_status == crate::event::TxCommitmentStatus::Finalized)
+                .then_some(slot),
+            pubkey: crate::framework::PubkeyBytes::from_solana(solana_sdk_ids::vote::id()),
+            owner: crate::framework::PubkeyBytes::from_solana(solana_sdk_ids::vote::id()),
+            lamports: 42,
+            executable: false,
+            rent_epoch: 0,
+            data: Arc::from([1_u8, 2, 3, 4]),
+            write_version: Some(slot),
+            txn_signature: Some(crate::framework::SignatureBytes::from_solana(
+                Signature::from([slot as u8; 64]),
+            )),
+            is_startup: false,
+            matched_filter: None,
             provider_source: None,
         })
     }
@@ -4502,6 +4576,7 @@ mod tests {
                 let plugin_host = PluginHost::builder().build();
                 let derived_state_host = DerivedStateHost::builder()
                     .add_consumer(AccountTouchDerivedStateConsumer)
+                    .add_consumer(RootedAuthoritativeDerivedStateConsumer)
                     .add_consumer(ControlPlaneDerivedStateConsumer)
                     .build();
                 let result = enforce_provider_stream_capability_policy(
@@ -4520,6 +4595,9 @@ mod tests {
                             unsupported_hooks
                                 .contains(&String::from("derived_state.account_touch_observed"))
                         );
+                        assert!(unsupported_hooks.contains(&String::from(
+                            "derived_state.rooted_authoritative_observed"
+                        )));
                         assert!(
                             unsupported_hooks
                                 .contains(&String::from("derived_state.control_plane_observed"))
@@ -5106,7 +5184,8 @@ mod tests {
     }
 
     #[test]
-    fn provider_stream_strict_policy_allows_transaction_status_and_block_meta_derived_state() {
+    fn provider_stream_strict_policy_allows_transaction_status_block_meta_and_rooted_account_derived_state()
+     {
         with_runtime_env_overrides(
             [(
                 String::from("SOF_PROVIDER_STREAM_CAPABILITY_POLICY"),
@@ -5119,6 +5198,9 @@ mod tests {
                     .build();
                 let block_meta_host = DerivedStateHost::builder()
                     .add_consumer(BlockMetaDerivedStateConsumer)
+                    .build();
+                let rooted_account_host = DerivedStateHost::builder()
+                    .add_consumer(RootedAuthoritativeDerivedStateConsumer)
                     .build();
 
                 assert!(
@@ -5139,6 +5221,14 @@ mod tests {
                 );
                 assert!(
                     enforce_provider_stream_capability_policy(
+                        ProviderStreamMode::YellowstoneGrpcAccounts,
+                        &plugin_host,
+                        &rooted_account_host,
+                    )
+                    .is_ok()
+                );
+                assert!(
+                    enforce_provider_stream_capability_policy(
                         ProviderStreamMode::LaserStreamTransactionStatus,
                         &plugin_host,
                         &transaction_status_host,
@@ -5153,13 +5243,30 @@ mod tests {
                     )
                     .is_ok()
                 );
+                assert!(
+                    enforce_provider_stream_capability_policy(
+                        ProviderStreamMode::LaserStreamAccounts,
+                        &plugin_host,
+                        &rooted_account_host,
+                    )
+                    .is_ok()
+                );
+                #[cfg(feature = "provider-websocket")]
+                assert!(
+                    enforce_provider_stream_capability_policy(
+                        ProviderStreamMode::WebsocketAccount,
+                        &plugin_host,
+                        &rooted_account_host,
+                    )
+                    .is_ok()
+                );
             },
         );
     }
 
     #[test]
-    fn dispatch_provider_stream_update_feeds_transaction_status_and_block_meta_into_derived_state()
-    {
+    fn dispatch_provider_stream_update_feeds_transaction_status_block_meta_and_rooted_account_into_derived_state()
+     {
         let events = Arc::new(Mutex::new(Vec::new()));
         let plugin_host = PluginHost::builder().build();
         let derived_state_host = DerivedStateHost::builder()
@@ -5167,7 +5274,8 @@ mod tests {
                 events: Arc::clone(&events),
                 config: DerivedStateConsumerConfig::new()
                     .with_transaction_status_observed()
-                    .with_block_meta_observed(),
+                    .with_block_meta_observed()
+                    .with_rooted_authoritative_observed(),
             })
             .build();
 
@@ -5181,11 +5289,21 @@ mod tests {
             &derived_state_host,
             sample_provider_block_meta_update(78),
         );
+        dispatch_provider_stream_update(
+            &plugin_host,
+            &derived_state_host,
+            sample_provider_account_update(79, crate::event::TxCommitmentStatus::Finalized),
+        );
+        dispatch_provider_stream_update(
+            &plugin_host,
+            &derived_state_host,
+            sample_provider_account_update(80, crate::event::TxCommitmentStatus::Confirmed),
+        );
 
         let events = events
             .lock()
             .expect("recording-derived-state mutex should not be poisoned");
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 3);
         assert!(matches!(
             events[0],
             DerivedStateFeedEvent::TransactionStatusObserved(_)
@@ -5194,6 +5312,18 @@ mod tests {
             events[1],
             DerivedStateFeedEvent::BlockMetaObserved(_)
         ));
+        let DerivedStateFeedEvent::RootedAccountObserved(event) = &events[2] else {
+            panic!("expected rooted-account observed event");
+        };
+        assert_eq!(event.slot, 79);
+        assert_eq!(
+            event.kind,
+            crate::framework::RootedAccountObservedKind::VoteAccount
+        );
+        assert_eq!(
+            event.commitment_status,
+            crate::event::TxCommitmentStatus::Finalized
+        );
     }
 
     #[tokio::test]

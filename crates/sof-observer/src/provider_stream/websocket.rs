@@ -83,6 +83,7 @@ pub struct WebsocketTransactionConfig {
     stream: WebsocketPrimaryStream,
     program_filters: Vec<WebsocketProgramFilter>,
     commitment: WebsocketTransactionCommitment,
+    commitment_explicit: bool,
     vote: Option<bool>,
     failed: Option<bool>,
     signature: Option<Signature>,
@@ -181,6 +182,7 @@ impl WebsocketTransactionConfig {
             stream: WebsocketPrimaryStream::Transaction,
             program_filters: Vec::new(),
             commitment: WebsocketTransactionCommitment::Processed,
+            commitment_explicit: false,
             vote: None,
             failed: None,
             signature: None,
@@ -252,6 +254,13 @@ impl WebsocketTransactionConfig {
     /// Selects the websocket subscription family this config should use.
     #[must_use]
     pub const fn with_stream(mut self, stream: WebsocketPrimaryStream) -> Self {
+        if matches!(
+            stream,
+            WebsocketPrimaryStream::Account(_) | WebsocketPrimaryStream::Program(_)
+        ) && !self.commitment_explicit
+        {
+            self.commitment = WebsocketTransactionCommitment::Finalized;
+        }
         self.stream = stream;
         self
     }
@@ -267,6 +276,7 @@ impl WebsocketTransactionConfig {
     #[must_use]
     pub const fn with_commitment(mut self, commitment: WebsocketTransactionCommitment) -> Self {
         self.commitment = commitment;
+        self.commitment_explicit = true;
         self
     }
 
@@ -2726,6 +2736,33 @@ mod tests {
             Some("finalized")
         );
         assert_eq!(request["params"][1]["encoding"].as_str(), Some("base64"));
+    }
+
+    #[test]
+    fn websocket_account_stream_defaults_to_finalized_commitment() {
+        let pubkey = Pubkey::new_unique();
+        let request = WebsocketTransactionConfig::new("wss://example.invalid")
+            .with_stream(WebsocketPrimaryStream::Account(pubkey))
+            .subscribe_request();
+
+        assert_eq!(
+            request["params"][1]["commitment"].as_str(),
+            Some("finalized")
+        );
+    }
+
+    #[test]
+    fn websocket_account_stream_preserves_explicit_processed_commitment() {
+        let pubkey = Pubkey::new_unique();
+        let request = WebsocketTransactionConfig::new("wss://example.invalid")
+            .with_commitment(WebsocketTransactionCommitment::Processed)
+            .with_stream(WebsocketPrimaryStream::Account(pubkey))
+            .subscribe_request();
+
+        assert_eq!(
+            request["params"][1]["commitment"].as_str(),
+            Some("processed")
+        );
     }
 
     #[test]
