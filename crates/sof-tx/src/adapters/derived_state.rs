@@ -336,8 +336,10 @@ impl DerivedStateConsumer for DerivedStateTxProviderAdapter {
             | DerivedStateFeedEvent::TxOutcomeObserved(_)
             | DerivedStateFeedEvent::TransactionApplied(_)
             | DerivedStateFeedEvent::TransactionStatusObserved(_)
+            | DerivedStateFeedEvent::RootedAccountObserved(_)
             | DerivedStateFeedEvent::AccountTouchObserved(_)
             | DerivedStateFeedEvent::BlockMetaObserved(_)
+            | DerivedStateFeedEvent::EpochBoundaryObserved(_)
             | DerivedStateFeedEvent::CheckpointBarrier(_) => {}
         }
         Ok(())

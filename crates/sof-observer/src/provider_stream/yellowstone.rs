@@ -91,6 +91,7 @@ pub struct YellowstoneGrpcConfig {
     source_arbitration: ProviderSourceArbitrationMode,
     stream: YellowstoneGrpcStream,
     commitment: YellowstoneGrpcCommitment,
+    commitment_explicit: bool,
     vote: Option<bool>,
     failed: Option<bool>,
     signature: Option<Signature>,
@@ -187,6 +188,7 @@ impl YellowstoneGrpcConfig {
             source_arbitration: ProviderSourceArbitrationMode::EmitAll,
             stream: YellowstoneGrpcStream::Transaction,
             commitment: YellowstoneGrpcCommitment::Processed,
+            commitment_explicit: false,
             vote: None,
             failed: None,
             signature: None,
@@ -254,6 +256,9 @@ impl YellowstoneGrpcConfig {
     /// Selects the Yellowstone stream family this config should subscribe to.
     #[must_use]
     pub const fn with_stream(mut self, stream: YellowstoneGrpcStream) -> Self {
+        if matches!(stream, YellowstoneGrpcStream::Accounts) && !self.commitment_explicit {
+            self.commitment = YellowstoneGrpcCommitment::Finalized;
+        }
         self.stream = stream;
         self
     }
@@ -269,6 +274,7 @@ impl YellowstoneGrpcConfig {
     #[must_use]
     pub const fn with_commitment(mut self, commitment: YellowstoneGrpcCommitment) -> Self {
         self.commitment = commitment;
+        self.commitment_explicit = true;
         self
     }
 
@@ -2153,6 +2159,23 @@ mod tests {
         assert_eq!(filter.owner, vec![owner.to_string()]);
         assert_eq!(filter.nonempty_txn_signature, Some(true));
         assert!(request.slots.contains_key(INTERNAL_SLOT_FILTER));
+    }
+
+    #[test]
+    fn yellowstone_account_stream_defaults_to_finalized_commitment() {
+        let request = YellowstoneGrpcConfig::new("http://127.0.0.1:10000")
+            .with_stream(YellowstoneGrpcStream::Accounts)
+            .subscribe_request_with_state(0);
+        assert_eq!(request.commitment, Some(CommitmentLevel::Finalized as i32));
+    }
+
+    #[test]
+    fn yellowstone_account_stream_preserves_explicit_processed_commitment() {
+        let request = YellowstoneGrpcConfig::new("http://127.0.0.1:10000")
+            .with_commitment(YellowstoneGrpcCommitment::Processed)
+            .with_stream(YellowstoneGrpcStream::Accounts)
+            .subscribe_request_with_state(0);
+        assert_eq!(request.commitment, Some(CommitmentLevel::Processed as i32));
     }
 
     #[test]

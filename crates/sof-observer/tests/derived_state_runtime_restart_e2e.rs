@@ -10,17 +10,23 @@ use std::{
 };
 
 use sof::{
+    event::TxCommitmentStatus,
     framework::{
         DerivedStateCheckpoint, DerivedStateConsumer, DerivedStateConsumerFault,
         DerivedStateConsumerFaultKind, DerivedStateFeedEnvelope, DerivedStateFeedEvent,
-        DerivedStateHost, DerivedStateReplayBackend, DerivedStateReplayDurability, FeedSequence,
-        FeedSessionId,
+        DerivedStateHost, DerivedStateReplayBackend, DerivedStateReplayDurability,
+        DerivedStateReplaySource, DiskDerivedStateReplaySource, EpochBoundaryObservedEvent,
+        FeedSequence, FeedSessionId, FeedWatermarks, RootedAccountObservedEvent,
+        RootedAccountObservedKind, SignatureBytes,
     },
     ingest::{RawPacketBatch, RawPacketIngress},
     protocol::shred_wire::{SIZE_OF_DATA_SHRED_PAYLOAD, VARIANT_MERKLE_DATA},
     runtime::{self, DerivedStateReplayConfig, DerivedStateRuntimeConfig, RuntimeSetup},
     shred::wire::SIZE_OF_DATA_SHRED_HEADERS,
 };
+use sof_types::PubkeyBytes;
+use solana_sdk_ids::vote;
+use solana_signature::Signature;
 use tokio::sync::mpsc;
 
 const SHRED_PAYLOAD_BYTES: usize = 128;
@@ -29,6 +35,8 @@ const SHRED_VERSION: u16 = 1;
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum AppliedEventKind {
     SlotStatus,
+    RootedAccount,
+    EpochBoundary,
     CheckpointBarrier,
 }
 
@@ -75,6 +83,8 @@ impl DerivedStateConsumer for PersistedCheckpointConsumer {
     ) -> Result<(), DerivedStateConsumerFault> {
         let event_kind = match envelope.event {
             DerivedStateFeedEvent::SlotStatusChanged(_) => AppliedEventKind::SlotStatus,
+            DerivedStateFeedEvent::RootedAccountObserved(_) => AppliedEventKind::RootedAccount,
+            DerivedStateFeedEvent::EpochBoundaryObserved(_) => AppliedEventKind::EpochBoundary,
             DerivedStateFeedEvent::CheckpointBarrier(_) => AppliedEventKind::CheckpointBarrier,
             DerivedStateFeedEvent::TransactionApplied(_)
             | DerivedStateFeedEvent::RecentBlockhashObserved(_)
@@ -277,6 +287,58 @@ async fn derived_state_runtime_restart_replays_retained_tail_from_disk()
         .into());
     }
 
+    {
+        let replay_source = DiskDerivedStateReplaySource::new(&replay_dir, 4)?;
+        replay_source.append_batch(&[
+            DerivedStateFeedEnvelope {
+                session_id: first_run_session,
+                sequence: FeedSequence(4),
+                emitted_at: SystemTime::UNIX_EPOCH,
+                watermarks: FeedWatermarks {
+                    canonical_tip_slot: Some(32),
+                    processed_slot: Some(32),
+                    confirmed_slot: Some(32),
+                    finalized_slot: Some(32),
+                },
+                event: DerivedStateFeedEvent::RootedAccountObserved(RootedAccountObservedEvent {
+                    slot: 32,
+                    commitment_status: TxCommitmentStatus::Finalized,
+                    finalized_slot: Some(32),
+                    pubkey: PubkeyBytes::from_solana(vote::id()),
+                    owner: PubkeyBytes::from_solana(vote::id()),
+                    lamports: 99,
+                    executable: false,
+                    rent_epoch: 0,
+                    data: Arc::from([1_u8, 2, 3]),
+                    write_version: Some(7),
+                    txn_signature: Some(SignatureBytes::from_solana(Signature::from([4_u8; 64]))),
+                    is_startup: true,
+                    matched_filter: None,
+                    provider_source: None,
+                    kind: RootedAccountObservedKind::VoteAccount,
+                }),
+            },
+            DerivedStateFeedEnvelope {
+                session_id: first_run_session,
+                sequence: FeedSequence(5),
+                emitted_at: SystemTime::UNIX_EPOCH,
+                watermarks: FeedWatermarks {
+                    canonical_tip_slot: Some(32),
+                    processed_slot: Some(32),
+                    confirmed_slot: Some(32),
+                    finalized_slot: Some(32),
+                },
+                event: DerivedStateFeedEvent::EpochBoundaryObserved(EpochBoundaryObservedEvent {
+                    epoch: 1,
+                    first_slot: 32,
+                    rooted_slot: 32,
+                    previous_epoch: Some(0),
+                }),
+            },
+        ]);
+        drop(replay_source);
+    }
+
     let second_run_state = Arc::new(Mutex::new(AppliedEnvelopeState::default()));
     let second_run_host = DerivedStateHost::builder()
         .add_consumer(PersistedCheckpointConsumer {
@@ -314,24 +376,32 @@ async fn derived_state_runtime_restart_replays_retained_tail_from_disk()
         .map_err(|poison| std::io::Error::other(format!("state mutex poisoned: {poison}")))?
         .envelopes
         .clone();
-    if !second_run_envelopes.contains(&(
-        first_run_session,
-        FeedSequence(3),
-        AppliedEventKind::CheckpointBarrier,
-    )) {
-        return Err(std::io::Error::other(
-            "second run should replay the retained shutdown barrier tail from the first session",
-        )
-        .into());
-    }
-    if !second_run_envelopes.contains(&(
-        second_run_session,
-        FeedSequence(0),
-        AppliedEventKind::CheckpointBarrier,
-    )) {
-        return Err(std::io::Error::other(
-            "second run should still emit its own shutdown checkpoint barrier",
-        )
+    let expected_second_run_envelopes = vec![
+        (
+            first_run_session,
+            FeedSequence(3),
+            AppliedEventKind::CheckpointBarrier,
+        ),
+        (
+            first_run_session,
+            FeedSequence(4),
+            AppliedEventKind::RootedAccount,
+        ),
+        (
+            first_run_session,
+            FeedSequence(5),
+            AppliedEventKind::EpochBoundary,
+        ),
+        (
+            second_run_session,
+            FeedSequence(0),
+            AppliedEventKind::CheckpointBarrier,
+        ),
+    ];
+    if second_run_envelopes != expected_second_run_envelopes {
+        return Err(std::io::Error::other(format!(
+            "unexpected replay order for second run: expected {expected_second_run_envelopes:?}, got {second_run_envelopes:?}",
+        ))
         .into());
     }
 

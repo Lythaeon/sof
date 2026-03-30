@@ -30,8 +30,9 @@ pub use derived_state::{
     DerivedStatePersistedCheckpoint, DerivedStateRecoveryReport, DerivedStateReplayBackend,
     DerivedStateReplayDurability, DerivedStateReplayError, DerivedStateReplaySource,
     DerivedStateReplayTelemetry, DerivedStateTxOutcomeEvent, DerivedStateTxOutcomeKind,
-    DiskDerivedStateReplaySource, FeedSequence, FeedSessionId, FeedWatermarks,
-    InMemoryDerivedStateReplaySource, SlotStatusChangedEvent, TransactionAppliedEvent,
+    DiskDerivedStateReplaySource, EpochBoundaryObservedEvent, FeedSequence, FeedSessionId,
+    FeedWatermarks, InMemoryDerivedStateReplaySource, RootedAccountObservedEvent,
+    RootedAccountObservedKind, SlotStatusChangedEvent, TransactionAppliedEvent,
     TransactionStatusObservedEvent,
 };
 pub use events::{

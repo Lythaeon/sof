@@ -99,15 +99,15 @@ SOF intentionally does not mirror every plugin callback into derived state.
 
 | Ingest type | Plugin surface | Derived-state surface | Does not emit |
 | --- | --- | --- | --- |
-| Raw shreds / gossip / trusted raw-shred provider | transactions, recent blockhash, slot status, cluster topology, leader schedule, reorg, plus raw packet/shred/dataset surfaces | transaction apply, recent-blockhash observation, slot status, topology, leader schedule, control-plane state, reorg/invalidation, account-touch | transaction-status, transaction-log, account-update, block-meta, provider-derived `TransactionStatusObserved`, provider-derived `BlockMetaObserved` |
+| Raw shreds / gossip / trusted raw-shred provider | transactions, recent blockhash, slot status, cluster topology, leader schedule, reorg, plus raw packet/shred/dataset surfaces | transaction apply, recent-blockhash observation, slot status, epoch-boundary observation, topology, leader schedule, control-plane state, reorg/invalidation, account-touch | transaction-status, transaction-log, account-update, block-meta, provider-derived `TransactionStatusObserved`, provider-derived `BlockMetaObserved`, `RootedAccountObserved` |
 | Websocket `transactionSubscribe` | `on_transaction`, synthesized `on_recent_blockhash` when requested | `TransactionApplied` | transaction-status, block-meta, and topology/leader/reorg control-plane families |
 | Websocket `logsSubscribe` | `on_transaction_log` | none | transaction-status, block-meta, control-plane, and derived-state provider observations |
-| Websocket `accountSubscribe` / `programSubscribe` | `on_account_update` | none | transaction-status, block-meta, control-plane, and derived-state provider observations |
+| Websocket `accountSubscribe` / `programSubscribe` | `on_account_update` | finalized `RootedAccountObserved` | transaction-status, block-meta, control-plane, and non-account provider observations |
 | Yellowstone / LaserStream transaction feeds | `on_transaction`, synthesized `on_recent_blockhash` when requested | `TransactionApplied` | topology/leader/reorg control-plane families unless supplied through `Generic` |
 | Yellowstone / LaserStream transaction-status feeds | `on_transaction_status` | `TransactionStatusObserved` | block-meta and raw-shred control-plane families unless separately supplied |
 | Yellowstone / LaserStream block-meta feeds | `on_block_meta` | `BlockMetaObserved` | transaction-status and raw-shred control-plane families unless separately supplied |
-| Yellowstone / LaserStream account feeds | `on_account_update` | none | provider-derived transaction-status/block-meta observations and raw-shred control-plane families |
-| Yellowstone / LaserStream slot feeds | `on_slot_status` | `SlotStatusChanged` | recent-blockhash/topology/leader-schedule/reorg unless supplied through `Generic` |
+| Yellowstone / LaserStream account feeds | `on_account_update` | finalized `RootedAccountObserved`; built-in account configs default to finalized commitment unless explicitly overridden | provider-derived transaction-status/block-meta observations and raw-shred control-plane families |
+| Yellowstone / LaserStream slot feeds | `on_slot_status` | `SlotStatusChanged`, `EpochBoundaryObserved` | recent-blockhash/topology/leader-schedule/reorg unless supplied through `Generic` |
 | `ProviderStreamMode::Generic` | any typed `ProviderStreamUpdate` variant the producer emits | the derived-state families SOF currently forwards from those typed updates | anything the producer does not emit |
 
 So the clean split is:
@@ -118,6 +118,11 @@ So the clean split is:
   or topology/leader control-plane hooks
 - built-in Yellowstone/LaserStream add transaction status and block meta, but
   still do not replace the raw-shred control-plane surface on their own
+- finalized account feeds are the current provider-backed rooted-authoritative
+  derived-state input surface
+- websocket account/program subscriptions default to finalized commitment
+- Yellowstone and LaserStream account feeds also default to finalized commitment
+  unless the config explicitly overrides it
 
 ## When To Use Plugins vs Runtime Extensions
 

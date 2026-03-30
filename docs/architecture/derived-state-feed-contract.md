@@ -159,7 +159,57 @@ Semantics:
 3. not a substitute for account-write semantics,
 4. not a primary truth source for bank-like state.
 
-### 5. `CheckpointBarrier`
+### 5. `RootedAccountObserved`
+
+Finalized provider-backed account update intended for authoritative state reducers.
+
+Suggested shape:
+
+```rust
+pub struct RootedAccountObserved {
+    pub slot: u64,
+    pub commitment_status: sof::event::TxCommitmentStatus,
+    pub finalized_slot: Option<u64>,
+    pub pubkey: solana_pubkey::Pubkey,
+    pub owner: solana_pubkey::Pubkey,
+    pub lamports: u64,
+    pub executable: bool,
+    pub rent_epoch: u64,
+    pub data: Arc<[u8]>,
+    pub write_version: Option<u64>,
+    pub txn_signature: Option<solana_signature::Signature>,
+    pub kind: RootedAccountObservedKind,
+}
+```
+
+Semantics:
+
+1. emitted only from finalized provider-backed account feeds,
+2. intended as an authoritative-ish input for rooted state reducers,
+3. not claimed as a universal bank-equivalent account truth surface across all ingest modes.
+
+### 6. `EpochBoundaryObserved`
+
+Explicit finalized epoch-boundary record derived from rooted slot progression.
+
+Suggested shape:
+
+```rust
+pub struct EpochBoundaryObserved {
+    pub epoch: u64,
+    pub first_slot: u64,
+    pub rooted_slot: u64,
+    pub previous_epoch: Option<u64>,
+}
+```
+
+Semantics:
+
+1. emitted when finalized slot progression reaches the first slot of a new epoch,
+2. gives state engines a cheap explicit boundary marker,
+3. is a control-plane boundary signal, not a substitute for vote/stake-derived schedule authority.
+
+### 7. `CheckpointBarrier`
 
 Explicit consumer checkpoint opportunity.
 

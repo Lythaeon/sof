@@ -142,7 +142,7 @@
 //! use solana_transaction::versioned::VersionedTransaction;
 //! use sof::{
 //!     event::{TxCommitmentStatus, TxKind},
-//!     framework::TransactionEvent,
+//!     framework::{SignatureBytes, TransactionEvent},
 //!     provider_stream::{
 //!         create_provider_stream_queue, ProviderStreamMode, ProviderStreamUpdate,
 //!     },
@@ -161,9 +161,14 @@
 //!     commitment_status: TxCommitmentStatus::Processed,
 //!     confirmed_slot: None,
 //!     finalized_slot: None,
-//!     signature: transaction.signatures.first().copied(),
+//!     signature: transaction
+//!         .signatures
+//!         .first()
+//!         .copied()
+//!         .map(SignatureBytes::from_solana),
 //!     tx: Arc::new(transaction),
 //!     kind: TxKind::NonVote,
+//!     provider_source: None,
 //! }))
 //! .await?;
 //!

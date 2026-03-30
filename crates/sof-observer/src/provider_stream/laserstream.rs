@@ -100,6 +100,7 @@ pub struct LaserStreamConfig {
     source_arbitration: ProviderSourceArbitrationMode,
     stream: LaserStreamStream,
     commitment: LaserStreamCommitment,
+    commitment_explicit: bool,
     vote: Option<bool>,
     failed: Option<bool>,
     signature: Option<Signature>,
@@ -200,6 +201,7 @@ impl LaserStreamConfig {
             source_arbitration: ProviderSourceArbitrationMode::EmitAll,
             stream: LaserStreamStream::Transaction,
             commitment: LaserStreamCommitment::Processed,
+            commitment_explicit: false,
             vote: None,
             failed: None,
             signature: None,
@@ -268,6 +270,9 @@ impl LaserStreamConfig {
     /// Selects the LaserStream stream family this config should subscribe to.
     #[must_use]
     pub const fn with_stream(mut self, stream: LaserStreamStream) -> Self {
+        if matches!(stream, LaserStreamStream::Accounts) && !self.commitment_explicit {
+            self.commitment = LaserStreamCommitment::Finalized;
+        }
         self.stream = stream;
         self
     }
@@ -276,6 +281,7 @@ impl LaserStreamConfig {
     #[must_use]
     pub const fn with_commitment(mut self, commitment: LaserStreamCommitment) -> Self {
         self.commitment = commitment;
+        self.commitment_explicit = true;
         self
     }
 
@@ -2418,6 +2424,29 @@ mod tests {
         assert_eq!(filter.owner, vec![owner.to_string()]);
         assert_eq!(filter.nonempty_txn_signature, Some(true));
         assert!(request.slots.contains_key(INTERNAL_WATERMARK_SLOT_FILTER));
+    }
+
+    #[test]
+    fn laserstream_account_stream_defaults_to_finalized_commitment() {
+        let request = LaserStreamConfig::new("https://laserstream.example", "token")
+            .with_stream(LaserStreamStream::Accounts)
+            .subscribe_request_with_state(0);
+        assert_eq!(
+            request.commitment,
+            Some(grpc::CommitmentLevel::Finalized as i32)
+        );
+    }
+
+    #[test]
+    fn laserstream_account_stream_preserves_explicit_processed_commitment() {
+        let request = LaserStreamConfig::new("https://laserstream.example", "token")
+            .with_commitment(LaserStreamCommitment::Processed)
+            .with_stream(LaserStreamStream::Accounts)
+            .subscribe_request_with_state(0);
+        assert_eq!(
+            request.commitment,
+            Some(grpc::CommitmentLevel::Processed as i32)
+        );
     }
 
     #[test]
