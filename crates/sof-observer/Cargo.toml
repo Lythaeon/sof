@@ -1,6 +1,6 @@
 [package]
 name = "sof"
-version = "0.18.0"
+version = "0.18.1"
 edition.workspace = true
 description = "Solana Observer Framework for low-latency shred ingestion and plugin-driven transaction observation"
 license = "Apache-2.0 OR MIT"
@@ -31,27 +31,27 @@ provider-grpc = [
 provider-websocket = []
 
 [dependencies]
-agave-transaction-view = { version = "3.1.8", features = ["agave-unstable-api"] }
-sof-gossip-tuning = { version = "0.18.0", path = "../sof-gossip-tuning" }
-sof-types = { version = "0.18.0", path = "../sof-types", features = ["solana-compat"] }
-solana-gossip = { package = "sof-solana-gossip", version = "3.1.8-sof.8", optional = true, features = ["agave-unstable-api"] }
-solana-entry = { version = "3.1.8", features = ["agave-unstable-api"] }
+agave-transaction-view = { version = "3.1.11", features = ["agave-unstable-api"] }
+sof-gossip-tuning = { version = "0.18.1", path = "../sof-gossip-tuning" }
+sof-types = { version = "0.18.1", path = "../sof-types", features = ["solana-compat"] }
+solana-gossip = { package = "sof-solana-gossip", version = "3.1.11-sof.9", optional = true, features = ["agave-unstable-api"] }
+solana-entry = { version = "3.1.11", features = ["agave-unstable-api"] }
 solana-epoch-schedule = "3.0.0"
 solana-hash = "3.1.0"
 solana-keypair = "3.0.1"
 solana-message = "3.0.1"
-solana-net-utils = "3.1.8"
-solana-perf = { version = "3.1.8", features = ["dev-context-only-utils"] }
+solana-net-utils = "3.1.11"
+solana-perf = { version = "3.1.11", features = ["dev-context-only-utils"] }
 solana-pubkey = { version = "3.0.0", features = ["serde"] }
 solana-sanitize = "3.0.1"
 solana-sdk-ids = "3.1.0"
 solana-signature = { version = "3.1.0", features = ["serde"] }
 solana-signer = "3.0.0"
-solana-streamer = "3.1.8"
+solana-streamer = "3.1.11"
 solana-transaction = { version = "3.0.2", features = ["serde"] }
 solana-packet = "3.0.0"
-solana-vote = "3.1.8"
-solana-vote-program = { version = "3.1.8", features = ["agave-unstable-api"] }
+solana-vote = "3.1.11"
+solana-vote-program = { version = "3.1.11", features = ["agave-unstable-api"] }
 reed-solomon-erasure = { version = "6.0.0", features = ["simd-accel"] }
 thiserror = "2.0"
 tokio = { version = "1.48", features = ["io-util", "macros", "rt-multi-thread", "net", "sync", "time"] }

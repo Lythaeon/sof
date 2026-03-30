@@ -59,7 +59,7 @@ SOF behaves more like a local observer/runtime.
 
 SOF can also relay traffic and participate in bounded repair.
 
-The vendored gossip backend does not exact-pin the Solana `3.1.8` patch line, so downstream
+The vendored gossip backend does not exact-pin the Solana `3.1.11` patch line, so downstream
 workspaces can still resolve newer compatible `3.1.x` Solana crates.
 
 If you want the safest first bring-up:

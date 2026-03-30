@@ -1,6 +1,6 @@
 [package]
 name = "sof-tx"
-version = "0.18.0"
+version = "0.18.1"
 edition.workspace = true
 description = "SOF transaction SDK for building and submitting Solana transactions"
 license = "Apache-2.0 OR MIT"
@@ -30,18 +30,18 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 solana-compute-budget-interface = "3.0.0"
-solana-connection-cache = "3.1.8"
+solana-connection-cache = "3.1.11"
 solana-keypair = "3.0.1"
 solana-message = "3.0.1"
 solana-packet = "3.0.0"
 solana-pubkey = "3.0.0"
-solana-quic-client = { version = "3.1.8", features = ["agave-unstable-api"] }
+solana-quic-client = { version = "3.1.11", features = ["agave-unstable-api"] }
 solana-signature = "3.1.0"
 solana-signer = "3.0.0"
 solana-system-interface = { version = "3.0.0", features = ["bincode"] }
 solana-transaction = { version = "3.0.2", features = ["bincode"] }
-sof = { version = "0.18.0", path = "../sof-observer", default-features = false, optional = true }
-sof-types = { version = "0.18.0", path = "../sof-types", features = ["solana-compat"] }
+sof = { version = "0.18.1", path = "../sof-observer", default-features = false, optional = true }
+sof-types = { version = "0.18.1", path = "../sof-types", features = ["solana-compat"] }
 thiserror = "2.0"
 tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
 tonic = { version = "0.12", optional = true, default-features = false, features = ["codegen", "prost", "transport", "tls-webpki-roots"] }
