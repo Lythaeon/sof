@@ -19,3 +19,6 @@ For the actual performance lineage and measured examples across releases, use
 [Performance and Measurement](performance-and-measurement.md).
 
 Start with [System Overview](system-overview.md) if you want the shortest diagram-first view.
+
+For the planned foreign-language authoring model on top of the Rust runtime, use
+[TypeScript and Python Integration](ts-and-python-integration.md).
