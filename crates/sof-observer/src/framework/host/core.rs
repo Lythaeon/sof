@@ -10,12 +10,16 @@ use super::dispatch::{
 use super::state::{ObservedRecentBlockhashState, ObservedTpuLeaderState};
 
 use super::*;
-use crate::framework::PluginContext;
-use crate::framework::events::AccountTouchEventRef;
-use crate::framework::events::TransactionEventRef;
-use crate::framework::pubkey_bytes;
-use crate::framework::{
-    AccountTouchEvent, AccountUpdateEvent, BlockMetaEvent, TransactionStatusEvent,
+use crate::{
+    event::TxCommitmentStatus,
+    framework::{
+        AccountTouchEvent, AccountUpdateEvent, BlockMetaEvent, PluginContext, TransactionInterest,
+        TransactionLogEvent, TransactionPrefilter, TransactionStatusEvent,
+        TransactionViewBatchEvent,
+        events::{AccountTouchEventRef, TransactionEventRef},
+        plugin::TransactionCommitmentSelector,
+        pubkey_bytes,
+    },
 };
 use agave_transaction_view::{
     transaction_data::TransactionData, transaction_view::SanitizedTransactionView,
@@ -93,22 +97,19 @@ pub struct PluginHost {
     /// Plugins interested in transaction callbacks.
     pub(super) transaction_plugins: Arc<[Arc<dyn ObserverPlugin>]>,
     /// Per-transaction-plugin commitment selector in registration order.
-    pub(super) transaction_plugin_commitments:
-        Arc<[crate::framework::plugin::TransactionCommitmentSelector]>,
+    pub(super) transaction_plugin_commitments: Arc<[TransactionCommitmentSelector]>,
     /// Plugins interested in transaction-log callbacks.
     pub(super) transaction_log_plugins: Arc<[Arc<dyn ObserverPlugin>]>,
     /// Per-transaction-log-plugin commitment selector in registration order.
-    pub(super) transaction_log_plugin_commitments:
-        Arc<[crate::framework::plugin::TransactionCommitmentSelector]>,
+    pub(super) transaction_log_plugin_commitments: Arc<[TransactionCommitmentSelector]>,
     /// Plugins interested in transaction-status callbacks.
     pub(super) transaction_status_plugins: Arc<[Arc<dyn ObserverPlugin>]>,
     /// Per-transaction-status-plugin commitment selector in registration order.
-    pub(super) transaction_status_plugin_commitments:
-        Arc<[crate::framework::plugin::TransactionCommitmentSelector]>,
+    pub(super) transaction_status_plugin_commitments: Arc<[TransactionCommitmentSelector]>,
     /// Per-transaction-plugin inline delivery preference in registration order.
     pub(super) transaction_plugin_inline_preferences: Arc<[bool]>,
     /// Optional compiled transaction prefilters in registration order.
-    pub(super) transaction_plugin_prefilters: Arc<[Option<crate::framework::TransactionPrefilter>]>,
+    pub(super) transaction_plugin_prefilters: Arc<[Option<TransactionPrefilter>]>,
     /// Cached processed-commitment prefilter availability for serialized transaction fast paths.
     pub(super) transaction_prefilter_enabled_at_processed: bool,
     /// Cached confirmed-commitment prefilter availability for serialized transaction fast paths.
@@ -118,15 +119,13 @@ pub struct PluginHost {
     /// Plugins interested in transaction-batch callbacks.
     pub(super) transaction_batch_plugins: Arc<[Arc<dyn ObserverPlugin>]>,
     /// Per-transaction-batch-plugin commitment selector in registration order.
-    pub(super) transaction_batch_plugin_commitments:
-        Arc<[crate::framework::plugin::TransactionCommitmentSelector]>,
+    pub(super) transaction_batch_plugin_commitments: Arc<[TransactionCommitmentSelector]>,
     /// Per-transaction-batch-plugin inline delivery preference in registration order.
     pub(super) transaction_batch_plugin_inline_preferences: Arc<[bool]>,
     /// Plugins interested in transaction-view-batch callbacks.
     pub(super) transaction_view_batch_plugins: Arc<[Arc<dyn ObserverPlugin>]>,
     /// Per-transaction-view-batch-plugin commitment selector in registration order.
-    pub(super) transaction_view_batch_plugin_commitments:
-        Arc<[crate::framework::plugin::TransactionCommitmentSelector]>,
+    pub(super) transaction_view_batch_plugin_commitments: Arc<[TransactionCommitmentSelector]>,
     /// Per-transaction-view-batch-plugin inline delivery preference in registration order.
     pub(super) transaction_view_batch_plugin_inline_preferences: Arc<[bool]>,
     /// Plugins interested in account-touch callbacks.
@@ -154,32 +153,28 @@ impl Default for PluginHost {
         Self {
             plugins: Arc::from(Vec::<Arc<dyn ObserverPlugin>>::new()),
             transaction_plugins: Arc::from(Vec::<Arc<dyn ObserverPlugin>>::new()),
-            transaction_plugin_commitments: Arc::from(Vec::<
-                crate::framework::plugin::TransactionCommitmentSelector,
-            >::new()),
+            transaction_plugin_commitments: Arc::from(Vec::<TransactionCommitmentSelector>::new()),
             transaction_log_plugins: Arc::from(Vec::<Arc<dyn ObserverPlugin>>::new()),
-            transaction_log_plugin_commitments: Arc::from(Vec::<
-                crate::framework::plugin::TransactionCommitmentSelector,
-            >::new()),
+            transaction_log_plugin_commitments: Arc::from(
+                Vec::<TransactionCommitmentSelector>::new(),
+            ),
             transaction_status_plugins: Arc::from(Vec::<Arc<dyn ObserverPlugin>>::new()),
-            transaction_status_plugin_commitments: Arc::from(Vec::<
-                crate::framework::plugin::TransactionCommitmentSelector,
-            >::new()),
+            transaction_status_plugin_commitments: Arc::from(
+                Vec::<TransactionCommitmentSelector>::new(),
+            ),
             transaction_plugin_inline_preferences: Arc::from(Vec::<bool>::new()),
-            transaction_plugin_prefilters: Arc::from(Vec::<
-                Option<crate::framework::TransactionPrefilter>,
-            >::new()),
+            transaction_plugin_prefilters: Arc::from(Vec::<Option<TransactionPrefilter>>::new()),
             transaction_prefilter_enabled_at_processed: false,
             transaction_prefilter_enabled_at_confirmed: false,
             transaction_prefilter_enabled_at_finalized: false,
             transaction_batch_plugins: Arc::from(Vec::<Arc<dyn ObserverPlugin>>::new()),
-            transaction_batch_plugin_commitments: Arc::from(Vec::<
-                crate::framework::plugin::TransactionCommitmentSelector,
-            >::new()),
+            transaction_batch_plugin_commitments: Arc::from(
+                Vec::<TransactionCommitmentSelector>::new(),
+            ),
             transaction_batch_plugin_inline_preferences: Arc::from(Vec::<bool>::new()),
             transaction_view_batch_plugins: Arc::from(Vec::<Arc<dyn ObserverPlugin>>::new()),
             transaction_view_batch_plugin_commitments: Arc::from(Vec::<
-                crate::framework::plugin::TransactionCommitmentSelector,
+                TransactionCommitmentSelector,
             >::new()),
             transaction_view_batch_plugin_inline_preferences: Arc::from(Vec::<bool>::new()),
             account_touch_plugins: Arc::from(Vec::<Arc<dyn ObserverPlugin>>::new()),
@@ -230,7 +225,7 @@ impl PluginHost {
     #[must_use]
     pub(crate) fn transaction_enabled_at_commitment(
         &self,
-        commitment_status: crate::event::TxCommitmentStatus,
+        commitment_status: TxCommitmentStatus,
     ) -> bool {
         self.subscriptions.transaction
             && commitment_status.satisfies_minimum(self.subscriptions.transaction_min_commitment)
@@ -246,18 +241,12 @@ impl PluginHost {
     #[must_use]
     pub(crate) const fn has_transaction_prefilter_at_commitment(
         &self,
-        commitment_status: crate::event::TxCommitmentStatus,
+        commitment_status: TxCommitmentStatus,
     ) -> bool {
         match commitment_status {
-            crate::event::TxCommitmentStatus::Processed => {
-                self.transaction_prefilter_enabled_at_processed
-            }
-            crate::event::TxCommitmentStatus::Confirmed => {
-                self.transaction_prefilter_enabled_at_confirmed
-            }
-            crate::event::TxCommitmentStatus::Finalized => {
-                self.transaction_prefilter_enabled_at_finalized
-            }
+            TxCommitmentStatus::Processed => self.transaction_prefilter_enabled_at_processed,
+            TxCommitmentStatus::Confirmed => self.transaction_prefilter_enabled_at_confirmed,
+            TxCommitmentStatus::Finalized => self.transaction_prefilter_enabled_at_finalized,
         }
     }
 
@@ -555,7 +544,7 @@ impl PluginHost {
                 || plugin.transaction_interest_ref(&event),
                 |filter| filter.classify_ref(&event),
             );
-            if interest != crate::framework::TransactionInterest::Ignore {
+            if interest != TransactionInterest::Ignore {
                 dispatch.push(interest, inline_requested, Arc::clone(plugin));
             }
         }
@@ -567,7 +556,7 @@ impl PluginHost {
     pub(crate) fn classify_transaction_view_in_scope<D: TransactionData>(
         &self,
         view: &SanitizedTransactionView<D>,
-        commitment_status: crate::event::TxCommitmentStatus,
+        commitment_status: TxCommitmentStatus,
         scope: TransactionDispatchScope,
     ) -> PrefilteredTransactionDispatch {
         if !self.wants_transaction_dispatch_in_scope(scope) || self.transaction_dispatcher.is_none()
@@ -591,7 +580,7 @@ impl PluginHost {
             }
             if let Some(filter) = prefilter.as_ref() {
                 let interest = filter.classify_view_ref(view);
-                if interest != crate::framework::TransactionInterest::Ignore {
+                if interest != TransactionInterest::Ignore {
                     dispatch.push(interest, inline_requested, Arc::clone(plugin));
                 }
             } else {
@@ -682,7 +671,7 @@ impl PluginHost {
     /// Enqueues one completed-dataset transaction-view batch hook to registered plugins.
     pub(crate) fn on_transaction_view_batch(
         &self,
-        event: crate::framework::TransactionViewBatchEvent,
+        event: TransactionViewBatchEvent,
         completed_at: Instant,
     ) {
         if !self.subscriptions.transaction_view_batch {
@@ -765,7 +754,7 @@ impl PluginHost {
     }
 
     /// Enqueues provider/websocket transaction-log hook to registered plugins.
-    pub fn on_transaction_log(&self, event: crate::framework::TransactionLogEvent) {
+    pub fn on_transaction_log(&self, event: TransactionLogEvent) {
         if !self.subscriptions.transaction_log {
             return;
         }

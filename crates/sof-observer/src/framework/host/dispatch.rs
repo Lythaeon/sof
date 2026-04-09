@@ -2,9 +2,13 @@
 #![allow(clippy::result_large_err)]
 
 use super::*;
-use crate::framework::TransactionInterest;
-use crate::framework::{
-    AccountTouchEvent, AccountUpdateEvent, BlockMetaEvent, TransactionStatusEvent,
+use crate::{
+    framework::{
+        AccountTouchEvent, AccountUpdateEvent, BlockMetaEvent, TransactionBatchEvent,
+        TransactionInterest, TransactionLogEvent, TransactionStatusEvent,
+        TransactionViewBatchEvent, plugin::TransactionCommitmentSelector,
+    },
+    runtime_metrics,
 };
 use crossbeam_queue::ArrayQueue;
 use futures_util::{FutureExt, StreamExt, stream};
@@ -299,7 +303,7 @@ pub(super) enum AcceptedTransactionBatchDispatch {
         /// Interested plugin.
         plugin: Arc<dyn ObserverPlugin>,
         /// Decoded batch payload.
-        event: crate::framework::TransactionBatchEvent,
+        event: TransactionBatchEvent,
         /// Time when the completed dataset became available to runtime processing.
         completed_at: Instant,
     },
@@ -308,7 +312,7 @@ pub(super) enum AcceptedTransactionBatchDispatch {
         /// Interested plugins in registration order.
         plugins: Arc<[Arc<dyn ObserverPlugin>]>,
         /// Shared decoded batch payload.
-        event: Arc<crate::framework::TransactionBatchEvent>,
+        event: Arc<TransactionBatchEvent>,
         /// Time when the completed dataset became available to runtime processing.
         completed_at: Instant,
         /// Whether all batch consumers prefer the inline low-jitter batch lane.
@@ -323,7 +327,7 @@ pub(super) enum AcceptedTransactionViewBatchDispatch {
         /// Interested plugin.
         plugin: Arc<dyn ObserverPlugin>,
         /// Validated transaction-view batch payload.
-        event: crate::framework::TransactionViewBatchEvent,
+        event: TransactionViewBatchEvent,
         /// Time when the completed dataset became available to runtime processing.
         completed_at: Instant,
     },
@@ -332,7 +336,7 @@ pub(super) enum AcceptedTransactionViewBatchDispatch {
         /// Interested plugins in registration order.
         plugins: Arc<[Arc<dyn ObserverPlugin>]>,
         /// Shared validated transaction-view batch payload.
-        event: Arc<crate::framework::TransactionViewBatchEvent>,
+        event: Arc<TransactionViewBatchEvent>,
         /// Time when the completed dataset became available to runtime processing.
         completed_at: Instant,
         /// Whether all view-batch consumers prefer the inline low-jitter batch lane.
@@ -347,9 +351,9 @@ impl ClassifiedTransactionBatchDispatch {
     /// Builds one shared batch dispatch only when at least one plugin subscribed.
     pub(super) fn from_plugins(
         plugins: &[Arc<dyn ObserverPlugin>],
-        commitment_selectors: &[crate::framework::plugin::TransactionCommitmentSelector],
+        commitment_selectors: &[TransactionCommitmentSelector],
         inline_preferences: &[bool],
-        event: crate::framework::TransactionBatchEvent,
+        event: TransactionBatchEvent,
         completed_at: Instant,
     ) -> Option<AcceptedTransactionBatchDispatch> {
         let selected_indices: SmallVec<[usize; 4]> = commitment_selectors
@@ -391,9 +395,9 @@ impl ClassifiedTransactionViewBatchDispatch {
     /// Builds one shared view-batch dispatch only when at least one plugin subscribed.
     pub(super) fn from_plugins(
         plugins: &[Arc<dyn ObserverPlugin>],
-        commitment_selectors: &[crate::framework::plugin::TransactionCommitmentSelector],
+        commitment_selectors: &[TransactionCommitmentSelector],
         inline_preferences: &[bool],
-        event: crate::framework::TransactionViewBatchEvent,
+        event: TransactionViewBatchEvent,
         completed_at: Instant,
     ) -> Option<AcceptedTransactionViewBatchDispatch> {
         let selected_indices: SmallVec<[usize; 4]> = commitment_selectors
@@ -1079,14 +1083,14 @@ pub(super) enum SelectedTransactionLogDispatch {
         /// Selected plugin callback target.
         plugin: Arc<dyn ObserverPlugin>,
         /// Event payload for the selected plugin.
-        event: crate::framework::TransactionLogEvent,
+        event: TransactionLogEvent,
     },
     /// Multiple interested plugins share the same event payload.
     Multi {
         /// Selected plugin callback targets.
         plugins: SmallVec<[Arc<dyn ObserverPlugin>; 4]>,
         /// Shared event payload.
-        event: Arc<crate::framework::TransactionLogEvent>,
+        event: Arc<TransactionLogEvent>,
     },
 }
 
@@ -1111,8 +1115,8 @@ pub(super) enum SelectedTransactionStatusDispatch {
 impl SelectedTransactionLogDispatch {
     pub(super) fn from_plugins(
         plugins: &[Arc<dyn ObserverPlugin>],
-        commitment_selectors: &[crate::framework::plugin::TransactionCommitmentSelector],
-        event: crate::framework::TransactionLogEvent,
+        commitment_selectors: &[TransactionCommitmentSelector],
+        event: TransactionLogEvent,
     ) -> Option<Self> {
         let interested: SmallVec<[Arc<dyn ObserverPlugin>; 4]> = plugins
             .iter()
@@ -1138,7 +1142,7 @@ impl SelectedTransactionLogDispatch {
 impl SelectedTransactionStatusDispatch {
     pub(super) fn from_plugins(
         plugins: &[Arc<dyn ObserverPlugin>],
-        commitment_selectors: &[crate::framework::plugin::TransactionCommitmentSelector],
+        commitment_selectors: &[TransactionCommitmentSelector],
         event: TransactionStatusEvent,
     ) -> Option<Self> {
         let interested: SmallVec<[Arc<dyn ObserverPlugin>; 4]> = plugins
@@ -1518,7 +1522,7 @@ fn spawn_transaction_dispatch_worker(
                     );
                 }
             });
-            crate::runtime_metrics::observe_transaction_dispatch_metrics_batch(&metrics_batch);
+            runtime_metrics::observe_transaction_dispatch_metrics_batch(&metrics_batch);
         }
     });
     if let Err(error) = spawn_result {
@@ -1989,7 +1993,7 @@ async fn dispatch_transaction_batch_event(
                     .as_micros(),
             )
             .unwrap_or(u64::MAX);
-            crate::runtime_metrics::observe_transaction_batch_plugin_visibility_lag(queue_wait_us);
+            runtime_metrics::observe_transaction_batch_plugin_visibility_lag(queue_wait_us);
             let callback_started_at = Instant::now();
             if let Err(panic) = AssertUnwindSafe(plugin.on_transaction_batch(&event))
                 .catch_unwind()
@@ -2002,7 +2006,7 @@ async fn dispatch_transaction_batch_event(
                     "plugin hook panicked; continuing runtime"
                 );
             }
-            crate::runtime_metrics::observe_transaction_batch_plugin_callback_duration(
+            runtime_metrics::observe_transaction_batch_plugin_callback_duration(
                 u64::try_from(
                     Instant::now()
                         .saturating_duration_since(callback_started_at)
@@ -2023,7 +2027,7 @@ async fn dispatch_transaction_batch_event(
                     .as_micros(),
             )
             .unwrap_or(u64::MAX);
-            crate::runtime_metrics::observe_transaction_batch_plugin_visibility_lag(queue_wait_us);
+            runtime_metrics::observe_transaction_batch_plugin_visibility_lag(queue_wait_us);
             let callback_started_at = Instant::now();
             let mode = if prefers_inline {
                 PluginDispatchMode::Sequential
@@ -2040,7 +2044,7 @@ async fn dispatch_transaction_batch_event(
                 },
             )
             .await;
-            crate::runtime_metrics::observe_transaction_batch_plugin_callback_duration(
+            runtime_metrics::observe_transaction_batch_plugin_callback_duration(
                 u64::try_from(
                     Instant::now()
                         .saturating_duration_since(callback_started_at)
@@ -2070,9 +2074,7 @@ async fn dispatch_transaction_view_batch_event(
                     .as_micros(),
             )
             .unwrap_or(u64::MAX);
-            crate::runtime_metrics::observe_transaction_view_batch_plugin_visibility_lag(
-                queue_wait_us,
-            );
+            runtime_metrics::observe_transaction_view_batch_plugin_visibility_lag(queue_wait_us);
             let callback_started_at = Instant::now();
             if let Err(panic) = AssertUnwindSafe(plugin.on_transaction_view_batch(&event))
                 .catch_unwind()
@@ -2085,7 +2087,7 @@ async fn dispatch_transaction_view_batch_event(
                     "plugin hook panicked; continuing runtime"
                 );
             }
-            crate::runtime_metrics::observe_transaction_view_batch_plugin_callback_duration(
+            runtime_metrics::observe_transaction_view_batch_plugin_callback_duration(
                 u64::try_from(
                     Instant::now()
                         .saturating_duration_since(callback_started_at)
@@ -2106,9 +2108,7 @@ async fn dispatch_transaction_view_batch_event(
                     .as_micros(),
             )
             .unwrap_or(u64::MAX);
-            crate::runtime_metrics::observe_transaction_view_batch_plugin_visibility_lag(
-                queue_wait_us,
-            );
+            runtime_metrics::observe_transaction_view_batch_plugin_visibility_lag(queue_wait_us);
             let callback_started_at = Instant::now();
             let mode = if prefers_inline {
                 PluginDispatchMode::Sequential
@@ -2125,7 +2125,7 @@ async fn dispatch_transaction_view_batch_event(
                 },
             )
             .await;
-            crate::runtime_metrics::observe_transaction_view_batch_plugin_callback_duration(
+            runtime_metrics::observe_transaction_view_batch_plugin_callback_duration(
                 u64::try_from(
                     Instant::now()
                         .saturating_duration_since(callback_started_at)

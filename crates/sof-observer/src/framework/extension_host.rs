@@ -25,9 +25,10 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungsten
 
 use crate::framework::extension::{
     ExtensionCapability, ExtensionContext, ExtensionManifest, ExtensionResourceSpec,
-    PacketSubscription, RuntimeExtension, RuntimePacketEvent, RuntimePacketEventClass,
-    RuntimePacketSource, RuntimePacketSourceKind, RuntimePacketTransport,
-    RuntimeWebSocketFrameType, WsConnectorSpec,
+    ExtensionSetupError, ExtensionStreamVisibility, PacketSubscription, RuntimeExtension,
+    RuntimePacketEvent, RuntimePacketEventClass, RuntimePacketSource, RuntimePacketSourceKind,
+    RuntimePacketTransport, RuntimeWebSocketFrameType, TcpConnectorSpec, TcpListenerSpec,
+    UdpListenerSpec, WsConnectorSpec,
 };
 
 /// Default bounded queue capacity for asynchronous extension packet dispatch.
@@ -1025,7 +1026,7 @@ impl ExtensionResourceReadContext {
 async fn spawn_udp_listener(
     host: RuntimeExtensionHost,
     extension: &Arc<ActiveRuntimeExtension>,
-    spec: crate::framework::extension::UdpListenerSpec,
+    spec: UdpListenerSpec,
 ) -> Result<JoinHandle<()>, String> {
     let socket = UdpSocket::bind(spec.bind_addr)
         .await
@@ -1087,7 +1088,7 @@ async fn spawn_udp_listener(
 async fn spawn_tcp_listener(
     host: RuntimeExtensionHost,
     extension: &Arc<ActiveRuntimeExtension>,
-    spec: crate::framework::extension::TcpListenerSpec,
+    spec: TcpListenerSpec,
 ) -> Result<JoinHandle<()>, String> {
     let listener = TcpListener::bind(spec.bind_addr)
         .await
@@ -1137,7 +1138,7 @@ async fn spawn_tcp_listener(
 async fn spawn_tcp_connector(
     host: RuntimeExtensionHost,
     extension: &Arc<ActiveRuntimeExtension>,
-    spec: crate::framework::extension::TcpConnectorSpec,
+    spec: TcpConnectorSpec,
 ) -> Result<JoinHandle<()>, String> {
     let stream = TcpStream::connect(spec.remote_addr)
         .await
@@ -1320,12 +1321,10 @@ async fn read_websocket_messages(
 }
 
 /// Converts extension stream visibility into the optional shared stream tag.
-fn visibility_tag(
-    visibility: crate::framework::extension::ExtensionStreamVisibility,
-) -> Option<String> {
+fn visibility_tag(visibility: ExtensionStreamVisibility) -> Option<String> {
     match visibility {
-        crate::framework::extension::ExtensionStreamVisibility::Private => None,
-        crate::framework::extension::ExtensionStreamVisibility::Shared { tag } => Some(tag),
+        ExtensionStreamVisibility::Private => None,
+        ExtensionStreamVisibility::Shared { tag } => Some(tag),
     }
 }
 
@@ -1443,7 +1442,7 @@ mod tests {
         async fn setup(
             &self,
             _ctx: ExtensionContext,
-        ) -> Result<ExtensionManifest, crate::framework::extension::ExtensionSetupError> {
+        ) -> Result<ExtensionManifest, ExtensionSetupError> {
             Ok(self.startup_manifest.clone())
         }
 
@@ -1470,10 +1469,8 @@ mod tests {
         async fn setup(
             &self,
             _ctx: ExtensionContext,
-        ) -> Result<ExtensionManifest, crate::framework::extension::ExtensionSetupError> {
-            Err(crate::framework::extension::ExtensionSetupError::new(
-                "intentional startup fail",
-            ))
+        ) -> Result<ExtensionManifest, ExtensionSetupError> {
+            Err(ExtensionSetupError::new("intentional startup fail"))
         }
     }
 
@@ -1484,7 +1481,7 @@ mod tests {
         async fn setup(
             &self,
             _ctx: ExtensionContext,
-        ) -> Result<ExtensionManifest, crate::framework::extension::ExtensionSetupError> {
+        ) -> Result<ExtensionManifest, ExtensionSetupError> {
             Ok(ExtensionManifest {
                 capabilities: vec![ExtensionCapability::ObserveObserverIngress],
                 resources: Vec::new(),
@@ -1538,15 +1535,12 @@ mod tests {
                 name: "bind-udp-extension",
                 startup_manifest: ExtensionManifest {
                     capabilities: vec![ExtensionCapability::BindUdp],
-                    resources: vec![ExtensionResourceSpec::UdpListener(
-                        crate::framework::extension::UdpListenerSpec {
-                            resource_id: "udp-1".to_owned(),
-                            bind_addr: SocketAddr::from_str("127.0.0.1:0").expect("valid addr"),
-                            visibility:
-                                crate::framework::extension::ExtensionStreamVisibility::Private,
-                            read_buffer_bytes: 128,
-                        },
-                    )],
+                    resources: vec![ExtensionResourceSpec::UdpListener(UdpListenerSpec {
+                        resource_id: "udp-1".to_owned(),
+                        bind_addr: SocketAddr::from_str("127.0.0.1:0").expect("valid addr"),
+                        visibility: ExtensionStreamVisibility::Private,
+                        read_buffer_bytes: 128,
+                    })],
                     subscriptions: Vec::new(),
                 },
                 packet_count: Arc::new(AtomicUsize::new(0)),
@@ -1566,15 +1560,12 @@ mod tests {
                 name: "connect-tcp-extension",
                 startup_manifest: ExtensionManifest {
                     capabilities: vec![ExtensionCapability::ConnectTcp],
-                    resources: vec![ExtensionResourceSpec::TcpConnector(
-                        crate::framework::extension::TcpConnectorSpec {
-                            resource_id: "tcp-outbound".to_owned(),
-                            remote_addr: SocketAddr::from_str("127.0.0.1:9").expect("valid addr"),
-                            visibility:
-                                crate::framework::extension::ExtensionStreamVisibility::Private,
-                            read_buffer_bytes: 128,
-                        },
-                    )],
+                    resources: vec![ExtensionResourceSpec::TcpConnector(TcpConnectorSpec {
+                        resource_id: "tcp-outbound".to_owned(),
+                        remote_addr: SocketAddr::from_str("127.0.0.1:9").expect("valid addr"),
+                        visibility: ExtensionStreamVisibility::Private,
+                        read_buffer_bytes: 128,
+                    })],
                     subscriptions: Vec::new(),
                 },
                 packet_count: Arc::new(AtomicUsize::new(0)),
@@ -1814,7 +1805,7 @@ mod tests {
         async fn setup(
             &self,
             _ctx: ExtensionContext,
-        ) -> Result<ExtensionManifest, crate::framework::extension::ExtensionSetupError> {
+        ) -> Result<ExtensionManifest, ExtensionSetupError> {
             Ok(ExtensionManifest {
                 capabilities: vec![ExtensionCapability::ObserveObserverIngress],
                 resources: Vec::new(),
@@ -1933,38 +1924,28 @@ mod tests {
                         ExtensionCapability::ConnectWebSocket,
                     ],
                     resources: vec![
-                        ExtensionResourceSpec::UdpListener(
-                            crate::framework::extension::UdpListenerSpec {
-                                resource_id: "udp-listener".to_owned(),
-                                bind_addr: SocketAddr::from_str("127.0.0.1:0").expect("addr"),
-                                visibility:
-                                    crate::framework::extension::ExtensionStreamVisibility::Private,
-                                read_buffer_bytes: 128,
-                            },
-                        ),
-                        ExtensionResourceSpec::TcpListener(
-                            crate::framework::extension::TcpListenerSpec {
-                                resource_id: "tcp-listener".to_owned(),
-                                bind_addr: SocketAddr::from_str("127.0.0.1:0").expect("addr"),
-                                visibility:
-                                    crate::framework::extension::ExtensionStreamVisibility::Private,
-                                read_buffer_bytes: 128,
-                            },
-                        ),
-                        ExtensionResourceSpec::TcpConnector(
-                            crate::framework::extension::TcpConnectorSpec {
-                                resource_id: "tcp-connector".to_owned(),
-                                remote_addr: tcp_server_addr,
-                                visibility:
-                                    crate::framework::extension::ExtensionStreamVisibility::Private,
-                                read_buffer_bytes: 128,
-                            },
-                        ),
+                        ExtensionResourceSpec::UdpListener(UdpListenerSpec {
+                            resource_id: "udp-listener".to_owned(),
+                            bind_addr: SocketAddr::from_str("127.0.0.1:0").expect("addr"),
+                            visibility: ExtensionStreamVisibility::Private,
+                            read_buffer_bytes: 128,
+                        }),
+                        ExtensionResourceSpec::TcpListener(TcpListenerSpec {
+                            resource_id: "tcp-listener".to_owned(),
+                            bind_addr: SocketAddr::from_str("127.0.0.1:0").expect("addr"),
+                            visibility: ExtensionStreamVisibility::Private,
+                            read_buffer_bytes: 128,
+                        }),
+                        ExtensionResourceSpec::TcpConnector(TcpConnectorSpec {
+                            resource_id: "tcp-connector".to_owned(),
+                            remote_addr: tcp_server_addr,
+                            visibility: ExtensionStreamVisibility::Private,
+                            read_buffer_bytes: 128,
+                        }),
                         ExtensionResourceSpec::WsConnector(WsConnectorSpec {
                             resource_id: "ws-connector".to_owned(),
                             url: format!("ws://{ws_server_addr}/feed"),
-                            visibility:
-                                crate::framework::extension::ExtensionStreamVisibility::Private,
+                            visibility: ExtensionStreamVisibility::Private,
                             read_buffer_bytes: 128,
                         }),
                     ],

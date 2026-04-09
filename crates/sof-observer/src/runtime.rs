@@ -9,28 +9,34 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     pin::Pin,
+    sync::Arc,
     time::Instant,
 };
 
 #[cfg(feature = "gossip-bootstrap")]
 pub use crate::app::config::GossipRuntimeMode;
 use crate::app::config::read_observability_bind_addr;
-use crate::app::runtime::RuntimeObservabilityService;
-#[cfg(feature = "gossip-bootstrap")]
-use crate::app::runtime::{
-    ClusterTopologyTracker, ProviderStreamGossipControlPlane,
-    start_provider_stream_gossip_control_plane,
-};
 use crate::framework::host::TransactionDispatchScope;
 use crate::framework::{
     DerivedStateHost, DerivedStateReplayBackend, DerivedStateReplayDurability, PluginHost,
-    RuntimeExtensionHost, TransactionEvent, TxCommitmentStatus,
+    RuntimeExtensionHost, TransactionEvent,
 };
-use crate::provider_stream::{
+use crate::{
+    app::runtime as app_runtime,
+    event::{TxCommitmentStatus, TxKind},
+    framework, provider_stream, runtime_env,
+};
+use agave_transaction_view::transaction_view::SanitizedTransactionView;
+use app_runtime::RuntimeObservabilityService;
+#[cfg(feature = "gossip-bootstrap")]
+use app_runtime::{
+    ClusterTopologyTracker, ProviderStreamGossipControlPlane,
+    start_provider_stream_gossip_control_plane,
+};
+use provider_stream::{
     ProviderSourceHealthEvent, ProviderSourceHealthStatus, ProviderSourceId,
     ProviderSourceIdentity, ProviderStreamMode, ProviderStreamReceiver, ProviderStreamUpdate,
 };
-use agave_transaction_view::transaction_view::SanitizedTransactionView;
 use sof_gossip_tuning::{
     CpuCoreIndex, GossipChannelTuning, GossipTuningProfile, GossipTuningService, IngestQueueMode,
     QueueCapacity, ReceiverCoalesceWindow, RuntimeTuningPort, SofRuntimeTuning,
@@ -140,15 +146,13 @@ pub enum ProviderStreamRuntimeError {
     },
 }
 
-impl From<crate::app::runtime::RuntimeEntrypointError> for RuntimeError {
-    fn from(value: crate::app::runtime::RuntimeEntrypointError) -> Self {
+impl From<app_runtime::RuntimeEntrypointError> for RuntimeError {
+    fn from(value: app_runtime::RuntimeEntrypointError) -> Self {
         match value {
-            crate::app::runtime::RuntimeEntrypointError::BuildTokioRuntime { source } => {
+            app_runtime::RuntimeEntrypointError::BuildTokioRuntime { source } => {
                 Self::BuildTokioRuntime(source)
             }
-            crate::app::runtime::RuntimeEntrypointError::Runloop { reason } => {
-                Self::Runloop(reason)
-            }
+            app_runtime::RuntimeEntrypointError::Runloop { reason } => Self::Runloop(reason),
         }
     }
 }
@@ -219,7 +223,7 @@ impl ProviderStreamCapabilityPolicy {
     }
 
     fn from_runtime_env() -> Self {
-        match crate::runtime_env::read_env_var("SOF_PROVIDER_STREAM_CAPABILITY_POLICY").as_deref() {
+        match runtime_env::read_env_var("SOF_PROVIDER_STREAM_CAPABILITY_POLICY").as_deref() {
             Some("strict") => Self::Strict,
             _ => Self::Warn,
         }
@@ -228,7 +232,7 @@ impl ProviderStreamCapabilityPolicy {
 
 fn provider_stream_allow_eof_from_runtime_env() -> bool {
     matches!(
-        crate::runtime_env::read_env_var("SOF_PROVIDER_STREAM_ALLOW_EOF").as_deref(),
+        runtime_env::read_env_var("SOF_PROVIDER_STREAM_ALLOW_EOF").as_deref(),
         Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
     )
 }
@@ -1175,7 +1179,7 @@ impl RuntimeSetup {
 
     /// Applies setup overrides to the runtime config layer.
     fn apply(&self) {
-        crate::runtime_env::set_runtime_env_overrides(self.env_overrides.clone());
+        runtime_env::set_runtime_env_overrides(self.env_overrides.clone());
     }
 }
 
@@ -1283,8 +1287,8 @@ impl RuntimeTuningPort for RuntimeSetupTuningAdapter {
 /// # Errors
 /// Returns any runtime initialization or shutdown error from the underlying observer runtime.
 pub fn run() -> Result<(), RuntimeError> {
-    crate::runtime_env::clear_runtime_env_overrides();
-    Ok(crate::app::runtime::run()?)
+    runtime_env::clear_runtime_env_overrides();
+    Ok(app_runtime::run()?)
 }
 
 /// Runs the packaged observer runtime with a custom plugin host.
@@ -1292,8 +1296,8 @@ pub fn run() -> Result<(), RuntimeError> {
 /// # Errors
 /// Returns any runtime initialization or shutdown error from the underlying observer runtime.
 pub fn run_with_plugin_host(plugin_host: PluginHost) -> Result<(), RuntimeError> {
-    crate::runtime_env::clear_runtime_env_overrides();
-    Ok(crate::app::runtime::run_with_plugin_host(plugin_host)?)
+    runtime_env::clear_runtime_env_overrides();
+    Ok(app_runtime::run_with_plugin_host(plugin_host)?)
 }
 
 /// Runs the packaged observer runtime with a custom runtime extension host.
@@ -1301,10 +1305,8 @@ pub fn run_with_plugin_host(plugin_host: PluginHost) -> Result<(), RuntimeError>
 /// # Errors
 /// Returns any runtime initialization or shutdown error from the underlying observer runtime.
 pub fn run_with_extension_host(extension_host: RuntimeExtensionHost) -> Result<(), RuntimeError> {
-    crate::runtime_env::clear_runtime_env_overrides();
-    Ok(crate::app::runtime::run_with_extension_host(
-        extension_host,
-    )?)
+    runtime_env::clear_runtime_env_overrides();
+    Ok(app_runtime::run_with_extension_host(extension_host)?)
 }
 
 /// Runs the packaged observer runtime with an explicit derived-state host.
@@ -1314,8 +1316,8 @@ pub fn run_with_extension_host(extension_host: RuntimeExtensionHost) -> Result<(
 pub fn run_with_derived_state_host(
     derived_state_host: DerivedStateHost,
 ) -> Result<(), RuntimeError> {
-    crate::runtime_env::clear_runtime_env_overrides();
-    Ok(crate::app::runtime::run_with_derived_state_host(
+    runtime_env::clear_runtime_env_overrides();
+    Ok(app_runtime::run_with_derived_state_host(
         derived_state_host,
     )?)
 }
@@ -1328,8 +1330,8 @@ pub fn run_with_hosts(
     plugin_host: PluginHost,
     extension_host: RuntimeExtensionHost,
 ) -> Result<(), RuntimeError> {
-    crate::runtime_env::clear_runtime_env_overrides();
-    Ok(crate::app::runtime::run_with_hosts(
+    runtime_env::clear_runtime_env_overrides();
+    Ok(app_runtime::run_with_hosts(
         plugin_host,
         extension_host,
         DerivedStateHost::builder().build(),
@@ -1345,8 +1347,8 @@ pub fn run_with_hosts_and_derived_state_host(
     extension_host: RuntimeExtensionHost,
     derived_state_host: DerivedStateHost,
 ) -> Result<(), RuntimeError> {
-    crate::runtime_env::clear_runtime_env_overrides();
-    Ok(crate::app::runtime::run_with_hosts(
+    runtime_env::clear_runtime_env_overrides();
+    Ok(app_runtime::run_with_hosts(
         plugin_host,
         extension_host,
         derived_state_host,
@@ -1362,7 +1364,7 @@ pub fn run_with_derived_state_host_and_setup(
     setup: &RuntimeSetup,
 ) -> Result<(), RuntimeError> {
     setup.apply();
-    Ok(crate::app::runtime::run_with_derived_state_host(
+    Ok(app_runtime::run_with_derived_state_host(
         derived_state_host,
     )?)
 }
@@ -1378,7 +1380,7 @@ pub fn run_with_hosts_and_derived_state_host_and_setup(
     setup: &RuntimeSetup,
 ) -> Result<(), RuntimeError> {
     setup.apply();
-    Ok(crate::app::runtime::run_with_hosts(
+    Ok(app_runtime::run_with_hosts(
         plugin_host,
         extension_host,
         derived_state_host,
@@ -1391,7 +1393,7 @@ pub fn run_with_hosts_and_derived_state_host_and_setup(
 /// Returns any runtime initialization or shutdown error from the underlying observer runtime.
 pub fn run_with_setup(setup: &RuntimeSetup) -> Result<(), RuntimeError> {
     setup.apply();
-    Ok(crate::app::runtime::run()?)
+    Ok(app_runtime::run()?)
 }
 
 /// Runs the packaged observer runtime with a custom plugin host and explicit setup overrides.
@@ -1403,7 +1405,7 @@ pub fn run_with_plugin_host_and_setup(
     setup: &RuntimeSetup,
 ) -> Result<(), RuntimeError> {
     setup.apply();
-    Ok(crate::app::runtime::run_with_plugin_host(plugin_host)?)
+    Ok(app_runtime::run_with_plugin_host(plugin_host)?)
 }
 
 /// Runs the packaged observer runtime with a custom runtime extension host and setup overrides.
@@ -1415,9 +1417,7 @@ pub fn run_with_extension_host_and_setup(
     setup: &RuntimeSetup,
 ) -> Result<(), RuntimeError> {
     setup.apply();
-    Ok(crate::app::runtime::run_with_extension_host(
-        extension_host,
-    )?)
+    Ok(app_runtime::run_with_extension_host(extension_host)?)
 }
 
 /// Runs the packaged observer runtime with explicit hosts and setup overrides.
@@ -1430,7 +1430,7 @@ pub fn run_with_hosts_and_setup(
     setup: &RuntimeSetup,
 ) -> Result<(), RuntimeError> {
     setup.apply();
-    Ok(crate::app::runtime::run_with_hosts(
+    Ok(app_runtime::run_with_hosts(
         plugin_host,
         extension_host,
         DerivedStateHost::builder().build(),
@@ -1591,7 +1591,7 @@ impl ObserverRuntime {
         self,
         shutdown_signal: Option<ShutdownSignal>,
     ) -> Result<(), RuntimeError> {
-        crate::runtime_env::clear_runtime_env_overrides();
+        runtime_env::clear_runtime_env_overrides();
         self.setup.apply();
         if let Some((mode, provider_stream_rx)) = self.provider_stream {
             return run_provider_stream_runtime(
@@ -1606,18 +1606,16 @@ impl ObserverRuntime {
         }
         #[cfg(feature = "kernel-bypass")]
         if let Some(packet_ingest_rx) = self.packet_ingest_rx {
-            return Ok(
-                crate::app::runtime::run_async_with_hosts_and_kernel_bypass_ingress(
-                    self.plugin_host,
-                    self.extension_host,
-                    self.derived_state_host,
-                    shutdown_signal,
-                    packet_ingest_rx,
-                )
-                .await?,
-            );
+            return Ok(app_runtime::run_async_with_hosts_and_kernel_bypass_ingress(
+                self.plugin_host,
+                self.extension_host,
+                self.derived_state_host,
+                shutdown_signal,
+                packet_ingest_rx,
+            )
+            .await?);
         }
-        Ok(crate::app::runtime::run_async_with_hosts(
+        Ok(app_runtime::run_async_with_hosts(
             self.plugin_host,
             self.extension_host,
             self.derived_state_host,
@@ -2178,7 +2176,7 @@ impl ProviderReplayLogicalKey {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ProviderReplayObservedKey {
-    source: Option<crate::provider_stream::ProviderSourceRef>,
+    source: Option<provider_stream::ProviderSourceRef>,
     logical: ProviderReplayLogicalKey,
 }
 
@@ -2191,7 +2189,7 @@ impl ProviderReplayObservedKey {
 #[derive(Clone, Debug)]
 struct ProviderReplayArbitratedWinner {
     priority: u16,
-    source: crate::provider_stream::ProviderSourceRef,
+    source: provider_stream::ProviderSourceRef,
 }
 
 #[derive(Default)]
@@ -2237,11 +2235,11 @@ impl ProviderReplayDedupe {
         };
 
         match source.arbitration() {
-            crate::provider_stream::ProviderSourceArbitrationMode::EmitAll => {
+            provider_stream::ProviderSourceArbitrationMode::EmitAll => {
                 self.evict();
                 false
             }
-            crate::provider_stream::ProviderSourceArbitrationMode::FirstSeen => {
+            provider_stream::ProviderSourceArbitrationMode::FirstSeen => {
                 match self.arbitrated.entry(logical.clone()) {
                     Entry::Occupied(_) => {
                         self.evict();
@@ -2258,7 +2256,7 @@ impl ProviderReplayDedupe {
                     }
                 }
             }
-            crate::provider_stream::ProviderSourceArbitrationMode::FirstSeenThenPromote => {
+            provider_stream::ProviderSourceArbitrationMode::FirstSeenThenPromote => {
                 match self.arbitrated.entry(logical.clone()) {
                     Entry::Occupied(mut entry) => {
                         let winner = entry.get_mut();
@@ -2309,7 +2307,7 @@ impl ProviderReplayDedupe {
 
 fn provider_stream_update_source_ref(
     update: &ProviderStreamUpdate,
-) -> Option<crate::provider_stream::ProviderSourceRef> {
+) -> Option<provider_stream::ProviderSourceRef> {
     match update {
         ProviderStreamUpdate::Transaction(event) => event.provider_source.clone(),
         ProviderStreamUpdate::SerializedTransaction(event) => event.provider_source.clone(),
@@ -2331,7 +2329,7 @@ fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderR
     match update {
         ProviderStreamUpdate::Transaction(event) => event
             .signature
-            .map(crate::framework::SignatureBytes::to_solana)
+            .map(framework::SignatureBytes::to_solana)
             .or_else(|| event.tx.signatures.first().copied())
             .map(|signature| ProviderReplayLogicalKey::Transaction {
                 slot: event.slot,
@@ -2342,7 +2340,7 @@ fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderR
             }),
         ProviderStreamUpdate::SerializedTransaction(event) => event
             .signature
-            .map(crate::framework::SignatureBytes::to_solana)
+            .map(framework::SignatureBytes::to_solana)
             .map_or_else(
                 || {
                     Some(ProviderReplayLogicalKey::SerializedTransaction {
@@ -2437,9 +2435,7 @@ fn provider_replay_fingerprint<T: Hash>(value: &T) -> u64 {
     hasher.finish()
 }
 
-fn provider_replay_transaction_log_fingerprint(
-    event: &crate::framework::TransactionLogEvent,
-) -> u64 {
+fn provider_replay_transaction_log_fingerprint(event: &framework::TransactionLogEvent) -> u64 {
     let mut hasher = DefaultHasher::new();
     event.signature.hash(&mut hasher);
     provider_replay_commitment_key(event.commitment_status).hash(&mut hasher);
@@ -2454,7 +2450,7 @@ fn provider_replay_transaction_log_fingerprint(
 }
 
 fn provider_replay_transaction_view_batch_fingerprint(
-    event: &crate::framework::TransactionViewBatchEvent,
+    event: &framework::TransactionViewBatchEvent,
 ) -> u64 {
     let mut hasher = DefaultHasher::new();
     event.start_index.hash(&mut hasher);
@@ -2472,11 +2468,11 @@ fn provider_replay_transaction_view_batch_fingerprint(
     hasher.finish()
 }
 
-const fn provider_replay_commitment_key(commitment_status: crate::event::TxCommitmentStatus) -> u8 {
+const fn provider_replay_commitment_key(commitment_status: TxCommitmentStatus) -> u8 {
     match commitment_status {
-        crate::event::TxCommitmentStatus::Processed => 0,
-        crate::event::TxCommitmentStatus::Confirmed => 1,
-        crate::event::TxCommitmentStatus::Finalized => 2,
+        TxCommitmentStatus::Processed => 0,
+        TxCommitmentStatus::Confirmed => 1,
+        TxCommitmentStatus::Finalized => 2,
     }
 }
 
@@ -2491,7 +2487,7 @@ fn dispatch_provider_stream_update(
     match update {
         ProviderStreamUpdate::Transaction(event) => {
             if plugin_host.wants_recent_blockhash() {
-                plugin_host.on_recent_blockhash(crate::framework::ObservedRecentBlockhashEvent {
+                plugin_host.on_recent_blockhash(framework::ObservedRecentBlockhashEvent {
                     slot: event.slot,
                     recent_blockhash: event.tx.message.recent_blockhash().to_bytes(),
                     dataset_tx_count: 1,
@@ -2596,7 +2592,7 @@ fn dispatch_provider_stream_update(
 fn dispatch_provider_stream_serialized_transaction(
     plugin_host: &PluginHost,
     derived_state_host: &DerivedStateHost,
-    event: &crate::provider_stream::SerializedTransactionEvent,
+    event: &provider_stream::SerializedTransactionEvent,
 ) {
     let derived_state_empty = derived_state_host.is_empty();
     let wants_transaction = plugin_host.transaction_enabled_at_commitment(event.commitment_status);
@@ -2622,9 +2618,11 @@ fn dispatch_provider_stream_serialized_transaction(
                 .signatures()
                 .first()
                 .copied()
-                .map(crate::framework::SignatureBytes::from_solana);
+                .map(framework::SignatureBytes::from_solana);
         }
-        kind = Some(crate::provider_stream::classify_provider_transaction_kind_view(&view));
+        kind = Some(provider_stream::classify_provider_transaction_kind_view(
+            &view,
+        ));
         if wants_recent_blockhash {
             recent_blockhash = Some(view.recent_blockhash().to_bytes());
         }
@@ -2639,21 +2637,19 @@ fn dispatch_provider_stream_serialized_transaction(
                 && !wants_derived_state_transaction
             {
                 if let Some(recent_blockhash) = recent_blockhash {
-                    plugin_host.on_recent_blockhash(
-                        crate::framework::ObservedRecentBlockhashEvent {
-                            slot: event.slot,
-                            recent_blockhash,
-                            dataset_tx_count: 1,
-                            provider_source: event.provider_source.clone(),
-                        },
-                    );
+                    plugin_host.on_recent_blockhash(framework::ObservedRecentBlockhashEvent {
+                        slot: event.slot,
+                        recent_blockhash,
+                        dataset_tx_count: 1,
+                        provider_source: event.provider_source.clone(),
+                    });
                 }
                 return;
             }
         }
         if !wants_transaction && !wants_derived_state_transaction {
             if let Some(recent_blockhash) = recent_blockhash {
-                plugin_host.on_recent_blockhash(crate::framework::ObservedRecentBlockhashEvent {
+                plugin_host.on_recent_blockhash(framework::ObservedRecentBlockhashEvent {
                     slot: event.slot,
                     recent_blockhash,
                     dataset_tx_count: 1,
@@ -2671,7 +2667,7 @@ fn dispatch_provider_stream_serialized_transaction(
         );
         return;
     };
-    let tx = std::sync::Arc::new(tx);
+    let tx = Arc::new(tx);
     let event = TransactionEvent {
         slot: event.slot,
         commitment_status: event.commitment_status,
@@ -2681,15 +2677,14 @@ fn dispatch_provider_stream_serialized_transaction(
             tx.signatures
                 .first()
                 .copied()
-                .map(crate::framework::SignatureBytes::from_solana)
+                .map(framework::SignatureBytes::from_solana)
         }),
         provider_source: event.provider_source.clone(),
-        kind: kind
-            .unwrap_or_else(|| crate::provider_stream::classify_provider_transaction_kind(&tx)),
+        kind: kind.unwrap_or_else(|| provider_stream::classify_provider_transaction_kind(&tx)),
         tx,
     };
     if wants_recent_blockhash {
-        plugin_host.on_recent_blockhash(crate::framework::ObservedRecentBlockhashEvent {
+        plugin_host.on_recent_blockhash(framework::ObservedRecentBlockhashEvent {
             slot: event.slot,
             recent_blockhash: recent_blockhash
                 .unwrap_or_else(|| event.tx.message.recent_blockhash().to_bytes()),
@@ -2999,8 +2994,8 @@ pub async fn run_async_with_hosts(
     plugin_host: PluginHost,
     extension_host: RuntimeExtensionHost,
 ) -> Result<(), RuntimeError> {
-    crate::runtime_env::clear_runtime_env_overrides();
-    Ok(crate::app::runtime::run_async_with_hosts(
+    runtime_env::clear_runtime_env_overrides();
+    Ok(app_runtime::run_async_with_hosts(
         plugin_host,
         extension_host,
         DerivedStateHost::builder().build(),
@@ -3018,14 +3013,11 @@ pub async fn run_async_with_hosts_and_derived_state_host(
     extension_host: RuntimeExtensionHost,
     derived_state_host: DerivedStateHost,
 ) -> Result<(), RuntimeError> {
-    crate::runtime_env::clear_runtime_env_overrides();
-    Ok(crate::app::runtime::run_async_with_hosts(
-        plugin_host,
-        extension_host,
-        derived_state_host,
-        None,
+    runtime_env::clear_runtime_env_overrides();
+    Ok(
+        app_runtime::run_async_with_hosts(plugin_host, extension_host, derived_state_host, None)
+            .await?,
     )
-    .await?)
 }
 
 /// Async variant of [`run_with_derived_state_host_and_setup`].
@@ -3037,7 +3029,7 @@ pub async fn run_async_with_derived_state_host_and_setup(
     setup: &RuntimeSetup,
 ) -> Result<(), RuntimeError> {
     setup.apply();
-    Ok(crate::app::runtime::run_async_with_derived_state_host(derived_state_host).await?)
+    Ok(app_runtime::run_async_with_derived_state_host(derived_state_host).await?)
 }
 
 /// Async variant of [`run_with_hosts_and_derived_state_host_and_setup`].
@@ -3051,13 +3043,10 @@ pub async fn run_async_with_hosts_and_derived_state_host_and_setup(
     setup: &RuntimeSetup,
 ) -> Result<(), RuntimeError> {
     setup.apply();
-    Ok(crate::app::runtime::run_async_with_hosts(
-        plugin_host,
-        extension_host,
-        derived_state_host,
-        None,
+    Ok(
+        app_runtime::run_async_with_hosts(plugin_host, extension_host, derived_state_host, None)
+            .await?,
     )
-    .await?)
 }
 
 #[cfg(feature = "kernel-bypass")]
@@ -3089,8 +3078,8 @@ pub fn create_kernel_bypass_ingress_queue()
 pub async fn run_async_with_kernel_bypass_ingress(
     packet_ingest_rx: impl Into<KernelBypassIngressReceiver>,
 ) -> Result<(), RuntimeError> {
-    crate::runtime_env::clear_runtime_env_overrides();
-    Ok(crate::app::runtime::run_async_with_kernel_bypass_ingress(packet_ingest_rx.into()).await?)
+    runtime_env::clear_runtime_env_overrides();
+    Ok(app_runtime::run_async_with_kernel_bypass_ingress(packet_ingest_rx.into()).await?)
 }
 
 #[cfg(feature = "kernel-bypass")]
@@ -3102,9 +3091,9 @@ pub async fn run_async_with_plugin_host_and_kernel_bypass_ingress(
     plugin_host: PluginHost,
     packet_ingest_rx: impl Into<KernelBypassIngressReceiver>,
 ) -> Result<(), RuntimeError> {
-    crate::runtime_env::clear_runtime_env_overrides();
+    runtime_env::clear_runtime_env_overrides();
     Ok(
-        crate::app::runtime::run_async_with_plugin_host_and_kernel_bypass_ingress(
+        app_runtime::run_async_with_plugin_host_and_kernel_bypass_ingress(
             plugin_host,
             packet_ingest_rx.into(),
         )
@@ -3121,9 +3110,9 @@ pub async fn run_async_with_extension_host_and_kernel_bypass_ingress(
     extension_host: RuntimeExtensionHost,
     packet_ingest_rx: impl Into<KernelBypassIngressReceiver>,
 ) -> Result<(), RuntimeError> {
-    crate::runtime_env::clear_runtime_env_overrides();
+    runtime_env::clear_runtime_env_overrides();
     Ok(
-        crate::app::runtime::run_async_with_extension_host_and_kernel_bypass_ingress(
+        app_runtime::run_async_with_extension_host_and_kernel_bypass_ingress(
             extension_host,
             packet_ingest_rx.into(),
         )
@@ -3141,17 +3130,15 @@ pub async fn run_async_with_hosts_and_kernel_bypass_ingress(
     extension_host: RuntimeExtensionHost,
     packet_ingest_rx: impl Into<KernelBypassIngressReceiver>,
 ) -> Result<(), RuntimeError> {
-    crate::runtime_env::clear_runtime_env_overrides();
-    Ok(
-        crate::app::runtime::run_async_with_hosts_and_kernel_bypass_ingress(
-            plugin_host,
-            extension_host,
-            DerivedStateHost::builder().build(),
-            None,
-            packet_ingest_rx.into(),
-        )
-        .await?,
+    runtime_env::clear_runtime_env_overrides();
+    Ok(app_runtime::run_async_with_hosts_and_kernel_bypass_ingress(
+        plugin_host,
+        extension_host,
+        DerivedStateHost::builder().build(),
+        None,
+        packet_ingest_rx.into(),
     )
+    .await?)
 }
 
 #[cfg(feature = "kernel-bypass")]
@@ -3163,9 +3150,9 @@ pub async fn run_async_with_derived_state_host_and_kernel_bypass_ingress(
     derived_state_host: DerivedStateHost,
     packet_ingest_rx: impl Into<KernelBypassIngressReceiver>,
 ) -> Result<(), RuntimeError> {
-    crate::runtime_env::clear_runtime_env_overrides();
+    runtime_env::clear_runtime_env_overrides();
     Ok(
-        crate::app::runtime::run_async_with_derived_state_host_and_kernel_bypass_ingress(
+        app_runtime::run_async_with_derived_state_host_and_kernel_bypass_ingress(
             derived_state_host,
             packet_ingest_rx.into(),
         )
@@ -3185,7 +3172,7 @@ pub async fn run_async_with_derived_state_host_and_kernel_bypass_ingress_and_set
 ) -> Result<(), RuntimeError> {
     setup.apply();
     Ok(
-        crate::app::runtime::run_async_with_derived_state_host_and_kernel_bypass_ingress(
+        app_runtime::run_async_with_derived_state_host_and_kernel_bypass_ingress(
             derived_state_host,
             packet_ingest_rx.into(),
         )
@@ -3204,17 +3191,15 @@ pub async fn run_async_with_hosts_and_derived_state_host_and_kernel_bypass_ingre
     derived_state_host: DerivedStateHost,
     packet_ingest_rx: impl Into<KernelBypassIngressReceiver>,
 ) -> Result<(), RuntimeError> {
-    crate::runtime_env::clear_runtime_env_overrides();
-    Ok(
-        crate::app::runtime::run_async_with_hosts_and_kernel_bypass_ingress(
-            plugin_host,
-            extension_host,
-            derived_state_host,
-            None,
-            packet_ingest_rx.into(),
-        )
-        .await?,
+    runtime_env::clear_runtime_env_overrides();
+    Ok(app_runtime::run_async_with_hosts_and_kernel_bypass_ingress(
+        plugin_host,
+        extension_host,
+        derived_state_host,
+        None,
+        packet_ingest_rx.into(),
     )
+    .await?)
 }
 
 #[cfg(feature = "kernel-bypass")]
@@ -3230,16 +3215,14 @@ pub async fn run_async_with_hosts_and_derived_state_host_and_kernel_bypass_ingre
     setup: &RuntimeSetup,
 ) -> Result<(), RuntimeError> {
     setup.apply();
-    Ok(
-        crate::app::runtime::run_async_with_hosts_and_kernel_bypass_ingress(
-            plugin_host,
-            extension_host,
-            derived_state_host,
-            None,
-            packet_ingest_rx.into(),
-        )
-        .await?,
+    Ok(app_runtime::run_async_with_hosts_and_kernel_bypass_ingress(
+        plugin_host,
+        extension_host,
+        derived_state_host,
+        None,
+        packet_ingest_rx.into(),
     )
+    .await?)
 }
 
 /// Async variant of [`run_with_setup`], for callers that already own a Tokio runtime.
@@ -3248,7 +3231,7 @@ pub async fn run_async_with_hosts_and_derived_state_host_and_kernel_bypass_ingre
 /// Returns any runtime initialization or shutdown error from the underlying observer runtime.
 pub async fn run_async_with_setup(setup: &RuntimeSetup) -> Result<(), RuntimeError> {
     setup.apply();
-    Ok(crate::app::runtime::run_async().await?)
+    Ok(app_runtime::run_async().await?)
 }
 
 /// Async variant of [`run_with_plugin_host_and_setup`].
@@ -3260,7 +3243,7 @@ pub async fn run_async_with_plugin_host_and_setup(
     setup: &RuntimeSetup,
 ) -> Result<(), RuntimeError> {
     setup.apply();
-    Ok(crate::app::runtime::run_async_with_plugin_host(plugin_host).await?)
+    Ok(app_runtime::run_async_with_plugin_host(plugin_host).await?)
 }
 
 /// Async variant of [`run_with_extension_host_and_setup`].
@@ -3272,7 +3255,7 @@ pub async fn run_async_with_extension_host_and_setup(
     setup: &RuntimeSetup,
 ) -> Result<(), RuntimeError> {
     setup.apply();
-    Ok(crate::app::runtime::run_async_with_extension_host(extension_host).await?)
+    Ok(app_runtime::run_async_with_extension_host(extension_host).await?)
 }
 
 /// Async variant of [`run_with_hosts_and_setup`].
@@ -3285,7 +3268,7 @@ pub async fn run_async_with_hosts_and_setup(
     setup: &RuntimeSetup,
 ) -> Result<(), RuntimeError> {
     setup.apply();
-    Ok(crate::app::runtime::run_async_with_hosts(
+    Ok(app_runtime::run_async_with_hosts(
         plugin_host,
         extension_host,
         DerivedStateHost::builder().build(),
@@ -3331,7 +3314,7 @@ mod tests {
         overrides: impl IntoIterator<Item = (String, String)>,
         f: impl FnOnce() -> T,
     ) -> T {
-        crate::runtime_env::with_runtime_env_overrides_for_test(overrides, f)
+        runtime_env::with_runtime_env_overrides_for_test(overrides, f)
     }
 
     async fn with_runtime_env_overrides_async<T, Fut>(
@@ -3341,7 +3324,7 @@ mod tests {
     where
         Fut: std::future::Future<Output = T>,
     {
-        crate::runtime_env::with_runtime_env_overrides_for_test_async(overrides, f).await
+        runtime_env::with_runtime_env_overrides_for_test_async(overrides, f).await
     }
 
     fn sample_provider_transaction_update() -> ProviderStreamUpdate {
@@ -3349,18 +3332,18 @@ mod tests {
         let message = Message::new(&[], Some(&signer.pubkey()));
         let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&signer])
             .expect("tx");
-        ProviderStreamUpdate::Transaction(crate::framework::TransactionEvent {
+        ProviderStreamUpdate::Transaction(framework::TransactionEvent {
             slot: 1,
-            commitment_status: crate::event::TxCommitmentStatus::Processed,
+            commitment_status: TxCommitmentStatus::Processed,
             confirmed_slot: None,
             finalized_slot: None,
             signature: tx
                 .signatures
                 .first()
                 .copied()
-                .map(crate::framework::SignatureBytes::from_solana),
+                .map(framework::SignatureBytes::from_solana),
             provider_source: None,
-            kind: crate::event::TxKind::NonVote,
+            kind: TxKind::NonVote,
             tx: Arc::new(tx),
         })
     }
@@ -3445,10 +3428,7 @@ mod tests {
             PluginConfig::new().with_raw_packet()
         }
 
-        async fn setup(
-            &self,
-            _ctx: PluginContext,
-        ) -> Result<(), crate::framework::PluginSetupError> {
+        async fn setup(&self, _ctx: PluginContext) -> Result<(), framework::PluginSetupError> {
             self.counter.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
@@ -3461,7 +3441,7 @@ mod tests {
         async fn setup(
             &self,
             _ctx: ExtensionContext,
-        ) -> Result<ExtensionManifest, crate::framework::extension::ExtensionSetupError> {
+        ) -> Result<ExtensionManifest, framework::extension::ExtensionSetupError> {
             self.counter.fetch_add(1, Ordering::Relaxed);
             Ok(ExtensionManifest::default())
         }
@@ -3493,7 +3473,7 @@ mod tests {
         fn setup(
             &mut self,
             _ctx: DerivedStateConsumerContext,
-        ) -> Result<(), crate::framework::DerivedStateConsumerSetupError> {
+        ) -> Result<(), framework::DerivedStateConsumerSetupError> {
             Ok(())
         }
 
@@ -3539,7 +3519,7 @@ mod tests {
         fn setup(
             &mut self,
             _ctx: DerivedStateConsumerContext,
-        ) -> Result<(), crate::framework::DerivedStateConsumerSetupError> {
+        ) -> Result<(), framework::DerivedStateConsumerSetupError> {
             Ok(())
         }
 
@@ -3704,7 +3684,7 @@ mod tests {
                 .lock()
                 .map_err(|_poison| {
                     DerivedStateConsumerFault::new(
-                        crate::framework::DerivedStateConsumerFaultKind::ConsumerApplyFailed,
+                        framework::DerivedStateConsumerFaultKind::ConsumerApplyFailed,
                         Some(envelope.sequence),
                         "recording-derived-state mutex poisoned during apply",
                     )
@@ -3780,7 +3760,7 @@ mod tests {
     ) {
         match update {
             ProviderStreamUpdate::Transaction(event) => {
-                plugin_host.on_recent_blockhash(crate::framework::ObservedRecentBlockhashEvent {
+                plugin_host.on_recent_blockhash(framework::ObservedRecentBlockhashEvent {
                     slot: event.slot,
                     recent_blockhash: event.tx.message.recent_blockhash().to_bytes(),
                     dataset_tx_count: 1,
@@ -3833,7 +3813,7 @@ mod tests {
     fn dispatch_provider_stream_serialized_transaction_baseline(
         plugin_host: &PluginHost,
         derived_state_host: &DerivedStateHost,
-        event: &crate::provider_stream::SerializedTransactionEvent,
+        event: &provider_stream::SerializedTransactionEvent,
     ) {
         let wants_transaction =
             plugin_host.transaction_enabled_at_commitment(event.commitment_status);
@@ -3852,9 +3832,11 @@ mod tests {
                     .signatures()
                     .first()
                     .copied()
-                    .map(crate::framework::SignatureBytes::from_solana);
+                    .map(framework::SignatureBytes::from_solana);
             }
-            kind = Some(crate::provider_stream::classify_provider_transaction_kind_view(&view));
+            kind = Some(provider_stream::classify_provider_transaction_kind_view(
+                &view,
+            ));
             if wants_recent_blockhash {
                 recent_blockhash = Some(view.recent_blockhash().to_bytes());
             }
@@ -3869,28 +3851,24 @@ mod tests {
                     && !wants_derived_state_transaction
                 {
                     if let Some(recent_blockhash) = recent_blockhash {
-                        plugin_host.on_recent_blockhash(
-                            crate::framework::ObservedRecentBlockhashEvent {
-                                slot: event.slot,
-                                recent_blockhash,
-                                dataset_tx_count: 1,
-                                provider_source: event.provider_source.clone(),
-                            },
-                        );
+                        plugin_host.on_recent_blockhash(framework::ObservedRecentBlockhashEvent {
+                            slot: event.slot,
+                            recent_blockhash,
+                            dataset_tx_count: 1,
+                            provider_source: event.provider_source.clone(),
+                        });
                     }
                     return;
                 }
             }
             if !wants_transaction && !wants_derived_state_transaction {
                 if let Some(recent_blockhash) = recent_blockhash {
-                    plugin_host.on_recent_blockhash(
-                        crate::framework::ObservedRecentBlockhashEvent {
-                            slot: event.slot,
-                            recent_blockhash,
-                            dataset_tx_count: 1,
-                            provider_source: event.provider_source.clone(),
-                        },
-                    );
+                    plugin_host.on_recent_blockhash(framework::ObservedRecentBlockhashEvent {
+                        slot: event.slot,
+                        recent_blockhash,
+                        dataset_tx_count: 1,
+                        provider_source: event.provider_source.clone(),
+                    });
                 }
                 return;
             }
@@ -3909,15 +3887,14 @@ mod tests {
                 tx.signatures
                     .first()
                     .copied()
-                    .map(crate::framework::SignatureBytes::from_solana)
+                    .map(framework::SignatureBytes::from_solana)
             }),
             provider_source: event.provider_source.clone(),
-            kind: kind
-                .unwrap_or_else(|| crate::provider_stream::classify_provider_transaction_kind(&tx)),
+            kind: kind.unwrap_or_else(|| provider_stream::classify_provider_transaction_kind(&tx)),
             tx,
         };
         if wants_recent_blockhash {
-            plugin_host.on_recent_blockhash(crate::framework::ObservedRecentBlockhashEvent {
+            plugin_host.on_recent_blockhash(framework::ObservedRecentBlockhashEvent {
                 slot: event.slot,
                 recent_blockhash: recent_blockhash
                     .unwrap_or_else(|| event.tx.message.recent_blockhash().to_bytes()),
@@ -3939,7 +3916,7 @@ mod tests {
             ProviderStreamUpdate::Transaction(event) => {
                 let bytes = bincode::serialize(event.tx.as_ref()).expect("serialize tx");
                 ProviderStreamUpdate::SerializedTransaction(
-                    crate::provider_stream::SerializedTransactionEvent {
+                    provider_stream::SerializedTransactionEvent {
                         slot: event.slot,
                         commitment_status: event.commitment_status,
                         confirmed_slot: event.confirmed_slot,
@@ -3968,7 +3945,7 @@ mod tests {
     fn sample_confirmed_provider_transaction_update() -> ProviderStreamUpdate {
         match sample_provider_transaction_update() {
             ProviderStreamUpdate::Transaction(mut event) => {
-                event.commitment_status = crate::event::TxCommitmentStatus::Confirmed;
+                event.commitment_status = TxCommitmentStatus::Confirmed;
                 event.confirmed_slot = Some(event.slot);
                 ProviderStreamUpdate::Transaction(event)
             }
@@ -3990,7 +3967,7 @@ mod tests {
     fn sample_confirmed_serialized_provider_transaction_update() -> ProviderStreamUpdate {
         match sample_serialized_provider_transaction_update() {
             ProviderStreamUpdate::SerializedTransaction(mut event) => {
-                event.commitment_status = crate::event::TxCommitmentStatus::Confirmed;
+                event.commitment_status = TxCommitmentStatus::Confirmed;
                 event.confirmed_slot = Some(event.slot);
                 ProviderStreamUpdate::SerializedTransaction(event)
             }
@@ -4013,9 +3990,9 @@ mod tests {
         match sample_provider_transaction_update() {
             ProviderStreamUpdate::Transaction(mut event) => {
                 event.slot = slot;
-                event.signature = Some(crate::framework::SignatureBytes::from_solana(
-                    Signature::from([slot as u8; 64]),
-                ));
+                event.signature = Some(framework::SignatureBytes::from_solana(Signature::from(
+                    [slot as u8; 64],
+                )));
                 ProviderStreamUpdate::Transaction(event)
             }
             other @ ProviderStreamUpdate::SerializedTransaction(_)
@@ -4034,7 +4011,7 @@ mod tests {
     }
 
     fn sample_provider_recent_blockhash_update(slot: u64) -> ProviderStreamUpdate {
-        ProviderStreamUpdate::RecentBlockhash(crate::framework::ObservedRecentBlockhashEvent {
+        ProviderStreamUpdate::RecentBlockhash(framework::ObservedRecentBlockhashEvent {
             slot,
             recent_blockhash: [slot as u8; 32],
             dataset_tx_count: 1,
@@ -4043,14 +4020,12 @@ mod tests {
     }
 
     fn sample_provider_transaction_status_update(slot: u64) -> ProviderStreamUpdate {
-        ProviderStreamUpdate::TransactionStatus(crate::framework::TransactionStatusEvent {
+        ProviderStreamUpdate::TransactionStatus(framework::TransactionStatusEvent {
             slot,
-            commitment_status: crate::event::TxCommitmentStatus::Processed,
+            commitment_status: TxCommitmentStatus::Processed,
             confirmed_slot: None,
             finalized_slot: None,
-            signature: crate::framework::SignatureBytes::from_solana(Signature::from(
-                [slot as u8; 64],
-            )),
+            signature: framework::SignatureBytes::from_solana(Signature::from([slot as u8; 64])),
             is_vote: false,
             index: Some(0),
             err: None,
@@ -4059,9 +4034,9 @@ mod tests {
     }
 
     fn sample_provider_block_meta_update(slot: u64) -> ProviderStreamUpdate {
-        ProviderStreamUpdate::BlockMeta(crate::framework::BlockMetaEvent {
+        ProviderStreamUpdate::BlockMeta(framework::BlockMetaEvent {
             slot,
-            commitment_status: crate::event::TxCommitmentStatus::Processed,
+            commitment_status: TxCommitmentStatus::Processed,
             confirmed_slot: None,
             finalized_slot: None,
             blockhash: [slot as u8; 32],
@@ -4077,25 +4052,23 @@ mod tests {
 
     fn sample_provider_account_update(
         slot: u64,
-        commitment_status: crate::event::TxCommitmentStatus,
+        commitment_status: TxCommitmentStatus,
     ) -> ProviderStreamUpdate {
-        ProviderStreamUpdate::AccountUpdate(crate::framework::AccountUpdateEvent {
+        ProviderStreamUpdate::AccountUpdate(framework::AccountUpdateEvent {
             slot,
             commitment_status,
-            confirmed_slot: (commitment_status != crate::event::TxCommitmentStatus::Processed)
-                .then_some(slot),
-            finalized_slot: (commitment_status == crate::event::TxCommitmentStatus::Finalized)
-                .then_some(slot),
-            pubkey: crate::framework::PubkeyBytes::from_solana(solana_sdk_ids::vote::id()),
-            owner: crate::framework::PubkeyBytes::from_solana(solana_sdk_ids::vote::id()),
+            confirmed_slot: (commitment_status != TxCommitmentStatus::Processed).then_some(slot),
+            finalized_slot: (commitment_status == TxCommitmentStatus::Finalized).then_some(slot),
+            pubkey: framework::PubkeyBytes::from_solana(solana_sdk_ids::vote::id()),
+            owner: framework::PubkeyBytes::from_solana(solana_sdk_ids::vote::id()),
             lamports: 42,
             executable: false,
             rent_epoch: 0,
             data: Arc::from([1_u8, 2, 3, 4]),
             write_version: Some(slot),
-            txn_signature: Some(crate::framework::SignatureBytes::from_solana(
-                Signature::from([slot as u8; 64]),
-            )),
+            txn_signature: Some(framework::SignatureBytes::from_solana(Signature::from(
+                [slot as u8; 64],
+            ))),
             is_startup: false,
             matched_filter: None,
             provider_source: None,
@@ -4103,12 +4076,10 @@ mod tests {
     }
 
     fn sample_provider_transaction_log_update(slot: u64) -> ProviderStreamUpdate {
-        ProviderStreamUpdate::TransactionLog(crate::framework::TransactionLogEvent {
+        ProviderStreamUpdate::TransactionLog(framework::TransactionLogEvent {
             slot,
-            commitment_status: crate::event::TxCommitmentStatus::Processed,
-            signature: crate::framework::SignatureBytes::from_solana(Signature::from(
-                [slot as u8; 64],
-            )),
+            commitment_status: TxCommitmentStatus::Processed,
+            signature: framework::SignatureBytes::from_solana(Signature::from([slot as u8; 64])),
             err: None,
             logs: Arc::from([String::from("program log: hello")]),
             matched_filter: None,
@@ -4118,16 +4089,16 @@ mod tests {
 
     fn sample_provider_transaction_view_batch_update(slot: u64) -> ProviderStreamUpdate {
         let payload: Arc<[u8]> = Arc::from([1_u8, 2, 3, 4]);
-        let transactions: Arc<[crate::framework::SerializedTransactionRange]> =
-            Arc::from([crate::framework::SerializedTransactionRange::new(0, 4)]);
-        ProviderStreamUpdate::TransactionViewBatch(crate::framework::TransactionViewBatchEvent {
+        let transactions: Arc<[framework::SerializedTransactionRange]> =
+            Arc::from([framework::SerializedTransactionRange::new(0, 4)]);
+        ProviderStreamUpdate::TransactionViewBatch(framework::TransactionViewBatchEvent {
             slot,
             start_index: 0,
             end_index: 0,
             last_in_slot: false,
             shreds: 1,
             payload_len: payload.len(),
-            commitment_status: crate::event::TxCommitmentStatus::Processed,
+            commitment_status: TxCommitmentStatus::Processed,
             confirmed_slot: None,
             finalized_slot: None,
             provider_source: None,
@@ -4852,12 +4823,12 @@ mod tests {
 
     #[test]
     fn provider_replay_dedupe_keeps_same_transaction_from_distinct_sources() {
-        let source_a = crate::provider_stream::ProviderSourceIdentity::new(
-            crate::provider_stream::ProviderSourceId::Generic("source-a".to_owned().into()),
+        let source_a = provider_stream::ProviderSourceIdentity::new(
+            provider_stream::ProviderSourceId::Generic("source-a".to_owned().into()),
             "ws-tx-1",
         );
-        let source_b = crate::provider_stream::ProviderSourceIdentity::new(
-            crate::provider_stream::ProviderSourceId::Generic("source-b".to_owned().into()),
+        let source_b = provider_stream::ProviderSourceIdentity::new(
+            provider_stream::ProviderSourceId::Generic("source-b".to_owned().into()),
             "ws-tx-2",
         );
         let update = sample_provider_transaction_update();
@@ -4871,17 +4842,17 @@ mod tests {
 
     #[test]
     fn provider_replay_dedupe_first_seen_suppresses_later_overlapping_source() {
-        let source_a = crate::provider_stream::ProviderSourceIdentity::new(
-            crate::provider_stream::ProviderSourceId::Generic("source-a".to_owned().into()),
+        let source_a = provider_stream::ProviderSourceIdentity::new(
+            provider_stream::ProviderSourceId::Generic("source-a".to_owned().into()),
             "primary",
         )
-        .with_arbitration(crate::provider_stream::ProviderSourceArbitrationMode::FirstSeen)
+        .with_arbitration(provider_stream::ProviderSourceArbitrationMode::FirstSeen)
         .with_priority(100);
-        let source_b = crate::provider_stream::ProviderSourceIdentity::new(
-            crate::provider_stream::ProviderSourceId::Generic("source-b".to_owned().into()),
+        let source_b = provider_stream::ProviderSourceIdentity::new(
+            provider_stream::ProviderSourceId::Generic("source-b".to_owned().into()),
             "secondary",
         )
-        .with_arbitration(crate::provider_stream::ProviderSourceArbitrationMode::FirstSeen)
+        .with_arbitration(provider_stream::ProviderSourceArbitrationMode::FirstSeen)
         .with_priority(300);
         let update = sample_provider_transaction_update();
         let update_a = update.clone().with_provider_source(source_a);
@@ -4894,21 +4865,17 @@ mod tests {
 
     #[test]
     fn provider_replay_dedupe_promotes_higher_priority_source() {
-        let source_a = crate::provider_stream::ProviderSourceIdentity::new(
-            crate::provider_stream::ProviderSourceId::Generic("source-a".to_owned().into()),
+        let source_a = provider_stream::ProviderSourceIdentity::new(
+            provider_stream::ProviderSourceId::Generic("source-a".to_owned().into()),
             "fallback",
         )
-        .with_arbitration(
-            crate::provider_stream::ProviderSourceArbitrationMode::FirstSeenThenPromote,
-        )
+        .with_arbitration(provider_stream::ProviderSourceArbitrationMode::FirstSeenThenPromote)
         .with_priority(100);
-        let source_b = crate::provider_stream::ProviderSourceIdentity::new(
-            crate::provider_stream::ProviderSourceId::Generic("source-b".to_owned().into()),
+        let source_b = provider_stream::ProviderSourceIdentity::new(
+            provider_stream::ProviderSourceId::Generic("source-b".to_owned().into()),
             "primary",
         )
-        .with_arbitration(
-            crate::provider_stream::ProviderSourceArbitrationMode::FirstSeenThenPromote,
-        )
+        .with_arbitration(provider_stream::ProviderSourceArbitrationMode::FirstSeenThenPromote)
         .with_priority(300);
         let update = sample_provider_transaction_update();
         let update_a = update.clone().with_provider_source(source_a);
@@ -4987,12 +4954,12 @@ mod tests {
 
     #[test]
     fn provider_replay_dedupe_keeps_same_control_plane_update_from_distinct_sources() {
-        let source_a = crate::provider_stream::ProviderSourceIdentity::new(
-            crate::provider_stream::ProviderSourceId::YellowstoneGrpcSlots,
+        let source_a = provider_stream::ProviderSourceIdentity::new(
+            provider_stream::ProviderSourceId::YellowstoneGrpcSlots,
             "yellowstone-slot-1",
         );
-        let source_b = crate::provider_stream::ProviderSourceIdentity::new(
-            crate::provider_stream::ProviderSourceId::YellowstoneGrpcSlots,
+        let source_b = provider_stream::ProviderSourceIdentity::new(
+            provider_stream::ProviderSourceId::YellowstoneGrpcSlots,
             "yellowstone-slot-2",
         );
         let update = sample_provider_recent_blockhash_update(42);
@@ -5024,12 +4991,12 @@ mod tests {
 
     #[test]
     fn provider_replay_dedupe_keeps_same_transaction_view_batch_from_distinct_sources() {
-        let source_a = crate::provider_stream::ProviderSourceIdentity::new(
-            crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
+        let source_a = provider_stream::ProviderSourceIdentity::new(
+            provider_stream::ProviderSourceId::YellowstoneGrpc,
             "yellowstone-view-batch-1",
         );
-        let source_b = crate::provider_stream::ProviderSourceIdentity::new(
-            crate::provider_stream::ProviderSourceId::LaserStream,
+        let source_b = provider_stream::ProviderSourceIdentity::new(
+            provider_stream::ProviderSourceId::LaserStream,
             "laserstream-view-batch-1",
         );
         let update = sample_provider_transaction_view_batch_update(42);
@@ -5044,8 +5011,8 @@ mod tests {
     #[test]
     fn built_in_provider_mode_rejects_mismatched_source_kind() {
         let update = sample_provider_transaction_update().with_provider_source(
-            crate::provider_stream::ProviderSourceIdentity::new(
-                crate::provider_stream::ProviderSourceId::LaserStream,
+            provider_stream::ProviderSourceIdentity::new(
+                provider_stream::ProviderSourceId::LaserStream,
                 "laserstream-1",
             ),
         );
@@ -5292,12 +5259,12 @@ mod tests {
         dispatch_provider_stream_update(
             &plugin_host,
             &derived_state_host,
-            sample_provider_account_update(79, crate::event::TxCommitmentStatus::Finalized),
+            sample_provider_account_update(79, TxCommitmentStatus::Finalized),
         );
         dispatch_provider_stream_update(
             &plugin_host,
             &derived_state_host,
-            sample_provider_account_update(80, crate::event::TxCommitmentStatus::Confirmed),
+            sample_provider_account_update(80, TxCommitmentStatus::Confirmed),
         );
 
         let events = events
@@ -5318,12 +5285,9 @@ mod tests {
         assert_eq!(event.slot, 79);
         assert_eq!(
             event.kind,
-            crate::framework::RootedAccountObservedKind::VoteAccount
+            framework::RootedAccountObservedKind::VoteAccount
         );
-        assert_eq!(
-            event.commitment_status,
-            crate::event::TxCommitmentStatus::Finalized
-        );
+        assert_eq!(event.commitment_status, TxCommitmentStatus::Finalized);
     }
 
     #[tokio::test]
@@ -5346,7 +5310,7 @@ mod tests {
                         counter: Arc::clone(&extension_counter),
                     })
                     .build();
-                let (_tx, rx) = crate::provider_stream::create_provider_stream_queue(1);
+                let (_tx, rx) = provider_stream::create_provider_stream_queue(1);
 
                 let result = run_provider_stream_runtime(
                     plugin_host,
@@ -5377,7 +5341,7 @@ mod tests {
             .add_plugin(TransactionOnlyPlugin)
             .build();
         let extension_host = RuntimeExtensionHost::builder().build();
-        let (tx, rx) = crate::provider_stream::create_provider_stream_queue(1);
+        let (tx, rx) = provider_stream::create_provider_stream_queue(1);
         drop(tx);
 
         let result = run_provider_stream_runtime(
@@ -5408,16 +5372,16 @@ mod tests {
             .add_plugin(TransactionOnlyPlugin)
             .build();
         let extension_host = RuntimeExtensionHost::builder().build();
-        let (tx, rx) = crate::provider_stream::create_provider_stream_queue(4);
+        let (tx, rx) = provider_stream::create_provider_stream_queue(4);
         tx.send(
-            crate::provider_stream::ProviderSourceHealthEvent {
-                source: crate::provider_stream::ProviderSourceIdentity::new(
-                    crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
+            provider_stream::ProviderSourceHealthEvent {
+                source: provider_stream::ProviderSourceIdentity::new(
+                    provider_stream::ProviderSourceId::YellowstoneGrpc,
                     "yellowstone-grpc-1",
                 ),
-                readiness: crate::provider_stream::ProviderSourceReadiness::Required,
-                status: crate::provider_stream::ProviderSourceHealthStatus::Reconnecting,
-                reason: crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
+                readiness: provider_stream::ProviderSourceReadiness::Required,
+                status: provider_stream::ProviderSourceHealthStatus::Reconnecting,
+                reason: provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
                 message: "upstream stalled".to_owned(),
             }
             .into(),
@@ -5444,18 +5408,18 @@ mod tests {
                 assert_eq!(degraded_sources.len(), 1);
                 assert_eq!(
                     degraded_sources[0].source,
-                    crate::provider_stream::ProviderSourceIdentity::new(
-                        crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
+                    provider_stream::ProviderSourceIdentity::new(
+                        provider_stream::ProviderSourceId::YellowstoneGrpc,
                         "yellowstone-grpc-1",
                     )
                 );
                 assert_eq!(
                     degraded_sources[0].status,
-                    crate::provider_stream::ProviderSourceHealthStatus::Reconnecting
+                    provider_stream::ProviderSourceHealthStatus::Reconnecting
                 );
                 assert_eq!(
                     degraded_sources[0].reason,
-                    crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure
+                    provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure
                 );
                 assert_eq!(degraded_sources[0].message, "upstream stalled");
             }
@@ -5469,20 +5433,17 @@ mod tests {
             .add_plugin(TransactionOnlyPlugin)
             .build();
         let extension_host = RuntimeExtensionHost::builder().build();
-        let (tx, rx) = crate::provider_stream::create_provider_stream_queue(4);
+        let (tx, rx) = provider_stream::create_provider_stream_queue(4);
         for instance in ["ws-tx-1", "ws-tx-2"] {
             tx.send(
-                crate::provider_stream::ProviderSourceHealthEvent {
-                    source: crate::provider_stream::ProviderSourceIdentity::new(
-                        crate::provider_stream::ProviderSourceId::Generic(
-                            instance.to_owned().into(),
-                        ),
+                provider_stream::ProviderSourceHealthEvent {
+                    source: provider_stream::ProviderSourceIdentity::new(
+                        provider_stream::ProviderSourceId::Generic(instance.to_owned().into()),
                         instance,
                     ),
-                    readiness: crate::provider_stream::ProviderSourceReadiness::Required,
-                    status: crate::provider_stream::ProviderSourceHealthStatus::Reconnecting,
-                    reason:
-                        crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
+                    readiness: provider_stream::ProviderSourceReadiness::Required,
+                    status: provider_stream::ProviderSourceHealthStatus::Reconnecting,
+                    reason: provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
                     message: format!("{instance} stalled"),
                 }
                 .into(),
@@ -5530,7 +5491,7 @@ mod tests {
                     .add_plugin(TransactionOnlyPlugin)
                     .build();
                 let extension_host = RuntimeExtensionHost::builder().build();
-                let (tx, rx) = crate::provider_stream::create_provider_stream_queue(1);
+                let (tx, rx) = provider_stream::create_provider_stream_queue(1);
                 drop(tx);
 
                 let result = run_provider_stream_runtime(
@@ -5564,18 +5525,19 @@ mod tests {
                     .add_plugin(TransactionOnlyPlugin)
                     .build();
                 let extension_host = RuntimeExtensionHost::builder().build();
-                let (tx, rx) = crate::provider_stream::create_provider_stream_queue(4);
+                let (tx, rx) = provider_stream::create_provider_stream_queue(4);
                 tx.send(
-                    crate::provider_stream::ProviderSourceHealthEvent {
-                        source: crate::provider_stream::ProviderSourceIdentity::new(
-                            crate::provider_stream::ProviderSourceId::Generic(
+                    provider_stream::ProviderSourceHealthEvent {
+                        source: provider_stream::ProviderSourceIdentity::new(
+                            provider_stream::ProviderSourceId::Generic(
                                 "generic_source".to_owned().into(),
                             ),
                             "generic_source",
                         ),
-                        readiness: crate::provider_stream::ProviderSourceReadiness::Required,
-                        status: crate::provider_stream::ProviderSourceHealthStatus::Reconnecting,
-                        reason: crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
+                        readiness: provider_stream::ProviderSourceReadiness::Required,
+                        status: provider_stream::ProviderSourceHealthStatus::Reconnecting,
+                        reason:
+                            provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
                         message: "upstream stalled".to_owned(),
                     }
                     .into(),
@@ -5595,10 +5557,12 @@ mod tests {
                 .await;
 
                 match result {
-                    Err(RuntimeError::ProviderStream(ProviderStreamRuntimeError::IngressClosed {
-                        mode,
-                        degraded_sources,
-                    })) => {
+                    Err(RuntimeError::ProviderStream(
+                        ProviderStreamRuntimeError::IngressClosed {
+                            mode,
+                            degraded_sources,
+                        },
+                    )) => {
                         assert_eq!(mode, ProviderStreamMode::Generic);
                         assert_eq!(degraded_sources.len(), 1);
                         assert_eq!(degraded_sources[0].source.instance_str(), "generic_source");

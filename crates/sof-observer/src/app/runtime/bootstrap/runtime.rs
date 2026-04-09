@@ -1,4 +1,8 @@
 use super::*;
+#[cfg(feature = "gossip-bootstrap")]
+use crate::{
+    app::runtime::bootstrap::gossip::stop_gossip_runtime_components, repair::GossipRepairClient,
+};
 
 pub(in crate::app::runtime) struct ReceiverRuntime {
     pub(in crate::app::runtime) static_receiver_handles: Vec<JoinHandle<()>>,
@@ -18,7 +22,7 @@ pub(in crate::app::runtime) struct ReceiverRuntime {
     #[cfg(feature = "gossip-bootstrap")]
     pub(in crate::app::runtime) gossip_runtime_active_port_range: Option<PortRange>,
     #[cfg(feature = "gossip-bootstrap")]
-    pub(in crate::app::runtime) repair_client: Option<crate::repair::GossipRepairClient>,
+    pub(in crate::app::runtime) repair_client: Option<GossipRepairClient>,
     pub(in crate::app::runtime) tx_event_rx: mpsc::Receiver<TxObservedEvent>,
 }
 
@@ -88,7 +92,7 @@ impl ReceiverRuntime {
         &mut self,
         receiver_handles: Vec<JoinHandle<()>>,
         runtime: GossipRuntime,
-        repair_client: Option<crate::repair::GossipRepairClient>,
+        repair_client: Option<GossipRepairClient>,
         active_entrypoint: Option<String>,
         active_port_range: Option<PortRange>,
     ) {
@@ -110,11 +114,7 @@ impl ReceiverRuntime {
     pub(in crate::app::runtime) async fn stop_gossip_runtime(&mut self) {
         let mut handles = Vec::new();
         handles.append(&mut self.gossip_receiver_handles);
-        crate::app::runtime::bootstrap::gossip::stop_gossip_runtime_components(
-            handles,
-            self.gossip_runtime.take(),
-        )
-        .await;
+        stop_gossip_runtime_components(handles, self.gossip_runtime.take()).await;
         self.gossip_ingest_telemetry = None;
         self.repair_client = None;
         self.active_gossip_entrypoint = None;
