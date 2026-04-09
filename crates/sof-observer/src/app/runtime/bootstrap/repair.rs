@@ -1,6 +1,8 @@
 #[cfg(feature = "gossip-bootstrap")]
 use super::*;
 #[cfg(feature = "gossip-bootstrap")]
+use crate::repair::{GossipRepairClient, RepairPeerSnapshot, ServedRepairRequest};
+#[cfg(feature = "gossip-bootstrap")]
 use tokio::sync::oneshot;
 
 #[cfg(feature = "gossip-bootstrap")]
@@ -44,7 +46,7 @@ pub(crate) enum RepairOutcome {
     },
     ServeRequestHandled {
         source: SocketAddr,
-        request: crate::repair::ServedRepairRequest,
+        request: ServedRepairRequest,
     },
     ServeRequestError {
         source: SocketAddr,
@@ -63,7 +65,7 @@ pub(crate) enum RepairDriverStartError {
 type RepairDriverParts = (
     mpsc::Sender<RepairCommand>,
     mpsc::Receiver<RepairOutcome>,
-    ArcShift<crate::repair::RepairPeerSnapshot>,
+    ArcShift<RepairPeerSnapshot>,
     RepairDriverHandle,
 );
 
@@ -196,7 +198,7 @@ pub(crate) fn flush_repair_source_hints(
 
 #[cfg(feature = "gossip-bootstrap")]
 pub(crate) fn spawn_repair_driver(
-    mut repair_client: crate::repair::GossipRepairClient,
+    mut repair_client: GossipRepairClient,
     relay_cache: Option<SharedRelayCache>,
 ) -> Result<RepairDriverParts, RepairDriverStartError> {
     let (command_tx, mut command_rx) =

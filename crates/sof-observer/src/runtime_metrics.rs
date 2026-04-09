@@ -1,3 +1,5 @@
+use crate::app::state::ShredDedupeStage;
+use crate::framework::host::TransactionDispatchMetricsBatch;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// One cache-line-aligned runtime counter to reduce false sharing across workers.
@@ -1019,17 +1021,13 @@ pub(crate) fn set_shred_dedupe_metrics(
 }
 
 /// Adds semantic shred dedupe drops for one pipeline stage.
-pub(crate) fn observe_shred_dedupe_drops(
-    stage: crate::app::state::ShredDedupeStage,
-    duplicates: u64,
-    conflicts: u64,
-) {
+pub(crate) fn observe_shred_dedupe_drops(stage: ShredDedupeStage, duplicates: u64, conflicts: u64) {
     match stage {
-        crate::app::state::ShredDedupeStage::Ingress => {
+        ShredDedupeStage::Ingress => {
             SHRED_DEDUPE_INGRESS_DUPLICATE_DROPS_TOTAL.fetch_add(duplicates, Ordering::Relaxed);
             SHRED_DEDUPE_INGRESS_CONFLICT_DROPS_TOTAL.fetch_add(conflicts, Ordering::Relaxed);
         }
-        crate::app::state::ShredDedupeStage::Canonical => {
+        ShredDedupeStage::Canonical => {
             SHRED_DEDUPE_CANONICAL_DUPLICATE_DROPS_TOTAL.fetch_add(duplicates, Ordering::Relaxed);
             SHRED_DEDUPE_CANONICAL_CONFLICT_DROPS_TOTAL.fetch_add(conflicts, Ordering::Relaxed);
         }
@@ -1359,9 +1357,7 @@ fn observe_max_counter(counter: &CacheAlignedAtomicU64, value: u64) {
 }
 
 /// Applies one batch of queued transaction-dispatch metrics to the runtime counters.
-pub(crate) fn observe_transaction_dispatch_metrics_batch(
-    batch: &crate::framework::host::TransactionDispatchMetricsBatch,
-) {
+pub(crate) fn observe_transaction_dispatch_metrics_batch(batch: &TransactionDispatchMetricsBatch) {
     if batch.visibility_samples_total != 0 {
         TRANSACTION_PLUGIN_VISIBILITY_SAMPLES_TOTAL
             .fetch_add(batch.visibility_samples_total, Ordering::Relaxed);

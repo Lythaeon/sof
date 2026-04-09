@@ -1,5 +1,5 @@
 use super::*;
-use std::sync::OnceLock;
+use std::{borrow::Cow, sync::OnceLock, time::Instant};
 
 use crate::{
     framework::{
@@ -33,9 +33,9 @@ pub(in crate::app::runtime) struct DatasetProcessInput {
     pub(in crate::app::runtime) start_index: u32,
     pub(in crate::app::runtime) end_index: u32,
     pub(in crate::app::runtime) last_in_slot: bool,
-    pub(in crate::app::runtime) completed_at: std::time::Instant,
-    pub(in crate::app::runtime) first_shred_observed_at: std::time::Instant,
-    pub(in crate::app::runtime) last_shred_observed_at: std::time::Instant,
+    pub(in crate::app::runtime) completed_at: Instant,
+    pub(in crate::app::runtime) first_shred_observed_at: Instant,
+    pub(in crate::app::runtime) last_shred_observed_at: Instant,
     pub(in crate::app::runtime) payload_fragments: PayloadFragmentBatch,
 }
 
@@ -302,7 +302,7 @@ pub(in crate::app::runtime) fn process_completed_dataset(
         for (dataset_tx_offset, tx) in flat_transactions.iter().enumerate() {
             let dataset_tx_offset = u32::try_from(dataset_tx_offset).unwrap_or(u32::MAX);
             process_decoded_transaction(
-                std::borrow::Cow::Borrowed(tx),
+                Cow::Borrowed(tx),
                 dataset_tx_offset,
                 &process_config,
                 &mut process_state,
@@ -316,7 +316,7 @@ pub(in crate::app::runtime) fn process_completed_dataset(
         {
             let dataset_tx_offset = u32::try_from(dataset_tx_offset).unwrap_or(u32::MAX);
             process_decoded_transaction(
-                std::borrow::Cow::Owned(tx),
+                Cow::Owned(tx),
                 dataset_tx_offset,
                 &process_config,
                 &mut process_state,
@@ -488,7 +488,7 @@ pub(in crate::app::runtime) fn process_completed_dataset_inline_transactions(
     {
         let dataset_tx_offset = u32::try_from(dataset_tx_offset).unwrap_or(u32::MAX);
         process_decoded_transaction(
-            std::borrow::Cow::Owned(tx),
+            Cow::Owned(tx),
             dataset_tx_offset,
             &process_config,
             &mut process_state,
@@ -860,14 +860,14 @@ struct ProcessDecodedTransactionState<'derived> {
 }
 
 fn process_decoded_transaction(
-    tx: std::borrow::Cow<'_, VersionedTransaction>,
+    tx: Cow<'_, VersionedTransaction>,
     dataset_tx_offset: u32,
     config: &ProcessDecodedTransactionConfig<'_, '_>,
     state: &mut ProcessDecodedTransactionState<'_>,
 ) {
     let tx_ref: &VersionedTransaction = match &tx {
-        std::borrow::Cow::Borrowed(tx) => tx,
-        std::borrow::Cow::Owned(tx) => tx,
+        Cow::Borrowed(tx) => tx,
+        Cow::Owned(tx) => tx,
     };
     if state.observed_recent_blockhash.is_none() {
         *state.observed_recent_blockhash = Some(tx_ref.message.recent_blockhash().to_bytes());
@@ -977,8 +977,8 @@ fn process_decoded_transaction(
                     signature: signature_bytes_opt(signature),
                     provider_source: None,
                     tx: Arc::new(match tx {
-                        std::borrow::Cow::Borrowed(tx) => tx.clone(),
-                        std::borrow::Cow::Owned(tx) => tx,
+                        Cow::Borrowed(tx) => tx.clone(),
+                        Cow::Owned(tx) => tx,
                     }),
                     kind,
                 }
@@ -1101,7 +1101,7 @@ struct ViewOnlyDatasetProcessInput {
     start_index: u32,
     end_index: u32,
     last_in_slot: bool,
-    completed_at: std::time::Instant,
+    completed_at: Instant,
     shred_count: usize,
     confirmed_slot: Option<u64>,
     finalized_slot: Option<u64>,
@@ -1115,9 +1115,9 @@ struct PrefilteredDatasetProcessInput {
     start_index: u32,
     end_index: u32,
     last_in_slot: bool,
-    completed_at: std::time::Instant,
-    first_shred_observed_at: std::time::Instant,
-    last_shred_observed_at: std::time::Instant,
+    completed_at: Instant,
+    first_shred_observed_at: Instant,
+    last_shred_observed_at: Instant,
     shred_count: usize,
     confirmed_slot: Option<u64>,
     finalized_slot: Option<u64>,

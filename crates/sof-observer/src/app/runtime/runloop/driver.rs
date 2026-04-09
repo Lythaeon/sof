@@ -9,7 +9,9 @@ use super::packet_workers::{
 use super::*;
 #[cfg(feature = "gossip-bootstrap")]
 use crate::app::runtime::bootstrap::gossip::GossipEntrypointBias;
-use crate::framework::host::TransactionDispatchScope;
+use crate::app::state::{ForkTrackerSnapshot, ShredDedupeCacheMetrics};
+use crate::event::ForkSlotStatus;
+use crate::framework::host::{ClassifiedTransactionDispatch, TransactionDispatchScope};
 use crate::framework::{
     SerializedTransactionRange, TransactionEvent, events::TransactionEventRef, signature_bytes_opt,
 };
@@ -21,6 +23,8 @@ use crate::repair::{
 use crate::runtime::ShredTrustMode;
 #[cfg(all(feature = "kernel-bypass", feature = "gossip-bootstrap"))]
 use crate::runtime_env;
+#[cfg(feature = "gossip-bootstrap")]
+use crate::verify::SlotLeaderDiff;
 use crate::{app::runtime::dataset, framework, reassembly, runtime_metrics};
 use agave_transaction_view::transaction_view::SanitizedTransactionView;
 use crossbeam_channel::Sender as CrossbeamSender;
@@ -30,8 +34,11 @@ use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 #[cfg(feature = "gossip-bootstrap")]
 use std::collections::{HashMap, VecDeque};
+#[cfg(feature = "gossip-bootstrap")]
+use std::net::UdpSocket;
 use std::{
     future::Future,
+    mem::{replace, take},
     net::{IpAddr, Ipv4Addr},
     pin::Pin,
     sync::{
@@ -411,9 +418,7 @@ impl DeferredControlPlaneEvent {
     }
 }
 
-const fn feed_watermarks_from_fork_snapshot(
-    snapshot: crate::app::state::ForkTrackerSnapshot,
-) -> FeedWatermarks {
+const fn feed_watermarks_from_fork_snapshot(snapshot: ForkTrackerSnapshot) -> FeedWatermarks {
     FeedWatermarks {
         canonical_tip_slot: snapshot.tip_slot,
         processed_slot: snapshot.tip_slot,
@@ -424,7 +429,7 @@ const fn feed_watermarks_from_fork_snapshot(
 
 fn emit_shutdown_checkpoint_barrier(
     derived_state_host: &DerivedStateHost,
-    fork_snapshot: crate::app::state::ForkTrackerSnapshot,
+    fork_snapshot: ForkTrackerSnapshot,
 ) {
     derived_state_host
         .emit_shutdown_checkpoint_barrier(feed_watermarks_from_fork_snapshot(fork_snapshot));
@@ -1479,8 +1484,8 @@ async fn run_async_with_hosts_inner(
     let mut dataset_workers_shutdown = false;
     let mut tx_events_closed = false;
     #[cfg(feature = "gossip-bootstrap")]
-    let udp_relay_socket: Option<std::net::UdpSocket> = if udp_relay_enabled {
-        match std::net::UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)) {
+    let udp_relay_socket: Option<UdpSocket> = if udp_relay_enabled {
+        match UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)) {
             Ok(socket) => match socket.set_nonblocking(true) {
                 Ok(()) => Some(socket),
                 Err(error) => {
@@ -4436,7 +4441,7 @@ impl PacketWorkerResultContext<'_> {
     fn process_open_inline_dataset(&mut self, slot: u64) {
         struct PreparedInlineTx {
             tx: Arc<VersionedTransaction>,
-            dispatch: crate::framework::host::ClassifiedTransactionDispatch,
+            dispatch: ClassifiedTransactionDispatch,
             kind: dataset::TxKind,
             signature: Option<Signature>,
             tx_ready_observed_at: Instant,
@@ -4645,7 +4650,7 @@ impl PacketWorkerResultContext<'_> {
     #[cfg(feature = "gossip-bootstrap")]
     fn emit_leader_events(
         &mut self,
-        leader_diff: crate::verify::SlotLeaderDiff,
+        leader_diff: SlotLeaderDiff,
         observed_slot_leaders: Vec<(u64, [u8; 32])>,
     ) {
         if !self.plugin_host.wants_leader_schedule() && !self.derived_state_hooks_enabled {
@@ -4822,7 +4827,7 @@ impl PacketBatchDispatchScratch {
         let Some(batch) = self.worker_batches.get_mut(worker_index) else {
             return Vec::new();
         };
-        std::mem::take(batch)
+        take(batch)
     }
 
     /// Recycles one drained worker batch back into retained scratch storage.
@@ -4883,10 +4888,10 @@ fn dispatch_packet_worker_burst(
 fn take_next_packet_worker_batch_chunk<T>(packets: &mut Vec<T>, max_packets: usize) -> Vec<T> {
     let max_packets = max_packets.max(1);
     if packets.len() <= max_packets {
-        return std::mem::take(packets);
+        return take(packets);
     }
     let tail = packets.split_off(max_packets);
-    std::mem::replace(packets, tail)
+    replace(packets, tail)
 }
 
 fn select_least_loaded_worker(worker_loads: &[u64], preferred_worker: usize) -> usize {
@@ -4936,10 +4941,7 @@ fn combine_packet_worker_pressure_into(
 }
 
 fn sync_shred_dedupe_runtime_metrics(cache: Option<&ShredDedupeCache>) {
-    let metrics = cache.map_or_else(
-        crate::app::state::ShredDedupeCacheMetrics::default,
-        ShredDedupeCache::metrics,
-    );
+    let metrics = cache.map_or_else(ShredDedupeCacheMetrics::default, ShredDedupeCache::metrics);
     runtime_metrics::set_shred_dedupe_metrics(
         metrics.entries,
         metrics.max_entries,
@@ -5004,7 +5006,7 @@ fn apply_fork_update(update: &ForkTrackerUpdate, context: &mut ForkUpdateDispatc
     let plugin_slot_status_enabled = context.plugin_host.wants_slot_status();
     let derived_slot_status_enabled = context.derived_state_hooks_enabled;
     for transition in &update.status_transitions {
-        if transition.status == crate::event::ForkSlotStatus::Orphaned {
+        if transition.status == ForkSlotStatus::Orphaned {
             *context.fork_orphaned_slots_total =
                 context.fork_orphaned_slots_total.saturating_add(1);
         }
@@ -5666,14 +5668,8 @@ mod tests {
                 .expect("load shed should activate");
         assert!(active);
         assert_eq!(selected.len(), 2);
-        assert_eq!(
-            selected[0],
-            "10.0.0.1".parse::<std::net::IpAddr>().expect("ip")
-        );
-        assert_eq!(
-            selected[1],
-            "10.0.0.2".parse::<std::net::IpAddr>().expect("ip")
-        );
+        assert_eq!(selected[0], "10.0.0.1".parse::<IpAddr>().expect("ip"));
+        assert_eq!(selected[1], "10.0.0.2".parse::<IpAddr>().expect("ip"));
 
         let selected_after_hysteresis =
             select_gossip_load_shed_source_ips(&mut tracker, now, 60, &mut active, 100, 2)
@@ -5699,7 +5695,7 @@ mod tests {
 
         emit_shutdown_checkpoint_barrier(
             &host,
-            crate::app::state::ForkTrackerSnapshot {
+            ForkTrackerSnapshot {
                 tracked_slots: 4,
                 tip_slot: Some(88),
                 confirmed_slot: Some(80),
