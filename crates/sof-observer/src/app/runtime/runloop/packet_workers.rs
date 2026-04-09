@@ -8,7 +8,7 @@ use crate::runtime_metrics::{
 };
 #[cfg(feature = "gossip-bootstrap")]
 use crate::verify::SlotLeaderDiff;
-use std::{mem, sync::atomic::AtomicBool};
+use std::{env, mem, sync::atomic::AtomicBool};
 
 #[derive(Debug)]
 pub(super) struct PacketWorkerInput {
@@ -526,8 +526,8 @@ where
                     parsed_header_slot(&packet.parsed_header),
                     &mut observed_slot_leaders,
                 );
-                let recovered_packets = fec_recoverer
-                    .ingest_packet(packet.packet_bytes.as_ref(), &packet.parsed_header);
+                let recovered_packets =
+                    fec_recoverer.ingest_packet(&packet.packet_bytes, &packet.parsed_header);
                 push_primary_shred(packet, &mut accepted_shreds);
 
                 for recovered in recovered_packets {
@@ -948,10 +948,15 @@ mod tests {
         ]
     }
 
+    fn avg_ns_per_iteration(elapsed: Duration, iterations: usize) -> u128 {
+        let iterations = u128::try_from(iterations.max(1)).unwrap_or(1);
+        elapsed.as_nanos().checked_div(iterations).unwrap_or(0)
+    }
+
     #[test]
     #[ignore = "profiling fixture for packet worker primary FEC ingest"]
     fn packet_worker_primary_fec_profile_fixture() {
-        let iterations = std::env::var("SOF_PACKET_WORKER_FEC_PROFILE_ITERS")
+        let iterations = env::var("SOF_PACKET_WORKER_FEC_PROFILE_ITERS")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
             .filter(|value| *value > 0)
@@ -1013,7 +1018,7 @@ mod tests {
     #[test]
     #[ignore = "profiling fixture for packet worker FEC recovery"]
     fn packet_worker_recovery_fec_profile_fixture() {
-        let iterations = std::env::var("SOF_PACKET_WORKER_FEC_RECOVERY_PROFILE_ITERS")
+        let iterations = env::var("SOF_PACKET_WORKER_FEC_RECOVERY_PROFILE_ITERS")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
             .filter(|value| *value > 0)

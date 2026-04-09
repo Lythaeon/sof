@@ -13,6 +13,7 @@ pub(super) fn recover_missing_data(
     set: &mut ErasureSet,
     fec_set_index: u32,
     reed_solomon_cache: &mut HashMap<(usize, usize), ReedSolomon>,
+    recovery_scratch: &mut RecoveryScratch,
 ) -> Option<Vec<RecoveredDataPacket>> {
     let config = set.config?;
     let variant = set.variant?;
@@ -22,9 +23,10 @@ pub(super) fn recover_missing_data(
 
     let _ = coding_erasure_shard_len(variant)?;
     let total = config.num_data.checked_add(config.num_coding)?;
-    let mut shards: Vec<Option<Vec<u8>>> = vec![None; total];
+    recovery_scratch.prepare(total, config.num_data);
+    let shards = &mut recovery_scratch.shards;
     let mut present = 0_usize;
-    let mut data_present = vec![false; config.num_data];
+    let data_present = &mut recovery_scratch.data_present;
 
     for (&index, shard) in &set.data_shards {
         let Some(position) = index.checked_sub(fec_set_index) else {
@@ -45,7 +47,10 @@ pub(super) fn recover_missing_data(
             continue;
         }
         if let Some(shard_slot) = shards.get_mut(position) {
-            *shard_slot = Some(shard.clone());
+            let Some(bytes) = shard.to_owned_vec() else {
+                continue;
+            };
+            *shard_slot = Some(bytes);
         } else {
             continue;
         }
@@ -82,12 +87,12 @@ pub(super) fn recover_missing_data(
         let _ = vacant.insert(reed_solomon);
     }
     let reed_solomon = reed_solomon_cache.get(&key)?;
-    if reed_solomon.reconstruct(&mut shards).is_err() {
+    if reed_solomon.reconstruct(shards).is_err() {
         return None;
     }
 
     let mut recovered_payloads = Vec::new();
-    for (position, was_present) in data_present.into_iter().enumerate() {
+    for (position, was_present) in data_present.iter().copied().enumerate() {
         if was_present {
             continue;
         }

@@ -5512,6 +5512,7 @@ name = "sof"
 version = "0.18.1"
 dependencies = [
  "agave-transaction-view",
+ "ahash 0.8.12",
  "arcshift",
  "async-trait",
  "base64 0.22.1",
