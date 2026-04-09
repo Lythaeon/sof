@@ -256,6 +256,26 @@ impl PruneData {
         Cow::Owned(serialize(&data).expect("should serialize PruneData"))
     }
 
+    #[cfg(test)]
+    fn signable_data_with_prefix(&self) -> Cow<'_, [u8]> {
+        #[derive(Serialize)]
+        struct SignDataWithPrefix<'a> {
+            prefix: &'a [u8],
+            pubkey: &'a Pubkey,
+            prunes: &'a [Pubkey],
+            destination: &'a Pubkey,
+            wallclock: u64,
+        }
+        let data = SignDataWithPrefix {
+            prefix: PRUNE_DATA_PREFIX,
+            pubkey: &self.pubkey,
+            prunes: &self.prunes,
+            destination: &self.destination,
+            wallclock: self.wallclock,
+        };
+        Cow::Owned(serialize(&data).expect("should serialize PruneData"))
+    }
+
     fn verify_data(&self, use_prefix: bool) -> bool {
         let mut buffer = ArrayVec::<u8, PACKET_DATA_SIZE>::new();
         let result = if !use_prefix {
@@ -833,7 +853,7 @@ pub(crate) mod tests {
 
         // Manually set the signature with prefixed data
         let prefixed_data = prune_data.signable_data_with_prefix();
-        let signature_with_prefix = keypair.sign_message(prefixed_data.borrow());
+        let signature_with_prefix = keypair.sign_message(prefixed_data.as_ref());
         prune_data.set_signature(signature_with_prefix);
 
         let is_valid = prune_data.verify();
@@ -859,7 +879,7 @@ pub(crate) mod tests {
 
         // Manually set the signature with prefixed, serialized data
         let prefixed_data = prune_data.signable_data_with_prefix();
-        let signature_with_prefix = keypair.sign_message(prefixed_data.borrow());
+        let signature_with_prefix = keypair.sign_message(prefixed_data.as_ref());
         prune_data.set_signature(signature_with_prefix);
 
         let is_valid_prefixed = prune_data.verify();

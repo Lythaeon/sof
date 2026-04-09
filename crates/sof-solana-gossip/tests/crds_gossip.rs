@@ -1,4 +1,5 @@
 #![allow(clippy::arithmetic_side_effects)]
+#![allow(deprecated)]
 use {
     bincode::serialized_size,
     itertools::Itertools,
@@ -313,13 +314,11 @@ fn network_simulator(thread_pool: &ThreadPool, network: &mut Network, max_conver
                 node_crds.get::<&ContactInfo>(node_pubkey).cloned().unwrap()
             };
             m.set_wallclock(now);
-            node.gossip.process_push_message(
-                vec![(
-                    Pubkey::default(),
-                    vec![CrdsValue::new(CrdsData::ContactInfo(m), &Keypair::new())],
-                )],
-                now,
-            );
+            let mut messages = vec![(
+                Pubkey::default(),
+                vec![CrdsValue::new(CrdsData::ContactInfo(m), &Keypair::new())],
+            )];
+            node.gossip.process_push_message(&mut messages, now);
         });
         // push for a bit
         let (queue_size, bytes_tx) = network_run_push(thread_pool, network, start, end);
@@ -395,11 +394,12 @@ fn network_run_push(
                         .map(CrdsValue::bincode_serialized_size)
                         .sum::<usize>();
                     num_msgs += 1;
+                    let mut push_messages = vec![(from, msgs.clone())];
                     let origins: HashSet<_> = network
                         .get(&to)
                         .unwrap()
                         .gossip
-                        .process_push_message(vec![(from, msgs.clone())], now)
+                        .process_push_message(&mut push_messages, now)
                         .into_iter()
                         .collect();
                     let prunes_map = network

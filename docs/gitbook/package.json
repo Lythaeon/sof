@@ -12,6 +12,6 @@
     "clean": "rm -rf _book"
   },
   "devDependencies": {
-    "honkit": "^6.1.6"
+    "honkit": "^6.1.7"
   }
 }

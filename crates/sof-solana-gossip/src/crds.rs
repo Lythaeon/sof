@@ -1334,7 +1334,7 @@ mod tests {
         assert_eq!(crds.get_shred_version(&pubkey), Some(8));
         // Remove the remaining entry with the same pubkey.
         crds.remove(&CrdsValueLabel::AccountsHashes(pubkey), timestamp());
-        assert_eq!(crds.get_records(&pubkey).count(), 0);
+        assert_eq!(crds.records.get(&pubkey), None);
         assert_eq!(crds.get_shred_version(&pubkey), None);
     }
 
