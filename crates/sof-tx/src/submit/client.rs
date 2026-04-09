@@ -627,20 +627,25 @@ impl TxSubmitClient {
         plan: SubmitPlan,
     ) -> Result<SubmitResult, SubmitError> {
         let legacy_mode = plan.legacy_mode();
+        let task_context = self.route_task_context();
+        let direct_transport = self.direct_transport.clone();
+        let leader_provider = self.leader_provider.clone();
+        let backups = self.backups.clone();
+        let policy = self.policy;
+        let direct_config = self.direct_config.clone().normalized();
         let (result_tx, mut result_rx) = mpsc::unbounded_channel();
         for (route_idx, route) in plan.routes.iter().copied().enumerate() {
-            let task_context = self.route_task_context();
+            let task_context = task_context.clone();
             let tx_bytes = Arc::clone(&tx_bytes);
             let result_tx = result_tx.clone();
             let telemetry = Arc::clone(&self.telemetry);
             let reporter = self.outcome_reporter.clone();
             let flow_safety_source = self.flow_safety_source.clone();
             let plan_for_task = plan.clone();
-            let direct_transport = self.direct_transport.clone();
-            let leader_provider = self.leader_provider.clone();
-            let backups = self.backups.clone();
-            let policy = self.policy;
-            let direct_config = self.direct_config.clone().normalized();
+            let direct_transport = direct_transport.clone();
+            let leader_provider = leader_provider.clone();
+            let backups = backups.clone();
+            let direct_config = direct_config.clone();
             tokio::spawn(async move {
                 let result = submit_one_route_task(
                     route,
