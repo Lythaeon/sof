@@ -1,16 +1,20 @@
 use super::*;
+use std::{net::SocketAddr, sync::Arc};
+
 use crate::{
     protocol::shred_wire::SIZE_OF_CODING_SHRED_PAYLOAD,
     relay::SharedRelayCache,
     shred::wire::{ParsedShredHeader, parse_shred_header},
 };
+use smallvec::SmallVec;
+use solana_gossip::contact_info::ContactInfo;
 use solana_keypair::signable::Signable;
 
 impl GossipRepairClient {
     pub fn new(
-        cluster_info: std::sync::Arc<ClusterInfo>,
+        cluster_info: Arc<ClusterInfo>,
         socket: UdpSocket,
-        keypair: std::sync::Arc<Keypair>,
+        keypair: Arc<Keypair>,
         config: GossipRepairClientConfig,
     ) -> Self {
         let now = Instant::now();
@@ -60,18 +64,9 @@ impl GossipRepairClient {
         (snapshot.total_candidates, snapshot.active_candidates)
     }
 
-    pub fn note_shred_source(&mut self, source_addr: std::net::SocketAddr) -> usize {
+    pub fn note_shred_source(&mut self, source_addr: SocketAddr) -> usize {
         let mut updated = 0_usize;
-        let mut seen = HashSet::new();
-        if let Some(pubkey) = self.addr_to_pubkey.get(&source_addr).copied() {
-            let _ = seen.insert(pubkey);
-        }
-        if let Some(pubkeys) = self.ip_to_pubkeys.get(&source_addr.ip()) {
-            for pubkey in pubkeys {
-                let _ = seen.insert(*pubkey);
-            }
-        }
-        for pubkey in seen {
+        for pubkey in self.source_pubkeys(source_addr) {
             self.peer_scores
                 .entry(pubkey)
                 .or_default()
@@ -81,19 +76,10 @@ impl GossipRepairClient {
         updated
     }
 
-    pub fn note_shred_sources(&mut self, source_addrs: &[(std::net::SocketAddr, u16)]) -> usize {
+    pub fn note_shred_sources(&mut self, source_addrs: &[(SocketAddr, u16)]) -> usize {
         let mut updated = 0_usize;
         for (source_addr, hits) in source_addrs.iter().copied() {
-            let mut seen = HashSet::new();
-            if let Some(pubkey) = self.addr_to_pubkey.get(&source_addr).copied() {
-                let _ = seen.insert(pubkey);
-            }
-            if let Some(pubkeys) = self.ip_to_pubkeys.get(&source_addr.ip()) {
-                for pubkey in pubkeys {
-                    let _ = seen.insert(*pubkey);
-                }
-            }
-            for pubkey in seen {
+            for pubkey in self.source_pubkeys(source_addr) {
                 self.peer_scores
                     .entry(pubkey)
                     .or_default()
@@ -104,12 +90,27 @@ impl GossipRepairClient {
         updated
     }
 
+    fn source_pubkeys(&self, source_addr: SocketAddr) -> SmallVec<[Pubkey; 4]> {
+        let mut seen = SmallVec::<[Pubkey; 4]>::new();
+        if let Some(pubkey) = self.addr_to_pubkey.get(&source_addr).copied() {
+            seen.push(pubkey);
+        }
+        if let Some(pubkeys) = self.ip_to_pubkeys.get(&source_addr.ip()) {
+            for &pubkey in pubkeys {
+                if !seen.contains(&pubkey) {
+                    seen.push(pubkey);
+                }
+            }
+        }
+        seen
+    }
+
     pub async fn request_missing_shred(
         &mut self,
         slot: u64,
         index: u32,
         kind: MissingShredRequestKind,
-    ) -> Result<Option<std::net::SocketAddr>, GossipRepairClientError> {
+    ) -> Result<Option<SocketAddr>, GossipRepairClientError> {
         let Some(peer) = self.pick_peer(slot, index) else {
             return Ok(None);
         };
@@ -152,7 +153,7 @@ impl GossipRepairClient {
     pub async fn maybe_handle_response_ping(
         &mut self,
         packet: &[u8],
-        from_addr: std::net::SocketAddr,
+        from_addr: SocketAddr,
     ) -> Result<bool, GossipRepairClientError> {
         if !is_repair_response_ping_packet(packet) {
             return Ok(false);
@@ -179,7 +180,7 @@ impl GossipRepairClient {
     pub async fn maybe_serve_repair_request(
         &mut self,
         packet: &[u8],
-        from_addr: std::net::SocketAddr,
+        from_addr: SocketAddr,
         relay_cache: Option<&SharedRelayCache>,
     ) -> Result<Option<ServedRepairRequest>, GossipRepairClientError> {
         let Some(request) = parse_signed_repair_request(
@@ -323,7 +324,6 @@ impl GossipRepairClient {
 
     fn refresh_peers(&mut self, slot: u64) {
         self.decay_peer_scores();
-        self.refresh_stake_map();
         self.peers_by_slot
             .retain(|_, cached| cached.updated_at.elapsed() < self.peer_cache_ttl);
         self.sticky_peer_by_slot.retain(|slot_key, sticky| {
@@ -355,7 +355,9 @@ impl GossipRepairClient {
         if !should_refresh {
             return;
         }
-        let mut candidates = self.collect_candidate_peers(slot);
+        let all_peers = self.cluster_info.all_peers();
+        self.refresh_stake_map(&all_peers);
+        let mut candidates = self.collect_candidate_peers(slot, &all_peers);
         let total_candidates = candidates.len();
         candidates.sort_unstable_by(|left, right| {
             self.score_for(right.pubkey)
@@ -387,7 +389,7 @@ impl GossipRepairClient {
                 peers: peers.clone(),
             },
         );
-        self.publish_peer_snapshot(total_candidates, &peers);
+        self.publish_peer_snapshot(total_candidates, &peers, &all_peers);
     }
 
     fn decay_peer_scores(&mut self) {
@@ -405,7 +407,11 @@ impl GossipRepairClient {
         });
     }
 
-    fn collect_candidate_peers(&self, slot: u64) -> Vec<RepairPeer> {
+    fn collect_candidate_peers(
+        &self,
+        slot: u64,
+        all_peers: &[(ContactInfo, u64)],
+    ) -> Vec<RepairPeer> {
         let mut seen = HashSet::new();
         let mut peers = Vec::new();
         for contact_info in self.cluster_info.repair_peers(slot) {
@@ -428,7 +434,7 @@ impl GossipRepairClient {
         if peers.is_empty() {
             let self_pubkey = self.cluster_info.id();
             let self_shred_version = self.cluster_info.my_shred_version();
-            for (contact_info, stake_lamports) in self.cluster_info.all_peers() {
+            for (contact_info, stake_lamports) in all_peers {
                 if contact_info.pubkey() == &self_pubkey
                     || contact_info.shred_version() != self_shred_version
                     || contact_info.tvu(Protocol::UDP).is_none()
@@ -441,7 +447,7 @@ impl GossipRepairClient {
                 let peer = RepairPeer {
                     pubkey: *contact_info.pubkey(),
                     addr,
-                    stake_lamports,
+                    stake_lamports: *stake_lamports,
                 };
                 if seen.insert((peer.pubkey, peer.addr)) {
                     peers.push(peer);
@@ -451,10 +457,15 @@ impl GossipRepairClient {
         peers
     }
 
-    fn publish_peer_snapshot(&mut self, total_candidates: usize, peers: &[RepairPeer]) {
-        let mut known_pubkeys = Vec::new();
+    fn publish_peer_snapshot(
+        &mut self,
+        total_candidates: usize,
+        peers: &[RepairPeer],
+        all_peers: &[(ContactInfo, u64)],
+    ) {
+        let mut known_pubkeys = Vec::with_capacity(all_peers.len().saturating_add(1));
         known_pubkeys.push(self.cluster_info.id().to_bytes());
-        for (contact_info, _) in self.cluster_info.all_peers() {
+        for (contact_info, _) in all_peers {
             known_pubkeys.push(contact_info.pubkey().to_bytes());
         }
         known_pubkeys.sort_unstable();
@@ -468,7 +479,7 @@ impl GossipRepairClient {
         });
     }
 
-    fn note_peer_ping(&mut self, from_addr: std::net::SocketAddr, now: Instant) {
+    fn note_peer_ping(&mut self, from_addr: SocketAddr, now: Instant) {
         let Some(sent_at) = self.last_request_sent_at.get(&from_addr).copied() else {
             return;
         };
@@ -513,12 +524,17 @@ impl GossipRepairClient {
             .weight()
     }
 
-    fn refresh_stake_map(&mut self) {
+    fn refresh_stake_map(&mut self, all_peers: &[(ContactInfo, u64)]) {
         self.stake_by_pubkey.clear();
-        for (contact_info, stake_lamports) in self.cluster_info.all_peers() {
+        self.stake_by_pubkey.reserve(
+            all_peers
+                .len()
+                .saturating_sub(self.stake_by_pubkey.capacity()),
+        );
+        for (contact_info, stake_lamports) in all_peers {
             let _ = self
                 .stake_by_pubkey
-                .insert(*contact_info.pubkey(), stake_lamports);
+                .insert(*contact_info.pubkey(), *stake_lamports);
         }
     }
 
@@ -539,11 +555,7 @@ impl GossipRepairClient {
         self.serve_requests_by_addr.clear();
     }
 
-    fn reserve_serve_request_budget(
-        &mut self,
-        source_addr: std::net::SocketAddr,
-        now: Instant,
-    ) -> bool {
+    fn reserve_serve_request_budget(&mut self, source_addr: SocketAddr, now: Instant) -> bool {
         self.reset_serve_window_if_needed(now);
         let requests = self.serve_requests_by_addr.entry(source_addr).or_default();
         if *requests >= self.serve_max_requests_per_peer_per_sec {
@@ -629,7 +641,7 @@ impl GossipRepairClient {
         selected
     }
 
-    fn last_request_age_ms(&self, now: Instant, addr: std::net::SocketAddr) -> u64 {
+    fn last_request_age_ms(&self, now: Instant, addr: SocketAddr) -> u64 {
         self.last_request_sent_at
             .get(&addr)
             .copied()
@@ -681,6 +693,11 @@ const fn mix_seed(seed: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{env, sync::Arc};
+
+    use solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo, node::Node};
+    use solana_signer::Signer;
+    use solana_streamer::socket::SocketAddrSpace;
 
     #[test]
     fn sticky_peer_is_kept_within_window_when_score_gap_is_small() {
@@ -707,5 +724,185 @@ mod tests {
             1_000,
             1_000 + REPAIR_PEER_SWITCH_SCORE_MARGIN,
         ));
+    }
+
+    fn avg_ns_per_iteration(elapsed: Duration, iterations: usize) -> u128 {
+        let iterations = u128::try_from(iterations.max(1)).unwrap_or(1);
+        elapsed.as_nanos().checked_div(iterations).unwrap_or(0)
+    }
+
+    fn profile_repair_client(peer_count: usize) -> GossipRepairClient {
+        let identity = Arc::new(Keypair::new());
+        let node = Node::new_localhost_with_pubkey(&identity.pubkey());
+        let cluster_info = Arc::new(ClusterInfo::new(
+            node.info,
+            Arc::clone(&identity),
+            SocketAddrSpace::Unspecified,
+        ));
+        for _ in 0..peer_count {
+            let peer = Keypair::new();
+            cluster_info.insert_info(ContactInfo::new_localhost(&peer.pubkey(), 0));
+        }
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind profile udp socket");
+        socket
+            .set_nonblocking(true)
+            .expect("set nonblocking profile udp socket");
+        let socket = UdpSocket::from_std(socket).expect("tokio udp socket");
+        GossipRepairClient::new(
+            cluster_info,
+            socket,
+            identity,
+            GossipRepairClientConfig {
+                peer_cache_ttl: Duration::from_secs(60),
+                peer_cache_capacity: 128,
+                active_peer_count: 32,
+                peer_sample_size: 8,
+                serve_max_bytes_per_sec: 1_000_000,
+                serve_unstaked_max_bytes_per_sec: 1_000_000,
+                serve_max_requests_per_peer_per_sec: 1_000,
+            },
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "profiling fixture for repair peer refresh"]
+    async fn repair_refresh_peer_snapshot_profile_fixture() {
+        let iterations = env::var("SOF_REPAIR_REFRESH_PROFILE_ITERS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(50_000);
+        let peer_count = env::var("SOF_REPAIR_REFRESH_PROFILE_PEERS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(64);
+        let slot = 77_u64;
+        let mut client = profile_repair_client(peer_count);
+        client.peer_cache_ttl = Duration::ZERO;
+
+        let started_at = Instant::now();
+        let mut total_candidates = 0_u64;
+        let mut active_candidates = 0_u64;
+        for _ in 0..iterations {
+            let (total, active) = client.refresh_peer_snapshot(slot);
+            total_candidates =
+                total_candidates.saturating_add(u64::try_from(total).unwrap_or(u64::MAX));
+            active_candidates =
+                active_candidates.saturating_add(u64::try_from(active).unwrap_or(u64::MAX));
+        }
+        let elapsed = started_at.elapsed();
+        let avg_ns = avg_ns_per_iteration(elapsed, iterations);
+        println!(
+            "repair_refresh_peer_snapshot_profile_fixture iterations={} peer_count={} total_candidates={} active_candidates={} elapsed_ms={} avg_ns_per_iteration={} avg_us_per_iteration={:.3}",
+            iterations,
+            peer_count,
+            total_candidates,
+            active_candidates,
+            elapsed.as_millis(),
+            avg_ns,
+            avg_ns as f64 / 1_000.0
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "profiling fixture for cached repair peer selection"]
+    async fn repair_pick_peer_cached_profile_fixture() {
+        let iterations = env::var("SOF_REPAIR_PICK_PEER_PROFILE_ITERS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(200_000);
+        let peer_count = env::var("SOF_REPAIR_PICK_PEER_PROFILE_PEERS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(64);
+        let slot = 42_u64;
+        let mut client = profile_repair_client(0);
+        let peers = (0..peer_count)
+            .map(|index| RepairPeer {
+                pubkey: Pubkey::new_unique(),
+                addr: SocketAddr::from((
+                    [127, 0, 0, 1],
+                    u16::try_from(10_000 + index).unwrap_or(u16::MAX),
+                )),
+                stake_lamports: (u64::try_from(index).unwrap_or(0) + 1)
+                    .saturating_mul(SOL_LAMPORTS),
+            })
+            .collect::<Vec<_>>();
+        let _ = client.peers_by_slot.insert(
+            slot,
+            CachedPeers {
+                updated_at: Instant::now(),
+                peers,
+            },
+        );
+
+        let started_at = Instant::now();
+        let mut selected = 0_u64;
+        for iteration in 0..iterations {
+            let index = u32::try_from(iteration & 0xffff).unwrap_or(u32::MAX);
+            if client.pick_peer(slot, index).is_some() {
+                selected = selected.saturating_add(1);
+            }
+        }
+        let elapsed = started_at.elapsed();
+        let avg_ns = avg_ns_per_iteration(elapsed, iterations);
+        println!(
+            "repair_pick_peer_cached_profile_fixture iterations={} peer_count={} selected={} elapsed_ms={} avg_ns_per_iteration={} avg_us_per_iteration={:.3}",
+            iterations,
+            peer_count,
+            selected,
+            elapsed.as_millis(),
+            avg_ns,
+            avg_ns as f64 / 1_000.0
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "profiling fixture for repair source note batching"]
+    async fn repair_note_shred_sources_profile_fixture() {
+        let iterations = env::var("SOF_REPAIR_NOTE_SOURCES_PROFILE_ITERS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(100_000);
+        let source_count = env::var("SOF_REPAIR_NOTE_SOURCES_PROFILE_BATCH")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(64);
+        let mut client = profile_repair_client(0);
+        let mut sources = Vec::with_capacity(source_count);
+        for index in 0..source_count {
+            let source_addr = SocketAddr::from((
+                [127, 0, 0, 1],
+                u16::try_from(12_000 + index).unwrap_or(u16::MAX),
+            ));
+            let direct_pubkey = Pubkey::new_unique();
+            let mut ip_pubkeys = vec![direct_pubkey];
+            ip_pubkeys.extend((0..3).map(|_| Pubkey::new_unique()));
+            let _ = client.addr_to_pubkey.insert(source_addr, direct_pubkey);
+            let _ = client.ip_to_pubkeys.insert(source_addr.ip(), ip_pubkeys);
+            sources.push((source_addr, u16::try_from((index % 4) + 1).unwrap_or(1)));
+        }
+
+        let started_at = Instant::now();
+        let mut updated = 0_usize;
+        for _ in 0..iterations {
+            updated = updated.saturating_add(client.note_shred_sources(&sources));
+        }
+        let elapsed = started_at.elapsed();
+        let avg_ns = avg_ns_per_iteration(elapsed, iterations);
+        println!(
+            "repair_note_shred_sources_profile_fixture iterations={} source_count={} updated={} elapsed_ms={} avg_ns_per_iteration={} avg_us_per_iteration={:.3}",
+            iterations,
+            source_count,
+            updated,
+            elapsed.as_millis(),
+            avg_ns,
+            avg_ns as f64 / 1_000.0
+        );
     }
 }
