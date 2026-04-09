@@ -515,14 +515,10 @@ where
                 push_primary_shred(packet, &mut accepted_shreds);
 
                 for recovered in recovered_packets {
-                    let parsed_recovered = match parse_shred(&recovered) {
-                        Ok(parsed) => parsed,
-                        Err(_) => continue,
-                    };
                     if verify_recovered_shreds {
                         let recovered_accepted = match verify_packet_with_counters(
                             shred_verifier.as_deref_mut(),
-                            &recovered,
+                            &recovered.bytes,
                             observed_at,
                             verify_strict_unknown,
                             &mut verify_counters,
@@ -534,40 +530,48 @@ where
                             continue;
                         }
                     }
-                    if let ParsedShred::Data(data) = parsed_recovered {
-                        let Some(signature) = packet_signature_bytes(&recovered) else {
-                            continue;
-                        };
-                        let Some(variant) = packet_variant_byte(&recovered) else {
-                            continue;
-                        };
-                        #[cfg(feature = "gossip-bootstrap")]
-                        maybe_record_observed_leader(
-                            shred_verifier.as_deref(),
-                            data.common.slot,
-                            &mut observed_slot_leaders,
-                        );
-                        accepted_shreds.push(WorkerAcceptedShred {
-                            source: None,
-                            observed_at,
-                            slot: data.common.slot,
-                            index: data.common.index,
-                            fec_set_index: data.common.fec_set_index,
-                            version: data.common.version,
-                            variant,
-                            signature,
-                            kind: WorkerAcceptedShredKind::RecoveredData {
-                                parent_slot: derive_parent_slot(
-                                    data.common.slot,
-                                    data.data_header.parent_offset,
-                                ),
-                                data_complete: data.data_header.data_complete(),
-                                last_in_slot: data.data_header.last_in_slot(),
-                                reference_tick: data.data_header.reference_tick(),
-                            },
-                            payload_fragment: Some(SharedPayloadFragment::owned(data.payload)),
-                        });
-                    }
+                    let Some(signature) = packet_signature_bytes(&recovered.bytes) else {
+                        continue;
+                    };
+                    let Some(variant) = packet_variant_byte(&recovered.bytes) else {
+                        continue;
+                    };
+                    #[cfg(feature = "gossip-bootstrap")]
+                    maybe_record_observed_leader(
+                        shred_verifier.as_deref(),
+                        recovered.parsed.common.slot,
+                        &mut observed_slot_leaders,
+                    );
+                    let packet_bytes: Arc<[u8]> = Arc::from(recovered.bytes);
+                    let Some(payload_fragment) =
+                        crate::reassembly::dataset::SharedPayloadFragment::borrowed(
+                            Arc::clone(&packet_bytes),
+                            recovered.parsed.payload_offset,
+                            recovered.parsed.payload_len,
+                        )
+                    else {
+                        continue;
+                    };
+                    accepted_shreds.push(WorkerAcceptedShred {
+                        source: None,
+                        observed_at,
+                        slot: recovered.parsed.common.slot,
+                        index: recovered.parsed.common.index,
+                        fec_set_index: recovered.parsed.common.fec_set_index,
+                        version: recovered.parsed.common.version,
+                        variant,
+                        signature,
+                        kind: WorkerAcceptedShredKind::RecoveredData {
+                            parent_slot: derive_parent_slot(
+                                recovered.parsed.common.slot,
+                                recovered.parsed.data_header.parent_offset,
+                            ),
+                            data_complete: recovered.parsed.data_header.data_complete(),
+                            last_in_slot: recovered.parsed.data_header.last_in_slot(),
+                            reference_tick: recovered.parsed.data_header.reference_tick(),
+                        },
+                        payload_fragment: Some(payload_fragment),
+                    });
                 }
             }
 

@@ -1,11 +1,19 @@
 use super::*;
-use crate::shred::wire::{ParsedShred, SIZE_OF_DATA_SHRED_PAYLOAD, parse_shred};
+use crate::shred::wire::{
+    ParsedDataShredHeader, ParsedShredHeader, SIZE_OF_DATA_SHRED_PAYLOAD, parse_shred_header,
+};
+
+#[derive(Debug)]
+pub struct RecoveredDataPacket {
+    pub bytes: Vec<u8>,
+    pub parsed: ParsedDataShredHeader,
+}
 
 pub(super) fn recover_missing_data(
     set: &mut ErasureSet,
     fec_set_index: u32,
     reed_solomon_cache: &mut HashMap<(usize, usize), ReedSolomon>,
-) -> Option<Vec<Vec<u8>>> {
+) -> Option<Vec<RecoveredDataPacket>> {
     let config = set.config?;
     let variant = set.variant?;
     if config.num_data == 0 || config.num_coding == 0 {
@@ -106,7 +114,7 @@ fn build_recovered_data_shred(
     erasure_shard: &[u8],
     leader_signature: &[u8; SIZE_OF_SIGNATURE],
     payload_len: usize,
-) -> Option<Vec<u8>> {
+) -> Option<RecoveredDataPacket> {
     let mut recovered = vec![0_u8; payload_len];
     recovered
         .get_mut(..SIZE_OF_SIGNATURE)?
@@ -116,9 +124,12 @@ fn build_recovered_data_shred(
     recovered
         .get_mut(start..end)?
         .copy_from_slice(erasure_shard);
-    match parse_shred(&recovered) {
-        Ok(ParsedShred::Data(_)) => Some(recovered),
-        Ok(ParsedShred::Code(_)) | Err(_) => None,
+    match parse_shred_header(&recovered) {
+        Ok(ParsedShredHeader::Data(parsed)) => Some(RecoveredDataPacket {
+            bytes: recovered,
+            parsed,
+        }),
+        Ok(ParsedShredHeader::Code(_)) | Err(_) => None,
     }
 }
 

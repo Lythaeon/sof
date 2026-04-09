@@ -7,7 +7,7 @@ use crate::shred::wire::{ParsedShredHeader, ShredVariant};
 #[path = "recover.rs"]
 mod recover;
 
-use recover::{parse_packet_signature, recover_missing_data};
+use recover::{RecoveredDataPacket, parse_packet_signature, recover_missing_data};
 
 const SIZE_OF_SIGNATURE: usize = 64;
 const SIZE_OF_MERKLE_ROOT: usize = 32;
@@ -69,7 +69,11 @@ impl FecRecoverer {
         }
     }
 
-    pub fn ingest_packet(&mut self, packet: &[u8], parsed: &ParsedShredHeader) -> Vec<Vec<u8>> {
+    pub fn ingest_packet(
+        &mut self,
+        packet: &[u8],
+        parsed: &ParsedShredHeader,
+    ) -> Vec<RecoveredDataPacket> {
         let signature = match parse_packet_signature(packet) {
             Some(signature) => signature,
             None => return Vec::new(),
