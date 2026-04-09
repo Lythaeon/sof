@@ -15,9 +15,12 @@ use tokio::{
     task::JoinHandle,
 };
 
+#[cfg(test)]
+use crate::provider_stream::{ProviderSourceHealthReason, ProviderSourceId};
 use crate::{
     framework::{
         DerivedStateConsumerRecoveryState, DerivedStateHost, PluginHost, RuntimeExtensionHost,
+        host::InlineTransactionDispatchSource,
     },
     provider_stream::{
         ProviderSourceHealthEvent, ProviderSourceHealthStatus, ProviderSourceIdentity,
@@ -63,7 +66,7 @@ impl RuntimeObservabilityHandle {
         if required_healthy.is_empty() {
             optional_healthy
         } else {
-            required_healthy.into_iter().all(std::convert::identity)
+            required_healthy.into_iter().all(core::convert::identity)
         }
     }
 
@@ -1125,7 +1128,7 @@ fn render_metrics(
         snapshot.inline_transaction_plugin_early_prefix_latency_samples_total,
         Some(&[(
             "source",
-            crate::framework::host::InlineTransactionDispatchSource::EarlyPrefix.as_str(),
+            InlineTransactionDispatchSource::EarlyPrefix.as_str(),
         )]),
     );
     append_metric_value(
@@ -1134,8 +1137,7 @@ fn render_metrics(
         snapshot.inline_transaction_plugin_completed_dataset_fallback_latency_samples_total,
         Some(&[(
             "source",
-            crate::framework::host::InlineTransactionDispatchSource::CompletedDatasetFallback
-                .as_str(),
+            InlineTransactionDispatchSource::CompletedDatasetFallback.as_str(),
         )]),
     );
     append_metric_family(
@@ -1150,7 +1152,7 @@ fn render_metrics(
         snapshot.inline_transaction_plugin_early_prefix_first_shred_lag_us_total,
         Some(&[(
             "source",
-            crate::framework::host::InlineTransactionDispatchSource::EarlyPrefix.as_str(),
+            InlineTransactionDispatchSource::EarlyPrefix.as_str(),
         )]),
     );
     append_metric_value(
@@ -1159,8 +1161,7 @@ fn render_metrics(
         snapshot.inline_transaction_plugin_completed_dataset_fallback_first_shred_lag_us_total,
         Some(&[(
             "source",
-            crate::framework::host::InlineTransactionDispatchSource::CompletedDatasetFallback
-                .as_str(),
+            InlineTransactionDispatchSource::CompletedDatasetFallback.as_str(),
         )]),
     );
     append_metric_family(
@@ -1175,7 +1176,7 @@ fn render_metrics(
         snapshot.inline_transaction_plugin_early_prefix_last_shred_lag_us_total,
         Some(&[(
             "source",
-            crate::framework::host::InlineTransactionDispatchSource::EarlyPrefix.as_str(),
+            InlineTransactionDispatchSource::EarlyPrefix.as_str(),
         )]),
     );
     append_metric_value(
@@ -1184,8 +1185,7 @@ fn render_metrics(
         snapshot.inline_transaction_plugin_completed_dataset_fallback_last_shred_lag_us_total,
         Some(&[(
             "source",
-            crate::framework::host::InlineTransactionDispatchSource::CompletedDatasetFallback
-                .as_str(),
+            InlineTransactionDispatchSource::CompletedDatasetFallback.as_str(),
         )]),
     );
     append_metric_family(
@@ -1200,7 +1200,7 @@ fn render_metrics(
         snapshot.inline_transaction_plugin_early_prefix_completed_dataset_lag_us_total,
         Some(&[(
             "source",
-            crate::framework::host::InlineTransactionDispatchSource::EarlyPrefix.as_str(),
+            InlineTransactionDispatchSource::EarlyPrefix.as_str(),
         )]),
     );
     append_metric_value(
@@ -1210,8 +1210,7 @@ fn render_metrics(
             .inline_transaction_plugin_completed_dataset_fallback_completed_dataset_lag_us_total,
         Some(&[(
             "source",
-            crate::framework::host::InlineTransactionDispatchSource::CompletedDatasetFallback
-                .as_str(),
+            InlineTransactionDispatchSource::CompletedDatasetFallback.as_str(),
         )]),
     );
     append_metric_family(
@@ -2766,13 +2765,13 @@ mod tests {
         let handle = RuntimeObservabilityHandle::default();
         handle.mark_live();
         handle.observe_provider_source_health(&ProviderSourceHealthEvent {
-            source: crate::provider_stream::ProviderSourceIdentity::new(
-                crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
+            source: ProviderSourceIdentity::new(
+                ProviderSourceId::YellowstoneGrpc,
                 "yellowstone_grpc-1",
             ),
             readiness: ProviderSourceReadiness::Required,
             status: ProviderSourceHealthStatus::Reconnecting,
-            reason: crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
+            reason: ProviderSourceHealthReason::UpstreamProtocolFailure,
             message: "upstream stalled".to_owned(),
         });
         let metrics = render_metrics(
@@ -2796,24 +2795,17 @@ mod tests {
         handle.mark_live();
         let shared_instance = "shared-source";
         handle.observe_provider_source_health(&ProviderSourceHealthEvent {
-            source: crate::provider_stream::ProviderSourceIdentity::new(
-                crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
-                shared_instance,
-            ),
+            source: ProviderSourceIdentity::new(ProviderSourceId::YellowstoneGrpc, shared_instance),
             readiness: ProviderSourceReadiness::Required,
             status: ProviderSourceHealthStatus::Reconnecting,
-            reason: crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
+            reason: ProviderSourceHealthReason::UpstreamProtocolFailure,
             message: "yellowstone stalled".to_owned(),
         });
         handle.observe_provider_source_health(&ProviderSourceHealthEvent {
-            source: crate::provider_stream::ProviderSourceIdentity::new(
-                crate::provider_stream::ProviderSourceId::LaserStream,
-                shared_instance,
-            ),
+            source: ProviderSourceIdentity::new(ProviderSourceId::LaserStream, shared_instance),
             readiness: ProviderSourceReadiness::Required,
             status: ProviderSourceHealthStatus::Unhealthy,
-            reason:
-                crate::provider_stream::ProviderSourceHealthReason::UpstreamStreamClosedUnexpectedly,
+            reason: ProviderSourceHealthReason::UpstreamStreamClosedUnexpectedly,
             message: "laserstream closed".to_owned(),
         });
 
@@ -2839,23 +2831,17 @@ mod tests {
         let handle = RuntimeObservabilityHandle::default();
         handle.mark_live();
         handle.observe_provider_source_health(&ProviderSourceHealthEvent {
-            source: crate::provider_stream::ProviderSourceIdentity::new(
-                crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
-                "yellowstone-a",
-            ),
+            source: ProviderSourceIdentity::new(ProviderSourceId::YellowstoneGrpc, "yellowstone-a"),
             readiness: ProviderSourceReadiness::Required,
             status: ProviderSourceHealthStatus::Reconnecting,
-            reason: crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
+            reason: ProviderSourceHealthReason::UpstreamProtocolFailure,
             message: "yellowstone reconnecting".to_owned(),
         });
         handle.observe_provider_source_health(&ProviderSourceHealthEvent {
-            source: crate::provider_stream::ProviderSourceIdentity::new(
-                crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
-                "yellowstone-b",
-            ),
+            source: ProviderSourceIdentity::new(ProviderSourceId::YellowstoneGrpc, "yellowstone-b"),
             readiness: ProviderSourceReadiness::Required,
             status: ProviderSourceHealthStatus::Healthy,
-            reason: crate::provider_stream::ProviderSourceHealthReason::SubscriptionAckReceived,
+            reason: ProviderSourceHealthReason::SubscriptionAckReceived,
             message: "yellowstone healthy".to_owned(),
         });
 
@@ -2875,23 +2861,23 @@ mod tests {
         let handle = RuntimeObservabilityHandle::default();
         handle.mark_live();
         handle.observe_provider_source_health(&ProviderSourceHealthEvent {
-            source: crate::provider_stream::ProviderSourceIdentity::new(
-                crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
+            source: ProviderSourceIdentity::new(
+                ProviderSourceId::YellowstoneGrpc,
                 "yellowstone-primary",
             ),
             readiness: ProviderSourceReadiness::Required,
             status: ProviderSourceHealthStatus::Healthy,
-            reason: crate::provider_stream::ProviderSourceHealthReason::SubscriptionAckReceived,
+            reason: ProviderSourceHealthReason::SubscriptionAckReceived,
             message: "yellowstone healthy".to_owned(),
         });
         handle.observe_provider_source_health(&ProviderSourceHealthEvent {
-            source: crate::provider_stream::ProviderSourceIdentity::new(
-                crate::provider_stream::ProviderSourceId::YellowstoneGrpcSlots,
+            source: ProviderSourceIdentity::new(
+                ProviderSourceId::YellowstoneGrpcSlots,
                 "yellowstone-slots",
             ),
             readiness: ProviderSourceReadiness::Optional,
             status: ProviderSourceHealthStatus::Reconnecting,
-            reason: crate::provider_stream::ProviderSourceHealthReason::UpstreamProtocolFailure,
+            reason: ProviderSourceHealthReason::UpstreamProtocolFailure,
             message: "slots reconnecting".to_owned(),
         });
 
@@ -2912,22 +2898,20 @@ mod tests {
     fn removed_provider_sources_are_pruned_from_readiness_and_metrics() {
         let handle = RuntimeObservabilityHandle::default();
         handle.mark_live();
-        let source = crate::provider_stream::ProviderSourceIdentity::new(
-            crate::provider_stream::ProviderSourceId::YellowstoneGrpc,
-            "yellowstone-primary",
-        );
+        let source =
+            ProviderSourceIdentity::new(ProviderSourceId::YellowstoneGrpc, "yellowstone-primary");
         handle.observe_provider_source_health(&ProviderSourceHealthEvent {
             source: source.clone(),
             readiness: ProviderSourceReadiness::Required,
             status: ProviderSourceHealthStatus::Reconnecting,
-            reason: crate::provider_stream::ProviderSourceHealthReason::InitialConnectPending,
+            reason: ProviderSourceHealthReason::InitialConnectPending,
             message: "pending".to_owned(),
         });
         handle.observe_provider_source_health(&ProviderSourceHealthEvent {
             source,
             readiness: ProviderSourceReadiness::Required,
             status: ProviderSourceHealthStatus::Removed,
-            reason: crate::provider_stream::ProviderSourceHealthReason::UpstreamTransportFailure,
+            reason: ProviderSourceHealthReason::UpstreamTransportFailure,
             message: "startup failed".to_owned(),
         });
 

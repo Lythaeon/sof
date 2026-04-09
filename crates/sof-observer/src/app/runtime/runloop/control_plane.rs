@@ -3,12 +3,14 @@ use super::*;
 #[cfg(feature = "gossip-bootstrap")]
 use crate::framework::{
     ClusterNodeInfo, ClusterTopologyEvent, ControlPlaneSource, LeaderScheduleEntry,
-    LeaderScheduleEvent, pubkey_bytes,
+    LeaderScheduleEvent, PubkeyBytes, pubkey_bytes,
 };
+#[cfg(feature = "gossip-bootstrap")]
+use crate::verify::SlotLeaderDiff;
 
 #[cfg(feature = "gossip-bootstrap")]
 pub(crate) struct ClusterTopologyTracker {
-    last_nodes: HashMap<crate::framework::PubkeyBytes, ClusterNodeInfo>,
+    last_nodes: HashMap<PubkeyBytes, ClusterNodeInfo>,
     last_polled_at: Option<Instant>,
     last_snapshot_at: Option<Instant>,
     poll_interval: Duration,
@@ -39,8 +41,7 @@ impl ClusterTopologyTracker {
         }
         self.last_polled_at = Some(now);
 
-        let mut current_nodes: HashMap<crate::framework::PubkeyBytes, ClusterNodeInfo> =
-            HashMap::new();
+        let mut current_nodes: HashMap<PubkeyBytes, ClusterNodeInfo> = HashMap::new();
         for (contact_info, _) in cluster_info.all_peers() {
             let node = cluster_node_info_from_contact(&contact_info);
             let _ = current_nodes.insert(node.pubkey, node);
@@ -114,7 +115,7 @@ impl ClusterTopologyTracker {
 pub(super) fn emit_slot_leader_diff_event(
     plugin_host: &PluginHost,
     derived_state_host: &DerivedStateHost,
-    diff: crate::verify::SlotLeaderDiff,
+    diff: SlotLeaderDiff,
     latest_slot: Option<u64>,
     emitted_slot_leaders: &mut HashMap<u64, [u8; 32]>,
 ) {

@@ -1,5 +1,9 @@
 use super::*;
-use crate::framework::host::TransactionDispatchScope;
+use crate::{
+    framework::host::TransactionDispatchScope,
+    reassembly::dataset::{CompletedDataSet, PayloadFragmentBatch},
+    runtime_metrics,
+};
 use std::num::NonZeroUsize;
 use std::sync::{OnceLock, atomic::AtomicBool};
 
@@ -16,7 +20,7 @@ struct CompletedDatasetJobItem {
     completed_at: Instant,
     first_shred_observed_at: Instant,
     last_shred_observed_at: Instant,
-    payload_fragments: crate::reassembly::dataset::PayloadFragmentBatch,
+    payload_fragments: PayloadFragmentBatch,
 }
 
 /// One burst of reassembled dataset payloads scheduled onto one worker queue.
@@ -239,7 +243,7 @@ pub(in crate::app::runtime) fn spawn_dataset_workers(
                                 continue;
                             }
                             let _ = dataset_jobs_started_count.fetch_add(1, Ordering::Relaxed);
-                            crate::runtime_metrics::observe_dataset_job_started(
+                            runtime_metrics::observe_dataset_job_started(
                                 u64::try_from(
                                     now.saturating_duration_since(item.completed_at).as_millis(),
                                 )
@@ -274,7 +278,7 @@ pub(in crate::app::runtime) fn spawn_dataset_workers(
                                 &mut scratch,
                             );
                             let _ = dataset_jobs_completed_count.fetch_add(1, Ordering::Relaxed);
-                            crate::runtime_metrics::observe_dataset_job_completed(
+                            runtime_metrics::observe_dataset_job_completed(
                                 u64::try_from(processing_started_at.elapsed().as_micros())
                                     .unwrap_or(u64::MAX),
                             );
@@ -309,7 +313,7 @@ pub(in crate::app::runtime) fn spawn_dataset_workers(
 
 pub(in crate::app::runtime) fn dispatch_completed_dataset(
     dataset_dispatch: &[DatasetDispatchQueue],
-    completed_datasets: Vec<crate::reassembly::dataset::CompletedDataSet>,
+    completed_datasets: Vec<CompletedDataSet>,
     observed_at: Instant,
     dataset_jobs_enqueued_count: &AtomicU64,
     dataset_queue_drop_count: &AtomicU64,
@@ -362,10 +366,10 @@ pub(in crate::app::runtime) fn dispatch_completed_dataset(
                 .saturating_add(queue.push_overwrite_oldest(CompletedDatasetJob { items: chunk }));
         }
         let _ = dataset_jobs_enqueued_count.fetch_add(item_count, Ordering::Relaxed);
-        crate::runtime_metrics::observe_dataset_jobs_enqueued(item_count);
+        runtime_metrics::observe_dataset_jobs_enqueued(item_count);
         if overwritten > 0 {
             let _ = dataset_queue_drop_count.fetch_add(overwritten, Ordering::Relaxed);
-            crate::runtime_metrics::observe_dataset_queue_dropped_jobs(overwritten);
+            runtime_metrics::observe_dataset_queue_dropped_jobs(overwritten);
         }
     }
 }
@@ -482,7 +486,6 @@ impl DatasetProcessOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reassembly::dataset::CompletedDataSet;
 
     fn build_job(slot: u64, start_index: u32, end_index: u32) -> CompletedDatasetJob {
         CompletedDatasetJob {
@@ -499,10 +502,7 @@ mod tests {
             completed_at: Instant::now(),
             first_shred_observed_at: Instant::now(),
             last_shred_observed_at: Instant::now(),
-            payload_fragments:
-                crate::reassembly::dataset::PayloadFragmentBatch::from_owned_fragments(vec![
-                    vec![0_u8; 1],
-                ]),
+            payload_fragments: PayloadFragmentBatch::from_owned_fragments(vec![vec![0_u8; 1]]),
         }
     }
 
@@ -558,10 +558,7 @@ mod tests {
             slot,
             start_index,
             end_index,
-            payload_fragments:
-                crate::reassembly::dataset::PayloadFragmentBatch::from_owned_fragments(vec![
-                    vec![0_u8; 1],
-                ]),
+            payload_fragments: PayloadFragmentBatch::from_owned_fragments(vec![vec![0_u8; 1]]),
             last_in_slot: false,
             first_shred_observed_at: Instant::now(),
             last_shred_observed_at: Instant::now(),

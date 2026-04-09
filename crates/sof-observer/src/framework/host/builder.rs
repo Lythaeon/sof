@@ -1,5 +1,8 @@
 use super::dispatch::{PluginDispatchTargets, PluginDispatcher, TransactionPluginDispatcher};
 use super::*;
+use crate::event::TxCommitmentStatus;
+use crate::framework::TransactionPrefilter;
+use crate::framework::plugin::TransactionCommitmentSelector;
 
 /// Collects plugins that subscribed to one hook family while preserving registration order.
 fn collect_hook_plugins(
@@ -266,9 +269,7 @@ impl PluginHostBuilder {
                 .map(|subscription| subscription.inline_transaction)
                 .collect::<Vec<_>>(),
         );
-        let transaction_plugin_commitments: Arc<
-            [crate::framework::plugin::TransactionCommitmentSelector],
-        > = Arc::from(
+        let transaction_plugin_commitments: Arc<[TransactionCommitmentSelector]> = Arc::from(
             plugins
                 .iter()
                 .zip(plugin_subscriptions.iter())
@@ -276,32 +277,31 @@ impl PluginHostBuilder {
                 .map(|(plugin, _subscription)| plugin.config().transaction_commitment)
                 .collect::<Vec<_>>(),
         );
-        let transaction_plugin_prefilters: Arc<[Option<crate::framework::TransactionPrefilter>]> =
-            Arc::from(
-                plugins
-                    .iter()
-                    .zip(plugin_subscriptions.iter())
-                    .filter(|(_plugin, subscription)| subscription.transaction)
-                    .map(|(plugin, _subscription)| plugin.transaction_prefilter().cloned())
-                    .collect::<Vec<_>>(),
-            );
+        let transaction_plugin_prefilters: Arc<[Option<TransactionPrefilter>]> = Arc::from(
+            plugins
+                .iter()
+                .zip(plugin_subscriptions.iter())
+                .filter(|(_plugin, subscription)| subscription.transaction)
+                .map(|(plugin, _subscription)| plugin.transaction_prefilter().cloned())
+                .collect::<Vec<_>>(),
+        );
         let transaction_prefilter_enabled_at_processed = transaction_plugin_prefilters
             .iter()
             .zip(transaction_plugin_commitments.iter().copied())
             .any(|(prefilter, selector)| {
-                prefilter.is_some() && selector.matches(crate::event::TxCommitmentStatus::Processed)
+                prefilter.is_some() && selector.matches(TxCommitmentStatus::Processed)
             });
         let transaction_prefilter_enabled_at_confirmed = transaction_plugin_prefilters
             .iter()
             .zip(transaction_plugin_commitments.iter().copied())
             .any(|(prefilter, selector)| {
-                prefilter.is_some() && selector.matches(crate::event::TxCommitmentStatus::Confirmed)
+                prefilter.is_some() && selector.matches(TxCommitmentStatus::Confirmed)
             });
         let transaction_prefilter_enabled_at_finalized = transaction_plugin_prefilters
             .iter()
             .zip(transaction_plugin_commitments.iter().copied())
             .any(|(prefilter, selector)| {
-                prefilter.is_some() && selector.matches(crate::event::TxCommitmentStatus::Finalized)
+                prefilter.is_some() && selector.matches(TxCommitmentStatus::Finalized)
             });
         let transaction_batch_plugin_inline_preferences: Arc<[bool]> = Arc::from(
             plugin_subscriptions
@@ -310,9 +310,7 @@ impl PluginHostBuilder {
                 .map(|subscription| subscription.inline_transaction_batch)
                 .collect::<Vec<_>>(),
         );
-        let transaction_log_plugin_commitments: Arc<
-            [crate::framework::plugin::TransactionCommitmentSelector],
-        > = Arc::from(
+        let transaction_log_plugin_commitments: Arc<[TransactionCommitmentSelector]> = Arc::from(
             plugins
                 .iter()
                 .zip(plugin_subscriptions.iter())
@@ -320,9 +318,7 @@ impl PluginHostBuilder {
                 .map(|(plugin, _subscription)| plugin.config().transaction_commitment)
                 .collect::<Vec<_>>(),
         );
-        let transaction_status_plugin_commitments: Arc<
-            [crate::framework::plugin::TransactionCommitmentSelector],
-        > = Arc::from(
+        let transaction_status_plugin_commitments: Arc<[TransactionCommitmentSelector]> = Arc::from(
             plugins
                 .iter()
                 .zip(plugin_subscriptions.iter())
@@ -330,9 +326,7 @@ impl PluginHostBuilder {
                 .map(|(plugin, _subscription)| plugin.config().transaction_commitment)
                 .collect::<Vec<_>>(),
         );
-        let transaction_batch_plugin_commitments: Arc<
-            [crate::framework::plugin::TransactionCommitmentSelector],
-        > = Arc::from(
+        let transaction_batch_plugin_commitments: Arc<[TransactionCommitmentSelector]> = Arc::from(
             plugins
                 .iter()
                 .zip(plugin_subscriptions.iter())
@@ -347,16 +341,15 @@ impl PluginHostBuilder {
                 .map(|subscription| subscription.inline_transaction_view_batch)
                 .collect::<Vec<_>>(),
         );
-        let transaction_view_batch_plugin_commitments: Arc<
-            [crate::framework::plugin::TransactionCommitmentSelector],
-        > = Arc::from(
-            plugins
-                .iter()
-                .zip(plugin_subscriptions.iter())
-                .filter(|(_plugin, subscription)| subscription.transaction_view_batch)
-                .map(|(plugin, _subscription)| plugin.config().transaction_commitment)
-                .collect::<Vec<_>>(),
-        );
+        let transaction_view_batch_plugin_commitments: Arc<[TransactionCommitmentSelector]> =
+            Arc::from(
+                plugins
+                    .iter()
+                    .zip(plugin_subscriptions.iter())
+                    .filter(|(_plugin, subscription)| subscription.transaction_view_batch)
+                    .map(|(plugin, _subscription)| plugin.config().transaction_commitment)
+                    .collect::<Vec<_>>(),
+            );
         let account_touch_plugins =
             collect_hook_plugins(&plugins, &plugin_subscriptions, |subscription| {
                 subscription.account_touch
@@ -396,9 +389,9 @@ impl PluginHostBuilder {
             transaction_min_commitment: transaction_plugin_commitments
                 .iter()
                 .copied()
-                .map(crate::framework::plugin::TransactionCommitmentSelector::minimum_required)
+                .map(TransactionCommitmentSelector::minimum_required)
                 .min()
-                .unwrap_or(crate::event::TxCommitmentStatus::Processed),
+                .unwrap_or(TxCommitmentStatus::Processed),
             transaction_prefilter: transaction_plugin_prefilters.iter().any(Option::is_some),
             transaction_log: !transaction_log_plugins.is_empty(),
             transaction_status: !transaction_status_plugins.is_empty(),

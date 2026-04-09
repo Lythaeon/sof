@@ -9,22 +9,36 @@ use super::packet_workers::{
 use super::*;
 #[cfg(feature = "gossip-bootstrap")]
 use crate::app::runtime::bootstrap::gossip::GossipEntrypointBias;
-use crate::framework::host::TransactionDispatchScope;
+use crate::app::state::{ForkTrackerSnapshot, ShredDedupeCacheMetrics};
+use crate::event::ForkSlotStatus;
+use crate::framework::host::{ClassifiedTransactionDispatch, TransactionDispatchScope};
 use crate::framework::{
     SerializedTransactionRange, TransactionEvent, events::TransactionEventRef, signature_bytes_opt,
 };
-use crate::reassembly::dataset::CompletedDataSet;
-use crate::reassembly::inline::InlineContiguousDataSetSink;
 use crate::relay::CacheInsertOutcome;
+#[cfg(feature = "gossip-bootstrap")]
+use crate::repair::{
+    ServedRepairRequestKind, is_repair_response_ping_packet, is_supported_repair_request_packet,
+};
 use crate::runtime::ShredTrustMode;
+#[cfg(all(feature = "kernel-bypass", feature = "gossip-bootstrap"))]
+use crate::runtime_env;
+#[cfg(feature = "gossip-bootstrap")]
+use crate::verify::SlotLeaderDiff;
+use crate::{app::runtime::dataset, framework, reassembly, runtime_metrics};
 use agave_transaction_view::transaction_view::SanitizedTransactionView;
 use crossbeam_channel::Sender as CrossbeamSender;
+use reassembly::dataset::CompletedDataSet;
+use reassembly::inline::InlineContiguousDataSetSink;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 #[cfg(feature = "gossip-bootstrap")]
 use std::collections::{HashMap, VecDeque};
+#[cfg(feature = "gossip-bootstrap")]
+use std::net::UdpSocket;
 use std::{
     future::Future,
+    mem::{replace, take},
     net::{IpAddr, Ipv4Addr},
     pin::Pin,
     sync::{
@@ -404,9 +418,7 @@ impl DeferredControlPlaneEvent {
     }
 }
 
-const fn feed_watermarks_from_fork_snapshot(
-    snapshot: crate::app::state::ForkTrackerSnapshot,
-) -> FeedWatermarks {
+const fn feed_watermarks_from_fork_snapshot(snapshot: ForkTrackerSnapshot) -> FeedWatermarks {
     FeedWatermarks {
         canonical_tip_slot: snapshot.tip_slot,
         processed_slot: snapshot.tip_slot,
@@ -417,7 +429,7 @@ const fn feed_watermarks_from_fork_snapshot(
 
 fn emit_shutdown_checkpoint_barrier(
     derived_state_host: &DerivedStateHost,
-    fork_snapshot: crate::app::state::ForkTrackerSnapshot,
+    fork_snapshot: ForkTrackerSnapshot,
 ) {
     derived_state_host
         .emit_shutdown_checkpoint_barrier(feed_watermarks_from_fork_snapshot(fork_snapshot));
@@ -491,7 +503,7 @@ async fn run_async_with_hosts_inner(
     let kernel_bypass_ingress_enabled = kernel_bypass_packet_ingest_rx.is_some();
     #[cfg(all(feature = "kernel-bypass", feature = "gossip-bootstrap"))]
     let kernel_bypass_gossip_control_plane_enabled = kernel_bypass_ingress_enabled
-        && crate::runtime_env::read_env_var("SOF_GOSSIP_ENTRYPOINT").is_some();
+        && runtime_env::read_env_var("SOF_GOSSIP_ENTRYPOINT").is_some();
     #[cfg(all(feature = "kernel-bypass", not(feature = "gossip-bootstrap")))]
     let kernel_bypass_gossip_control_plane_enabled = false;
     #[cfg(feature = "kernel-bypass")]
@@ -638,9 +650,9 @@ async fn run_async_with_hosts_inner(
     let derived_state_replay_max_sessions = derived_state_config.replay.max_sessions;
     if derived_state_hooks_enabled {
         if derived_state_replay_max_envelopes > 0 {
-            let runtime_replay_source: Arc<dyn crate::framework::DerivedStateReplaySource> =
+            let runtime_replay_source: Arc<dyn framework::DerivedStateReplaySource> =
                 match derived_state_replay_backend {
-                    crate::framework::DerivedStateReplayBackend::Disk => {
+                    framework::DerivedStateReplayBackend::Disk => {
                         match DiskDerivedStateReplaySource::with_policy(
                             derived_state_replay_dir.clone(),
                             derived_state_replay_max_envelopes,
@@ -650,7 +662,7 @@ async fn run_async_with_hosts_inner(
                             Ok(replay_source) => Arc::new(replay_source),
                             Err(error) => {
                                 tracing::warn!(
-                                    backend = %crate::framework::DerivedStateReplayBackend::Disk,
+                                    backend = %framework::DerivedStateReplayBackend::Disk,
                                     path = %derived_state_replay_dir.display(),
                                     error = %error,
                                     "failed to initialize disk-backed derived-state replay tail; falling back to memory"
@@ -663,7 +675,7 @@ async fn run_async_with_hosts_inner(
                             }
                         }
                     }
-                    crate::framework::DerivedStateReplayBackend::Memory => Arc::new(
+                    framework::DerivedStateReplayBackend::Memory => Arc::new(
                         InMemoryDerivedStateReplaySource::with_max_envelopes_per_session(
                             derived_state_replay_max_envelopes,
                         ),
@@ -1127,7 +1139,7 @@ async fn run_async_with_hosts_inner(
         .with_retained_slot_lag(dataset_retained_slot_lag)
         .with_tail_min_shreds_without_anchor(dataset_tail_min_shreds_without_anchor);
     let mut inline_reassembler =
-        crate::reassembly::inline::InlineDataReassembler::new(dataset_max_tracked_slots)
+        reassembly::inline::InlineDataReassembler::new(dataset_max_tracked_slots)
             .with_retained_slot_lag(dataset_retained_slot_lag);
     let mut packet_count: u64 = 0;
     let mut source_port_8899_packets: u64 = 0;
@@ -1472,8 +1484,8 @@ async fn run_async_with_hosts_inner(
     let mut dataset_workers_shutdown = false;
     let mut tx_events_closed = false;
     #[cfg(feature = "gossip-bootstrap")]
-    let udp_relay_socket: Option<std::net::UdpSocket> = if udp_relay_enabled {
-        match std::net::UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)) {
+    let udp_relay_socket: Option<UdpSocket> = if udp_relay_enabled {
+        match UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)) {
             Ok(socket) => match socket.set_nonblocking(true) {
                 Ok(()) => Some(socket),
                 Err(error) => {
@@ -1588,10 +1600,10 @@ async fn run_async_with_hosts_inner(
                 observed_at,
                 &mut packet_batch_dispatch_scratch,
             );
-            crate::runtime_metrics::observe_recovered_data_packets(summary.recovered_data_packets);
+            runtime_metrics::observe_recovered_data_packets(summary.recovered_data_packets);
             dataset_ranges_emitted =
                 dataset_ranges_emitted.saturating_add(summary.completed_dataset_count);
-            crate::runtime_metrics::observe_completed_datasets(summary.completed_dataset_count);
+            runtime_metrics::observe_completed_datasets(summary.completed_dataset_count);
             dataset_ranges_emitted_from_recovered = dataset_ranges_emitted_from_recovered
                 .saturating_add(summary.completed_datasets_from_recovered);
         }};
@@ -1738,7 +1750,7 @@ async fn run_async_with_hosts_inner(
                         Err(error) => {
                             #[cfg(feature = "gossip-bootstrap")]
                             if repair_driver_enabled
-                                && crate::repair::is_repair_response_ping_packet(packet_bytes)
+                                && is_repair_response_ping_packet(packet_bytes)
                                 && let Some(command_tx) = repair_command_tx.as_ref()
                             {
                                 match command_tx.try_send(RepairCommand::HandleResponsePing {
@@ -1759,7 +1771,7 @@ async fn run_async_with_hosts_inner(
                             }
                             #[cfg(feature = "gossip-bootstrap")]
                             if repair_driver_enabled
-                                && crate::repair::is_supported_repair_request_packet(packet_bytes)
+                                && is_supported_repair_request_packet(packet_bytes)
                                 && let Some(command_tx) = repair_command_tx.as_ref()
                             {
                                 relay_cache_keepalive_until = observed_at.checked_add(
@@ -1830,7 +1842,7 @@ async fn run_async_with_hosts_inner(
                             ShredDedupeObservation::Duplicate => {
                                 dedupe_ingress_duplicate_drop_count =
                                     dedupe_ingress_duplicate_drop_count.saturating_add(1);
-                                crate::runtime_metrics::observe_shred_dedupe_drops(
+                                runtime_metrics::observe_shred_dedupe_drops(
                                     ShredDedupeStage::Ingress,
                                     1,
                                     0,
@@ -1840,7 +1852,7 @@ async fn run_async_with_hosts_inner(
                             ShredDedupeObservation::Conflict => {
                                 dedupe_ingress_conflict_drop_count =
                                     dedupe_ingress_conflict_drop_count.saturating_add(1);
-                                crate::runtime_metrics::observe_shred_dedupe_drops(
+                                runtime_metrics::observe_shred_dedupe_drops(
                                     ShredDedupeStage::Ingress,
                                     0,
                                     1,
@@ -2180,10 +2192,10 @@ async fn run_async_with_hosts_inner(
                             }
                             if log_repair_peer_traffic {
                                 let kind = match request.kind {
-                                    crate::repair::ServedRepairRequestKind::WindowIndex => {
+                                    ServedRepairRequestKind::WindowIndex => {
                                         "window_index"
                                     }
-                                    crate::repair::ServedRepairRequestKind::HighestWindowIndex => {
+                                    ServedRepairRequestKind::HighestWindowIndex => {
                                         "highest_window_index"
                                     }
                                 };
@@ -2923,7 +2935,7 @@ async fn run_async_with_hosts_inner(
                         counters.snapshot()
                     });
                 sync_shred_dedupe_runtime_metrics(shred_dedupe_cache.as_ref());
-                crate::runtime_metrics::set_ingest_metrics(
+                runtime_metrics::set_ingest_metrics(
                     ingest_packets_seen,
                     ingest_sent_packets,
                     ingest_sent_batches,
@@ -2932,19 +2944,19 @@ async fn run_async_with_hosts_inner(
                     ingest_rxq_ovfl_drops,
                     ingest_last_packet_age_ms,
                 );
-                crate::runtime_metrics::set_dataset_dispatch_metrics(
+                runtime_metrics::set_dataset_dispatch_metrics(
                     u64::try_from(dataset_queue_depth).unwrap_or(u64::MAX),
                     dataset_jobs_pending,
                 );
-                crate::runtime_metrics::set_runtime_health_metrics(
+                runtime_metrics::set_runtime_health_metrics(
                     latest_shred_age_ms,
                     latest_dataset_age_ms,
                     latest_substantial_dataset_age_ms,
                     gossip_runtime_stall_age_ms,
                     repair_dynamic_stream_healthy,
                 );
-                crate::runtime_metrics::set_network_operability_metrics(
-                    crate::runtime_metrics::NetworkOperabilityMetrics {
+                runtime_metrics::set_network_operability_metrics(
+                    runtime_metrics::NetworkOperabilityMetrics {
                         relay_cache_entries: relay_cache.as_ref().map_or(0_u64, |cache| {
                             u64::try_from(cache.len()).unwrap_or(u64::MAX)
                         }),
@@ -2995,7 +3007,7 @@ async fn run_async_with_hosts_inner(
                         gossip_runtime_switch_failures_total: gossip_switch_fails,
                     },
                 );
-                let runtime_stage_metrics = crate::runtime_metrics::snapshot();
+                let runtime_stage_metrics = runtime_metrics::snapshot();
                 telemetry_tick_count = telemetry_tick_count.saturating_add(1);
                 let dataset_queue_pressure = dataset_queue_capacity_total > 0
                     && dataset_queue_depth >= (dataset_queue_capacity_total / 2).max(1);
@@ -3802,7 +3814,7 @@ struct DataLikeShredInput {
     /// Reference tick extracted from the shred header.
     reference_tick: u8,
     /// Optional payload fragment retained for dataset reconstruction.
-    payload_fragment: Option<crate::reassembly::dataset::SharedPayloadFragment>,
+    payload_fragment: Option<reassembly::dataset::SharedPayloadFragment>,
     /// Time when the packet carrying this shred entered runtime processing.
     ingress_observed_at: Instant,
     /// Source address for non-recovered shreds.
@@ -3824,12 +3836,12 @@ struct InlineOpenDatasetState {
     fragment_observed_ats: Vec<Instant>,
     prefix_max_observed_ats: Vec<Instant>,
     ready_tx_ranges: Vec<SerializedTransactionRange>,
-    parse_cursor: crate::app::runtime::dataset::EntryStreamPrefixCursor,
+    parse_cursor: dataset::EntryStreamPrefixCursor,
     emitted_tx_count: usize,
 }
 
 impl InlineOpenDatasetState {
-    fn advance_ready_ranges(&mut self) -> crate::app::runtime::dataset::EntryStreamPrefixAdvance {
+    fn advance_ready_ranges(&mut self) -> dataset::EntryStreamPrefixAdvance {
         self.parse_cursor
             .advance(self.payload.as_slice(), &mut self.ready_tx_ranges)
     }
@@ -3870,7 +3882,7 @@ impl InlineContiguousDataSetSink for InlineOpenDatasetState {
         self.fragment_observed_ats.clear();
         self.prefix_max_observed_ats.clear();
         self.ready_tx_ranges.clear();
-        self.parse_cursor = crate::app::runtime::dataset::EntryStreamPrefixCursor::default();
+        self.parse_cursor = dataset::EntryStreamPrefixCursor::default();
         self.emitted_tx_count = 0;
     }
 
@@ -3887,7 +3899,7 @@ impl InlineContiguousDataSetSink for InlineOpenDatasetState {
 
     fn append_inline_contiguous_fragment(
         &mut self,
-        fragment: &crate::reassembly::dataset::SharedPayloadFragment,
+        fragment: &reassembly::dataset::SharedPayloadFragment,
         observed_at: Instant,
     ) {
         self.payload.extend_from_slice(fragment.as_slice());
@@ -3928,7 +3940,7 @@ struct PacketWorkerResultContext<'context> {
     dedupe_canonical_duplicate_drop_count: &'context mut u64,
     dedupe_canonical_conflict_drop_count: &'context mut u64,
     dataset_reassembler: &'context mut DataSetReassembler,
-    inline_reassembler: &'context mut crate::reassembly::inline::InlineDataReassembler,
+    inline_reassembler: &'context mut reassembly::inline::InlineDataReassembler,
     dataset_retained_slot_lag: u64,
     dataset_worker_queues: &'context [DatasetDispatchQueue],
     dataset_jobs_enqueued_count: &'context AtomicU64,
@@ -4034,21 +4046,13 @@ impl PacketWorkerResultContext<'_> {
                 ShredDedupeObservation::Duplicate => {
                     *self.dedupe_canonical_duplicate_drop_count =
                         self.dedupe_canonical_duplicate_drop_count.saturating_add(1);
-                    crate::runtime_metrics::observe_shred_dedupe_drops(
-                        ShredDedupeStage::Canonical,
-                        1,
-                        0,
-                    );
+                    runtime_metrics::observe_shred_dedupe_drops(ShredDedupeStage::Canonical, 1, 0);
                     return;
                 }
                 ShredDedupeObservation::Conflict => {
                     *self.dedupe_canonical_conflict_drop_count =
                         self.dedupe_canonical_conflict_drop_count.saturating_add(1);
-                    crate::runtime_metrics::observe_shred_dedupe_drops(
-                        ShredDedupeStage::Canonical,
-                        0,
-                        1,
-                    );
+                    runtime_metrics::observe_shred_dedupe_drops(ShredDedupeStage::Canonical, 0, 1);
                     if *self.dedupe_canonical_conflict_drop_count <= INITIAL_DEBUG_SAMPLE_LOG_LIMIT
                     {
                         tracing::warn!(
@@ -4212,9 +4216,9 @@ impl PacketWorkerResultContext<'_> {
             }
             if inline_enabled {
                 if input.recovered {
-                    crate::runtime_metrics::observe_inline_reassembler_recovered_data_shreds(1);
+                    runtime_metrics::observe_inline_reassembler_recovered_data_shreds(1);
                 } else {
-                    crate::runtime_metrics::observe_inline_reassembler_data_shreds(1);
+                    runtime_metrics::observe_inline_reassembler_data_shreds(1);
                 }
                 let inline_observation = self.inline_reassembler.observe_data_shred_meta_at(
                     input.slot,
@@ -4226,7 +4230,7 @@ impl PacketWorkerResultContext<'_> {
                     input.ingress_observed_at,
                 );
                 if inline_observation.fec_set_became_ready {
-                    crate::runtime_metrics::observe_inline_reassembler_fec_sets_ready(1);
+                    runtime_metrics::observe_inline_reassembler_fec_sets_ready(1);
                 }
             }
             let completed_datasets = self.dataset_reassembler.ingest_data_shred_meta_at(
@@ -4283,12 +4287,12 @@ impl PacketWorkerResultContext<'_> {
             self.inline_transaction_dispatch_mode,
             InlineTransactionDispatchMode::Disabled
         ) {
-            crate::runtime_metrics::observe_inline_reassembler_code_shreds(1);
+            runtime_metrics::observe_inline_reassembler_code_shreds(1);
             let inline_observation =
                 self.inline_reassembler
                     .observe_code_shred(slot, fec_set_index, num_data_shreds);
             if inline_observation.fec_set_became_ready {
-                crate::runtime_metrics::observe_inline_reassembler_fec_sets_ready(1);
+                runtime_metrics::observe_inline_reassembler_fec_sets_ready(1);
                 self.process_open_inline_dataset(slot);
             }
         }
@@ -4371,7 +4375,7 @@ impl PacketWorkerResultContext<'_> {
         );
         self.inline_reassembler
             .retire_range(dataset.slot, dataset.start_index, dataset.end_index);
-        crate::runtime_metrics::observe_inline_reassembler_ranges_retired(1);
+        runtime_metrics::observe_inline_reassembler_ranges_retired(1);
         true
     }
 
@@ -4431,14 +4435,14 @@ impl PacketWorkerResultContext<'_> {
             .record(cache_key, now, outcome.status());
         self.inline_reassembler
             .retire_range(dataset.slot, dataset.start_index, dataset.end_index);
-        crate::runtime_metrics::observe_inline_reassembler_ranges_retired(1);
+        runtime_metrics::observe_inline_reassembler_ranges_retired(1);
     }
 
     fn process_open_inline_dataset(&mut self, slot: u64) {
         struct PreparedInlineTx {
             tx: Arc<VersionedTransaction>,
-            dispatch: crate::framework::host::ClassifiedTransactionDispatch,
-            kind: crate::app::runtime::dataset::TxKind,
+            dispatch: ClassifiedTransactionDispatch,
+            kind: dataset::TxKind,
             signature: Option<Signature>,
             tx_ready_observed_at: Instant,
             tx_first_observed_at: Instant,
@@ -4478,9 +4482,9 @@ impl PacketWorkerResultContext<'_> {
                     remove_state = true;
                 } else {
                     match state.advance_ready_ranges() {
-                        crate::app::runtime::dataset::EntryStreamPrefixAdvance::Complete
-                        | crate::app::runtime::dataset::EntryStreamPrefixAdvance::Incomplete => {}
-                        crate::app::runtime::dataset::EntryStreamPrefixAdvance::Malformed => {
+                        dataset::EntryStreamPrefixAdvance::Complete
+                        | dataset::EntryStreamPrefixAdvance::Incomplete => {}
+                        dataset::EntryStreamPrefixAdvance::Malformed => {
                             remove_state = true;
                         }
                     }
@@ -4536,7 +4540,7 @@ impl PacketWorkerResultContext<'_> {
                                 remove_state = true;
                                 break;
                             };
-                            let kind = crate::app::runtime::dataset::classify_tx_kind(&tx);
+                            let kind = dataset::classify_tx_kind(&tx);
                             let signature = tx.signatures.first().copied();
                             let dispatch = match prefiltered_dispatch {
                                 Some(prefiltered) if !prefiltered.needs_full_classification => {
@@ -4598,7 +4602,7 @@ impl PacketWorkerResultContext<'_> {
                     prepared_tx.tx_ready_observed_at,
                     prepared_tx.tx_first_observed_at,
                     prepared_tx.tx_ready_observed_at,
-                    crate::framework::host::InlineTransactionDispatchSource::EarlyPrefix,
+                    framework::host::InlineTransactionDispatchSource::EarlyPrefix,
                     prepared_tx.visible_tx_count,
                     prepared_tx.dataset_tx_offset,
                 );
@@ -4646,7 +4650,7 @@ impl PacketWorkerResultContext<'_> {
     #[cfg(feature = "gossip-bootstrap")]
     fn emit_leader_events(
         &mut self,
-        leader_diff: crate::verify::SlotLeaderDiff,
+        leader_diff: SlotLeaderDiff,
         observed_slot_leaders: Vec<(u64, [u8; 32])>,
     ) {
         if !self.plugin_host.wants_leader_schedule() && !self.derived_state_hooks_enabled {
@@ -4823,7 +4827,7 @@ impl PacketBatchDispatchScratch {
         let Some(batch) = self.worker_batches.get_mut(worker_index) else {
             return Vec::new();
         };
-        std::mem::take(batch)
+        take(batch)
     }
 
     /// Recycles one drained worker batch back into retained scratch storage.
@@ -4884,10 +4888,10 @@ fn dispatch_packet_worker_burst(
 fn take_next_packet_worker_batch_chunk<T>(packets: &mut Vec<T>, max_packets: usize) -> Vec<T> {
     let max_packets = max_packets.max(1);
     if packets.len() <= max_packets {
-        return std::mem::take(packets);
+        return take(packets);
     }
     let tail = packets.split_off(max_packets);
-    std::mem::replace(packets, tail)
+    replace(packets, tail)
 }
 
 fn select_least_loaded_worker(worker_loads: &[u64], preferred_worker: usize) -> usize {
@@ -4937,17 +4941,14 @@ fn combine_packet_worker_pressure_into(
 }
 
 fn sync_shred_dedupe_runtime_metrics(cache: Option<&ShredDedupeCache>) {
-    let metrics = cache.map_or_else(
-        crate::app::state::ShredDedupeCacheMetrics::default,
-        ShredDedupeCache::metrics,
-    );
-    crate::runtime_metrics::set_shred_dedupe_metrics(
+    let metrics = cache.map_or_else(ShredDedupeCacheMetrics::default, ShredDedupeCache::metrics);
+    runtime_metrics::set_shred_dedupe_metrics(
         metrics.entries,
         metrics.max_entries,
         metrics.queue_depth,
         metrics.max_queue_depth,
     );
-    crate::runtime_metrics::set_shred_dedupe_evictions(
+    runtime_metrics::set_shred_dedupe_evictions(
         metrics.capacity_evictions_total,
         metrics.expired_evictions_total,
     );
@@ -5005,7 +5006,7 @@ fn apply_fork_update(update: &ForkTrackerUpdate, context: &mut ForkUpdateDispatc
     let plugin_slot_status_enabled = context.plugin_host.wants_slot_status();
     let derived_slot_status_enabled = context.derived_state_hooks_enabled;
     for transition in &update.status_transitions {
-        if transition.status == crate::event::ForkSlotStatus::Orphaned {
+        if transition.status == ForkSlotStatus::Orphaned {
             *context.fork_orphaned_slots_total =
                 context.fork_orphaned_slots_total.saturating_add(1);
         }
@@ -5223,7 +5224,7 @@ mod tests {
             Ok(())
         }
 
-        async fn on_transaction(&self, _event: &crate::framework::TransactionEvent) {}
+        async fn on_transaction(&self, _event: &framework::TransactionEvent) {}
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -5243,7 +5244,7 @@ mod tests {
 
         fn transaction_interest_ref(
             &self,
-            event: &crate::framework::TransactionEventRef<'_>,
+            event: &framework::TransactionEventRef<'_>,
         ) -> TransactionInterest {
             if event
                 .tx
@@ -5314,7 +5315,7 @@ mod tests {
         for iteration in 0..iterations {
             let slot = 3_000_000_u64.saturating_add(u64::try_from(iteration).unwrap_or(u64::MAX));
             let mut reassembler =
-                crate::reassembly::inline::InlineDataReassembler::new(fragment_count.max(4));
+                reassembly::inline::InlineDataReassembler::new(fragment_count.max(4));
             let mut open_state = InlineOpenDatasetState::default();
             for (index, fragment) in fragments.iter().enumerate() {
                 let observed_at = Instant::now();
@@ -5324,7 +5325,7 @@ mod tests {
                     0,
                     index + 1 == fragments.len(),
                     index + 1 == fragments.len(),
-                    crate::reassembly::dataset::SharedPayloadFragment::owned(fragment.clone()),
+                    reassembly::dataset::SharedPayloadFragment::owned(fragment.clone()),
                     observed_at,
                 );
                 reassembler.fill_inline_contiguous_dataset_starts(slot, &mut start_indices_scratch);
@@ -5335,9 +5336,9 @@ mod tests {
                     reassembler.sync_inline_contiguous_dataset(slot, start_index, &mut open_state);
                 assert!(synced.is_some(), "inline dataset state should sync");
                 match open_state.advance_ready_ranges() {
-                    crate::app::runtime::dataset::EntryStreamPrefixAdvance::Complete
-                    | crate::app::runtime::dataset::EntryStreamPrefixAdvance::Incomplete => {}
-                    crate::app::runtime::dataset::EntryStreamPrefixAdvance::Malformed => {
+                    dataset::EntryStreamPrefixAdvance::Complete
+                    | dataset::EntryStreamPrefixAdvance::Incomplete => {}
+                    dataset::EntryStreamPrefixAdvance::Malformed => {
                         panic!("unexpected malformed inline prefix fixture")
                     }
                 }
@@ -5381,7 +5382,7 @@ mod tests {
                     }
                     let tx = bincode::deserialize::<VersionedTransaction>(bytes)
                         .expect("deserialize inline transaction");
-                    let kind = crate::app::runtime::dataset::classify_tx_kind(&tx);
+                    let kind = dataset::classify_tx_kind(&tx);
                     let signature = tx.signatures.first().copied();
                     let dispatch = match prefiltered_dispatch {
                         Some(prefiltered) if !prefiltered.needs_full_classification => {
@@ -5393,8 +5394,7 @@ mod tests {
                                 commitment_status,
                                 confirmed_slot: commitment_snapshot.confirmed_slot,
                                 finalized_slot: commitment_snapshot.finalized_slot,
-                                signature: signature
-                                    .map(crate::framework::SignatureBytes::from_solana),
+                                signature: signature.map(framework::SignatureBytes::from_solana),
                                 tx: &tx,
                                 kind,
                             },
@@ -5412,12 +5412,12 @@ mod tests {
                         .expect("first observed at");
                     plugin_host.on_classified_transaction(
                         dispatch,
-                        crate::framework::TransactionEvent {
+                        framework::TransactionEvent {
                             slot,
                             commitment_status,
                             confirmed_slot: commitment_snapshot.confirmed_slot,
                             finalized_slot: commitment_snapshot.finalized_slot,
-                            signature: signature.map(crate::framework::SignatureBytes::from_solana),
+                            signature: signature.map(framework::SignatureBytes::from_solana),
                             tx: Arc::new(tx),
                             kind,
                             provider_source: None,
@@ -5425,7 +5425,7 @@ mod tests {
                         tx_ready_observed_at,
                         tx_first_observed_at,
                         tx_ready_observed_at,
-                        crate::framework::host::InlineTransactionDispatchSource::EarlyPrefix,
+                        framework::host::InlineTransactionDispatchSource::EarlyPrefix,
                         visible_tx_count,
                         u32::try_from(dataset_tx_offset).unwrap_or(u32::MAX),
                     );
@@ -5489,7 +5489,7 @@ mod tests {
         for iteration in 0..iterations {
             let slot = 4_000_000_u64.saturating_add(u64::try_from(iteration).unwrap_or(u64::MAX));
             let mut reassembler =
-                crate::reassembly::inline::InlineDataReassembler::new(fragment_count.max(4));
+                reassembly::inline::InlineDataReassembler::new(fragment_count.max(4));
             let mut open_state = InlineOpenDatasetState::default();
             for (index, fragment) in fragments.iter().enumerate() {
                 let observed_at = Instant::now();
@@ -5499,7 +5499,7 @@ mod tests {
                     0,
                     index + 1 == fragments.len(),
                     index + 1 == fragments.len(),
-                    crate::reassembly::dataset::SharedPayloadFragment::owned(fragment.clone()),
+                    reassembly::dataset::SharedPayloadFragment::owned(fragment.clone()),
                     observed_at,
                 );
                 reassembler.fill_inline_contiguous_dataset_starts(slot, &mut start_indices_scratch);
@@ -5510,9 +5510,9 @@ mod tests {
                     reassembler.sync_inline_contiguous_dataset(slot, start_index, &mut open_state);
                 assert!(synced.is_some(), "inline dataset state should sync");
                 match open_state.advance_ready_ranges() {
-                    crate::app::runtime::dataset::EntryStreamPrefixAdvance::Complete
-                    | crate::app::runtime::dataset::EntryStreamPrefixAdvance::Incomplete => {}
-                    crate::app::runtime::dataset::EntryStreamPrefixAdvance::Malformed => {
+                    dataset::EntryStreamPrefixAdvance::Complete
+                    | dataset::EntryStreamPrefixAdvance::Incomplete => {}
+                    dataset::EntryStreamPrefixAdvance::Malformed => {
                         panic!("unexpected malformed inline prefix fixture")
                     }
                 }
@@ -5554,7 +5554,7 @@ mod tests {
                     }
                     let tx = bincode::deserialize::<VersionedTransaction>(bytes)
                         .expect("deserialize inline transaction");
-                    let kind = crate::app::runtime::dataset::classify_tx_kind(&tx);
+                    let kind = dataset::classify_tx_kind(&tx);
                     let signature = tx.signatures.first().copied();
                     let dispatch = match prefiltered_dispatch {
                         Some(prefiltered) if !prefiltered.needs_full_classification => {
@@ -5566,8 +5566,7 @@ mod tests {
                                 commitment_status,
                                 confirmed_slot: commitment_snapshot.confirmed_slot,
                                 finalized_slot: commitment_snapshot.finalized_slot,
-                                signature: signature
-                                    .map(crate::framework::SignatureBytes::from_solana),
+                                signature: signature.map(framework::SignatureBytes::from_solana),
                                 tx: &tx,
                                 kind,
                             },
@@ -5669,14 +5668,8 @@ mod tests {
                 .expect("load shed should activate");
         assert!(active);
         assert_eq!(selected.len(), 2);
-        assert_eq!(
-            selected[0],
-            "10.0.0.1".parse::<std::net::IpAddr>().expect("ip")
-        );
-        assert_eq!(
-            selected[1],
-            "10.0.0.2".parse::<std::net::IpAddr>().expect("ip")
-        );
+        assert_eq!(selected[0], "10.0.0.1".parse::<IpAddr>().expect("ip"));
+        assert_eq!(selected[1], "10.0.0.2".parse::<IpAddr>().expect("ip"));
 
         let selected_after_hysteresis =
             select_gossip_load_shed_source_ips(&mut tracker, now, 60, &mut active, 100, 2)
@@ -5702,7 +5695,7 @@ mod tests {
 
         emit_shutdown_checkpoint_barrier(
             &host,
-            crate::app::state::ForkTrackerSnapshot {
+            ForkTrackerSnapshot {
                 tracked_slots: 4,
                 tip_slot: Some(88),
                 confirmed_slot: Some(80),
@@ -5779,8 +5772,8 @@ mod tests {
             Ok(None)
         }
 
-        fn config(&self) -> crate::framework::DerivedStateConsumerConfig {
-            crate::framework::DerivedStateConsumerConfig::new()
+        fn config(&self) -> framework::DerivedStateConsumerConfig {
+            framework::DerivedStateConsumerConfig::new()
                 .with_transaction_applied()
                 .with_account_touch_key_partitions()
                 .with_control_plane_observed()

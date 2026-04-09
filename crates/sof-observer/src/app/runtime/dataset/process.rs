@@ -1,15 +1,19 @@
 use super::*;
-use crate::framework::AccountTouchEvent;
-use crate::framework::AccountTouchEventRef;
-use crate::framework::DerivedStateFeedEvent;
-use crate::framework::SerializedTransactionRange;
-use crate::framework::TransactionBatchEvent;
-use crate::framework::TransactionEvent;
-use crate::framework::TransactionViewBatchEvent;
-use crate::framework::arc_pubkey_bytes;
-use crate::framework::events::TransactionEventRef;
-use crate::framework::host::TransactionDispatchScope;
-use crate::framework::{signature_bytes, signature_bytes_opt};
+use std::{borrow::Cow, sync::OnceLock, time::Instant};
+
+use crate::{
+    framework::{
+        AccountTouchEvent, AccountTouchEventRef, DerivedStateFeedEvent, PubkeyBytes,
+        SerializedTransactionRange, TransactionBatchEvent, TransactionEvent,
+        TransactionViewBatchEvent, arc_pubkey_bytes,
+        events::TransactionEventRef,
+        host::{InlineTransactionDispatchSource, TransactionDispatchScope},
+        plugin::clone_cached_transaction_event,
+        signature_bytes, signature_bytes_opt,
+    },
+    reassembly::dataset::{PayloadFragmentBatch, SharedPayloadFragment},
+    runtime_metrics,
+};
 use agave_transaction_view::transaction_view::SanitizedTransactionView;
 use core::mem::size_of;
 use solana_hash::Hash;
@@ -29,10 +33,10 @@ pub(in crate::app::runtime) struct DatasetProcessInput {
     pub(in crate::app::runtime) start_index: u32,
     pub(in crate::app::runtime) end_index: u32,
     pub(in crate::app::runtime) last_in_slot: bool,
-    pub(in crate::app::runtime) completed_at: std::time::Instant,
-    pub(in crate::app::runtime) first_shred_observed_at: std::time::Instant,
-    pub(in crate::app::runtime) last_shred_observed_at: std::time::Instant,
-    pub(in crate::app::runtime) payload_fragments: crate::reassembly::dataset::PayloadFragmentBatch,
+    pub(in crate::app::runtime) completed_at: Instant,
+    pub(in crate::app::runtime) first_shred_observed_at: Instant,
+    pub(in crate::app::runtime) last_shred_observed_at: Instant,
+    pub(in crate::app::runtime) payload_fragments: PayloadFragmentBatch,
 }
 
 pub(in crate::app::runtime) struct DatasetProcessContext<'context> {
@@ -191,7 +195,7 @@ pub(in crate::app::runtime) fn process_completed_dataset(
         let _ = context
             .dataset_decode_fail_count
             .fetch_add(1, Ordering::Relaxed);
-        crate::runtime_metrics::observe_decode_failed_dataset();
+        runtime_metrics::observe_decode_failed_dataset();
         tracing::debug!(
             slot,
             start_index,
@@ -298,7 +302,7 @@ pub(in crate::app::runtime) fn process_completed_dataset(
         for (dataset_tx_offset, tx) in flat_transactions.iter().enumerate() {
             let dataset_tx_offset = u32::try_from(dataset_tx_offset).unwrap_or(u32::MAX);
             process_decoded_transaction(
-                std::borrow::Cow::Borrowed(tx),
+                Cow::Borrowed(tx),
                 dataset_tx_offset,
                 &process_config,
                 &mut process_state,
@@ -312,7 +316,7 @@ pub(in crate::app::runtime) fn process_completed_dataset(
         {
             let dataset_tx_offset = u32::try_from(dataset_tx_offset).unwrap_or(u32::MAX);
             process_decoded_transaction(
-                std::borrow::Cow::Owned(tx),
+                Cow::Owned(tx),
                 dataset_tx_offset,
                 &process_config,
                 &mut process_state,
@@ -329,7 +333,7 @@ pub(in crate::app::runtime) fn process_completed_dataset(
         };
         if context.tx_event_tx.try_send(event).is_err() {
             let _ = context.tx_event_drop_count.fetch_add(1, Ordering::Relaxed);
-            crate::runtime_metrics::observe_tx_event_drops(1);
+            runtime_metrics::observe_tx_event_drops(1);
         }
     }
 
@@ -381,7 +385,7 @@ pub(in crate::app::runtime) fn process_completed_dataset(
             "completed dataset reconstruction"
         );
     }
-    crate::runtime_metrics::observe_decoded_dataset(tx_count);
+    runtime_metrics::observe_decoded_dataset(tx_count);
     DatasetProcessOutcome::Decoded
 }
 
@@ -397,7 +401,7 @@ pub(in crate::app::runtime) fn process_completed_dataset_inline_transactions(
     first_shred_observed_at: Instant,
     last_shred_observed_at: Instant,
     already_emitted_tx_count: usize,
-    payload_fragments: &crate::reassembly::dataset::PayloadFragmentBatch,
+    payload_fragments: &PayloadFragmentBatch,
     context: &DatasetProcessContext<'_>,
     scratch: &mut DatasetWorkerScratch,
 ) -> DatasetProcessOutcome {
@@ -420,7 +424,7 @@ pub(in crate::app::runtime) fn process_completed_dataset_inline_transactions(
         let _ = context
             .dataset_decode_fail_count
             .fetch_add(1, Ordering::Relaxed);
-        crate::runtime_metrics::observe_decode_failed_dataset();
+        runtime_metrics::observe_decode_failed_dataset();
         tracing::debug!(
             slot,
             start_index,
@@ -484,7 +488,7 @@ pub(in crate::app::runtime) fn process_completed_dataset_inline_transactions(
     {
         let dataset_tx_offset = u32::try_from(dataset_tx_offset).unwrap_or(u32::MAX);
         process_decoded_transaction(
-            std::borrow::Cow::Owned(tx),
+            Cow::Owned(tx),
             dataset_tx_offset,
             &process_config,
             &mut process_state,
@@ -704,14 +708,14 @@ fn process_completed_dataset_from_views(
             let _ = context
                 .dataset_decode_fail_count
                 .fetch_add(1, Ordering::Relaxed);
-            crate::runtime_metrics::observe_decode_failed_dataset();
+            runtime_metrics::observe_decode_failed_dataset();
             return DatasetProcessOutcome::DecodeFailed;
         };
         let Ok(view) = SanitizedTransactionView::try_new_sanitized(bytes, true) else {
             let _ = context
                 .dataset_decode_fail_count
                 .fetch_add(1, Ordering::Relaxed);
-            crate::runtime_metrics::observe_decode_failed_dataset();
+            runtime_metrics::observe_decode_failed_dataset();
             return DatasetProcessOutcome::DecodeFailed;
         };
         if observed_recent_blockhash.is_none() {
@@ -739,7 +743,7 @@ fn process_completed_dataset_from_views(
             };
             if context.tx_event_tx.try_send(event).is_err() {
                 let _ = context.tx_event_drop_count.fetch_add(1, Ordering::Relaxed);
-                crate::runtime_metrics::observe_tx_event_drops(1);
+                runtime_metrics::observe_tx_event_drops(1);
             }
         }
     }
@@ -753,7 +757,7 @@ fn process_completed_dataset_from_views(
         };
         if context.tx_event_tx.try_send(event).is_err() {
             let _ = context.tx_event_drop_count.fetch_add(1, Ordering::Relaxed);
-            crate::runtime_metrics::observe_tx_event_drops(1);
+            runtime_metrics::observe_tx_event_drops(1);
         }
     }
 
@@ -808,7 +812,7 @@ fn process_completed_dataset_from_views(
             "completed dataset reconstruction"
         );
     }
-    crate::runtime_metrics::observe_decoded_dataset(tx_count);
+    runtime_metrics::observe_decoded_dataset(tx_count);
     let _ = completed_at;
     DatasetProcessOutcome::Decoded
 }
@@ -856,14 +860,14 @@ struct ProcessDecodedTransactionState<'derived> {
 }
 
 fn process_decoded_transaction(
-    tx: std::borrow::Cow<'_, VersionedTransaction>,
+    tx: Cow<'_, VersionedTransaction>,
     dataset_tx_offset: u32,
     config: &ProcessDecodedTransactionConfig<'_, '_>,
     state: &mut ProcessDecodedTransactionState<'_>,
 ) {
     let tx_ref: &VersionedTransaction = match &tx {
-        std::borrow::Cow::Borrowed(tx) => tx,
-        std::borrow::Cow::Owned(tx) => tx,
+        Cow::Borrowed(tx) => tx,
+        Cow::Owned(tx) => tx,
     };
     if state.observed_recent_blockhash.is_none() {
         *state.observed_recent_blockhash = Some(tx_ref.message.recent_blockhash().to_bytes());
@@ -964,8 +968,8 @@ fn process_decoded_transaction(
             .is_some_and(|dispatch| !dispatch.is_empty())
     {
         Some(
-            crate::framework::plugin::clone_cached_transaction_event(&transaction_event_ref)
-                .unwrap_or_else(|| TransactionEvent {
+            clone_cached_transaction_event(&transaction_event_ref).unwrap_or_else(|| {
+                TransactionEvent {
                     slot: config.slot,
                     commitment_status: config.commitment_status,
                     confirmed_slot: config.confirmed_slot,
@@ -973,11 +977,12 @@ fn process_decoded_transaction(
                     signature: signature_bytes_opt(signature),
                     provider_source: None,
                     tx: Arc::new(match tx {
-                        std::borrow::Cow::Borrowed(tx) => tx.clone(),
-                        std::borrow::Cow::Owned(tx) => tx,
+                        Cow::Borrowed(tx) => tx.clone(),
+                        Cow::Owned(tx) => tx,
                     }),
                     kind,
-                }),
+                }
+            }),
         )
     } else {
         None
@@ -1045,7 +1050,7 @@ fn process_decoded_transaction(
             config.completed_at,
             config.first_shred_observed_at,
             config.last_shred_observed_at,
-            crate::framework::host::InlineTransactionDispatchSource::CompletedDatasetFallback,
+            InlineTransactionDispatchSource::CompletedDatasetFallback,
             config.dataset_tx_count,
             tx_index.saturating_sub(config.dataset_tx_index_base),
         );
@@ -1079,7 +1084,7 @@ fn emit_detailed_tx_observed_event(
     };
     if context.tx_event_tx.try_send(event).is_err() {
         let _ = context.tx_event_drop_count.fetch_add(1, Ordering::Relaxed);
-        crate::runtime_metrics::observe_tx_event_drops(1);
+        runtime_metrics::observe_tx_event_drops(1);
     }
 }
 
@@ -1096,7 +1101,7 @@ struct ViewOnlyDatasetProcessInput {
     start_index: u32,
     end_index: u32,
     last_in_slot: bool,
-    completed_at: std::time::Instant,
+    completed_at: Instant,
     shred_count: usize,
     confirmed_slot: Option<u64>,
     finalized_slot: Option<u64>,
@@ -1110,9 +1115,9 @@ struct PrefilteredDatasetProcessInput {
     start_index: u32,
     end_index: u32,
     last_in_slot: bool,
-    completed_at: std::time::Instant,
-    first_shred_observed_at: std::time::Instant,
-    last_shred_observed_at: std::time::Instant,
+    completed_at: Instant,
+    first_shred_observed_at: Instant,
+    last_shred_observed_at: Instant,
     shred_count: usize,
     confirmed_slot: Option<u64>,
     finalized_slot: Option<u64>,
@@ -1212,7 +1217,7 @@ fn process_completed_dataset_with_prefiltered_transactions(
             completed_at,
             first_shred_observed_at,
             last_shred_observed_at,
-            crate::framework::host::InlineTransactionDispatchSource::CompletedDatasetFallback,
+            InlineTransactionDispatchSource::CompletedDatasetFallback,
             dataset_tx_count,
             u32::try_from(dataset_tx_offset).unwrap_or(u32::MAX),
         );
@@ -1227,7 +1232,7 @@ fn process_completed_dataset_with_prefiltered_transactions(
         };
         if context.tx_event_tx.try_send(event).is_err() {
             let _ = context.tx_event_drop_count.fetch_add(1, Ordering::Relaxed);
-            crate::runtime_metrics::observe_tx_event_drops(1);
+            runtime_metrics::observe_tx_event_drops(1);
         }
     }
 
@@ -1282,15 +1287,11 @@ fn process_completed_dataset_with_prefiltered_transactions(
             "completed dataset reconstruction"
         );
     }
-    crate::runtime_metrics::observe_decoded_dataset(tx_count);
+    runtime_metrics::observe_decoded_dataset(tx_count);
     Some(DatasetProcessOutcome::Decoded)
 }
 
-type PartitionedStaticAccountKeys = (
-    Arc<[crate::framework::PubkeyBytes]>,
-    Arc<[crate::framework::PubkeyBytes]>,
-    Arc<[crate::framework::PubkeyBytes]>,
-);
+type PartitionedStaticAccountKeys = (Arc<[PubkeyBytes]>, Arc<[PubkeyBytes]>, Arc<[PubkeyBytes]>);
 
 fn partition_static_account_keys(tx: &VersionedTransaction) -> PartitionedStaticAccountKeys {
     let static_account_keys = tx.message.static_account_keys();
@@ -1310,9 +1311,8 @@ fn partition_static_account_keys(tx: &VersionedTransaction) -> PartitionedStatic
     )
 }
 
-fn empty_pubkey_vec() -> Arc<[crate::framework::PubkeyBytes]> {
-    static EMPTY: std::sync::OnceLock<Arc<[crate::framework::PubkeyBytes]>> =
-        std::sync::OnceLock::new();
+fn empty_pubkey_vec() -> Arc<[PubkeyBytes]> {
+    static EMPTY: OnceLock<Arc<[PubkeyBytes]>> = OnceLock::new();
     Arc::clone(EMPTY.get_or_init(|| Arc::from([])))
 }
 
@@ -1322,7 +1322,7 @@ fn lookup_table_account_key_count(tx: &VersionedTransaction) -> usize {
         .map_or(0, |lookups| lookups.len())
 }
 
-fn lookup_table_account_keys(tx: &VersionedTransaction) -> Arc<[crate::framework::PubkeyBytes]> {
+fn lookup_table_account_keys(tx: &VersionedTransaction) -> Arc<[PubkeyBytes]> {
     let Some(lookups) = tx.message.address_table_lookups() else {
         return empty_pubkey_vec();
     };
@@ -1333,7 +1333,7 @@ fn lookup_table_account_keys(tx: &VersionedTransaction) -> Arc<[crate::framework
 }
 
 fn decode_entries_from_payload_fragments(
-    payload_fragments: &crate::reassembly::dataset::PayloadFragmentBatch,
+    payload_fragments: &PayloadFragmentBatch,
     scratch_payload: &mut Vec<u8>,
     scratch_contains_joined_payload: bool,
 ) -> Option<(Vec<Entry>, usize, u32)> {
@@ -1387,7 +1387,7 @@ fn decode_entries_from_payload_fragments(
 }
 
 fn extract_transaction_view_batch_from_payload_fragments<'payload>(
-    payload_fragments: &'payload crate::reassembly::dataset::PayloadFragmentBatch,
+    payload_fragments: &'payload PayloadFragmentBatch,
     scratch_payload: &'payload mut Vec<u8>,
 ) -> Option<ExtractedTransactionViewBatch<'payload>> {
     let total_payload_len = payload_fragments.total_len();
@@ -1879,7 +1879,7 @@ enum PartialParseError {
 
 fn join_payload_fragments_into(
     buffer: &mut Vec<u8>,
-    fragments: &[crate::reassembly::dataset::SharedPayloadFragment],
+    fragments: &[SharedPayloadFragment],
     payload_len: usize,
 ) {
     buffer.clear();
@@ -2365,11 +2365,10 @@ mod tests {
             .filter(|value| *value > 0)
             .unwrap_or(512);
         let payload = build_profile_payload(PROFILE_ENTRY_COUNT);
-        let payload_fragments =
-            crate::reassembly::dataset::PayloadFragmentBatch::from_owned_fragments(split_payload(
-                &payload,
-                PROFILE_FRAGMENT_COUNT,
-            ));
+        let payload_fragments = PayloadFragmentBatch::from_owned_fragments(split_payload(
+            &payload,
+            PROFILE_FRAGMENT_COUNT,
+        ));
         let plugin_host = build_profile_plugin_host();
         let derived_state_host = DerivedStateHost::default();
         let (tx_event_tx, _tx_event_rx) = mpsc::channel::<TxObservedEvent>(262_144);
@@ -2440,7 +2439,7 @@ mod tests {
         assert_eq!(dataset_decode_fail_count.load(Ordering::Relaxed), 0);
         assert_eq!(tx_event_drop_count.load(Ordering::Relaxed), 0);
         assert_eq!(plugin_host.dropped_event_count(), 0);
-        let metrics = crate::runtime_metrics::snapshot();
+        let metrics = runtime_metrics::snapshot();
         println!(
             "multi_hook_profile_fixture iterations={} elapsed_ms={} dataset_tail_skips={} inline_samples={} inline_first_avg_us={} inline_last_avg_us={} inline_completed_avg_us={} inline_first_max_us={} inline_last_max_us={} inline_completed_max_us={}",
             iterations,
@@ -2477,11 +2476,10 @@ mod tests {
             .unwrap_or_else(|_| "manual".to_owned());
         let ignored_account = Pubkey::new_unique();
         let payload = build_profile_payload(PROFILE_ENTRY_COUNT);
-        let payload_fragments =
-            crate::reassembly::dataset::PayloadFragmentBatch::from_owned_fragments(split_payload(
-                &payload,
-                PROFILE_FRAGMENT_COUNT,
-            ));
+        let payload_fragments = PayloadFragmentBatch::from_owned_fragments(split_payload(
+            &payload,
+            PROFILE_FRAGMENT_COUNT,
+        ));
         let plugin_host = build_profile_prefilter_plugin_host(mode.as_str(), ignored_account);
         let derived_state_host = DerivedStateHost::default();
         let (tx_event_tx, _tx_event_rx) = mpsc::channel::<TxObservedEvent>(262_144);
@@ -2642,9 +2640,7 @@ mod tests {
             active_entrypoint: Some("synthetic".to_owned()),
             total_nodes: 1,
             added_nodes: vec![ClusterNodeInfo {
-                pubkey: crate::framework::PubkeyBytes::from_solana(Pubkey::new_from_array(
-                    [3_u8; 32],
-                )),
+                pubkey: PubkeyBytes::from_solana(Pubkey::new_from_array([3_u8; 32])),
                 wallclock: slot,
                 shred_version: 1,
                 gossip: Some(SocketAddr::V4(SocketAddrV4::new(
@@ -2679,9 +2675,7 @@ mod tests {
             epoch: Some(0),
             added_leaders: vec![LeaderScheduleEntry {
                 slot,
-                leader: crate::framework::PubkeyBytes::from_solana(Pubkey::new_from_array(
-                    [5_u8; 32],
-                )),
+                leader: PubkeyBytes::from_solana(Pubkey::new_from_array([5_u8; 32])),
             }],
             removed_slots: Vec::new(),
             updated_leaders: Vec::new(),

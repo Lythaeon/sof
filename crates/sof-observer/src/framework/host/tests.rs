@@ -14,10 +14,10 @@ use std::{
 
 use crate::event::TxKind;
 use crate::framework::{
-    PluginConfig, PluginContext, PluginSetupError, PubkeyBytes, SerializedTransactionRange,
-    SignatureBytes, TransactionBatchEvent, TransactionDispatchMode, TransactionEvent,
-    TransactionEventRef, TransactionInterest, TransactionLogEvent, TransactionPrefilter,
-    TransactionViewBatchEvent, TxCommitmentStatus,
+    ControlPlaneSource, ForkSlotStatus, PluginConfig, PluginContext, PluginSetupError, PubkeyBytes,
+    SerializedTransactionRange, SignatureBytes, TransactionBatchEvent, TransactionDispatchMode,
+    TransactionEvent, TransactionEventRef, TransactionInterest, TransactionLogEvent,
+    TransactionPrefilter, TransactionViewBatchEvent, TxCommitmentStatus,
 };
 
 fn pb(value: Pubkey) -> PubkeyBytes {
@@ -601,8 +601,8 @@ fn fork_hooks_dispatch_to_plugins() {
     host.on_slot_status(SlotStatusEvent {
         slot: 42,
         parent_slot: Some(41),
-        previous_status: Some(crate::framework::ForkSlotStatus::Processed),
-        status: crate::framework::ForkSlotStatus::Confirmed,
+        previous_status: Some(ForkSlotStatus::Processed),
+        status: ForkSlotStatus::Confirmed,
         tip_slot: Some(42),
         confirmed_slot: Some(41),
         finalized_slot: Some(40),
@@ -638,7 +638,7 @@ fn latest_observed_tpu_leader_is_stateful() {
     let leader_b = Pubkey::new_from_array([8_u8; 32]);
 
     host.on_leader_schedule(LeaderScheduleEvent {
-        source: crate::framework::ControlPlaneSource::GossipBootstrap,
+        source: ControlPlaneSource::GossipBootstrap,
         slot: Some(100),
         epoch: None,
         added_leaders: vec![LeaderScheduleEntry {
@@ -659,7 +659,7 @@ fn latest_observed_tpu_leader_is_stateful() {
     );
 
     host.on_leader_schedule(LeaderScheduleEvent {
-        source: crate::framework::ControlPlaneSource::GossipBootstrap,
+        source: ControlPlaneSource::GossipBootstrap,
         slot: Some(99),
         epoch: None,
         added_leaders: vec![LeaderScheduleEntry {
@@ -680,7 +680,7 @@ fn latest_observed_tpu_leader_is_stateful() {
     );
 
     host.on_leader_schedule(LeaderScheduleEvent {
-        source: crate::framework::ControlPlaneSource::GossipBootstrap,
+        source: ControlPlaneSource::GossipBootstrap,
         slot: Some(100),
         epoch: None,
         added_leaders: Vec::new(),

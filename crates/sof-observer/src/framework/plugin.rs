@@ -8,12 +8,15 @@ use sof_types::{PubkeyBytes, SignatureBytes};
 use std::{cell::RefCell, sync::Arc};
 use thiserror::Error;
 
-use crate::framework::events::{
-    AccountTouchEvent, AccountTouchEventRef, AccountUpdateEvent, BlockMetaEvent,
-    ClusterTopologyEvent, DatasetEvent, LeaderScheduleEvent, ObservedRecentBlockhashEvent,
-    RawPacketEvent, ReorgEvent, ShredEvent, SlotStatusEvent, TransactionBatchEvent,
-    TransactionEvent, TransactionEventRef, TransactionLogEvent, TransactionStatusEvent,
-    TransactionViewBatchEvent,
+use crate::{
+    event::{TxCommitmentStatus, TxKind},
+    framework::events::{
+        AccountTouchEvent, AccountTouchEventRef, AccountUpdateEvent, BlockMetaEvent,
+        ClusterTopologyEvent, DatasetEvent, LeaderScheduleEvent, ObservedRecentBlockhashEvent,
+        RawPacketEvent, ReorgEvent, ShredEvent, SlotStatusEvent, TransactionBatchEvent,
+        TransactionEvent, TransactionEventRef, TransactionLogEvent, TransactionStatusEvent,
+        TransactionViewBatchEvent,
+    },
 };
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -21,7 +24,7 @@ struct CachedTransactionEventKey {
     slot: u64,
     signature: Option<SignatureBytes>,
     tx_ptr: *const solana_transaction::versioned::VersionedTransaction,
-    kind: crate::event::TxKind,
+    kind: TxKind,
 }
 
 struct CachedTransactionEvent {
@@ -390,21 +393,21 @@ pub enum TransactionDispatchMode {
 /// Commitment selector applied to transaction-family plugin hooks.
 pub enum TransactionCommitmentSelector {
     /// Deliver transactions at or above one minimum commitment.
-    AtLeast(crate::event::TxCommitmentStatus),
+    AtLeast(TxCommitmentStatus),
     /// Deliver transactions only at one exact commitment.
-    Only(crate::event::TxCommitmentStatus),
+    Only(TxCommitmentStatus),
 }
 
 impl Default for TransactionCommitmentSelector {
     fn default() -> Self {
-        Self::AtLeast(crate::event::TxCommitmentStatus::Processed)
+        Self::AtLeast(TxCommitmentStatus::Processed)
     }
 }
 
 impl TransactionCommitmentSelector {
     /// Returns true when one transaction event should be delivered under this selector.
     #[must_use]
-    pub fn matches(self, commitment_status: crate::event::TxCommitmentStatus) -> bool {
+    pub fn matches(self, commitment_status: TxCommitmentStatus) -> bool {
         match self {
             Self::AtLeast(minimum) => commitment_status.satisfies_minimum(minimum),
             Self::Only(expected) => commitment_status == expected,
@@ -413,7 +416,7 @@ impl TransactionCommitmentSelector {
 
     /// Returns the lowest commitment this selector can ever accept.
     #[must_use]
-    pub const fn minimum_required(self) -> crate::event::TxCommitmentStatus {
+    pub const fn minimum_required(self) -> TxCommitmentStatus {
         match self {
             Self::AtLeast(minimum) | Self::Only(minimum) => minimum,
         }
@@ -550,17 +553,14 @@ impl PluginConfig {
     /// [`Self::only_at_commitment`], the default is
     /// `AtLeast(TxCommitmentStatus::Processed)`.
     #[must_use]
-    pub const fn at_commitment(mut self, commitment: crate::event::TxCommitmentStatus) -> Self {
+    pub const fn at_commitment(mut self, commitment: TxCommitmentStatus) -> Self {
         self.transaction_commitment = TransactionCommitmentSelector::AtLeast(commitment);
         self
     }
 
     /// Delivers transaction-family hooks only at one exact commitment.
     #[must_use]
-    pub const fn only_at_commitment(
-        mut self,
-        commitment: crate::event::TxCommitmentStatus,
-    ) -> Self {
+    pub const fn only_at_commitment(mut self, commitment: TxCommitmentStatus) -> Self {
         self.transaction_commitment = TransactionCommitmentSelector::Only(commitment);
         self
     }

@@ -1,7 +1,14 @@
 #![allow(clippy::missing_docs_in_private_items)]
 
 use super::*;
-use std::sync::atomic::AtomicBool;
+use crate::reassembly::dataset::SharedPayloadFragment;
+use crate::runtime_metrics::{
+    observe_packet_worker_max_queue_depth, observe_packet_worker_queue_drops,
+    set_packet_worker_queue_depth,
+};
+#[cfg(feature = "gossip-bootstrap")]
+use crate::verify::SlotLeaderDiff;
+use std::{mem, sync::atomic::AtomicBool};
 
 #[derive(Debug)]
 pub(super) struct PacketWorkerInput {
@@ -47,7 +54,7 @@ pub(super) struct WorkerAcceptedShred {
     pub(super) variant: u8,
     pub(super) signature: [u8; 64],
     pub(super) kind: WorkerAcceptedShredKind,
-    pub(super) payload_fragment: Option<crate::reassembly::dataset::SharedPayloadFragment>,
+    pub(super) payload_fragment: Option<SharedPayloadFragment>,
 }
 
 #[derive(Debug)]
@@ -56,7 +63,7 @@ pub(super) struct PacketWorkerBatchResult {
     pub(super) reusable_packets: Vec<PacketWorkerInput>,
     pub(super) accepted_shreds: Vec<WorkerAcceptedShred>,
     #[cfg(feature = "gossip-bootstrap")]
-    pub(super) leader_diff: crate::verify::SlotLeaderDiff,
+    pub(super) leader_diff: SlotLeaderDiff,
     #[cfg(feature = "gossip-bootstrap")]
     pub(super) observed_slot_leaders: Vec<(u64, [u8; 32])>,
     pub(super) verify_verified_count: u64,
@@ -260,7 +267,7 @@ impl PacketWorkerPool {
                         .queue_depth()
                         .saturating_sub(packet_count);
                     worker_telemetry_state.set_queue_depth(worker_depth_after);
-                    crate::runtime_metrics::set_packet_worker_queue_depth(depth_after);
+                    set_packet_worker_queue_depth(depth_after);
                     #[cfg(feature = "gossip-bootstrap")]
                     refresh_known_pubkeys(
                         &worker_known_pubkeys,
@@ -333,7 +340,7 @@ impl PacketWorkerPool {
                         .max(u64::try_from(worker_depth_after).unwrap_or(u64::MAX));
                     worker_telemetry.set_queue_depth(worker_queue_depth);
                 }
-                crate::runtime_metrics::set_packet_worker_queue_depth(depth_after);
+                set_packet_worker_queue_depth(depth_after);
                 let mut current_max = self.max_queue_depth.load(Ordering::Relaxed);
                 while depth_after > current_max {
                     match self.max_queue_depth.compare_exchange_weak(
@@ -346,13 +353,11 @@ impl PacketWorkerPool {
                         Err(observed) => current_max = observed,
                     }
                 }
-                crate::runtime_metrics::observe_packet_worker_max_queue_depth(
-                    self.max_queue_depth.load(Ordering::Relaxed),
-                );
+                observe_packet_worker_max_queue_depth(self.max_queue_depth.load(Ordering::Relaxed));
                 DispatchWorkerBatchOutcome::Enqueued
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(batch)) => {
-                crate::runtime_metrics::observe_packet_worker_queue_drops(1, packet_count);
+                observe_packet_worker_queue_drops(1, packet_count);
                 DispatchWorkerBatchOutcome::Dropped(batch.packets)
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(batch)) => {
@@ -436,7 +441,7 @@ impl PacketWorkerPool {
 
     pub(super) async fn shutdown(&mut self) {
         self.close_inputs();
-        for handle in std::mem::take(&mut self.worker_handles) {
+        for handle in mem::take(&mut self.worker_handles) {
             if handle.await.is_err() {
                 // Worker task was already cancelled during runtime teardown.
             }
@@ -559,11 +564,7 @@ where
                                 last_in_slot: data.data_header.last_in_slot(),
                                 reference_tick: data.data_header.reference_tick(),
                             },
-                            payload_fragment: Some(
-                                crate::reassembly::dataset::SharedPayloadFragment::owned(
-                                    data.payload,
-                                ),
-                            ),
+                            payload_fragment: Some(SharedPayloadFragment::owned(data.payload)),
                         });
                     }
                 }
@@ -571,7 +572,7 @@ where
 
             #[cfg(feature = "gossip-bootstrap")]
             let leader_diff = shred_verifier.as_deref_mut().map_or_else(
-                crate::verify::SlotLeaderDiff::default,
+                SlotLeaderDiff::default,
                 ShredVerifier::take_slot_leader_diff,
             );
             #[cfg(not(feature = "gossip-bootstrap"))]
@@ -588,7 +589,7 @@ where
                 continue;
             }
 
-            verify_counters.merge_from(&std::mem::take(&mut pending_verify_counters));
+            verify_counters.merge_from(&mem::take(&mut pending_verify_counters));
 
             if !emit_result(PacketWorkerBatchResult {
                 worker_index,
@@ -619,7 +620,7 @@ where
         reusable_packets: packets,
         accepted_shreds: Vec::new(),
         #[cfg(feature = "gossip-bootstrap")]
-        leader_diff: crate::verify::SlotLeaderDiff::default(),
+        leader_diff: SlotLeaderDiff::default(),
         #[cfg(feature = "gossip-bootstrap")]
         observed_slot_leaders: Vec::new(),
         verify_verified_count: 0,
@@ -654,7 +655,7 @@ fn push_primary_shred(packet: PacketWorkerInput, accepted_shreds: &mut Vec<Worke
     };
     match packet.parsed_header {
         ParsedShredHeader::Data(data) => {
-            let payload_fragment = crate::reassembly::dataset::SharedPayloadFragment::borrowed(
+            let payload_fragment = SharedPayloadFragment::borrowed(
                 Arc::clone(&packet.packet_bytes),
                 data.payload_offset,
                 data.payload_len,
