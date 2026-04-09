@@ -24,3 +24,18 @@ The vendored backend makes room for:
 - anyone debugging queue pressure or control-plane traffic inside the bootstrap path
 
 If you are only using direct UDP or processed providers, you can mostly ignore this crate.
+
+## Maintenance Status
+
+`sof-solana-gossip` remains excluded from the main Rust workspace because SOF does not want the
+vendored backend to shape the normal crate graph for most contributors.
+
+But it is still part of the maintained repository surface:
+
+- the default contributor gate runs an explicit manifest-path compile check for its maintained
+  library/bin surface
+- changes to `gossip-bootstrap` behavior should treat this crate as maintained code, not as a dead vendor dump
+
+Its full upstream-vendored test matrix is not part of the normal SOF workspace gate today.
+
+So the support policy is: workspace-excluded, library/bin surface checked, and intentionally maintained for SOF's bootstrap path.

@@ -42,7 +42,7 @@ pub(crate) fn with_runtime_env_overrides_for_test<T>(
 ) -> T {
     use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
-    let _guard = acquire_test_runtime_env_lock();
+    let _guard = acquire_test_runtime_env_lock_blocking();
     set_runtime_env_overrides(overrides);
     let result = catch_unwind(AssertUnwindSafe(f));
     clear_runtime_env_overrides();
@@ -53,15 +53,15 @@ pub(crate) fn with_runtime_env_overrides_for_test<T>(
 }
 
 #[cfg(test)]
-pub(crate) fn acquire_test_runtime_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    use std::sync::Mutex;
+fn test_runtime_env_lock() -> &'static tokio::sync::Mutex<()> {
+    static TEST_ENV_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
-    static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    TEST_ENV_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 
-    TEST_ENV_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("test runtime env lock should not be poisoned")
+#[cfg(test)]
+pub(crate) fn acquire_test_runtime_env_lock_blocking() -> tokio::sync::MutexGuard<'static, ()> {
+    test_runtime_env_lock().blocking_lock()
 }
 
 #[cfg(test)]
@@ -72,10 +72,6 @@ pub(crate) async fn with_runtime_env_overrides_for_test_async<T, Fut>(
 where
     Fut: std::future::Future<Output = T>,
 {
-    use tokio::sync::Mutex;
-
-    static TEST_ENV_ASYNC_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
     struct ClearOnDrop;
 
     impl Drop for ClearOnDrop {
@@ -84,11 +80,65 @@ where
         }
     }
 
-    let _guard = TEST_ENV_ASYNC_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .await;
+    let _guard = test_runtime_env_lock().lock().await;
     set_runtime_env_overrides(overrides);
     let _clear = ClearOnDrop;
     f().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn sync_and_async_override_helpers_share_the_same_lock() {
+        let (guard_ready_tx, guard_ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let guard_thread = thread::spawn(move || {
+            let _guard = acquire_test_runtime_env_lock_blocking();
+            guard_ready_tx
+                .send(())
+                .expect("guard-ready signal should send");
+            release_rx.recv().expect("release signal should arrive");
+        });
+
+        guard_ready_rx
+            .recv()
+            .expect("guard-ready signal should arrive");
+
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let finished = std::sync::Arc::new(tokio::sync::Notify::new());
+        let started_wait = std::sync::Arc::clone(&started);
+        let finished_wait = std::sync::Arc::clone(&finished);
+
+        let waiter = tokio::spawn(async move {
+            started_wait.notify_one();
+            with_runtime_env_overrides_for_test_async(
+                [(
+                    String::from("SOF_PROVIDER_STREAM_ALLOW_EOF"),
+                    String::from("true"),
+                )],
+                || async {},
+            )
+            .await;
+            finished_wait.notify_one();
+        });
+
+        started.notified().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), finished.notified())
+                .await
+                .is_err(),
+            "async helper should wait while the sync helper holds the shared lock"
+        );
+
+        release_tx.send(()).expect("release signal should send");
+        waiter.await.expect("waiter task should join");
+        guard_thread.join().expect("guard thread should join");
+    }
 }
