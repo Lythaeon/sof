@@ -47,13 +47,13 @@ pub struct DuplicateShred {
 
 impl DuplicateShred {
     #[inline]
-    #[cfg(any(test, feature = "duplicate-shred-rocksdb"))]
+    #[cfg(feature = "duplicate-shred-rocksdb")]
     pub(crate) fn num_chunks(&self) -> u8 {
         self.num_chunks
     }
 
     #[inline]
-    #[cfg(any(test, feature = "duplicate-shred-rocksdb"))]
+    #[cfg(feature = "duplicate-shred-rocksdb")]
     pub(crate) fn chunk_index(&self) -> u8 {
         self.chunk_index
     }
