@@ -1,6 +1,6 @@
 #![allow(clippy::indexing_slicing)]
 
-use std::io::{ErrorKind, IoSliceMut};
+use std::io::{Error as IoError, ErrorKind, IoSliceMut};
 use std::net::SocketAddr;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsFd, AsRawFd};
@@ -168,7 +168,7 @@ impl RawPacketBatch {
     ) -> Result<(), UdpReceiverError> {
         let Some(storage) = self.storage.as_mut() else {
             return Err(UdpReceiverError::Receive {
-                source: std::io::Error::other("raw packet batch storage missing"),
+                source: IoError::other("raw packet batch storage missing"),
             });
         };
         if len > UDP_PACKET_BUFFER_BYTES {
@@ -224,14 +224,33 @@ impl RawPacketBatch {
                 capacity: UDP_PACKET_BUFFER_BYTES,
             });
         }
-        let buffer_index = self.ensure_receive_slots(1);
+        let Some(storage) = self.storage.as_mut() else {
+            return Err(UdpReceiverError::Receive {
+                source: std::io::Error::other("raw packet batch storage missing"),
+            });
+        };
+        let buffer_index = storage.packets.len();
+        if buffer_index >= storage.buffers.len() {
+            storage.buffers.resize(
+                buffer_index.saturating_add(1),
+                [0_u8; UDP_PACKET_BUFFER_BYTES],
+            );
+        }
         let buffer =
-            self.receive_buffer_mut(buffer_index)
+            storage
+                .buffers
+                .get_mut(buffer_index)
                 .ok_or_else(|| UdpReceiverError::Receive {
-                    source: std::io::Error::other("raw packet receive buffer missing"),
+                    source: IoError::other("raw packet receive buffer missing"),
                 })?;
         buffer[..bytes.len()].copy_from_slice(bytes);
-        self.push_received_metadata(source, ingress, buffer_index, bytes.len())
+        storage.packets.push(RawPacket {
+            source,
+            ingress,
+            buffer_index,
+            len: bytes.len(),
+        });
+        Ok(())
     }
 
     #[must_use]

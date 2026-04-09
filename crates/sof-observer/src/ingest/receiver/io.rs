@@ -483,7 +483,7 @@ pub(super) fn maybe_pin_receiver_thread(socket: &std::net::UdpSocket) {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use std::thread;
+    use std::{env, thread};
 
     #[derive(Debug)]
     struct LegacyRawPacket {
@@ -540,6 +540,11 @@ mod tests {
         Ok(received)
     }
 
+    fn avg_ns_per_iteration(elapsed: Duration, iterations: usize) -> u128 {
+        let iterations = u128::try_from(iterations.max(1)).unwrap_or(1);
+        elapsed.as_nanos().checked_div(iterations).unwrap_or(0)
+    }
+
     #[test]
     fn recvmmsg_batch_matches_legacy_receive_count() {
         let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
@@ -566,12 +571,12 @@ mod tests {
     #[test]
     #[ignore = "profiling fixture for UDP receiver ingress"]
     fn udp_receiver_recvmmsg_profile_fixture() {
-        let iterations = std::env::var("SOF_UDP_RECEIVER_PROFILE_ITERS")
+        let iterations = env::var("SOF_UDP_RECEIVER_PROFILE_ITERS")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(1_000);
-        let packet_count = std::env::var("SOF_UDP_RECEIVER_PROFILE_BURST")
+        let packet_count = env::var("SOF_UDP_RECEIVER_PROFILE_BURST")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
             .filter(|value| *value > 0)
@@ -603,13 +608,19 @@ mod tests {
             assert_eq!(batch.len(), packet_count);
         }
         let batch_elapsed = batch_started_at.elapsed();
+        let legacy_avg_ns = avg_ns_per_iteration(legacy_elapsed, iterations);
+        let batch_avg_ns = avg_ns_per_iteration(batch_elapsed, iterations);
 
         println!(
-            "udp_receiver_recvmmsg_profile_fixture iterations={} burst={} legacy_us={} recvmmsg_us={}",
+            "udp_receiver_recvmmsg_profile_fixture iterations={} burst={} legacy_us={} legacy_avg_ns_per_iteration={} legacy_avg_us_per_iteration={:.3} recvmmsg_us={} recvmmsg_avg_ns_per_iteration={} recvmmsg_avg_us_per_iteration={:.3}",
             iterations,
             packet_count,
             legacy_elapsed.as_micros(),
-            batch_elapsed.as_micros()
+            legacy_avg_ns,
+            legacy_avg_ns as f64 / 1_000.0,
+            batch_elapsed.as_micros(),
+            batch_avg_ns,
+            batch_avg_ns as f64 / 1_000.0
         );
     }
 
@@ -618,22 +629,22 @@ mod tests {
     fn udp_receiver_recvmmsg_coalesced_profile_fixture() {
         use std::os::fd::AsFd;
 
-        let iterations = std::env::var("SOF_UDP_RECEIVER_PROFILE_ITERS")
+        let iterations = env::var("SOF_UDP_RECEIVER_PROFILE_ITERS")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(1_000);
-        let packet_count = std::env::var("SOF_UDP_RECEIVER_PROFILE_BURST")
+        let packet_count = env::var("SOF_UDP_RECEIVER_PROFILE_BURST")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(64);
-        let chunk_size = std::env::var("SOF_UDP_RECEIVER_PROFILE_CHUNK")
+        let chunk_size = env::var("SOF_UDP_RECEIVER_PROFILE_CHUNK")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(8);
-        let gap_us = std::env::var("SOF_UDP_RECEIVER_PROFILE_GAP_US")
+        let gap_us = env::var("SOF_UDP_RECEIVER_PROFILE_GAP_US")
             .ok()
             .and_then(|raw| raw.parse::<u64>().ok())
             .filter(|value| *value > 0)
@@ -711,27 +722,33 @@ mod tests {
                 .expect("send staggered burst");
         }
         let coalesced_elapsed = coalesced_started_at.elapsed();
+        let blocking_avg_ns = avg_ns_per_iteration(blocking_elapsed, iterations);
+        let coalesced_avg_ns = avg_ns_per_iteration(coalesced_elapsed, iterations);
 
         println!(
-            "udp_receiver_recvmmsg_coalesced_profile_fixture iterations={} burst={} chunk={} gap_us={} immediate_us={} coalesced_us={}",
+            "udp_receiver_recvmmsg_coalesced_profile_fixture iterations={} burst={} chunk={} gap_us={} immediate_us={} immediate_avg_ns_per_iteration={} immediate_avg_us_per_iteration={:.3} coalesced_us={} coalesced_avg_ns_per_iteration={} coalesced_avg_us_per_iteration={:.3}",
             iterations,
             packet_count,
             chunk_size,
             gap_us,
             blocking_elapsed.as_micros(),
-            coalesced_elapsed.as_micros()
+            blocking_avg_ns,
+            blocking_avg_ns as f64 / 1_000.0,
+            coalesced_elapsed.as_micros(),
+            coalesced_avg_ns,
+            coalesced_avg_ns as f64 / 1_000.0
         );
     }
 
     #[test]
     #[ignore = "profiling fixture for contiguous raw packet batch materialization"]
     fn udp_receiver_batch_materialization_profile_fixture() {
-        let iterations = std::env::var("SOF_UDP_RECEIVER_PROFILE_ITERS")
+        let iterations = env::var("SOF_UDP_RECEIVER_PROFILE_ITERS")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(20_000);
-        let packet_count = std::env::var("SOF_UDP_RECEIVER_PROFILE_BURST")
+        let packet_count = env::var("SOF_UDP_RECEIVER_PROFILE_BURST")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
             .filter(|value| *value > 0)
@@ -778,26 +795,35 @@ mod tests {
             assert_eq!(batch.len(), packet_count);
         }
         let recycled_elapsed = recycled_started_at.elapsed();
+        let legacy_avg_ns = avg_ns_per_iteration(legacy_elapsed, iterations);
+        let contiguous_avg_ns = avg_ns_per_iteration(contiguous_elapsed, iterations);
+        let recycled_avg_ns = avg_ns_per_iteration(recycled_elapsed, iterations);
 
         println!(
-            "udp_receiver_batch_materialization_profile_fixture iterations={} burst={} legacy_arc_us={} contiguous_us={} recycled_us={}",
+            "udp_receiver_batch_materialization_profile_fixture iterations={} burst={} legacy_arc_us={} legacy_arc_avg_ns_per_iteration={} legacy_arc_avg_us_per_iteration={:.3} contiguous_us={} contiguous_avg_ns_per_iteration={} contiguous_avg_us_per_iteration={:.3} recycled_us={} recycled_avg_ns_per_iteration={} recycled_avg_us_per_iteration={:.3}",
             iterations,
             packet_count,
             legacy_elapsed.as_micros(),
+            legacy_avg_ns,
+            legacy_avg_ns as f64 / 1_000.0,
             contiguous_elapsed.as_micros(),
-            recycled_elapsed.as_micros()
+            contiguous_avg_ns,
+            contiguous_avg_ns as f64 / 1_000.0,
+            recycled_elapsed.as_micros(),
+            recycled_avg_ns,
+            recycled_avg_ns as f64 / 1_000.0
         );
     }
 
     #[test]
     #[ignore = "profiling fixture for recycled raw packet batch materialization"]
     fn udp_receiver_batch_recycler_profile_fixture() {
-        let iterations = std::env::var("SOF_UDP_RECEIVER_PROFILE_ITERS")
+        let iterations = env::var("SOF_UDP_RECEIVER_PROFILE_ITERS")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(50_000);
-        let packet_count = std::env::var("SOF_UDP_RECEIVER_PROFILE_BURST")
+        let packet_count = env::var("SOF_UDP_RECEIVER_PROFILE_BURST")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
             .filter(|value| *value > 0)
@@ -819,12 +845,15 @@ mod tests {
             assert_eq!(batch.len(), packet_count);
         }
         let elapsed = started_at.elapsed();
+        let avg_ns = avg_ns_per_iteration(elapsed, iterations);
 
         println!(
-            "udp_receiver_batch_recycler_profile_fixture iterations={} burst={} recycled_us={}",
+            "udp_receiver_batch_recycler_profile_fixture iterations={} burst={} recycled_us={} recycled_avg_ns_per_iteration={} recycled_avg_us_per_iteration={:.3}",
             iterations,
             packet_count,
-            elapsed.as_micros()
+            elapsed.as_micros(),
+            avg_ns,
+            avg_ns as f64 / 1_000.0
         );
     }
 }

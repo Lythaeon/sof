@@ -783,13 +783,14 @@ mod tests {
     use super::*;
     use std::env;
 
+    #[cfg(feature = "gossip-bootstrap")]
+    use crate::verify::ShredVerifier;
     use crate::{
         protocol::shred_wire::{
             SIZE_OF_CODING_SHRED_HEADERS, SIZE_OF_CODING_SHRED_PAYLOAD, SIZE_OF_DATA_SHRED_PAYLOAD,
             SIZE_OF_SIGNATURE, VARIANT_MERKLE_CODE, VARIANT_MERKLE_DATA,
         },
         shred::wire::{SIZE_OF_DATA_SHRED_HEADERS, parse_shred_header},
-        verify::ShredVerifier,
     };
     use reed_solomon_erasure::galois_8::ReedSolomon;
     #[cfg(feature = "gossip-bootstrap")]
