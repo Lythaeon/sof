@@ -147,17 +147,33 @@ pub(super) struct SharedKnownPubkeys {
 #[cfg(feature = "gossip-bootstrap")]
 impl SharedKnownPubkeys {
     #[cfg(feature = "gossip-bootstrap")]
-    pub(super) fn update(&self, pubkeys: Vec<[u8; 32]>) {
+    pub(super) fn update(&self, pubkeys: &[[u8; 32]]) {
+        let current = self.pubkeys.shared_get();
+        if current.as_slice() == pubkeys {
+            return;
+        }
+
+        let mut normalized = pubkeys.to_vec();
+        normalized.sort_unstable();
+        normalized.dedup();
+        if current.as_slice() == normalized.as_slice() {
+            return;
+        }
+
         let mut shared_pubkeys = self.pubkeys.clone();
-        shared_pubkeys.update(Arc::new(pubkeys));
-        self.generation.fetch_add(1, Ordering::Relaxed);
+        shared_pubkeys.update(Arc::new(normalized));
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
     fn snapshot(&self) -> (u64, Arc<Vec<[u8; 32]>>) {
-        let generation = self.generation.load(Ordering::Relaxed);
-        let pubkeys = self.pubkeys.shared_get();
-        let pubkeys = Arc::clone(&pubkeys);
-        (generation, pubkeys)
+        loop {
+            let generation_before = self.generation.load(Ordering::Acquire);
+            let pubkeys = self.pubkeys.shared_get();
+            let generation_after = self.generation.load(Ordering::Acquire);
+            if generation_before == generation_after {
+                return (generation_after, Arc::clone(&pubkeys));
+            }
+        }
     }
 }
 
@@ -386,7 +402,7 @@ impl PacketWorkerPool {
     }
 
     #[cfg(feature = "gossip-bootstrap")]
-    pub(super) fn update_known_pubkeys(&self, pubkeys: Vec<[u8; 32]>) {
+    pub(super) fn update_known_pubkeys(&self, pubkeys: &[[u8; 32]]) {
         self.known_pubkeys.update(pubkeys);
     }
 
@@ -462,7 +478,7 @@ fn refresh_known_pubkeys(
     if generation == *verifier_generation {
         return;
     }
-    shred_verifier.set_known_pubkeys(pubkeys.as_ref().clone());
+    shred_verifier.set_known_pubkeys_sorted(pubkeys.as_slice());
     *verifier_generation = generation;
 }
 
@@ -765,14 +781,21 @@ const fn derive_parent_slot(slot: u64, parent_offset: u16) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+
     use crate::{
         protocol::shred_wire::{
             SIZE_OF_CODING_SHRED_HEADERS, SIZE_OF_CODING_SHRED_PAYLOAD, SIZE_OF_DATA_SHRED_PAYLOAD,
             SIZE_OF_SIGNATURE, VARIANT_MERKLE_CODE, VARIANT_MERKLE_DATA,
         },
         shred::wire::{SIZE_OF_DATA_SHRED_HEADERS, parse_shred_header},
+        verify::ShredVerifier,
     };
     use reed_solomon_erasure::galois_8::ReedSolomon;
+    #[cfg(feature = "gossip-bootstrap")]
+    use solana_keypair::Keypair;
+    #[cfg(feature = "gossip-bootstrap")]
+    use solana_signer::Signer;
 
     fn build_data_shred_packet(
         slot: u64,
@@ -831,6 +854,73 @@ mod tests {
     fn data_erasure_shard_for_test(packet: &[u8]) -> Vec<u8> {
         let shard_len = erasure_shard_len_for_test();
         packet[SIZE_OF_SIGNATURE..SIZE_OF_SIGNATURE + shard_len].to_vec()
+    }
+
+    fn avg_ns_per_iteration(elapsed: Duration, iterations: usize) -> u128 {
+        let iterations = u128::try_from(iterations.max(1)).unwrap_or(1);
+        elapsed.as_nanos().checked_div(iterations).unwrap_or(0)
+    }
+
+    #[cfg(feature = "gossip-bootstrap")]
+    #[test]
+    fn shared_known_pubkeys_skips_equivalent_updates() {
+        let shared = SharedKnownPubkeys::default();
+        let initial = [[2_u8; 32], [1_u8; 32], [2_u8; 32]];
+
+        shared.update(&initial);
+        let (generation, pubkeys) = shared.snapshot();
+        assert_eq!(generation, 1);
+        assert_eq!(pubkeys.as_slice(), &[[1_u8; 32], [2_u8; 32]]);
+
+        let reordered = [[1_u8; 32], [2_u8; 32]];
+        shared.update(&reordered);
+        let (generation, pubkeys) = shared.snapshot();
+        assert_eq!(generation, 1);
+        assert_eq!(pubkeys.as_slice(), &[[1_u8; 32], [2_u8; 32]]);
+    }
+
+    #[cfg(feature = "gossip-bootstrap")]
+    #[test]
+    #[ignore = "profiling fixture for equivalent known-pubkey refresh churn"]
+    fn shared_known_pubkeys_equivalent_refresh_profile_fixture() {
+        let iterations = env::var("SOF_PACKET_WORKER_KNOWN_PUBKEY_PROFILE_ITERS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(200_000);
+        let key_count = env::var("SOF_PACKET_WORKER_KNOWN_PUBKEY_COUNT")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(64);
+        let mut canonical = (0..key_count)
+            .map(|_| Keypair::new().pubkey().to_bytes())
+            .collect::<Vec<_>>();
+        canonical.sort_unstable();
+
+        let shared = SharedKnownPubkeys::default();
+        let mut verifier = ShredVerifier::new(1024, 256, Duration::from_secs(5));
+        let mut verifier_generation = 0_u64;
+
+        shared.update(&canonical);
+        refresh_known_pubkeys(&shared, &mut verifier_generation, Some(&mut verifier));
+
+        let started_at = Instant::now();
+        for _ in 0..iterations {
+            shared.update(&canonical);
+            refresh_known_pubkeys(&shared, &mut verifier_generation, Some(&mut verifier));
+        }
+        let elapsed = started_at.elapsed();
+        let avg_ns = avg_ns_per_iteration(elapsed, iterations);
+        println!(
+            "shared_known_pubkeys_equivalent_refresh_profile_fixture iterations={} key_count={} final_generation={} elapsed_ms={} avg_ns_per_iteration={} avg_us_per_iteration={:.3}",
+            iterations,
+            key_count,
+            verifier_generation,
+            elapsed.as_millis(),
+            avg_ns,
+            avg_ns as f64 / 1_000.0
+        );
     }
 
     fn build_recoverable_fec_pair(slot: u64) -> [(Arc<[u8]>, ParsedShredHeader); 2] {
@@ -908,11 +998,15 @@ mod tests {
             );
             assert!(forwarded);
         }
+        let elapsed = started_at.elapsed();
+        let avg_ns = avg_ns_per_iteration(elapsed, iterations);
         println!(
-            "packet_worker_primary_fec_profile_fixture iterations={} emitted={} elapsed_ms={}",
+            "packet_worker_primary_fec_profile_fixture iterations={} emitted={} elapsed_ms={} avg_ns_per_iteration={} avg_us_per_iteration={:.3}",
             iterations,
             emitted,
-            started_at.elapsed().as_millis()
+            elapsed.as_millis(),
+            avg_ns,
+            avg_ns as f64 / 1_000.0
         );
     }
 
@@ -974,12 +1068,16 @@ mod tests {
             );
             assert!(forwarded);
         }
+        let elapsed = started_at.elapsed();
+        let avg_ns = avg_ns_per_iteration(elapsed, iterations);
         println!(
-            "packet_worker_recovery_fec_profile_fixture iterations={} emitted={} recovered={} elapsed_ms={}",
+            "packet_worker_recovery_fec_profile_fixture iterations={} emitted={} recovered={} elapsed_ms={} avg_ns_per_iteration={} avg_us_per_iteration={:.3}",
             iterations,
             emitted,
             recovered,
-            started_at.elapsed().as_millis()
+            elapsed.as_millis(),
+            avg_ns,
+            avg_ns as f64 / 1_000.0
         );
     }
 

@@ -70,8 +70,12 @@ impl ShredVerifier {
     pub fn set_known_pubkeys(&mut self, mut pubkeys: Vec<[u8; 32]>) {
         pubkeys.sort_unstable();
         pubkeys.dedup();
+        self.set_known_pubkeys_sorted(&pubkeys);
+    }
+
+    pub(crate) fn set_known_pubkeys_sorted(&mut self, pubkeys: &[[u8; 32]]) {
         let mut known_pubkey_verifiers = Vec::with_capacity(pubkeys.len());
-        for pubkey in pubkeys {
+        for &pubkey in pubkeys {
             let Ok(verifying_key) = VerifyingKey::from_bytes(&pubkey) else {
                 continue;
             };

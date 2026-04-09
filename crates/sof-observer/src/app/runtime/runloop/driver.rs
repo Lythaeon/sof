@@ -2658,8 +2658,8 @@ async fn run_async_with_hosts_inner(
                 #[cfg(feature = "gossip-bootstrap")]
                 {
                     if let Some(peer_snapshot) = repair_peer_snapshot.as_ref() {
-                        packet_worker_pool
-                            .update_known_pubkeys(peer_snapshot.shared_get().known_pubkeys.clone());
+                        let peer_snapshot = peer_snapshot.shared_get();
+                        packet_worker_pool.update_known_pubkeys(&peer_snapshot.known_pubkeys);
                     }
                 }
                 #[cfg(feature = "gossip-bootstrap")]
