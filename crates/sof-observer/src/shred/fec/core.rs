@@ -2,7 +2,7 @@ use std::collections::{HashMap, hash_map::Entry};
 
 use reed_solomon_erasure::galois_8::ReedSolomon;
 
-use crate::shred::wire::{ParsedShred, ShredVariant, parse_shred};
+use crate::shred::wire::{ParsedShredHeader, ShredVariant};
 
 #[path = "recover.rs"]
 mod recover;
@@ -69,23 +69,19 @@ impl FecRecoverer {
         }
     }
 
-    pub fn ingest_packet(&mut self, packet: &[u8]) -> Vec<Vec<u8>> {
-        let parsed = match parse_shred(packet) {
-            Ok(parsed) => parsed,
-            Err(_) => return Vec::new(),
-        };
+    pub fn ingest_packet(&mut self, packet: &[u8], parsed: &ParsedShredHeader) -> Vec<Vec<u8>> {
         let signature = match parse_packet_signature(packet) {
             Some(signature) => signature,
             None => return Vec::new(),
         };
 
-        let (slot, fec_set_index, variant) = match &parsed {
-            ParsedShred::Data(data) => (
+        let (slot, fec_set_index, variant) = match parsed {
+            ParsedShredHeader::Data(data) => (
                 data.common.slot,
                 data.common.fec_set_index,
                 SetVariant::from(data.common.shred_variant),
             ),
-            ParsedShred::Code(code) => (
+            ParsedShredHeader::Code(code) => (
                 code.common.slot,
                 code.common.fec_set_index,
                 SetVariant::from(code.common.shred_variant),
@@ -102,13 +98,13 @@ impl FecRecoverer {
             if !set.accepts_variant(variant) {
                 return Vec::new();
             }
-            set.ingest_packet(&parsed, packet);
+            set.ingest_packet(parsed, packet);
             recovered = recover_missing_data(set, fec_set_index, &mut self.reed_solomon_cache)
                 .unwrap_or_default();
             should_remove = set.is_data_complete_for_config(fec_set_index);
         } else {
             let mut new_set = ErasureSet::new(signature);
-            new_set.ingest_packet(&parsed, packet);
+            new_set.ingest_packet(parsed, packet);
             let _ = self.sets.insert(set_id, new_set);
         }
 
@@ -154,10 +150,10 @@ impl ErasureSet {
         self.variant.is_none_or(|existing| existing == incoming)
     }
 
-    fn ingest_packet(&mut self, parsed: &ParsedShred, packet: &[u8]) {
+    fn ingest_packet(&mut self, parsed: &ParsedShredHeader, packet: &[u8]) {
         let common_variant = match parsed {
-            ParsedShred::Data(data) => data.common.shred_variant,
-            ParsedShred::Code(code) => code.common.shred_variant,
+            ParsedShredHeader::Data(data) => data.common.shred_variant,
+            ParsedShredHeader::Code(code) => code.common.shred_variant,
         };
         if self.variant.is_none() {
             self.variant = Some(SetVariant::from(common_variant));
@@ -167,7 +163,7 @@ impl ErasureSet {
         };
 
         match parsed {
-            ParsedShred::Data(data) => {
+            ParsedShredHeader::Data(data) => {
                 let Some(shard) = extract_data_erasure_shard(packet, shard_len) else {
                     return;
                 };
@@ -179,7 +175,7 @@ impl ErasureSet {
                     }
                 }
             }
-            ParsedShred::Code(code) => {
+            ParsedShredHeader::Code(code) => {
                 let Some(shard) = extract_coding_erasure_shard(packet, shard_len) else {
                     return;
                 };

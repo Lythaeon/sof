@@ -510,7 +510,8 @@ where
                     parsed_header_slot(&packet.parsed_header),
                     &mut observed_slot_leaders,
                 );
-                let recovered_packets = fec_recoverer.ingest_packet(packet.packet_bytes.as_ref());
+                let recovered_packets = fec_recoverer
+                    .ingest_packet(packet.packet_bytes.as_ref(), &packet.parsed_header);
                 push_primary_shred(packet, &mut accepted_shreds);
 
                 for recovered in recovered_packets {
