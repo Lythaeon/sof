@@ -543,12 +543,11 @@ where
                         &mut observed_slot_leaders,
                     );
                     let packet_bytes: Arc<[u8]> = Arc::from(recovered.bytes);
-                    let Some(payload_fragment) =
-                        crate::reassembly::dataset::SharedPayloadFragment::borrowed(
-                            Arc::clone(&packet_bytes),
-                            recovered.parsed.payload_offset,
-                            recovered.parsed.payload_len,
-                        )
+                    let Some(payload_fragment) = SharedPayloadFragment::borrowed(
+                        Arc::clone(&packet_bytes),
+                        recovered.parsed.payload_offset,
+                        recovered.parsed.payload_len,
+                    )
                     else {
                         continue;
                     };
