@@ -13,7 +13,7 @@ search_rust_files() {
   shift 2
 
   if has_rg; then
-    rg -n "$@" "${pattern}" >"${output_file}"
+    rg -n "${pattern}" "$@" >"${output_file}"
     return
   fi
 
@@ -39,15 +39,6 @@ check_forbidden_import() {
   local src_slice="$1"
   local forbidden_target="$2"
   local match_file="/tmp/sof-arch-check-${src_slice}-${forbidden_target}.log"
-
-  if has_rg; then
-    if rg -n --glob '!**/tests.rs' "crate::${forbidden_target}\b" "crates/sof-observer/src/${src_slice}" >"${match_file}"; then
-      echo "ARD boundary violation: '${src_slice}' must not import '${forbidden_target}'"
-      cat "${match_file}"
-      violations=1
-    fi
-    return
-  fi
 
   if search_rust_files \
     "${match_file}" \

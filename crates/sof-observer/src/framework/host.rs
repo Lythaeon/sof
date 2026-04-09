@@ -8,13 +8,14 @@ use std::{
     thread,
 };
 
+use crate::event::TxCommitmentStatus;
 use crate::framework::{
     events::{
         ClusterTopologyEvent, DatasetEvent, LeaderScheduleEntry, LeaderScheduleEvent,
         ObservedRecentBlockhashEvent, RawPacketEvent, ReorgEvent, ShredEvent, SlotStatusEvent,
         TransactionBatchEvent, TransactionEvent,
     },
-    plugin::{ObserverPlugin, PluginConfig},
+    plugin::{ObserverPlugin, PluginConfig, TransactionDispatchMode},
 };
 use arcshift::ArcShift;
 use solana_pubkey::Pubkey;
@@ -65,7 +66,7 @@ pub struct PluginHostStartupError {
 
 /// Chooses a bounded default worker count for accepted-transaction dispatch.
 fn default_transaction_dispatch_workers() -> usize {
-    std::thread::available_parallelism()
+    thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1)
         .clamp(1, DEFAULT_TRANSACTION_DISPATCH_WORKERS_CAP)
@@ -138,7 +139,7 @@ struct PluginHookSubscriptions {
     /// At least one plugin wants transaction callbacks.
     transaction: bool,
     /// Lowest commitment required by any transaction subscriber.
-    transaction_min_commitment: crate::event::TxCommitmentStatus,
+    transaction_min_commitment: TxCommitmentStatus,
     /// At least one transaction plugin exposes a compiled prefilter.
     transaction_prefilter: bool,
     /// At least one plugin wants transaction-log callbacks.
@@ -187,19 +188,19 @@ impl From<&PluginConfig> for PluginHookSubscriptions {
             inline_transaction: config.transaction
                 && matches!(
                     config.transaction_dispatch_mode,
-                    crate::framework::plugin::TransactionDispatchMode::Inline
+                    TransactionDispatchMode::Inline
                 ),
             transaction_batch: config.transaction_batch,
             inline_transaction_batch: config.transaction_batch
                 && matches!(
                     config.transaction_batch_dispatch_mode,
-                    crate::framework::plugin::TransactionDispatchMode::Inline
+                    TransactionDispatchMode::Inline
                 ),
             transaction_view_batch: config.transaction_view_batch,
             inline_transaction_view_batch: config.transaction_view_batch
                 && matches!(
                     config.transaction_view_batch_dispatch_mode,
-                    crate::framework::plugin::TransactionDispatchMode::Inline
+                    TransactionDispatchMode::Inline
                 ),
             account_touch: config.account_touch,
             account_update: config.account_update,

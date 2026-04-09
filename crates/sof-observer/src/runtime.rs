@@ -10,6 +10,7 @@ use std::{
     path::PathBuf,
     pin::Pin,
     sync::Arc,
+    thread,
     time::Instant,
 };
 
@@ -21,6 +22,8 @@ use crate::framework::{
     DerivedStateHost, DerivedStateReplayBackend, DerivedStateReplayDurability, PluginHost,
     RuntimeExtensionHost, TransactionEvent,
 };
+#[cfg(feature = "kernel-bypass")]
+use crate::ingest::{RawPacketBatchReceiver, RawPacketBatchSender, create_raw_packet_batch_queue};
 use crate::{
     app::runtime as app_runtime, event::TxCommitmentStatus, framework, provider_stream, runtime_env,
 };
@@ -2911,7 +2914,7 @@ async fn wait_for_termination_signal() {
     #[cfg(unix)]
     {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        std::thread::spawn(move || {
+        thread::spawn(move || {
             let mut signals = match signal_hook::iterator::Signals::new([
                 signal_hook::consts::signal::SIGTERM,
                 signal_hook::consts::signal::SIGINT,
@@ -3051,11 +3054,11 @@ pub async fn run_async_with_hosts_and_derived_state_host_and_setup(
 /// External ingress sender type used by `kernel-bypass` integrations.
 ///
 /// Producers publish [`crate::ingest::RawPacketBatch`] values through this queue.
-pub type KernelBypassIngressSender = crate::ingest::RawPacketBatchSender;
+pub type KernelBypassIngressSender = RawPacketBatchSender;
 
 #[cfg(feature = "kernel-bypass")]
 /// External ingress receiver type used by `kernel-bypass` integrations.
-pub type KernelBypassIngressReceiver = crate::ingest::RawPacketBatchReceiver;
+pub type KernelBypassIngressReceiver = RawPacketBatchReceiver;
 
 #[cfg(feature = "kernel-bypass")]
 /// Creates a kernel-bypass ingress queue pair.
@@ -3065,7 +3068,7 @@ pub type KernelBypassIngressReceiver = crate::ingest::RawPacketBatchReceiver;
 #[must_use]
 pub fn create_kernel_bypass_ingress_queue()
 -> (KernelBypassIngressSender, KernelBypassIngressReceiver) {
-    crate::ingest::create_raw_packet_batch_queue()
+    create_raw_packet_batch_queue()
 }
 
 #[cfg(feature = "kernel-bypass")]
