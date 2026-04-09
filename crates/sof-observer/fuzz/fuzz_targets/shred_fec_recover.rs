@@ -13,7 +13,7 @@ use sof::{
     },
     shred::{
         fec::FecRecoverer,
-        wire::{ParsedShred, parse_shred},
+        wire::{ParsedDataShredHeader, ParsedShred, ParsedShredHeader, parse_shred},
     },
 };
 
@@ -217,7 +217,20 @@ fuzz_target!(|bytes: &[u8]| {
             }
         };
 
-        let recovered = recoverer.ingest_packet(&packet);
+        let Ok(parsed) = parse_shred(&packet) else {
+            assert!(recoverer.tracked_sets() <= max_tracked_sets);
+            continue;
+        };
+        let parsed_header = match parsed {
+            ParsedShred::Data(data) => ParsedShredHeader::Data(ParsedDataShredHeader {
+                common: data.common,
+                data_header: data.data_header,
+                payload_offset: SIZE_OF_DATA_SHRED_HEADERS,
+                payload_len: data.payload.len(),
+            }),
+            ParsedShred::Code(code) => ParsedShredHeader::Code(code),
+        };
+        let recovered = recoverer.ingest_packet(&packet, &parsed_header);
         assert!(recoverer.tracked_sets() <= max_tracked_sets);
 
         for recovered_packet in recovered {
