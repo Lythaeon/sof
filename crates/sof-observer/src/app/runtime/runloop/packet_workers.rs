@@ -547,8 +547,7 @@ where
                         Arc::clone(&packet_bytes),
                         recovered.parsed.payload_offset,
                         recovered.parsed.payload_len,
-                    )
-                    else {
+                    ) else {
                         continue;
                     };
                     accepted_shreds.push(WorkerAcceptedShred {
