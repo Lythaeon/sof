@@ -14,7 +14,13 @@ use crate::framework::{
     SerializedTransactionRange, TransactionEvent, events::TransactionEventRef, signature_bytes_opt,
 };
 use crate::relay::CacheInsertOutcome;
+#[cfg(feature = "gossip-bootstrap")]
+use crate::repair::{
+    ServedRepairRequestKind, is_repair_response_ping_packet, is_supported_repair_request_packet,
+};
 use crate::runtime::ShredTrustMode;
+#[cfg(all(feature = "kernel-bypass", feature = "gossip-bootstrap"))]
+use crate::runtime_env;
 use crate::{app::runtime::dataset, framework, reassembly, runtime_metrics};
 use agave_transaction_view::transaction_view::SanitizedTransactionView;
 use crossbeam_channel::Sender as CrossbeamSender;
@@ -1739,7 +1745,7 @@ async fn run_async_with_hosts_inner(
                         Err(error) => {
                             #[cfg(feature = "gossip-bootstrap")]
                             if repair_driver_enabled
-                                && repair::is_repair_response_ping_packet(packet_bytes)
+                                && is_repair_response_ping_packet(packet_bytes)
                                 && let Some(command_tx) = repair_command_tx.as_ref()
                             {
                                 match command_tx.try_send(RepairCommand::HandleResponsePing {
@@ -1760,7 +1766,7 @@ async fn run_async_with_hosts_inner(
                             }
                             #[cfg(feature = "gossip-bootstrap")]
                             if repair_driver_enabled
-                                && repair::is_supported_repair_request_packet(packet_bytes)
+                                && is_supported_repair_request_packet(packet_bytes)
                                 && let Some(command_tx) = repair_command_tx.as_ref()
                             {
                                 relay_cache_keepalive_until = observed_at.checked_add(
@@ -2181,10 +2187,10 @@ async fn run_async_with_hosts_inner(
                             }
                             if log_repair_peer_traffic {
                                 let kind = match request.kind {
-                                    repair::ServedRepairRequestKind::WindowIndex => {
+                                    ServedRepairRequestKind::WindowIndex => {
                                         "window_index"
                                     }
-                                    repair::ServedRepairRequestKind::HighestWindowIndex => {
+                                    ServedRepairRequestKind::HighestWindowIndex => {
                                         "highest_window_index"
                                     }
                                 };

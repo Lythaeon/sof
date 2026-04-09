@@ -22,9 +22,7 @@ use crate::framework::{
     RuntimeExtensionHost, TransactionEvent,
 };
 use crate::{
-    app::runtime as app_runtime,
-    event::{TxCommitmentStatus, TxKind},
-    framework, provider_stream, runtime_env,
+    app::runtime as app_runtime, event::TxCommitmentStatus, framework, provider_stream, runtime_env,
 };
 use agave_transaction_view::transaction_view::SanitizedTransactionView;
 use app_runtime::RuntimeObservabilityService;
@@ -3289,6 +3287,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::event::TxKind;
     use crate::framework::{
         DerivedStateCheckpoint, DerivedStateConsumer, DerivedStateConsumerConfig,
         DerivedStateConsumerContext, DerivedStateConsumerFault, DerivedStateFeedEnvelope,

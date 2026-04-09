@@ -25,10 +25,9 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungsten
 
 use crate::framework::extension::{
     ExtensionCapability, ExtensionContext, ExtensionManifest, ExtensionResourceSpec,
-    ExtensionSetupError, ExtensionStreamVisibility, PacketSubscription, RuntimeExtension,
-    RuntimePacketEvent, RuntimePacketEventClass, RuntimePacketSource, RuntimePacketSourceKind,
-    RuntimePacketTransport, RuntimeWebSocketFrameType, TcpConnectorSpec, TcpListenerSpec,
-    UdpListenerSpec, WsConnectorSpec,
+    ExtensionStreamVisibility, PacketSubscription, RuntimeExtension, RuntimePacketEvent,
+    RuntimePacketEventClass, RuntimePacketSource, RuntimePacketSourceKind, RuntimePacketTransport,
+    RuntimeWebSocketFrameType, TcpConnectorSpec, TcpListenerSpec, UdpListenerSpec, WsConnectorSpec,
 };
 
 /// Default bounded queue capacity for asynchronous extension packet dispatch.
@@ -1423,6 +1422,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
+    use crate::framework::ExtensionSetupError;
     use async_trait::async_trait;
 
     struct CounterExtension {
