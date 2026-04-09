@@ -234,8 +234,8 @@ fuzz_target!(|bytes: &[u8]| {
         assert!(recoverer.tracked_sets() <= max_tracked_sets);
 
         for recovered_packet in recovered {
-            assert_eq!(recovered_packet.len(), SIZE_OF_DATA_SHRED_PAYLOAD);
-            let parsed = parse_shred(&recovered_packet);
+            assert_eq!(recovered_packet.bytes.len(), SIZE_OF_DATA_SHRED_PAYLOAD);
+            let parsed = parse_shred(&recovered_packet.bytes);
             assert!(matches!(parsed, Ok(ParsedShred::Data(_))));
         }
     }

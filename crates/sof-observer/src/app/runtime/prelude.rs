@@ -43,7 +43,7 @@ pub(super) use crate::{
     repair::MissingShredTracker,
     shred::{
         fec::FecRecoverer,
-        wire::{ParseError, ParsedShred, ParsedShredHeader, parse_shred, parse_shred_header},
+        wire::{ParseError, ParsedShredHeader, parse_shred_header},
     },
     verify::{ShredVerifier, VerifyStatus},
 };
