@@ -1,7 +1,7 @@
 //! Routing policy, target selection, and signature-level duplicate suppression.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     time::{Duration, Instant},
 };
 
@@ -93,6 +93,8 @@ pub struct SignatureDeduper {
     ttl: Duration,
     /// Last seen timestamps by signature.
     seen: HashMap<SignatureBytes, Instant>,
+    /// Arrival order for bounded eviction without rescanning the whole map.
+    order: VecDeque<(SignatureBytes, Instant)>,
 }
 
 impl SignatureDeduper {
@@ -102,6 +104,7 @@ impl SignatureDeduper {
         Self {
             ttl: ttl.max(Duration::from_millis(1)),
             seen: HashMap::new(),
+            order: VecDeque::new(),
         }
     }
 
@@ -112,6 +115,7 @@ impl SignatureDeduper {
             return false;
         }
         let _ = self.seen.insert(signature, now);
+        self.order.push_back((signature, now));
         true
     }
 
@@ -129,9 +133,15 @@ impl SignatureDeduper {
 
     /// Removes all expired signature entries.
     fn evict_expired(&mut self, now: Instant) {
-        let ttl = self.ttl;
-        self.seen
-            .retain(|_, first_seen| now.saturating_duration_since(*first_seen) < ttl);
+        while let Some((signature, first_seen)) = self.order.front().copied() {
+            if now.saturating_duration_since(first_seen) < self.ttl {
+                break;
+            }
+            self.order.pop_front();
+            if self.seen.get(&signature).copied() == Some(first_seen) {
+                let _ = self.seen.remove(&signature);
+            }
+        }
     }
 }
 
@@ -139,6 +149,13 @@ impl SignatureDeduper {
 mod tests {
     use super::*;
     use crate::providers::{LeaderTarget, StaticLeaderProvider};
+
+    fn avg_ns_per_iteration(elapsed: Duration, iterations: usize) -> u128 {
+        elapsed
+            .as_nanos()
+            .checked_div(u128::try_from(iterations.max(1)).unwrap_or(1))
+            .unwrap_or(0)
+    }
 
     fn target(port: u16) -> LeaderTarget {
         LeaderTarget::new(None, std::net::SocketAddr::from(([127, 0, 0, 1], port)))
@@ -199,5 +216,44 @@ mod tests {
         assert!(deduper.check_and_insert(signature, now));
         assert!(!deduper.check_and_insert(signature, now + Duration::from_millis(5)));
         assert!(deduper.check_and_insert(signature, now + Duration::from_millis(30)));
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for signature dedupe churn"]
+    fn signature_deduper_profile_fixture() {
+        let iterations = std::env::var("SOF_TX_SIGNATURE_DEDUPER_PROFILE_ITERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(50_000);
+        let ttl_ms = std::env::var("SOF_TX_SIGNATURE_DEDUPER_PROFILE_TTL_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(10_000);
+        let mut deduper = SignatureDeduper::new(Duration::from_millis(ttl_ms));
+        let start = Instant::now();
+        let now = Instant::now();
+
+        for index in 0..iterations {
+            let mut signature = [0_u8; 64];
+            signature[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            assert!(deduper.check_and_insert(
+                SignatureBytes::from(signature),
+                now + Duration::from_nanos(index as u64)
+            ));
+        }
+
+        let elapsed = start.elapsed();
+        let avg_ns = avg_ns_per_iteration(elapsed, iterations);
+        println!(
+            "signature_deduper_profile_fixture iterations={} ttl_ms={} entries={} elapsed_us={} avg_ns_per_iteration={} avg_us_per_iteration={:.3}",
+            iterations,
+            ttl_ms,
+            deduper.len(),
+            elapsed.as_micros(),
+            avg_ns,
+            avg_ns as f64 / 1_000.0
+        );
     }
 }

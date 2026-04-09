@@ -29,6 +29,13 @@ use crate::{
     routing::RoutingPolicy,
 };
 
+fn avg_ns_per_iteration(elapsed: Duration, iterations: u64) -> u128 {
+    elapsed
+        .as_nanos()
+        .checked_div(u128::from(iterations.max(1)))
+        .unwrap_or(0)
+}
+
 /// Mock RPC transport with configurable response.
 #[derive(Debug)]
 struct MockRpcTransport {
@@ -1553,7 +1560,15 @@ async fn submit_rpc_only_profile_fixture() {
             .await;
         assert!(result.is_ok());
     }
-    println!("rpc_only_us={}", start.elapsed().as_micros());
+    let elapsed = start.elapsed();
+    let avg_ns = avg_ns_per_iteration(elapsed, iterations);
+    println!(
+        "submit_rpc_only_profile_fixture iterations={} rpc_only_us={} avg_ns_per_iteration={} avg_us_per_iteration={:.3}",
+        iterations,
+        elapsed.as_micros(),
+        avg_ns,
+        avg_ns as f64 / 1_000.0
+    );
 }
 
 #[tokio::test]
@@ -1585,7 +1600,15 @@ async fn submit_jito_only_profile_fixture() {
             .await;
         assert!(result.is_ok());
     }
-    println!("jito_only_us={}", start.elapsed().as_micros());
+    let elapsed = start.elapsed();
+    let avg_ns = avg_ns_per_iteration(elapsed, iterations);
+    println!(
+        "submit_jito_only_profile_fixture iterations={} jito_only_us={} avg_ns_per_iteration={} avg_us_per_iteration={:.3}",
+        iterations,
+        elapsed.as_micros(),
+        avg_ns,
+        avg_ns as f64 / 1_000.0
+    );
 }
 
 #[tokio::test]
@@ -1618,7 +1641,15 @@ async fn submit_direct_only_profile_fixture() {
             .await;
         assert!(result.is_ok());
     }
-    println!("direct_only_us={}", start.elapsed().as_micros());
+    let elapsed = start.elapsed();
+    let avg_ns = avg_ns_per_iteration(elapsed, iterations);
+    println!(
+        "submit_direct_only_profile_fixture iterations={} direct_only_us={} avg_ns_per_iteration={} avg_us_per_iteration={:.3}",
+        iterations,
+        elapsed.as_micros(),
+        avg_ns,
+        avg_ns as f64 / 1_000.0
+    );
 }
 
 #[tokio::test]
@@ -1663,7 +1694,15 @@ async fn submit_hybrid_fallback_profile_fixture() {
             .await;
         assert!(result.is_ok());
     }
-    println!("hybrid_fallback_us={}", start.elapsed().as_micros());
+    let elapsed = start.elapsed();
+    let avg_ns = avg_ns_per_iteration(elapsed, iterations);
+    println!(
+        "submit_hybrid_fallback_profile_fixture iterations={} hybrid_fallback_us={} avg_ns_per_iteration={} avg_us_per_iteration={:.3}",
+        iterations,
+        elapsed.as_micros(),
+        avg_ns,
+        avg_ns as f64 / 1_000.0
+    );
 }
 
 #[tokio::test]
@@ -1709,5 +1748,13 @@ async fn submit_all_at_once_profile_fixture() {
             .await;
         assert!(result.is_ok());
     }
-    println!("all_at_once_us={}", start.elapsed().as_micros());
+    let elapsed = start.elapsed();
+    let avg_ns = avg_ns_per_iteration(elapsed, iterations);
+    println!(
+        "submit_all_at_once_profile_fixture iterations={} all_at_once_us={} avg_ns_per_iteration={} avg_us_per_iteration={:.3}",
+        iterations,
+        elapsed.as_micros(),
+        avg_ns,
+        avg_ns as f64 / 1_000.0
+    );
 }
