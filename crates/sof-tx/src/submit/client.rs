@@ -974,13 +974,12 @@ impl OutcomeReporterDispatcher {
     fn shared(reporter: Arc<dyn TxSubmitOutcomeReporter>) -> Result<Arc<Self>, std::io::Error> {
         let key = reporter_identity(&reporter);
         let registry = outcome_reporter_registry();
-        {
-            let registry = registry
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
-                return Ok(existing);
-            }
+        let mut registry = registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.retain(|_key, dispatcher| dispatcher.strong_count() > 0);
+        if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
+            return Ok(existing);
         }
 
         let (tx, rx) = std_mpsc::sync_channel::<TxSubmitOutcome>(Self::QUEUE_CAPACITY);
@@ -999,9 +998,6 @@ impl OutcomeReporterDispatcher {
             queue_full_warned: AtomicBool::new(false),
             unavailable_warned: AtomicBool::new(false),
         });
-        let mut registry = registry
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _ = registry.insert(key, Arc::downgrade(&dispatcher));
         Ok(dispatcher)
     }
@@ -1429,4 +1425,32 @@ fn direct_attempt_timeout(direct_config: &DirectSubmitConfig) -> Duration {
         .saturating_add(direct_config.per_target_timeout)
         .saturating_add(direct_config.rebroadcast_interval)
         .max(Duration::from_secs(8))
+}
+
+#[cfg(test)]
+#[allow(clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct NoopOutcomeReporter;
+
+    impl TxSubmitOutcomeReporter for NoopOutcomeReporter {
+        fn record_outcome(&self, _outcome: &TxSubmitOutcome) {}
+    }
+
+    #[test]
+    fn reporter_dispatcher_reuses_existing_instance() {
+        let reporter: Arc<dyn TxSubmitOutcomeReporter> = Arc::new(NoopOutcomeReporter);
+        let first = match OutcomeReporterDispatcher::shared(Arc::clone(&reporter)) {
+            Ok(dispatcher) => dispatcher,
+            Err(error) => panic!("first dispatcher failed: {error}"),
+        };
+        let second = match OutcomeReporterDispatcher::shared(reporter) {
+            Ok(dispatcher) => dispatcher,
+            Err(error) => panic!("second dispatcher failed: {error}"),
+        };
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
 }
