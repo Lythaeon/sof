@@ -8,7 +8,7 @@ use crate::runtime_metrics::{
 };
 #[cfg(feature = "gossip-bootstrap")]
 use crate::verify::SlotLeaderDiff;
-use std::{env, mem, sync::atomic::AtomicBool};
+use std::{mem, sync::atomic::AtomicBool};
 
 #[derive(Debug)]
 pub(super) struct PacketWorkerInput {
@@ -946,11 +946,6 @@ mod tests {
                 parse_shred_header(&code0).expect("valid coding shred"),
             ),
         ]
-    }
-
-    fn avg_ns_per_iteration(elapsed: Duration, iterations: usize) -> u128 {
-        let iterations = u128::try_from(iterations.max(1)).unwrap_or(1);
-        elapsed.as_nanos().checked_div(iterations).unwrap_or(0)
     }
 
     #[test]
