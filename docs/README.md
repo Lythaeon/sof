@@ -35,6 +35,8 @@ Contributors:
 ## Architecture Docs
 
 - `architecture/README.md`: architecture index and ADR/ARD scope
+- `gitbook/architecture/ts-and-python-integration.md`: planned TS/Python authoring model, typed
+  bridge contract, and phased next plan
 - `architecture/framework-plugin-hooks.md`: observer plugin hooks and event contracts
 - `architecture/runtime-extension-hooks.md`: runtime extension capabilities and filtered ingress model
 - `architecture/runtime-bootstrap-modes.md`: runtime bootstrap and ingress modes

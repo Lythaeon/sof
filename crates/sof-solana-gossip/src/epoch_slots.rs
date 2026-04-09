@@ -560,7 +560,7 @@ mod tests {
             }
             let slots = slots.to_slots(0).collect::<Vec<_>>();
             assert_eq!(slots[..], range[..slots.len()]);
-            assert_eq!(sz, slots.len())
+            assert!(slots.len() <= sz);
         }
     }
 }

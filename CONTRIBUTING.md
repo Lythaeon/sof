@@ -121,7 +121,9 @@ cargo make ci
 This includes:
 
 - formatting check
+- docs build (`docs/gitbook`)
 - architecture boundary checks
+- vendored `sof-solana-gossip` library/bin compile check
 - clippy matrix (`all-features`, `no-default-features`)
 - test matrix (default + all-features)
 

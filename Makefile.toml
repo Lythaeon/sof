@@ -18,6 +18,12 @@ workspace = false
 command = "cargo"
 args = ["fmt", "--check", "--all"]
 
+[tasks.docs-build]
+description = "Build the HonKit documentation site"
+workspace = false
+command = "bash"
+args = ["-lc", "cd docs/gitbook && npm ci && npm run build"]
+
 [tasks.clean]
 description = "Remove build artifacts"
 command = "cargo"
@@ -74,14 +80,28 @@ args = [
     "${@}",
 ]
 
+[tasks.gossip-check]
+description = "Check the maintained library/bin surface of the vendored sof-solana-gossip crate"
+workspace = false
+command = "cargo"
+args = [
+    "check",
+    "--manifest-path",
+    "crates/sof-solana-gossip/Cargo.toml",
+    "--locked",
+    "${@}",
+]
+
 [tasks.ci]
-description = "Run core contributor checks (format, architecture boundaries, strict clippy, default/all-feature tests)"
+description = "Run core contributor checks (format, docs, architecture boundaries, strict clippy, vendored gossip check, default/all-feature tests)"
 workspace = false
 dependencies = [
     "format-check",
+    "docs-build",
     "arch-check",
     "clippy",
     "clippy-no-default-features",
+    "gossip-check",
     "test",
     "test-all-features",
 ]

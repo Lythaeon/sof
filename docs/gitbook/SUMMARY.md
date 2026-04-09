@@ -33,6 +33,7 @@
     - [Performance and Measurement](architecture/performance-and-measurement.md)
     - [Runtime Pipeline](architecture/runtime-pipeline.md)
     - [Integration Model](architecture/integration-model.md)
+    - [TypeScript and Python Integration](architecture/ts-and-python-integration.md)
     - [Plugin Config and Lifecycle](architecture/plugin-config-and-lifecycle.md)
     - [Derived State and Control Plane](architecture/derived-state-and-control-plane.md)
     - [Decision Records Map](architecture/decision-records.md)

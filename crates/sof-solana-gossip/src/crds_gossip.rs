@@ -418,7 +418,13 @@ pub(crate) fn maybe_ping_gossip_addresses<R: Rng + CryptoRng>(
 
 #[cfg(test)]
 mod test {
-    use {super::*, solana_sha256_hasher::hash, solana_time_utils::timestamp};
+    use {
+        super::*,
+        crate::{crds::GossipRoute, crds_data::CrdsData},
+        solana_signer::Signer,
+        solana_sha256_hasher::hash,
+        solana_time_utils::timestamp,
+    };
 
     #[test]
     fn test_prune_errors() {

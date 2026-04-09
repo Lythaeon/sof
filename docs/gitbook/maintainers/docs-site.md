@@ -29,6 +29,9 @@ npm run build
 
 Generated output is written to `docs/gitbook/_book/`.
 
+The default contributor gate also runs this build through `cargo make ci`, so
+navigation and render regressions should fail before merge.
+
 ## GitHub Pages Deployment
 
 The repository includes a Pages workflow at `.github/workflows/docs-pages.yml`.
