@@ -868,15 +868,15 @@ mod tests {
         let initial = [[2_u8; 32], [1_u8; 32], [2_u8; 32]];
 
         shared.update(&initial);
-        let (generation, pubkeys) = shared.snapshot();
-        assert_eq!(generation, 1);
-        assert_eq!(pubkeys.as_slice(), &[[1_u8; 32], [2_u8; 32]]);
+        let (first_generation, first_pubkeys) = shared.snapshot();
+        assert_eq!(first_generation, 1);
+        assert_eq!(first_pubkeys.as_slice(), &[[1_u8; 32], [2_u8; 32]]);
 
         let reordered = [[1_u8; 32], [2_u8; 32]];
         shared.update(&reordered);
-        let (generation, pubkeys) = shared.snapshot();
-        assert_eq!(generation, 1);
-        assert_eq!(pubkeys.as_slice(), &[[1_u8; 32], [2_u8; 32]]);
+        let (second_generation, second_pubkeys) = shared.snapshot();
+        assert_eq!(second_generation, 1);
+        assert_eq!(second_pubkeys.as_slice(), &[[1_u8; 32], [2_u8; 32]]);
     }
 
     #[cfg(feature = "gossip-bootstrap")]
