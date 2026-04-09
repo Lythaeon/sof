@@ -806,7 +806,7 @@ pub trait ObserverPlugin: Send + Sync + 'static {
         }
     }
 
-    /// Borrowed transaction-interest classifier used on the dataset hot path.
+    /// Borrowed transaction-interest classifier used on decoded transaction paths.
     ///
     /// Override this when classification can run directly on borrowed message
     /// data without first allocating an owned [`TransactionEvent`].

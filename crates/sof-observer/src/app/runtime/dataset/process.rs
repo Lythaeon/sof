@@ -1949,10 +1949,17 @@ mod tests {
     use rand::thread_rng;
     use rand::{SeedableRng, rngs::StdRng};
     use solana_entry::entry::{Entry, MaxDataShredsLen};
+    use solana_instruction::{AccountMeta, Instruction};
+    use solana_keypair::Keypair;
     use solana_perf::test_tx::{new_test_vote_tx, test_tx};
+    use solana_signer::Signer as _;
+    use solana_transaction::Transaction;
     use std::{
         net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{Duration, Instant},
     };
     use wincode::{
@@ -2570,6 +2577,131 @@ mod tests {
                 .add_plugin(ProfileManualIgnoreTransactionPlugin { ignored_account })
                 .build(),
         }
+    }
+
+    fn test_transaction_with_static_accounts<const N: usize>(
+        accounts: [Pubkey; N],
+    ) -> VersionedTransaction {
+        let payer = Keypair::new();
+        let instruction = Instruction {
+            program_id: Pubkey::new_unique(),
+            accounts: accounts
+                .into_iter()
+                .map(|pubkey| AccountMeta::new_readonly(pubkey, false))
+                .collect(),
+            data: Vec::new(),
+        };
+        VersionedTransaction::from(Transaction::new_signed_with_payer(
+            &[instruction],
+            Some(&payer.pubkey()),
+            &[&payer],
+            Hash::new_unique(),
+        ))
+    }
+
+    #[derive(Clone)]
+    struct PrefilteredDatasetTransactionPlugin {
+        filter: TransactionPrefilter,
+        handled: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Plugin for PrefilteredDatasetTransactionPlugin {
+        fn name(&self) -> &'static str {
+            "prefiltered-dataset-transaction-plugin"
+        }
+
+        fn config(&self) -> PluginConfig {
+            PluginConfig::new().with_transaction()
+        }
+
+        async fn setup(&self, _ctx: PluginContext) -> Result<(), PluginSetupError> {
+            Ok(())
+        }
+
+        fn transaction_prefilter(&self) -> Option<&TransactionPrefilter> {
+            Some(&self.filter)
+        }
+
+        fn transaction_interest_ref(
+            &self,
+            _event: &TransactionEventRef<'_>,
+        ) -> TransactionInterest {
+            panic!("decoded transaction classifier should not run for prefiltered dataset plugin")
+        }
+
+        async fn on_transaction(&self, _event: &TransactionEvent) {
+            self.handled.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn completed_dataset_prefilter_decodes_only_matching_transactions() {
+        let required_account = Pubkey::new_unique();
+        let handled = Arc::new(AtomicUsize::new(0));
+        let payload = WincodeVec::<Elem<Entry>, MaxDataShredsLen>::serialize(&vec![Entry {
+            num_hashes: 1,
+            hash: Hash::new_unique(),
+            transactions: vec![
+                test_transaction_with_static_accounts([required_account, Pubkey::new_unique()]),
+                test_transaction_with_static_accounts([Pubkey::new_unique(), Pubkey::new_unique()]),
+            ],
+        }])
+        .expect("serialize entry payload");
+        let payload_fragments =
+            PayloadFragmentBatch::from_owned_fragments(split_payload(&payload, 4));
+        let plugin_host = PluginHost::builder()
+            .with_event_queue_capacity(1024)
+            .with_dispatch_mode(PluginDispatchMode::Sequential)
+            .with_transaction_dispatch_workers(1)
+            .add_plugin(PrefilteredDatasetTransactionPlugin {
+                filter: TransactionPrefilter::new(TransactionInterest::Critical)
+                    .with_account_required([required_account]),
+                handled: Arc::clone(&handled),
+            })
+            .build();
+        let derived_state_host = DerivedStateHost::default();
+        let (tx_event_tx, _tx_event_rx) = mpsc::channel::<TxObservedEvent>(1024);
+        let tx_commitment_tracker = CommitmentSlotTracker::new();
+        let tx_event_drop_count = AtomicU64::new(0);
+        let dataset_decode_fail_count = AtomicU64::new(0);
+        let dataset_tail_skip_count = AtomicU64::new(0);
+        let context = DatasetProcessContext {
+            derived_state_host: &derived_state_host,
+            plugin_host: &plugin_host,
+            transaction_dispatch_scope: TransactionDispatchScope::DeferredOnly,
+            tx_event_tx: &tx_event_tx,
+            tx_commitment_tracker: &tx_commitment_tracker,
+            tx_event_drop_count: &tx_event_drop_count,
+            dataset_decode_fail_count: &dataset_decode_fail_count,
+            dataset_tail_skip_count: &dataset_tail_skip_count,
+            log_dataset_reconstruction: false,
+            log_all_txs: false,
+            log_non_vote_txs: false,
+            skip_vote_only_tx_detail_path: false,
+        };
+        let outcome = process_completed_dataset(
+            DatasetProcessInput {
+                slot: 42,
+                start_index: 0,
+                end_index: u32::try_from(payload_fragments.len().saturating_sub(1))
+                    .unwrap_or(u32::MAX),
+                last_in_slot: true,
+                completed_at: Instant::now(),
+                first_shred_observed_at: Instant::now(),
+                last_shred_observed_at: Instant::now(),
+                payload_fragments,
+            },
+            &context,
+            &mut DatasetWorkerScratch::default(),
+        );
+
+        assert!(matches!(outcome, DatasetProcessOutcome::Decoded));
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(handled.load(Ordering::Relaxed), 1);
+        assert_eq!(dataset_decode_fail_count.load(Ordering::Relaxed), 0);
+        assert_eq!(tx_event_drop_count.load(Ordering::Relaxed), 0);
+        assert_eq!(plugin_host.dropped_event_count(), 0);
     }
 
     fn build_profile_payload(entry_count: usize) -> Vec<u8> {
