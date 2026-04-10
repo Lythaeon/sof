@@ -1411,7 +1411,8 @@ async fn run_websocket_primary_connection(
                     }
                     WsMessage::Pong(_) => {}
                     WsMessage::Close(frame) => {
-                        return Err(WebsocketProtocolError::Closed(format!("{frame:?}")).into());
+                        write.send(WsMessage::Close(frame)).await.ok();
+                        return Ok(());
                     }
                     _ => {}
                 }
@@ -1977,7 +1978,8 @@ async fn run_websocket_logs_connection(
                     }
                     WsMessage::Pong(_) => {}
                     WsMessage::Close(frame) => {
-                        return Err(WebsocketProtocolError::Closed(format!("{frame:?}")).into());
+                        write.send(WsMessage::Close(frame)).await.ok();
+                        return Ok(());
                     }
                     _ => {}
                 }
@@ -3832,6 +3834,78 @@ mod tests {
         assert_eq!(event.slot, 55);
         assert!(event.signature.is_some());
         assert!(!event.bytes.is_empty());
+
+        handle.abort();
+        handle.await.ok();
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn websocket_source_reports_clean_close_as_stream_end() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = accept_async(stream).await.expect("websocket handshake");
+            let subscribe = ws
+                .next()
+                .await
+                .expect("subscribe frame")
+                .expect("subscribe message");
+            match subscribe {
+                WsMessage::Text(text) => {
+                    assert!(text.contains("transactionSubscribe"));
+                }
+                other @ WsMessage::Binary(_)
+                | other @ WsMessage::Ping(_)
+                | other @ WsMessage::Pong(_)
+                | other @ WsMessage::Close(_)
+                | other @ WsMessage::Frame(_) => {
+                    panic!("expected subscribe text frame, got {other:?}");
+                }
+            }
+            ws.send(WsMessage::Text(
+                String::from(r#"{"jsonrpc":"2.0","id":1,"result":42}"#).into(),
+            ))
+            .await
+            .expect("ack");
+            ws.close(None).await.expect("close");
+        });
+
+        let (tx, mut rx) = create_provider_stream_queue(8);
+        let config = WebsocketTransactionConfig::new(format!("ws://{addr}"))
+            .with_max_reconnect_attempts(1)
+            .with_reconnect_delay(Duration::from_millis(10));
+        let handle = spawn_websocket_source(&config, tx)
+            .await
+            .expect("spawn websocket source");
+
+        let health = loop {
+            let update = timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("provider update timeout")
+                .expect("provider update");
+            match update {
+                ProviderStreamUpdate::Health(event)
+                    if event.status == ProviderSourceHealthStatus::Reconnecting
+                        && event.reason
+                            == ProviderSourceHealthReason::UpstreamStreamClosedUnexpectedly =>
+                {
+                    break event;
+                }
+                _ => continue,
+            }
+        };
+        assert_eq!(
+            health.reason,
+            ProviderSourceHealthReason::UpstreamStreamClosedUnexpectedly
+        );
+        assert!(
+            health.message.contains("stream ended unexpectedly"),
+            "unexpected health message: {}",
+            health.message
+        );
 
         handle.abort();
         handle.await.ok();
