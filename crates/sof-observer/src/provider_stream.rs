@@ -210,6 +210,10 @@ use solana_transaction::versioned::VersionedTransaction;
 
 /// Default queue capacity for processed provider-stream ingress.
 pub const DEFAULT_PROVIDER_STREAM_QUEUE_CAPACITY: usize = 8_192;
+/// Stable compute-budget program id reused in provider transaction classifiers.
+const COMPUTE_BUDGET_PROGRAM_ID: solana_pubkey::Pubkey = compute_budget::ID;
+/// Stable vote program id reused in provider transaction classifiers.
+const VOTE_PROGRAM_ID: solana_pubkey::Pubkey = vote::ID;
 
 /// Creates one keepalive interval that waits one full period before the first tick.
 #[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
@@ -1195,18 +1199,16 @@ pub(crate) fn classify_provider_transaction_kind(tx: &VersionedTransaction) -> T
     let mut has_vote = false;
     let mut has_non_vote_non_budget = false;
     let keys = tx.message.static_account_keys();
-    let vote_program = vote::id();
-    let compute_budget_program = compute_budget::id();
     for instruction in tx.message.instructions() {
         if let Some(program_id) = keys.get(usize::from(instruction.program_id_index)) {
-            if *program_id == vote_program {
+            if *program_id == VOTE_PROGRAM_ID {
                 has_vote = true;
                 if has_non_vote_non_budget {
                     return TxKind::Mixed;
                 }
                 continue;
             }
-            if *program_id != compute_budget_program {
+            if *program_id != COMPUTE_BUDGET_PROGRAM_ID {
                 has_non_vote_non_budget = true;
                 if has_vote {
                     return TxKind::Mixed;
@@ -1229,17 +1231,15 @@ pub(crate) fn classify_provider_transaction_kind_view<D: TransactionData>(
 ) -> TxKind {
     let mut has_vote = false;
     let mut has_non_vote_non_budget = false;
-    let vote_program = vote::id();
-    let compute_budget_program = compute_budget::id();
     for (program_id, _) in view.program_instructions_iter() {
-        if *program_id == vote_program {
+        if *program_id == VOTE_PROGRAM_ID {
             has_vote = true;
             if has_non_vote_non_budget {
                 return TxKind::Mixed;
             }
             continue;
         }
-        if *program_id != compute_budget_program {
+        if *program_id != COMPUTE_BUDGET_PROGRAM_ID {
             has_non_vote_non_budget = true;
             if has_vote {
                 return TxKind::Mixed;
