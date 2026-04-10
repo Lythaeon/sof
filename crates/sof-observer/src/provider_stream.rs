@@ -382,6 +382,27 @@ impl ProviderStreamUpdate {
         }
         self
     }
+
+    /// Tags one provider-origin update with one shared source reference.
+    #[must_use]
+    pub(crate) fn with_provider_source_ref(mut self, source: &Arc<ProviderSourceIdentity>) -> Self {
+        match &mut self {
+            Self::Transaction(event) => event.provider_source = Some(Arc::clone(source)),
+            Self::SerializedTransaction(event) => event.provider_source = Some(Arc::clone(source)),
+            Self::TransactionLog(event) => event.provider_source = Some(Arc::clone(source)),
+            Self::TransactionStatus(event) => event.provider_source = Some(Arc::clone(source)),
+            Self::TransactionViewBatch(event) => event.provider_source = Some(Arc::clone(source)),
+            Self::AccountUpdate(event) => event.provider_source = Some(Arc::clone(source)),
+            Self::BlockMeta(event) => event.provider_source = Some(Arc::clone(source)),
+            Self::RecentBlockhash(event) => event.provider_source = Some(Arc::clone(source)),
+            Self::SlotStatus(event) => event.provider_source = Some(Arc::clone(source)),
+            Self::ClusterTopology(event) => event.provider_source = Some(Arc::clone(source)),
+            Self::LeaderSchedule(event) => event.provider_source = Some(Arc::clone(source)),
+            Self::Reorg(event) => event.provider_source = Some(Arc::clone(source)),
+            Self::Health(event) => event.source = (**source).clone(),
+        }
+        self
+    }
 }
 
 impl From<TransactionEvent> for ProviderStreamUpdate {
@@ -1334,6 +1355,15 @@ mod tests {
         VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&signer]).expect("tx")
     }
 
+    fn sample_recent_blockhash_update() -> ProviderStreamUpdate {
+        ProviderStreamUpdate::RecentBlockhash(ObservedRecentBlockhashEvent {
+            slot: 7,
+            recent_blockhash: solana_hash::Hash::new_unique().to_bytes(),
+            dataset_tx_count: 0,
+            provider_source: None,
+        })
+    }
+
     fn classify_provider_transaction_kind_baseline(tx: &VersionedTransaction) -> TxKind {
         let mut has_vote = false;
         let mut has_non_vote_non_budget = false;
@@ -1774,5 +1804,42 @@ mod tests {
         for _ in 0..iterations {
             std::hint::black_box(classify_provider_transaction_kind(&tx));
         }
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for provider source attachment path"]
+    fn provider_update_source_attachment_profile_fixture() {
+        let iterations = profile_iterations(1_000_000);
+        let source = ProviderSourceIdentity::new(
+            ProviderSourceId::Generic(Arc::<str>::from("custom")),
+            "source-a",
+        );
+        let source_ref = Arc::new(source.clone());
+        let update = sample_recent_blockhash_update();
+
+        let baseline_started = Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(update.clone().with_provider_source(source.clone()));
+        }
+        let baseline_elapsed = baseline_started.elapsed();
+
+        let optimized_started = Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(update.clone().with_provider_source_ref(&source_ref));
+        }
+        let optimized_elapsed = optimized_started.elapsed();
+        let baseline_avg_ns = avg_ns_per_iteration(baseline_elapsed, iterations);
+        let optimized_avg_ns = avg_ns_per_iteration(optimized_elapsed, iterations);
+
+        eprintln!(
+            "provider_update_source_attachment_profile_fixture iterations={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.3} optimized_avg_us_per_iteration={:.3}",
+            iterations,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
+            baseline_avg_ns,
+            optimized_avg_ns,
+            baseline_avg_ns as f64 / 1_000.0,
+            optimized_avg_ns as f64 / 1_000.0,
+        );
     }
 }

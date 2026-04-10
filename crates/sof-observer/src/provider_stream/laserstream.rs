@@ -1431,6 +1431,7 @@ async fn run_laserstream_primary_connection(
 ) -> Result<(), LaserStreamError> {
     *state.session_established = false;
     let commitment = config.commitment.as_tx_commitment();
+    let provider_source = Arc::new(source.clone());
     *state.session_established = true;
     send_primary_provider_health(
         source,
@@ -1499,7 +1500,7 @@ async fn run_laserstream_primary_connection(
                         sender
                             .send(
                                 ProviderStreamUpdate::Transaction(event)
-                                    .with_provider_source(source.clone()),
+                                    .with_provider_source_ref(&provider_source),
                             )
                             .await
                             .map_err(|_error| LaserStreamError::QueueClosed)?;
@@ -1519,7 +1520,7 @@ async fn run_laserstream_primary_connection(
                         sender
                             .send(
                                 ProviderStreamUpdate::TransactionStatus(event)
-                                    .with_provider_source(source.clone()),
+                                    .with_provider_source_ref(&provider_source),
                             )
                             .await
                             .map_err(|_error| LaserStreamError::QueueClosed)?;
@@ -1541,7 +1542,7 @@ async fn run_laserstream_primary_connection(
                         sender
                             .send(
                                 ProviderStreamUpdate::AccountUpdate(event)
-                                    .with_provider_source(source.clone()),
+                                    .with_provider_source_ref(&provider_source),
                             )
                             .await
                             .map_err(|_error| LaserStreamError::QueueClosed)?;
@@ -1563,7 +1564,7 @@ async fn run_laserstream_primary_connection(
                         sender
                             .send(
                                 ProviderStreamUpdate::BlockMeta(event)
-                                    .with_provider_source(source.clone()),
+                                    .with_provider_source_ref(&provider_source),
                             )
                             .await
                             .map_err(|_error| LaserStreamError::QueueClosed)?;
@@ -1584,6 +1585,7 @@ async fn run_laserstream_slot_connection(
     mut stream: LaserStreamUpdateStream,
 ) -> Result<(), LaserStreamError> {
     *state.session_established = false;
+    let provider_source = Arc::new(source.clone());
     *state.session_established = true;
     send_provider_slot_health(
         source,
@@ -1626,7 +1628,7 @@ async fn run_laserstream_slot_connection(
                         sender
                             .send(
                                 ProviderStreamUpdate::SlotStatus(event)
-                                    .with_provider_source(source.clone()),
+                                    .with_provider_source_ref(&provider_source),
                             )
                             .await
                             .map_err(|_error| LaserStreamError::QueueClosed)?;

@@ -1349,6 +1349,7 @@ async fn run_yellowstone_primary_connection(
     mut stream: YellowstoneUpdateStream,
 ) -> Result<(), YellowstoneGrpcError> {
     let commitment = config.commitment.as_tx_commitment();
+    let provider_source = Arc::new(source.clone());
     *state.session_established = false;
     *state.session_established = true;
     send_primary_provider_health(
@@ -1415,7 +1416,7 @@ async fn run_yellowstone_primary_connection(
                         sender
                             .send(
                                 ProviderStreamUpdate::Transaction(event)
-                                    .with_provider_source(source.clone()),
+                                    .with_provider_source_ref(&provider_source),
                             )
                             .await
                             .map_err(|_error| YellowstoneGrpcError::QueueClosed)?;
@@ -1435,7 +1436,7 @@ async fn run_yellowstone_primary_connection(
                         sender
                             .send(
                                 ProviderStreamUpdate::TransactionStatus(event)
-                                    .with_provider_source(source.clone()),
+                                    .with_provider_source_ref(&provider_source),
                             )
                             .await
                             .map_err(|_error| YellowstoneGrpcError::QueueClosed)?;
@@ -1457,7 +1458,7 @@ async fn run_yellowstone_primary_connection(
                         sender
                             .send(
                                 ProviderStreamUpdate::AccountUpdate(event)
-                                    .with_provider_source(source.clone()),
+                                    .with_provider_source_ref(&provider_source),
                             )
                             .await
                             .map_err(|_error| YellowstoneGrpcError::QueueClosed)?;
@@ -1479,7 +1480,7 @@ async fn run_yellowstone_primary_connection(
                         sender
                             .send(
                                 ProviderStreamUpdate::BlockMeta(event)
-                                    .with_provider_source(source.clone()),
+                                    .with_provider_source_ref(&provider_source),
                             )
                             .await
                             .map_err(|_error| YellowstoneGrpcError::QueueClosed)?;
@@ -1521,6 +1522,7 @@ async fn run_yellowstone_slot_connection(
     mut subscribe_tx: YellowstoneSubscribeSink,
     mut stream: YellowstoneUpdateStream,
 ) -> Result<(), YellowstoneGrpcError> {
+    let provider_source = Arc::new(source.clone());
     *state.session_established = false;
     *state.session_established = true;
     send_provider_slot_health(
@@ -1580,7 +1582,7 @@ async fn run_yellowstone_slot_connection(
                             sender
                                 .send(
                                     ProviderStreamUpdate::SlotStatus(event)
-                                        .with_provider_source(source.clone()),
+                                        .with_provider_source_ref(&provider_source),
                                 )
                                 .await
                                 .map_err(|_error| YellowstoneGrpcError::QueueClosed)?;
