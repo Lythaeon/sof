@@ -39,7 +39,7 @@ use yellowstone_grpc_proto::prelude::{
 use crate::{
     event::{ForkSlotStatus, TxCommitmentStatus, TxKind},
     framework::{
-        AccountUpdateEvent, BlockMetaEvent, SignatureBytes, SlotStatusEvent, TransactionEvent,
+        AccountUpdateEvent, BlockMetaEvent, SlotStatusEvent, TransactionEvent,
         TransactionStatusEvent,
     },
     provider_stream::{
@@ -1763,14 +1763,10 @@ fn transaction_event_from_update(
     let transaction =
         transaction.ok_or(YellowstoneGrpcError::Convert("missing transaction payload"))?;
     let is_vote = transaction.is_vote;
-    let signature = if is_vote {
-        Some(signature_bytes_from_slice(
-            transaction.signature.as_slice(),
-            || YellowstoneGrpcError::Convert("invalid signature"),
-        )?)
-    } else {
-        None
-    };
+    let signature = Some(signature_bytes_from_slice(
+        transaction.signature.as_slice(),
+        || YellowstoneGrpcError::Convert("invalid signature"),
+    )?);
     let tx = convert_transaction(
         transaction
             .transaction
@@ -1783,7 +1779,7 @@ fn transaction_event_from_update(
         commitment_status,
         confirmed_slot: watermarks.confirmed_slot,
         finalized_slot: watermarks.finalized_slot,
-        signature: signature.or_else(|| tx.signatures.first().copied().map(SignatureBytes::from)),
+        signature,
         provider_source: None,
         kind: if is_vote {
             TxKind::VoteOnly

@@ -29,7 +29,6 @@ use laserstream_core_proto::tonic::{
 };
 use sof_support::bytes::{pubkey_bytes_from_slice, signature_bytes_from_slice};
 use sof_support::time_support::duration_secs_ceil;
-use sof_types::SignatureBytes;
 use solana_hash::Hash;
 use solana_message::{
     Message, MessageHeader, VersionedMessage,
@@ -1947,14 +1946,10 @@ fn transaction_event_from_update(
     let transaction =
         transaction.ok_or(LaserStreamError::Convert("missing transaction payload"))?;
     let is_vote = transaction.is_vote;
-    let signature = if is_vote {
-        Some(signature_bytes_from_slice(
-            transaction.signature.as_slice(),
-            || LaserStreamError::Convert("invalid signature"),
-        )?)
-    } else {
-        None
-    };
+    let signature = Some(signature_bytes_from_slice(
+        transaction.signature.as_slice(),
+        || LaserStreamError::Convert("invalid signature"),
+    )?);
     let tx = convert_transaction(
         transaction
             .transaction
@@ -1965,7 +1960,7 @@ fn transaction_event_from_update(
         commitment_status,
         confirmed_slot: watermarks.confirmed_slot,
         finalized_slot: watermarks.finalized_slot,
-        signature: signature.or_else(|| tx.signatures.first().copied().map(SignatureBytes::from)),
+        signature,
         provider_source: None,
         kind: if is_vote {
             TxKind::VoteOnly
