@@ -2621,9 +2621,11 @@ fn dispatch_provider_stream_serialized_transaction(
                 .copied()
                 .map(framework::SignatureBytes::from_solana);
         }
-        kind = Some(provider_stream::classify_provider_transaction_kind_view(
-            &view,
-        ));
+        if wants_transaction || wants_derived_state_transaction {
+            kind = Some(provider_stream::classify_provider_transaction_kind_view(
+                &view,
+            ));
+        }
         if wants_recent_blockhash {
             recent_blockhash = Some(view.recent_blockhash().to_bytes());
         }
@@ -5730,6 +5732,48 @@ mod tests {
 
         eprintln!(
             "provider_stream_serialized_transaction_accept_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            iterations,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
+        );
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for provider serialized tx recent-blockhash-only path"]
+    fn provider_stream_serialized_transaction_recent_blockhash_profile_fixture() {
+        let iterations = profile_iterations(500_000);
+        let plugin_host = PluginHost::builder()
+            .add_plugin(RecentBlockhashPlugin)
+            .build();
+        let derived_state_host = DerivedStateHost::builder().build();
+        let baseline_update = sample_serialized_provider_transaction_update();
+        let optimized_update = baseline_update.clone();
+
+        let baseline_started = Instant::now();
+        for _ in 0..iterations {
+            let ProviderStreamUpdate::SerializedTransaction(event) = baseline_update.clone() else {
+                panic!("expected serialized update fixture");
+            };
+            dispatch_provider_stream_serialized_transaction_baseline(
+                &plugin_host,
+                &derived_state_host,
+                &event,
+            );
+        }
+        let baseline_elapsed = baseline_started.elapsed();
+
+        let optimized_started = Instant::now();
+        for _ in 0..iterations {
+            dispatch_provider_stream_update(
+                &plugin_host,
+                &derived_state_host,
+                optimized_update.clone(),
+            );
+        }
+        let optimized_elapsed = optimized_started.elapsed();
+
+        eprintln!(
+            "provider_stream_serialized_transaction_recent_blockhash_profile_fixture iterations={} baseline_us={} optimized_us={}",
             iterations,
             baseline_elapsed.as_micros(),
             optimized_elapsed.as_micros(),
