@@ -67,6 +67,15 @@ const LASERSTREAM_SDK_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_ACCOUNT_DATA_LEN: usize = MAX_PERMITTED_DATA_LENGTH as usize;
 const SLOT_STATUS_RETAINED_LAG: u64 = 4_096;
 const SLOT_STATUS_PRUNE_THRESHOLD: usize = SLOT_STATUS_RETAINED_LAG as usize * 2;
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL_SECS: u64 = 30;
+const DEFAULT_KEEP_ALIVE_TIMEOUT_SECS: u64 = 5;
+const DEFAULT_INITIAL_STREAM_WINDOW_SIZE: u32 = 1024 * 1024 * 4;
+const DEFAULT_INITIAL_CONNECTION_WINDOW_SIZE: u32 = 1024 * 1024 * 8;
+const DEFAULT_BUFFER_SIZE: usize = 1024 * 64;
+const DEFAULT_MAX_DECODING_MESSAGE_SIZE: usize = 1_000_000_000;
+const DEFAULT_MAX_ENCODING_MESSAGE_SIZE: usize = 32_000_000;
 
 /// LaserStream subscription commitment used for provider-stream transaction updates.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1782,6 +1791,55 @@ impl Interceptor for SofLaserStreamInterceptor {
     }
 }
 
+fn laserstream_endpoint(
+    endpoint: &str,
+    options: &ChannelOptions,
+) -> Result<Endpoint, LaserStreamError> {
+    let mut transport = Endpoint::from_shared(endpoint.to_owned())
+        .map_err(|error| LaserStreamProtocolError::InvalidEndpoint(error.to_string()))?
+        .connect_timeout(Duration::from_secs(
+            options
+                .connect_timeout_secs
+                .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
+        ))
+        .timeout(Duration::from_secs(
+            options.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
+        ))
+        .http2_keep_alive_interval(Duration::from_secs(
+            options
+                .http2_keep_alive_interval_secs
+                .unwrap_or(DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL_SECS),
+        ))
+        .keep_alive_timeout(Duration::from_secs(
+            options
+                .keep_alive_timeout_secs
+                .unwrap_or(DEFAULT_KEEP_ALIVE_TIMEOUT_SECS),
+        ))
+        .keep_alive_while_idle(options.keep_alive_while_idle.unwrap_or(true))
+        .initial_stream_window_size(
+            options
+                .initial_stream_window_size
+                .or(Some(DEFAULT_INITIAL_STREAM_WINDOW_SIZE)),
+        )
+        .initial_connection_window_size(
+            options
+                .initial_connection_window_size
+                .or(Some(DEFAULT_INITIAL_CONNECTION_WINDOW_SIZE)),
+        )
+        .http2_adaptive_window(options.http2_adaptive_window.unwrap_or(true))
+        .tcp_nodelay(options.tcp_nodelay.unwrap_or(true))
+        .buffer_size(options.buffer_size.or(Some(DEFAULT_BUFFER_SIZE)));
+    if let Some(tcp_keepalive_secs) = options.tcp_keepalive_secs {
+        transport = transport.tcp_keepalive(Some(Duration::from_secs(tcp_keepalive_secs)));
+    }
+    if endpoint_uses_tls(endpoint) {
+        transport = transport
+            .tls_config(ClientTlsConfig::new().with_enabled_roots())
+            .map_err(|error| LaserStreamProtocolError::TlsConfig(error.to_string()))?;
+    }
+    Ok(transport)
+}
+
 async fn connect_and_subscribe_once(
     config: &LaserStreamConfig,
     request: grpc::SubscribeRequest,
@@ -1789,47 +1847,23 @@ async fn connect_and_subscribe_once(
     let options = config.client_config().channel_options;
     let interceptor = SofLaserStreamInterceptor::new(&config.api_key)
         .map_err(|error| LaserStreamProtocolError::InvalidApiKey(error.to_string()))?;
-
-    let mut endpoint = Endpoint::from_shared(config.endpoint.clone())
-        .map_err(|error| LaserStreamProtocolError::InvalidEndpoint(error.to_string()))?
-        .connect_timeout(Duration::from_secs(
-            options.connect_timeout_secs.unwrap_or(10),
-        ))
-        .timeout(Duration::from_secs(options.timeout_secs.unwrap_or(30)))
-        .http2_keep_alive_interval(Duration::from_secs(
-            options.http2_keep_alive_interval_secs.unwrap_or(30),
-        ))
-        .keep_alive_timeout(Duration::from_secs(
-            options.keep_alive_timeout_secs.unwrap_or(5),
-        ))
-        .keep_alive_while_idle(options.keep_alive_while_idle.unwrap_or(true))
-        .initial_stream_window_size(options.initial_stream_window_size.or(Some(1024 * 1024 * 4)))
-        .initial_connection_window_size(
-            options
-                .initial_connection_window_size
-                .or(Some(1024 * 1024 * 8)),
-        )
-        .http2_adaptive_window(options.http2_adaptive_window.unwrap_or(true))
-        .tcp_nodelay(options.tcp_nodelay.unwrap_or(true))
-        .buffer_size(options.buffer_size.or(Some(1024 * 64)));
-    if let Some(tcp_keepalive_secs) = options.tcp_keepalive_secs {
-        endpoint = endpoint.tcp_keepalive(Some(Duration::from_secs(tcp_keepalive_secs)));
-    }
-    if endpoint_uses_tls(&config.endpoint) {
-        endpoint = endpoint
-            .tls_config(ClientTlsConfig::new().with_enabled_roots())
-            .map_err(|error| LaserStreamProtocolError::TlsConfig(error.to_string()))?;
-    }
-
-    let channel = endpoint
+    let channel = laserstream_endpoint(&config.endpoint, &options)?
         .connect()
         .await
         .map_err(|error| LaserStreamProtocolError::ConnectionFailed(error.to_string()))?;
     let mut geyser_client =
         grpc::geyser_client::GeyserClient::with_interceptor(channel, interceptor);
     geyser_client = geyser_client
-        .max_decoding_message_size(options.max_decoding_message_size.unwrap_or(1_000_000_000))
-        .max_encoding_message_size(options.max_encoding_message_size.unwrap_or(32_000_000));
+        .max_decoding_message_size(
+            options
+                .max_decoding_message_size
+                .unwrap_or(DEFAULT_MAX_DECODING_MESSAGE_SIZE),
+        )
+        .max_encoding_message_size(
+            options
+                .max_encoding_message_size
+                .unwrap_or(DEFAULT_MAX_ENCODING_MESSAGE_SIZE),
+        );
     if let Some(send_comp) = options.send_compression {
         let encoding = match send_comp {
             helius_laserstream::CompressionEncoding::Gzip => CompressionEncoding::Gzip,
@@ -1867,47 +1901,23 @@ async fn connect_and_subscribe_slots_once(
     let options = config.client_config().channel_options;
     let interceptor = SofLaserStreamInterceptor::new(&config.api_key)
         .map_err(|error| LaserStreamProtocolError::InvalidApiKey(error.to_string()))?;
-
-    let mut endpoint = Endpoint::from_shared(config.endpoint.clone())
-        .map_err(|error| LaserStreamProtocolError::InvalidEndpoint(error.to_string()))?
-        .connect_timeout(Duration::from_secs(
-            options.connect_timeout_secs.unwrap_or(10),
-        ))
-        .timeout(Duration::from_secs(options.timeout_secs.unwrap_or(30)))
-        .http2_keep_alive_interval(Duration::from_secs(
-            options.http2_keep_alive_interval_secs.unwrap_or(30),
-        ))
-        .keep_alive_timeout(Duration::from_secs(
-            options.keep_alive_timeout_secs.unwrap_or(5),
-        ))
-        .keep_alive_while_idle(options.keep_alive_while_idle.unwrap_or(true))
-        .initial_stream_window_size(options.initial_stream_window_size.or(Some(1024 * 1024 * 4)))
-        .initial_connection_window_size(
-            options
-                .initial_connection_window_size
-                .or(Some(1024 * 1024 * 8)),
-        )
-        .http2_adaptive_window(options.http2_adaptive_window.unwrap_or(true))
-        .tcp_nodelay(options.tcp_nodelay.unwrap_or(true))
-        .buffer_size(options.buffer_size.or(Some(1024 * 64)));
-    if let Some(tcp_keepalive_secs) = options.tcp_keepalive_secs {
-        endpoint = endpoint.tcp_keepalive(Some(Duration::from_secs(tcp_keepalive_secs)));
-    }
-    if endpoint_uses_tls(&config.endpoint) {
-        endpoint = endpoint
-            .tls_config(ClientTlsConfig::new().with_enabled_roots())
-            .map_err(|error| LaserStreamProtocolError::TlsConfig(error.to_string()))?;
-    }
-
-    let channel = endpoint
+    let channel = laserstream_endpoint(&config.endpoint, &options)?
         .connect()
         .await
         .map_err(|error| LaserStreamProtocolError::ConnectionFailed(error.to_string()))?;
     let mut geyser_client =
         grpc::geyser_client::GeyserClient::with_interceptor(channel, interceptor);
     geyser_client = geyser_client
-        .max_decoding_message_size(options.max_decoding_message_size.unwrap_or(1_000_000_000))
-        .max_encoding_message_size(options.max_encoding_message_size.unwrap_or(32_000_000));
+        .max_decoding_message_size(
+            options
+                .max_decoding_message_size
+                .unwrap_or(DEFAULT_MAX_DECODING_MESSAGE_SIZE),
+        )
+        .max_encoding_message_size(
+            options
+                .max_encoding_message_size
+                .unwrap_or(DEFAULT_MAX_ENCODING_MESSAGE_SIZE),
+        );
     if let Some(send_comp) = options.send_compression {
         let encoding = match send_comp {
             helius_laserstream::CompressionEncoding::Gzip => CompressionEncoding::Gzip,
