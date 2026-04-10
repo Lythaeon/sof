@@ -1163,16 +1163,18 @@ pub(crate) fn classify_provider_transaction_kind(tx: &VersionedTransaction) -> T
     let mut has_vote = false;
     let mut has_non_vote_non_budget = false;
     let keys = tx.message.static_account_keys();
+    let vote_program = vote::id();
+    let compute_budget_program = compute_budget::id();
     for instruction in tx.message.instructions() {
         if let Some(program_id) = keys.get(usize::from(instruction.program_id_index)) {
-            if *program_id == vote::id() {
+            if *program_id == vote_program {
                 has_vote = true;
                 if has_non_vote_non_budget {
                     return TxKind::Mixed;
                 }
                 continue;
             }
-            if *program_id != compute_budget::id() {
+            if *program_id != compute_budget_program {
                 has_non_vote_non_budget = true;
                 if has_vote {
                     return TxKind::Mixed;
@@ -1195,15 +1197,17 @@ pub(crate) fn classify_provider_transaction_kind_view<D: TransactionData>(
 ) -> TxKind {
     let mut has_vote = false;
     let mut has_non_vote_non_budget = false;
+    let vote_program = vote::id();
+    let compute_budget_program = compute_budget::id();
     for (program_id, _) in view.program_instructions_iter() {
-        if *program_id == vote::id() {
+        if *program_id == vote_program {
             has_vote = true;
             if has_non_vote_non_budget {
                 return TxKind::Mixed;
             }
             continue;
         }
-        if *program_id != compute_budget::id() {
+        if *program_id != compute_budget_program {
             has_non_vote_non_budget = true;
             if has_vote {
                 return TxKind::Mixed;
@@ -1300,7 +1304,7 @@ pub mod websocket;
 #[cfg(all(test, any(feature = "provider-grpc", feature = "provider-websocket")))]
 mod tests {
     use super::*;
-    use sof_support::bench::profile_iterations;
+    use sof_support::bench::{avg_ns_per_iteration, profile_iterations};
     use solana_instruction::Instruction;
     use solana_keypair::Keypair;
     use solana_message::{Message, VersionedMessage};
@@ -1342,6 +1346,36 @@ mod tests {
                 }
                 if *program_id != compute_budget::id() {
                     has_non_vote_non_budget = true;
+                }
+            }
+        }
+        if has_vote && !has_non_vote_non_budget {
+            TxKind::VoteOnly
+        } else if has_vote {
+            TxKind::Mixed
+        } else {
+            TxKind::NonVote
+        }
+    }
+
+    fn classify_provider_transaction_kind_pre_hoist(tx: &VersionedTransaction) -> TxKind {
+        let mut has_vote = false;
+        let mut has_non_vote_non_budget = false;
+        let keys = tx.message.static_account_keys();
+        for instruction in tx.message.instructions() {
+            if let Some(program_id) = keys.get(usize::from(instruction.program_id_index)) {
+                if *program_id == vote::id() {
+                    has_vote = true;
+                    if has_non_vote_non_budget {
+                        return TxKind::Mixed;
+                    }
+                    continue;
+                }
+                if *program_id != compute_budget::id() {
+                    has_non_vote_non_budget = true;
+                    if has_vote {
+                        return TxKind::Mixed;
+                    }
                 }
             }
         }
@@ -1686,6 +1720,37 @@ mod tests {
             iterations,
             baseline_elapsed.as_micros(),
             optimized_elapsed.as_micros(),
+        );
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for provider tx kind hoisted id comparison"]
+    fn provider_transaction_kind_hoist_ids_profile_fixture() {
+        let iterations = profile_iterations(1_000_000);
+
+        let tx = sample_mixed_transaction();
+
+        let baseline_started = Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(classify_provider_transaction_kind_pre_hoist(&tx));
+        }
+        let baseline_elapsed = baseline_started.elapsed();
+
+        let optimized_started = Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(classify_provider_transaction_kind(&tx));
+        }
+        let optimized_elapsed = optimized_started.elapsed();
+
+        eprintln!(
+            "provider_transaction_kind_hoist_ids_profile_fixture iterations={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.3} optimized_avg_us_per_iteration={:.3}",
+            iterations,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
+            avg_ns_per_iteration(baseline_elapsed, iterations),
+            avg_ns_per_iteration(optimized_elapsed, iterations),
+            avg_ns_per_iteration(baseline_elapsed, iterations) as f64 / 1_000.0,
+            avg_ns_per_iteration(optimized_elapsed, iterations) as f64 / 1_000.0,
         );
     }
 
