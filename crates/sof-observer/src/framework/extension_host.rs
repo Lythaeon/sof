@@ -1089,14 +1089,15 @@ async fn spawn_udp_listener(
                     }
                 }
                 Err(error) => {
-                    if error.kind() != ErrorKind::Interrupted {
-                        tracing::warn!(
-                            extension = owner_extension,
-                            resource_id,
-                            error = %error,
-                            "udp extension listener read loop terminated"
-                        );
+                    if error.kind() == ErrorKind::Interrupted {
+                        continue;
                     }
+                    tracing::warn!(
+                        extension = owner_extension,
+                        resource_id,
+                        error = %error,
+                        "udp extension listener read loop terminated"
+                    );
                     break;
                 }
             }
@@ -1268,14 +1269,15 @@ async fn read_tcp_stream_packets(context: ExtensionResourceReadContext, mut stre
                 }
             }
             Err(error) => {
-                if error.kind() != ErrorKind::Interrupted {
-                    tracing::warn!(
-                        extension = context.emitter.owner_extension.as_str(),
-                        resource_id = context.emitter.resource_id.as_str(),
-                        error = %error,
-                        "extension tcp stream read loop terminated"
-                    );
+                if error.kind() == ErrorKind::Interrupted {
+                    continue;
                 }
+                tracing::warn!(
+                    extension = context.emitter.owner_extension.as_str(),
+                    resource_id = context.emitter.resource_id.as_str(),
+                    error = %error,
+                    "extension tcp stream read loop terminated"
+                );
                 break;
             }
         }
