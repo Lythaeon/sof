@@ -63,6 +63,7 @@ use crate::{
 };
 
 const MIN_RECONNECT_DELAY: Duration = Duration::from_millis(1);
+const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Commitment level used for websocket `transactionSubscribe` notifications.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1977,12 +1978,16 @@ async fn run_websocket_logs_connection(
 async fn establish_websocket_logs_session(
     config: &WebsocketLogsConfig,
 ) -> Result<WebsocketProviderStream, WebsocketLogsError> {
-    let (mut stream, _response) = connect_async_with_config(
-        config.endpoint(),
-        Some(websocket_transport_config(WEBSOCKET_LOGS_MAX_MESSAGE_SIZE)),
-        false,
+    let (mut stream, _response) = tokio::time::timeout(
+        websocket_connect_timeout(config.stall_timeout),
+        connect_async_with_config(
+            config.endpoint(),
+            Some(websocket_transport_config(WEBSOCKET_LOGS_MAX_MESSAGE_SIZE)),
+            false,
+        ),
     )
-    .await?;
+    .await
+    .map_err(|_elapsed| WebsocketProtocolError::SubscriptionAckTimeout)??;
     stream
         .send(WsMessage::Text(
             config.subscribe_request().to_string().into(),
@@ -2252,12 +2257,16 @@ async fn establish_websocket_primary_session(
     {
         return Err(WebsocketProtocolError::MissingReplayHttpEndpoint.into());
     }
-    let (mut stream, _response) = connect_async_with_config(
-        config.endpoint(),
-        Some(websocket_primary_transport_config(config)),
-        false,
+    let (mut stream, _response) = tokio::time::timeout(
+        websocket_connect_timeout(config.stall_timeout),
+        connect_async_with_config(
+            config.endpoint(),
+            Some(websocket_primary_transport_config(config)),
+            false,
+        ),
     )
-    .await?;
+    .await
+    .map_err(|_elapsed| WebsocketProtocolError::SubscriptionAckTimeout)??;
     stream
         .send(WsMessage::Text(
             config.subscribe_request().to_string().into(),
@@ -2291,6 +2300,13 @@ fn websocket_transport_config(max_message_size: usize) -> WebSocketConfig {
     WebSocketConfig::default()
         .max_message_size(Some(max_message_size))
         .max_frame_size(Some(max_message_size))
+}
+
+const fn websocket_connect_timeout(stall_timeout: Option<Duration>) -> Duration {
+    match stall_timeout {
+        Some(timeout) if !timeout.is_zero() => timeout,
+        _ => DEFAULT_WEBSOCKET_CONNECT_TIMEOUT,
+    }
 }
 
 fn http_rpc_error_detail(error: &reqwest::Error) -> String {
@@ -3620,6 +3636,34 @@ mod tests {
             }) => {}
             other => panic!("expected vote config rejection, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn websocket_spawn_times_out_stalled_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        let server = tokio::spawn(async move {
+            let accepted = listener.accept().await;
+            assert!(accepted.is_ok());
+            let (_stream, _) = accepted.unwrap_or_else(|error| panic!("{error}"));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        let (tx, _rx) = create_provider_stream_queue(1);
+        let config = WebsocketTransactionConfig::new(format!("ws://{addr}"))
+            .with_stall_timeout(Duration::from_millis(25));
+
+        let error = spawn_websocket_source(&config, tx)
+            .await
+            .expect_err("stalled websocket handshake should time out");
+        assert!(
+            error.to_string().contains("timed out"),
+            "unexpected error: {error}"
+        );
+
+        server.abort();
+        drop(server.await);
     }
 
     #[tokio::test]
