@@ -148,7 +148,8 @@ impl RecentShredRingBuffer {
             });
         }
 
-        let mut latest_by_index: HashMap<u32, (Instant, Arc<[u8]>)> = HashMap::new();
+        let mut latest_by_index: HashMap<u32, (Instant, Arc<[u8]>)> =
+            HashMap::with_capacity(query_range_index_capacity(span, limits.max_response_shreds));
         for (key, entry) in self.entries.iter().filter(|(key, _)| {
             key.slot == request.slot
                 && key.index >= request.start_index
@@ -381,7 +382,8 @@ impl SharedRelayCache {
             });
         }
 
-        let mut latest_by_index: HashMap<u32, (Instant, Arc<[u8]>)> = HashMap::new();
+        let mut latest_by_index: HashMap<u32, (Instant, Arc<[u8]>)> =
+            HashMap::with_capacity(query_range_index_capacity(span, limits.max_response_shreds));
         let start = slot_index_range_start(request.slot, request.start_index);
         let end = slot_index_range_end(request.slot, request.end_index);
         for entry in self.slot_index.range(start..=end) {
@@ -552,6 +554,12 @@ impl SharedRelayCache {
     }
 }
 
+fn query_range_index_capacity(span: u32, max_response_shreds: usize) -> usize {
+    usize::try_from(span)
+        .unwrap_or(usize::MAX)
+        .min(max_response_shreds.max(1))
+}
+
 fn make_cached_shred_key(
     packet: &[u8],
     parsed_shred: &ParsedShredHeader,
@@ -661,6 +669,63 @@ mod tests {
 
         eprintln!(
             "relay_ring_buffer_replace_profile_fixture iterations={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.3} optimized_avg_us_per_iteration={:.3}",
+            iterations,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
+            baseline_avg_ns,
+            optimized_avg_ns,
+            baseline_avg_ns as f64 / 1_000.0,
+            optimized_avg_ns as f64 / 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for relay ring-buffer query-range churn"]
+    fn relay_ring_buffer_query_range_profile_fixture() {
+        let iterations = profile_iterations(200_000);
+        let now = Instant::now();
+        let request = RelayRangeRequest {
+            slot: 42,
+            start_index: 0,
+            end_index: 31,
+        };
+        let limits = RelayRangeLimits {
+            max_request_span: 64,
+            max_response_shreds: 32,
+            max_response_bytes: usize::MAX,
+        };
+        let mut baseline = RecentShredRingBuffer::new(128, Duration::from_secs(60));
+        let mut optimized = RecentShredRingBuffer::new(128, Duration::from_secs(60));
+
+        for index in 0_u32..32_u32 {
+            let packet = build_data_shred_packet(42, index, index, 0, b"payload");
+            let parsed = parse_shred_header(&packet).expect("valid");
+            let seen_at = now + Duration::from_nanos(u64::from(index));
+            let _ = baseline.insert(&packet, &parsed, seen_at);
+            let _ = optimized.insert(&packet, &parsed, seen_at);
+        }
+
+        let baseline_started = Instant::now();
+        for _ in 0..iterations {
+            let result =
+                query_range_baseline(&mut baseline, request, limits, now).expect("baseline query");
+            black_box(result);
+        }
+        let baseline_elapsed = baseline_started.elapsed();
+
+        let optimized_started = Instant::now();
+        for _ in 0..iterations {
+            let result = optimized
+                .query_range(request, limits, now)
+                .expect("optimized query");
+            black_box(result);
+        }
+        let optimized_elapsed = optimized_started.elapsed();
+        let baseline_avg_ns = avg_ns_per_iteration(baseline_elapsed, iterations);
+        let optimized_avg_ns = avg_ns_per_iteration(optimized_elapsed, iterations);
+
+        eprintln!(
+            "relay_ring_buffer_query_range_profile_fixture iterations={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.3} optimized_avg_us_per_iteration={:.3}",
             iterations,
             baseline_elapsed.as_micros(),
             optimized_elapsed.as_micros(),
@@ -1025,6 +1090,74 @@ mod tests {
             baseline_avg_ns as f64 / 1_000.0,
             optimized_avg_ns as f64 / 1_000.0,
         );
+    }
+
+    fn query_range_baseline(
+        cache: &mut RecentShredRingBuffer,
+        request: RelayRangeRequest,
+        limits: RelayRangeLimits,
+        now: Instant,
+    ) -> Result<Vec<Arc<[u8]>>, RelayRangeQueryError> {
+        let mut evicted = 0usize;
+        cache.evict(now, &mut evicted);
+
+        if request.start_index > request.end_index {
+            return Err(RelayRangeQueryError::InvalidRange {
+                start_index: request.start_index,
+                end_index: request.end_index,
+            });
+        }
+
+        let span = request
+            .end_index
+            .saturating_sub(request.start_index)
+            .saturating_add(1);
+        if span > limits.max_request_span {
+            return Err(RelayRangeQueryError::SpanTooLarge {
+                span,
+                max_request_span: limits.max_request_span,
+            });
+        }
+
+        let mut latest_by_index: HashMap<u32, (Instant, Arc<[u8]>)> = HashMap::new();
+        for (key, entry) in cache.entries.iter().filter(|(key, _)| {
+            key.slot == request.slot
+                && key.index >= request.start_index
+                && key.index <= request.end_index
+        }) {
+            let candidate = (entry.seen_at, entry.bytes.clone());
+            match latest_by_index.entry(key.index) {
+                Entry::Occupied(mut current) => {
+                    if candidate.0 > current.get().0 {
+                        current.insert(candidate);
+                    }
+                }
+                Entry::Vacant(vacant) => {
+                    vacant.insert(candidate);
+                }
+            }
+        }
+        let mut matches: Vec<(u32, Arc<[u8]>)> = latest_by_index
+            .into_iter()
+            .map(|(index, (_, bytes))| (index, bytes))
+            .collect();
+        matches.sort_unstable_by_key(|(index, _)| *index);
+
+        let mut response: Vec<Arc<[u8]>> = Vec::new();
+        let mut response_bytes = 0usize;
+        for (_, bytes) in matches {
+            if response.len() >= limits.max_response_shreds {
+                break;
+            }
+            let next_bytes = response_bytes.saturating_add(bytes.len());
+            if next_bytes > limits.max_response_bytes {
+                break;
+            }
+            response_bytes = next_bytes;
+            response.push(bytes);
+        }
+
+        Ok(response)
     }
 
     fn profile_iterations(default: usize) -> usize {
