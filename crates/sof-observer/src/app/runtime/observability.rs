@@ -9,7 +9,7 @@ use std::{
 };
 
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::oneshot,
     task::JoinHandle,
@@ -35,6 +35,7 @@ const HEALTH_PATH: &str = "/healthz";
 const READY_PATH: &str = "/readyz";
 const REQUEST_BUFFER_BYTES: usize = 8 * 1024;
 const REQUEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const RESPONSE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const CONTENT_TYPE_TEXT: &str = "text/plain; charset=utf-8";
 const CONTENT_TYPE_PROMETHEUS: &str = "text/plain; version=0.0.4; charset=utf-8";
 
@@ -269,8 +270,7 @@ async fn handle_connection(
         Some(_) => HttpResponse::not_found(),
         None => HttpResponse::bad_request(),
     };
-    stream.write_all(response.serialize().as_bytes()).await?;
-    stream.shutdown().await
+    write_response_with_timeout(&mut stream, &response, RESPONSE_WRITE_TIMEOUT).await
 }
 
 async fn read_request_path(stream: &mut TcpStream) -> io::Result<Option<&'static str>> {
@@ -311,6 +311,27 @@ async fn read_request_path_with_timeout(
         READY_PATH => Some(READY_PATH),
         _ => Some(""),
     })
+}
+
+async fn write_response_with_timeout<W>(
+    stream: &mut W,
+    response: &HttpResponse,
+    write_timeout: std::time::Duration,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let response = response.serialize();
+    timeout(write_timeout, stream.write_all(response.as_bytes()))
+        .await
+        .map_err(|_elapsed| {
+            io::Error::new(io::ErrorKind::TimedOut, "response write timed out")
+        })??;
+    timeout(write_timeout, stream.shutdown())
+        .await
+        .map_err(|_elapsed| {
+            io::Error::new(io::ErrorKind::TimedOut, "response shutdown timed out")
+        })?
 }
 
 fn render_metrics(
@@ -2727,7 +2748,7 @@ impl HttpResponse {
 mod tests {
     use super::*;
     use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
+        io::{AsyncReadExt, AsyncWriteExt, duplex},
         net::TcpStream,
     };
 
@@ -3034,5 +3055,24 @@ mod tests {
         drop(client);
 
         assert!(server.await.is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_response_with_timeout_times_out_slow_clients() {
+        let (mut writer, _reader) = duplex(64);
+        let response = HttpResponse::ok(CONTENT_TYPE_TEXT, "x".repeat(1024));
+
+        let result = write_response_with_timeout(
+            &mut writer,
+            &response,
+            std::time::Duration::from_millis(25),
+        )
+        .await;
+        assert!(result.is_err(), "slow client should time out");
+        let error = match result {
+            Ok(()) => panic!("expected timeout"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 }
