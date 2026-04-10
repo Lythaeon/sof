@@ -2088,8 +2088,9 @@ fn convert_message(
 )]
 mod tests {
     use super::*;
-    use crate::event::TxKind;
-    use crate::provider_stream::create_provider_stream_queue;
+    use crate::{
+        event::TxKind, framework::signature_bytes, provider_stream::create_provider_stream_queue,
+    };
     use futures_channel::mpsc as futures_mpsc;
     use futures_util::stream::{self, Stream};
     use solana_instruction::Instruction;
@@ -2900,7 +2901,7 @@ mod tests {
         let transaction =
             transaction.ok_or(YellowstoneGrpcError::Convert("missing transaction payload"))?;
         let signature = Signature::try_from(transaction.signature.as_slice())
-            .map(crate::framework::signature_bytes)
+            .map(signature_bytes)
             .map(Some)
             .map_err(|_error| YellowstoneGrpcError::Convert("invalid signature"))?;
         let tx = {
@@ -3048,7 +3049,7 @@ mod tests {
 
     #[tokio::test]
     async fn yellowstone_spawn_rejects_transaction_filters_for_accounts_stream() {
-        let (tx, _rx) = crate::provider_stream::create_provider_stream_queue(1);
+        let (tx, _rx) = create_provider_stream_queue(1);
         let config = YellowstoneGrpcConfig::new("http://127.0.0.1:1")
             .with_stream(YellowstoneGrpcStream::Accounts)
             .with_vote(true);

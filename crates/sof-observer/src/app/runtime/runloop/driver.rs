@@ -5141,7 +5141,11 @@ mod tests {
     use solana_perf::test_tx::{new_test_vote_tx, test_tx};
     use solana_pubkey::Pubkey;
     use solana_transaction::versioned::VersionedTransaction;
-    use std::sync::{Arc, Mutex};
+    use std::{
+        env,
+        sync::{Arc, Mutex},
+        thread,
+    };
     use wincode::{
         Serialize as _,
         containers::{Elem, Vec as WincodeVec},
@@ -5290,12 +5294,12 @@ mod tests {
     #[test]
     #[ignore = "profiling fixture for perf"]
     fn inline_open_dataset_profile_fixture() {
-        let iterations = std::env::var("SOF_INLINE_OPEN_DATASET_PROFILE_ITERS")
+        let iterations = env::var("SOF_INLINE_OPEN_DATASET_PROFILE_ITERS")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(2_048);
-        let fragment_count = std::env::var("SOF_INLINE_OPEN_DATASET_PROFILE_FRAGMENTS")
+        let fragment_count = env::var("SOF_INLINE_OPEN_DATASET_PROFILE_FRAGMENTS")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
             .filter(|value| *value > 0)
@@ -5435,7 +5439,7 @@ mod tests {
             }
         }
 
-        std::thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(100));
         assert!(dispatched_total > 0);
         println!(
             "inline_open_dataset_profile_fixture iterations={} fragments={} dispatched={} elapsed_ms={}",
@@ -5449,14 +5453,14 @@ mod tests {
     #[test]
     #[ignore = "profiling fixture for inline prefilter decode skip A/B"]
     fn inline_open_dataset_prefilter_profile_fixture() {
-        let mode = std::env::var("SOF_INLINE_PREFILTER_PROFILE_MODE")
-            .unwrap_or_else(|_| "manual".to_owned());
-        let iterations = std::env::var("SOF_INLINE_PREFILTER_PROFILE_ITERS")
+        let mode =
+            env::var("SOF_INLINE_PREFILTER_PROFILE_MODE").unwrap_or_else(|_| "manual".to_owned());
+        let iterations = env::var("SOF_INLINE_PREFILTER_PROFILE_ITERS")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(2_048);
-        let fragment_count = std::env::var("SOF_INLINE_PREFILTER_PROFILE_FRAGMENTS")
+        let fragment_count = env::var("SOF_INLINE_PREFILTER_PROFILE_FRAGMENTS")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
             .filter(|value| *value > 0)
