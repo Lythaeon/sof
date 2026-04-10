@@ -222,7 +222,9 @@ impl TransactionPrefilter {
         {
             return TransactionInterest::Ignore;
         }
-        if transaction_matches_any_keys(event.tx, &self.account_exclude) {
+        if !matches!(self.account_exclude, CompiledAccountMatcher::Empty)
+            && transaction_matches_any_keys(event.tx, &self.account_exclude)
+        {
             return TransactionInterest::Ignore;
         }
         if !transaction_matches_all_keys(event.tx, &self.account_required) {
@@ -247,7 +249,9 @@ impl TransactionPrefilter {
         {
             return TransactionInterest::Ignore;
         }
-        if transaction_view_matches_any_keys(view, &self.account_exclude) {
+        if !matches!(self.account_exclude, CompiledAccountMatcher::Empty)
+            && transaction_view_matches_any_keys(view, &self.account_exclude)
+        {
             return TransactionInterest::Ignore;
         }
         if !transaction_view_matches_all_keys(view, &self.account_required) {

@@ -2194,13 +2194,22 @@ fn convert_transaction(
     first_signature: Option<SignatureBytes>,
 ) -> Result<VersionedTransaction, LaserStreamError> {
     let mut signatures = Vec::with_capacity(tx.signatures.len());
-    for (index, signature) in tx.signatures.into_iter().enumerate() {
-        if index == 0
-            && let Some(first_signature) = first_signature
-        {
-            signatures.push(first_signature.into());
-            continue;
-        }
+    let mut tx_signatures = tx.signatures.into_iter();
+    if let Some(signature) = tx_signatures.next() {
+        signatures.push(
+            first_signature
+                .map_or_else(
+                    || {
+                        signature_bytes_from_slice(signature.as_slice(), || {
+                            LaserStreamError::Convert("failed to parse transaction signature")
+                        })
+                    },
+                    Ok,
+                )?
+                .into(),
+        );
+    }
+    for signature in tx_signatures {
         signatures.push(
             signature_bytes_from_slice(signature.as_slice(), || {
                 LaserStreamError::Convert("failed to parse transaction signature")

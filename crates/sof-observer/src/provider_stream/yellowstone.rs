@@ -2002,7 +2002,7 @@ impl ProviderStreamFanIn {
     }
 }
 
-#[inline]
+#[inline(always)]
 fn convert_transaction(
     tx: yellowstone_grpc_proto::prelude::Transaction,
     first_signature: Option<SignatureBytes>,
@@ -2032,7 +2032,7 @@ fn convert_transaction(
     })
 }
 
-#[inline]
+#[inline(always)]
 fn convert_message(
     message: yellowstone_grpc_proto::prelude::Message,
 ) -> Result<VersionedMessage, YellowstoneGrpcError> {
