@@ -6,8 +6,12 @@
 //! built-in adapter exposes transaction, transaction-status, account-update,
 //! block-meta, and slot feeds through the same typed provider-stream surface.
 
+#[cfg(test)]
+use std::hint::black_box;
 use std::{
     collections::HashMap,
+    fmt,
+    pin::Pin,
     str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
@@ -23,7 +27,10 @@ use laserstream_core_proto::prelude::Transaction as LaserStreamTransaction;
 use laserstream_core_proto::tonic::{
     Status, codec::CompressionEncoding, metadata::MetadataValue, transport::Endpoint,
 };
-use sof_types::{PubkeyBytes, SignatureBytes};
+use sof_support::bytes::{pubkey_bytes_from_slice, signature_bytes_from_slice};
+use sof_support::collections_support::prune_recent_slots;
+use sof_support::time_support::{duration_secs_ceil, nonzero_duration_or};
+use sof_types::SignatureBytes;
 use solana_hash::Hash;
 use solana_message::{
     Message, MessageHeader, VersionedMessage,
@@ -32,6 +39,7 @@ use solana_message::{
 };
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
+use solana_system_interface::MAX_PERMITTED_DATA_LENGTH;
 use solana_transaction::versioned::VersionedTransaction;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -57,6 +65,20 @@ use crate::{
 const INTERNAL_WATERMARK_SLOT_FILTER: &str = "__sof_watermark_slots";
 const LASERSTREAM_SDK_NAME: &str = "sof";
 const LASERSTREAM_SDK_VERSION: &str = env!("CARGO_PKG_VERSION");
+const MAX_ACCOUNT_DATA_LEN: usize = MAX_PERMITTED_DATA_LENGTH as usize;
+const SLOT_STATUS_RETAINED_LAG: u64 = 4_096;
+const SLOT_STATUS_PRUNE_THRESHOLD: usize = SLOT_STATUS_RETAINED_LAG as usize * 2;
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL_SECS: u64 = 30;
+const DEFAULT_KEEP_ALIVE_TIMEOUT_SECS: u64 = 5;
+const DEFAULT_INITIAL_STREAM_WINDOW_SIZE: u32 = 1024 * 1024 * 4;
+const DEFAULT_INITIAL_CONNECTION_WINDOW_SIZE: u32 = 1024 * 1024 * 8;
+const DEFAULT_BUFFER_SIZE: usize = 1024 * 64;
+const DEFAULT_MAX_DECODING_MESSAGE_SIZE: usize = 1_000_000_000;
+const DEFAULT_MAX_ENCODING_MESSAGE_SIZE: usize = 32_000_000;
+const MIN_PROVIDER_STALL_TIMEOUT: Duration = Duration::from_millis(1);
+const MIN_RECONNECT_DELAY: Duration = Duration::from_millis(1);
 
 /// LaserStream subscription commitment used for provider-stream transaction updates.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -143,8 +165,8 @@ pub enum LaserStreamConfigOption {
     RequireTransactionSignature,
 }
 
-impl std::fmt::Display for LaserStreamConfigOption {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for LaserStreamConfigOption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::VoteFilter => f.write_str("vote filter"),
             Self::FailedFilter => f.write_str("failed filter"),
@@ -471,6 +493,10 @@ impl LaserStreamConfig {
         self
     }
 
+    const fn reconnect_delay_effective(&self) -> Duration {
+        effective_reconnect_delay(self.reconnect_delay)
+    }
+
     /// Sets provider replay behavior.
     #[must_use]
     pub const fn with_replay_mode(mut self, mode: ProviderReplayMode) -> Self {
@@ -519,47 +545,20 @@ impl LaserStreamConfig {
     }
 
     fn client_config(&self) -> ClientConfig {
-        let mut options = ChannelOptions::default();
-        if let Some(timeout) = self.connect_timeout {
-            options.connect_timeout_secs = Some(timeout.as_secs());
-        }
-        if let Some(timeout) = self.timeout {
-            options.timeout_secs = Some(timeout.as_secs());
-        }
-        if let Some(bytes) = self.max_decoding_message_size {
-            options.max_decoding_message_size = Some(bytes);
-        }
-        if let Some(bytes) = self.max_encoding_message_size {
-            options.max_encoding_message_size = Some(bytes);
-        }
-
-        let mut config = ClientConfig::new(self.endpoint.clone(), self.api_key.clone())
-            .with_channel_options(options)
-            .with_replay(!matches!(self.replay_mode, ProviderReplayMode::Live));
-        if let Some(attempts) = self.max_reconnect_attempts {
-            config = config.with_max_reconnect_attempts(attempts);
-        }
-        config
+        laserstream_client_config(&LaserStreamClientConfigInputs {
+            endpoint: &self.endpoint,
+            api_key: &self.api_key,
+            connect_timeout: self.connect_timeout,
+            request_timeout: self.timeout,
+            max_decoding_message_size: self.max_decoding_message_size,
+            max_encoding_message_size: self.max_encoding_message_size,
+            replay_mode: self.replay_mode,
+            max_reconnect_attempts: self.max_reconnect_attempts,
+        })
     }
 
     const fn replay_from_slot(&self, tracked_slot: u64) -> Option<u64> {
-        match self.replay_mode {
-            ProviderReplayMode::Live => None,
-            ProviderReplayMode::Resume => {
-                if tracked_slot == 0 {
-                    None
-                } else {
-                    Some(tracked_slot)
-                }
-            }
-            ProviderReplayMode::FromSlot(slot) => {
-                if tracked_slot == 0 {
-                    Some(slot)
-                } else {
-                    Some(tracked_slot)
-                }
-            }
-        }
+        laserstream_replay_from_slot(self.replay_mode, tracked_slot)
     }
 
     fn transaction_filter(&self) -> grpc::SubscribeRequestFilterTransactions {
@@ -646,6 +645,70 @@ impl LaserStreamConfig {
             LaserStreamStream::TransactionStatus => LaserStreamStreamKind::TransactionStatus,
             LaserStreamStream::Accounts => LaserStreamStreamKind::Accounts,
             LaserStreamStream::BlockMeta => LaserStreamStreamKind::BlockMeta,
+        }
+    }
+}
+
+struct LaserStreamClientConfigInputs<'config> {
+    endpoint: &'config str,
+    api_key: &'config str,
+    connect_timeout: Option<Duration>,
+    request_timeout: Option<Duration>,
+    max_decoding_message_size: Option<usize>,
+    max_encoding_message_size: Option<usize>,
+    replay_mode: ProviderReplayMode,
+    max_reconnect_attempts: Option<u32>,
+}
+
+fn laserstream_client_config(inputs: &LaserStreamClientConfigInputs<'_>) -> ClientConfig {
+    let mut options = ChannelOptions::default();
+    if let Some(connect_timeout) = inputs.connect_timeout {
+        options.connect_timeout_secs = Some(duration_secs_ceil(nonzero_duration_or(
+            connect_timeout,
+            Duration::from_millis(1),
+        )));
+    }
+    if let Some(request_timeout) = inputs.request_timeout {
+        options.timeout_secs = Some(duration_secs_ceil(nonzero_duration_or(
+            request_timeout,
+            Duration::from_millis(1),
+        )));
+    }
+    if let Some(bytes) = inputs.max_decoding_message_size {
+        options.max_decoding_message_size = Some(bytes);
+    }
+    if let Some(bytes) = inputs.max_encoding_message_size {
+        options.max_encoding_message_size = Some(bytes);
+    }
+
+    let mut config = ClientConfig::new(inputs.endpoint.to_owned(), inputs.api_key.to_owned())
+        .with_channel_options(options)
+        .with_replay(!matches!(inputs.replay_mode, ProviderReplayMode::Live));
+    if let Some(attempts) = inputs.max_reconnect_attempts {
+        config = config.with_max_reconnect_attempts(attempts);
+    }
+    config
+}
+
+const fn laserstream_replay_from_slot(
+    replay_mode: ProviderReplayMode,
+    tracked_slot: u64,
+) -> Option<u64> {
+    match replay_mode {
+        ProviderReplayMode::Live => None,
+        ProviderReplayMode::Resume => {
+            if tracked_slot == 0 {
+                None
+            } else {
+                Some(tracked_slot)
+            }
+        }
+        ProviderReplayMode::FromSlot(slot) => {
+            if tracked_slot == 0 {
+                Some(slot)
+            } else {
+                Some(tracked_slot)
+            }
         }
     }
 }
@@ -843,6 +906,10 @@ impl LaserStreamSlotsConfig {
         self
     }
 
+    const fn reconnect_delay_effective(&self) -> Duration {
+        effective_reconnect_delay(self.reconnect_delay)
+    }
+
     /// Sets provider replay behavior.
     #[must_use]
     pub const fn with_replay_mode(mut self, mode: ProviderReplayMode) -> Self {
@@ -866,47 +933,28 @@ impl LaserStreamSlotsConfig {
     }
 
     fn client_config(&self) -> ClientConfig {
-        let mut options = ChannelOptions::default();
-        if let Some(timeout) = self.connect_timeout {
-            options.connect_timeout_secs = Some(timeout.as_secs());
-        }
-        if let Some(timeout) = self.timeout {
-            options.timeout_secs = Some(timeout.as_secs());
-        }
-        if let Some(bytes) = self.max_decoding_message_size {
-            options.max_decoding_message_size = Some(bytes);
-        }
-        if let Some(bytes) = self.max_encoding_message_size {
-            options.max_encoding_message_size = Some(bytes);
-        }
-
-        let mut config = ClientConfig::new(self.endpoint.clone(), self.api_key.clone())
-            .with_channel_options(options)
-            .with_replay(!matches!(self.replay_mode, ProviderReplayMode::Live));
-        if let Some(attempts) = self.max_reconnect_attempts {
-            config = config.with_max_reconnect_attempts(attempts);
-        }
-        config
+        laserstream_client_config(&LaserStreamClientConfigInputs {
+            endpoint: &self.endpoint,
+            api_key: &self.api_key,
+            connect_timeout: self.connect_timeout,
+            request_timeout: self.timeout,
+            max_decoding_message_size: self.max_decoding_message_size,
+            max_encoding_message_size: self.max_encoding_message_size,
+            replay_mode: self.replay_mode,
+            max_reconnect_attempts: self.max_reconnect_attempts,
+        })
     }
 
     const fn replay_from_slot(&self, tracked_slot: u64) -> Option<u64> {
-        match self.replay_mode {
-            ProviderReplayMode::Live => None,
-            ProviderReplayMode::Resume => {
-                if tracked_slot == 0 {
-                    None
-                } else {
-                    Some(tracked_slot)
-                }
-            }
-            ProviderReplayMode::FromSlot(slot) => {
-                if tracked_slot == 0 {
-                    Some(slot)
-                } else {
-                    Some(tracked_slot)
-                }
-            }
-        }
+        laserstream_replay_from_slot(self.replay_mode, tracked_slot)
+    }
+}
+
+const fn effective_reconnect_delay(delay: Duration) -> Duration {
+    if delay.is_zero() {
+        MIN_RECONNECT_DELAY
+    } else {
+        delay
     }
 }
 
@@ -991,8 +1039,8 @@ pub enum LaserStreamStreamKind {
     Slots,
 }
 
-impl std::fmt::Display for LaserStreamStreamKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for LaserStreamStreamKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Transaction => f.write_str("transaction"),
             Self::TransactionStatus => f.write_str("transaction-status"),
@@ -1003,10 +1051,10 @@ impl std::fmt::Display for LaserStreamStreamKind {
     }
 }
 
-type LaserStreamSubscribeSink = std::pin::Pin<
+type LaserStreamSubscribeSink = Pin<
     Box<dyn futures_util::Sink<grpc::SubscribeRequest, Error = futures_mpsc::SendError> + Send>,
 >;
-type LaserStreamUpdateStream = std::pin::Pin<
+type LaserStreamUpdateStream = Pin<
     Box<
         dyn futures_util::Stream<
                 Item = Result<grpc::SubscribeUpdate, yellowstone_grpc_proto::tonic::Status>,
@@ -1227,7 +1275,7 @@ async fn spawn_laserstream_source_inner(
                 .await?;
                 return Err(LaserStreamProtocolError::ReconnectBudgetExhausted { attempts }.into());
             }
-            tokio::time::sleep(config.reconnect_delay).await;
+            tokio::time::sleep(config.reconnect_delay_effective()).await;
         }
     }))
 }
@@ -1291,7 +1339,7 @@ async fn spawn_laserstream_slot_source_inner(
         let mut attempts = 0_u32;
         let mut tracked_slot = 0_u64;
         let mut watermarks = ProviderCommitmentWatermarks::default();
-        let mut slot_states = HashMap::new();
+        let mut slot_states = HashMap::with_capacity(SLOT_STATUS_PRUNE_THRESHOLD);
         let mut first_session = Some(first_session);
         loop {
             let mut session_established = false;
@@ -1397,7 +1445,7 @@ async fn spawn_laserstream_slot_source_inner(
                 .await?;
                 return Err(LaserStreamProtocolError::ReconnectBudgetExhausted { attempts }.into());
             }
-            tokio::time::sleep(config.reconnect_delay).await;
+            tokio::time::sleep(config.reconnect_delay_effective()).await;
         }
     }))
 }
@@ -1412,6 +1460,7 @@ async fn run_laserstream_primary_connection(
 ) -> Result<(), LaserStreamError> {
     *state.session_established = false;
     let commitment = config.commitment.as_tx_commitment();
+    let provider_source = Arc::new(source.clone());
     *state.session_established = true;
     send_primary_provider_health(
         source,
@@ -1426,7 +1475,10 @@ async fn run_laserstream_primary_connection(
     loop {
         tokio::select! {
             () = async {
-                if let Some(timeout) = config.stall_timeout {
+                if let Some(timeout) = config
+                    .stall_timeout
+                    .map(|timeout| nonzero_duration_or(timeout, MIN_PROVIDER_STALL_TIMEOUT))
+                {
                     let deadline = last_progress.checked_add(timeout).unwrap_or(last_progress);
                     tokio::time::sleep_until(deadline.into()).await;
                 } else {
@@ -1480,7 +1532,7 @@ async fn run_laserstream_primary_connection(
                         sender
                             .send(
                                 ProviderStreamUpdate::Transaction(event)
-                                    .with_provider_source(source.clone()),
+                                    .with_provider_source_ref(&provider_source),
                             )
                             .await
                             .map_err(|_error| LaserStreamError::QueueClosed)?;
@@ -1500,7 +1552,7 @@ async fn run_laserstream_primary_connection(
                         sender
                             .send(
                                 ProviderStreamUpdate::TransactionStatus(event)
-                                    .with_provider_source(source.clone()),
+                                    .with_provider_source_ref(&provider_source),
                             )
                             .await
                             .map_err(|_error| LaserStreamError::QueueClosed)?;
@@ -1522,7 +1574,7 @@ async fn run_laserstream_primary_connection(
                         sender
                             .send(
                                 ProviderStreamUpdate::AccountUpdate(event)
-                                    .with_provider_source(source.clone()),
+                                    .with_provider_source_ref(&provider_source),
                             )
                             .await
                             .map_err(|_error| LaserStreamError::QueueClosed)?;
@@ -1544,7 +1596,7 @@ async fn run_laserstream_primary_connection(
                         sender
                             .send(
                                 ProviderStreamUpdate::BlockMeta(event)
-                                    .with_provider_source(source.clone()),
+                                    .with_provider_source_ref(&provider_source),
                             )
                             .await
                             .map_err(|_error| LaserStreamError::QueueClosed)?;
@@ -1565,6 +1617,7 @@ async fn run_laserstream_slot_connection(
     mut stream: LaserStreamUpdateStream,
 ) -> Result<(), LaserStreamError> {
     *state.session_established = false;
+    let provider_source = Arc::new(source.clone());
     *state.session_established = true;
     send_provider_slot_health(
         source,
@@ -1579,7 +1632,10 @@ async fn run_laserstream_slot_connection(
     loop {
         tokio::select! {
             () = async {
-                if let Some(timeout) = config.stall_timeout {
+                if let Some(timeout) = config
+                    .stall_timeout
+                    .map(|timeout| nonzero_duration_or(timeout, MIN_PROVIDER_STALL_TIMEOUT))
+                {
                     let deadline = last_progress.checked_add(timeout).unwrap_or(last_progress);
                     tokio::time::sleep_until(deadline.into()).await;
                 } else {
@@ -1607,7 +1663,7 @@ async fn run_laserstream_slot_connection(
                         sender
                             .send(
                                 ProviderStreamUpdate::SlotStatus(event)
-                                    .with_provider_source(source.clone()),
+                                    .with_provider_source_ref(&provider_source),
                             )
                             .await
                             .map_err(|_error| LaserStreamError::QueueClosed)?;
@@ -1772,6 +1828,55 @@ impl Interceptor for SofLaserStreamInterceptor {
     }
 }
 
+fn laserstream_endpoint(
+    endpoint: &str,
+    options: &ChannelOptions,
+) -> Result<Endpoint, LaserStreamError> {
+    let mut transport = Endpoint::from_shared(endpoint.to_owned())
+        .map_err(|error| LaserStreamProtocolError::InvalidEndpoint(error.to_string()))?
+        .connect_timeout(Duration::from_secs(
+            options
+                .connect_timeout_secs
+                .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
+        ))
+        .timeout(Duration::from_secs(
+            options.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
+        ))
+        .http2_keep_alive_interval(Duration::from_secs(
+            options
+                .http2_keep_alive_interval_secs
+                .unwrap_or(DEFAULT_HTTP2_KEEP_ALIVE_INTERVAL_SECS),
+        ))
+        .keep_alive_timeout(Duration::from_secs(
+            options
+                .keep_alive_timeout_secs
+                .unwrap_or(DEFAULT_KEEP_ALIVE_TIMEOUT_SECS),
+        ))
+        .keep_alive_while_idle(options.keep_alive_while_idle.unwrap_or(true))
+        .initial_stream_window_size(
+            options
+                .initial_stream_window_size
+                .or(Some(DEFAULT_INITIAL_STREAM_WINDOW_SIZE)),
+        )
+        .initial_connection_window_size(
+            options
+                .initial_connection_window_size
+                .or(Some(DEFAULT_INITIAL_CONNECTION_WINDOW_SIZE)),
+        )
+        .http2_adaptive_window(options.http2_adaptive_window.unwrap_or(true))
+        .tcp_nodelay(options.tcp_nodelay.unwrap_or(true))
+        .buffer_size(options.buffer_size.or(Some(DEFAULT_BUFFER_SIZE)));
+    if let Some(tcp_keepalive_secs) = options.tcp_keepalive_secs {
+        transport = transport.tcp_keepalive(Some(Duration::from_secs(tcp_keepalive_secs)));
+    }
+    if endpoint_uses_tls(endpoint) {
+        transport = transport
+            .tls_config(ClientTlsConfig::new().with_enabled_roots())
+            .map_err(|error| LaserStreamProtocolError::TlsConfig(error.to_string()))?;
+    }
+    Ok(transport)
+}
+
 async fn connect_and_subscribe_once(
     config: &LaserStreamConfig,
     request: grpc::SubscribeRequest,
@@ -1779,47 +1884,23 @@ async fn connect_and_subscribe_once(
     let options = config.client_config().channel_options;
     let interceptor = SofLaserStreamInterceptor::new(&config.api_key)
         .map_err(|error| LaserStreamProtocolError::InvalidApiKey(error.to_string()))?;
-
-    let mut endpoint = Endpoint::from_shared(config.endpoint.clone())
-        .map_err(|error| LaserStreamProtocolError::InvalidEndpoint(error.to_string()))?
-        .connect_timeout(Duration::from_secs(
-            options.connect_timeout_secs.unwrap_or(10),
-        ))
-        .timeout(Duration::from_secs(options.timeout_secs.unwrap_or(30)))
-        .http2_keep_alive_interval(Duration::from_secs(
-            options.http2_keep_alive_interval_secs.unwrap_or(30),
-        ))
-        .keep_alive_timeout(Duration::from_secs(
-            options.keep_alive_timeout_secs.unwrap_or(5),
-        ))
-        .keep_alive_while_idle(options.keep_alive_while_idle.unwrap_or(true))
-        .initial_stream_window_size(options.initial_stream_window_size.or(Some(1024 * 1024 * 4)))
-        .initial_connection_window_size(
-            options
-                .initial_connection_window_size
-                .or(Some(1024 * 1024 * 8)),
-        )
-        .http2_adaptive_window(options.http2_adaptive_window.unwrap_or(true))
-        .tcp_nodelay(options.tcp_nodelay.unwrap_or(true))
-        .buffer_size(options.buffer_size.or(Some(1024 * 64)));
-    if let Some(tcp_keepalive_secs) = options.tcp_keepalive_secs {
-        endpoint = endpoint.tcp_keepalive(Some(Duration::from_secs(tcp_keepalive_secs)));
-    }
-    if endpoint_uses_tls(&config.endpoint) {
-        endpoint = endpoint
-            .tls_config(ClientTlsConfig::new().with_enabled_roots())
-            .map_err(|error| LaserStreamProtocolError::TlsConfig(error.to_string()))?;
-    }
-
-    let channel = endpoint
+    let channel = laserstream_endpoint(&config.endpoint, &options)?
         .connect()
         .await
         .map_err(|error| LaserStreamProtocolError::ConnectionFailed(error.to_string()))?;
     let mut geyser_client =
         grpc::geyser_client::GeyserClient::with_interceptor(channel, interceptor);
     geyser_client = geyser_client
-        .max_decoding_message_size(options.max_decoding_message_size.unwrap_or(1_000_000_000))
-        .max_encoding_message_size(options.max_encoding_message_size.unwrap_or(32_000_000));
+        .max_decoding_message_size(
+            options
+                .max_decoding_message_size
+                .unwrap_or(DEFAULT_MAX_DECODING_MESSAGE_SIZE),
+        )
+        .max_encoding_message_size(
+            options
+                .max_encoding_message_size
+                .unwrap_or(DEFAULT_MAX_ENCODING_MESSAGE_SIZE),
+        );
     if let Some(send_comp) = options.send_compression {
         let encoding = match send_comp {
             helius_laserstream::CompressionEncoding::Gzip => CompressionEncoding::Gzip,
@@ -1857,47 +1938,23 @@ async fn connect_and_subscribe_slots_once(
     let options = config.client_config().channel_options;
     let interceptor = SofLaserStreamInterceptor::new(&config.api_key)
         .map_err(|error| LaserStreamProtocolError::InvalidApiKey(error.to_string()))?;
-
-    let mut endpoint = Endpoint::from_shared(config.endpoint.clone())
-        .map_err(|error| LaserStreamProtocolError::InvalidEndpoint(error.to_string()))?
-        .connect_timeout(Duration::from_secs(
-            options.connect_timeout_secs.unwrap_or(10),
-        ))
-        .timeout(Duration::from_secs(options.timeout_secs.unwrap_or(30)))
-        .http2_keep_alive_interval(Duration::from_secs(
-            options.http2_keep_alive_interval_secs.unwrap_or(30),
-        ))
-        .keep_alive_timeout(Duration::from_secs(
-            options.keep_alive_timeout_secs.unwrap_or(5),
-        ))
-        .keep_alive_while_idle(options.keep_alive_while_idle.unwrap_or(true))
-        .initial_stream_window_size(options.initial_stream_window_size.or(Some(1024 * 1024 * 4)))
-        .initial_connection_window_size(
-            options
-                .initial_connection_window_size
-                .or(Some(1024 * 1024 * 8)),
-        )
-        .http2_adaptive_window(options.http2_adaptive_window.unwrap_or(true))
-        .tcp_nodelay(options.tcp_nodelay.unwrap_or(true))
-        .buffer_size(options.buffer_size.or(Some(1024 * 64)));
-    if let Some(tcp_keepalive_secs) = options.tcp_keepalive_secs {
-        endpoint = endpoint.tcp_keepalive(Some(Duration::from_secs(tcp_keepalive_secs)));
-    }
-    if endpoint_uses_tls(&config.endpoint) {
-        endpoint = endpoint
-            .tls_config(ClientTlsConfig::new().with_enabled_roots())
-            .map_err(|error| LaserStreamProtocolError::TlsConfig(error.to_string()))?;
-    }
-
-    let channel = endpoint
+    let channel = laserstream_endpoint(&config.endpoint, &options)?
         .connect()
         .await
         .map_err(|error| LaserStreamProtocolError::ConnectionFailed(error.to_string()))?;
     let mut geyser_client =
         grpc::geyser_client::GeyserClient::with_interceptor(channel, interceptor);
     geyser_client = geyser_client
-        .max_decoding_message_size(options.max_decoding_message_size.unwrap_or(1_000_000_000))
-        .max_encoding_message_size(options.max_encoding_message_size.unwrap_or(32_000_000));
+        .max_decoding_message_size(
+            options
+                .max_decoding_message_size
+                .unwrap_or(DEFAULT_MAX_DECODING_MESSAGE_SIZE),
+        )
+        .max_encoding_message_size(
+            options
+                .max_encoding_message_size
+                .unwrap_or(DEFAULT_MAX_ENCODING_MESSAGE_SIZE),
+        );
     if let Some(send_comp) = options.send_compression {
         let encoding = match send_comp {
             helius_laserstream::CompressionEncoding::Gzip => CompressionEncoding::Gzip,
@@ -1937,21 +1994,21 @@ fn transaction_event_from_update(
     let transaction =
         transaction.ok_or(LaserStreamError::Convert("missing transaction payload"))?;
     let is_vote = transaction.is_vote;
-    let signature = Some(signature_bytes_from_slice(
-        transaction.signature.as_slice(),
-        "invalid signature",
-    )?);
+    let signature = signature_bytes_from_slice(transaction.signature.as_slice(), || {
+        LaserStreamError::Convert("invalid signature")
+    })?;
     let tx = convert_transaction(
         transaction
             .transaction
             .ok_or(LaserStreamError::Convert("missing versioned transaction"))?,
+        Some(signature),
     )?;
     Ok(TransactionEvent {
         slot,
         commitment_status,
         confirmed_slot: watermarks.confirmed_slot,
         finalized_slot: watermarks.finalized_slot,
-        signature,
+        signature: Some(signature),
         provider_source: None,
         kind: if is_vote {
             TxKind::VoteOnly
@@ -1967,10 +2024,9 @@ fn transaction_status_event_from_update(
     watermarks: ProviderCommitmentWatermarks,
     update: grpc::SubscribeUpdateTransactionStatus,
 ) -> Result<TransactionStatusEvent, LaserStreamError> {
-    let signature = signature_bytes_from_slice(
-        update.signature.as_slice(),
-        "invalid transaction-status signature",
-    )?;
+    let signature = signature_bytes_from_slice(update.signature.as_slice(), || {
+        LaserStreamError::Convert("invalid transaction-status signature")
+    })?;
     Ok(TransactionStatusEvent {
         slot: update.slot,
         commitment_status,
@@ -1992,15 +2048,23 @@ fn account_update_event_from_laserstream(
     let account = update
         .account
         .ok_or(LaserStreamError::Convert("missing account payload"))?;
-    let pubkey = pubkey_bytes_from_slice(account.pubkey.as_slice(), "invalid account pubkey")?;
-    let owner = pubkey_bytes_from_slice(account.owner.as_slice(), "invalid account owner")?;
+    let pubkey = pubkey_bytes_from_slice(account.pubkey.as_slice(), || {
+        LaserStreamError::Convert("invalid account pubkey")
+    })?;
+    let owner = pubkey_bytes_from_slice(account.owner.as_slice(), || {
+        LaserStreamError::Convert("invalid account owner")
+    })?;
     let txn_signature = match account.txn_signature {
-        Some(signature) => Some(signature_bytes_from_slice(
-            signature.as_slice(),
-            "invalid account txn signature",
-        )?),
+        Some(signature) => Some(signature_bytes_from_slice(signature.as_slice(), || {
+            LaserStreamError::Convert("invalid account txn signature")
+        })?),
         None => None,
     };
+    if account.data.len() > MAX_ACCOUNT_DATA_LEN {
+        return Err(LaserStreamError::Convert(
+            "account data exceeds max permitted size",
+        ));
+    }
     Ok(AccountUpdateEvent {
         slot: update.slot,
         commitment_status,
@@ -2045,26 +2109,6 @@ fn block_meta_event_from_update(
     })
 }
 
-fn signature_bytes_from_slice(
-    bytes: &[u8],
-    message: &'static str,
-) -> Result<SignatureBytes, LaserStreamError> {
-    let raw: [u8; 64] = bytes
-        .try_into()
-        .map_err(|_error: std::array::TryFromSliceError| LaserStreamError::Convert(message))?;
-    Ok(SignatureBytes::from(raw))
-}
-
-fn pubkey_bytes_from_slice(
-    bytes: &[u8],
-    message: &'static str,
-) -> Result<PubkeyBytes, LaserStreamError> {
-    let raw: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_error: std::array::TryFromSliceError| LaserStreamError::Convert(message))?;
-    Ok(PubkeyBytes::from(raw))
-}
-
 fn observe_non_transaction_commitment(
     watermarks: &mut ProviderCommitmentWatermarks,
     slot: u64,
@@ -2104,6 +2148,12 @@ fn slot_status_event_from_update(
         | grpc::SlotStatus::SlotCreatedBank => ForkSlotStatus::Processed,
     };
     let previous_status = slot_states.insert(slot, mapped);
+    prune_recent_slots(
+        slot_states,
+        slot,
+        SLOT_STATUS_RETAINED_LAG,
+        SLOT_STATUS_PRUNE_THRESHOLD,
+    );
     if previous_status == Some(mapped) {
         return None;
     }
@@ -2168,15 +2218,29 @@ impl ProviderStreamFanIn {
     }
 }
 
-#[inline]
+#[inline(always)]
 fn convert_transaction(
     tx: LaserStreamTransaction,
+    first_signature: Option<SignatureBytes>,
 ) -> Result<VersionedTransaction, LaserStreamError> {
     let mut signatures = Vec::with_capacity(tx.signatures.len());
-    for signature in tx.signatures {
-        signatures.push(Signature::try_from(signature.as_slice()).map_err(|_error| {
-            LaserStreamError::Convert("failed to parse transaction signature")
-        })?);
+    let mut tx_signatures = tx.signatures.into_iter();
+    if let Some(signature) = tx_signatures.next() {
+        signatures.push(match first_signature {
+            Some(first_signature) => first_signature.into(),
+            None => signature_bytes_from_slice(signature.as_slice(), || {
+                LaserStreamError::Convert("failed to parse transaction signature")
+            })?
+            .into(),
+        });
+    }
+    for signature in tx_signatures {
+        signatures.push(
+            signature_bytes_from_slice(signature.as_slice(), || {
+                LaserStreamError::Convert("failed to parse transaction signature")
+            })?
+            .into(),
+        );
     }
     let message = tx
         .message
@@ -2201,8 +2265,10 @@ fn convert_transaction(
     let mut account_keys = Vec::with_capacity(message.account_keys.len());
     for key in message.account_keys {
         account_keys.push(
-            Pubkey::try_from(key.as_slice())
-                .map_err(|_error| LaserStreamError::Convert("invalid account key"))?,
+            pubkey_bytes_from_slice(key.as_slice(), || {
+                LaserStreamError::Convert("invalid account key")
+            })?
+            .into(),
         );
     }
 
@@ -2221,9 +2287,10 @@ fn convert_transaction(
         let mut address_table_lookups = Vec::with_capacity(message.address_table_lookups.len());
         for lookup in message.address_table_lookups {
             address_table_lookups.push(MessageAddressTableLookup {
-                account_key: Pubkey::try_from(lookup.account_key.as_slice()).map_err(|_error| {
+                account_key: pubkey_bytes_from_slice(lookup.account_key.as_slice(), || {
                     LaserStreamError::Convert("invalid address table account key")
-                })?,
+                })?
+                .into(),
                 writable_indexes: lookup.writable_indexes,
                 readonly_indexes: lookup.readonly_indexes,
             });
@@ -2259,8 +2326,14 @@ fn convert_transaction(
 )]
 mod tests {
     use super::*;
-    use crate::provider_stream::create_provider_stream_queue;
-    use crate::provider_stream::yellowstone::{YellowstoneGrpcCommitment, YellowstoneGrpcConfig};
+    use crate::{
+        event::TxKind,
+        framework::signature_bytes,
+        provider_stream::{
+            create_provider_stream_queue,
+            yellowstone::{YellowstoneGrpcCommitment, YellowstoneGrpcConfig},
+        },
+    };
     use futures_channel::mpsc as futures_mpsc;
     use futures_util::stream::{self, Stream};
     use laserstream_core_proto::geyser::geyser_server::{Geyser, GeyserServer};
@@ -2282,16 +2355,70 @@ mod tests {
     use solana_message::{Message, VersionedMessage};
     use solana_sdk_ids::{compute_budget, system_program, vote};
     use solana_signer::Signer;
-    use std::{pin::Pin, time::Instant};
+    use std::{
+        net::{SocketAddr, TcpListener as StdTcpListener},
+        pin::Pin,
+        time::Instant,
+    };
+
+    use sof_support::bench::{avg_ns_per_iteration, profile_iterations};
     use tokio::sync::oneshot;
     use tokio::time::{Duration, timeout};
 
-    fn profile_iterations(default: usize) -> usize {
-        std::env::var("SOF_PROFILE_ITERATIONS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(default)
+    #[test]
+    fn laserstream_account_update_rejects_oversized_data() {
+        let pubkey = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let update = sample_account_update(92, pubkey, owner);
+        let account_update = match update.update_oneof {
+            Some(grpc::subscribe_update::UpdateOneof::Account(account_update)) => account_update,
+            other => panic!("expected account update, got {other:?}"),
+        };
+
+        let mut oversized = account_update;
+        oversized.account.as_mut().expect("account payload").data =
+            vec![7_u8; MAX_ACCOUNT_DATA_LEN + 1];
+
+        let error = account_update_event_from_laserstream(
+            oversized,
+            TxCommitmentStatus::Confirmed,
+            ProviderCommitmentWatermarks::default(),
+        )
+        .expect_err("oversized account payload must fail");
+
+        assert!(matches!(
+            error,
+            LaserStreamError::Convert("account data exceeds max permitted size")
+        ));
+    }
+
+    #[test]
+    fn laserstream_slot_state_pruning_evicts_old_slots() {
+        let mut slot_states = HashMap::new();
+        for slot in 0..=u64::try_from(SLOT_STATUS_PRUNE_THRESHOLD).unwrap_or(u64::MAX) {
+            let _ = slot_states.insert(slot, ForkSlotStatus::Processed);
+        }
+
+        prune_recent_slots(
+            &mut slot_states,
+            10_000,
+            SLOT_STATUS_RETAINED_LAG,
+            SLOT_STATUS_PRUNE_THRESHOLD,
+        );
+
+        assert!(
+            !slot_states.contains_key(&0),
+            "old tracked slots should be pruned"
+        );
+        assert!(
+            slot_states.contains_key(&10_000_u64.saturating_sub(SLOT_STATUS_RETAINED_LAG)),
+            "recent tracked slots should stay resident"
+        );
+        assert!(
+            slot_states.len()
+                <= usize::try_from(SLOT_STATUS_RETAINED_LAG + 1).unwrap_or(usize::MAX),
+            "tracked slot state should stay bounded"
+        );
     }
 
     #[test]
@@ -2459,6 +2586,66 @@ mod tests {
         assert!(request.transactions_status.is_empty());
         assert!(request.blocks_meta.contains_key("sof"));
         assert!(request.slots.contains_key(INTERNAL_WATERMARK_SLOT_FILTER));
+    }
+
+    #[test]
+    fn laserstream_client_config_rounds_subsecond_timeouts_up() {
+        let config = LaserStreamConfig::new("https://laserstream.example", "token")
+            .with_connect_timeout(Duration::from_millis(250))
+            .with_timeout(Duration::from_millis(750))
+            .client_config();
+        assert_eq!(config.channel_options.connect_timeout_secs, Some(1));
+        assert_eq!(config.channel_options.timeout_secs, Some(1));
+
+        let slots_config = LaserStreamSlotsConfig::new("https://laserstream.example", "token")
+            .with_connect_timeout(Duration::from_millis(400))
+            .with_timeout(Duration::from_millis(900))
+            .client_config();
+        assert_eq!(slots_config.channel_options.connect_timeout_secs, Some(1));
+        assert_eq!(slots_config.channel_options.timeout_secs, Some(1));
+    }
+
+    #[test]
+    fn laserstream_client_config_clamps_zero_timeouts() {
+        let config = LaserStreamConfig::new("https://laserstream.example", "token")
+            .with_connect_timeout(Duration::ZERO)
+            .with_timeout(Duration::ZERO)
+            .client_config();
+        assert_eq!(config.channel_options.connect_timeout_secs, Some(1));
+        assert_eq!(config.channel_options.timeout_secs, Some(1));
+
+        let slots_config = LaserStreamSlotsConfig::new("https://laserstream.example", "token")
+            .with_connect_timeout(Duration::ZERO)
+            .with_timeout(Duration::ZERO)
+            .client_config();
+        assert_eq!(slots_config.channel_options.connect_timeout_secs, Some(1));
+        assert_eq!(slots_config.channel_options.timeout_secs, Some(1));
+    }
+
+    #[test]
+    fn laserstream_reconnect_delay_never_spins() {
+        let config = LaserStreamConfig::new("https://laserstream.example", "token")
+            .with_reconnect_delay(Duration::ZERO);
+        assert_eq!(config.reconnect_delay_effective(), Duration::from_millis(1));
+
+        let slots_config = LaserStreamSlotsConfig::new("https://laserstream.example", "token")
+            .with_reconnect_delay(Duration::ZERO);
+        assert_eq!(
+            slots_config.reconnect_delay_effective(),
+            Duration::from_millis(1)
+        );
+    }
+
+    #[test]
+    fn laserstream_stall_timeout_never_zero() {
+        assert_eq!(
+            nonzero_duration_or(Duration::ZERO, MIN_PROVIDER_STALL_TIMEOUT),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            nonzero_duration_or(Duration::from_millis(25), MIN_PROVIDER_STALL_TIMEOUT),
+            Duration::from_millis(25)
+        );
     }
 
     #[tokio::test]
@@ -3064,12 +3251,8 @@ mod tests {
 
     async fn spawn_laserstream_test_server(
         service: MockLaserStream,
-    ) -> (
-        std::net::SocketAddr,
-        oneshot::Sender<()>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind LaserStream test");
+    ) -> (SocketAddr, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind LaserStream test");
         let addr = listener.local_addr().expect("LaserStream test addr");
         drop(listener);
 
@@ -3095,13 +3278,14 @@ mod tests {
         let transaction =
             transaction.ok_or(LaserStreamError::Convert("missing transaction payload"))?;
         let signature = Signature::try_from(transaction.signature.as_slice())
-            .map(crate::framework::signature_bytes)
+            .map(signature_bytes)
             .map(Some)
             .map_err(|_error| LaserStreamError::Convert("invalid signature"))?;
         let tx = convert_transaction(
             transaction
                 .transaction
                 .ok_or(LaserStreamError::Convert("missing versioned transaction"))?,
+            None,
         )?;
         Ok(TransactionEvent {
             slot,
@@ -3220,7 +3404,7 @@ mod tests {
 
     #[tokio::test]
     async fn laserstream_spawn_rejects_account_filters_for_block_meta_stream() {
-        let (tx, _rx) = crate::provider_stream::create_provider_stream_queue(1);
+        let (tx, _rx) = create_provider_stream_queue(1);
         let config = LaserStreamConfig::new("http://127.0.0.1:1", "test-api-key")
             .with_stream(LaserStreamStream::BlockMeta)
             .with_accounts([Pubkey::new_unique()]);
@@ -3241,7 +3425,7 @@ mod tests {
     #[test]
     fn laserstream_local_conversion_matches_sdk_baseline() {
         let tx = proto_transaction_from_versioned(&sample_transaction());
-        let local = convert_transaction(tx.clone()).expect("local tx");
+        let local = convert_transaction(tx.clone(), None).expect("local tx");
         let baseline = convert_transaction_sdk_baseline(tx).expect("baseline tx");
         assert_eq!(local, baseline);
     }
@@ -3255,22 +3439,28 @@ mod tests {
         let baseline_started = Instant::now();
         for _ in 0..iterations {
             let tx = convert_transaction_sdk_baseline(tx.clone()).expect("baseline tx");
-            std::hint::black_box(tx);
+            black_box(tx);
         }
         let baseline_elapsed = baseline_started.elapsed();
 
         let optimized_started = Instant::now();
         for _ in 0..iterations {
-            let tx = convert_transaction(tx.clone()).expect("optimized tx");
-            std::hint::black_box(tx);
+            let tx = convert_transaction(tx.clone(), None).expect("optimized tx");
+            black_box(tx);
         }
         let optimized_elapsed = optimized_started.elapsed();
+        let baseline_avg_ns = avg_ns_per_iteration(baseline_elapsed, iterations);
+        let optimized_avg_ns = avg_ns_per_iteration(optimized_elapsed, iterations);
 
         eprintln!(
-            "laserstream_local_conversion_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            "laserstream_local_conversion_profile_fixture iterations={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.3} optimized_avg_us_per_iteration={:.3}",
             iterations,
             baseline_elapsed.as_micros(),
             optimized_elapsed.as_micros(),
+            baseline_avg_ns,
+            optimized_avg_ns,
+            baseline_avg_ns as f64 / 1_000.0,
+            optimized_avg_ns as f64 / 1_000.0,
         );
     }
 
@@ -3284,7 +3474,7 @@ mod tests {
         )
         .expect("event");
         assert_eq!(event.slot, 77);
-        assert_eq!(event.kind, crate::event::TxKind::Mixed);
+        assert_eq!(event.kind, TxKind::Mixed);
         assert!(event.signature.is_some());
     }
 
@@ -3298,7 +3488,7 @@ mod tests {
         )
         .expect("event");
         assert_eq!(event.slot, 78);
-        assert_eq!(event.kind, crate::event::TxKind::VoteOnly);
+        assert_eq!(event.kind, TxKind::VoteOnly);
         assert!(event.signature.is_some());
     }
 
@@ -3317,7 +3507,7 @@ mod tests {
                 TxCommitmentStatus::Processed,
             )
             .expect("baseline event");
-            std::hint::black_box(event);
+            black_box(event);
         }
         let baseline_elapsed = baseline_started.elapsed();
 
@@ -3330,15 +3520,21 @@ mod tests {
                 ProviderCommitmentWatermarks::default(),
             )
             .expect("optimized event");
-            std::hint::black_box(event);
+            black_box(event);
         }
         let optimized_elapsed = optimized_started.elapsed();
+        let baseline_avg_ns = avg_ns_per_iteration(baseline_elapsed, iterations);
+        let optimized_avg_ns = avg_ns_per_iteration(optimized_elapsed, iterations);
 
         eprintln!(
-            "laserstream_transaction_conversion_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            "laserstream_transaction_conversion_profile_fixture iterations={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.3} optimized_avg_us_per_iteration={:.3}",
             iterations,
             baseline_elapsed.as_micros(),
             optimized_elapsed.as_micros(),
+            baseline_avg_ns,
+            optimized_avg_ns,
+            baseline_avg_ns as f64 / 1_000.0,
+            optimized_avg_ns as f64 / 1_000.0,
         );
     }
 
@@ -3355,7 +3551,7 @@ mod tests {
                 TxCommitmentStatus::Processed,
             )
             .expect("baseline event");
-            std::hint::black_box(event);
+            black_box(event);
         }
     }
 
@@ -3373,7 +3569,7 @@ mod tests {
                 ProviderCommitmentWatermarks::default(),
             )
             .expect("optimized event");
-            std::hint::black_box(event);
+            black_box(event);
         }
     }
 
@@ -3392,7 +3588,7 @@ mod tests {
                 TxCommitmentStatus::Processed,
             )
             .expect("baseline event");
-            std::hint::black_box(event);
+            black_box(event);
         }
         let baseline_elapsed = baseline_started.elapsed();
 
@@ -3405,15 +3601,21 @@ mod tests {
                 ProviderCommitmentWatermarks::default(),
             )
             .expect("optimized event");
-            std::hint::black_box(event);
+            black_box(event);
         }
         let optimized_elapsed = optimized_started.elapsed();
+        let baseline_avg_ns = avg_ns_per_iteration(baseline_elapsed, iterations);
+        let optimized_avg_ns = avg_ns_per_iteration(optimized_elapsed, iterations);
 
         eprintln!(
-            "laserstream_vote_only_conversion_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            "laserstream_vote_only_conversion_profile_fixture iterations={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.3} optimized_avg_us_per_iteration={:.3}",
             iterations,
             baseline_elapsed.as_micros(),
             optimized_elapsed.as_micros(),
+            baseline_avg_ns,
+            optimized_avg_ns,
+            baseline_avg_ns as f64 / 1_000.0,
+            optimized_avg_ns as f64 / 1_000.0,
         );
     }
 }

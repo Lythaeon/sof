@@ -15,6 +15,8 @@ pub use fork::{ForkTracker, ForkTrackerSnapshot, ForkTrackerUpdate};
 pub use latest::note_latest_shred_slot;
 pub use repair::OutstandingRepairRequests;
 
+#[cfg(any(feature = "gossip-bootstrap", test))]
+pub(super) use std::collections::BTreeSet;
 pub(super) use std::{
     collections::{HashMap, VecDeque},
     time::{Duration, Instant},

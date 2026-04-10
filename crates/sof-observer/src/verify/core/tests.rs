@@ -1,4 +1,8 @@
-use std::time::Duration;
+use std::{
+    env,
+    hint::black_box,
+    time::{Duration, Instant},
+};
 
 use solana_keypair::Keypair;
 use solana_signer::Signer;
@@ -127,18 +131,18 @@ fn unknown_slot_retry_short_circuits_distinct_signatures_in_same_slot() {
 #[test]
 #[ignore = "profiling fixture for unknown-slot verifier backoff"]
 fn unknown_slot_retry_profile_fixture() {
-    let iterations = std::env::var("SOF_VERIFY_UNKNOWN_SLOT_PROFILE_ITERS")
+    let iterations = env::var("SOF_VERIFY_UNKNOWN_SLOT_PROFILE_ITERS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(200_000);
-    let strict_unknown = std::env::var("SOF_VERIFY_STRICT_UNKNOWN_PROFILE")
+    let strict_unknown = env::var("SOF_VERIFY_STRICT_UNKNOWN_PROFILE")
         .ok()
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false);
-    let now = std::time::Instant::now();
+    let now = Instant::now();
     let mut verifier = ShredVerifier::new(1024, 256, Duration::from_secs(5));
-    let started_at = std::time::Instant::now();
+    let started_at = Instant::now();
 
     for i in 0..iterations {
         let mut packet = build_data_packet(11, u32::try_from(i & 0xffff).unwrap_or(u32::MAX), 11);
@@ -157,20 +161,20 @@ fn unknown_slot_retry_profile_fixture() {
 #[test]
 #[ignore = "profiling fixture for strict-unknown verifier short-circuit"]
 fn strict_unknown_known_pubkey_profile_fixture() {
-    let iterations = std::env::var("SOF_VERIFY_STRICT_KNOWN_PUBKEY_PROFILE_ITERS")
+    let iterations = env::var("SOF_VERIFY_STRICT_KNOWN_PUBKEY_PROFILE_ITERS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(50_000);
-    let strict_unknown = std::env::var("SOF_VERIFY_STRICT_UNKNOWN_PROFILE")
+    let strict_unknown = env::var("SOF_VERIFY_STRICT_UNKNOWN_PROFILE")
         .ok()
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false);
     let keypair = Keypair::new();
     let mut verifier = ShredVerifier::new(1024, 256, Duration::from_secs(5));
     verifier.set_known_pubkeys(vec![keypair.pubkey().to_bytes()]);
-    let now = std::time::Instant::now();
-    let started_at = std::time::Instant::now();
+    let now = Instant::now();
+    let started_at = Instant::now();
 
     for i in 0..iterations {
         let slot = 100_000_u64.saturating_add(u64::try_from(i).unwrap_or(u64::MAX));
@@ -184,6 +188,44 @@ fn strict_unknown_known_pubkey_profile_fixture() {
         iterations,
         strict_unknown,
         started_at.elapsed().as_micros()
+    );
+}
+
+#[test]
+#[ignore = "profiling fixture for verifier slot-state allocation churn"]
+fn verifier_slot_state_allocation_profile_fixture() {
+    let iterations = env::var("SOF_VERIFY_UNKNOWN_SLOT_PROFILE_ITERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(50_000);
+    let now = Instant::now();
+    let mut baseline = ShredVerifier::new_baseline(1024, 256, Duration::from_secs(5));
+    let mut optimized = ShredVerifier::new(1024, 256, Duration::from_secs(5));
+
+    let baseline_started = Instant::now();
+    for i in 0..iterations {
+        let slot = 500_000_u64.saturating_add(u64::try_from(i).unwrap_or(u64::MAX));
+        let mut packet = build_data_packet(slot, 1, 1);
+        packet[..SIZE_OF_SIGNATURE].fill((i & 0xff) as u8);
+        black_box(baseline.verify_packet(&packet, now, true));
+    }
+    let baseline_elapsed = baseline_started.elapsed();
+
+    let optimized_started = Instant::now();
+    for i in 0..iterations {
+        let slot = 500_000_u64.saturating_add(u64::try_from(i).unwrap_or(u64::MAX));
+        let mut packet = build_data_packet(slot, 1, 1);
+        packet[..SIZE_OF_SIGNATURE].fill((i & 0xff) as u8);
+        black_box(optimized.verify_packet(&packet, now, true));
+    }
+    let optimized_elapsed = optimized_started.elapsed();
+
+    println!(
+        "verifier_slot_state_allocation_profile_fixture iterations={} baseline_us={} optimized_us={}",
+        iterations,
+        baseline_elapsed.as_micros(),
+        optimized_elapsed.as_micros()
     );
 }
 
@@ -227,7 +269,7 @@ fn strict_unknown_short_circuits_before_pubkey_probe() {
     verifier.set_known_pubkeys(vec![keypair.pubkey().to_bytes()]);
 
     assert_eq!(
-        verifier.verify_packet(&packet, std::time::Instant::now(), true),
+        verifier.verify_packet(&packet, Instant::now(), true),
         VerifyStatus::UnknownLeader
     );
 }

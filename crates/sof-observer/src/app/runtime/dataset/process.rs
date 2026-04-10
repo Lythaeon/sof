@@ -16,6 +16,9 @@ use crate::{
 };
 use agave_transaction_view::transaction_view::SanitizedTransactionView;
 use core::mem::size_of;
+use sof_support::short_vec::{
+    ShortVecDecodeError as PartialParseError, decode_short_u16_len, decode_short_u16_len_partial,
+};
 use solana_hash::Hash;
 use solana_packet::PACKET_DATA_SIZE;
 use solana_pubkey::Pubkey;
@@ -1833,50 +1836,6 @@ fn read_u64_le_partial(payload: &[u8], offset: &mut usize) -> Result<u64, Partia
     Ok(u64::from_le_bytes(raw))
 }
 
-fn decode_short_u16_len(payload: &[u8], offset: &mut usize) -> Option<usize> {
-    let mut value = 0_usize;
-    let mut shift = 0_u32;
-    for byte_index in 0..3 {
-        let byte = usize::from(*payload.get(*offset)?);
-        *offset = (*offset).saturating_add(1);
-        value |= (byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Some(value);
-        }
-        shift = shift.saturating_add(7);
-        if byte_index == 2 {
-            return None;
-        }
-    }
-    None
-}
-
-fn decode_short_u16_len_partial(
-    payload: &[u8],
-    offset: &mut usize,
-) -> Result<usize, PartialParseError> {
-    let mut value = 0_usize;
-    let mut shift = 0_u32;
-    for byte_index in 0..3 {
-        let byte = usize::from(*payload.get(*offset).ok_or(PartialParseError::Incomplete)?);
-        *offset = (*offset).saturating_add(1);
-        value |= (byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Ok(value);
-        }
-        shift = shift.saturating_add(7);
-        if byte_index == 2 {
-            return Err(PartialParseError::Invalid);
-        }
-    }
-    Err(PartialParseError::Invalid)
-}
-
-enum PartialParseError {
-    Incomplete,
-    Invalid,
-}
-
 fn join_payload_fragments_into(
     buffer: &mut Vec<u8>,
     fragments: &[SharedPayloadFragment],
@@ -1955,11 +1914,13 @@ mod tests {
     use solana_signer::Signer as _;
     use solana_transaction::Transaction;
     use std::{
+        env,
         net::{Ipv4Addr, SocketAddr, SocketAddrV4},
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
+        thread,
         time::{Duration, Instant},
     };
     use wincode::{
@@ -2366,7 +2327,7 @@ mod tests {
     #[test]
     #[ignore = "profiling fixture for perf"]
     fn multi_hook_profile_fixture() {
-        let iterations = std::env::var("SOF_MULTI_HOOK_PROFILE_ITERS")
+        let iterations = env::var("SOF_MULTI_HOOK_PROFILE_ITERS")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
             .filter(|value| *value > 0)
@@ -2442,7 +2403,7 @@ mod tests {
             );
             assert!(matches!(outcome, DatasetProcessOutcome::Decoded));
         }
-        std::thread::sleep(Duration::from_millis(250));
+        thread::sleep(Duration::from_millis(250));
         assert_eq!(dataset_decode_fail_count.load(Ordering::Relaxed), 0);
         assert_eq!(tx_event_drop_count.load(Ordering::Relaxed), 0);
         assert_eq!(plugin_host.dropped_event_count(), 0);
@@ -2474,12 +2435,12 @@ mod tests {
     #[test]
     #[ignore = "profiling fixture for completed-dataset prefilter decode skip A/B"]
     fn completed_dataset_prefilter_profile_fixture() {
-        let iterations = std::env::var("SOF_COMPLETED_DATASET_PREFILTER_PROFILE_ITERS")
+        let iterations = env::var("SOF_COMPLETED_DATASET_PREFILTER_PROFILE_ITERS")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(20_000);
-        let mode = std::env::var("SOF_COMPLETED_DATASET_PREFILTER_PROFILE_MODE")
+        let mode = env::var("SOF_COMPLETED_DATASET_PREFILTER_PROFILE_MODE")
             .unwrap_or_else(|_| "manual".to_owned());
         let ignored_account = Pubkey::new_unique();
         let payload = build_profile_payload(PROFILE_ENTRY_COUNT);
@@ -2529,7 +2490,7 @@ mod tests {
             );
             assert!(matches!(outcome, DatasetProcessOutcome::Decoded));
         }
-        std::thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(100));
         assert_eq!(dataset_decode_fail_count.load(Ordering::Relaxed), 0);
         assert_eq!(tx_event_drop_count.load(Ordering::Relaxed), 0);
         assert_eq!(plugin_host.dropped_event_count(), 0);
@@ -2697,7 +2658,7 @@ mod tests {
         );
 
         assert!(matches!(outcome, DatasetProcessOutcome::Decoded));
-        std::thread::sleep(Duration::from_millis(50));
+        thread::sleep(Duration::from_millis(50));
         assert_eq!(handled.load(Ordering::Relaxed), 1);
         assert_eq!(dataset_decode_fail_count.load(Ordering::Relaxed), 0);
         assert_eq!(tx_event_drop_count.load(Ordering::Relaxed), 0);

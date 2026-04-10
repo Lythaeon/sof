@@ -1,5 +1,8 @@
-use std::collections::HashMap;
-use std::sync::{OnceLock, RwLock};
+use std::{
+    collections::HashMap,
+    env,
+    sync::{OnceLock, RwLock},
+};
 
 /// Global runtime setup overrides used to avoid mutating process env at runtime.
 static ENV_OVERRIDES: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
@@ -16,7 +19,7 @@ pub(crate) fn read_env_var(name: &str) -> Option<String> {
     {
         return Some(value.clone());
     }
-    std::env::var(name).ok()
+    env::var(name).ok()
 }
 
 /// Replaces all runtime setup environment overrides.
@@ -89,9 +92,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc;
-    use std::thread;
-    use std::time::Duration;
+    use std::{
+        sync::{Arc, mpsc},
+        thread,
+        time::Duration,
+    };
 
     #[tokio::test]
     async fn sync_and_async_override_helpers_share_the_same_lock() {
@@ -110,10 +115,10 @@ mod tests {
             .recv()
             .expect("guard-ready signal should arrive");
 
-        let started = std::sync::Arc::new(tokio::sync::Notify::new());
-        let finished = std::sync::Arc::new(tokio::sync::Notify::new());
-        let started_wait = std::sync::Arc::clone(&started);
-        let finished_wait = std::sync::Arc::clone(&finished);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(tokio::sync::Notify::new());
+        let started_wait = Arc::clone(&started);
+        let finished_wait = Arc::clone(&finished);
 
         let waiter = tokio::spawn(async move {
             started_wait.notify_one();

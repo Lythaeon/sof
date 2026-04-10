@@ -1,0 +1,28 @@
+[package]
+name = "helius-laserstream"
+version = "0.1.9"
+edition = "2021"
+authors = ["Helius <support@helius.xyz>"]
+description = "Rust client for Helius LaserStream gRPC with robust reconnection and slot tracking"
+license = "MIT"
+repository = "https://github.com/helius-labs/laserstream"
+keywords = ["solana", "laserstream", "yellowstone", "grpc", "blockchain"]
+readme = "README.md"
+
+[lib]
+name = "helius_laserstream"
+path = "src/lib.rs"
+
+[dependencies]
+async-stream = "0.3"
+futures = "0.3"
+futures-channel = "0.3"
+futures-util = { version = "0.3", features = ["sink"] }
+laserstream-core-client = "9.0.2"
+laserstream-core-proto = { version = "9.0.2", default-features = false, features = ["tonic", "tonic-compression"] }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tracing = "0.1"
+url = "2.5"
+uuid = { version = "1.7.0", features = ["v4"] }

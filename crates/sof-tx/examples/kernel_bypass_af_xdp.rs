@@ -12,11 +12,15 @@ fn main() {
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
 use std::{
+    env,
     ffi::CString,
     io,
-    net::{Ipv4Addr, SocketAddr, UdpSocket},
+    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
+    path::Path,
     process::Command,
+    slice,
     sync::{Arc, Mutex},
+    thread,
     time::Duration,
 };
 
@@ -29,6 +33,8 @@ use sof_tx::{
     KernelBypassDatagramSocket, KernelBypassDirectTransport, LeaderTarget, RoutingPolicy,
     submit::{DirectSubmitConfig, DirectSubmitTransport},
 };
+#[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
+use tokio::runtime::Builder;
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
 use xdp::{
     RingConfigBuilder, Umem, WakableRings,
@@ -139,8 +145,8 @@ impl KernelBypassDatagramSocket for AfXdpKernelBypassSocket {
     /// Example helper used by this binary.
     async fn send_to(&self, payload: &[u8], target: SocketAddr) -> io::Result<usize> {
         let dst = match target.ip() {
-            std::net::IpAddr::V4(ip) => ip,
-            std::net::IpAddr::V6(_) => {
+            IpAddr::V4(ip) => ip,
+            IpAddr::V6(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "AF_XDP example socket only supports IPv4 targets",
@@ -457,7 +463,7 @@ fn setup_veth_pair() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
 /// Example helper used by this binary.
-fn run_unshare(current_exe: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+fn run_unshare(current_exe: &Path) -> Result<(), Box<dyn std::error::Error>> {
     for candidate in [
         "/usr/bin/unshare",
         "/bin/unshare",
@@ -524,15 +530,13 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         ..DirectSubmitConfig::default()
     };
 
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
+    let runtime = Builder::new_current_thread().enable_all().build()?;
     let selected = runtime
         .block_on(async {
             transport
                 .submit_direct(
                     &payload,
-                    std::slice::from_ref(&target),
+                    slice::from_ref(&target),
                     RoutingPolicy::default(),
                     &config,
                 )
@@ -543,7 +547,7 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let mut sender_tx_after = sender_tx_before;
     let mut receiver_rx_after = receiver_rx_before;
     for _ in 0..10 {
-        std::thread::sleep(Duration::from_millis(50));
+        thread::sleep(Duration::from_millis(50));
         (sender_tx_after, _) = read_link_packets(VETH_SENDER)?;
         (_, receiver_rx_after) = read_link_packets(VETH_RECEIVER)?;
         if sender_tx_after > sender_tx_before && receiver_rx_after > receiver_rx_before {
@@ -576,8 +580,8 @@ fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
 /// Example helper used by this binary.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::var_os(INNER_ENV).is_none() {
-        let current_exe = std::env::current_exe()?;
+    if env::var_os(INNER_ENV).is_none() {
+        let current_exe = env::current_exe()?;
         return run_unshare(&current_exe);
     }
     run_inner()

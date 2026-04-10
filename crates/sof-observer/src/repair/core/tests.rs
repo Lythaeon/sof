@@ -1,5 +1,9 @@
-use std::time::Duration;
+use std::{
+    hint::black_box,
+    time::{Duration, Instant},
+};
 
+use sof_support::bench::{avg_ns_per_iteration, profile_iterations};
 use solana_keypair::Keypair;
 use solana_signer::Signer;
 
@@ -382,4 +386,82 @@ fn unix_timestamp_is_monotonicish() {
     let first = unix_timestamp_ms();
     let second = unix_timestamp_ms();
     assert!(second >= first);
+}
+
+#[test]
+fn missing_tracker_sorted_slot_keys_matches_baseline() {
+    let tracker = build_profile_tracker();
+    assert_eq!(
+        tracker.sorted_slot_keys_baseline(),
+        tracker.sorted_slot_keys()
+    );
+}
+
+#[test]
+#[ignore = "profiling fixture for missing shred tracker slot prioritization"]
+fn missing_tracker_slot_sort_profile_fixture() {
+    let iterations = profile_iterations(5_000);
+    let baseline_tracker = build_profile_tracker();
+    let optimized_tracker = build_profile_tracker();
+
+    let baseline_started = Instant::now();
+    for _ in 0..iterations {
+        let slot_keys = baseline_tracker.sorted_slot_keys_baseline();
+        black_box(slot_keys);
+    }
+    let baseline_elapsed = baseline_started.elapsed();
+
+    let optimized_started = Instant::now();
+    for _ in 0..iterations {
+        let slot_keys = optimized_tracker.sorted_slot_keys();
+        black_box(slot_keys);
+    }
+    let optimized_elapsed = optimized_started.elapsed();
+
+    let baseline_avg_ns = avg_ns_per_iteration(baseline_elapsed, iterations);
+    let optimized_avg_ns = avg_ns_per_iteration(optimized_elapsed, iterations);
+    eprintln!(
+        "missing_tracker_slot_sort_profile_fixture iterations={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.3} optimized_avg_us_per_iteration={:.3}",
+        iterations,
+        baseline_elapsed.as_micros(),
+        optimized_elapsed.as_micros(),
+        baseline_avg_ns,
+        optimized_avg_ns,
+        baseline_avg_ns as f64 / 1_000.0,
+        optimized_avg_ns as f64 / 1_000.0,
+    );
+}
+
+fn build_profile_tracker() -> MissingShredTracker {
+    let mut tracker = MissingShredTracker::new(
+        512,
+        0,
+        Duration::from_millis(10),
+        Duration::from_millis(100),
+        4,
+        16,
+        4,
+    );
+    let base = Instant::now();
+
+    for slot in 10_000_u64..10_768 {
+        tracker.on_code_shred(slot, 0, 32, base);
+        tracker.on_data_shred(slot, 0, 0, false, 0, base);
+        if slot % 3 != 0 {
+            tracker.on_data_shred(slot, 2, 0, false, 0, base);
+        }
+        if slot % 5 == 0 {
+            tracker.on_data_shred(slot, 31, 0, true, 0, base);
+        }
+        if slot % 7 == 0 {
+            tracker.seed_highest_probe_slot(slot + 1, base);
+        }
+        if slot % 11 == 0 {
+            tracker.on_code_shred(slot, 32, 32, base);
+            tracker.on_data_shred(slot, 32, 32, false, 0, base);
+            tracker.on_data_shred(slot, 34, 32, false, 0, base);
+        }
+    }
+
+    tracker
 }

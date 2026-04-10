@@ -1,0 +1,530 @@
+use crate::{LaserstreamConfig, LaserstreamError, config::CompressionEncoding as ConfigCompressionEncoding};
+use async_stream::stream;
+use futures::StreamExt;
+use futures_channel::mpsc as futures_mpsc;
+use futures_util::{sink::SinkExt, Stream};
+use std::{pin::Pin, time::Duration};
+use tokio::sync::mpsc;
+use tokio::time::sleep;
+use laserstream_core_proto::tonic::{
+    Status, Request, metadata::MetadataValue, transport::Endpoint, codec::CompressionEncoding,
+};
+use tracing::{error, instrument, warn};
+use uuid;
+use laserstream_core_client::{ClientTlsConfig, Interceptor};
+use laserstream_core_proto::prelude::{geyser_client::GeyserClient};
+use laserstream_core_proto::geyser::{
+    subscribe_update::UpdateOneof, SubscribeRequest, SubscribeRequestFilterSlots,
+    SubscribeRequestPing, SubscribeUpdate,
+    SubscribePreprocessedRequest, SubscribePreprocessedUpdate,
+};
+
+const HARD_CAP_RECONNECT_ATTEMPTS: u32 = (20 * 60) / 5; // 20 mins / 5 sec interval
+const FIXED_RECONNECT_INTERVAL_MS: u64 = 5000; // 5 seconds fixed interval
+const SDK_NAME: &str = "laserstream-rust";
+const SDK_VERSION: &str = "0.1.9";
+
+/// Custom interceptor that adds SDK metadata headers to all gRPC requests
+#[derive(Clone)]
+struct SdkMetadataInterceptor {
+    x_token: Option<laserstream_core_proto::tonic::metadata::AsciiMetadataValue>,
+}
+
+impl SdkMetadataInterceptor {
+    fn new(api_key: String) -> Result<Self, Status> {
+        let x_token = if !api_key.is_empty() {
+            Some(api_key.parse().map_err(|e| {
+                Status::invalid_argument(format!("Invalid API key: {}", e))
+            })?)
+        } else {
+            None
+        };
+        Ok(Self { x_token })
+    }
+}
+
+impl Interceptor for SdkMetadataInterceptor {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+        // Add x-token if present
+        if let Some(ref x_token) = self.x_token {
+            request.metadata_mut().insert("x-token", x_token.clone());
+        }
+
+        // Add SDK metadata headers
+        request.metadata_mut().insert("x-sdk-name", MetadataValue::from_static(SDK_NAME));
+        request.metadata_mut().insert("x-sdk-version", MetadataValue::from_static(SDK_VERSION));
+
+        Ok(request)
+    }
+}
+
+/// Handle for managing a bidirectional streaming subscription.
+#[derive(Clone)]
+pub struct StreamHandle {
+    write_tx: mpsc::UnboundedSender<SubscribeRequest>,
+}
+
+impl StreamHandle {
+    /// Send a new subscription request to update the active subscription.
+    pub async fn write(&self, request: SubscribeRequest) -> Result<(), LaserstreamError> {
+        self.write_tx
+            .send(request)
+            .map_err(|_| LaserstreamError::ConnectionError("Write channel closed".to_string()))
+    }
+}
+
+/// Establishes a gRPC connection, handles the subscription lifecycle,
+/// and provides a stream of updates. Automatically reconnects on failure.
+#[instrument(skip(config, request))]
+pub fn subscribe(
+    config: LaserstreamConfig,
+    request: SubscribeRequest,
+) -> (
+    impl Stream<Item = Result<SubscribeUpdate, LaserstreamError>>,
+    StreamHandle,
+) {
+    let (write_tx, mut write_rx) = mpsc::unbounded_channel::<SubscribeRequest>();
+    let handle = StreamHandle { write_tx };
+    let update_stream = stream! {
+        let mut reconnect_attempts = 0;
+        let mut tracked_slot: u64 = 0;
+
+        // Determine the effective max reconnect attempts
+        let effective_max_attempts = config
+            .max_reconnect_attempts
+            .unwrap_or(HARD_CAP_RECONNECT_ATTEMPTS) // Default to hard cap if not set
+            .min(HARD_CAP_RECONNECT_ATTEMPTS); // Enforce hard cap
+
+        // Keep original request for reconnection attempts
+        let mut current_request = request.clone();
+        let internal_slot_sub_id = format!("internal-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap());
+        
+        // Get replay behavior from config
+        let replay_enabled = config.replay;
+        
+        // Add internal slot subscription only when replay is enabled
+        if replay_enabled {
+            current_request.slots.insert(
+                internal_slot_sub_id.clone(),
+                SubscribeRequestFilterSlots {
+                    filter_by_commitment: Some(true), // Use same commitment as user request
+                    ..Default::default()
+                }
+            );
+        }
+        
+        // Clear any user-provided from_slot if replay is disabled
+        if !replay_enabled {
+            current_request.from_slot = None;
+        }
+
+        let api_key_string = config.api_key.clone();
+
+        loop {
+            // Drain any pending write requests that arrived during reconnection delay.
+            // This ensures writes sent while disconnected are included in the next connection.
+            while let Ok(write_request) = write_rx.try_recv() {
+                merge_subscribe_requests(&mut current_request, &write_request, &internal_slot_sub_id);
+            }
+
+            // Always update from_slot on current_request based on tracked_slot.
+            // This ensures reconnections always use the most recent slot, even after
+            // a successful connection that subsequently errors on the stream.
+            if tracked_slot > 0 && replay_enabled {
+                let commitment_level = current_request.commitment.unwrap_or(0);
+                let from_slot = match commitment_level {
+                    0 => tracked_slot.saturating_sub(31), // PROCESSED: rewind by 31 slots
+                    1 | 2 => tracked_slot,                 // CONFIRMED/FINALIZED: exact slot
+                    _ => tracked_slot.saturating_sub(31),  // Unknown: default to safe behavior
+                };
+                current_request.from_slot = Some(from_slot);
+            } else if !replay_enabled {
+                current_request.from_slot = None;
+            }
+
+            let attempt_request = current_request.clone();
+
+            match connect_and_subscribe_once(&config, attempt_request, api_key_string.clone()).await {
+                Ok((sender, stream)) => {
+                    // Successful connection – reset attempt counter so we don't hit the cap
+                    reconnect_attempts = 0;
+
+                    // Box sender and stream here before processing
+                    let mut sender: Pin<Box<dyn futures_util::Sink<SubscribeRequest, Error = futures_mpsc::SendError> + Send>> = Box::pin(sender);
+                    // Ensure the boxed stream yields Result<_, Status>
+                    let mut stream: Pin<Box<dyn Stream<Item = Result<SubscribeUpdate, Status>> + Send>> = Box::pin(stream);
+
+                    // Ping interval timer
+                    let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
+                    ping_interval.tick().await; // Skip first immediate tick
+                    let mut ping_id = 0i32;
+
+                    loop {
+                        tokio::select! {
+                            // Send periodic ping
+                            _ = ping_interval.tick() => {
+                                ping_id = ping_id.wrapping_add(1);
+                                let ping_request = SubscribeRequest {
+                                    ping: Some(SubscribeRequestPing { id: ping_id }),
+                                    ..Default::default()
+                                };
+                                let _ = sender.send(ping_request).await;
+                            },
+                            // Handle incoming messages from the server
+                            result = stream.next() => {
+                                if let Some(result) = result {
+                                    match result {
+                                        Ok(update) => {
+                                            
+                                            // Handle ping/pong
+                                            if matches!(&update.update_oneof, Some(UpdateOneof::Ping(_))) {
+                                                let pong_req = SubscribeRequest { ping: Some(SubscribeRequestPing { id: 1 }), ..Default::default() };
+                                                if let Err(e) = sender.send(pong_req).await {
+                                                    warn!(error = %e, "Failed to send pong");
+                                                    break;
+                                                }
+                                                continue;
+                                            }
+                                            
+                                            // Do not forward server 'Pong' updates to consumers either
+                                            if matches!(&update.update_oneof, Some(UpdateOneof::Pong(_))) {
+                                                continue;
+                                            }
+
+                                // Track the latest slot from any slot update (including internal subscription)
+                                if let Some(UpdateOneof::Slot(s)) = &update.update_oneof {
+                                    if replay_enabled {
+                                        tracked_slot = s.slot;
+                                    }
+                                    
+                                    // Skip if this slot update is EXCLUSIVELY from our internal subscription
+                                    if update.filters.len() == 1 && update.filters.contains(&internal_slot_sub_id) {
+                                        continue;
+                                    }
+                                }
+
+                                            // Filter out internal subscription from filters before yielding (only if replay is enabled)
+                                            let mut clean_update = update;
+                                            if replay_enabled {
+                                                clean_update.filters.retain(|f| f != &internal_slot_sub_id);
+                                                
+                                                // Only yield if there are still filters after cleaning
+                                                if !clean_update.filters.is_empty() {
+                                                    yield Ok(clean_update);
+                                                }
+                                            } else {
+                                                // When replay is disabled, yield all updates as-is
+                                                yield Ok(clean_update);
+                                            }
+                                        }
+                                        Err(status) => {
+                                            // Yield the error to consumer AND continue with reconnection
+                                            warn!(error = %status, "Stream error, will reconnect after 5s delay");
+                                            yield Err(LaserstreamError::Status(status.clone()));
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    // Stream ended
+                                    break;
+                                }
+                            }
+                            
+                            // Handle write requests from the user
+                            Some(write_request) = write_rx.recv() => {
+                                // Merge the write_request into current_request so it persists across reconnections
+                                merge_subscribe_requests(&mut current_request, &write_request, &internal_slot_sub_id);
+
+                                if let Err(e) = sender.send(write_request).await {
+                                    warn!(error = %e, "Failed to send write request");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    // Increment reconnect attempts
+                    reconnect_attempts += 1;
+
+                    // Log error internally but don't yield to consumer until max attempts exhausted
+                    error!(error = %err, attempt = reconnect_attempts, max_attempts = effective_max_attempts, "Connection failed, will retry after 5s delay");
+
+                    // Check if exceeded max reconnect attempts
+                    if reconnect_attempts >= effective_max_attempts {
+                        error!(attempts = effective_max_attempts, "Max reconnection attempts reached");
+                        // Only report error to consumer after exhausting all retries
+                        yield Err(LaserstreamError::MaxReconnectAttempts(Status::cancelled(
+                            format!("Connection failed after {} attempts", effective_max_attempts)
+                        )));
+                        return;
+                    }
+                }
+            }
+
+            // Wait 5s before retry
+            let delay = Duration::from_millis(FIXED_RECONNECT_INTERVAL_MS);
+            sleep(delay).await;
+        }
+    };
+    
+    (update_stream, handle)
+}
+
+#[instrument(skip(config, request, api_key))]
+async fn connect_and_subscribe_once(
+    config: &LaserstreamConfig,
+    request: SubscribeRequest,
+    api_key: String,
+) -> Result<
+    (
+        impl futures_util::Sink<SubscribeRequest, Error = futures_mpsc::SendError> + Send,
+        impl Stream<Item = Result<SubscribeUpdate, laserstream_core_proto::tonic::Status>> + Send,
+    ),
+    Status,
+> {
+    let options = &config.channel_options;
+
+    // Create our custom interceptor with SDK metadata
+    let interceptor = SdkMetadataInterceptor::new(api_key)?;
+
+    // Build endpoint with all options
+    let mut endpoint = Endpoint::from_shared(config.endpoint.clone())
+        .map_err(|e| Status::internal(format!("Failed to parse endpoint: {}", e)))?
+        .connect_timeout(Duration::from_secs(options.connect_timeout_secs.unwrap_or(10)))
+        .timeout(Duration::from_secs(options.timeout_secs.unwrap_or(30)))
+        .http2_keep_alive_interval(Duration::from_secs(options.http2_keep_alive_interval_secs.unwrap_or(30)))
+        .keep_alive_timeout(Duration::from_secs(options.keep_alive_timeout_secs.unwrap_or(5)))
+        .keep_alive_while_idle(options.keep_alive_while_idle.unwrap_or(true))
+        .initial_stream_window_size(options.initial_stream_window_size.or(Some(1024 * 1024 * 4)))
+        .initial_connection_window_size(options.initial_connection_window_size.or(Some(1024 * 1024 * 8)))
+        .http2_adaptive_window(options.http2_adaptive_window.unwrap_or(true))
+        .tcp_nodelay(options.tcp_nodelay.unwrap_or(true))
+        .buffer_size(options.buffer_size.or(Some(1024 * 64)));
+
+    if let Some(tcp_keepalive_secs) = options.tcp_keepalive_secs {
+        endpoint = endpoint.tcp_keepalive(Some(Duration::from_secs(tcp_keepalive_secs)));
+    }
+
+    // Configure TLS
+    endpoint = endpoint
+        .tls_config(ClientTlsConfig::new().with_enabled_roots())
+        .map_err(|e| Status::internal(format!("TLS config error: {}", e)))?;
+
+    // Connect to create channel
+    let channel = endpoint
+        .connect()
+        .await
+        .map_err(|e| Status::unavailable(format!("Connection failed: {}", e)))?;
+
+    // Create geyser client with our custom interceptor
+    let mut geyser_client = GeyserClient::with_interceptor(channel, interceptor);
+
+    // Configure message size limits
+    geyser_client = geyser_client
+        .max_decoding_message_size(options.max_decoding_message_size.unwrap_or(1_000_000_000))
+        .max_encoding_message_size(options.max_encoding_message_size.unwrap_or(32_000_000));
+
+    // Configure compression if specified
+    if let Some(send_comp) = options.send_compression {
+        let encoding = match send_comp {
+            ConfigCompressionEncoding::Gzip => CompressionEncoding::Gzip,
+            ConfigCompressionEncoding::Zstd => CompressionEncoding::Zstd,
+        };
+        geyser_client = geyser_client.send_compressed(encoding);
+    }
+
+    // Configure accepted compression encodings
+    if let Some(ref accept_comps) = options.accept_compression {
+        for comp in accept_comps {
+            let encoding = match comp {
+                ConfigCompressionEncoding::Gzip => CompressionEncoding::Gzip,
+                ConfigCompressionEncoding::Zstd => CompressionEncoding::Zstd,
+            };
+            geyser_client = geyser_client.accept_compressed(encoding);
+        }
+    }
+
+    // Create bidirectional stream
+    let (mut subscribe_tx, subscribe_rx) = futures_mpsc::unbounded();
+    subscribe_tx
+        .send(request)
+        .await
+        .map_err(|e| Status::internal(format!("Failed to send initial request: {}", e)))?;
+
+    let response = geyser_client
+        .subscribe(subscribe_rx)
+        .await
+        .map_err(|e| Status::internal(format!("Subscription failed: {}", e)))?;
+
+    Ok((subscribe_tx, response.into_inner()))
+}
+
+/// Handle for managing a preprocessed subscription (no write support).
+#[derive(Clone)]
+pub struct PreprocessedStreamHandle;
+
+/// Establishes a gRPC connection for preprocessed transactions and provides a stream of updates.
+/// Automatically reconnects on failure. No slot tracking or replay - just simple reconnection.
+#[instrument(skip(config, request))]
+pub fn subscribe_preprocessed(
+    config: LaserstreamConfig,
+    request: SubscribePreprocessedRequest,
+) -> (
+    impl Stream<Item = Result<SubscribePreprocessedUpdate, LaserstreamError>>,
+    PreprocessedStreamHandle,
+) {
+    let handle = PreprocessedStreamHandle;
+    let update_stream = stream! {
+        let mut reconnect_attempts = 0;
+
+        // Determine the effective max reconnect attempts
+        let effective_max_attempts = config
+            .max_reconnect_attempts
+            .unwrap_or(HARD_CAP_RECONNECT_ATTEMPTS)
+            .min(HARD_CAP_RECONNECT_ATTEMPTS);
+
+        loop {
+            let api_key = config.api_key.clone();
+            let request_clone = request.clone();
+
+            match connect_and_subscribe_preprocessed_once(&config, request_clone, api_key).await {
+                Ok(mut stream) => {
+                    reconnect_attempts = 0;
+
+                    while let Some(result) = stream.next().await {
+                        match result {
+                            Ok(update) => yield Ok(update),
+                            Err(e) => {
+                                warn!(error = %e, "Stream error received");
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    reconnect_attempts += 1;
+                    error!(error = %err, attempt = reconnect_attempts, max_attempts = effective_max_attempts, "Connection failed, will retry after 5s delay");
+
+                    if reconnect_attempts >= effective_max_attempts {
+                        error!(attempts = effective_max_attempts, "Max reconnection attempts reached");
+                        yield Err(LaserstreamError::MaxReconnectAttempts(Status::cancelled(
+                            format!("Connection failed after {} attempts", effective_max_attempts)
+                        )));
+                        return;
+                    }
+                }
+            }
+
+            let delay = Duration::from_millis(FIXED_RECONNECT_INTERVAL_MS);
+            sleep(delay).await;
+        }
+    };
+
+    (update_stream, handle)
+}
+
+#[instrument(skip(config, request, api_key))]
+async fn connect_and_subscribe_preprocessed_once(
+    config: &LaserstreamConfig,
+    request: SubscribePreprocessedRequest,
+    api_key: String,
+) -> Result<
+    impl Stream<Item = Result<SubscribePreprocessedUpdate, laserstream_core_proto::tonic::Status>> + Send,
+    Status,
+> {
+    let options = &config.channel_options;
+
+    // Create our custom interceptor with SDK metadata
+    let interceptor = SdkMetadataInterceptor::new(api_key)?;
+
+    // Build endpoint with all options
+    let mut endpoint = Endpoint::from_shared(config.endpoint.clone())
+        .map_err(|e| Status::internal(format!("Failed to parse endpoint: {}", e)))?
+        .connect_timeout(Duration::from_secs(options.connect_timeout_secs.unwrap_or(10)))
+        .timeout(Duration::from_secs(options.timeout_secs.unwrap_or(30)))
+        .tcp_nodelay(options.tcp_nodelay.unwrap_or(true))
+        .tcp_keepalive(Some(Duration::from_secs(options.tcp_keepalive_secs.unwrap_or(30))))
+        .http2_keep_alive_interval(Duration::from_secs(options.http2_keep_alive_interval_secs.unwrap_or(30)))
+        .keep_alive_timeout(Duration::from_secs(options.keep_alive_timeout_secs.unwrap_or(10)))
+        .keep_alive_while_idle(options.keep_alive_while_idle.unwrap_or(true));
+
+    endpoint = endpoint
+        .tls_config(ClientTlsConfig::new().with_enabled_roots())
+        .map_err(|e| Status::internal(format!("Failed to configure TLS: {}", e)))?;
+
+    let channel = endpoint
+        .connect()
+        .await
+        .map_err(|e| Status::internal(format!("Failed to connect: {}", e)))?;
+
+    let mut geyser_client = GeyserClient::with_interceptor(channel, interceptor)
+        .max_decoding_message_size(options.max_decoding_message_size.unwrap_or(1_000_000_000))
+        .max_encoding_message_size(options.max_encoding_message_size.unwrap_or(32_000_000));
+
+    // Apply compression if specified
+    if let Some(compression) = &options.send_compression {
+        let encoding = match compression {
+            ConfigCompressionEncoding::Gzip => CompressionEncoding::Gzip,
+            ConfigCompressionEncoding::Zstd => CompressionEncoding::Zstd,
+        };
+        geyser_client = geyser_client.send_compressed(encoding).accept_compressed(encoding);
+    }
+
+    let (mut subscribe_tx, subscribe_rx) = futures_mpsc::unbounded();
+
+    subscribe_tx
+        .send(request)
+        .await
+        .map_err(|e| Status::internal(format!("Failed to send initial request: {}", e)))?;
+
+    let response = geyser_client
+        .subscribe_preprocessed(subscribe_rx)
+        .await
+        .map_err(|e| Status::internal(format!("Preprocessed subscription failed: {}", e)))?;
+
+    Ok(response.into_inner())
+}
+
+/// Merges a write request into the current stored request so that subscription
+/// changes made via `write()` persist across reconnections.
+///
+/// Replaces all user subscription fields with the modification's values while
+/// preserving the internal slot tracker subscription used for replay.
+/// `from_slot` and `ping` are not replaced as they are connection-specific.
+fn merge_subscribe_requests(
+    current: &mut SubscribeRequest,
+    modification: &SubscribeRequest,
+    internal_slot_sub_id: &str,
+) {
+    // Save the internal slot tracker before replacing slots
+    let internal_tracker = current
+        .slots
+        .get(internal_slot_sub_id)
+        .cloned();
+
+    // Replace all subscription types (Yellowstone gRPC replaces, not merges)
+    current.accounts = modification.accounts.clone();
+    current.slots = modification.slots.clone();
+    current.transactions = modification.transactions.clone();
+    current.transactions_status = modification.transactions_status.clone();
+    current.blocks = modification.blocks.clone();
+    current.blocks_meta = modification.blocks_meta.clone();
+    current.entry = modification.entry.clone();
+    current.accounts_data_slice = modification.accounts_data_slice.clone();
+
+    // Restore the internal slot tracker if it existed
+    if let Some(value) = internal_tracker {
+        current
+            .slots
+            .insert(internal_slot_sub_id.to_string(), value);
+    }
+
+    // Update commitment if specified in the modification
+    if modification.commitment.is_some() {
+        current.commitment = modification.commitment;
+    }
+
+    // Note: from_slot and ping are not replaced as they are connection-specific
+}
+

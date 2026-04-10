@@ -1,15 +1,17 @@
 //! `sof` derived-state adapter that bridges replayable control-plane state into `sof-tx` providers.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use arcshift::ArcShift;
 use sof::framework::{
     DerivedStateCheckpoint, DerivedStateCheckpointStore, DerivedStateConsumer,
-    DerivedStateConsumerFault, DerivedStateControlPlaneQuality, DerivedStateControlPlaneStateEvent,
-    DerivedStateFeedEnvelope, DerivedStateFeedEvent, DerivedStatePersistedCheckpoint,
+    DerivedStateConsumerConfig, DerivedStateConsumerFault, DerivedStateControlPlaneQuality,
+    DerivedStateControlPlaneStateEvent, DerivedStateFeedEnvelope, DerivedStateFeedEvent,
+    DerivedStatePersistedCheckpoint,
 };
 
 use crate::{
+    adapters::TxProviderControlPlaneQuality,
     adapters::common::{
         TxProviderAdapterConfig, TxProviderAdapterCore, TxProviderAdapterSnapshot,
         TxProviderControlPlaneSnapshot, TxProviderFlowSafetyPolicy, TxProviderFlowSafetyReport,
@@ -47,7 +49,7 @@ impl DerivedStateTxProviderAdapterPersistence {
 
     /// Returns the persisted checkpoint path.
     #[must_use]
-    pub fn checkpoint_path(&self) -> &std::path::Path {
+    pub fn checkpoint_path(&self) -> &Path {
         &self.checkpoint_path
     }
 }
@@ -211,16 +213,10 @@ impl TxFlowSafetySource for DerivedStateTxProviderAdapter {
                 let report = self.evaluate_flow_safety(TxProviderFlowSafetyPolicy::default());
                 TxFlowSafetySnapshot {
                     quality: match report.quality {
-                        crate::adapters::TxProviderControlPlaneQuality::Stable => {
-                            TxFlowSafetyQuality::Stable
-                        }
-                        crate::adapters::TxProviderControlPlaneQuality::Degraded => {
-                            TxFlowSafetyQuality::Degraded
-                        }
-                        crate::adapters::TxProviderControlPlaneQuality::Stale => {
-                            TxFlowSafetyQuality::Stale
-                        }
-                        crate::adapters::TxProviderControlPlaneQuality::IncompleteControlPlane => {
+                        TxProviderControlPlaneQuality::Stable => TxFlowSafetyQuality::Stable,
+                        TxProviderControlPlaneQuality::Degraded => TxFlowSafetyQuality::Degraded,
+                        TxProviderControlPlaneQuality::Stale => TxFlowSafetyQuality::Stale,
+                        TxProviderControlPlaneQuality::IncompleteControlPlane => {
                             TxFlowSafetyQuality::IncompleteControlPlane
                         }
                     },
@@ -305,8 +301,8 @@ impl DerivedStateConsumer for DerivedStateTxProviderAdapter {
         Ok(Some(checkpoint))
     }
 
-    fn config(&self) -> sof::framework::DerivedStateConsumerConfig {
-        sof::framework::DerivedStateConsumerConfig::new().with_control_plane_observed()
+    fn config(&self) -> DerivedStateConsumerConfig {
+        DerivedStateConsumerConfig::new().with_control_plane_observed()
     }
 
     fn apply(
@@ -357,24 +353,22 @@ impl DerivedStateConsumer for DerivedStateTxProviderAdapter {
 #[cfg(test)]
 #[allow(clippy::panic)]
 mod tests {
-    use std::{
-        env, fs,
-        net::SocketAddr,
-        path::PathBuf,
-        sync::Arc,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use sof_support::time_support::current_unix_nanos;
+    use std::{env, fs, net::SocketAddr, path::PathBuf, process::id, sync::Arc, time::UNIX_EPOCH};
 
     use sof::framework::{
         BranchReorgedEvent, CheckpointBarrierEvent, CheckpointBarrierReason, ClusterNodeInfo,
         ClusterTopologyEvent, ControlPlaneSource, DerivedStateConsumer, DerivedStateFeedEnvelope,
-        DerivedStateFeedEvent, FeedSequence, FeedSessionId, FeedWatermarks, LeaderScheduleEntry,
-        LeaderScheduleEvent, ObservedRecentBlockhashEvent, SlotStatusChangedEvent,
+        DerivedStateFeedEvent, FeedSequence, FeedSessionId, FeedWatermarks, ForkSlotStatus,
+        LeaderScheduleEntry, LeaderScheduleEvent, ObservedRecentBlockhashEvent,
+        SlotStatusChangedEvent,
     };
     use sof_types::PubkeyBytes;
     use solana_pubkey::Pubkey;
 
     use super::*;
+
+    use crate::adapters::TxProviderFlowSafetyIssue;
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
@@ -414,11 +408,8 @@ mod tests {
     fn unique_temp_path(label: &str) -> PathBuf {
         env::temp_dir().join(format!(
             "sof-tx-{label}-{}-{}.json",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or_default()
+            id(),
+            current_unix_nanos()
         ))
     }
 
@@ -438,17 +429,17 @@ mod tests {
         assert!(
             report
                 .issues
-                .contains(&crate::adapters::TxProviderFlowSafetyIssue::MissingRecentBlockhash)
+                .contains(&TxProviderFlowSafetyIssue::MissingRecentBlockhash)
         );
         assert!(
             report
                 .issues
-                .contains(&crate::adapters::TxProviderFlowSafetyIssue::MissingClusterTopology)
+                .contains(&TxProviderFlowSafetyIssue::MissingClusterTopology)
         );
         assert!(
             report
                 .issues
-                .contains(&crate::adapters::TxProviderFlowSafetyIssue::MissingLeaderSchedule)
+                .contains(&TxProviderFlowSafetyIssue::MissingLeaderSchedule)
         );
     }
 
@@ -513,7 +504,7 @@ mod tests {
                     slot: 41,
                     parent_slot: Some(40),
                     previous_status: None,
-                    status: sof::framework::ForkSlotStatus::Processed,
+                    status: ForkSlotStatus::Processed,
                 },
             ))),
         );

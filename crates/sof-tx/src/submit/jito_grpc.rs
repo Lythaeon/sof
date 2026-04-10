@@ -1,18 +1,24 @@
 //! Jito searcher gRPC bundle transport implementation.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
+use sof_support::time_support::nonzero_duration_or;
 use tonic::{
     Request, Status,
     client::Grpc,
-    codec::ProstCodec,
     codegen::http::uri::PathAndQuery,
     transport::{Channel, ClientTlsConfig, Endpoint},
 };
+use tonic_prost::ProstCodec;
 
 use super::{
     JitoBlockEngineEndpoint, JitoSubmitConfig, JitoSubmitResponse, JitoSubmitTransport,
     JitoTransportConfig, SubmitTransportError,
 };
+
+/// Default timeout used for Jito gRPC connect and request deadlines.
+const DEFAULT_JITO_GRPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Minimal shared header message for Jito bundle requests.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -107,6 +113,8 @@ impl JitoGrpcTransport {
             endpoint: block_engine_endpoint,
             request_timeout,
         } = config;
+        let request_timeout =
+            nonzero_duration_or(request_timeout, DEFAULT_JITO_GRPC_REQUEST_TIMEOUT);
         let endpoint_url = block_engine_endpoint.as_url().to_owned();
         let mut transport_endpoint =
             Endpoint::from_shared(endpoint_url.clone()).map_err(|error| {
@@ -176,7 +184,7 @@ impl JitoGrpcTransport {
             .unary(
                 Request::new(request),
                 PathAndQuery::from_static("/searcher.SearcherService/SendBundle"),
-                ProstCodec::default(),
+                ProstCodec::<SendBundleRequest, SendBundleResponse>::default(),
             )
             .await?;
         Ok(response.into_inner())
@@ -224,5 +232,14 @@ mod tests {
             .map(|bundle| bundle.packets.len())
             .unwrap_or_default();
         assert_eq!(packet_count, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn jito_grpc_transport_accepts_zero_timeout_config() {
+        let transport = JitoGrpcTransport::with_config(JitoTransportConfig {
+            endpoint: JitoBlockEngineEndpoint::default(),
+            request_timeout: Duration::ZERO,
+        });
+        assert!(transport.is_ok());
     }
 }

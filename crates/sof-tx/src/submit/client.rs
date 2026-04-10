@@ -14,6 +14,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use sof_support::{short_vec::decode_short_u16_len_prefix, time_support::duration_millis_u64};
 use sof_types::SignatureBytes;
 use tokio::{
     net::TcpStream,
@@ -391,11 +392,11 @@ impl TxSubmitClient {
         let opportunity_age_ms = context
             .opportunity_created_at
             .and_then(|created_at| now.duration_since(created_at).ok())
-            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64);
+            .map(duration_millis_u64);
         if let Some(age_ms) = opportunity_age_ms
             && let Some(max_age) = self.guard_policy.max_opportunity_age
         {
-            let max_allowed_ms = max_age.as_millis().min(u128::from(u64::MAX)) as u64;
+            let max_allowed_ms = duration_millis_u64(max_age);
             if age_ms > max_allowed_ms {
                 return Err(self.reject_with_outcome(
                     TxToxicFlowRejectionReason::OpportunityStale {
@@ -627,20 +628,25 @@ impl TxSubmitClient {
         plan: SubmitPlan,
     ) -> Result<SubmitResult, SubmitError> {
         let legacy_mode = plan.legacy_mode();
+        let task_context = self.route_task_context();
+        let direct_transport = self.direct_transport.clone();
+        let leader_provider = self.leader_provider.clone();
+        let backups = self.backups.clone();
+        let policy = self.policy;
+        let direct_config = self.direct_config.clone().normalized();
         let (result_tx, mut result_rx) = mpsc::unbounded_channel();
         for (route_idx, route) in plan.routes.iter().copied().enumerate() {
-            let task_context = self.route_task_context();
+            let task_context = task_context.clone();
             let tx_bytes = Arc::clone(&tx_bytes);
             let result_tx = result_tx.clone();
             let telemetry = Arc::clone(&self.telemetry);
             let reporter = self.outcome_reporter.clone();
             let flow_safety_source = self.flow_safety_source.clone();
             let plan_for_task = plan.clone();
-            let direct_transport = self.direct_transport.clone();
-            let leader_provider = self.leader_provider.clone();
-            let backups = self.backups.clone();
-            let policy = self.policy;
-            let direct_config = self.direct_config.clone().normalized();
+            let direct_transport = direct_transport.clone();
+            let leader_provider = leader_provider.clone();
+            let backups = backups.clone();
+            let direct_config = direct_config.clone();
             tokio::spawn(async move {
                 let result = submit_one_route_task(
                     route,
@@ -969,13 +975,12 @@ impl OutcomeReporterDispatcher {
     fn shared(reporter: Arc<dyn TxSubmitOutcomeReporter>) -> Result<Arc<Self>, std::io::Error> {
         let key = reporter_identity(&reporter);
         let registry = outcome_reporter_registry();
-        {
-            let registry = registry
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
-                return Ok(existing);
-            }
+        let mut registry = registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.retain(|_key, dispatcher| dispatcher.strong_count() > 0);
+        if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
+            return Ok(existing);
         }
 
         let (tx, rx) = std_mpsc::sync_channel::<TxSubmitOutcome>(Self::QUEUE_CAPACITY);
@@ -994,9 +999,6 @@ impl OutcomeReporterDispatcher {
             queue_full_warned: AtomicBool::new(false),
             unavailable_warned: AtomicBool::new(false),
         });
-        let mut registry = registry
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _ = registry.insert(key, Arc::downgrade(&dispatcher));
         Ok(dispatcher)
     }
@@ -1054,7 +1056,7 @@ fn reporter_identity(reporter: &Arc<dyn TxSubmitOutcomeReporter>) -> usize {
 
 /// Extracts the first transaction signature from serialized transaction bytes.
 fn extract_first_signature(tx_bytes: &[u8]) -> Result<Option<SignatureBytes>, SubmitError> {
-    let Some((signature_count, offset)) = decode_short_vec_len(tx_bytes) else {
+    let Some((signature_count, offset)) = decode_short_u16_len_prefix(tx_bytes) else {
         return Err(decode_signed_bytes_error(
             "transaction bytes did not contain a valid signature vector prefix",
         ));
@@ -1071,20 +1073,6 @@ fn extract_first_signature(tx_bytes: &[u8]) -> Result<Option<SignatureBytes>, Su
     let mut signature = [0_u8; 64];
     signature.copy_from_slice(signature_bytes);
     Ok(Some(SignatureBytes::new(signature)))
-}
-
-/// Decodes Solana's short-vec length prefix and returns the decoded length plus payload offset.
-fn decode_short_vec_len(bytes: &[u8]) -> Option<(usize, usize)> {
-    let mut value = 0_usize;
-    let mut shift = 0_u32;
-    for (idx, byte) in bytes.iter().copied().take(3).enumerate() {
-        value |= usize::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Some((value, idx.saturating_add(1)));
-        }
-        shift = shift.saturating_add(7);
-    }
-    None
 }
 
 /// Builds one signed-byte decode error from a static message.
@@ -1424,4 +1412,32 @@ fn direct_attempt_timeout(direct_config: &DirectSubmitConfig) -> Duration {
         .saturating_add(direct_config.per_target_timeout)
         .saturating_add(direct_config.rebroadcast_interval)
         .max(Duration::from_secs(8))
+}
+
+#[cfg(test)]
+#[allow(clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct NoopOutcomeReporter;
+
+    impl TxSubmitOutcomeReporter for NoopOutcomeReporter {
+        fn record_outcome(&self, _outcome: &TxSubmitOutcome) {}
+    }
+
+    #[test]
+    fn reporter_dispatcher_reuses_existing_instance() {
+        let reporter: Arc<dyn TxSubmitOutcomeReporter> = Arc::new(NoopOutcomeReporter);
+        let first = match OutcomeReporterDispatcher::shared(Arc::clone(&reporter)) {
+            Ok(dispatcher) => dispatcher,
+            Err(error) => panic!("first dispatcher failed: {error}"),
+        };
+        let second = match OutcomeReporterDispatcher::shared(reporter) {
+            Ok(dispatcher) => dispatcher,
+            Err(error) => panic!("second dispatcher failed: {error}"),
+        };
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
 }

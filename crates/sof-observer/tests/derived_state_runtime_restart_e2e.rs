@@ -3,10 +3,11 @@
 #![cfg(feature = "kernel-bypass")]
 
 use std::{
+    env,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime},
 };
 
 use sof::{
@@ -24,6 +25,7 @@ use sof::{
     runtime::{self, DerivedStateReplayConfig, DerivedStateRuntimeConfig, RuntimeSetup},
     shred::wire::SIZE_OF_DATA_SHRED_HEADERS,
 };
+use sof_support::time_support::current_unix_nanos;
 use sof_types::PubkeyBytes;
 use solana_sdk_ids::vote;
 use solana_signature::Signature;
@@ -144,10 +146,8 @@ impl DerivedStateConsumer for PersistedCheckpointConsumer {
 }
 
 fn unique_test_dir(name: &str) -> PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0_u128, |duration| duration.as_nanos());
-    std::env::temp_dir().join(format!(
+    let unique = current_unix_nanos();
+    env::temp_dir().join(format!(
         "sof-derived-state-runtime-{name}-{}-{unique}",
         std::process::id()
     ))

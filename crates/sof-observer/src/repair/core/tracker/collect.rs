@@ -1,4 +1,68 @@
+use std::cmp::Ordering;
+
 use super::*;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SlotCollectPriority {
+    probe_ready: bool,
+    has_received: bool,
+    received_upper: u32,
+    probe_only: bool,
+    has_last: bool,
+    gap: u32,
+    observed_span: u32,
+}
+
+impl SlotCollectPriority {
+    fn from_state(slot_state: &SlotMissingState) -> Self {
+        let probe_ready = slot_state.is_highest_probe_ready();
+        let received_upper = slot_state.received_upper_bound();
+        let has_received = received_upper.is_some();
+        let probe_only = probe_ready && !has_received;
+        let has_last = slot_state.last_index_seen.is_some();
+        let received_upper_value = received_upper.unwrap_or(0);
+        let gap = received_upper
+            .map(|upper| upper.saturating_sub(slot_state.contiguous_data_prefix))
+            .unwrap_or(u32::MAX);
+        let observed_span = received_upper
+            .map(|upper| {
+                upper.saturating_sub(
+                    slot_state
+                        .min_data_index_seen
+                        .unwrap_or(slot_state.contiguous_data_prefix),
+                )
+            })
+            .unwrap_or(u32::MAX);
+
+        Self {
+            probe_ready,
+            has_received,
+            received_upper: received_upper_value,
+            probe_only,
+            has_last,
+            gap,
+            observed_span,
+        }
+    }
+
+    fn cmp_with_slot(self, slot: u64, other: Self, other_slot: u64) -> Ordering {
+        other
+            .probe_ready
+            .cmp(&self.probe_ready)
+            .then_with(|| other.has_received.cmp(&self.has_received))
+            .then_with(|| other.received_upper.cmp(&self.received_upper))
+            .then_with(|| {
+                if self.probe_only && other.probe_only {
+                    slot.cmp(&other_slot)
+                } else {
+                    other_slot.cmp(&slot)
+                }
+            })
+            .then_with(|| other.has_last.cmp(&self.has_last))
+            .then_with(|| self.gap.cmp(&other.gap))
+            .then_with(|| self.observed_span.cmp(&other.observed_span))
+    }
+}
 
 impl MissingShredTracker {
     pub fn collect_requests(
@@ -16,68 +80,8 @@ impl MissingShredTracker {
         let mut requests = Vec::with_capacity(max_requests);
         let highest_request_budget = max_requests.min(max_highest_window_requests);
         let mut forward_probe_requests_sent = 0_usize;
-        let mut slot_request_counts: HashMap<u64, usize> = HashMap::new();
-        let mut slot_keys: Vec<u64> = self.slots.keys().copied().collect();
-        slot_keys.sort_unstable_by(|a, b| {
-            let Some(a_state) = self.slots.get(a) else {
-                return std::cmp::Ordering::Greater;
-            };
-            let Some(b_state) = self.slots.get(b) else {
-                return std::cmp::Ordering::Less;
-            };
-            let a_probe_ready = a_state.is_highest_probe_ready();
-            let b_probe_ready = b_state.is_highest_probe_ready();
-            let a_has_received = a_state.received_upper_bound().is_some();
-            let b_has_received = b_state.received_upper_bound().is_some();
-            let a_probe_only = a_probe_ready && !a_has_received;
-            let b_probe_only = b_probe_ready && !b_has_received;
-            let a_has_last = a_state.last_index_seen.is_some();
-            let b_has_last = b_state.last_index_seen.is_some();
-            let a_received_upper = a_state.received_upper_bound().unwrap_or(0);
-            let b_received_upper = b_state.received_upper_bound().unwrap_or(0);
-            let a_gap = a_state
-                .received_upper_bound()
-                .map(|upper| upper.saturating_sub(a_state.contiguous_data_prefix))
-                .unwrap_or(u32::MAX);
-            let b_gap = b_state
-                .received_upper_bound()
-                .map(|upper| upper.saturating_sub(b_state.contiguous_data_prefix))
-                .unwrap_or(u32::MAX);
-            let a_observed_span = a_state
-                .received_upper_bound()
-                .map(|upper| {
-                    upper.saturating_sub(
-                        a_state
-                            .min_data_index_seen
-                            .unwrap_or(a_state.contiguous_data_prefix),
-                    )
-                })
-                .unwrap_or(u32::MAX);
-            let b_observed_span = b_state
-                .received_upper_bound()
-                .map(|upper| {
-                    upper.saturating_sub(
-                        b_state
-                            .min_data_index_seen
-                            .unwrap_or(b_state.contiguous_data_prefix),
-                    )
-                })
-                .unwrap_or(u32::MAX);
-            b_probe_ready
-                .cmp(&a_probe_ready)
-                .then_with(|| b_has_received.cmp(&a_has_received))
-                .then_with(|| b_received_upper.cmp(&a_received_upper))
-                .then_with(|| {
-                    if a_probe_only && b_probe_only {
-                        a.cmp(b)
-                    } else {
-                        b.cmp(a)
-                    }
-                })
-                .then_with(|| b_has_last.cmp(&a_has_last))
-                .then_with(|| a_gap.cmp(&b_gap))
-                .then_with(|| a_observed_span.cmp(&b_observed_span))
-        });
+        let mut slot_request_counts: HashMap<u64, usize> = HashMap::with_capacity(self.slots.len());
+        let slot_keys = self.sorted_slot_keys();
         if highest_request_budget > 0 {
             for slot in &slot_keys {
                 if requests.len() >= max_requests || requests.len() >= highest_request_budget {
@@ -289,5 +293,36 @@ impl MissingShredTracker {
             };
             fec_set_index = next;
         }
+    }
+
+    pub(crate) fn sorted_slot_keys(&self) -> Vec<u64> {
+        let mut priorities: Vec<_> = self
+            .slots
+            .iter()
+            .map(|(&slot, slot_state)| (slot, SlotCollectPriority::from_state(slot_state)))
+            .collect();
+        priorities.sort_unstable_by(|(slot, priority), (other_slot, other_priority)| {
+            priority.cmp_with_slot(*slot, *other_priority, *other_slot)
+        });
+        priorities.into_iter().map(|(slot, _)| slot).collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sorted_slot_keys_baseline(&self) -> Vec<u64> {
+        let mut slot_keys: Vec<u64> = self.slots.keys().copied().collect();
+        slot_keys.sort_unstable_by(|a, b| {
+            let Some(a_state) = self.slots.get(a) else {
+                return Ordering::Greater;
+            };
+            let Some(b_state) = self.slots.get(b) else {
+                return Ordering::Less;
+            };
+            SlotCollectPriority::from_state(a_state).cmp_with_slot(
+                *a,
+                SlotCollectPriority::from_state(b_state),
+                *b,
+            )
+        });
+        slot_keys
     }
 }

@@ -2,14 +2,22 @@
 
 //! Yellowstone gRPC adapters for SOF processed provider-stream ingress.
 
+#[cfg(test)]
+use std::hint::black_box;
 use std::{
     collections::HashMap,
+    fmt,
+    pin::Pin,
     str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use futures_util::{SinkExt, StreamExt};
+use sof_support::bytes::{pubkey_bytes_from_slice, signature_bytes_from_slice};
+use sof_support::collections_support::prune_recent_slots;
+use sof_support::time_support::nonzero_duration_or;
+use sof_types::SignatureBytes;
 use solana_hash::Hash;
 use solana_message::{
     Message, MessageHeader, VersionedMessage,
@@ -18,6 +26,7 @@ use solana_message::{
 };
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
+use solana_system_interface::MAX_PERMITTED_DATA_LENGTH;
 use solana_transaction::versioned::VersionedTransaction;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -34,7 +43,7 @@ use crate::{
     event::{ForkSlotStatus, TxCommitmentStatus, TxKind},
     framework::{
         AccountUpdateEvent, BlockMetaEvent, SlotStatusEvent, TransactionEvent,
-        TransactionStatusEvent, pubkey_bytes, signature_bytes_opt,
+        TransactionStatusEvent,
     },
     provider_stream::{
         ProviderCommitmentWatermarks, ProviderReplayMode, ProviderSourceArbitrationMode,
@@ -43,11 +52,18 @@ use crate::{
         ProviderSourceReadiness, ProviderSourceReservation, ProviderSourceRole,
         ProviderSourceTaskGuard, ProviderStreamFanIn, ProviderStreamMode, ProviderStreamSender,
         ProviderStreamUpdate, classify_provider_transaction_kind,
-        emit_provider_source_removed_with_reservation,
+        emit_provider_source_removed_with_reservation, keepalive_interval,
     },
 };
 
 const INTERNAL_SLOT_FILTER: &str = "__sof_internal_slots";
+const MAX_ACCOUNT_DATA_LEN: usize = MAX_PERMITTED_DATA_LENGTH as usize;
+const SLOT_STATUS_RETAINED_LAG: u64 = 4_096;
+const SLOT_STATUS_PRUNE_THRESHOLD: usize = SLOT_STATUS_RETAINED_LAG as usize * 2;
+const DEFAULT_MAX_DECODING_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+const MIN_PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_millis(1);
+const MIN_PROVIDER_STALL_TIMEOUT: Duration = Duration::from_millis(1);
+const MIN_RECONNECT_DELAY: Duration = Duration::from_millis(1);
 
 /// Yellowstone subscription commitment used for provider-stream transaction updates.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -84,7 +100,7 @@ impl YellowstoneGrpcCommitment {
 pub struct YellowstoneGrpcConfig {
     endpoint: String,
     x_token: Option<String>,
-    source_instance: Option<std::sync::Arc<str>>,
+    source_instance: Option<Arc<str>>,
     readiness: ProviderSourceReadiness,
     source_role: ProviderSourceRole,
     source_priority: u16,
@@ -133,8 +149,8 @@ pub enum YellowstoneGrpcConfigOption {
     RequireTransactionSignature,
 }
 
-impl std::fmt::Display for YellowstoneGrpcConfigOption {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for YellowstoneGrpcConfigOption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::VoteFilter => f.write_str("vote filter"),
             Self::FailedFilter => f.write_str("failed filter"),
@@ -198,7 +214,7 @@ impl YellowstoneGrpcConfig {
             accounts: Vec::new(),
             owners: Vec::new(),
             require_txn_signature: false,
-            max_decoding_message_size: 64 * 1024 * 1024,
+            max_decoding_message_size: DEFAULT_MAX_DECODING_MESSAGE_SIZE,
             connect_timeout: Some(Duration::from_secs(10)),
             stall_timeout: Some(Duration::from_secs(30)),
             ping_interval: Some(Duration::from_secs(30)),
@@ -216,7 +232,7 @@ impl YellowstoneGrpcConfig {
 
     /// Sets one stable source instance label for observability and redundancy intent.
     #[must_use]
-    pub fn with_source_instance(mut self, instance: impl Into<std::sync::Arc<str>>) -> Self {
+    pub fn with_source_instance(mut self, instance: impl Into<Arc<str>>) -> Self {
         self.source_instance = Some(instance.into());
         self
     }
@@ -389,6 +405,10 @@ impl YellowstoneGrpcConfig {
     pub const fn with_reconnect_delay(mut self, delay: Duration) -> Self {
         self.reconnect_delay = delay;
         self
+    }
+
+    const fn reconnect_delay_effective(&self) -> Duration {
+        effective_reconnect_delay(self.reconnect_delay)
     }
 
     fn validate(&self) -> Result<(), YellowstoneGrpcConfigError> {
@@ -646,7 +666,7 @@ pub enum YellowstoneGrpcStream {
 pub struct YellowstoneGrpcSlotsConfig {
     endpoint: String,
     x_token: Option<String>,
-    source_instance: Option<std::sync::Arc<str>>,
+    source_instance: Option<Arc<str>>,
     readiness: ProviderSourceReadiness,
     source_role: ProviderSourceRole,
     source_priority: u16,
@@ -690,7 +710,7 @@ impl YellowstoneGrpcSlotsConfig {
 
     /// Sets one stable source instance label for observability and redundancy intent.
     #[must_use]
-    pub fn with_source_instance(mut self, instance: impl Into<std::sync::Arc<str>>) -> Self {
+    pub fn with_source_instance(mut self, instance: impl Into<Arc<str>>) -> Self {
         self.source_instance = Some(instance.into());
         self
     }
@@ -802,6 +822,10 @@ impl YellowstoneGrpcSlotsConfig {
         self
     }
 
+    const fn reconnect_delay_effective(&self) -> Duration {
+        effective_reconnect_delay(self.reconnect_delay)
+    }
+
     /// Sets the maximum reconnect attempts. `None` keeps retrying forever.
     #[must_use]
     pub const fn with_max_reconnect_attempts(mut self, attempts: u32) -> Self {
@@ -860,6 +884,14 @@ impl YellowstoneGrpcSlotsConfig {
                 }
             }
         }
+    }
+}
+
+const fn effective_reconnect_delay(delay: Duration) -> Duration {
+    if delay.is_zero() {
+        MIN_RECONNECT_DELAY
+    } else {
+        delay
     }
 }
 
@@ -929,8 +961,8 @@ pub enum YellowstoneGrpcStreamKind {
     Slots,
 }
 
-impl std::fmt::Display for YellowstoneGrpcStreamKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for YellowstoneGrpcStreamKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Transaction => f.write_str("transaction"),
             Self::TransactionStatus => f.write_str("transaction-status"),
@@ -941,10 +973,10 @@ impl std::fmt::Display for YellowstoneGrpcStreamKind {
     }
 }
 
-type YellowstoneSubscribeSink = std::pin::Pin<
+type YellowstoneSubscribeSink = Pin<
     Box<dyn futures_util::Sink<SubscribeRequest, Error = futures_channel::mpsc::SendError> + Send>,
 >;
-type YellowstoneUpdateStream = std::pin::Pin<
+type YellowstoneUpdateStream = Pin<
     Box<
         dyn futures_util::Stream<
                 Item = Result<SubscribeUpdate, yellowstone_grpc_proto::tonic::Status>,
@@ -1162,7 +1194,7 @@ async fn spawn_yellowstone_grpc_source_inner(
                     YellowstoneGrpcProtocolError::ReconnectBudgetExhausted { attempts }.into(),
                 );
             }
-            tokio::time::sleep(config.reconnect_delay).await;
+            tokio::time::sleep(config.reconnect_delay_effective()).await;
         }
     }))
 }
@@ -1223,7 +1255,7 @@ async fn spawn_yellowstone_grpc_slot_source_inner(
         let mut attempts = 0_u32;
         let mut tracked_slot = 0_u64;
         let mut watermarks = ProviderCommitmentWatermarks::default();
-        let mut slot_states = HashMap::new();
+        let mut slot_states = HashMap::with_capacity(SLOT_STATUS_PRUNE_THRESHOLD);
         let mut first_session = Some(first_session);
         loop {
             let mut session_established = false;
@@ -1325,7 +1357,7 @@ async fn spawn_yellowstone_grpc_slot_source_inner(
                     YellowstoneGrpcProtocolError::ReconnectBudgetExhausted { attempts }.into(),
                 );
             }
-            tokio::time::sleep(config.reconnect_delay).await;
+            tokio::time::sleep(config.reconnect_delay_effective()).await;
         }
     }))
 }
@@ -1339,6 +1371,7 @@ async fn run_yellowstone_primary_connection(
     mut stream: YellowstoneUpdateStream,
 ) -> Result<(), YellowstoneGrpcError> {
     let commitment = config.commitment.as_tx_commitment();
+    let provider_source = Arc::new(source.clone());
     *state.session_established = false;
     *state.session_established = true;
     send_primary_provider_health(
@@ -1350,7 +1383,7 @@ async fn run_yellowstone_primary_connection(
         PROVIDER_SUBSCRIPTION_ACKNOWLEDGED.to_owned(),
     )
     .await?;
-    let mut ping = config.ping_interval.map(tokio::time::interval);
+    let mut ping = config.ping_interval.map(keepalive_interval);
     let mut last_progress = Instant::now();
     loop {
         tokio::select! {
@@ -1370,7 +1403,10 @@ async fn run_yellowstone_primary_connection(
                     .map_err(GeyserGrpcClientError::SubscribeSendError)?;
             }
             () = async {
-                if let Some(timeout) = config.stall_timeout {
+                if let Some(timeout) = config
+                    .stall_timeout
+                    .map(|timeout| nonzero_duration_or(timeout, MIN_PROVIDER_STALL_TIMEOUT))
+                {
                     let deadline = last_progress.checked_add(timeout).unwrap_or(last_progress);
                     tokio::time::sleep_until(deadline.into()).await;
                 } else {
@@ -1405,7 +1441,7 @@ async fn run_yellowstone_primary_connection(
                         sender
                             .send(
                                 ProviderStreamUpdate::Transaction(event)
-                                    .with_provider_source(source.clone()),
+                                    .with_provider_source_ref(&provider_source),
                             )
                             .await
                             .map_err(|_error| YellowstoneGrpcError::QueueClosed)?;
@@ -1425,7 +1461,7 @@ async fn run_yellowstone_primary_connection(
                         sender
                             .send(
                                 ProviderStreamUpdate::TransactionStatus(event)
-                                    .with_provider_source(source.clone()),
+                                    .with_provider_source_ref(&provider_source),
                             )
                             .await
                             .map_err(|_error| YellowstoneGrpcError::QueueClosed)?;
@@ -1447,7 +1483,7 @@ async fn run_yellowstone_primary_connection(
                         sender
                             .send(
                                 ProviderStreamUpdate::AccountUpdate(event)
-                                    .with_provider_source(source.clone()),
+                                    .with_provider_source_ref(&provider_source),
                             )
                             .await
                             .map_err(|_error| YellowstoneGrpcError::QueueClosed)?;
@@ -1469,7 +1505,7 @@ async fn run_yellowstone_primary_connection(
                         sender
                             .send(
                                 ProviderStreamUpdate::BlockMeta(event)
-                                    .with_provider_source(source.clone()),
+                                    .with_provider_source_ref(&provider_source),
                             )
                             .await
                             .map_err(|_error| YellowstoneGrpcError::QueueClosed)?;
@@ -1511,6 +1547,7 @@ async fn run_yellowstone_slot_connection(
     mut subscribe_tx: YellowstoneSubscribeSink,
     mut stream: YellowstoneUpdateStream,
 ) -> Result<(), YellowstoneGrpcError> {
+    let provider_source = Arc::new(source.clone());
     *state.session_established = false;
     *state.session_established = true;
     send_provider_slot_health(
@@ -1522,7 +1559,7 @@ async fn run_yellowstone_slot_connection(
         PROVIDER_SUBSCRIPTION_ACKNOWLEDGED.to_owned(),
     )
     .await?;
-    let mut ping = config.ping_interval.map(tokio::time::interval);
+    let mut ping = config.ping_interval.map(keepalive_interval);
     let mut last_progress = Instant::now();
     loop {
         tokio::select! {
@@ -1542,7 +1579,10 @@ async fn run_yellowstone_slot_connection(
                     .map_err(GeyserGrpcClientError::SubscribeSendError)?;
             }
             () = async {
-                if let Some(timeout) = config.stall_timeout {
+                if let Some(timeout) = config
+                    .stall_timeout
+                    .map(|timeout| nonzero_duration_or(timeout, MIN_PROVIDER_STALL_TIMEOUT))
+                {
                     let deadline = last_progress.checked_add(timeout).unwrap_or(last_progress);
                     tokio::time::sleep_until(deadline.into()).await;
                 } else {
@@ -1570,7 +1610,7 @@ async fn run_yellowstone_slot_connection(
                             sender
                                 .send(
                                     ProviderStreamUpdate::SlotStatus(event)
-                                        .with_provider_source(source.clone()),
+                                        .with_provider_source_ref(&provider_source),
                                 )
                                 .await
                                 .map_err(|_error| YellowstoneGrpcError::QueueClosed)?;
@@ -1597,33 +1637,46 @@ async fn establish_yellowstone_session(
     config: &YellowstoneGrpcConfig,
     tracked_slot: u64,
 ) -> Result<(YellowstoneSubscribeSink, YellowstoneUpdateStream), YellowstoneGrpcError> {
-    let mut builder = GeyserGrpcClient::build_from_shared(config.endpoint.clone())?
-        .x_token(config.x_token.clone())?
-        .max_decoding_message_size(config.max_decoding_message_size);
-    if let Some(timeout) = config.connect_timeout {
-        builder = builder.connect_timeout(timeout);
-    }
-    let mut client = builder.connect().await?;
-    let (subscribe_tx, stream) = client
-        .subscribe_with_request(Some(config.subscribe_request_with_state(tracked_slot)))
-        .await?;
-    Ok((Box::pin(subscribe_tx), Box::pin(stream)))
+    establish_yellowstone_subscribe_session(
+        config.endpoint.clone(),
+        config.x_token.clone(),
+        config.max_decoding_message_size,
+        config.connect_timeout,
+        config.subscribe_request_with_state(tracked_slot),
+    )
+    .await
 }
 
 async fn establish_yellowstone_slot_session(
     config: &YellowstoneGrpcSlotsConfig,
     tracked_slot: u64,
 ) -> Result<(YellowstoneSubscribeSink, YellowstoneUpdateStream), YellowstoneGrpcError> {
-    let mut builder = GeyserGrpcClient::build_from_shared(config.endpoint.clone())?
-        .x_token(config.x_token.clone())?
-        .max_decoding_message_size(64 * 1024 * 1024);
-    if let Some(timeout) = config.connect_timeout {
-        builder = builder.connect_timeout(timeout);
+    establish_yellowstone_subscribe_session(
+        config.endpoint.clone(),
+        config.x_token.clone(),
+        DEFAULT_MAX_DECODING_MESSAGE_SIZE,
+        config.connect_timeout,
+        config.subscribe_request_with_state(tracked_slot),
+    )
+    .await
+}
+
+async fn establish_yellowstone_subscribe_session(
+    endpoint: String,
+    x_token: Option<String>,
+    max_decoding_message_size: usize,
+    connect_timeout: Option<Duration>,
+    request: SubscribeRequest,
+) -> Result<(YellowstoneSubscribeSink, YellowstoneUpdateStream), YellowstoneGrpcError> {
+    let mut builder = GeyserGrpcClient::build_from_shared(endpoint)?
+        .x_token(x_token)?
+        .max_decoding_message_size(max_decoding_message_size);
+    if let Some(timeout) = connect_timeout {
+        builder =
+            builder.connect_timeout(nonzero_duration_or(timeout, MIN_PROVIDER_CONNECT_TIMEOUT));
     }
     let mut client = builder.connect().await?;
-    let (subscribe_tx, stream) = client
-        .subscribe_with_request(Some(config.subscribe_request_with_state(tracked_slot)))
-        .await?;
+    let (subscribe_tx, stream) = client.subscribe_with_request(Some(request)).await?;
     Ok((Box::pin(subscribe_tx), Box::pin(stream)))
 }
 
@@ -1754,33 +1807,30 @@ fn transaction_event_from_update(
     let transaction =
         transaction.ok_or(YellowstoneGrpcError::Convert("missing transaction payload"))?;
     let is_vote = transaction.is_vote;
-    let signature = if is_vote {
-        Signature::try_from(transaction.signature.as_slice())
-            .map(Some)
-            .map_err(|_error| YellowstoneGrpcError::Convert("invalid signature"))?
-    } else {
-        None
-    };
+    let signature = signature_bytes_from_slice(transaction.signature.as_slice(), || {
+        YellowstoneGrpcError::Convert("invalid signature")
+    })?;
     let tx = convert_transaction(
         transaction
             .transaction
             .ok_or(YellowstoneGrpcError::Convert(
                 "missing versioned transaction",
             ))?,
+        Some(signature),
     )?;
     Ok(TransactionEvent {
         slot,
         commitment_status,
         confirmed_slot: watermarks.confirmed_slot,
         finalized_slot: watermarks.finalized_slot,
-        signature: signature_bytes_opt(signature.or_else(|| tx.signatures.first().copied())),
+        signature: Some(signature),
         provider_source: None,
         kind: if is_vote {
             TxKind::VoteOnly
         } else {
             classify_provider_transaction_kind(&tx)
         },
-        tx: std::sync::Arc::new(tx),
+        tx: Arc::new(tx),
     })
 }
 
@@ -1789,14 +1839,15 @@ fn transaction_status_event_from_update(
     watermarks: ProviderCommitmentWatermarks,
     update: yellowstone_grpc_proto::prelude::SubscribeUpdateTransactionStatus,
 ) -> Result<TransactionStatusEvent, YellowstoneGrpcError> {
-    let signature = Signature::try_from(update.signature.as_slice())
-        .map_err(|_error| YellowstoneGrpcError::Convert("invalid transaction-status signature"))?;
+    let signature = signature_bytes_from_slice(update.signature.as_slice(), || {
+        YellowstoneGrpcError::Convert("invalid transaction-status signature")
+    })?;
     Ok(TransactionStatusEvent {
         slot: update.slot,
         commitment_status,
         confirmed_slot: watermarks.confirmed_slot,
         finalized_slot: watermarks.finalized_slot,
-        signature: signature.into(),
+        signature,
         is_vote: update.is_vote,
         index: Some(update.index),
         err: update.err.map(|error| format!("{error:?}")),
@@ -1812,30 +1863,36 @@ fn account_update_event_from_yellowstone(
     let account = update
         .account
         .ok_or(YellowstoneGrpcError::Convert("missing account payload"))?;
-    let pubkey = Pubkey::try_from(account.pubkey.as_slice())
-        .map_err(|_error| YellowstoneGrpcError::Convert("invalid account pubkey"))?;
-    let owner = Pubkey::try_from(account.owner.as_slice())
-        .map_err(|_error| YellowstoneGrpcError::Convert("invalid account owner"))?;
+    let pubkey = pubkey_bytes_from_slice(account.pubkey.as_slice(), || {
+        YellowstoneGrpcError::Convert("invalid account pubkey")
+    })?;
+    let owner = pubkey_bytes_from_slice(account.owner.as_slice(), || {
+        YellowstoneGrpcError::Convert("invalid account owner")
+    })?;
     let txn_signature = match account.txn_signature {
-        Some(signature) => Some(
-            Signature::try_from(signature.as_slice())
-                .map_err(|_error| YellowstoneGrpcError::Convert("invalid account txn signature"))?,
-        ),
+        Some(signature) => Some(signature_bytes_from_slice(signature.as_slice(), || {
+            YellowstoneGrpcError::Convert("invalid account txn signature")
+        })?),
         None => None,
     };
+    if account.data.len() > MAX_ACCOUNT_DATA_LEN {
+        return Err(YellowstoneGrpcError::Convert(
+            "account data exceeds max permitted size",
+        ));
+    }
     Ok(AccountUpdateEvent {
         slot: update.slot,
         commitment_status,
         confirmed_slot: watermarks.confirmed_slot,
         finalized_slot: watermarks.finalized_slot,
-        pubkey: pubkey_bytes(pubkey),
-        owner: pubkey_bytes(owner),
+        pubkey,
+        owner,
         lamports: account.lamports,
         executable: account.executable,
         rent_epoch: account.rent_epoch,
         data: account.data.into(),
         write_version: Some(account.write_version),
-        txn_signature: signature_bytes_opt(txn_signature),
+        txn_signature,
         is_startup: update.is_startup,
         matched_filter: None,
         provider_source: None,
@@ -1902,6 +1959,12 @@ fn slot_status_event_from_update(
         | SlotStatus::SlotCreatedBank => ForkSlotStatus::Processed,
     };
     let previous_status = slot_states.insert(slot, mapped);
+    prune_recent_slots(
+        slot_states,
+        slot,
+        SLOT_STATUS_RETAINED_LAG,
+        SLOT_STATUS_PRUNE_THRESHOLD,
+    );
     if previous_status == Some(mapped) {
         return None;
     }
@@ -1966,15 +2029,29 @@ impl ProviderStreamFanIn {
     }
 }
 
-#[inline]
+#[inline(always)]
 fn convert_transaction(
     tx: yellowstone_grpc_proto::prelude::Transaction,
+    first_signature: Option<SignatureBytes>,
 ) -> Result<VersionedTransaction, YellowstoneGrpcError> {
     let mut signatures = Vec::with_capacity(tx.signatures.len());
-    for signature in tx.signatures {
-        signatures.push(Signature::try_from(signature.as_slice()).map_err(|_error| {
-            YellowstoneGrpcError::Convert("failed to parse transaction signature")
-        })?);
+    let mut tx_signatures = tx.signatures.into_iter();
+    if let Some(signature) = tx_signatures.next() {
+        signatures.push(match first_signature {
+            Some(first_signature) => first_signature.into(),
+            None => signature_bytes_from_slice(signature.as_slice(), || {
+                YellowstoneGrpcError::Convert("failed to parse transaction signature")
+            })?
+            .into(),
+        });
+    }
+    for signature in tx_signatures {
+        signatures.push(
+            signature_bytes_from_slice(signature.as_slice(), || {
+                YellowstoneGrpcError::Convert("failed to parse transaction signature")
+            })?
+            .into(),
+        );
     }
     let message = convert_message(
         tx.message
@@ -1986,7 +2063,7 @@ fn convert_transaction(
     })
 }
 
-#[inline]
+#[inline(always)]
 fn convert_message(
     message: yellowstone_grpc_proto::prelude::Message,
 ) -> Result<VersionedMessage, YellowstoneGrpcError> {
@@ -2007,8 +2084,10 @@ fn convert_message(
     let mut account_keys = Vec::with_capacity(message.account_keys.len());
     for key in message.account_keys {
         account_keys.push(
-            Pubkey::try_from(key.as_slice())
-                .map_err(|_error| YellowstoneGrpcError::Convert("invalid account key"))?,
+            pubkey_bytes_from_slice(key.as_slice(), || {
+                YellowstoneGrpcError::Convert("invalid account key")
+            })?
+            .into(),
         );
     }
     let recent_blockhash = <[u8; 32]>::try_from(message.recent_blockhash.as_slice())
@@ -2028,9 +2107,10 @@ fn convert_message(
         let mut address_table_lookups = Vec::with_capacity(message.address_table_lookups.len());
         for lookup in message.address_table_lookups {
             address_table_lookups.push(MessageAddressTableLookup {
-                account_key: Pubkey::try_from(lookup.account_key.as_slice()).map_err(|_error| {
+                account_key: pubkey_bytes_from_slice(lookup.account_key.as_slice(), || {
                     YellowstoneGrpcError::Convert("invalid address table account key")
-                })?,
+                })?
+                .into(),
                 writable_indexes: lookup.writable_indexes,
                 readonly_indexes: lookup.readonly_indexes,
             });
@@ -2060,8 +2140,9 @@ fn convert_message(
 )]
 mod tests {
     use super::*;
-    use crate::event::TxKind;
-    use crate::provider_stream::create_provider_stream_queue;
+    use crate::{
+        event::TxKind, framework::signature_bytes, provider_stream::create_provider_stream_queue,
+    };
     use futures_channel::mpsc as futures_mpsc;
     use futures_util::stream::{self, Stream};
     use solana_instruction::Instruction;
@@ -2071,6 +2152,8 @@ mod tests {
     use solana_sdk_ids::{compute_budget, vote};
     use solana_signer::Signer;
     use std::{pin::Pin, time::Instant};
+
+    use sof_support::bench::{avg_ns_per_iteration, profile_iterations};
     use tokio::sync::oneshot;
     use tokio::time::{Duration, timeout};
     use yellowstone_grpc_proto::geyser::geyser_server::{Geyser, GeyserServer};
@@ -2087,12 +2170,60 @@ mod tests {
     };
     use yellowstone_grpc_proto::tonic::{self, Request, Response, Status, transport::Server};
 
-    fn profile_iterations(default: usize) -> usize {
-        std::env::var("SOF_PROFILE_ITERATIONS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(default)
+    #[test]
+    fn yellowstone_account_update_rejects_oversized_data() {
+        let pubkey = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let update = sample_account_update(92, pubkey, owner);
+        let account_update = match update.update_oneof {
+            Some(UpdateOneof::Account(account_update)) => account_update,
+            other => panic!("expected account update, got {other:?}"),
+        };
+
+        let mut oversized = account_update;
+        oversized.account.as_mut().expect("account payload").data =
+            vec![7_u8; MAX_ACCOUNT_DATA_LEN + 1];
+
+        let error = account_update_event_from_yellowstone(
+            oversized,
+            TxCommitmentStatus::Confirmed,
+            ProviderCommitmentWatermarks::default(),
+        )
+        .expect_err("oversized account payload must fail");
+
+        assert!(matches!(
+            error,
+            YellowstoneGrpcError::Convert("account data exceeds max permitted size")
+        ));
+    }
+
+    #[test]
+    fn yellowstone_slot_state_pruning_evicts_old_slots() {
+        let mut slot_states = HashMap::new();
+        for slot in 0..=u64::try_from(SLOT_STATUS_PRUNE_THRESHOLD).unwrap_or(u64::MAX) {
+            let _ = slot_states.insert(slot, ForkSlotStatus::Processed);
+        }
+
+        prune_recent_slots(
+            &mut slot_states,
+            10_000,
+            SLOT_STATUS_RETAINED_LAG,
+            SLOT_STATUS_PRUNE_THRESHOLD,
+        );
+
+        assert!(
+            !slot_states.contains_key(&0),
+            "old tracked slots should be pruned"
+        );
+        assert!(
+            slot_states.contains_key(&10_000_u64.saturating_sub(SLOT_STATUS_RETAINED_LAG)),
+            "recent tracked slots should stay resident"
+        );
+        assert!(
+            slot_states.len()
+                <= usize::try_from(SLOT_STATUS_RETAINED_LAG + 1).unwrap_or(usize::MAX),
+            "tracked slot state should stay bounded"
+        );
     }
 
     fn sample_transaction() -> VersionedTransaction {
@@ -2122,6 +2253,44 @@ mod tests {
         let filter = request.transactions.get("sof").expect("sof filter");
         assert_eq!(filter.vote, None);
         assert_eq!(filter.failed, None);
+    }
+
+    #[test]
+    fn yellowstone_reconnect_delay_never_spins() {
+        let config = YellowstoneGrpcConfig::new("http://127.0.0.1:10000")
+            .with_reconnect_delay(Duration::ZERO);
+        assert_eq!(config.reconnect_delay_effective(), Duration::from_millis(1));
+
+        let slots_config = YellowstoneGrpcSlotsConfig::new("http://127.0.0.1:10000")
+            .with_reconnect_delay(Duration::ZERO);
+        assert_eq!(
+            slots_config.reconnect_delay_effective(),
+            Duration::from_millis(1)
+        );
+    }
+
+    #[test]
+    fn yellowstone_connect_timeout_never_zero() {
+        assert_eq!(
+            nonzero_duration_or(Duration::ZERO, MIN_PROVIDER_CONNECT_TIMEOUT),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            nonzero_duration_or(Duration::from_millis(25), MIN_PROVIDER_CONNECT_TIMEOUT),
+            Duration::from_millis(25)
+        );
+    }
+
+    #[test]
+    fn yellowstone_stall_timeout_never_zero() {
+        assert_eq!(
+            nonzero_duration_or(Duration::ZERO, MIN_PROVIDER_STALL_TIMEOUT),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            nonzero_duration_or(Duration::from_millis(25), MIN_PROVIDER_STALL_TIMEOUT),
+            Duration::from_millis(25)
+        );
     }
 
     #[test]
@@ -2827,7 +2996,7 @@ mod tests {
         let transaction =
             transaction.ok_or(YellowstoneGrpcError::Convert("missing transaction payload"))?;
         let signature = Signature::try_from(transaction.signature.as_slice())
-            .map(crate::framework::signature_bytes)
+            .map(signature_bytes)
             .map(Some)
             .map_err(|_error| YellowstoneGrpcError::Convert("invalid signature"))?;
         let tx = {
@@ -2940,7 +3109,7 @@ mod tests {
             finalized_slot: None,
             signature,
             kind: classify_provider_transaction_kind(&tx),
-            tx: std::sync::Arc::new(tx),
+            tx: Arc::new(tx),
             provider_source: None,
         })
     }
@@ -2975,7 +3144,7 @@ mod tests {
 
     #[tokio::test]
     async fn yellowstone_spawn_rejects_transaction_filters_for_accounts_stream() {
-        let (tx, _rx) = crate::provider_stream::create_provider_stream_queue(1);
+        let (tx, _rx) = create_provider_stream_queue(1);
         let config = YellowstoneGrpcConfig::new("http://127.0.0.1:1")
             .with_stream(YellowstoneGrpcStream::Accounts)
             .with_vote(true);
@@ -3008,7 +3177,7 @@ mod tests {
                 TxCommitmentStatus::Processed,
             )
             .expect("baseline event");
-            std::hint::black_box(event);
+            black_box(event);
         }
         let baseline_elapsed = baseline_started.elapsed();
 
@@ -3021,15 +3190,21 @@ mod tests {
                 ProviderCommitmentWatermarks::default(),
             )
             .expect("optimized event");
-            std::hint::black_box(event);
+            black_box(event);
         }
         let optimized_elapsed = optimized_started.elapsed();
+        let baseline_avg_ns = avg_ns_per_iteration(baseline_elapsed, iterations);
+        let optimized_avg_ns = avg_ns_per_iteration(optimized_elapsed, iterations);
 
         eprintln!(
-            "yellowstone_transaction_conversion_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            "yellowstone_transaction_conversion_profile_fixture iterations={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.3} optimized_avg_us_per_iteration={:.3}",
             iterations,
             baseline_elapsed.as_micros(),
             optimized_elapsed.as_micros(),
+            baseline_avg_ns,
+            optimized_avg_ns,
+            baseline_avg_ns as f64 / 1_000.0,
+            optimized_avg_ns as f64 / 1_000.0,
         );
     }
 
@@ -3046,7 +3221,7 @@ mod tests {
                 TxCommitmentStatus::Processed,
             )
             .expect("baseline event");
-            std::hint::black_box(event);
+            black_box(event);
         }
     }
 
@@ -3064,7 +3239,7 @@ mod tests {
                 ProviderCommitmentWatermarks::default(),
             )
             .expect("optimized event");
-            std::hint::black_box(event);
+            black_box(event);
         }
     }
 
@@ -3083,7 +3258,7 @@ mod tests {
                 TxCommitmentStatus::Processed,
             )
             .expect("baseline event");
-            std::hint::black_box(event);
+            black_box(event);
         }
         let baseline_elapsed = baseline_started.elapsed();
 
@@ -3096,15 +3271,21 @@ mod tests {
                 ProviderCommitmentWatermarks::default(),
             )
             .expect("optimized event");
-            std::hint::black_box(event);
+            black_box(event);
         }
         let optimized_elapsed = optimized_started.elapsed();
+        let baseline_avg_ns = avg_ns_per_iteration(baseline_elapsed, iterations);
+        let optimized_avg_ns = avg_ns_per_iteration(optimized_elapsed, iterations);
 
         eprintln!(
-            "yellowstone_vote_only_conversion_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            "yellowstone_vote_only_conversion_profile_fixture iterations={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.3} optimized_avg_us_per_iteration={:.3}",
             iterations,
             baseline_elapsed.as_micros(),
             optimized_elapsed.as_micros(),
+            baseline_avg_ns,
+            optimized_avg_ns,
+            baseline_avg_ns as f64 / 1_000.0,
+            optimized_avg_ns as f64 / 1_000.0,
         );
     }
 }

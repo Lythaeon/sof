@@ -1,16 +1,21 @@
 use super::*;
+use std::{net::SocketAddr, sync::Arc};
+
 use crate::{
     protocol::shred_wire::SIZE_OF_CODING_SHRED_PAYLOAD,
     relay::SharedRelayCache,
     shred::wire::{ParsedShredHeader, parse_shred_header},
 };
+use smallvec::SmallVec;
+use sof_support::time_support::duration_millis_u64;
+use solana_gossip::contact_info::ContactInfo;
 use solana_keypair::signable::Signable;
 
 impl GossipRepairClient {
     pub fn new(
-        cluster_info: std::sync::Arc<ClusterInfo>,
+        cluster_info: Arc<ClusterInfo>,
         socket: UdpSocket,
-        keypair: std::sync::Arc<Keypair>,
+        keypair: Arc<Keypair>,
         config: GossipRepairClientConfig,
     ) -> Self {
         let now = Instant::now();
@@ -60,18 +65,9 @@ impl GossipRepairClient {
         (snapshot.total_candidates, snapshot.active_candidates)
     }
 
-    pub fn note_shred_source(&mut self, source_addr: std::net::SocketAddr) -> usize {
+    pub fn note_shred_source(&mut self, source_addr: SocketAddr) -> usize {
         let mut updated = 0_usize;
-        let mut seen = HashSet::new();
-        if let Some(pubkey) = self.addr_to_pubkey.get(&source_addr).copied() {
-            let _ = seen.insert(pubkey);
-        }
-        if let Some(pubkeys) = self.ip_to_pubkeys.get(&source_addr.ip()) {
-            for pubkey in pubkeys {
-                let _ = seen.insert(*pubkey);
-            }
-        }
-        for pubkey in seen {
+        for pubkey in self.source_pubkeys(source_addr) {
             self.peer_scores
                 .entry(pubkey)
                 .or_default()
@@ -81,19 +77,10 @@ impl GossipRepairClient {
         updated
     }
 
-    pub fn note_shred_sources(&mut self, source_addrs: &[(std::net::SocketAddr, u16)]) -> usize {
+    pub fn note_shred_sources(&mut self, source_addrs: &[(SocketAddr, u16)]) -> usize {
         let mut updated = 0_usize;
         for (source_addr, hits) in source_addrs.iter().copied() {
-            let mut seen = HashSet::new();
-            if let Some(pubkey) = self.addr_to_pubkey.get(&source_addr).copied() {
-                let _ = seen.insert(pubkey);
-            }
-            if let Some(pubkeys) = self.ip_to_pubkeys.get(&source_addr.ip()) {
-                for pubkey in pubkeys {
-                    let _ = seen.insert(*pubkey);
-                }
-            }
-            for pubkey in seen {
+            for pubkey in self.source_pubkeys(source_addr) {
                 self.peer_scores
                     .entry(pubkey)
                     .or_default()
@@ -104,12 +91,36 @@ impl GossipRepairClient {
         updated
     }
 
+    fn source_pubkeys(&self, source_addr: SocketAddr) -> SmallVec<[Pubkey; 4]> {
+        let direct_pubkey = self.addr_to_pubkey.get(&source_addr).copied();
+        let Some(ip_pubkeys) = self.ip_to_pubkeys.get(&source_addr.ip()) else {
+            return direct_pubkey.into_iter().collect();
+        };
+        let mut seen = SmallVec::<[Pubkey; 4]>::with_capacity(
+            ip_pubkeys
+                .len()
+                .saturating_add(usize::from(direct_pubkey.is_some())),
+        );
+        if let Some(pubkey) = direct_pubkey {
+            seen.push(pubkey);
+            seen.extend(
+                ip_pubkeys
+                    .iter()
+                    .copied()
+                    .filter(|ip_pubkey| *ip_pubkey != pubkey),
+            );
+        } else {
+            seen.extend(ip_pubkeys.iter().copied());
+        }
+        seen
+    }
+
     pub async fn request_missing_shred(
         &mut self,
         slot: u64,
         index: u32,
         kind: MissingShredRequestKind,
-    ) -> Result<Option<std::net::SocketAddr>, GossipRepairClientError> {
+    ) -> Result<Option<SocketAddr>, GossipRepairClientError> {
         let Some(peer) = self.pick_peer(slot, index) else {
             return Ok(None);
         };
@@ -152,7 +163,7 @@ impl GossipRepairClient {
     pub async fn maybe_handle_response_ping(
         &mut self,
         packet: &[u8],
-        from_addr: std::net::SocketAddr,
+        from_addr: SocketAddr,
     ) -> Result<bool, GossipRepairClientError> {
         if !is_repair_response_ping_packet(packet) {
             return Ok(false);
@@ -179,7 +190,7 @@ impl GossipRepairClient {
     pub async fn maybe_serve_repair_request(
         &mut self,
         packet: &[u8],
-        from_addr: std::net::SocketAddr,
+        from_addr: SocketAddr,
         relay_cache: Option<&SharedRelayCache>,
     ) -> Result<Option<ServedRepairRequest>, GossipRepairClientError> {
         let Some(request) = parse_signed_repair_request(
@@ -323,7 +334,6 @@ impl GossipRepairClient {
 
     fn refresh_peers(&mut self, slot: u64) {
         self.decay_peer_scores();
-        self.refresh_stake_map();
         self.peers_by_slot
             .retain(|_, cached| cached.updated_at.elapsed() < self.peer_cache_ttl);
         self.sticky_peer_by_slot.retain(|slot_key, sticky| {
@@ -355,19 +365,32 @@ impl GossipRepairClient {
         if !should_refresh {
             return;
         }
-        let mut candidates = self.collect_candidate_peers(slot);
+        let all_peers = self.cluster_info.all_peers();
+        self.refresh_stake_map(&all_peers);
+        let mut candidates = self.collect_candidate_peers(slot, &all_peers);
         let total_candidates = candidates.len();
         candidates.sort_unstable_by(|left, right| {
             self.score_for(right.pubkey)
                 .cmp(&self.score_for(left.pubkey))
                 .then_with(|| left.pubkey.to_bytes().cmp(&right.pubkey.to_bytes()))
         });
-        let mut peers = candidates.clone();
-        if peers.len() > self.active_peer_count {
-            peers.truncate(self.active_peer_count);
-        }
+        let peers = candidates
+            .iter()
+            .take(self.active_peer_count)
+            .copied()
+            .collect::<Vec<_>>();
         self.addr_to_pubkey.clear();
         self.ip_to_pubkeys.clear();
+        self.addr_to_pubkey.reserve(
+            candidates
+                .len()
+                .saturating_sub(self.addr_to_pubkey.capacity()),
+        );
+        self.ip_to_pubkeys.reserve(
+            candidates
+                .len()
+                .saturating_sub(self.ip_to_pubkeys.capacity()),
+        );
         for peer in &candidates {
             let _ = self.addr_to_pubkey.insert(peer.addr, peer.pubkey);
             self.ip_to_pubkeys
@@ -387,7 +410,7 @@ impl GossipRepairClient {
                 peers: peers.clone(),
             },
         );
-        self.publish_peer_snapshot(total_candidates, &peers);
+        self.publish_peer_snapshot(total_candidates, &peers, &all_peers);
     }
 
     fn decay_peer_scores(&mut self) {
@@ -405,9 +428,14 @@ impl GossipRepairClient {
         });
     }
 
-    fn collect_candidate_peers(&self, slot: u64) -> Vec<RepairPeer> {
-        let mut seen = HashSet::new();
-        let mut peers = Vec::new();
+    fn collect_candidate_peers(
+        &self,
+        slot: u64,
+        all_peers: &[(ContactInfo, u64)],
+    ) -> Vec<RepairPeer> {
+        let estimated_peers = all_peers.len().saturating_add(1);
+        let mut seen = HashSet::with_capacity(estimated_peers);
+        let mut peers = Vec::with_capacity(estimated_peers);
         for contact_info in self.cluster_info.repair_peers(slot) {
             let Some(addr) = contact_info.serve_repair(Protocol::UDP) else {
                 continue;
@@ -428,7 +456,7 @@ impl GossipRepairClient {
         if peers.is_empty() {
             let self_pubkey = self.cluster_info.id();
             let self_shred_version = self.cluster_info.my_shred_version();
-            for (contact_info, stake_lamports) in self.cluster_info.all_peers() {
+            for (contact_info, stake_lamports) in all_peers {
                 if contact_info.pubkey() == &self_pubkey
                     || contact_info.shred_version() != self_shred_version
                     || contact_info.tvu(Protocol::UDP).is_none()
@@ -441,7 +469,7 @@ impl GossipRepairClient {
                 let peer = RepairPeer {
                     pubkey: *contact_info.pubkey(),
                     addr,
-                    stake_lamports,
+                    stake_lamports: *stake_lamports,
                 };
                 if seen.insert((peer.pubkey, peer.addr)) {
                     peers.push(peer);
@@ -451,10 +479,15 @@ impl GossipRepairClient {
         peers
     }
 
-    fn publish_peer_snapshot(&mut self, total_candidates: usize, peers: &[RepairPeer]) {
-        let mut known_pubkeys = Vec::new();
+    fn publish_peer_snapshot(
+        &mut self,
+        total_candidates: usize,
+        peers: &[RepairPeer],
+        all_peers: &[(ContactInfo, u64)],
+    ) {
+        let mut known_pubkeys = Vec::with_capacity(all_peers.len().saturating_add(1));
         known_pubkeys.push(self.cluster_info.id().to_bytes());
-        for (contact_info, _) in self.cluster_info.all_peers() {
+        for (contact_info, _) in all_peers {
             known_pubkeys.push(contact_info.pubkey().to_bytes());
         }
         known_pubkeys.sort_unstable();
@@ -468,7 +501,7 @@ impl GossipRepairClient {
         });
     }
 
-    fn note_peer_ping(&mut self, from_addr: std::net::SocketAddr, now: Instant) {
+    fn note_peer_ping(&mut self, from_addr: SocketAddr, now: Instant) {
         let Some(sent_at) = self.last_request_sent_at.get(&from_addr).copied() else {
             return;
         };
@@ -513,12 +546,17 @@ impl GossipRepairClient {
             .weight()
     }
 
-    fn refresh_stake_map(&mut self) {
+    fn refresh_stake_map(&mut self, all_peers: &[(ContactInfo, u64)]) {
         self.stake_by_pubkey.clear();
-        for (contact_info, stake_lamports) in self.cluster_info.all_peers() {
+        self.stake_by_pubkey.reserve(
+            all_peers
+                .len()
+                .saturating_sub(self.stake_by_pubkey.capacity()),
+        );
+        for (contact_info, stake_lamports) in all_peers {
             let _ = self
                 .stake_by_pubkey
-                .insert(*contact_info.pubkey(), stake_lamports);
+                .insert(*contact_info.pubkey(), *stake_lamports);
         }
     }
 
@@ -539,11 +577,7 @@ impl GossipRepairClient {
         self.serve_requests_by_addr.clear();
     }
 
-    fn reserve_serve_request_budget(
-        &mut self,
-        source_addr: std::net::SocketAddr,
-        now: Instant,
-    ) -> bool {
+    fn reserve_serve_request_budget(&mut self, source_addr: SocketAddr, now: Instant) -> bool {
         self.reset_serve_window_if_needed(now);
         let requests = self.serve_requests_by_addr.entry(source_addr).or_default();
         if *requests >= self.serve_max_requests_per_peer_per_sec {
@@ -629,14 +663,11 @@ impl GossipRepairClient {
         selected
     }
 
-    fn last_request_age_ms(&self, now: Instant, addr: std::net::SocketAddr) -> u64 {
+    fn last_request_age_ms(&self, now: Instant, addr: SocketAddr) -> u64 {
         self.last_request_sent_at
             .get(&addr)
             .copied()
-            .map(|sent_at| {
-                u64::try_from(now.saturating_duration_since(sent_at).as_millis())
-                    .unwrap_or(u64::MAX)
-            })
+            .map(|sent_at| duration_millis_u64(now.saturating_duration_since(sent_at)))
             .unwrap_or(u64::MAX)
     }
 
@@ -681,6 +712,12 @@ const fn mix_seed(seed: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use sof_support::{bench::avg_ns_per_iteration, env_support::read_positive_usize};
+    use solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo, node::Node};
+    use solana_signer::Signer;
+    use solana_streamer::socket::SocketAddrSpace;
 
     #[test]
     fn sticky_peer_is_kept_within_window_when_score_gap_is_small() {
@@ -707,5 +744,309 @@ mod tests {
             1_000,
             1_000 + REPAIR_PEER_SWITCH_SCORE_MARGIN,
         ));
+    }
+
+    fn profile_repair_client(peer_count: usize) -> GossipRepairClient {
+        let identity = Arc::new(Keypair::new());
+        let node = Node::new_localhost_with_pubkey(&identity.pubkey());
+        let cluster_info = Arc::new(ClusterInfo::new(
+            node.info,
+            Arc::clone(&identity),
+            SocketAddrSpace::Unspecified,
+        ));
+        for _ in 0..peer_count {
+            let peer = Keypair::new();
+            cluster_info.insert_info(ContactInfo::new_localhost(&peer.pubkey(), 0));
+        }
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind profile udp socket");
+        socket
+            .set_nonblocking(true)
+            .expect("set nonblocking profile udp socket");
+        let socket = UdpSocket::from_std(socket).expect("tokio udp socket");
+        GossipRepairClient::new(
+            cluster_info,
+            socket,
+            identity,
+            GossipRepairClientConfig {
+                peer_cache_ttl: Duration::from_secs(60),
+                peer_cache_capacity: 128,
+                active_peer_count: 32,
+                peer_sample_size: 8,
+                serve_max_bytes_per_sec: 1_000_000,
+                serve_unstaked_max_bytes_per_sec: 1_000_000,
+                serve_max_requests_per_peer_per_sec: 1_000,
+            },
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "profiling fixture for repair peer refresh"]
+    async fn repair_refresh_peer_snapshot_profile_fixture() {
+        let iterations = read_positive_usize("SOF_REPAIR_REFRESH_PROFILE_ITERS", 50_000);
+        let peer_count = read_positive_usize("SOF_REPAIR_REFRESH_PROFILE_PEERS", 64);
+        let slot = 77_u64;
+        let mut baseline_client = profile_repair_client(peer_count);
+        baseline_client.peer_cache_ttl = Duration::ZERO;
+        let mut optimized_client = profile_repair_client(peer_count);
+        optimized_client.peer_cache_ttl = Duration::ZERO;
+
+        let baseline_started_at = Instant::now();
+        let mut baseline_total_candidates = 0_u64;
+        let mut baseline_active_candidates = 0_u64;
+        for _ in 0..iterations {
+            let (total, active) = refresh_peer_snapshot_baseline(&mut baseline_client, slot);
+            baseline_total_candidates =
+                baseline_total_candidates.saturating_add(u64::try_from(total).unwrap_or(u64::MAX));
+            baseline_active_candidates = baseline_active_candidates
+                .saturating_add(u64::try_from(active).unwrap_or(u64::MAX));
+        }
+        let baseline_elapsed = baseline_started_at.elapsed();
+
+        let optimized_started_at = Instant::now();
+        let mut optimized_total_candidates = 0_u64;
+        let mut optimized_active_candidates = 0_u64;
+        for _ in 0..iterations {
+            let (total, active) = optimized_client.refresh_peer_snapshot(slot);
+            optimized_total_candidates =
+                optimized_total_candidates.saturating_add(u64::try_from(total).unwrap_or(u64::MAX));
+            optimized_active_candidates = optimized_active_candidates
+                .saturating_add(u64::try_from(active).unwrap_or(u64::MAX));
+        }
+        let optimized_elapsed = optimized_started_at.elapsed();
+        let baseline_avg_ns = avg_ns_per_iteration(baseline_elapsed, iterations);
+        let optimized_avg_ns = avg_ns_per_iteration(optimized_elapsed, iterations);
+        println!(
+            "repair_refresh_peer_snapshot_profile_fixture iterations={} peer_count={} baseline_total_candidates={} baseline_active_candidates={} optimized_total_candidates={} optimized_active_candidates={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.3} optimized_avg_us_per_iteration={:.3}",
+            iterations,
+            peer_count,
+            baseline_total_candidates,
+            baseline_active_candidates,
+            optimized_total_candidates,
+            optimized_active_candidates,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
+            baseline_avg_ns,
+            optimized_avg_ns,
+            baseline_avg_ns as f64 / 1_000.0,
+            optimized_avg_ns as f64 / 1_000.0
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "profiling fixture for cached repair peer selection"]
+    async fn repair_pick_peer_cached_profile_fixture() {
+        let iterations = read_positive_usize("SOF_REPAIR_PICK_PEER_PROFILE_ITERS", 200_000);
+        let peer_count = read_positive_usize("SOF_REPAIR_PICK_PEER_PROFILE_PEERS", 64);
+        let slot = 42_u64;
+        let mut client = profile_repair_client(0);
+        let peers = (0..peer_count)
+            .map(|index| RepairPeer {
+                pubkey: Pubkey::new_unique(),
+                addr: SocketAddr::from((
+                    [127, 0, 0, 1],
+                    u16::try_from(10_000 + index).unwrap_or(u16::MAX),
+                )),
+                stake_lamports: (u64::try_from(index).unwrap_or(0) + 1)
+                    .saturating_mul(SOL_LAMPORTS),
+            })
+            .collect::<Vec<_>>();
+        let _ = client.peers_by_slot.insert(
+            slot,
+            CachedPeers {
+                updated_at: Instant::now(),
+                peers,
+            },
+        );
+
+        let started_at = Instant::now();
+        let mut selected = 0_u64;
+        for iteration in 0..iterations {
+            let index = u32::try_from(iteration & 0xffff).unwrap_or(u32::MAX);
+            if client.pick_peer(slot, index).is_some() {
+                selected = selected.saturating_add(1);
+            }
+        }
+        let elapsed = started_at.elapsed();
+        let avg_ns = avg_ns_per_iteration(elapsed, iterations);
+        println!(
+            "repair_pick_peer_cached_profile_fixture iterations={} peer_count={} selected={} elapsed_ms={} avg_ns_per_iteration={} avg_us_per_iteration={:.3}",
+            iterations,
+            peer_count,
+            selected,
+            elapsed.as_millis(),
+            avg_ns,
+            avg_ns as f64 / 1_000.0
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "profiling fixture for repair source note batching"]
+    async fn repair_note_shred_sources_profile_fixture() {
+        let iterations = read_positive_usize("SOF_REPAIR_NOTE_SOURCES_PROFILE_ITERS", 100_000);
+        let source_count = read_positive_usize("SOF_REPAIR_NOTE_SOURCES_PROFILE_BATCH", 64);
+        let mut client = profile_repair_client(0);
+        let mut sources = Vec::with_capacity(source_count);
+        for index in 0..source_count {
+            let source_addr = SocketAddr::from((
+                [127, 0, 0, 1],
+                u16::try_from(12_000 + index).unwrap_or(u16::MAX),
+            ));
+            let direct_pubkey = Pubkey::new_unique();
+            let mut ip_pubkeys = vec![direct_pubkey];
+            ip_pubkeys.extend((0..3).map(|_| Pubkey::new_unique()));
+            let _ = client.addr_to_pubkey.insert(source_addr, direct_pubkey);
+            let _ = client.ip_to_pubkeys.insert(source_addr.ip(), ip_pubkeys);
+            sources.push((source_addr, u16::try_from((index % 4) + 1).unwrap_or(1)));
+        }
+
+        let started_at = Instant::now();
+        let mut updated = 0_usize;
+        for _ in 0..iterations {
+            updated = updated.saturating_add(client.note_shred_sources(&sources));
+        }
+        let elapsed = started_at.elapsed();
+        let avg_ns = avg_ns_per_iteration(elapsed, iterations);
+        println!(
+            "repair_note_shred_sources_profile_fixture iterations={} source_count={} updated={} elapsed_ms={} avg_ns_per_iteration={} avg_us_per_iteration={:.3}",
+            iterations,
+            source_count,
+            updated,
+            elapsed.as_millis(),
+            avg_ns,
+            avg_ns as f64 / 1_000.0
+        );
+    }
+
+    fn refresh_peer_snapshot_baseline(
+        client: &mut GossipRepairClient,
+        slot: u64,
+    ) -> (usize, usize) {
+        refresh_peers_baseline(client, slot);
+        let snapshot = client.peer_snapshot.shared_get();
+        (snapshot.total_candidates, snapshot.active_candidates)
+    }
+
+    fn refresh_peers_baseline(client: &mut GossipRepairClient, slot: u64) {
+        client.decay_peer_scores();
+        client
+            .peers_by_slot
+            .retain(|_, cached| cached.updated_at.elapsed() < client.peer_cache_ttl);
+        client.sticky_peer_by_slot.retain(|slot_key, sticky| {
+            client.peers_by_slot.contains_key(slot_key)
+                && sticky.selected_at.elapsed() < client.peer_cache_ttl
+        });
+        if client.peers_by_slot.len() > client.peer_cache_capacity {
+            let mut keys: Vec<_> = client.peers_by_slot.keys().copied().collect();
+            keys.sort_unstable_by_key(|key| {
+                client
+                    .peers_by_slot
+                    .get(key)
+                    .map(|cached| cached.updated_at)
+                    .unwrap_or_else(Instant::now)
+            });
+            let overflow = client
+                .peers_by_slot
+                .len()
+                .saturating_sub(client.peer_cache_capacity);
+            for key in keys.into_iter().take(overflow) {
+                let _ = client.peers_by_slot.remove(&key);
+                let _ = client.sticky_peer_by_slot.remove(&key);
+            }
+        }
+        let should_refresh = client
+            .peers_by_slot
+            .get(&slot)
+            .map(|cached| cached.updated_at.elapsed() >= client.peer_cache_ttl)
+            .unwrap_or(true);
+        if !should_refresh {
+            return;
+        }
+        let all_peers = client.cluster_info.all_peers();
+        client.refresh_stake_map(&all_peers);
+        let mut candidates = collect_candidate_peers_baseline(client, slot, &all_peers);
+        let total_candidates = candidates.len();
+        candidates.sort_unstable_by(|left, right| {
+            client
+                .score_for(right.pubkey)
+                .cmp(&client.score_for(left.pubkey))
+                .then_with(|| left.pubkey.to_bytes().cmp(&right.pubkey.to_bytes()))
+        });
+        let mut peers = candidates.clone();
+        if peers.len() > client.active_peer_count {
+            peers.truncate(client.active_peer_count);
+        }
+        client.addr_to_pubkey.clear();
+        client.ip_to_pubkeys.clear();
+        for peer in &candidates {
+            let _ = client.addr_to_pubkey.insert(peer.addr, peer.pubkey);
+            client
+                .ip_to_pubkeys
+                .entry(peer.addr.ip())
+                .or_default()
+                .push(peer.pubkey);
+            let _ = client.peer_scores.entry(peer.pubkey).or_default();
+        }
+        for pubkeys in client.ip_to_pubkeys.values_mut() {
+            pubkeys.sort_unstable_by_key(Pubkey::to_bytes);
+            pubkeys.dedup();
+        }
+        let _ = client.peers_by_slot.insert(
+            slot,
+            CachedPeers {
+                updated_at: Instant::now(),
+                peers: peers.clone(),
+            },
+        );
+        client.publish_peer_snapshot(total_candidates, &peers, &all_peers);
+    }
+
+    fn collect_candidate_peers_baseline(
+        client: &GossipRepairClient,
+        slot: u64,
+        all_peers: &[(ContactInfo, u64)],
+    ) -> Vec<RepairPeer> {
+        let mut seen = HashSet::new();
+        let mut peers = Vec::new();
+        for contact_info in client.cluster_info.repair_peers(slot) {
+            let Some(addr) = contact_info.serve_repair(Protocol::UDP) else {
+                continue;
+            };
+            let peer = RepairPeer {
+                pubkey: *contact_info.pubkey(),
+                addr,
+                stake_lamports: client
+                    .stake_by_pubkey
+                    .get(contact_info.pubkey())
+                    .copied()
+                    .unwrap_or_default(),
+            };
+            if seen.insert((peer.pubkey, peer.addr)) {
+                peers.push(peer);
+            }
+        }
+        if peers.is_empty() {
+            let self_pubkey = client.cluster_info.id();
+            let self_shred_version = client.cluster_info.my_shred_version();
+            for (contact_info, stake_lamports) in all_peers {
+                if contact_info.pubkey() == &self_pubkey
+                    || contact_info.shred_version() != self_shred_version
+                    || contact_info.tvu(Protocol::UDP).is_none()
+                {
+                    continue;
+                }
+                let Some(addr) = contact_info.serve_repair(Protocol::UDP) else {
+                    continue;
+                };
+                let peer = RepairPeer {
+                    pubkey: *contact_info.pubkey(),
+                    addr,
+                    stake_lamports: *stake_lamports,
+                };
+                if seen.insert((peer.pubkey, peer.addr)) {
+                    peers.push(peer);
+                }
+            }
+        }
+        peers
     }
 }

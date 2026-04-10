@@ -5,11 +5,12 @@ use std::net::SocketAddr;
 use async_trait::async_trait;
 use sof::framework::{
     ClusterTopologyEvent, LeaderScheduleEvent, ObservedRecentBlockhashEvent, ObserverPlugin,
-    PluginHost,
+    PluginConfig, PluginHost,
 };
 use sof_types::PubkeyBytes;
 
 use crate::{
+    adapters::TxProviderControlPlaneQuality,
     adapters::common::{
         TxProviderAdapterConfig, TxProviderAdapterCore, TxProviderControlPlaneSnapshot,
         TxProviderFlowSafetyPolicy, TxProviderFlowSafetyReport, take_next_leader_identity_targets,
@@ -139,12 +140,10 @@ impl TxFlowSafetySource for PluginHostTxProviderAdapter {
             ..TxProviderFlowSafetyPolicy::default()
         });
         let quality = match report.quality {
-            crate::adapters::TxProviderControlPlaneQuality::Stable => TxFlowSafetyQuality::Stable,
-            crate::adapters::TxProviderControlPlaneQuality::Degraded => {
-                TxFlowSafetyQuality::Degraded
-            }
-            crate::adapters::TxProviderControlPlaneQuality::Stale => TxFlowSafetyQuality::Stale,
-            crate::adapters::TxProviderControlPlaneQuality::IncompleteControlPlane => {
+            TxProviderControlPlaneQuality::Stable => TxFlowSafetyQuality::Stable,
+            TxProviderControlPlaneQuality::Degraded => TxFlowSafetyQuality::Degraded,
+            TxProviderControlPlaneQuality::Stale => TxFlowSafetyQuality::Stale,
+            TxProviderControlPlaneQuality::IncompleteControlPlane => {
                 TxFlowSafetyQuality::IncompleteControlPlane
             }
         };
@@ -177,8 +176,8 @@ impl ObserverPlugin for PluginHostTxProviderAdapter {
         "sof-tx-provider-adapter"
     }
 
-    fn config(&self) -> sof::framework::PluginConfig {
-        let config = sof::framework::PluginConfig::new()
+    fn config(&self) -> PluginConfig {
+        let config = PluginConfig::new()
             .with_recent_blockhash()
             .with_cluster_topology();
         if self.leader_schedule_enabled {
@@ -206,9 +205,17 @@ mod tests {
     use std::net::SocketAddr;
 
     use super::*;
-    use sof::framework::{ClusterNodeInfo, ControlPlaneSource, LeaderScheduleEntry, PluginHost};
+    use sof::{
+        event::ForkSlotStatus,
+        framework::{
+            ClusterNodeInfo, ControlPlaneSource, LeaderScheduleEntry, PluginHost,
+            SlotStatusChangedEvent,
+        },
+    };
     use sof_types::PubkeyBytes;
     use solana_pubkey::Pubkey;
+
+    use crate::adapters::TxProviderFlowSafetyIssue;
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
@@ -538,14 +545,12 @@ mod tests {
                 vec![LeaderScheduleEntry { slot: 200, leader }],
             ))
             .await;
-        adapter
-            .core
-            .apply_slot_status(sof::framework::SlotStatusChangedEvent {
-                slot: 200,
-                parent_slot: Some(199),
-                previous_status: Some(sof::event::ForkSlotStatus::Processed),
-                status: sof::event::ForkSlotStatus::Confirmed,
-            });
+        adapter.core.apply_slot_status(SlotStatusChangedEvent {
+            slot: 200,
+            parent_slot: Some(199),
+            previous_status: Some(ForkSlotStatus::Processed),
+            status: ForkSlotStatus::Confirmed,
+        });
 
         let report = adapter.evaluate_flow_safety(TxProviderFlowSafetyPolicy {
             max_recent_blockhash_slot_lag: Some(16),
@@ -553,12 +558,14 @@ mod tests {
         });
 
         assert!(!report.is_safe());
-        assert!(report.issues.contains(
-            &crate::adapters::TxProviderFlowSafetyIssue::StaleRecentBlockhash {
-                slot_lag: 190,
-                max_allowed: 16,
-            }
-        ));
+        assert!(
+            report
+                .issues
+                .contains(&TxProviderFlowSafetyIssue::StaleRecentBlockhash {
+                    slot_lag: 190,
+                    max_allowed: 16,
+                })
+        );
     }
 
     #[tokio::test]
@@ -579,17 +586,15 @@ mod tests {
         adapter
             .on_cluster_topology(topology_snapshot(vec![node(leader, 9441)]))
             .await;
-        adapter
-            .core
-            .apply_slot_status(sof::framework::SlotStatusChangedEvent {
-                slot: 100,
-                parent_slot: Some(99),
-                previous_status: Some(sof::event::ForkSlotStatus::Processed),
-                status: sof::event::ForkSlotStatus::Confirmed,
-            });
+        adapter.core.apply_slot_status(SlotStatusChangedEvent {
+            slot: 100,
+            parent_slot: Some(99),
+            previous_status: Some(ForkSlotStatus::Processed),
+            status: ForkSlotStatus::Confirmed,
+        });
 
         let snapshot = adapter.toxic_flow_snapshot();
-        assert_eq!(snapshot.quality, crate::submit::TxFlowSafetyQuality::Stable);
+        assert_eq!(snapshot.quality, TxFlowSafetyQuality::Stable);
         assert!(snapshot.issues.is_empty());
         assert_eq!(
             adapter.current_leader(),

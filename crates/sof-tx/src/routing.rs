@@ -1,13 +1,16 @@
 //! Routing policy, target selection, and signature-level duplicate suppression.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque, hash_map::Entry},
     time::{Duration, Instant},
 };
 
 use sof_types::SignatureBytes;
 
 use crate::providers::{LeaderProvider, LeaderTarget};
+
+/// Initial storage reserved for the signature dedupe window before it grows.
+const INITIAL_SIGNATURE_DEDUPER_CAPACITY: usize = 4_096;
 
 /// Routing controls used for direct and hybrid submit paths.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -93,6 +96,8 @@ pub struct SignatureDeduper {
     ttl: Duration,
     /// Last seen timestamps by signature.
     seen: HashMap<SignatureBytes, Instant>,
+    /// Arrival order for bounded eviction without rescanning the whole map.
+    order: VecDeque<(SignatureBytes, Instant)>,
 }
 
 impl SignatureDeduper {
@@ -101,18 +106,22 @@ impl SignatureDeduper {
     pub fn new(ttl: Duration) -> Self {
         Self {
             ttl: ttl.max(Duration::from_millis(1)),
-            seen: HashMap::new(),
+            seen: HashMap::with_capacity(INITIAL_SIGNATURE_DEDUPER_CAPACITY),
+            order: VecDeque::with_capacity(INITIAL_SIGNATURE_DEDUPER_CAPACITY),
         }
     }
 
     /// Returns true when signature is new (and records it), false when duplicate.
     pub fn check_and_insert(&mut self, signature: SignatureBytes, now: Instant) -> bool {
         self.evict_expired(now);
-        if self.seen.contains_key(&signature) {
-            return false;
+        match self.seen.entry(signature) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(entry) => {
+                entry.insert(now);
+                self.order.push_back((signature, now));
+                true
+            }
         }
-        let _ = self.seen.insert(signature, now);
-        true
     }
 
     /// Returns number of signatures currently tracked.
@@ -129,14 +138,22 @@ impl SignatureDeduper {
 
     /// Removes all expired signature entries.
     fn evict_expired(&mut self, now: Instant) {
-        let ttl = self.ttl;
-        self.seen
-            .retain(|_, first_seen| now.saturating_duration_since(*first_seen) < ttl);
+        while let Some((signature, first_seen)) = self.order.front().copied() {
+            if now.saturating_duration_since(first_seen) < self.ttl {
+                break;
+            }
+            self.order.pop_front();
+            if self.seen.get(&signature).copied() == Some(first_seen) {
+                let _ = self.seen.remove(&signature);
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use sof_support::{bench::avg_ns_per_iteration, env_support::read_positive_usize};
+
     use super::*;
     use crate::providers::{LeaderTarget, StaticLeaderProvider};
 
@@ -199,5 +216,96 @@ mod tests {
         assert!(deduper.check_and_insert(signature, now));
         assert!(!deduper.check_and_insert(signature, now + Duration::from_millis(5)));
         assert!(deduper.check_and_insert(signature, now + Duration::from_millis(30)));
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for signature dedupe churn"]
+    fn signature_deduper_profile_fixture() {
+        let iterations = read_positive_usize("SOF_TX_SIGNATURE_DEDUPER_PROFILE_ITERS", 50_000);
+        let ttl_ms = u64::try_from(read_positive_usize(
+            "SOF_TX_SIGNATURE_DEDUPER_PROFILE_TTL_MS",
+            10_000,
+        ))
+        .unwrap_or(10_000);
+        let mut deduper = SignatureDeduper::new(Duration::from_millis(ttl_ms));
+        let start = Instant::now();
+        let now = Instant::now();
+
+        for index in 0..iterations {
+            let mut signature = [0_u8; 64];
+            signature[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            assert!(deduper.check_and_insert(
+                SignatureBytes::from(signature),
+                now + Duration::from_nanos(index as u64)
+            ));
+        }
+
+        let elapsed = start.elapsed();
+        let avg_ns = avg_ns_per_iteration(elapsed, iterations);
+        println!(
+            "signature_deduper_profile_fixture iterations={} ttl_ms={} entries={} elapsed_us={} avg_ns_per_iteration={} avg_us_per_iteration={:.3}",
+            iterations,
+            ttl_ms,
+            deduper.len(),
+            elapsed.as_micros(),
+            avg_ns,
+            avg_ns as f64 / 1_000.0
+        );
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for signature deduper allocation churn"]
+    fn signature_deduper_allocation_profile_fixture() {
+        let iterations = read_positive_usize("SOF_TX_SIGNATURE_DEDUPER_PROFILE_ITERS", 50_000);
+        let ttl_ms = u64::try_from(read_positive_usize(
+            "SOF_TX_SIGNATURE_DEDUPER_PROFILE_TTL_MS",
+            10_000,
+        ))
+        .unwrap_or(10_000);
+        let ttl = Duration::from_millis(ttl_ms);
+        let mut baseline = signature_deduper_baseline(ttl);
+        let mut optimized = SignatureDeduper::new(ttl);
+        let now = Instant::now();
+
+        let baseline_started = Instant::now();
+        for index in 0..iterations {
+            let signature = make_signature(index);
+            assert!(baseline.check_and_insert(
+                SignatureBytes::from(signature),
+                now + Duration::from_nanos(index as u64)
+            ));
+        }
+        let baseline_elapsed = baseline_started.elapsed();
+
+        let optimized_started = Instant::now();
+        for index in 0..iterations {
+            let signature = make_signature(index);
+            assert!(optimized.check_and_insert(
+                SignatureBytes::from(signature),
+                now + Duration::from_nanos(index as u64)
+            ));
+        }
+        let optimized_elapsed = optimized_started.elapsed();
+
+        println!(
+            "signature_deduper_allocation_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            iterations,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
+        );
+    }
+
+    fn signature_deduper_baseline(ttl: Duration) -> SignatureDeduper {
+        SignatureDeduper {
+            ttl: ttl.max(Duration::from_millis(1)),
+            seen: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn make_signature(index: usize) -> [u8; 64] {
+        let mut signature = [0_u8; 64];
+        signature[..8].copy_from_slice(&(index as u64).to_le_bytes());
+        signature
     }
 }

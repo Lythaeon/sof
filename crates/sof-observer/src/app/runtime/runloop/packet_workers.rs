@@ -147,17 +147,33 @@ pub(super) struct SharedKnownPubkeys {
 #[cfg(feature = "gossip-bootstrap")]
 impl SharedKnownPubkeys {
     #[cfg(feature = "gossip-bootstrap")]
-    pub(super) fn update(&self, pubkeys: Vec<[u8; 32]>) {
+    pub(super) fn update(&self, pubkeys: &[[u8; 32]]) {
+        let current = self.pubkeys.shared_get();
+        if current.as_slice() == pubkeys {
+            return;
+        }
+
+        let mut normalized = pubkeys.to_vec();
+        normalized.sort_unstable();
+        normalized.dedup();
+        if current.as_slice() == normalized.as_slice() {
+            return;
+        }
+
         let mut shared_pubkeys = self.pubkeys.clone();
-        shared_pubkeys.update(Arc::new(pubkeys));
-        self.generation.fetch_add(1, Ordering::Relaxed);
+        shared_pubkeys.update(Arc::new(normalized));
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
     fn snapshot(&self) -> (u64, Arc<Vec<[u8; 32]>>) {
-        let generation = self.generation.load(Ordering::Relaxed);
-        let pubkeys = self.pubkeys.shared_get();
-        let pubkeys = Arc::clone(&pubkeys);
-        (generation, pubkeys)
+        loop {
+            let generation_before = self.generation.load(Ordering::Acquire);
+            let pubkeys = self.pubkeys.shared_get();
+            let generation_after = self.generation.load(Ordering::Acquire);
+            if generation_before == generation_after {
+                return (generation_after, Arc::clone(&pubkeys));
+            }
+        }
     }
 }
 
@@ -386,7 +402,7 @@ impl PacketWorkerPool {
     }
 
     #[cfg(feature = "gossip-bootstrap")]
-    pub(super) fn update_known_pubkeys(&self, pubkeys: Vec<[u8; 32]>) {
+    pub(super) fn update_known_pubkeys(&self, pubkeys: &[[u8; 32]]) {
         self.known_pubkeys.update(pubkeys);
     }
 
@@ -462,7 +478,7 @@ fn refresh_known_pubkeys(
     if generation == *verifier_generation {
         return;
     }
-    shred_verifier.set_known_pubkeys(pubkeys.as_ref().clone());
+    shred_verifier.set_known_pubkeys_sorted(pubkeys.as_slice());
     *verifier_generation = generation;
 }
 
@@ -510,8 +526,8 @@ where
                     parsed_header_slot(&packet.parsed_header),
                     &mut observed_slot_leaders,
                 );
-                let recovered_packets = fec_recoverer
-                    .ingest_packet(packet.packet_bytes.as_ref(), &packet.parsed_header);
+                let recovered_packets =
+                    fec_recoverer.ingest_packet(&packet.packet_bytes, &packet.parsed_header);
                 push_primary_shred(packet, &mut accepted_shreds);
 
                 for recovered in recovered_packets {
@@ -765,6 +781,9 @@ const fn derive_parent_slot(slot: u64, parent_offset: u16) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "gossip-bootstrap")]
+    use crate::verify::ShredVerifier;
     use crate::{
         protocol::shred_wire::{
             SIZE_OF_CODING_SHRED_HEADERS, SIZE_OF_CODING_SHRED_PAYLOAD, SIZE_OF_DATA_SHRED_PAYLOAD,
@@ -773,6 +792,11 @@ mod tests {
         shred::wire::{SIZE_OF_DATA_SHRED_HEADERS, parse_shred_header},
     };
     use reed_solomon_erasure::galois_8::ReedSolomon;
+    use sof_support::{bench::avg_ns_per_iteration, env_support::read_positive_usize};
+    #[cfg(feature = "gossip-bootstrap")]
+    use solana_keypair::Keypair;
+    #[cfg(feature = "gossip-bootstrap")]
+    use solana_signer::Signer;
 
     fn build_data_shred_packet(
         slot: u64,
@@ -833,6 +857,61 @@ mod tests {
         packet[SIZE_OF_SIGNATURE..SIZE_OF_SIGNATURE + shard_len].to_vec()
     }
 
+    #[cfg(feature = "gossip-bootstrap")]
+    #[test]
+    fn shared_known_pubkeys_skips_equivalent_updates() {
+        let shared = SharedKnownPubkeys::default();
+        let initial = [[2_u8; 32], [1_u8; 32], [2_u8; 32]];
+
+        shared.update(&initial);
+        let (first_generation, first_pubkeys) = shared.snapshot();
+        assert_eq!(first_generation, 1);
+        assert_eq!(first_pubkeys.as_slice(), &[[1_u8; 32], [2_u8; 32]]);
+
+        let reordered = [[1_u8; 32], [2_u8; 32]];
+        shared.update(&reordered);
+        let (second_generation, second_pubkeys) = shared.snapshot();
+        assert_eq!(second_generation, 1);
+        assert_eq!(second_pubkeys.as_slice(), &[[1_u8; 32], [2_u8; 32]]);
+    }
+
+    #[cfg(feature = "gossip-bootstrap")]
+    #[test]
+    #[ignore = "profiling fixture for equivalent known-pubkey refresh churn"]
+    fn shared_known_pubkeys_equivalent_refresh_profile_fixture() {
+        let iterations =
+            read_positive_usize("SOF_PACKET_WORKER_KNOWN_PUBKEY_PROFILE_ITERS", 200_000);
+        let key_count = read_positive_usize("SOF_PACKET_WORKER_KNOWN_PUBKEY_COUNT", 64);
+        let mut canonical = (0..key_count)
+            .map(|_| Keypair::new().pubkey().to_bytes())
+            .collect::<Vec<_>>();
+        canonical.sort_unstable();
+
+        let shared = SharedKnownPubkeys::default();
+        let mut verifier = ShredVerifier::new(1024, 256, Duration::from_secs(5));
+        let mut verifier_generation = 0_u64;
+
+        shared.update(&canonical);
+        refresh_known_pubkeys(&shared, &mut verifier_generation, Some(&mut verifier));
+
+        let started_at = Instant::now();
+        for _ in 0..iterations {
+            shared.update(&canonical);
+            refresh_known_pubkeys(&shared, &mut verifier_generation, Some(&mut verifier));
+        }
+        let elapsed = started_at.elapsed();
+        let avg_ns = avg_ns_per_iteration(elapsed, iterations);
+        println!(
+            "shared_known_pubkeys_equivalent_refresh_profile_fixture iterations={} key_count={} final_generation={} elapsed_ms={} avg_ns_per_iteration={} avg_us_per_iteration={:.3}",
+            iterations,
+            key_count,
+            verifier_generation,
+            elapsed.as_millis(),
+            avg_ns,
+            avg_ns as f64 / 1_000.0
+        );
+    }
+
     fn build_recoverable_fec_pair(slot: u64) -> [(Arc<[u8]>, ParsedShredHeader); 2] {
         let data0 = build_data_shred_packet(slot, 0, 0, 1, &[1, 2, 3, 4]);
         let data1 = build_data_shred_packet(slot, 1, 0, 1, &[5, 6, 7, 8]);
@@ -861,11 +940,7 @@ mod tests {
     #[test]
     #[ignore = "profiling fixture for packet worker primary FEC ingest"]
     fn packet_worker_primary_fec_profile_fixture() {
-        let iterations = std::env::var("SOF_PACKET_WORKER_FEC_PROFILE_ITERS")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(50_000);
+        let iterations = read_positive_usize("SOF_PACKET_WORKER_FEC_PROFILE_ITERS", 50_000);
         let packets = (0..iterations)
             .map(|iteration| {
                 let slot =
@@ -908,22 +983,23 @@ mod tests {
             );
             assert!(forwarded);
         }
+        let elapsed = started_at.elapsed();
+        let avg_ns = avg_ns_per_iteration(elapsed, iterations);
         println!(
-            "packet_worker_primary_fec_profile_fixture iterations={} emitted={} elapsed_ms={}",
+            "packet_worker_primary_fec_profile_fixture iterations={} emitted={} elapsed_ms={} avg_ns_per_iteration={} avg_us_per_iteration={:.3}",
             iterations,
             emitted,
-            started_at.elapsed().as_millis()
+            elapsed.as_millis(),
+            avg_ns,
+            avg_ns as f64 / 1_000.0
         );
     }
 
     #[test]
     #[ignore = "profiling fixture for packet worker FEC recovery"]
     fn packet_worker_recovery_fec_profile_fixture() {
-        let iterations = std::env::var("SOF_PACKET_WORKER_FEC_RECOVERY_PROFILE_ITERS")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(20_000);
+        let iterations =
+            read_positive_usize("SOF_PACKET_WORKER_FEC_RECOVERY_PROFILE_ITERS", 20_000);
         let batches = (0..iterations)
             .map(|iteration| {
                 let slot =
@@ -974,12 +1050,16 @@ mod tests {
             );
             assert!(forwarded);
         }
+        let elapsed = started_at.elapsed();
+        let avg_ns = avg_ns_per_iteration(elapsed, iterations);
         println!(
-            "packet_worker_recovery_fec_profile_fixture iterations={} emitted={} recovered={} elapsed_ms={}",
+            "packet_worker_recovery_fec_profile_fixture iterations={} emitted={} recovered={} elapsed_ms={} avg_ns_per_iteration={} avg_us_per_iteration={:.3}",
             iterations,
             emitted,
             recovered,
-            started_at.elapsed().as_millis()
+            elapsed.as_millis(),
+            avg_ns,
+            avg_ns as f64 / 1_000.0
         );
     }
 

@@ -22,6 +22,11 @@ impl OutstandingRepairKey {
 pub struct OutstandingRepairRequests {
     entries: HashMap<OutstandingRepairKey, Instant>,
     #[cfg(any(feature = "gossip-bootstrap", test))]
+    highest_window_by_slot: BTreeSet<(u64, u32)>,
+    #[cfg(any(feature = "gossip-bootstrap", test))]
+    /// Insertion order for expiry, including stale superseded timestamps.
+    order: VecDeque<(OutstandingRepairKey, Instant)>,
+    #[cfg(any(feature = "gossip-bootstrap", test))]
     timeout: Duration,
 }
 
@@ -32,16 +37,31 @@ impl OutstandingRepairRequests {
         Self {
             entries: HashMap::new(),
             #[cfg(any(feature = "gossip-bootstrap", test))]
+            highest_window_by_slot: BTreeSet::new(),
+            #[cfg(any(feature = "gossip-bootstrap", test))]
+            order: VecDeque::new(),
+            #[cfg(any(feature = "gossip-bootstrap", test))]
             timeout,
         }
     }
 
-    #[cfg(feature = "gossip-bootstrap")]
+    #[cfg(any(feature = "gossip-bootstrap", test))]
     pub fn purge_expired(&mut self, now: Instant) -> usize {
-        let before = self.entries.len();
-        self.entries
-            .retain(|_, sent_at| now.saturating_duration_since(*sent_at) < self.timeout);
-        before.saturating_sub(self.entries.len())
+        let mut removed = 0_usize;
+        while let Some((_, front_sent_at)) = self.order.front() {
+            if now.saturating_duration_since(*front_sent_at) < self.timeout {
+                break;
+            }
+            let Some((key, queued_sent_at)) = self.order.pop_front() else {
+                break;
+            };
+            if self.entries.get(&key) == Some(&queued_sent_at) {
+                let _ = self.entries.remove(&key);
+                self.remove_highest_window_index(key);
+                removed = removed.saturating_add(1);
+            }
+        }
+        removed
     }
 
     #[cfg(any(feature = "gossip-bootstrap", test))]
@@ -52,17 +72,21 @@ impl OutstandingRepairRequests {
                 return false;
             }
             *sent_at = now;
+            self.insert_highest_window_index(key);
+            self.order.push_back((key, now));
             return true;
         }
         let _ = self.entries.insert(key, now);
+        self.insert_highest_window_index(key);
+        self.order.push_back((key, now));
         true
     }
 
     #[cfg(feature = "gossip-bootstrap")]
     pub fn release(&mut self, request: &MissingShredRequest) {
-        let _ = self
-            .entries
-            .remove(&OutstandingRepairKey::from_request(request));
+        let key = OutstandingRepairKey::from_request(request);
+        let _ = self.entries.remove(&key);
+        self.remove_highest_window_index(key);
     }
 
     pub fn on_shred_received(&mut self, slot: u64, index: u32) -> usize {
@@ -78,16 +102,48 @@ impl OutstandingRepairRequests {
         {
             removed = removed.saturating_add(1);
         }
-        let before = self.entries.len();
-        self.entries.retain(|key, _| {
-            !(key.kind == MissingShredRequestKind::HighestWindowIndex
-                && key.slot == slot
-                && key.index <= index)
-        });
-        removed.saturating_add(before.saturating_sub(self.entries.len()))
+        #[cfg(any(feature = "gossip-bootstrap", test))]
+        {
+            let highest_to_clear: Vec<_> = self
+                .highest_window_by_slot
+                .range((slot, 0)..=(slot, index))
+                .copied()
+                .collect();
+            for (highest_slot, highest_index) in highest_to_clear {
+                if self
+                    .entries
+                    .remove(&OutstandingRepairKey {
+                        slot: highest_slot,
+                        index: highest_index,
+                        kind: MissingShredRequestKind::HighestWindowIndex,
+                    })
+                    .is_some()
+                {
+                    removed = removed.saturating_add(1);
+                }
+                let _ = self
+                    .highest_window_by_slot
+                    .remove(&(highest_slot, highest_index));
+            }
+        }
+        removed
     }
 
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    #[cfg(any(feature = "gossip-bootstrap", test))]
+    fn insert_highest_window_index(&mut self, key: OutstandingRepairKey) {
+        if key.kind == MissingShredRequestKind::HighestWindowIndex {
+            let _ = self.highest_window_by_slot.insert((key.slot, key.index));
+        }
+    }
+
+    #[cfg(any(feature = "gossip-bootstrap", test))]
+    fn remove_highest_window_index(&mut self, key: OutstandingRepairKey) {
+        if key.kind == MissingShredRequestKind::HighestWindowIndex {
+            let _ = self.highest_window_by_slot.remove(&(key.slot, key.index));
+        }
     }
 }

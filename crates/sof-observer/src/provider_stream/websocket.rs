@@ -7,28 +7,51 @@
 //! and LaserStream by requesting full base64 transaction payloads and converting
 //! them into [`crate::framework::TransactionEvent`] values before dispatch.
 
-use std::{borrow::Cow, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow,
+    fmt,
+    future::pending,
+    mem,
+    str::FromStr,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
+use reqwest::redirect::Policy;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Value, from_slice as json_from_slice, json};
 use simd_json::{Buffers as SimdJsonBuffers, serde::from_slice as simd_from_slice};
+use sof_support::short_vec::decode_short_u16_len;
+use sof_support::time_support::nonzero_duration_or;
 use sof_types::{PubkeyBytes, SignatureBytes};
+use solana_packet::PACKET_DATA_SIZE;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
+use solana_system_interface::MAX_PERMITTED_DATA_LENGTH;
 use solana_transaction::versioned::VersionedTransaction;
 use thiserror::Error;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async, tungstenite::protocol::Message as WsMessage,
+    MaybeTlsStream, WebSocketStream, connect_async_with_config,
+    tungstenite::{
+        Error as TungsteniteError,
+        protocol::{Message as WsMessage, WebSocketConfig},
+    },
 };
 
+#[cfg(test)]
+use std::hint::black_box;
+
 use crate::{
-    event::TxCommitmentStatus,
-    framework::{AccountUpdateEvent, TransactionEvent, pubkey_bytes, signature_bytes_opt},
+    event::{TxCommitmentStatus, TxKind},
+    framework::{
+        AccountUpdateEvent, TransactionEvent, TransactionLogEvent, pubkey_bytes,
+        signature_bytes_opt,
+    },
     provider_stream::{
         ProviderCommitmentWatermarks, ProviderSourceArbitrationMode, ProviderSourceHealthEvent,
         ProviderSourceHealthReason, ProviderSourceHealthStatus, ProviderSourceId,
@@ -36,9 +59,13 @@ use crate::{
         ProviderSourceReservation, ProviderSourceRole, ProviderSourceTaskGuard,
         ProviderStreamFanIn, ProviderStreamMode, ProviderStreamSender, ProviderStreamUpdate,
         SerializedTransactionEvent, classify_provider_transaction_kind,
-        emit_provider_source_removed_with_reservation,
+        emit_provider_source_removed_with_reservation, keepalive_interval,
     },
 };
+
+const MIN_RECONNECT_DELAY: Duration = Duration::from_millis(1);
+const MIN_STALL_TIMEOUT: Duration = Duration::from_millis(1);
+const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Commitment level used for websocket `transactionSubscribe` notifications.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -125,8 +152,8 @@ pub enum WebsocketConfigOption {
     ProgramFilters,
 }
 
-impl std::fmt::Display for WebsocketConfigOption {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for WebsocketConfigOption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::HttpEndpoint => f.write_str("http replay endpoint"),
             Self::VoteFilter => f.write_str("vote filter"),
@@ -588,6 +615,10 @@ impl WebsocketTransactionConfig {
             WebsocketPrimaryStream::Program(_) => WebsocketStreamKind::Program,
         }
     }
+
+    const fn reconnect_delay_effective(&self) -> Duration {
+        effective_reconnect_delay(self.reconnect_delay)
+    }
 }
 
 /// Primary websocket subscription families supported by the built-in adapter.
@@ -814,6 +845,18 @@ impl WebsocketLogsConfig {
             .with_priority(self.source_priority)
             .with_arbitration(self.source_arbitration)
     }
+
+    const fn reconnect_delay_effective(&self) -> Duration {
+        effective_reconnect_delay(self.reconnect_delay)
+    }
+}
+
+const fn effective_reconnect_delay(delay: Duration) -> Duration {
+    if delay.is_zero() {
+        MIN_RECONNECT_DELAY
+    } else {
+        delay
+    }
 }
 
 /// Websocket `transactionSubscribe` error surface.
@@ -824,7 +867,7 @@ pub enum WebsocketTransactionError {
     Config(#[from] WebsocketConfigError),
     /// Websocket transport failure.
     #[error(transparent)]
-    Transport(#[from] tokio_tungstenite::tungstenite::Error),
+    Transport(#[from] TungsteniteError),
     /// Upstream payload shape/protocol failure.
     #[error(transparent)]
     Protocol(#[from] WebsocketProtocolError),
@@ -844,7 +887,7 @@ pub enum WebsocketTransactionError {
 pub enum WebsocketLogsError {
     /// Websocket transport failure.
     #[error(transparent)]
-    Transport(#[from] tokio_tungstenite::tungstenite::Error),
+    Transport(#[from] TungsteniteError),
     /// Upstream payload shape/protocol failure.
     #[error(transparent)]
     Protocol(#[from] WebsocketProtocolError),
@@ -937,8 +980,8 @@ pub enum WebsocketStreamKind {
     Program,
 }
 
-impl std::fmt::Display for WebsocketStreamKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for WebsocketStreamKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Transaction => f.write_str("websocket transaction"),
             Self::Logs => f.write_str("websocket logs"),
@@ -1131,7 +1174,7 @@ async fn spawn_websocket_source_inner(
                 .await?;
                 return Err(WebsocketProtocolError::ReconnectBudgetExhausted { attempts }.into());
             }
-            tokio::time::sleep(config.reconnect_delay).await;
+            tokio::time::sleep(config.reconnect_delay_effective()).await;
         }
     }))
 }
@@ -1286,7 +1329,7 @@ async fn spawn_websocket_logs_source_inner(
                 .await?;
                 return Err(WebsocketProtocolError::ReconnectBudgetExhausted { attempts }.into());
             }
-            tokio::time::sleep(config.reconnect_delay).await;
+            tokio::time::sleep(config.reconnect_delay_effective()).await;
         }
     }))
 }
@@ -1302,6 +1345,7 @@ async fn run_websocket_primary_connection(
 ) -> Result<(), WebsocketTransactionError> {
     *session_established = false;
     let (mut write, mut read) = stream.split();
+    let provider_source = Arc::new(source.clone());
     *session_established = true;
     send_primary_provider_health(
         source,
@@ -1316,9 +1360,9 @@ async fn run_websocket_primary_connection(
         && config.replay_on_reconnect
         && last_seen_slot.is_some()
     {
-        replay_websocket_gap(config, source, sender, last_seen_slot, watermarks).await?;
+        replay_websocket_gap(config, &provider_source, sender, last_seen_slot, watermarks).await?;
     }
-    let mut ping = config.ping_interval.map(tokio::time::interval);
+    let mut ping = config.ping_interval.map(keepalive_interval);
     let mut scratch = WebsocketParseScratch::default();
     let mut last_progress = tokio::time::Instant::now();
 
@@ -1328,17 +1372,17 @@ async fn run_websocket_primary_connection(
                 if let Some(interval) = ping.as_mut() {
                     interval.tick().await;
                 } else {
-                    std::future::pending::<()>().await;
+                    pending::<()>().await;
                 }
             } => {
                 write.send(WsMessage::Ping(Vec::new().into())).await?;
             }
             () = async {
-                if let Some(timeout) = config.stall_timeout {
+                if let Some(timeout) = websocket_stall_timeout(config.stall_timeout) {
                     let deadline = last_progress.checked_add(timeout).unwrap_or(last_progress);
                     tokio::time::sleep_until(deadline).await;
                 } else {
-                    std::future::pending::<()>().await;
+                    pending::<()>().await;
                 }
             } => {
                 return Err(WebsocketProtocolError::StreamStalled {
@@ -1362,7 +1406,7 @@ async fn run_websocket_primary_connection(
                         };
                         handle_primary_notification(
                             config,
-                            source,
+                            &provider_source,
                             sender,
                             frame_bytes_mut(&mut scratch.frame_bytes, text.as_str().as_bytes()),
                             &mut state,
@@ -1378,7 +1422,7 @@ async fn run_websocket_primary_connection(
                         };
                         handle_primary_notification(
                             config,
-                            source,
+                            &provider_source,
                             sender,
                             frame_bytes_mut(&mut scratch.frame_bytes, bytes.as_ref()),
                             &mut state,
@@ -1390,7 +1434,8 @@ async fn run_websocket_primary_connection(
                     }
                     WsMessage::Pong(_) => {}
                     WsMessage::Close(frame) => {
-                        return Err(WebsocketProtocolError::Closed(format!("{frame:?}")).into());
+                        write.send(WsMessage::Close(frame)).await.ok();
+                        return Ok(());
                     }
                     _ => {}
                 }
@@ -1529,51 +1574,16 @@ const fn websocket_logs_health_reason(error: &WebsocketLogsError) -> ProviderSou
     }
 }
 
-async fn wait_for_subscription_ack<S>(read: &mut S) -> Result<(), WebsocketTransactionError>
+async fn wait_for_subscription_ack<S>(
+    read: &mut S,
+    ack_timeout: Duration,
+) -> Result<(), WebsocketTransactionError>
 where
-    S: futures_util::Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
+    S: Stream<Item = Result<WsMessage, TungsteniteError>>
+        + Sink<WsMessage, Error = TungsteniteError>
         + Unpin,
 {
-    let ack_timeout = Duration::from_secs(10);
-    let mut frame_bytes = Vec::new();
-    tokio::time::timeout(ack_timeout, async {
-        loop {
-            let Some(frame) = read.next().await else {
-                return Err(WebsocketTransactionError::Protocol(
-                    WebsocketProtocolError::ClosedBeforeSubscriptionAck,
-                ));
-            };
-            let frame = frame?;
-            match frame {
-                WsMessage::Text(text) => {
-                    if handle_subscription_text(frame_bytes_mut(
-                        &mut frame_bytes,
-                        text.as_str().as_bytes(),
-                    ))? {
-                        return Ok(());
-                    }
-                }
-                WsMessage::Binary(bytes) => {
-                    if handle_subscription_text(frame_bytes_mut(&mut frame_bytes, bytes.as_ref()))?
-                    {
-                        return Ok(());
-                    }
-                }
-                WsMessage::Ping(_) | WsMessage::Pong(_) => {}
-                WsMessage::Close(frame) => {
-                    return Err(
-                        WebsocketProtocolError::ClosedBeforeSubscriptionAckWithFrame(format!(
-                            "{frame:?}"
-                        ))
-                        .into(),
-                    );
-                }
-                _ => {}
-            }
-        }
-    })
-    .await
-    .map_err(|_elapsed| WebsocketProtocolError::SubscriptionAckTimeout)?
+    wait_for_subscription_ack_with(read, ack_timeout, handle_subscription_text).await
 }
 
 fn handle_subscription_text(bytes: &mut [u8]) -> Result<bool, WebsocketTransactionError> {
@@ -1615,30 +1625,79 @@ fn parse_transaction_notification(
             "unsupported websocket transaction encoding",
         ));
     }
-    tx_bytes.clear();
-    STANDARD
-        .decode_vec(notification.transaction.transaction.0.as_bytes(), tx_bytes)
-        .map_err(|_error| {
-            WebsocketTransactionError::Convert("invalid base64 transaction payload")
-        })?;
+    decode_transaction_wire_payload(&notification.transaction.transaction.0, tx_bytes)?;
     let signature = serialized_transaction_first_signature(tx_bytes).or_else(|| {
         notification
             .signature
             .and_then(|signature| Signature::from_str(&signature).ok())
             .map(SignatureBytes::from)
     });
-    watermarks
-        .observe_transaction_commitment(notification.slot, commitment_status.as_tx_commitment());
-    let tx_payload = std::mem::take(tx_bytes).into_boxed_slice();
+    let commitment_status = commitment_status.as_tx_commitment();
+    watermarks.observe_transaction_commitment(notification.slot, commitment_status);
+    let tx_payload = mem::take(tx_bytes).into_boxed_slice();
     Ok(Some(SerializedTransactionEvent {
         slot: notification.slot,
-        commitment_status: commitment_status.as_tx_commitment(),
+        commitment_status,
         confirmed_slot: watermarks.confirmed_slot,
         finalized_slot: watermarks.finalized_slot,
         signature,
         provider_source: None,
         bytes: tx_payload,
     }))
+}
+
+const MAX_BASE64_TRANSACTION_WIRE_LEN: usize = PACKET_DATA_SIZE.div_ceil(3) * 4;
+const MAX_ACCOUNT_DATA_LEN: usize = MAX_PERMITTED_DATA_LENGTH as usize;
+const MAX_BASE64_ACCOUNT_DATA_LEN: usize = MAX_ACCOUNT_DATA_LEN.div_ceil(3) * 4;
+const WEBSOCKET_TRANSACTION_MAX_MESSAGE_SIZE: usize = 64 * 1024;
+const WEBSOCKET_ACCOUNT_MAX_MESSAGE_SIZE: usize = MAX_BASE64_ACCOUNT_DATA_LEN + (128 * 1024);
+const WEBSOCKET_LOGS_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+const WEBSOCKET_REPLAY_HTTP_MAX_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
+
+fn decode_transaction_wire_payload(
+    encoded: &str,
+    tx_bytes: &mut Vec<u8>,
+) -> Result<(), WebsocketTransactionError> {
+    if encoded.len() > MAX_BASE64_TRANSACTION_WIRE_LEN {
+        return Err(WebsocketTransactionError::Convert(
+            "websocket transaction payload exceeds max wire size",
+        ));
+    }
+    tx_bytes.clear();
+    STANDARD
+        .decode_vec(encoded.as_bytes(), tx_bytes)
+        .map_err(|_error| {
+            WebsocketTransactionError::Convert("invalid base64 transaction payload")
+        })?;
+    if tx_bytes.len() > PACKET_DATA_SIZE {
+        tx_bytes.clear();
+        return Err(WebsocketTransactionError::Convert(
+            "websocket transaction payload exceeds max wire size",
+        ));
+    }
+    Ok(())
+}
+
+fn decode_account_payload(
+    encoded: &str,
+    tx_bytes: &mut Vec<u8>,
+) -> Result<(), WebsocketTransactionError> {
+    if encoded.len() > MAX_BASE64_ACCOUNT_DATA_LEN {
+        return Err(WebsocketTransactionError::Convert(
+            "websocket account payload exceeds max data size",
+        ));
+    }
+    tx_bytes.clear();
+    STANDARD
+        .decode_vec(encoded.as_bytes(), tx_bytes)
+        .map_err(|_error| WebsocketTransactionError::Convert("invalid base64 account payload"))?;
+    if tx_bytes.len() > MAX_ACCOUNT_DATA_LEN {
+        tx_bytes.clear();
+        return Err(WebsocketTransactionError::Convert(
+            "websocket account payload exceeds max data size",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_account_notification(
@@ -1703,20 +1762,19 @@ fn decode_account_update_event(
     tx_bytes: &mut Vec<u8>,
 ) -> Result<AccountUpdateEvent, WebsocketTransactionError> {
     let owner = parse_pubkey(&account.owner)?;
+    let commitment_status = commitment.as_tx_commitment();
     tx_bytes.clear();
     if account.data.1 != "base64" {
         return Err(WebsocketTransactionError::Convert(
             "unsupported websocket account encoding",
         ));
     }
-    STANDARD
-        .decode_vec(account.data.0.as_bytes(), tx_bytes)
-        .map_err(|_error| WebsocketTransactionError::Convert("invalid base64 account payload"))?;
-    observe_non_transaction_commitment(watermarks, slot, commitment.as_tx_commitment());
-    let data = std::mem::take(tx_bytes).into_boxed_slice();
+    decode_account_payload(&account.data.0, tx_bytes)?;
+    observe_non_transaction_commitment(watermarks, slot, commitment_status);
+    let data = mem::take(tx_bytes).into_boxed_slice();
     Ok(AccountUpdateEvent {
         slot,
-        commitment_status: commitment.as_tx_commitment(),
+        commitment_status,
         confirmed_slot: watermarks.confirmed_slot,
         finalized_slot: watermarks.finalized_slot,
         pubkey: pubkey_bytes(pubkey),
@@ -1756,24 +1814,6 @@ fn serialized_transaction_first_signature(payload: &[u8]) -> Option<SignatureByt
     Some(SignatureBytes::from(bytes))
 }
 
-fn decode_short_u16_len(payload: &[u8], offset: &mut usize) -> Option<usize> {
-    let mut value = 0_usize;
-    let mut shift = 0_u32;
-    for byte_index in 0..3 {
-        let byte = usize::from(*payload.get(*offset)?);
-        *offset = (*offset).saturating_add(1);
-        value |= (byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Some(value);
-        }
-        shift = shift.saturating_add(7);
-        if byte_index == 2 {
-            return None;
-        }
-    }
-    None
-}
-
 fn parse_pubkey(input: &str) -> Result<Pubkey, WebsocketTransactionError> {
     Pubkey::from_str(input)
         .map_err(|_error| WebsocketTransactionError::Convert("invalid websocket pubkey"))
@@ -1788,7 +1828,7 @@ struct WebsocketPrimaryNotificationState<'state> {
 
 async fn handle_primary_notification(
     config: &WebsocketTransactionConfig,
-    source: &ProviderSourceIdentity,
+    source: &Arc<ProviderSourceIdentity>,
     sender: &ProviderStreamSender,
     bytes: &mut [u8],
     state: &mut WebsocketPrimaryNotificationState<'_>,
@@ -1810,7 +1850,7 @@ async fn handle_primary_notification(
                 sender
                     .send(
                         ProviderStreamUpdate::SerializedTransaction(update)
-                            .with_provider_source(source.clone()),
+                            .with_provider_source_ref(source),
                     )
                     .await
                     .map_err(|_error| WebsocketTransactionError::QueueClosed)?;
@@ -1832,7 +1872,7 @@ async fn handle_primary_notification(
                 sender
                     .send(
                         ProviderStreamUpdate::AccountUpdate(update)
-                            .with_provider_source(source.clone()),
+                            .with_provider_source_ref(source),
                     )
                     .await
                     .map_err(|_error| WebsocketTransactionError::QueueClosed)?;
@@ -1851,6 +1891,7 @@ async fn run_websocket_logs_connection(
 ) -> Result<(), WebsocketLogsError> {
     *session_established = false;
     let (mut write, mut read) = stream.split();
+    let provider_source = Arc::new(source.clone());
     *session_established = true;
     send_provider_logs_health(
         source,
@@ -1861,7 +1902,7 @@ async fn run_websocket_logs_connection(
         PROVIDER_SUBSCRIPTION_ACKNOWLEDGED.to_owned(),
     )
     .await?;
-    let mut ping = config.ping_interval.map(tokio::time::interval);
+    let mut ping = config.ping_interval.map(keepalive_interval);
     let mut frame_bytes = Vec::new();
     let mut last_progress = tokio::time::Instant::now();
 
@@ -1871,17 +1912,17 @@ async fn run_websocket_logs_connection(
                 if let Some(interval) = ping.as_mut() {
                     interval.tick().await;
                 } else {
-                    std::future::pending::<()>().await;
+                    pending::<()>().await;
                 }
             } => {
                 write.send(WsMessage::Ping(Vec::new().into())).await?;
             }
             () = async {
-                if let Some(timeout) = config.stall_timeout {
+                if let Some(timeout) = websocket_stall_timeout(config.stall_timeout) {
                     let deadline = last_progress.checked_add(timeout).unwrap_or(last_progress);
                     tokio::time::sleep_until(deadline).await;
                 } else {
-                    std::future::pending::<()>().await;
+                    pending::<()>().await;
                 }
             } => {
                 return Err(WebsocketProtocolError::StreamStalled {
@@ -1904,7 +1945,7 @@ async fn run_websocket_logs_connection(
                             sender
                                 .send(
                                     ProviderStreamUpdate::TransactionLog(update)
-                                        .with_provider_source(source.clone()),
+                                        .with_provider_source_ref(&provider_source),
                                 )
                                 .await
                                 .map_err(|_error| WebsocketLogsError::QueueClosed)?;
@@ -1918,7 +1959,7 @@ async fn run_websocket_logs_connection(
                             sender
                                 .send(
                                     ProviderStreamUpdate::TransactionLog(update)
-                                        .with_provider_source(source.clone()),
+                                        .with_provider_source_ref(&provider_source),
                                 )
                                 .await
                                 .map_err(|_error| WebsocketLogsError::QueueClosed)?;
@@ -1929,7 +1970,8 @@ async fn run_websocket_logs_connection(
                     }
                     WsMessage::Pong(_) => {}
                     WsMessage::Close(frame) => {
-                        return Err(WebsocketProtocolError::Closed(format!("{frame:?}")).into());
+                        write.send(WsMessage::Close(frame)).await.ok();
+                        return Ok(());
                     }
                     _ => {}
                 }
@@ -1941,69 +1983,91 @@ async fn run_websocket_logs_connection(
 async fn establish_websocket_logs_session(
     config: &WebsocketLogsConfig,
 ) -> Result<WebsocketProviderStream, WebsocketLogsError> {
-    let (mut stream, _response) = connect_async(config.endpoint()).await?;
+    let (mut stream, _response) = tokio::time::timeout(
+        websocket_connect_timeout(config.stall_timeout),
+        connect_async_with_config(
+            config.endpoint(),
+            Some(websocket_transport_config(WEBSOCKET_LOGS_MAX_MESSAGE_SIZE)),
+            false,
+        ),
+    )
+    .await
+    .map_err(|_elapsed| WebsocketProtocolError::SubscriptionAckTimeout)??;
     stream
         .send(WsMessage::Text(
             config.subscribe_request().to_string().into(),
         ))
         .await?;
-    wait_for_logs_subscription_ack(&mut stream).await?;
+    wait_for_logs_subscription_ack(&mut stream, websocket_ack_timeout(config.stall_timeout))
+        .await?;
     Ok(stream)
 }
 
-async fn wait_for_logs_subscription_ack<S>(read: &mut S) -> Result<(), WebsocketLogsError>
+async fn wait_for_logs_subscription_ack<S>(
+    read: &mut S,
+    ack_timeout: Duration,
+) -> Result<(), WebsocketLogsError>
 where
-    S: futures_util::Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
+    S: Stream<Item = Result<WsMessage, TungsteniteError>>
+        + Sink<WsMessage, Error = TungsteniteError>
         + Unpin,
 {
-    let ack_timeout = Duration::from_secs(10);
+    wait_for_subscription_ack_with(read, ack_timeout, handle_logs_subscription_text).await
+}
+
+async fn wait_for_subscription_ack_with<S, E, F>(
+    read: &mut S,
+    ack_timeout: Duration,
+    mut handle_text: F,
+) -> Result<(), E>
+where
+    S: Stream<Item = Result<WsMessage, TungsteniteError>>
+        + Sink<WsMessage, Error = TungsteniteError>
+        + Unpin,
+    E: From<TungsteniteError> + From<WebsocketProtocolError>,
+    F: FnMut(&mut [u8]) -> Result<bool, E>,
+{
     let mut frame_bytes = Vec::new();
     tokio::time::timeout(ack_timeout, async {
         loop {
             let Some(frame) = read.next().await else {
-                return Err(WebsocketLogsError::Protocol(
-                    WebsocketProtocolError::ClosedBeforeSubscriptionAck,
-                ));
+                return Err(E::from(WebsocketProtocolError::ClosedBeforeSubscriptionAck));
             };
             let frame = frame?;
             match frame {
                 WsMessage::Text(text) => {
-                    if handle_logs_subscription_text(frame_bytes_mut(
-                        &mut frame_bytes,
-                        text.as_str().as_bytes(),
-                    ))? {
+                    if handle_text(frame_bytes_mut(&mut frame_bytes, text.as_str().as_bytes()))? {
                         return Ok(());
                     }
                 }
                 WsMessage::Binary(bytes) => {
-                    if handle_logs_subscription_text(frame_bytes_mut(
-                        &mut frame_bytes,
-                        bytes.as_ref(),
-                    ))? {
+                    if handle_text(frame_bytes_mut(&mut frame_bytes, bytes.as_ref()))? {
                         return Ok(());
                     }
                 }
-                WsMessage::Ping(_) | WsMessage::Pong(_) => {}
+                WsMessage::Ping(payload) => {
+                    read.send(WsMessage::Pong(payload)).await?;
+                }
+                WsMessage::Pong(_) => {}
                 WsMessage::Close(frame) => {
-                    return Err(
+                    return Err(E::from(
                         WebsocketProtocolError::ClosedBeforeSubscriptionAckWithFrame(format!(
                             "{frame:?}"
-                        ))
-                        .into(),
-                    );
+                        )),
+                    ));
                 }
                 _ => {}
             }
         }
     })
     .await
-    .map_err(|_elapsed| WebsocketProtocolError::SubscriptionAckTimeout)?
+    .map_err(|_elapsed| E::from(WebsocketProtocolError::SubscriptionAckTimeout))?
 }
 
 fn parse_logs_notification(
     bytes: &mut [u8],
     config: &WebsocketLogsConfig,
-) -> Result<Option<crate::framework::TransactionLogEvent>, WebsocketLogsError> {
+) -> Result<Option<TransactionLogEvent>, WebsocketLogsError> {
     let value: WebsocketLogsEnvelopeMessage = simd_from_slice(bytes)
         .map_err(|error| WebsocketProtocolError::InvalidJson(error.to_string()))?;
     if let Some(error) = value.error {
@@ -2018,7 +2082,7 @@ fn parse_logs_notification(
         WebsocketLogsFilter::Mentions(pubkey) => Some(PubkeyBytes::from(pubkey)),
         WebsocketLogsFilter::All | WebsocketLogsFilter::AllWithVotes => None,
     };
-    Ok(Some(crate::framework::TransactionLogEvent {
+    Ok(Some(TransactionLogEvent {
         slot: notification.context.slot,
         commitment_status: config.commitment.as_tx_commitment(),
         signature: signature.into(),
@@ -2054,11 +2118,8 @@ fn materialize_transaction_baseline(
             "unsupported websocket transaction encoding",
         ));
     }
-    let tx_bytes = STANDARD
-        .decode(notification.transaction.transaction.0.as_bytes())
-        .map_err(|_error| {
-            WebsocketTransactionError::Convert("invalid base64 transaction payload")
-        })?;
+    let mut tx_bytes = Vec::new();
+    decode_transaction_wire_payload(&notification.transaction.transaction.0, &mut tx_bytes)?;
     let tx = bincode::deserialize::<VersionedTransaction>(&tx_bytes).map_err(|_error| {
         WebsocketTransactionError::Convert("failed to deserialize transaction")
     })?;
@@ -2067,9 +2128,10 @@ fn materialize_transaction_baseline(
             .signature
             .and_then(|signature| Signature::from_str(&signature).ok())
     });
+    let commitment_status = commitment_status.as_tx_commitment();
     Ok(Some(TransactionEvent {
         slot: notification.slot,
-        commitment_status: commitment_status.as_tx_commitment(),
+        commitment_status,
         confirmed_slot: None,
         finalized_slot: None,
         signature: signature_bytes_opt(signature),
@@ -2092,9 +2154,28 @@ fn frame_bytes_mut<'buffer>(buffer: &'buffer mut Vec<u8>, bytes: &[u8]) -> &'buf
     buffer.as_mut_slice()
 }
 
+fn websocket_replay_http_client() -> Result<&'static reqwest::Client, WebsocketTransactionError> {
+    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .redirect(Policy::none())
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|detail| {
+            WebsocketProtocolError::HttpRpcFailed {
+                method: "client",
+                detail: detail.clone(),
+            }
+            .into()
+        })
+}
+
 async fn replay_websocket_gap(
     config: &WebsocketTransactionConfig,
-    source: &ProviderSourceIdentity,
+    source: &Arc<ProviderSourceIdentity>,
     sender: &ProviderStreamSender,
     last_seen_slot: &mut Option<u64>,
     watermarks: &mut ProviderCommitmentWatermarks,
@@ -2106,24 +2187,35 @@ async fn replay_websocket_gap(
         return Err(WebsocketProtocolError::MissingReplayHttpEndpoint.into());
     };
 
-    let client = reqwest::Client::new();
-    let head = rpc_get_slot(&client, &http_endpoint, config.commitment).await?;
+    let client = websocket_replay_http_client()?;
+    let head = rpc_get_slot(
+        client,
+        &http_endpoint,
+        config.commitment,
+        websocket_stall_timeout(config.stall_timeout),
+    )
+    .await?;
     if head < previous_slot {
         return Ok(());
     }
 
     let start_slot = websocket_replay_start_slot(previous_slot, head, config.replay_max_slots);
+    let commitment_status = config.commitment.as_tx_commitment();
+    let mut tx_bytes = Vec::new();
     for slot in start_slot..=head {
-        let Some(block) = rpc_get_block(&client, &http_endpoint, slot, config.commitment).await?
+        let Some(block) = rpc_get_block(
+            client,
+            &http_endpoint,
+            slot,
+            config.commitment,
+            websocket_stall_timeout(config.stall_timeout),
+        )
+        .await?
         else {
             continue;
         };
         for transaction in block.transactions {
-            let tx_bytes = STANDARD
-                .decode(transaction.transaction.0.as_bytes())
-                .map_err(|_error| {
-                    WebsocketTransactionError::Convert("invalid base64 transaction payload")
-                })?;
+            decode_transaction_wire_payload(&transaction.transaction.0, &mut tx_bytes)?;
             let tx = bincode::deserialize::<VersionedTransaction>(&tx_bytes).map_err(|_error| {
                 WebsocketTransactionError::Convert("failed to deserialize transaction")
             })?;
@@ -2145,12 +2237,12 @@ async fn replay_websocket_gap(
             ) {
                 continue;
             }
-            watermarks.observe_transaction_commitment(slot, config.commitment.as_tx_commitment());
+            watermarks.observe_transaction_commitment(slot, commitment_status);
             sender
                 .send(
                     ProviderStreamUpdate::Transaction(TransactionEvent {
                         slot,
-                        commitment_status: config.commitment.as_tx_commitment(),
+                        commitment_status,
                         confirmed_slot: watermarks.confirmed_slot,
                         finalized_slot: watermarks.finalized_slot,
                         signature: signature_bytes_opt(tx.signatures.first().copied()),
@@ -2158,7 +2250,7 @@ async fn replay_websocket_gap(
                         kind,
                         tx: Arc::new(tx),
                     })
-                    .with_provider_source(source.clone()),
+                    .with_provider_source_ref(source),
                 )
                 .await
                 .map_err(|_error| WebsocketTransactionError::QueueClosed)?;
@@ -2177,13 +2269,22 @@ async fn establish_websocket_primary_session(
     {
         return Err(WebsocketProtocolError::MissingReplayHttpEndpoint.into());
     }
-    let (mut stream, _response) = connect_async(config.endpoint()).await?;
+    let (mut stream, _response) = tokio::time::timeout(
+        websocket_connect_timeout(config.stall_timeout),
+        connect_async_with_config(
+            config.endpoint(),
+            Some(websocket_primary_transport_config(config)),
+            false,
+        ),
+    )
+    .await
+    .map_err(|_elapsed| WebsocketProtocolError::SubscriptionAckTimeout)??;
     stream
         .send(WsMessage::Text(
             config.subscribe_request().to_string().into(),
         ))
         .await?;
-    wait_for_subscription_ack(&mut stream).await?;
+    wait_for_subscription_ack(&mut stream, websocket_ack_timeout(config.stall_timeout)).await?;
     Ok(stream)
 }
 
@@ -2207,31 +2308,70 @@ fn websocket_http_endpoint(config: &WebsocketTransactionConfig) -> Option<String
     None
 }
 
+fn websocket_transport_config(max_message_size: usize) -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(max_message_size))
+        .max_frame_size(Some(max_message_size))
+}
+
+const fn websocket_connect_timeout(stall_timeout: Option<Duration>) -> Duration {
+    match websocket_stall_timeout(stall_timeout) {
+        Some(timeout) => timeout,
+        None => DEFAULT_WEBSOCKET_CONNECT_TIMEOUT,
+    }
+}
+
+const fn websocket_ack_timeout(stall_timeout: Option<Duration>) -> Duration {
+    match websocket_stall_timeout(stall_timeout) {
+        Some(timeout) => timeout,
+        None => DEFAULT_WEBSOCKET_CONNECT_TIMEOUT,
+    }
+}
+
+const fn websocket_stall_timeout(stall_timeout: Option<Duration>) -> Option<Duration> {
+    match stall_timeout {
+        Some(timeout) => Some(nonzero_duration_or(timeout, MIN_STALL_TIMEOUT)),
+        None => None,
+    }
+}
+
+fn http_rpc_error_detail(error: &reqwest::Error) -> String {
+    if error.is_timeout() {
+        return format!("request timed out: {error}");
+    }
+    error.to_string()
+}
+
+fn websocket_primary_transport_config(config: &WebsocketTransactionConfig) -> WebSocketConfig {
+    match config.stream {
+        WebsocketPrimaryStream::Transaction => {
+            websocket_transport_config(WEBSOCKET_TRANSACTION_MAX_MESSAGE_SIZE)
+        }
+        WebsocketPrimaryStream::Account(_) | WebsocketPrimaryStream::Program(_) => {
+            websocket_transport_config(WEBSOCKET_ACCOUNT_MAX_MESSAGE_SIZE)
+        }
+    }
+}
+
 async fn rpc_get_slot(
     client: &reqwest::Client,
     endpoint: &str,
     commitment: WebsocketTransactionCommitment,
+    timeout: Option<Duration>,
 ) -> Result<u64, WebsocketTransactionError> {
-    let response: RpcJsonResponse<u64> = client
-        .post(endpoint)
-        .json(&json!({
+    let response = rpc_post(
+        client,
+        endpoint,
+        "getSlot",
+        json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "getSlot",
             "params": [{ "commitment": commitment.as_str() }],
-        }))
-        .send()
-        .await
-        .map_err(|error| WebsocketProtocolError::HttpRpcFailed {
-            method: "getSlot",
-            detail: error.to_string(),
-        })?
-        .json()
-        .await
-        .map_err(|error| WebsocketProtocolError::HttpRpcDecodeFailed {
-            method: "getSlot",
-            detail: error.to_string(),
-        })?;
+        }),
+        timeout,
+    )
+    .await?;
     if let Some(error) = response.error {
         return Err(WebsocketProtocolError::HttpRpcFailed {
             method: "getSlot",
@@ -2249,10 +2389,13 @@ async fn rpc_get_block(
     endpoint: &str,
     slot: u64,
     commitment: WebsocketTransactionCommitment,
+    timeout: Option<Duration>,
 ) -> Result<Option<RpcBlockResponse>, WebsocketTransactionError> {
-    let response: RpcJsonResponse<RpcBlockResponse> = client
-        .post(endpoint)
-        .json(&json!({
+    let response = rpc_post(
+        client,
+        endpoint,
+        "getBlock",
+        json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "getBlock",
@@ -2266,19 +2409,10 @@ async fn rpc_get_block(
                     "rewards": false
                 }
             ],
-        }))
-        .send()
-        .await
-        .map_err(|error| WebsocketProtocolError::HttpRpcFailed {
-            method: "getBlock",
-            detail: error.to_string(),
-        })?
-        .json()
-        .await
-        .map_err(|error| WebsocketProtocolError::HttpRpcDecodeFailed {
-            method: "getBlock",
-            detail: error.to_string(),
-        })?;
+        }),
+        timeout,
+    )
+    .await?;
     if let Some(error) = response.error {
         return Err(WebsocketProtocolError::HttpRpcFailed {
             method: "getBlock",
@@ -2289,11 +2423,122 @@ async fn rpc_get_block(
     Ok(response.result)
 }
 
+async fn rpc_post<T>(
+    client: &reqwest::Client,
+    endpoint: &str,
+    method: &'static str,
+    payload: Value,
+    timeout: Option<Duration>,
+) -> Result<RpcJsonResponse<T>, WebsocketTransactionError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    rpc_post_with_max_response_bytes(
+        client,
+        endpoint,
+        method,
+        payload,
+        WEBSOCKET_REPLAY_HTTP_MAX_RESPONSE_BYTES,
+        timeout,
+    )
+    .await
+}
+
+async fn rpc_post_with_max_response_bytes<T>(
+    client: &reqwest::Client,
+    endpoint: &str,
+    method: &'static str,
+    payload: Value,
+    max_response_bytes: usize,
+    timeout: Option<Duration>,
+) -> Result<RpcJsonResponse<T>, WebsocketTransactionError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let mut request = client.post(endpoint).json(&payload);
+    if let Some(timeout) = timeout {
+        request = request.timeout(timeout);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| WebsocketProtocolError::HttpRpcFailed {
+            method,
+            detail: http_rpc_error_detail(&error),
+        })?;
+    if response.status().is_redirection() {
+        return Err(WebsocketProtocolError::HttpRpcFailed {
+            method,
+            detail: format!("unexpected redirect response: {}", response.status()),
+        }
+        .into());
+    }
+    let response =
+        response
+            .error_for_status()
+            .map_err(|error| WebsocketProtocolError::HttpRpcFailed {
+                method,
+                detail: error.to_string(),
+            })?;
+    let response_body =
+        read_http_response_bytes_bounded(response, method, max_response_bytes).await?;
+    Ok(json_from_slice(&response_body).map_err(|error| {
+        WebsocketProtocolError::HttpRpcDecodeFailed {
+            method,
+            detail: error.to_string(),
+        }
+    })?)
+}
+
+async fn read_http_response_bytes_bounded(
+    mut response: reqwest::Response,
+    method: &'static str,
+    max_response_bytes: usize,
+) -> Result<Vec<u8>, WebsocketTransactionError> {
+    if response
+        .content_length()
+        .is_some_and(|content_length| content_length > max_response_bytes as u64)
+    {
+        return Err(WebsocketProtocolError::HttpRpcFailed {
+            method,
+            detail: format!("response body exceeded max size of {max_response_bytes} bytes"),
+        }
+        .into());
+    }
+
+    let initial_capacity = response
+        .content_length()
+        .and_then(|content_length| usize::try_from(content_length).ok())
+        .unwrap_or(0)
+        .min(max_response_bytes);
+    let mut body = Vec::with_capacity(initial_capacity);
+    while let Some(chunk) =
+        response
+            .chunk()
+            .await
+            .map_err(|error| WebsocketProtocolError::HttpRpcFailed {
+                method,
+                detail: http_rpc_error_detail(&error),
+            })?
+    {
+        let remaining = max_response_bytes.saturating_sub(body.len());
+        if chunk.len() > remaining {
+            return Err(WebsocketProtocolError::HttpRpcFailed {
+                method,
+                detail: format!("response body exceeded max size of {max_response_bytes} bytes"),
+            }
+            .into());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 fn websocket_transaction_matches_filter(
     config: &WebsocketTransactionConfig,
     tx: &VersionedTransaction,
     loaded_addresses: Option<&RpcLoadedAddresses>,
-    kind: crate::event::TxKind,
+    kind: TxKind,
     failed: bool,
 ) -> bool {
     if let Some(signature) = config.signature
@@ -2302,7 +2547,7 @@ fn websocket_transaction_matches_filter(
         return false;
     }
     if let Some(expect_vote) = config.vote {
-        let is_vote = kind == crate::event::TxKind::VoteOnly;
+        let is_vote = kind == TxKind::VoteOnly;
         if is_vote != expect_vote {
             return false;
         }
@@ -2556,28 +2801,28 @@ impl RpcLoadedAddresses {
 )]
 mod tests {
     use super::*;
-    use crate::event::TxKind;
-    use crate::provider_stream::{create_provider_stream_fan_in, create_provider_stream_queue};
+    #[cfg(feature = "provider-grpc")]
+    use crate::provider_stream::yellowstone::{YellowstoneGrpcCommitment, YellowstoneGrpcConfig};
+    use crate::{
+        event::TxKind,
+        provider_stream::{
+            ProviderSourceId, ProviderSourceIdentity, ProviderStreamUpdate,
+            create_provider_stream_fan_in, create_provider_stream_queue,
+        },
+    };
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use serde_json::json;
+    #[cfg(feature = "provider-grpc")]
+    use serde_json::to_value;
+    use sof_support::bench::{avg_ns_per_iteration, profile_iterations};
     use solana_keypair::Keypair;
     use solana_message::{Message, VersionedMessage};
     use solana_signer::Signer;
     use std::time::Instant;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::time::{Duration, timeout};
     use tokio_tungstenite::{accept_async, tungstenite::protocol::Message as WsMessage};
-
-    #[cfg(feature = "provider-grpc")]
-    use crate::provider_stream::yellowstone::{YellowstoneGrpcCommitment, YellowstoneGrpcConfig};
-
-    fn profile_iterations(default: usize) -> usize {
-        std::env::var("SOF_PROFILE_ITERATIONS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(default)
-    }
 
     fn sample_notification_payload() -> Vec<u8> {
         let signer = Keypair::new();
@@ -2601,6 +2846,255 @@ mod tests {
         })
         .to_string()
         .into_bytes()
+    }
+
+    async fn spawn_raw_http_response_server(response: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("http listener");
+        let addr = listener.local_addr().expect("http local addr");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("http accept");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await;
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("http response write");
+        });
+        format!("http://{addr}")
+    }
+
+    async fn spawn_http_response_server(status_line: &'static str, body: &'static str) -> String {
+        spawn_raw_http_response_server(format!(
+            "{status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        ))
+        .await
+    }
+
+    async fn spawn_redirect_http_response_server(
+        status_line: &'static str,
+        location: &str,
+    ) -> String {
+        spawn_raw_http_response_server(format!(
+            "{status_line}\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        ))
+        .await
+    }
+
+    async fn spawn_chunked_http_response_server(
+        status_line: &'static str,
+        chunks: Vec<String>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("http listener");
+        let addr = listener.local_addr().expect("http local addr");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("http accept");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let header = format!(
+                "{status_line}\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+            );
+            stream
+                .write_all(header.as_bytes())
+                .await
+                .expect("http response header write");
+            for chunk in chunks {
+                let chunk_header = format!("{:X}\r\n", chunk.len());
+                stream
+                    .write_all(chunk_header.as_bytes())
+                    .await
+                    .expect("http chunk header write");
+                stream
+                    .write_all(chunk.as_bytes())
+                    .await
+                    .expect("http chunk body write");
+                stream
+                    .write_all(b"\r\n")
+                    .await
+                    .expect("http chunk terminator write");
+            }
+            stream
+                .write_all(b"0\r\n\r\n")
+                .await
+                .expect("http final chunk write");
+        });
+        format!("http://{addr}")
+    }
+
+    async fn spawn_stalled_http_response_server(stall: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("http listener");
+        let addr = listener.local_addr().expect("http local addr");
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.expect("http accept");
+            tokio::time::sleep(stall).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn websocket_rpc_get_slot_surfaces_http_status_failures() {
+        let endpoint = spawn_http_response_server(
+            "HTTP/1.1 500 Internal Server Error",
+            "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32000,\"message\":\"boom\"}}",
+        )
+        .await;
+        let client = reqwest::Client::new();
+
+        let error = rpc_get_slot(
+            &client,
+            &endpoint,
+            WebsocketTransactionCommitment::Confirmed,
+            None,
+        )
+        .await
+        .expect_err("http failure should surface as rpc failure");
+
+        assert!(
+            error.to_string().contains("500 Internal Server Error"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_rpc_get_block_surfaces_http_status_failures() {
+        let endpoint = spawn_http_response_server(
+            "HTTP/1.1 503 Service Unavailable",
+            "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32000,\"message\":\"down\"}}",
+        )
+        .await;
+        let client = reqwest::Client::new();
+
+        let error = rpc_get_block(
+            &client,
+            &endpoint,
+            55,
+            WebsocketTransactionCommitment::Confirmed,
+            None,
+        )
+        .await
+        .expect_err("http failure should surface as rpc failure");
+
+        assert!(
+            error.to_string().contains("503 Service Unavailable"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_rpc_get_slot_rejects_redirects() {
+        let target =
+            spawn_http_response_server("HTTP/1.1 200 OK", "{\"jsonrpc\":\"2.0\",\"result\":99}")
+                .await;
+        let endpoint =
+            spawn_redirect_http_response_server("HTTP/1.1 307 Temporary Redirect", &target).await;
+
+        let client = match websocket_replay_http_client() {
+            Ok(client) => client,
+            Err(error) => panic!("shared replay client: {error}"),
+        };
+        let error = rpc_get_slot(
+            client,
+            &endpoint,
+            WebsocketTransactionCommitment::Confirmed,
+            None,
+        )
+        .await
+        .expect_err("redirect replay response should be rejected");
+
+        assert!(
+            error.to_string().contains("307 Temporary Redirect"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_rpc_get_slot_rejects_oversized_content_length() {
+        let endpoint = spawn_raw_http_response_server(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 99\r\nconnection: close\r\n\r\n{}".to_owned(),
+        )
+        .await;
+        let client = reqwest::Client::new();
+
+        let error = rpc_post_with_max_response_bytes::<u64>(
+            &client,
+            &endpoint,
+            "getSlot",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getSlot",
+                "params": []
+            }),
+            32,
+            None,
+        )
+        .await
+        .expect_err("oversized content-length should be rejected");
+
+        assert!(
+            error.to_string().contains("exceeded max size"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_rpc_get_slot_rejects_oversized_chunked_response() {
+        let endpoint = spawn_chunked_http_response_server(
+            "HTTP/1.1 200 OK",
+            vec![
+                "{\"jsonrpc\":\"2.0\",\"result\":".to_owned(),
+                "12345678901234567890}".to_owned(),
+            ],
+        )
+        .await;
+        let client = reqwest::Client::new();
+
+        let error = rpc_post_with_max_response_bytes::<u64>(
+            &client,
+            &endpoint,
+            "getSlot",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getSlot",
+                "params": []
+            }),
+            16,
+            None,
+        )
+        .await
+        .expect_err("oversized chunked response should be rejected");
+
+        assert!(
+            error.to_string().contains("exceeded max size"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_rpc_get_slot_times_out_stalled_response() {
+        let endpoint = spawn_stalled_http_response_server(Duration::from_millis(200)).await;
+        let client = reqwest::Client::new();
+
+        let error = rpc_get_slot(
+            &client,
+            &endpoint,
+            WebsocketTransactionCommitment::Confirmed,
+            Some(Duration::from_millis(25)),
+        )
+        .await
+        .expect_err("stalled replay response should time out");
+
+        assert!(
+            error.to_string().contains("timed out"),
+            "unexpected error: {error}"
+        );
     }
 
     #[cfg(feature = "provider-grpc")]
@@ -2653,24 +3147,15 @@ mod tests {
         );
         assert_eq!(
             websocket_filter.get("accountInclude"),
-            Some(
-                &serde_json::to_value(yellowstone_filter.account_include.clone())
-                    .expect("include json")
-            )
+            Some(&to_value(yellowstone_filter.account_include.clone()).expect("include json"))
         );
         assert_eq!(
             websocket_filter.get("accountExclude"),
-            Some(
-                &serde_json::to_value(yellowstone_filter.account_exclude.clone())
-                    .expect("exclude json")
-            )
+            Some(&to_value(yellowstone_filter.account_exclude.clone()).expect("exclude json"))
         );
         assert_eq!(
             websocket_filter.get("accountRequired"),
-            Some(
-                &serde_json::to_value(yellowstone_filter.account_required.clone())
-                    .expect("required json")
-            )
+            Some(&to_value(yellowstone_filter.account_required.clone()).expect("required json"))
         );
     }
 
@@ -2697,6 +3182,20 @@ mod tests {
         let filter = request["params"][0].as_object().expect("filter object");
         assert!(!filter.contains_key("vote"));
         assert!(!filter.contains_key("failed"));
+    }
+
+    #[test]
+    fn websocket_reconnect_delay_never_spins() {
+        let config = WebsocketTransactionConfig::new("wss://example.invalid")
+            .with_reconnect_delay(Duration::ZERO);
+        assert_eq!(config.reconnect_delay_effective(), Duration::from_millis(1));
+
+        let logs_config =
+            WebsocketLogsConfig::new("wss://example.invalid").with_reconnect_delay(Duration::ZERO);
+        assert_eq!(
+            logs_config.reconnect_delay_effective(),
+            Duration::from_millis(1)
+        );
     }
 
     #[test]
@@ -2841,6 +3340,85 @@ mod tests {
     }
 
     #[test]
+    fn websocket_transaction_notification_rejects_oversized_payload() {
+        let mut payload = json!({
+            "jsonrpc":"2.0",
+            "method":"transactionNotification",
+            "params":{
+                "result":{
+                    "slot":55,
+                    "transaction":{
+                        "transaction":[BASE64_STANDARD.encode(vec![7_u8; PACKET_DATA_SIZE + 1]),"base64"]
+                    }
+                }
+            }
+        })
+        .to_string()
+        .into_bytes();
+        let mut json_buffers = SimdJsonBuffers::default();
+        let mut tx_bytes = Vec::new();
+        let mut watermarks = ProviderCommitmentWatermarks::default();
+
+        let error = parse_transaction_notification(
+            &mut payload,
+            &mut json_buffers,
+            &mut tx_bytes,
+            WebsocketTransactionCommitment::Confirmed,
+            &mut watermarks,
+        )
+        .expect_err("oversized payload should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("websocket transaction payload exceeds max wire size"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn websocket_transport_config_caps_transaction_stream_frames() {
+        let config = WebsocketTransactionConfig::new("ws://example.invalid");
+        let transport = websocket_primary_transport_config(&config);
+
+        assert_eq!(
+            transport.max_message_size,
+            Some(WEBSOCKET_TRANSACTION_MAX_MESSAGE_SIZE),
+        );
+        assert_eq!(
+            transport.max_frame_size,
+            Some(WEBSOCKET_TRANSACTION_MAX_MESSAGE_SIZE),
+        );
+    }
+
+    #[test]
+    fn websocket_transport_config_caps_account_stream_frames() {
+        let config = WebsocketTransactionConfig::new("ws://example.invalid")
+            .with_stream(WebsocketPrimaryStream::Account(Pubkey::new_unique()));
+        let transport = websocket_primary_transport_config(&config);
+
+        assert_eq!(
+            transport.max_message_size,
+            Some(WEBSOCKET_ACCOUNT_MAX_MESSAGE_SIZE),
+        );
+        assert!(transport.max_message_size.unwrap_or_default() > MAX_BASE64_ACCOUNT_DATA_LEN,);
+    }
+
+    #[test]
+    fn websocket_logs_transport_config_caps_frames() {
+        let transport = websocket_transport_config(WEBSOCKET_LOGS_MAX_MESSAGE_SIZE);
+
+        assert_eq!(
+            transport.max_message_size,
+            Some(WEBSOCKET_LOGS_MAX_MESSAGE_SIZE),
+        );
+        assert_eq!(
+            transport.max_frame_size,
+            Some(WEBSOCKET_LOGS_MAX_MESSAGE_SIZE)
+        );
+    }
+
+    #[test]
     fn websocket_http_endpoint_derives_from_websocket_scheme() {
         let config = WebsocketTransactionConfig::new("wss://example.invalid/?api-key=1");
         assert_eq!(
@@ -2966,6 +3544,52 @@ mod tests {
     }
 
     #[test]
+    fn websocket_account_notification_rejects_oversized_payload() {
+        let pubkey = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let payload = json!({
+            "jsonrpc":"2.0",
+            "method":"accountNotification",
+            "params":{
+                "result":{
+                    "context":{"slot":77},
+                    "value":{
+                        "lamports":42,
+                        "data":[STANDARD.encode(vec![7_u8; MAX_ACCOUNT_DATA_LEN + 1]), "base64"],
+                        "owner":owner.to_string(),
+                        "executable":false,
+                        "rentEpoch":9
+                    }
+                }
+            }
+        })
+        .to_string()
+        .into_bytes();
+        let mut payload = payload;
+        let mut json_buffers = SimdJsonBuffers::default();
+        let mut scratch = Vec::new();
+        let mut watermarks = ProviderCommitmentWatermarks::default();
+        let config = WebsocketTransactionConfig::new("wss://example.invalid")
+            .with_stream(WebsocketPrimaryStream::Account(pubkey));
+
+        let error = parse_account_notification(
+            &mut payload,
+            &mut json_buffers,
+            &mut scratch,
+            &config,
+            &mut watermarks,
+        )
+        .expect_err("oversized account payload should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("websocket account payload exceeds max data size"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn websocket_program_notification_decodes_account_update_event() {
         let program_id = Pubkey::new_unique();
         let account_pubkey = Pubkey::new_unique();
@@ -3041,6 +3665,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_spawn_times_out_stalled_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        let server = tokio::spawn(async move {
+            let accepted = listener.accept().await;
+            assert!(accepted.is_ok());
+            let (_stream, _) = accepted.unwrap_or_else(|error| panic!("{error}"));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        let (tx, _rx) = create_provider_stream_queue(1);
+        let config = WebsocketTransactionConfig::new(format!("ws://{addr}"))
+            .with_stall_timeout(Duration::from_millis(25));
+
+        let error = spawn_websocket_source(&config, tx)
+            .await
+            .expect_err("stalled websocket handshake should time out");
+        assert!(
+            error.to_string().contains("timed out"),
+            "unexpected error: {error}"
+        );
+
+        server.abort();
+        drop(server.await);
+    }
+
+    #[tokio::test]
+    async fn websocket_spawn_times_out_stalled_subscription_ack() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        let server = tokio::spawn(async move {
+            let accepted = listener.accept().await;
+            assert!(accepted.is_ok());
+            let (stream, _) = accepted.unwrap_or_else(|error| panic!("{error}"));
+            let _ws = accept_async(stream).await.expect("websocket handshake");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        let (tx, _rx) = create_provider_stream_queue(1);
+        let config = WebsocketTransactionConfig::new(format!("ws://{addr}"))
+            .with_stall_timeout(Duration::from_millis(25));
+
+        let error = spawn_websocket_source(&config, tx)
+            .await
+            .expect_err("stalled subscription ack should time out");
+        assert!(
+            error.to_string().contains("timed out"),
+            "unexpected error: {error}"
+        );
+
+        server.abort();
+        drop(server.await);
+    }
+
+    #[test]
+    fn websocket_stall_timeout_never_zero() {
+        assert_eq!(
+            websocket_stall_timeout(Some(Duration::ZERO)),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(
+            websocket_stall_timeout(Some(Duration::from_millis(25))),
+            Some(Duration::from_millis(25))
+        );
+        assert_eq!(websocket_stall_timeout(None), None);
+    }
+
+    #[tokio::test]
     async fn websocket_logs_source_delivers_log_update() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
         let addr = listener.local_addr().expect("local addr");
@@ -3105,6 +3799,83 @@ mod tests {
             }
         };
         assert_eq!(event.slot, 88);
+        assert_eq!(event.signature, signature.into());
+
+        handle.abort();
+        handle.await.ok();
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn websocket_logs_source_replies_to_ping_before_subscription_ack() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+        let signature = Signature::from([7_u8; 64]);
+        let payload = json!({
+            "jsonrpc":"2.0",
+            "method":"logsNotification",
+            "params":{
+                "result":{
+                    "context":{"slot":91},
+                    "value":{
+                        "signature":signature.to_string(),
+                        "err":null,
+                        "logs":["Program log: ping-before-ack"]
+                    }
+                }
+            }
+        })
+        .to_string();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = accept_async(stream).await.expect("websocket handshake");
+            let subscribe = ws
+                .next()
+                .await
+                .expect("subscribe frame")
+                .expect("subscribe message");
+            match subscribe {
+                WsMessage::Text(text) => assert!(text.contains("logsSubscribe")),
+                other => panic!("expected subscribe text frame, got {other:?}"),
+            }
+            ws.send(WsMessage::Ping(Vec::from(&b"probe"[..]).into()))
+                .await
+                .expect("ping");
+            let pong = ws.next().await.expect("pong frame").expect("pong message");
+            assert!(matches!(pong, WsMessage::Pong(payload) if payload.as_ref() == b"probe"));
+            ws.send(WsMessage::Text(
+                String::from(r#"{"jsonrpc":"2.0","id":1,"result":42}"#).into(),
+            ))
+            .await
+            .expect("ack");
+            ws.send(WsMessage::Text(payload.into()))
+                .await
+                .expect("notification");
+            ws.close(None).await.expect("close");
+        });
+
+        let (tx, mut rx) = create_provider_stream_queue(8);
+        let config = WebsocketLogsConfig::new(format!("ws://{addr}"))
+            .with_ping_interval(Duration::from_millis(250))
+            .with_reconnect_delay(Duration::from_millis(10))
+            .with_max_reconnect_attempts(1);
+        let handle = spawn_websocket_logs_source(&config, tx)
+            .await
+            .expect("spawn websocket logs source");
+
+        let event = loop {
+            let update = timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("provider update timeout")
+                .expect("provider update");
+            match update {
+                ProviderStreamUpdate::TransactionLog(event) => break event,
+                ProviderStreamUpdate::Health(_) => continue,
+                other => panic!("expected log update, got {other:?}"),
+            }
+        };
+        assert_eq!(event.slot, 91);
         assert_eq!(event.signature, signature.into());
 
         handle.abort();
@@ -3474,6 +4245,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_source_replies_to_ping_before_subscription_ack() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+        let payload = sample_notification_payload();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = accept_async(stream).await.expect("websocket handshake");
+            let subscribe = ws
+                .next()
+                .await
+                .expect("subscribe frame")
+                .expect("subscribe message");
+            match subscribe {
+                WsMessage::Text(text) => assert!(text.contains("transactionSubscribe")),
+                other => panic!("expected subscribe text frame, got {other:?}"),
+            }
+            ws.send(WsMessage::Ping(Vec::from(&b"probe"[..]).into()))
+                .await
+                .expect("ping");
+            let pong = ws.next().await.expect("pong frame").expect("pong message");
+            assert!(matches!(pong, WsMessage::Pong(payload) if payload.as_ref() == b"probe"));
+            ws.send(WsMessage::Text(
+                String::from(r#"{"jsonrpc":"2.0","id":1,"result":42}"#).into(),
+            ))
+            .await
+            .expect("ack");
+            ws.send(WsMessage::Text(
+                String::from_utf8(payload)
+                    .expect("notification utf8")
+                    .into(),
+            ))
+            .await
+            .expect("notification");
+            ws.close(None).await.expect("close");
+        });
+
+        let (tx, mut rx) = create_provider_stream_queue(8);
+        let config = WebsocketTransactionConfig::new(format!("ws://{addr}"))
+            .with_max_reconnect_attempts(1)
+            .with_reconnect_delay(Duration::from_millis(10));
+        let handle = spawn_websocket_source(&config, tx)
+            .await
+            .expect("spawn websocket source");
+
+        let event = loop {
+            let update = timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("provider update timeout")
+                .expect("provider update");
+            match update {
+                ProviderStreamUpdate::SerializedTransaction(event) => break event,
+                ProviderStreamUpdate::Health(_) => continue,
+                other => panic!("expected transaction update, got {other:?}"),
+            }
+        };
+        assert_eq!(event.slot, 55);
+        assert!(event.signature.is_some());
+
+        handle.abort();
+        handle.await.ok();
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
     async fn websocket_source_reconnects_and_delivers_after_disconnect() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
         let addr = listener.local_addr().expect("local addr");
@@ -3539,10 +4375,7 @@ mod tests {
             match update {
                 ProviderStreamUpdate::Health(event) => {
                     saw_health = true;
-                    assert_eq!(
-                        event.source.kind,
-                        crate::provider_stream::ProviderSourceId::WebsocketTransaction
-                    );
+                    assert_eq!(event.source.kind, ProviderSourceId::WebsocketTransaction);
                     continue;
                 }
                 ProviderStreamUpdate::SerializedTransaction(event) => break event,
@@ -3565,6 +4398,78 @@ mod tests {
         assert_eq!(event.slot, 55);
         assert!(event.signature.is_some());
         assert!(!event.bytes.is_empty());
+
+        handle.abort();
+        handle.await.ok();
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn websocket_source_reports_clean_close_as_stream_end() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = accept_async(stream).await.expect("websocket handshake");
+            let subscribe = ws
+                .next()
+                .await
+                .expect("subscribe frame")
+                .expect("subscribe message");
+            match subscribe {
+                WsMessage::Text(text) => {
+                    assert!(text.contains("transactionSubscribe"));
+                }
+                other @ WsMessage::Binary(_)
+                | other @ WsMessage::Ping(_)
+                | other @ WsMessage::Pong(_)
+                | other @ WsMessage::Close(_)
+                | other @ WsMessage::Frame(_) => {
+                    panic!("expected subscribe text frame, got {other:?}");
+                }
+            }
+            ws.send(WsMessage::Text(
+                String::from(r#"{"jsonrpc":"2.0","id":1,"result":42}"#).into(),
+            ))
+            .await
+            .expect("ack");
+            ws.close(None).await.expect("close");
+        });
+
+        let (tx, mut rx) = create_provider_stream_queue(8);
+        let config = WebsocketTransactionConfig::new(format!("ws://{addr}"))
+            .with_max_reconnect_attempts(1)
+            .with_reconnect_delay(Duration::from_millis(10));
+        let handle = spawn_websocket_source(&config, tx)
+            .await
+            .expect("spawn websocket source");
+
+        let health = loop {
+            let update = timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("provider update timeout")
+                .expect("provider update");
+            match update {
+                ProviderStreamUpdate::Health(event)
+                    if event.status == ProviderSourceHealthStatus::Reconnecting
+                        && event.reason
+                            == ProviderSourceHealthReason::UpstreamStreamClosedUnexpectedly =>
+                {
+                    break event;
+                }
+                _ => continue,
+            }
+        };
+        assert_eq!(
+            health.reason,
+            ProviderSourceHealthReason::UpstreamStreamClosedUnexpectedly
+        );
+        assert!(
+            health.message.contains("stream ended unexpectedly"),
+            "unexpected health message: {}",
+            health.message
+        );
 
         handle.abort();
         handle.await.ok();
@@ -3798,14 +4703,8 @@ mod tests {
         }
 
         assert_eq!(sources.len(), 2);
-        assert_eq!(
-            sources[0].kind,
-            crate::provider_stream::ProviderSourceId::WebsocketTransaction
-        );
-        assert_eq!(
-            sources[1].kind,
-            crate::provider_stream::ProviderSourceId::WebsocketTransaction
-        );
+        assert_eq!(sources[0].kind, ProviderSourceId::WebsocketTransaction);
+        assert_eq!(sources[1].kind, ProviderSourceId::WebsocketTransaction);
         assert_ne!(sources[0], sources[1]);
 
         handle_a.abort();
@@ -3987,7 +4886,7 @@ mod tests {
             )
             .expect("baseline parse")
             .expect("baseline event");
-            std::hint::black_box(event);
+            black_box(event);
         }
         let baseline_elapsed = baseline_started.elapsed();
 
@@ -4007,15 +4906,73 @@ mod tests {
             )
             .expect("optimized parse")
             .expect("optimized event");
-            std::hint::black_box(event);
+            black_box(event);
         }
         let optimized_elapsed = optimized_started.elapsed();
+        let baseline_avg_ns = avg_ns_per_iteration(baseline_elapsed, iterations);
+        let optimized_avg_ns = avg_ns_per_iteration(optimized_elapsed, iterations);
 
         eprintln!(
-            "websocket_transaction_parse_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            "websocket_transaction_parse_profile_fixture iterations={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.3} optimized_avg_us_per_iteration={:.3}",
             iterations,
             baseline_elapsed.as_micros(),
             optimized_elapsed.as_micros(),
+            baseline_avg_ns,
+            optimized_avg_ns,
+            baseline_avg_ns as f64 / 1_000.0,
+            optimized_avg_ns as f64 / 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for websocket provider source attachment path"]
+    fn websocket_provider_source_attachment_profile_fixture() {
+        let iterations = profile_iterations(500_000);
+        let payload = sample_notification_payload();
+        let mut frame_bytes = Vec::new();
+        let mut json_buffers = SimdJsonBuffers::default();
+        let mut tx_bytes = Vec::new();
+        let mut watermarks = ProviderCommitmentWatermarks::default();
+        let update = ProviderStreamUpdate::SerializedTransaction(
+            parse_transaction_notification(
+                frame_bytes_mut(&mut frame_bytes, &payload),
+                &mut json_buffers,
+                &mut tx_bytes,
+                WebsocketTransactionCommitment::Confirmed,
+                &mut watermarks,
+            )
+            .expect("parse update")
+            .expect("transaction update"),
+        );
+        let source = ProviderSourceIdentity::new(
+            ProviderSourceId::WebsocketTransaction,
+            "websocket-source-a",
+        );
+        let source_ref = Arc::new(source.clone());
+
+        let baseline_started = Instant::now();
+        for _ in 0..iterations {
+            black_box(update.clone().with_provider_source(source.clone()));
+        }
+        let baseline_elapsed = baseline_started.elapsed();
+
+        let optimized_started = Instant::now();
+        for _ in 0..iterations {
+            black_box(update.clone().with_provider_source_ref(&source_ref));
+        }
+        let optimized_elapsed = optimized_started.elapsed();
+        let baseline_avg_ns = avg_ns_per_iteration(baseline_elapsed, iterations);
+        let optimized_avg_ns = avg_ns_per_iteration(optimized_elapsed, iterations);
+
+        eprintln!(
+            "websocket_provider_source_attachment_profile_fixture iterations={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.3} optimized_avg_us_per_iteration={:.3}",
+            iterations,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
+            baseline_avg_ns,
+            optimized_avg_ns,
+            baseline_avg_ns as f64 / 1_000.0,
+            optimized_avg_ns as f64 / 1_000.0,
         );
     }
 
@@ -4033,7 +4990,7 @@ mod tests {
             )
             .expect("baseline parse")
             .expect("baseline event");
-            std::hint::black_box(event);
+            black_box(event);
         }
     }
 
@@ -4058,7 +5015,7 @@ mod tests {
             )
             .expect("optimized parse")
             .expect("optimized event");
-            std::hint::black_box(event);
+            black_box(event);
         }
     }
 }

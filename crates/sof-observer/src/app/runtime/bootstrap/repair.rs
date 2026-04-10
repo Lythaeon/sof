@@ -125,6 +125,15 @@ pub(crate) struct RepairSourceHintBuffer {
 #[cfg(feature = "gossip-bootstrap")]
 impl RepairSourceHintBuffer {
     pub(crate) fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            counts: HashMap::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_baseline(capacity: usize) -> Self {
         Self {
             counts: HashMap::new(),
             capacity: capacity.max(1),
@@ -333,6 +342,90 @@ pub(crate) fn spawn_repair_driver(
         .map_err(|source| RepairDriverStartError::SpawnThread { source })?;
     let driver_handle = RepairDriverHandle::new(shutdown_tx, driver_thread);
     Ok((command_tx, result_rx, peer_snapshot, driver_handle))
+}
+
+#[cfg(all(test, feature = "gossip-bootstrap"))]
+mod tests {
+    use std::{
+        env,
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        time::Instant,
+    };
+
+    use super::RepairSourceHintBuffer;
+
+    #[test]
+    #[ignore = "profiling fixture for repair source hint buffer allocation"]
+    fn repair_source_hint_buffer_profile_fixture() {
+        let iterations = env::var("SOF_REPAIR_SOURCE_HINT_PROFILE_ITERS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(20_000);
+        let capacity = env::var("SOF_REPAIR_SOURCE_HINT_PROFILE_CAPACITY")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(256);
+        let batch_size = env::var("SOF_REPAIR_SOURCE_HINT_PROFILE_BATCH")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(capacity / 2);
+        let addresses = (0..capacity)
+            .map(|index| {
+                SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(
+                        127,
+                        0,
+                        u8::try_from((index / 255) % 255).unwrap_or(0),
+                        u8::try_from((index % 255) + 1).unwrap_or(u8::MAX),
+                    )),
+                    u16::try_from((10_000 + index) % usize::from(u16::MAX)).unwrap_or(u16::MAX),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(!addresses.is_empty());
+
+        let baseline_started_at = Instant::now();
+        for _ in 0..iterations {
+            let mut buffer = RepairSourceHintBuffer::new_baseline(capacity);
+            for addr in addresses.iter().copied() {
+                assert!(buffer.record(addr).is_ok());
+            }
+            let drained = buffer.drain_batch(batch_size);
+            assert!(!drained.is_empty());
+        }
+        let baseline_elapsed = baseline_started_at.elapsed();
+
+        let optimized_started_at = Instant::now();
+        for _ in 0..iterations {
+            let mut buffer = RepairSourceHintBuffer::new(capacity);
+            for addr in addresses.iter().copied() {
+                assert!(buffer.record(addr).is_ok());
+            }
+            let drained = buffer.drain_batch(batch_size);
+            assert!(!drained.is_empty());
+        }
+        let optimized_elapsed = optimized_started_at.elapsed();
+
+        let baseline_avg_ns =
+            baseline_elapsed.as_nanos() / u128::try_from(iterations).unwrap_or(u128::MAX);
+        let optimized_avg_ns =
+            optimized_elapsed.as_nanos() / u128::try_from(iterations).unwrap_or(u128::MAX);
+        let baseline_avg_us = baseline_avg_ns as f64 / 1_000.0;
+        let optimized_avg_us = optimized_avg_ns as f64 / 1_000.0;
+        println!(
+            "repair_source_hint_buffer_profile_fixture iterations={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.6} optimized_avg_us_per_iteration={:.6}",
+            iterations,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
+            baseline_avg_ns,
+            optimized_avg_ns,
+            baseline_avg_us,
+            optimized_avg_us
+        );
+    }
 }
 
 #[cfg(feature = "gossip-bootstrap")]

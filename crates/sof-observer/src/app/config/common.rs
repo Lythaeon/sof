@@ -1,4 +1,4 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 pub(crate) use crate::runtime_env::read_env_var;
 
@@ -15,12 +15,4 @@ pub fn duration_to_ms_u64(duration: Duration) -> u64 {
     } else {
         millis as u64
     }
-}
-
-pub fn current_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            duration.as_millis().min(u128::from(u64::MAX)) as u64
-        })
 }

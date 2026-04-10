@@ -1,6 +1,8 @@
 #[cfg(feature = "gossip-bootstrap")]
 use super::*;
 #[cfg(feature = "gossip-bootstrap")]
+use sof_support::time_support::current_unix_ms;
+#[cfg(feature = "gossip-bootstrap")]
 use thiserror::Error;
 
 #[cfg(feature = "gossip-bootstrap")]

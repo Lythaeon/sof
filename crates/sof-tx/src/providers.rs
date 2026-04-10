@@ -6,10 +6,18 @@ use std::{
     time::Duration,
 };
 
+use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
+use serde_json::from_slice as json_from_slice;
+use sof_support::time_support::nonzero_duration_or;
 use sof_types::PubkeyBytes;
 
 use crate::submit::SubmitTransportError;
+
+/// Maximum HTTP body size accepted from `getLatestBlockhash` RPC responses.
+const MAX_BLOCKHASH_RPC_RESPONSE_BYTES: usize = 64 * 1024;
+/// Default timeout used for recent-blockhash HTTP requests.
+const DEFAULT_RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One leader/validator target that can receive transactions directly.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -44,7 +52,7 @@ pub struct RpcRecentBlockhashProviderConfig {
 impl Default for RpcRecentBlockhashProviderConfig {
     fn default() -> Self {
         Self {
-            request_timeout: Duration::from_secs(10),
+            request_timeout: DEFAULT_RPC_REQUEST_TIMEOUT,
         }
     }
 }
@@ -81,8 +89,12 @@ impl RpcRecentBlockhashProvider {
         config: &RpcRecentBlockhashProviderConfig,
     ) -> Result<Self, SubmitTransportError> {
         let rpc_url = rpc_url.into();
+        let request_timeout =
+            nonzero_duration_or(config.request_timeout, DEFAULT_RPC_REQUEST_TIMEOUT);
         let client = reqwest::Client::builder()
-            .timeout(config.request_timeout)
+            .redirect(Policy::none())
+            .connect_timeout(request_timeout)
+            .timeout(request_timeout)
             .build()
             .map_err(|error| SubmitTransportError::Config {
                 message: error.to_string(),
@@ -250,18 +262,21 @@ async fn fetch_latest_blockhash(
         .map_err(|error| SubmitTransportError::Failure {
             message: error.to_string(),
         })?;
+    if response.status().is_redirection() {
+        return Err(SubmitTransportError::Failure {
+            message: format!("unexpected redirect response: {}", response.status()),
+        });
+    }
     let response = response
         .error_for_status()
         .map_err(|error| SubmitTransportError::Failure {
             message: error.to_string(),
         })?;
+    let response_body = read_http_response_bytes_bounded(response).await?;
     let parsed: LatestBlockhashRpcResponse =
-        response
-            .json()
-            .await
-            .map_err(|error| SubmitTransportError::Failure {
-                message: error.to_string(),
-            })?;
+        json_from_slice(&response_body).map_err(|error| SubmitTransportError::Failure {
+            message: error.to_string(),
+        })?;
     if let Some(result) = parsed.result {
         return parse_blockhash(&result.value.blockhash);
     }
@@ -273,6 +288,48 @@ async fn fetch_latest_blockhash(
     Err(SubmitTransportError::Failure {
         message: "rpc returned neither result nor error".to_owned(),
     })
+}
+
+/// Reads one RPC response body while enforcing a fixed maximum byte budget.
+async fn read_http_response_bytes_bounded(
+    mut response: reqwest::Response,
+) -> Result<Vec<u8>, SubmitTransportError> {
+    if response
+        .content_length()
+        .is_some_and(|content_length| content_length > MAX_BLOCKHASH_RPC_RESPONSE_BYTES as u64)
+    {
+        return Err(SubmitTransportError::Failure {
+            message: format!(
+                "response body exceeded max size of {MAX_BLOCKHASH_RPC_RESPONSE_BYTES} bytes"
+            ),
+        });
+    }
+
+    let initial_capacity = response
+        .content_length()
+        .and_then(|content_length| usize::try_from(content_length).ok())
+        .unwrap_or(0)
+        .min(MAX_BLOCKHASH_RPC_RESPONSE_BYTES);
+    let mut body = Vec::with_capacity(initial_capacity);
+    while let Some(chunk) =
+        response
+            .chunk()
+            .await
+            .map_err(|error| SubmitTransportError::Failure {
+                message: error.to_string(),
+            })?
+    {
+        let remaining = MAX_BLOCKHASH_RPC_RESPONSE_BYTES.saturating_sub(body.len());
+        if chunk.len() > remaining {
+            return Err(SubmitTransportError::Failure {
+                message: format!(
+                    "response body exceeded max size of {MAX_BLOCKHASH_RPC_RESPONSE_BYTES} bytes"
+                ),
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// Decodes one base58 blockhash string into the byte format used by `TxBuilder`.
@@ -299,6 +356,37 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
+
+    async fn spawn_http_response_server(response: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await;
+        assert!(listener.is_ok());
+        let listener = listener.unwrap_or_else(|error| panic!("{error}"));
+        let addr = listener.local_addr();
+        assert!(addr.is_ok());
+        let addr = addr.unwrap_or_else(|error| panic!("{error}"));
+        tokio::spawn(async move {
+            let accepted = listener.accept().await;
+            assert!(accepted.is_ok());
+            let (mut stream, _) = accepted.unwrap_or_else(|error| panic!("{error}"));
+            let mut buffer = [0_u8; 4096];
+            let read = stream.read(&mut buffer).await;
+            assert!(read.is_ok());
+            let write = stream.write_all(response.as_bytes()).await;
+            assert!(write.is_ok());
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn rpc_recent_blockhash_provider_accepts_zero_timeout_config() {
+        let provider = RpcRecentBlockhashProvider::with_config(
+            "http://127.0.0.1:8899",
+            &RpcRecentBlockhashProviderConfig {
+                request_timeout: Duration::ZERO,
+            },
+        );
+        assert!(provider.is_ok());
+    }
 
     #[tokio::test]
     async fn rpc_recent_blockhash_provider_fetches_initial_value() {
@@ -346,5 +434,45 @@ mod tests {
 
         let joined = server.await;
         assert!(joined.is_ok());
+    }
+
+    #[tokio::test]
+    async fn rpc_recent_blockhash_provider_rejects_redirects() {
+        let target = spawn_http_response_server(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                .to_owned(),
+        )
+        .await;
+        let endpoint = spawn_http_response_server(format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nlocation: {target}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        ))
+        .await;
+
+        let provider = RpcRecentBlockhashProvider::new(endpoint);
+        assert!(provider.is_ok());
+        let provider = provider.unwrap_or_else(|error| panic!("{error}"));
+        let error = match provider.refresh().await {
+            Ok(_blockhash) => panic!("redirect should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("redirect"));
+    }
+
+    #[tokio::test]
+    async fn rpc_recent_blockhash_provider_rejects_oversized_responses() {
+        let endpoint = spawn_http_response_server(format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            MAX_BLOCKHASH_RPC_RESPONSE_BYTES.saturating_add(1)
+        ))
+        .await;
+
+        let provider = RpcRecentBlockhashProvider::new(endpoint);
+        assert!(provider.is_ok());
+        let provider = provider.unwrap_or_else(|error| panic!("{error}"));
+        let error = match provider.refresh().await {
+            Ok(_blockhash) => panic!("oversized body should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("exceeded max size"));
     }
 }

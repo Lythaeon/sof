@@ -5,6 +5,7 @@
 //! It defines the feed envelope, event families, checkpoints, and consumer-facing
 //! fault types without yet wiring a runtime producer.
 
+use sof_support::time_support::{current_unix_nanos, current_unix_secs};
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -18,7 +19,7 @@ use std::{
         mpsc,
     },
     thread::JoinHandle,
-    time::{SystemTime, UNIX_EPOCH},
+    time::SystemTime,
 };
 
 use arcshift::ArcShift;
@@ -39,6 +40,11 @@ use crate::{
         SlotStatusEvent, TransactionEvent, TransactionStatusEvent,
     },
 };
+
+/// Maximum derived-state checkpoint bundle accepted from disk during restart recovery.
+const MAX_CHECKPOINT_STORE_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum retained replay record accepted from disk before the loader rejects the segment.
+const MAX_DISK_REPLAY_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 /// Static feed subscriptions requested by one derived-state consumer during host construction.
@@ -828,7 +834,7 @@ impl DerivedStateCheckpointStore {
         if !self.path.exists() {
             return Ok(None);
         }
-        let bytes = fs::read(&self.path).map_err(|error| {
+        let file = File::open(&self.path).map_err(|error| {
             DerivedStateConsumerFault::new(
                 DerivedStateConsumerFaultKind::CheckpointWriteFailed,
                 None,
@@ -838,6 +844,44 @@ impl DerivedStateCheckpointStore {
                 ),
             )
         })?;
+        let file_len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        if file_len > MAX_CHECKPOINT_STORE_BYTES {
+            return Err(DerivedStateConsumerFault::new(
+                DerivedStateConsumerFaultKind::CheckpointWriteFailed,
+                None,
+                format!(
+                    "derived-state checkpoint {} exceeds max {} bytes",
+                    self.path.display(),
+                    MAX_CHECKPOINT_STORE_BYTES
+                ),
+            ));
+        }
+        let mut bytes = Vec::with_capacity(
+            usize::try_from(file_len.min(MAX_CHECKPOINT_STORE_BYTES)).unwrap_or(0),
+        );
+        file.take(MAX_CHECKPOINT_STORE_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|error| {
+                DerivedStateConsumerFault::new(
+                    DerivedStateConsumerFaultKind::CheckpointWriteFailed,
+                    None,
+                    format!(
+                        "failed to read derived-state checkpoint {}: {error}",
+                        self.path.display()
+                    ),
+                )
+            })?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_CHECKPOINT_STORE_BYTES {
+            return Err(DerivedStateConsumerFault::new(
+                DerivedStateConsumerFaultKind::CheckpointWriteFailed,
+                None,
+                format!(
+                    "derived-state checkpoint {} exceeds max {} bytes",
+                    self.path.display(),
+                    MAX_CHECKPOINT_STORE_BYTES
+                ),
+            ));
+        }
         let persisted = serde_json::from_slice::<DerivedStatePersistedCheckpoint<T>>(&bytes)
             .map_err(|error| {
                 DerivedStateConsumerFault::new(
@@ -898,6 +942,17 @@ impl DerivedStateCheckpointStore {
                     format!("failed to serialize derived-state checkpoint: {error}"),
                 )
             })?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_CHECKPOINT_STORE_BYTES {
+            return Err(DerivedStateConsumerFault::new(
+                DerivedStateConsumerFaultKind::CheckpointWriteFailed,
+                Some(checkpoint.last_applied_sequence),
+                format!(
+                    "derived-state checkpoint {} exceeds max {} bytes",
+                    self.path.display(),
+                    MAX_CHECKPOINT_STORE_BYTES
+                ),
+            ));
+        }
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|error| {
                 DerivedStateConsumerFault::new(
@@ -1569,8 +1624,18 @@ impl DiskDerivedStateReplaySource {
 
     /// Serializes one feed envelope into an on-disk record payload.
     fn encode_envelope(envelope: &DerivedStateFeedEnvelope) -> io::Result<Vec<u8>> {
-        bincode::serialize(envelope)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+        let encoded = bincode::serialize(envelope)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        if encoded.len() > MAX_DISK_REPLAY_RECORD_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "derived-state replay record exceeded max {} bytes",
+                    MAX_DISK_REPLAY_RECORD_BYTES
+                ),
+            ));
+        }
+        Ok(encoded)
     }
 
     /// Deserializes one feed envelope from an on-disk record payload.
@@ -1737,8 +1802,17 @@ impl DiskDerivedStateReplaySource {
                 Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(error) => return Err(error),
             }
-            let encoded_len = u32::from_le_bytes(length_bytes);
-            let mut encoded = vec![0_u8; encoded_len as usize];
+            let encoded_len = u32::from_le_bytes(length_bytes) as usize;
+            if encoded_len > MAX_DISK_REPLAY_RECORD_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "derived-state replay record exceeded max {} bytes",
+                        MAX_DISK_REPLAY_RECORD_BYTES
+                    ),
+                ));
+            }
+            let mut encoded = vec![0_u8; encoded_len];
             file.read_exact(&mut encoded)?;
             envelopes.push(Self::decode_envelope(&encoded)?);
         }
@@ -1764,8 +1838,17 @@ impl DiskDerivedStateReplaySource {
                 Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(error) => return Err(error),
             }
-            let encoded_len = u32::from_le_bytes(length_bytes);
-            let mut encoded = vec![0_u8; encoded_len as usize];
+            let encoded_len = u32::from_le_bytes(length_bytes) as usize;
+            if encoded_len > MAX_DISK_REPLAY_RECORD_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "derived-state replay record exceeded max {} bytes",
+                        MAX_DISK_REPLAY_RECORD_BYTES
+                    ),
+                ));
+            }
+            let mut encoded = vec![0_u8; encoded_len];
             file.read_exact(&mut encoded)?;
             let envelope = Self::decode_envelope(&encoded)?;
             first_sequence.get_or_insert(envelope.sequence);
@@ -1915,20 +1998,21 @@ impl DiskDerivedStateReplaySource {
         mut envelopes_to_remove: usize,
     ) -> io::Result<usize> {
         let mut removed = 0_usize;
+        let mut removed_segments = 0_usize;
         while envelopes_to_remove > 0 {
-            let Some(oldest_segment) = metadata.segments.first().cloned() else {
+            let Some(oldest_segment) = metadata.segments.get(removed_segments).cloned() else {
                 break;
             };
             if oldest_segment.retained_envelopes <= envelopes_to_remove {
                 Self::evict_cached_appender(&oldest_segment.path);
                 fs::remove_file(&oldest_segment.path)?;
-                metadata.segments.remove(0);
                 metadata.retained_envelopes = metadata
                     .retained_envelopes
                     .saturating_sub(oldest_segment.retained_envelopes);
                 envelopes_to_remove =
                     envelopes_to_remove.saturating_sub(oldest_segment.retained_envelopes);
                 removed = removed.saturating_add(oldest_segment.retained_envelopes);
+                removed_segments = removed_segments.saturating_add(1);
                 continue;
             }
 
@@ -1943,7 +2027,7 @@ impl DiskDerivedStateReplaySource {
             };
             let new_path = self.segment_path(session_id, new_first_sequence);
             self.rewrite_records(&oldest_segment.path, &new_path, &retained)?;
-            let Some(oldest_segment_metadata) = metadata.segments.first_mut() else {
+            let Some(oldest_segment_metadata) = metadata.segments.get_mut(removed_segments) else {
                 break;
             };
             *oldest_segment_metadata = DiskDerivedStateSegmentMetadata {
@@ -1957,6 +2041,9 @@ impl DiskDerivedStateReplaySource {
                 .saturating_sub(envelopes_to_remove);
             removed = removed.saturating_add(envelopes_to_remove);
             envelopes_to_remove = 0;
+        }
+        if removed_segments > 0 {
+            metadata.segments.drain(..removed_segments);
         }
         Ok(removed)
     }
@@ -1982,8 +2069,10 @@ impl DiskDerivedStateReplaySource {
             .collect::<Vec<_>>();
         retained_sessions.sort_by_key(|(session_id, _path)| *session_id);
         let mut removed_any = false;
-        while retained_sessions.len() > self.max_retained_sessions {
-            let Some((session_id, path)) = retained_sessions.first().cloned() else {
+        let mut removed_sessions = 0_usize;
+        while retained_sessions.len().saturating_sub(removed_sessions) > self.max_retained_sessions
+        {
+            let Some((session_id, path)) = retained_sessions.get(removed_sessions).cloned() else {
                 break;
             };
             if session_id == current_session_id {
@@ -1992,8 +2081,11 @@ impl DiskDerivedStateReplaySource {
             Self::evict_cached_appenders_in_dir(&path);
             fs::remove_dir_all(&path)?;
             self.update_session_metadata(session_id, DiskDerivedStateSessionMetadata::default());
-            retained_sessions.remove(0);
+            removed_sessions = removed_sessions.saturating_add(1);
             removed_any = true;
+        }
+        if removed_sessions > 0 {
+            retained_sessions.drain(..removed_sessions);
         }
         if removed_any {
             let _ = self.compactions.fetch_add(1, Ordering::Relaxed);
@@ -4393,7 +4485,7 @@ fn classify_rooted_account_observed_kind(event: &AccountUpdateEvent) -> RootedAc
 
 /// Returns the maximum wallclock skew across topology nodes when present.
 fn topology_max_wallclock_skew_ms(event: &ClusterTopologyEvent) -> Option<u64> {
-    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let now_secs = current_unix_secs();
     event
         .snapshot_nodes
         .iter()
@@ -4615,9 +4707,7 @@ impl RegisteredDerivedStateConsumer {
 
 /// Generates a best-effort unique session id for one process lifetime.
 fn generate_session_id() -> FeedSessionId {
-    let now_nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0_u128, |duration| duration.as_nanos());
+    let now_nanos = current_unix_nanos();
     let pid = u128::from(std::process::id());
     FeedSessionId(now_nanos ^ pid)
 }
@@ -4639,9 +4729,7 @@ mod tests {
     };
 
     fn unique_test_replay_dir(name: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0_u128, |duration| duration.as_nanos());
+        let unique = current_unix_nanos();
         env::temp_dir().join(format!(
             "sof-derived-state-{name}-{}-{unique}",
             std::process::id()
@@ -4734,6 +4822,144 @@ mod tests {
         if let Some(parent) = checkpoint_path.parent() {
             drop(fs::remove_dir_all(parent));
         }
+    }
+
+    #[test]
+    fn checkpoint_store_rejects_oversized_files() {
+        let checkpoint_path = unique_test_checkpoint_path("store-oversized");
+        let parent = checkpoint_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| unique_test_replay_dir("store-oversized"));
+        let create_result = fs::create_dir_all(&parent);
+        assert!(create_result.is_ok(), "{create_result:?}");
+
+        let file_result = File::create(&checkpoint_path);
+        assert!(file_result.is_ok(), "{file_result:?}");
+        let file = file_result.unwrap_or_else(|error| panic!("{error}"));
+        let set_len_result = file.set_len(MAX_CHECKPOINT_STORE_BYTES.saturating_add(1));
+        assert!(set_len_result.is_ok(), "{set_len_result:?}");
+
+        let store = DerivedStateCheckpointStore::new(&checkpoint_path);
+        let load_result = store.load::<TestCheckpointState>();
+        assert!(load_result.is_err(), "oversized checkpoint should fail");
+        let error = match load_result {
+            Ok(value) => panic!("expected oversized checkpoint failure, got {value:?}"),
+            Err(error) => error,
+        };
+        assert!(error.message.contains("exceeds max"));
+
+        drop(fs::remove_file(&checkpoint_path));
+        drop(fs::remove_dir_all(parent));
+    }
+
+    #[test]
+    fn checkpoint_store_rejects_oversized_writes() {
+        let checkpoint_path = unique_test_checkpoint_path("store-oversized-write");
+        let store = DerivedStateCheckpointStore::new(&checkpoint_path);
+        let checkpoint = DerivedStateCheckpoint {
+            session_id: FeedSessionId(123),
+            last_applied_sequence: FeedSequence(9),
+            watermarks: FeedWatermarks::default(),
+            state_version: 1,
+            extension_version: "oversized-write-test".to_owned(),
+        };
+        let oversized = "x".repeat(
+            usize::try_from(MAX_CHECKPOINT_STORE_BYTES)
+                .unwrap_or(0)
+                .saturating_add(1),
+        );
+
+        let store_result = store.store(&checkpoint, &oversized);
+        assert!(
+            store_result.is_err(),
+            "oversized checkpoint write should fail"
+        );
+        let error = match store_result {
+            Ok(()) => panic!("expected oversized checkpoint write failure"),
+            Err(error) => error,
+        };
+        assert!(error.message.contains("exceeds max"));
+        assert!(
+            !checkpoint_path.exists(),
+            "oversized checkpoint should not be written"
+        );
+
+        if let Some(parent) = checkpoint_path.parent() {
+            drop(fs::remove_dir_all(parent));
+        }
+    }
+
+    #[test]
+    fn replay_encode_rejects_oversized_records() {
+        let envelope = DerivedStateFeedEnvelope {
+            session_id: FeedSessionId(55),
+            sequence: FeedSequence(1),
+            emitted_at: SystemTime::UNIX_EPOCH,
+            watermarks: FeedWatermarks::default(),
+            event: DerivedStateFeedEvent::RootedAccountObserved(RootedAccountObservedEvent {
+                slot: 1,
+                commitment_status: TxCommitmentStatus::Finalized,
+                finalized_slot: Some(1),
+                pubkey: PubkeyBytes::from([1_u8; 32]),
+                owner: PubkeyBytes::from([2_u8; 32]),
+                lamports: 1,
+                executable: false,
+                rent_epoch: 0,
+                data: Arc::from(
+                    vec![7_u8; MAX_DISK_REPLAY_RECORD_BYTES.saturating_add(1)].into_boxed_slice(),
+                ),
+                write_version: None,
+                txn_signature: None,
+                is_startup: false,
+                matched_filter: None,
+                provider_source: None,
+                kind: RootedAccountObservedKind::Other,
+            }),
+        };
+
+        let encoded = DiskDerivedStateReplaySource::encode_envelope(&envelope);
+        assert!(encoded.is_err(), "oversized replay record should fail");
+        let error = match encoded {
+            Ok(value) => panic!(
+                "expected oversized replay encode failure, got {}",
+                value.len()
+            ),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeded max"));
+    }
+
+    #[test]
+    fn replay_loader_rejects_oversized_segment_record() {
+        let replay_dir = unique_test_replay_dir("oversized-record");
+        let source = DiskDerivedStateReplaySource::new(&replay_dir, 32);
+        assert!(source.is_ok());
+        let source = source.unwrap_or_else(|error| panic!("{error}"));
+
+        let segment_path = replay_dir.join("segment.bin");
+        let file_result = File::create(&segment_path);
+        assert!(file_result.is_ok(), "{file_result:?}");
+        let mut file = file_result.unwrap_or_else(|error| panic!("{error}"));
+        let record_len =
+            u32::try_from(MAX_DISK_REPLAY_RECORD_BYTES.saturating_add(1)).unwrap_or(u32::MAX);
+        let write_result = file.write_all(&record_len.to_le_bytes());
+        assert!(write_result.is_ok(), "{write_result:?}");
+        let flush_result = file.flush();
+        assert!(flush_result.is_ok(), "{flush_result:?}");
+
+        let load_result = source.load_segment_from_disk(&segment_path);
+        assert!(load_result.is_err(), "oversized replay record should fail");
+        let error = match load_result {
+            Ok(value) => panic!("expected oversized replay record failure, got {value:?}"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeded max"));
+
+        drop(fs::remove_file(&segment_path));
+        drop(fs::remove_dir_all(replay_dir));
     }
 
     #[test]

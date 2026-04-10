@@ -188,6 +188,8 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::SendError;
+#[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
+use tokio::time::{Instant as TokioInstant, Interval, interval_at};
 
 #[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -208,6 +210,26 @@ use solana_transaction::versioned::VersionedTransaction;
 
 /// Default queue capacity for processed provider-stream ingress.
 pub const DEFAULT_PROVIDER_STREAM_QUEUE_CAPACITY: usize = 8_192;
+/// Smallest keepalive period accepted by provider intervals to avoid Tokio zero-period panics.
+#[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
+const MIN_KEEPALIVE_INTERVAL: Duration = Duration::from_millis(1);
+/// Stable compute-budget program id reused in provider transaction classifiers.
+const COMPUTE_BUDGET_PROGRAM_ID: solana_pubkey::Pubkey = compute_budget::ID;
+/// Stable vote program id reused in provider transaction classifiers.
+const VOTE_PROGRAM_ID: solana_pubkey::Pubkey = vote::ID;
+
+/// Creates one keepalive interval that waits one full period before the first tick.
+#[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
+pub(crate) fn keepalive_interval(period: Duration) -> Interval {
+    let period = if period.is_zero() {
+        MIN_KEEPALIVE_INTERVAL
+    } else {
+        period
+    };
+    let start = TokioInstant::now();
+    let first_tick = start.checked_add(period).unwrap_or(start);
+    interval_at(first_tick, period)
+}
 
 /// Identifies the processed provider family driving SOF's direct plugin ingress.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -379,6 +401,28 @@ impl ProviderStreamUpdate {
             Self::LeaderSchedule(event) => event.provider_source = Some(Arc::clone(&source)),
             Self::Reorg(event) => event.provider_source = Some(Arc::clone(&source)),
             Self::Health(event) => event.source = Arc::unwrap_or_clone(source),
+        }
+        self
+    }
+
+    /// Tags one provider-origin update with one shared source reference.
+    #[must_use]
+    #[cfg_attr(not(feature = "provider-grpc"), allow(dead_code))]
+    pub(crate) fn with_provider_source_ref(mut self, source: &Arc<ProviderSourceIdentity>) -> Self {
+        match &mut self {
+            Self::Transaction(event) => event.provider_source = Some(Arc::clone(source)),
+            Self::SerializedTransaction(event) => event.provider_source = Some(Arc::clone(source)),
+            Self::TransactionLog(event) => event.provider_source = Some(Arc::clone(source)),
+            Self::TransactionStatus(event) => event.provider_source = Some(Arc::clone(source)),
+            Self::TransactionViewBatch(event) => event.provider_source = Some(Arc::clone(source)),
+            Self::AccountUpdate(event) => event.provider_source = Some(Arc::clone(source)),
+            Self::BlockMeta(event) => event.provider_source = Some(Arc::clone(source)),
+            Self::RecentBlockhash(event) => event.provider_source = Some(Arc::clone(source)),
+            Self::SlotStatus(event) => event.provider_source = Some(Arc::clone(source)),
+            Self::ClusterTopology(event) => event.provider_source = Some(Arc::clone(source)),
+            Self::LeaderSchedule(event) => event.provider_source = Some(Arc::clone(source)),
+            Self::Reorg(event) => event.provider_source = Some(Arc::clone(source)),
+            Self::Health(event) => event.source = (**source).clone(),
         }
         self
     }
@@ -1165,14 +1209,14 @@ pub(crate) fn classify_provider_transaction_kind(tx: &VersionedTransaction) -> T
     let keys = tx.message.static_account_keys();
     for instruction in tx.message.instructions() {
         if let Some(program_id) = keys.get(usize::from(instruction.program_id_index)) {
-            if *program_id == vote::id() {
+            if *program_id == VOTE_PROGRAM_ID {
                 has_vote = true;
                 if has_non_vote_non_budget {
                     return TxKind::Mixed;
                 }
                 continue;
             }
-            if *program_id != compute_budget::id() {
+            if *program_id != COMPUTE_BUDGET_PROGRAM_ID {
                 has_non_vote_non_budget = true;
                 if has_vote {
                     return TxKind::Mixed;
@@ -1196,14 +1240,14 @@ pub(crate) fn classify_provider_transaction_kind_view<D: TransactionData>(
     let mut has_vote = false;
     let mut has_non_vote_non_budget = false;
     for (program_id, _) in view.program_instructions_iter() {
-        if *program_id == vote::id() {
+        if *program_id == VOTE_PROGRAM_ID {
             has_vote = true;
             if has_non_vote_non_budget {
                 return TxKind::Mixed;
             }
             continue;
         }
-        if *program_id != compute_budget::id() {
+        if *program_id != COMPUTE_BUDGET_PROGRAM_ID {
             has_non_vote_non_budget = true;
             if has_vote {
                 return TxKind::Mixed;
@@ -1300,6 +1344,7 @@ pub mod websocket;
 #[cfg(all(test, any(feature = "provider-grpc", feature = "provider-websocket")))]
 mod tests {
     use super::*;
+    use sof_support::bench::{avg_ns_per_iteration, profile_iterations};
     use solana_instruction::Instruction;
     use solana_keypair::Keypair;
     use solana_message::{Message, VersionedMessage};
@@ -1308,14 +1353,6 @@ mod tests {
     use std::{sync::Arc, time::Instant};
     use tokio::runtime::Runtime;
     use tokio::time::{Duration, sleep, timeout};
-
-    fn profile_iterations(default: usize) -> usize {
-        std::env::var("SOF_PROFILE_ITERATIONS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(default)
-    }
 
     fn sample_mixed_transaction() -> VersionedTransaction {
         let signer = Keypair::new();
@@ -1337,6 +1374,37 @@ mod tests {
         VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&signer]).expect("tx")
     }
 
+    fn sample_recent_blockhash_update() -> ProviderStreamUpdate {
+        ProviderStreamUpdate::RecentBlockhash(ObservedRecentBlockhashEvent {
+            slot: 7,
+            recent_blockhash: solana_hash::Hash::new_unique().to_bytes(),
+            dataset_tx_count: 0,
+            provider_source: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn keepalive_interval_waits_one_full_period_before_first_tick() {
+        let mut interval = keepalive_interval(Duration::from_millis(25));
+        assert!(
+            timeout(Duration::from_millis(5), interval.tick())
+                .await
+                .is_err(),
+            "keepalive interval should not tick immediately"
+        );
+        timeout(Duration::from_millis(50), interval.tick())
+            .await
+            .expect("keepalive interval should tick after one full period");
+    }
+
+    #[tokio::test]
+    async fn keepalive_interval_zero_period_is_clamped() {
+        let mut interval = keepalive_interval(Duration::ZERO);
+        timeout(Duration::from_millis(50), interval.tick())
+            .await
+            .expect("zero keepalive period should not panic or stall");
+    }
+
     fn classify_provider_transaction_kind_baseline(tx: &VersionedTransaction) -> TxKind {
         let mut has_vote = false;
         let mut has_non_vote_non_budget = false;
@@ -1349,6 +1417,36 @@ mod tests {
                 }
                 if *program_id != compute_budget::id() {
                     has_non_vote_non_budget = true;
+                }
+            }
+        }
+        if has_vote && !has_non_vote_non_budget {
+            TxKind::VoteOnly
+        } else if has_vote {
+            TxKind::Mixed
+        } else {
+            TxKind::NonVote
+        }
+    }
+
+    fn classify_provider_transaction_kind_pre_hoist(tx: &VersionedTransaction) -> TxKind {
+        let mut has_vote = false;
+        let mut has_non_vote_non_budget = false;
+        let keys = tx.message.static_account_keys();
+        for instruction in tx.message.instructions() {
+            if let Some(program_id) = keys.get(usize::from(instruction.program_id_index)) {
+                if *program_id == vote::id() {
+                    has_vote = true;
+                    if has_non_vote_non_budget {
+                        return TxKind::Mixed;
+                    }
+                    continue;
+                }
+                if *program_id != compute_budget::id() {
+                    has_non_vote_non_budget = true;
+                    if has_vote {
+                        return TxKind::Mixed;
+                    }
                 }
             }
         }
@@ -1697,6 +1795,37 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "profiling fixture for provider tx kind hoisted id comparison"]
+    fn provider_transaction_kind_hoist_ids_profile_fixture() {
+        let iterations = profile_iterations(1_000_000);
+
+        let tx = sample_mixed_transaction();
+
+        let baseline_started = Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(classify_provider_transaction_kind_pre_hoist(&tx));
+        }
+        let baseline_elapsed = baseline_started.elapsed();
+
+        let optimized_started = Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(classify_provider_transaction_kind(&tx));
+        }
+        let optimized_elapsed = optimized_started.elapsed();
+
+        eprintln!(
+            "provider_transaction_kind_hoist_ids_profile_fixture iterations={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.3} optimized_avg_us_per_iteration={:.3}",
+            iterations,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
+            avg_ns_per_iteration(baseline_elapsed, iterations),
+            avg_ns_per_iteration(optimized_elapsed, iterations),
+            avg_ns_per_iteration(baseline_elapsed, iterations) as f64 / 1_000.0,
+            avg_ns_per_iteration(optimized_elapsed, iterations) as f64 / 1_000.0,
+        );
+    }
+
+    #[test]
     #[ignore = "profiling fixture for baseline provider tx kind classification"]
     fn provider_transaction_kind_baseline_profile_fixture() {
         let iterations = profile_iterations(1_000_000);
@@ -1716,5 +1845,42 @@ mod tests {
         for _ in 0..iterations {
             std::hint::black_box(classify_provider_transaction_kind(&tx));
         }
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for provider source attachment path"]
+    fn provider_update_source_attachment_profile_fixture() {
+        let iterations = profile_iterations(1_000_000);
+        let source = ProviderSourceIdentity::new(
+            ProviderSourceId::Generic(Arc::<str>::from("custom")),
+            "source-a",
+        );
+        let source_ref = Arc::new(source.clone());
+        let update = sample_recent_blockhash_update();
+
+        let baseline_started = Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(update.clone().with_provider_source(source.clone()));
+        }
+        let baseline_elapsed = baseline_started.elapsed();
+
+        let optimized_started = Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(update.clone().with_provider_source_ref(&source_ref));
+        }
+        let optimized_elapsed = optimized_started.elapsed();
+        let baseline_avg_ns = avg_ns_per_iteration(baseline_elapsed, iterations);
+        let optimized_avg_ns = avg_ns_per_iteration(optimized_elapsed, iterations);
+
+        eprintln!(
+            "provider_update_source_attachment_profile_fixture iterations={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.3} optimized_avg_us_per_iteration={:.3}",
+            iterations,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
+            baseline_avg_ns,
+            optimized_avg_ns,
+            baseline_avg_ns as f64 / 1_000.0,
+            optimized_avg_ns as f64 / 1_000.0,
+        );
     }
 }

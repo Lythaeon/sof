@@ -1,12 +1,12 @@
 #![allow(clippy::indexing_slicing)]
 
-use std::io::{ErrorKind, IoSliceMut};
+use std::io::{Error as IoError, ErrorKind, IoSliceMut};
 use std::net::SocketAddr;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsFd, AsRawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crossbeam_queue::ArrayQueue;
 
@@ -17,13 +17,15 @@ use nix::poll::{PollFd, PollFlags};
 #[cfg(target_os = "linux")]
 use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg};
 use socket2::SockRef;
+use sof_support::time_support::current_unix_ms;
 use thiserror::Error;
 use tokio::task::{self, JoinHandle};
 
 use crate::ingest::RawPacketBatchSender;
 use crate::ingest::config::{
     enable_rxq_ovfl_tracking, read_udp_batch_max_wait_ms, read_udp_batch_size,
-    read_udp_idle_wait_ms, read_udp_rcvbuf_bytes, read_udp_receiver_core,
+    read_udp_drop_on_channel_full, read_udp_idle_wait_ms, read_udp_rcvbuf_bytes,
+    read_udp_receiver_core,
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -168,7 +170,7 @@ impl RawPacketBatch {
     ) -> Result<(), UdpReceiverError> {
         let Some(storage) = self.storage.as_mut() else {
             return Err(UdpReceiverError::Receive {
-                source: std::io::Error::other("raw packet batch storage missing"),
+                source: IoError::other("raw packet batch storage missing"),
             });
         };
         if len > UDP_PACKET_BUFFER_BYTES {
@@ -213,25 +215,31 @@ impl RawPacketBatch {
         ingress: RawPacketIngress,
         bytes: &[u8],
     ) -> Result<(), UdpReceiverError> {
-        if self.storage.is_none() {
-            return Err(UdpReceiverError::Receive {
-                source: std::io::Error::other("raw packet batch storage missing"),
-            });
-        }
         if bytes.len() > UDP_PACKET_BUFFER_BYTES {
             return Err(UdpReceiverError::InvalidPacketLength {
                 len: bytes.len(),
                 capacity: UDP_PACKET_BUFFER_BYTES,
             });
         }
-        let buffer_index = self.ensure_receive_slots(1);
-        let buffer =
-            self.receive_buffer_mut(buffer_index)
-                .ok_or_else(|| UdpReceiverError::Receive {
-                    source: std::io::Error::other("raw packet receive buffer missing"),
-                })?;
-        buffer[..bytes.len()].copy_from_slice(bytes);
-        self.push_received_metadata(source, ingress, buffer_index, bytes.len())
+        let Some(storage) = self.storage.as_mut() else {
+            return Err(UdpReceiverError::Receive {
+                source: IoError::other("raw packet batch storage missing"),
+            });
+        };
+        let buffer_index = storage.packets.len();
+        if buffer_index == storage.buffers.len() {
+            storage.buffers.push([0_u8; UDP_PACKET_BUFFER_BYTES]);
+        }
+        let packet_len = bytes.len();
+        debug_assert!(buffer_index < storage.buffers.len());
+        storage.buffers[buffer_index][..packet_len].copy_from_slice(bytes);
+        storage.packets.push(RawPacket {
+            source,
+            ingress,
+            buffer_index,
+            len: packet_len,
+        });
+        Ok(())
     }
 
     #[must_use]
@@ -499,9 +507,10 @@ fn run_udp_receiver_with_socket(
     let mut batch = recycler.allocate();
     let mut batch_started_at: Option<Instant> = None;
     let mut last_rxq_ovfl_counter: Option<u64> = None;
+    let drop_on_full = read_udp_drop_on_channel_full();
     loop {
         if should_shutdown(shutdown) {
-            flush_batch(tx, &mut batch, telemetry);
+            flush_batch(tx, &mut batch, drop_on_full, telemetry);
             return Ok(());
         }
         #[cfg(target_os = "linux")]
@@ -521,7 +530,7 @@ fn run_udp_receiver_with_socket(
                     if let Some(telemetry) = telemetry {
                         telemetry.record_packets(received);
                     }
-                    flush_batch(tx, &mut batch, telemetry);
+                    flush_batch(tx, &mut batch, drop_on_full, telemetry);
                     continue;
                 }
                 Err(error)
@@ -574,7 +583,7 @@ fn run_udp_receiver_with_socket(
                     .map(|started_at| started_at.elapsed())
                     .unwrap_or_default();
                 if batch.len() >= batch_size || batch_elapsed >= batch_max_wait {
-                    flush_batch(tx, &mut batch, telemetry);
+                    flush_batch(tx, &mut batch, drop_on_full, telemetry);
                     batch_started_at = None;
                     if current_wait != idle_wait {
                         std_socket
@@ -587,7 +596,7 @@ fn run_udp_receiver_with_socket(
             Err(error)
                 if error.kind() == ErrorKind::WouldBlock || error.kind() == ErrorKind::TimedOut =>
             {
-                flush_batch(tx, &mut batch, telemetry);
+                flush_batch(tx, &mut batch, drop_on_full, telemetry);
                 batch_started_at = None;
                 if current_wait != idle_wait {
                     std_socket
@@ -613,6 +622,6 @@ fn should_shutdown(shutdown: Option<&Arc<AtomicBool>>) -> bool {
 #[path = "io.rs"]
 mod io;
 use io::{
-    current_unix_ms, flush_batch, maybe_pin_receiver_thread, recv_udp_batch_coalesced,
-    recv_udp_packet, tune_udp_socket,
+    flush_batch, maybe_pin_receiver_thread, recv_udp_batch_coalesced, recv_udp_packet,
+    tune_udp_socket,
 };

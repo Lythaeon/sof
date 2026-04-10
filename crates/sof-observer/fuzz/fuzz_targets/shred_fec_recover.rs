@@ -1,5 +1,7 @@
 #![no_main]
 
+use std::sync::Arc;
+
 use libfuzzer_sys::fuzz_target;
 use sof::{
     protocol::shred_wire::{
@@ -230,6 +232,7 @@ fuzz_target!(|bytes: &[u8]| {
             }),
             ParsedShred::Code(code) => ParsedShredHeader::Code(code),
         };
+        let packet = Arc::<[u8]>::from(packet);
         let recovered = recoverer.ingest_packet(&packet, &parsed_header);
         assert!(recoverer.tracked_sets() <= max_tracked_sets);
 

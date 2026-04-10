@@ -1,4 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use sof_support::time_support::current_unix_ms;
 
 use bincode::Options;
 use serde::{Deserialize, Serialize};
@@ -336,16 +336,7 @@ pub fn build_window_index_request(
 }
 
 pub(super) fn unix_timestamp_ms() -> u64 {
-    let now = SystemTime::now();
-    let Ok(duration) = now.duration_since(UNIX_EPOCH) else {
-        return 0;
-    };
-    let millis = duration.as_millis();
-    if millis > u128::from(u64::MAX) {
-        u64::MAX
-    } else {
-        millis as u64
-    }
+    current_unix_ms()
 }
 
 #[cfg(test)]

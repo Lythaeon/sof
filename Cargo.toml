@@ -4,6 +4,7 @@ members = [
     "crates/sof-gossip-tuning",
     "crates/sof-observer",
     "crates/sof-solana-compat",
+    "crates/sof-support",
     "crates/sof-tx",
     "crates/sof-types",
 ]
@@ -11,6 +12,7 @@ exclude = ["crates/sof-solana-gossip"]
 
 [patch.crates-io]
 sof-solana-gossip = { path = "crates/sof-solana-gossip" }
+helius-laserstream = { path = "vendor/helius-laserstream" }
 
 [workspace.package]
 edition = "2024"

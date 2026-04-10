@@ -12,6 +12,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use sof_support::{bench::avg_ns_per_iteration, short_vec::decode_short_u16_len_prefix};
 use sof_types::SignatureBytes;
 use solana_keypair::Keypair;
 use solana_signature::Signature;
@@ -262,20 +263,6 @@ fn target(port: u16) -> LeaderTarget {
     LeaderTarget::new(None, SocketAddr::from(([127, 0, 0, 1], port)))
 }
 
-/// Decodes the first short-vec length prefix in a serialized transaction.
-fn decode_short_vec_len(bytes: &[u8]) -> Option<(usize, usize)> {
-    let mut value = 0_usize;
-    let mut shift = 0_u32;
-    for (idx, byte) in bytes.iter().copied().take(3).enumerate() {
-        value |= usize::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Some((value, idx.saturating_add(1)));
-        }
-        shift = shift.saturating_add(7);
-    }
-    None
-}
-
 /// Rewrites the first signature bytes so repeated profile iterations do not trip dedupe.
 fn rewrite_first_signature(bytes: &mut [u8], seed: u64) {
     const BYTE_SHIFTS: [u32; 64] = [
@@ -283,7 +270,7 @@ fn rewrite_first_signature(bytes: &mut [u8], seed: u64) {
         0, 8, 16, 24, 32, 40, 48, 56, 0, 8, 16, 24, 32, 40, 48, 56, 0, 8, 16, 24, 32, 40, 48, 56,
         0, 8, 16, 24, 32, 40, 48, 56, 0, 8, 16, 24, 32, 40, 48, 56,
     ];
-    let decoded = decode_short_vec_len(bytes);
+    let decoded = decode_short_u16_len_prefix(bytes);
     assert!(decoded.is_some());
     let (signature_count, offset) = decoded.unwrap_or((0, 0));
     assert!(signature_count > 0);
@@ -1553,7 +1540,15 @@ async fn submit_rpc_only_profile_fixture() {
             .await;
         assert!(result.is_ok());
     }
-    println!("rpc_only_us={}", start.elapsed().as_micros());
+    let elapsed = start.elapsed();
+    let avg_ns = avg_ns_per_iteration(elapsed, iterations);
+    println!(
+        "submit_rpc_only_profile_fixture iterations={} rpc_only_us={} avg_ns_per_iteration={} avg_us_per_iteration={:.3}",
+        iterations,
+        elapsed.as_micros(),
+        avg_ns,
+        avg_ns as f64 / 1_000.0
+    );
 }
 
 #[tokio::test]
@@ -1585,7 +1580,15 @@ async fn submit_jito_only_profile_fixture() {
             .await;
         assert!(result.is_ok());
     }
-    println!("jito_only_us={}", start.elapsed().as_micros());
+    let elapsed = start.elapsed();
+    let avg_ns = avg_ns_per_iteration(elapsed, iterations);
+    println!(
+        "submit_jito_only_profile_fixture iterations={} jito_only_us={} avg_ns_per_iteration={} avg_us_per_iteration={:.3}",
+        iterations,
+        elapsed.as_micros(),
+        avg_ns,
+        avg_ns as f64 / 1_000.0
+    );
 }
 
 #[tokio::test]
@@ -1618,7 +1621,15 @@ async fn submit_direct_only_profile_fixture() {
             .await;
         assert!(result.is_ok());
     }
-    println!("direct_only_us={}", start.elapsed().as_micros());
+    let elapsed = start.elapsed();
+    let avg_ns = avg_ns_per_iteration(elapsed, iterations);
+    println!(
+        "submit_direct_only_profile_fixture iterations={} direct_only_us={} avg_ns_per_iteration={} avg_us_per_iteration={:.3}",
+        iterations,
+        elapsed.as_micros(),
+        avg_ns,
+        avg_ns as f64 / 1_000.0
+    );
 }
 
 #[tokio::test]
@@ -1663,7 +1674,15 @@ async fn submit_hybrid_fallback_profile_fixture() {
             .await;
         assert!(result.is_ok());
     }
-    println!("hybrid_fallback_us={}", start.elapsed().as_micros());
+    let elapsed = start.elapsed();
+    let avg_ns = avg_ns_per_iteration(elapsed, iterations);
+    println!(
+        "submit_hybrid_fallback_profile_fixture iterations={} hybrid_fallback_us={} avg_ns_per_iteration={} avg_us_per_iteration={:.3}",
+        iterations,
+        elapsed.as_micros(),
+        avg_ns,
+        avg_ns as f64 / 1_000.0
+    );
 }
 
 #[tokio::test]
@@ -1709,5 +1728,13 @@ async fn submit_all_at_once_profile_fixture() {
             .await;
         assert!(result.is_ok());
     }
-    println!("all_at_once_us={}", start.elapsed().as_micros());
+    let elapsed = start.elapsed();
+    let avg_ns = avg_ns_per_iteration(elapsed, iterations);
+    println!(
+        "submit_all_at_once_profile_fixture iterations={} all_at_once_us={} avg_ns_per_iteration={} avg_us_per_iteration={:.3}",
+        iterations,
+        elapsed.as_micros(),
+        avg_ns,
+        avg_ns as f64 / 1_000.0
+    );
 }

@@ -164,7 +164,6 @@ impl ShredDedupeCache {
             if matches!(observation, ShredDedupeObservation::Accepted) {
                 existing.seen_at = now;
                 self.order.push_back((now, key));
-                self.evict(now);
                 self.observe_depths();
             }
             return observation;
@@ -239,6 +238,8 @@ fn make_shred_dedupe_key(
 
 #[cfg(test)]
 mod tests {
+    use sof_support::bench::avg_ns_per_iteration;
+
     use super::*;
     use crate::{
         protocol::shred_wire::SIZE_OF_DATA_SHRED_PAYLOAD, shred::wire::parse_shred_header,
@@ -529,12 +530,15 @@ mod tests {
             );
         }
         let elapsed = start.elapsed();
+        let avg_ns = avg_ns_per_iteration(elapsed, iterations);
         let metrics = cache.metrics();
         println!(
-            "duplicate_ingress_profile_fixture iterations={} unique_keys={} elapsed_us={} queue_depth={} entries={}",
+            "duplicate_ingress_profile_fixture iterations={} unique_keys={} elapsed_us={} avg_ns_per_iteration={} avg_us_per_iteration={:.3} queue_depth={} entries={}",
             iterations,
             unique_keys,
             elapsed.as_micros(),
+            avg_ns,
+            avg_ns as f64 / 1_000.0,
             metrics.queue_depth,
             metrics.entries,
         );
@@ -569,11 +573,14 @@ mod tests {
             );
         }
         let elapsed = start.elapsed();
+        let avg_ns = avg_ns_per_iteration(elapsed, iterations);
         let metrics = cache.metrics();
         println!(
-            "duplicate_parse_and_ingress_profile_fixture iterations={} elapsed_us={} queue_depth={} entries={}",
+            "duplicate_parse_and_ingress_profile_fixture iterations={} elapsed_us={} avg_ns_per_iteration={} avg_us_per_iteration={:.3} queue_depth={} entries={}",
             iterations,
             elapsed.as_micros(),
+            avg_ns,
+            avg_ns as f64 / 1_000.0,
             metrics.queue_depth,
             metrics.entries,
         );
