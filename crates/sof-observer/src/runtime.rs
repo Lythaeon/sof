@@ -2238,24 +2238,17 @@ impl ProviderReplayDedupe {
             return false;
         };
 
-        match source.arbitration() {
-            provider_stream::ProviderSourceArbitrationMode::EmitAll => {
-                self.evict();
-                false
-            }
+        let suppressed = match source.arbitration() {
+            provider_stream::ProviderSourceArbitrationMode::EmitAll => false,
             provider_stream::ProviderSourceArbitrationMode::FirstSeen => {
                 match self.arbitrated.entry(logical.clone()) {
-                    Entry::Occupied(_) => {
-                        self.evict();
-                        true
-                    }
+                    Entry::Occupied(_) => true,
                     Entry::Vacant(entry) => {
                         entry.insert(ProviderReplayArbitratedWinner {
                             priority: source.priority(),
                             source,
                         });
                         self.arbitrated_order.push_back(logical);
-                        self.evict();
                         false
                     }
                 }
@@ -2267,10 +2260,8 @@ impl ProviderReplayDedupe {
                         if source.priority() > winner.priority {
                             winner.priority = source.priority();
                             winner.source = source;
-                            self.evict();
                             false
                         } else {
-                            self.evict();
                             true
                         }
                     }
@@ -2280,12 +2271,13 @@ impl ProviderReplayDedupe {
                             source,
                         });
                         self.arbitrated_order.push_back(logical);
-                        self.evict();
                         false
                     }
                 }
             }
-        }
+        };
+        self.evict();
+        suppressed
     }
 
     fn evict(&mut self) {
