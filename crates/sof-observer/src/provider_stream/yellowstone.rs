@@ -60,6 +60,7 @@ const MAX_ACCOUNT_DATA_LEN: usize = MAX_PERMITTED_DATA_LENGTH as usize;
 const SLOT_STATUS_RETAINED_LAG: u64 = 4_096;
 const SLOT_STATUS_PRUNE_THRESHOLD: usize = SLOT_STATUS_RETAINED_LAG as usize * 2;
 const DEFAULT_MAX_DECODING_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+const MIN_RECONNECT_DELAY: Duration = Duration::from_millis(1);
 
 /// Yellowstone subscription commitment used for provider-stream transaction updates.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -401,6 +402,10 @@ impl YellowstoneGrpcConfig {
     pub const fn with_reconnect_delay(mut self, delay: Duration) -> Self {
         self.reconnect_delay = delay;
         self
+    }
+
+    const fn reconnect_delay_effective(&self) -> Duration {
+        effective_reconnect_delay(self.reconnect_delay)
     }
 
     fn validate(&self) -> Result<(), YellowstoneGrpcConfigError> {
@@ -814,6 +819,10 @@ impl YellowstoneGrpcSlotsConfig {
         self
     }
 
+    const fn reconnect_delay_effective(&self) -> Duration {
+        effective_reconnect_delay(self.reconnect_delay)
+    }
+
     /// Sets the maximum reconnect attempts. `None` keeps retrying forever.
     #[must_use]
     pub const fn with_max_reconnect_attempts(mut self, attempts: u32) -> Self {
@@ -872,6 +881,14 @@ impl YellowstoneGrpcSlotsConfig {
                 }
             }
         }
+    }
+}
+
+const fn effective_reconnect_delay(delay: Duration) -> Duration {
+    if delay.is_zero() {
+        MIN_RECONNECT_DELAY
+    } else {
+        delay
     }
 }
 
@@ -1174,7 +1191,7 @@ async fn spawn_yellowstone_grpc_source_inner(
                     YellowstoneGrpcProtocolError::ReconnectBudgetExhausted { attempts }.into(),
                 );
             }
-            tokio::time::sleep(config.reconnect_delay).await;
+            tokio::time::sleep(config.reconnect_delay_effective()).await;
         }
     }))
 }
@@ -1337,7 +1354,7 @@ async fn spawn_yellowstone_grpc_slot_source_inner(
                     YellowstoneGrpcProtocolError::ReconnectBudgetExhausted { attempts }.into(),
                 );
             }
-            tokio::time::sleep(config.reconnect_delay).await;
+            tokio::time::sleep(config.reconnect_delay_effective()).await;
         }
     }))
 }
@@ -2226,6 +2243,20 @@ mod tests {
         let filter = request.transactions.get("sof").expect("sof filter");
         assert_eq!(filter.vote, None);
         assert_eq!(filter.failed, None);
+    }
+
+    #[test]
+    fn yellowstone_reconnect_delay_never_spins() {
+        let config = YellowstoneGrpcConfig::new("http://127.0.0.1:10000")
+            .with_reconnect_delay(Duration::ZERO);
+        assert_eq!(config.reconnect_delay_effective(), Duration::from_millis(1));
+
+        let slots_config = YellowstoneGrpcSlotsConfig::new("http://127.0.0.1:10000")
+            .with_reconnect_delay(Duration::ZERO);
+        assert_eq!(
+            slots_config.reconnect_delay_effective(),
+            Duration::from_millis(1)
+        );
     }
 
     #[test]

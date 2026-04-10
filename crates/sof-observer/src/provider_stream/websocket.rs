@@ -62,6 +62,8 @@ use crate::{
     },
 };
 
+const MIN_RECONNECT_DELAY: Duration = Duration::from_millis(1);
+
 /// Commitment level used for websocket `transactionSubscribe` notifications.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum WebsocketTransactionCommitment {
@@ -610,6 +612,10 @@ impl WebsocketTransactionConfig {
             WebsocketPrimaryStream::Program(_) => WebsocketStreamKind::Program,
         }
     }
+
+    const fn reconnect_delay_effective(&self) -> Duration {
+        effective_reconnect_delay(self.reconnect_delay)
+    }
 }
 
 /// Primary websocket subscription families supported by the built-in adapter.
@@ -835,6 +841,18 @@ impl WebsocketLogsConfig {
             .with_role(self.source_role)
             .with_priority(self.source_priority)
             .with_arbitration(self.source_arbitration)
+    }
+
+    const fn reconnect_delay_effective(&self) -> Duration {
+        effective_reconnect_delay(self.reconnect_delay)
+    }
+}
+
+const fn effective_reconnect_delay(delay: Duration) -> Duration {
+    if delay.is_zero() {
+        MIN_RECONNECT_DELAY
+    } else {
+        delay
     }
 }
 
@@ -1153,7 +1171,7 @@ async fn spawn_websocket_source_inner(
                 .await?;
                 return Err(WebsocketProtocolError::ReconnectBudgetExhausted { attempts }.into());
             }
-            tokio::time::sleep(config.reconnect_delay).await;
+            tokio::time::sleep(config.reconnect_delay_effective()).await;
         }
     }))
 }
@@ -1308,7 +1326,7 @@ async fn spawn_websocket_logs_source_inner(
                 .await?;
                 return Err(WebsocketProtocolError::ReconnectBudgetExhausted { attempts }.into());
             }
-            tokio::time::sleep(config.reconnect_delay).await;
+            tokio::time::sleep(config.reconnect_delay_effective()).await;
         }
     }))
 }
@@ -3122,6 +3140,20 @@ mod tests {
         let filter = request["params"][0].as_object().expect("filter object");
         assert!(!filter.contains_key("vote"));
         assert!(!filter.contains_key("failed"));
+    }
+
+    #[test]
+    fn websocket_reconnect_delay_never_spins() {
+        let config = WebsocketTransactionConfig::new("wss://example.invalid")
+            .with_reconnect_delay(Duration::ZERO);
+        assert_eq!(config.reconnect_delay_effective(), Duration::from_millis(1));
+
+        let logs_config =
+            WebsocketLogsConfig::new("wss://example.invalid").with_reconnect_delay(Duration::ZERO);
+        assert_eq!(
+            logs_config.reconnect_delay_effective(),
+            Duration::from_millis(1)
+        );
     }
 
     #[test]

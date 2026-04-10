@@ -77,6 +77,7 @@ const DEFAULT_INITIAL_CONNECTION_WINDOW_SIZE: u32 = 1024 * 1024 * 8;
 const DEFAULT_BUFFER_SIZE: usize = 1024 * 64;
 const DEFAULT_MAX_DECODING_MESSAGE_SIZE: usize = 1_000_000_000;
 const DEFAULT_MAX_ENCODING_MESSAGE_SIZE: usize = 32_000_000;
+const MIN_RECONNECT_DELAY: Duration = Duration::from_millis(1);
 
 /// LaserStream subscription commitment used for provider-stream transaction updates.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -491,6 +492,10 @@ impl LaserStreamConfig {
         self
     }
 
+    const fn reconnect_delay_effective(&self) -> Duration {
+        effective_reconnect_delay(self.reconnect_delay)
+    }
+
     /// Sets provider replay behavior.
     #[must_use]
     pub const fn with_replay_mode(mut self, mode: ProviderReplayMode) -> Self {
@@ -894,6 +899,10 @@ impl LaserStreamSlotsConfig {
         self
     }
 
+    const fn reconnect_delay_effective(&self) -> Duration {
+        effective_reconnect_delay(self.reconnect_delay)
+    }
+
     /// Sets provider replay behavior.
     #[must_use]
     pub const fn with_replay_mode(mut self, mode: ProviderReplayMode) -> Self {
@@ -931,6 +940,14 @@ impl LaserStreamSlotsConfig {
 
     const fn replay_from_slot(&self, tracked_slot: u64) -> Option<u64> {
         laserstream_replay_from_slot(self.replay_mode, tracked_slot)
+    }
+}
+
+const fn effective_reconnect_delay(delay: Duration) -> Duration {
+    if delay.is_zero() {
+        MIN_RECONNECT_DELAY
+    } else {
+        delay
     }
 }
 
@@ -1251,7 +1268,7 @@ async fn spawn_laserstream_source_inner(
                 .await?;
                 return Err(LaserStreamProtocolError::ReconnectBudgetExhausted { attempts }.into());
             }
-            tokio::time::sleep(config.reconnect_delay).await;
+            tokio::time::sleep(config.reconnect_delay_effective()).await;
         }
     }))
 }
@@ -1421,7 +1438,7 @@ async fn spawn_laserstream_slot_source_inner(
                 .await?;
                 return Err(LaserStreamProtocolError::ReconnectBudgetExhausted { attempts }.into());
             }
-            tokio::time::sleep(config.reconnect_delay).await;
+            tokio::time::sleep(config.reconnect_delay_effective()).await;
         }
     }))
 }
@@ -2573,6 +2590,20 @@ mod tests {
             .client_config();
         assert_eq!(slots_config.channel_options.connect_timeout_secs, Some(1));
         assert_eq!(slots_config.channel_options.timeout_secs, Some(1));
+    }
+
+    #[test]
+    fn laserstream_reconnect_delay_never_spins() {
+        let config = LaserStreamConfig::new("https://laserstream.example", "token")
+            .with_reconnect_delay(Duration::ZERO);
+        assert_eq!(config.reconnect_delay_effective(), Duration::from_millis(1));
+
+        let slots_config = LaserStreamSlotsConfig::new("https://laserstream.example", "token")
+            .with_reconnect_delay(Duration::ZERO);
+        assert_eq!(
+            slots_config.reconnect_delay_effective(),
+            Duration::from_millis(1)
+        );
     }
 
     #[tokio::test]
