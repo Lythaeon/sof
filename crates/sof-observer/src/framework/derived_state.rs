@@ -41,6 +41,9 @@ use crate::{
     },
 };
 
+/// Maximum derived-state checkpoint bundle accepted from disk during restart recovery.
+const MAX_CHECKPOINT_STORE_BYTES: u64 = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 /// Static feed subscriptions requested by one derived-state consumer during host construction.
 pub struct DerivedStateConsumerConfig {
@@ -829,7 +832,7 @@ impl DerivedStateCheckpointStore {
         if !self.path.exists() {
             return Ok(None);
         }
-        let bytes = fs::read(&self.path).map_err(|error| {
+        let file = File::open(&self.path).map_err(|error| {
             DerivedStateConsumerFault::new(
                 DerivedStateConsumerFaultKind::CheckpointWriteFailed,
                 None,
@@ -839,6 +842,44 @@ impl DerivedStateCheckpointStore {
                 ),
             )
         })?;
+        let file_len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        if file_len > MAX_CHECKPOINT_STORE_BYTES {
+            return Err(DerivedStateConsumerFault::new(
+                DerivedStateConsumerFaultKind::CheckpointWriteFailed,
+                None,
+                format!(
+                    "derived-state checkpoint {} exceeds max {} bytes",
+                    self.path.display(),
+                    MAX_CHECKPOINT_STORE_BYTES
+                ),
+            ));
+        }
+        let mut bytes = Vec::with_capacity(
+            usize::try_from(file_len.min(MAX_CHECKPOINT_STORE_BYTES)).unwrap_or(0),
+        );
+        file.take(MAX_CHECKPOINT_STORE_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|error| {
+                DerivedStateConsumerFault::new(
+                    DerivedStateConsumerFaultKind::CheckpointWriteFailed,
+                    None,
+                    format!(
+                        "failed to read derived-state checkpoint {}: {error}",
+                        self.path.display()
+                    ),
+                )
+            })?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_CHECKPOINT_STORE_BYTES {
+            return Err(DerivedStateConsumerFault::new(
+                DerivedStateConsumerFaultKind::CheckpointWriteFailed,
+                None,
+                format!(
+                    "derived-state checkpoint {} exceeds max {} bytes",
+                    self.path.display(),
+                    MAX_CHECKPOINT_STORE_BYTES
+                ),
+            ));
+        }
         let persisted = serde_json::from_slice::<DerivedStatePersistedCheckpoint<T>>(&bytes)
             .map_err(|error| {
                 DerivedStateConsumerFault::new(
@@ -4740,6 +4781,35 @@ mod tests {
         if let Some(parent) = checkpoint_path.parent() {
             drop(fs::remove_dir_all(parent));
         }
+    }
+
+    #[test]
+    fn checkpoint_store_rejects_oversized_files() {
+        let checkpoint_path = unique_test_checkpoint_path("store-oversized");
+        let parent = checkpoint_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| unique_test_replay_dir("store-oversized"));
+        let create_result = fs::create_dir_all(&parent);
+        assert!(create_result.is_ok(), "{create_result:?}");
+
+        let file_result = File::create(&checkpoint_path);
+        assert!(file_result.is_ok(), "{file_result:?}");
+        let file = file_result.unwrap_or_else(|error| panic!("{error}"));
+        let set_len_result = file.set_len(MAX_CHECKPOINT_STORE_BYTES.saturating_add(1));
+        assert!(set_len_result.is_ok(), "{set_len_result:?}");
+
+        let store = DerivedStateCheckpointStore::new(&checkpoint_path);
+        let load_result = store.load::<TestCheckpointState>();
+        assert!(load_result.is_err(), "oversized checkpoint should fail");
+        let error = match load_result {
+            Ok(value) => panic!("expected oversized checkpoint failure, got {value:?}"),
+            Err(error) => error,
+        };
+        assert!(error.message.contains("exceeds max"));
+
+        drop(fs::remove_file(&checkpoint_path));
+        drop(fs::remove_dir_all(parent));
     }
 
     #[test]
