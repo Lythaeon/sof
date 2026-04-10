@@ -62,6 +62,7 @@ const SLOT_STATUS_RETAINED_LAG: u64 = 4_096;
 const SLOT_STATUS_PRUNE_THRESHOLD: usize = SLOT_STATUS_RETAINED_LAG as usize * 2;
 const DEFAULT_MAX_DECODING_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 const MIN_PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_millis(1);
+const MIN_PROVIDER_STALL_TIMEOUT: Duration = Duration::from_millis(1);
 const MIN_RECONNECT_DELAY: Duration = Duration::from_millis(1);
 
 /// Yellowstone subscription commitment used for provider-stream transaction updates.
@@ -1402,7 +1403,10 @@ async fn run_yellowstone_primary_connection(
                     .map_err(GeyserGrpcClientError::SubscribeSendError)?;
             }
             () = async {
-                if let Some(timeout) = config.stall_timeout {
+                if let Some(timeout) = config
+                    .stall_timeout
+                    .map(|timeout| nonzero_duration_or(timeout, MIN_PROVIDER_STALL_TIMEOUT))
+                {
                     let deadline = last_progress.checked_add(timeout).unwrap_or(last_progress);
                     tokio::time::sleep_until(deadline.into()).await;
                 } else {
@@ -1575,7 +1579,10 @@ async fn run_yellowstone_slot_connection(
                     .map_err(GeyserGrpcClientError::SubscribeSendError)?;
             }
             () = async {
-                if let Some(timeout) = config.stall_timeout {
+                if let Some(timeout) = config
+                    .stall_timeout
+                    .map(|timeout| nonzero_duration_or(timeout, MIN_PROVIDER_STALL_TIMEOUT))
+                {
                     let deadline = last_progress.checked_add(timeout).unwrap_or(last_progress);
                     tokio::time::sleep_until(deadline.into()).await;
                 } else {
@@ -2270,6 +2277,18 @@ mod tests {
         );
         assert_eq!(
             nonzero_duration_or(Duration::from_millis(25), MIN_PROVIDER_CONNECT_TIMEOUT),
+            Duration::from_millis(25)
+        );
+    }
+
+    #[test]
+    fn yellowstone_stall_timeout_never_zero() {
+        assert_eq!(
+            nonzero_duration_or(Duration::ZERO, MIN_PROVIDER_STALL_TIMEOUT),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            nonzero_duration_or(Duration::from_millis(25), MIN_PROVIDER_STALL_TIMEOUT),
             Duration::from_millis(25)
         );
     }

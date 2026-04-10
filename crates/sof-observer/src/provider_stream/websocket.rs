@@ -24,6 +24,7 @@ use serde::Deserialize;
 use serde_json::{Value, from_slice as json_from_slice, json};
 use simd_json::{Buffers as SimdJsonBuffers, serde::from_slice as simd_from_slice};
 use sof_support::short_vec::decode_short_u16_len;
+use sof_support::time_support::nonzero_duration_or;
 use sof_types::{PubkeyBytes, SignatureBytes};
 use solana_packet::PACKET_DATA_SIZE;
 use solana_pubkey::Pubkey;
@@ -63,6 +64,7 @@ use crate::{
 };
 
 const MIN_RECONNECT_DELAY: Duration = Duration::from_millis(1);
+const MIN_STALL_TIMEOUT: Duration = Duration::from_millis(1);
 const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Commitment level used for websocket `transactionSubscribe` notifications.
@@ -1376,7 +1378,7 @@ async fn run_websocket_primary_connection(
                 write.send(WsMessage::Ping(Vec::new().into())).await?;
             }
             () = async {
-                if let Some(timeout) = config.stall_timeout {
+                if let Some(timeout) = websocket_stall_timeout(config.stall_timeout) {
                     let deadline = last_progress.checked_add(timeout).unwrap_or(last_progress);
                     tokio::time::sleep_until(deadline).await;
                 } else {
@@ -1913,7 +1915,7 @@ async fn run_websocket_logs_connection(
                 write.send(WsMessage::Ping(Vec::new().into())).await?;
             }
             () = async {
-                if let Some(timeout) = config.stall_timeout {
+                if let Some(timeout) = websocket_stall_timeout(config.stall_timeout) {
                     let deadline = last_progress.checked_add(timeout).unwrap_or(last_progress);
                     tokio::time::sleep_until(deadline).await;
                 } else {
@@ -2180,7 +2182,7 @@ async fn replay_websocket_gap(
         client,
         &http_endpoint,
         config.commitment,
-        config.stall_timeout,
+        websocket_stall_timeout(config.stall_timeout),
     )
     .await?;
     if head < previous_slot {
@@ -2196,7 +2198,7 @@ async fn replay_websocket_gap(
             &http_endpoint,
             slot,
             config.commitment,
-            config.stall_timeout,
+            websocket_stall_timeout(config.stall_timeout),
         )
         .await?
         else {
@@ -2303,9 +2305,16 @@ fn websocket_transport_config(max_message_size: usize) -> WebSocketConfig {
 }
 
 const fn websocket_connect_timeout(stall_timeout: Option<Duration>) -> Duration {
+    match websocket_stall_timeout(stall_timeout) {
+        Some(timeout) => timeout,
+        None => DEFAULT_WEBSOCKET_CONNECT_TIMEOUT,
+    }
+}
+
+const fn websocket_stall_timeout(stall_timeout: Option<Duration>) -> Option<Duration> {
     match stall_timeout {
-        Some(timeout) if !timeout.is_zero() => timeout,
-        _ => DEFAULT_WEBSOCKET_CONNECT_TIMEOUT,
+        Some(timeout) => Some(nonzero_duration_or(timeout, MIN_STALL_TIMEOUT)),
+        None => None,
     }
 }
 
@@ -3664,6 +3673,19 @@ mod tests {
 
         server.abort();
         drop(server.await);
+    }
+
+    #[test]
+    fn websocket_stall_timeout_never_zero() {
+        assert_eq!(
+            websocket_stall_timeout(Some(Duration::ZERO)),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(
+            websocket_stall_timeout(Some(Duration::from_millis(25))),
+            Some(Duration::from_millis(25))
+        );
+        assert_eq!(websocket_stall_timeout(None), None);
     }
 
     #[tokio::test]

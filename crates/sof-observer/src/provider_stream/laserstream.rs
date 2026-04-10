@@ -77,6 +77,7 @@ const DEFAULT_INITIAL_CONNECTION_WINDOW_SIZE: u32 = 1024 * 1024 * 8;
 const DEFAULT_BUFFER_SIZE: usize = 1024 * 64;
 const DEFAULT_MAX_DECODING_MESSAGE_SIZE: usize = 1_000_000_000;
 const DEFAULT_MAX_ENCODING_MESSAGE_SIZE: usize = 32_000_000;
+const MIN_PROVIDER_STALL_TIMEOUT: Duration = Duration::from_millis(1);
 const MIN_RECONNECT_DELAY: Duration = Duration::from_millis(1);
 
 /// LaserStream subscription commitment used for provider-stream transaction updates.
@@ -1474,7 +1475,10 @@ async fn run_laserstream_primary_connection(
     loop {
         tokio::select! {
             () = async {
-                if let Some(timeout) = config.stall_timeout {
+                if let Some(timeout) = config
+                    .stall_timeout
+                    .map(|timeout| nonzero_duration_or(timeout, MIN_PROVIDER_STALL_TIMEOUT))
+                {
                     let deadline = last_progress.checked_add(timeout).unwrap_or(last_progress);
                     tokio::time::sleep_until(deadline.into()).await;
                 } else {
@@ -1628,7 +1632,10 @@ async fn run_laserstream_slot_connection(
     loop {
         tokio::select! {
             () = async {
-                if let Some(timeout) = config.stall_timeout {
+                if let Some(timeout) = config
+                    .stall_timeout
+                    .map(|timeout| nonzero_duration_or(timeout, MIN_PROVIDER_STALL_TIMEOUT))
+                {
                     let deadline = last_progress.checked_add(timeout).unwrap_or(last_progress);
                     tokio::time::sleep_until(deadline.into()).await;
                 } else {
@@ -2626,6 +2633,18 @@ mod tests {
         assert_eq!(
             slots_config.reconnect_delay_effective(),
             Duration::from_millis(1)
+        );
+    }
+
+    #[test]
+    fn laserstream_stall_timeout_never_zero() {
+        assert_eq!(
+            nonzero_duration_or(Duration::ZERO, MIN_PROVIDER_STALL_TIMEOUT),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            nonzero_duration_or(Duration::from_millis(25), MIN_PROVIDER_STALL_TIMEOUT),
+            Duration::from_millis(25)
         );
     }
 
