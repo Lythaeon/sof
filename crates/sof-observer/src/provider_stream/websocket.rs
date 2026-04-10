@@ -18,6 +18,7 @@ use sof_types::{PubkeyBytes, SignatureBytes};
 use solana_packet::PACKET_DATA_SIZE;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
+use solana_system_interface::MAX_PERMITTED_DATA_LENGTH;
 use solana_transaction::versioned::VersionedTransaction;
 use thiserror::Error;
 use tokio::net::TcpStream;
@@ -1644,6 +1645,8 @@ fn parse_transaction_notification(
 }
 
 const MAX_BASE64_TRANSACTION_WIRE_LEN: usize = PACKET_DATA_SIZE.div_ceil(3) * 4;
+const MAX_ACCOUNT_DATA_LEN: usize = MAX_PERMITTED_DATA_LENGTH as usize;
+const MAX_BASE64_ACCOUNT_DATA_LEN: usize = MAX_ACCOUNT_DATA_LEN.div_ceil(3) * 4;
 
 fn decode_transaction_wire_payload(
     encoded: &str,
@@ -1664,6 +1667,28 @@ fn decode_transaction_wire_payload(
         tx_bytes.clear();
         return Err(WebsocketTransactionError::Convert(
             "websocket transaction payload exceeds max wire size",
+        ));
+    }
+    Ok(())
+}
+
+fn decode_account_payload(
+    encoded: &str,
+    tx_bytes: &mut Vec<u8>,
+) -> Result<(), WebsocketTransactionError> {
+    if encoded.len() > MAX_BASE64_ACCOUNT_DATA_LEN {
+        return Err(WebsocketTransactionError::Convert(
+            "websocket account payload exceeds max data size",
+        ));
+    }
+    tx_bytes.clear();
+    STANDARD
+        .decode_vec(encoded.as_bytes(), tx_bytes)
+        .map_err(|_error| WebsocketTransactionError::Convert("invalid base64 account payload"))?;
+    if tx_bytes.len() > MAX_ACCOUNT_DATA_LEN {
+        tx_bytes.clear();
+        return Err(WebsocketTransactionError::Convert(
+            "websocket account payload exceeds max data size",
         ));
     }
     Ok(())
@@ -1737,9 +1762,7 @@ fn decode_account_update_event(
             "unsupported websocket account encoding",
         ));
     }
-    STANDARD
-        .decode_vec(account.data.0.as_bytes(), tx_bytes)
-        .map_err(|_error| WebsocketTransactionError::Convert("invalid base64 account payload"))?;
+    decode_account_payload(&account.data.0, tx_bytes)?;
     observe_non_transaction_commitment(watermarks, slot, commitment.as_tx_commitment());
     let data = mem::take(tx_bytes).into_boxed_slice();
     Ok(AccountUpdateEvent {
@@ -3022,6 +3045,52 @@ mod tests {
         assert_eq!(event.rent_epoch, 9);
         assert_eq!(event.data.as_ref(), &[1, 2, 3, 4]);
         assert_eq!(event.matched_filter, Some(pubkey.into()));
+    }
+
+    #[test]
+    fn websocket_account_notification_rejects_oversized_payload() {
+        let pubkey = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let payload = json!({
+            "jsonrpc":"2.0",
+            "method":"accountNotification",
+            "params":{
+                "result":{
+                    "context":{"slot":77},
+                    "value":{
+                        "lamports":42,
+                        "data":[STANDARD.encode(vec![7_u8; MAX_ACCOUNT_DATA_LEN + 1]), "base64"],
+                        "owner":owner.to_string(),
+                        "executable":false,
+                        "rentEpoch":9
+                    }
+                }
+            }
+        })
+        .to_string()
+        .into_bytes();
+        let mut payload = payload;
+        let mut json_buffers = SimdJsonBuffers::default();
+        let mut scratch = Vec::new();
+        let mut watermarks = ProviderCommitmentWatermarks::default();
+        let config = WebsocketTransactionConfig::new("wss://example.invalid")
+            .with_stream(WebsocketPrimaryStream::Account(pubkey));
+
+        let error = parse_account_notification(
+            &mut payload,
+            &mut json_buffers,
+            &mut scratch,
+            &config,
+            &mut watermarks,
+        )
+        .expect_err("oversized account payload should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("websocket account payload exceeds max data size"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

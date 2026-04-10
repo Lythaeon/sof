@@ -50,6 +50,7 @@ solana-signer = "3.0.0"
 solana-streamer = "3.1.11"
 solana-transaction = { version = "3.0.2", features = ["serde"] }
 solana-packet = "3.0.0"
+solana-system-interface = "3.1.0"
 solana-vote = "3.1.11"
 solana-vote-program = { version = "3.1.11", features = ["agave-unstable-api"] }
 reed-solomon-erasure = { version = "6.0.0", features = ["simd-accel"] }
