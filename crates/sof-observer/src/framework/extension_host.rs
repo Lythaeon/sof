@@ -988,6 +988,22 @@ impl ExtensionResourceEmitter {
         websocket_frame_type: Option<RuntimeWebSocketFrameType>,
         bytes: Arc<[u8]>,
     ) {
+        self.emit_event_with_remote_addr(
+            event_class,
+            websocket_frame_type,
+            self.remote_addr,
+            bytes,
+        );
+    }
+
+    /// Emits one runtime packet event from this resource with one explicit remote address.
+    fn emit_event_with_remote_addr(
+        &self,
+        event_class: RuntimePacketEventClass,
+        websocket_frame_type: Option<RuntimeWebSocketFrameType>,
+        remote_addr: Option<SocketAddr>,
+        bytes: Arc<[u8]>,
+    ) {
         let source = RuntimePacketSource {
             kind: RuntimePacketSourceKind::ExtensionResource,
             transport: self.transport,
@@ -997,7 +1013,7 @@ impl ExtensionResourceEmitter {
             shared_tag: self.shared_tag.clone(),
             websocket_frame_type,
             local_addr: self.local_addr,
-            remote_addr: self.remote_addr,
+            remote_addr,
         };
         self.host.emit_extension_packet(source, bytes);
     }
@@ -1055,13 +1071,10 @@ async fn spawn_udp_listener(
                         continue;
                     }
                     if let Some(payload) = buffer.get(..len) {
-                        ExtensionResourceEmitter {
-                            remote_addr: Some(remote_addr),
-                            ..emitter.clone()
-                        }
-                        .emit_event(
+                        emitter.emit_event_with_remote_addr(
                             RuntimePacketEventClass::Packet,
                             None,
+                            Some(remote_addr),
                             Arc::from(payload),
                         );
                     }
@@ -2044,6 +2057,58 @@ mod tests {
 
         println!(
             "runtime_extension_callback_isolation_profile_fixture iterations={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.3} optimized_avg_us_per_iteration={:.3}",
+            iterations,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
+            baseline_avg_ns,
+            optimized_avg_ns,
+            baseline_avg_ns as f64 / 1_000.0,
+            optimized_avg_ns as f64 / 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for udp extension emitter remote-address churn"]
+    fn udp_extension_emitter_remote_addr_profile_fixture() {
+        let iterations = profile_iterations(200_000);
+        let host = RuntimeExtensionHost::default();
+        let emitter = ExtensionResourceEmitter::new(
+            host,
+            "udp-extension",
+            "udp-listener",
+            None,
+            RuntimePacketTransport::Udp,
+            Some(SocketAddr::from_str("127.0.0.1:7000").expect("valid local addr")),
+            None,
+        );
+        let remote_addr = Some(SocketAddr::from_str("127.0.0.1:8000").expect("valid remote addr"));
+        let payload = Arc::from(&[9_u8; 256][..]);
+
+        let baseline_started_at = Instant::now();
+        for _ in 0..iterations {
+            ExtensionResourceEmitter {
+                remote_addr,
+                ..emitter.clone()
+            }
+            .emit_event(RuntimePacketEventClass::Packet, None, Arc::clone(&payload));
+        }
+        let baseline_elapsed = baseline_started_at.elapsed();
+
+        let optimized_started_at = Instant::now();
+        for _ in 0..iterations {
+            emitter.emit_event_with_remote_addr(
+                RuntimePacketEventClass::Packet,
+                None,
+                remote_addr,
+                Arc::clone(&payload),
+            );
+        }
+        let optimized_elapsed = optimized_started_at.elapsed();
+        let baseline_avg_ns = avg_ns_per_iteration(baseline_elapsed, iterations);
+        let optimized_avg_ns = avg_ns_per_iteration(optimized_elapsed, iterations);
+
+        println!(
+            "udp_extension_emitter_remote_addr_profile_fixture iterations={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.3} optimized_avg_us_per_iteration={:.3}",
             iterations,
             baseline_elapsed.as_micros(),
             optimized_elapsed.as_micros(),
