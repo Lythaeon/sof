@@ -2292,6 +2292,106 @@ impl ProviderReplayDedupe {
         let min_slot = self
             .max_slot_seen
             .saturating_sub(PROVIDER_REPLAY_DEDUPE_SLOT_WINDOW);
+        while self.order.len() > self.capacity
+            || self
+                .order
+                .front()
+                .is_some_and(|oldest| oldest.slot() < min_slot)
+        {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.seen.remove(&oldest);
+        }
+        while self.arbitrated_order.len() > self.capacity
+            || self
+                .arbitrated_order
+                .front()
+                .is_some_and(|oldest| oldest.slot() < min_slot)
+        {
+            let Some(oldest) = self.arbitrated_order.pop_front() else {
+                break;
+            };
+            self.arbitrated.remove(&oldest);
+        }
+    }
+
+    #[cfg(test)]
+    fn observe_baseline(&mut self, update: &ProviderStreamUpdate) -> bool {
+        let Some(logical) = provider_replay_dedupe_key(update) else {
+            return false;
+        };
+        self.max_slot_seen = self.max_slot_seen.max(logical.slot());
+        let source = provider_stream_update_source_ref(update);
+        let observed = ProviderReplayObservedKey {
+            source: source.clone(),
+            logical: logical.clone(),
+        };
+        if !self.seen.insert(observed.clone()) {
+            return true;
+        }
+        self.order.push_back(observed);
+
+        let Some(source) = source else {
+            self.evict_baseline();
+            return false;
+        };
+
+        match source.arbitration() {
+            provider_stream::ProviderSourceArbitrationMode::EmitAll => {
+                self.evict_baseline();
+                false
+            }
+            provider_stream::ProviderSourceArbitrationMode::FirstSeen => {
+                match self.arbitrated.entry(logical.clone()) {
+                    Entry::Occupied(_) => {
+                        self.evict_baseline();
+                        true
+                    }
+                    Entry::Vacant(entry) => {
+                        entry.insert(ProviderReplayArbitratedWinner {
+                            priority: source.priority(),
+                            source,
+                        });
+                        self.arbitrated_order.push_back(logical);
+                        self.evict_baseline();
+                        false
+                    }
+                }
+            }
+            provider_stream::ProviderSourceArbitrationMode::FirstSeenThenPromote => {
+                match self.arbitrated.entry(logical.clone()) {
+                    Entry::Occupied(mut entry) => {
+                        let winner = entry.get_mut();
+                        if source.priority() > winner.priority {
+                            winner.priority = source.priority();
+                            winner.source = source;
+                            self.evict_baseline();
+                            false
+                        } else {
+                            self.evict_baseline();
+                            true
+                        }
+                    }
+                    Entry::Vacant(entry) => {
+                        entry.insert(ProviderReplayArbitratedWinner {
+                            priority: source.priority(),
+                            source,
+                        });
+                        self.arbitrated_order.push_back(logical);
+                        self.evict_baseline();
+                        false
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn evict_baseline(&mut self) {
+        let min_slot = self
+            .max_slot_seen
+            .saturating_sub(PROVIDER_REPLAY_DEDUPE_SLOT_WINDOW);
         while let Some(oldest) = self.order.front().cloned() {
             if self.order.len() <= self.capacity && oldest.slot() >= min_slot {
                 break;
@@ -5838,6 +5938,56 @@ mod tests {
 
         eprintln!(
             "provider_stream_serialized_transaction_recent_blockhash_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            iterations,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
+        );
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for provider replay dedupe eviction churn"]
+    fn provider_replay_dedupe_eviction_profile_fixture() {
+        let iterations = profile_iterations(500_000);
+        let source_a = provider_stream::ProviderSourceIdentity::new(
+            provider_stream::ProviderSourceId::Generic("source-a".to_owned().into()),
+            "primary",
+        )
+        .with_arbitration(provider_stream::ProviderSourceArbitrationMode::FirstSeenThenPromote)
+        .with_priority(100);
+        let source_b = provider_stream::ProviderSourceIdentity::new(
+            provider_stream::ProviderSourceId::Generic("source-b".to_owned().into()),
+            "secondary",
+        )
+        .with_arbitration(provider_stream::ProviderSourceArbitrationMode::FirstSeenThenPromote)
+        .with_priority(300);
+        let updates: Vec<_> = (0..4096_u64)
+            .flat_map(|slot| {
+                let update = sample_provider_transaction_update_at(slot);
+                [
+                    update.clone().with_provider_source(source_a.clone()),
+                    update.with_provider_source(source_b.clone()),
+                ]
+            })
+            .collect();
+        let mut baseline = ProviderReplayDedupe::new(1024);
+        let mut optimized = ProviderReplayDedupe::new(1024);
+
+        let baseline_started = Instant::now();
+        for i in 0..iterations {
+            let update = &updates[i % updates.len()];
+            baseline.observe_baseline(update);
+        }
+        let baseline_elapsed = baseline_started.elapsed();
+
+        let optimized_started = Instant::now();
+        for i in 0..iterations {
+            let update = &updates[i % updates.len()];
+            optimized.observe(update);
+        }
+        let optimized_elapsed = optimized_started.elapsed();
+
+        eprintln!(
+            "provider_replay_dedupe_eviction_profile_fixture iterations={} baseline_us={} optimized_us={}",
             iterations,
             baseline_elapsed.as_micros(),
             optimized_elapsed.as_micros(),
