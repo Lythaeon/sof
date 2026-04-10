@@ -275,7 +275,6 @@ impl SharedRelayCache {
             replaced = true;
             let previous_seen_at = previous.value().seen_at;
             let _ = self.order.remove(&(previous_seen_at, key));
-            let _ = self.slot_index.remove(&(key.slot, key.index, key));
         } else {
             let _ = self.len.fetch_add(1, Ordering::Relaxed);
         }
@@ -287,7 +286,9 @@ impl SharedRelayCache {
             },
         );
         self.order.insert((now, key), ());
-        self.slot_index.insert((key.slot, key.index, key), ());
+        if !replaced {
+            self.slot_index.insert((key.slot, key.index, key), ());
+        }
         evicted = evicted.saturating_add(self.evict(now));
 
         CacheInsertOutcome {
@@ -438,6 +439,49 @@ impl SharedRelayCache {
         }
         evicted
     }
+
+    #[cfg(test)]
+    fn insert_baseline(
+        &self,
+        packet: &[u8],
+        parsed_shred: &ParsedShredHeader,
+        now: Instant,
+    ) -> CacheInsertOutcome {
+        let mut evicted = self.evict(now);
+        let Some(key) = make_cached_shred_key(packet, parsed_shred) else {
+            return CacheInsertOutcome {
+                inserted: false,
+                replaced: false,
+                evicted,
+            };
+        };
+
+        let mut replaced = false;
+        if let Some(previous) = self.entries.remove(&key) {
+            replaced = true;
+            let previous_seen_at = previous.value().seen_at;
+            let _ = self.order.remove(&(previous_seen_at, key));
+            let _ = self.slot_index.remove(&(key.slot, key.index, key));
+        } else {
+            let _ = self.len.fetch_add(1, Ordering::Relaxed);
+        }
+        self.entries.insert(
+            key,
+            CachedShred {
+                seen_at: now,
+                bytes: Arc::from(packet),
+            },
+        );
+        self.order.insert((now, key), ());
+        self.slot_index.insert((key.slot, key.index, key), ());
+        evicted = evicted.saturating_add(self.evict(now));
+
+        CacheInsertOutcome {
+            inserted: !replaced,
+            replaced,
+            evicted,
+        }
+    }
 }
 
 fn make_cached_shred_key(
@@ -492,6 +536,8 @@ const fn max_cached_shred_key() -> CachedShredKey {
 
 #[cfg(test)]
 mod tests {
+    use std::{env, hint::black_box};
+
     use super::*;
     use crate::{
         protocol::shred_wire::{
@@ -698,6 +744,41 @@ mod tests {
     }
 
     #[test]
+    fn shared_insert_replaces_existing_key_without_duplicate_slot_index_entry() {
+        let packet = build_data_shred_packet(12, 42, 1, 0, b"same");
+        let header = parse_shred_header(&packet).expect("valid");
+        let cache = SharedRelayCache::new(RecentShredRingBuffer::new(16, Duration::from_secs(2)));
+        let now = Instant::now();
+
+        let first = cache.insert(&packet, &header, now);
+        let second = cache.insert(&packet, &header, now + Duration::from_millis(1));
+
+        assert!(first.inserted);
+        assert!(!first.replaced);
+        assert!(!second.inserted);
+        assert!(second.replaced);
+        assert_eq!(cache.len(), 1);
+
+        let query = cache
+            .query_range(
+                RelayRangeRequest {
+                    slot: 12,
+                    start_index: 42,
+                    end_index: 42,
+                },
+                RelayRangeLimits {
+                    max_request_span: 4,
+                    max_response_shreds: 4,
+                    max_response_bytes: usize::MAX,
+                },
+                now + Duration::from_millis(2),
+            )
+            .expect("query succeeds");
+        assert_eq!(query.len(), 1);
+        assert_eq!(query[0].as_ref(), packet.as_slice());
+    }
+
+    #[test]
     fn shared_query_highest_above_prefers_highest_index_then_latest_seen_at() {
         let packet_mid = build_data_shred_packet(13, 7, 1, 0, b"mid");
         let packet_old_top = build_data_shred_packet(13, 9, 1, 0, b"old-top");
@@ -732,6 +813,48 @@ mod tests {
             .expect("highest above threshold");
         assert_eq!(index, 9);
         assert_eq!(found.as_ref(), packet_new_top.as_slice());
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for shared relay cache replacement churn"]
+    fn shared_relay_cache_replace_profile_fixture() {
+        let iterations = profile_iterations(200_000);
+        let packet = build_data_shred_packet(42, 7, 1, 9, b"hello");
+        let parsed = parse_shred_header(&packet).expect("valid");
+        let baseline =
+            SharedRelayCache::new(RecentShredRingBuffer::new(16, Duration::from_secs(60)));
+        let optimized =
+            SharedRelayCache::new(RecentShredRingBuffer::new(16, Duration::from_secs(60)));
+        let started_at = Instant::now();
+
+        let baseline_started = Instant::now();
+        for i in 0..iterations {
+            let now = started_at + Duration::from_nanos(u64::try_from(i).expect("iterations fit"));
+            black_box(baseline.insert_baseline(&packet, &parsed, now));
+        }
+        let baseline_elapsed = baseline_started.elapsed();
+
+        let optimized_started = Instant::now();
+        for i in 0..iterations {
+            let now = started_at + Duration::from_nanos(u64::try_from(i).expect("iterations fit"));
+            black_box(optimized.insert(&packet, &parsed, now));
+        }
+        let optimized_elapsed = optimized_started.elapsed();
+
+        eprintln!(
+            "shared_relay_cache_replace_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            iterations,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
+        );
+    }
+
+    fn profile_iterations(default: usize) -> usize {
+        env::var("SOF_PROFILE_ITERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default)
     }
 
     fn build_data_shred_packet(
