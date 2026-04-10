@@ -1,7 +1,7 @@
 //! Shared submission types, errors, and transport traits.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     hash::{Hash, Hasher},
     sync::{
         Arc,
@@ -932,6 +932,8 @@ impl TxSubmitOutcomeReporter for TxToxicFlowTelemetry {
 pub(crate) struct TxSuppressionCache {
     /// Active suppression entries keyed by opportunity identity.
     entries: HashMap<TxSubmitSuppressionKey, SystemTime>,
+    /// Insertion order for eviction, including stale superseded timestamps.
+    order: VecDeque<(TxSubmitSuppressionKey, SystemTime)>,
 }
 
 impl TxSuppressionCache {
@@ -950,16 +952,27 @@ impl TxSuppressionCache {
     pub(crate) fn insert_all(&mut self, keys: &[TxSubmitSuppressionKey], now: SystemTime) {
         for key in keys {
             let _ = self.entries.insert(key.clone(), now);
+            self.order.push_back((key.clone(), now));
         }
     }
 
     /// Removes entries older than the current TTL window.
     fn evict_expired(&mut self, now: SystemTime, ttl: Duration) {
-        self.entries.retain(|_, inserted_at| {
-            now.duration_since(*inserted_at)
+        while let Some((_, front_inserted_at)) = self.order.front() {
+            let still_live = now
+                .duration_since(*front_inserted_at)
                 .map(|elapsed| elapsed <= ttl)
-                .unwrap_or(false)
-        });
+                .unwrap_or(false);
+            if still_live {
+                break;
+            }
+            let Some((key, queued_inserted_at)) = self.order.pop_front() else {
+                break;
+            };
+            if self.entries.get(&key) == Some(&queued_inserted_at) {
+                let _ = self.entries.remove(&key);
+            }
+        }
     }
 }
 
@@ -1001,6 +1014,46 @@ pub trait DirectSubmitTransport: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{env, hint::black_box, time::Instant};
+
+    fn profile_iterations(default: usize) -> usize {
+        env::var("SOF_PROFILE_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default)
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for submit suppression cache churn"]
+    fn suppression_cache_profile_fixture() {
+        let iterations = profile_iterations(50_000);
+        let ttl = Duration::from_millis(750);
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        let keys = (0_u8..64)
+            .map(|value| TxSubmitSuppressionKey::Opportunity([value; 32]))
+            .collect::<Vec<_>>();
+        let mut cache = TxSuppressionCache::default();
+
+        let started = Instant::now();
+        for (iteration, key) in keys.iter().cycle().take(iterations).enumerate() {
+            let now = base + Duration::from_millis(u64::try_from(iteration % 2_000).unwrap_or(0));
+            cache.insert_all(std::slice::from_ref(key), now);
+            black_box(cache.is_suppressed(std::slice::from_ref(key), now, ttl));
+        }
+        let elapsed = started.elapsed();
+        let avg_ns_per_iteration = elapsed.as_nanos() / u128::try_from(iterations).unwrap_or(1);
+        let avg_us_per_iteration = avg_ns_per_iteration as f64 / 1_000.0;
+
+        eprintln!(
+            "suppression_cache_profile_fixture iterations={} elapsed_us={} avg_ns_per_iteration={} avg_us_per_iteration={:.3} entries={}",
+            iterations,
+            elapsed.as_micros(),
+            avg_ns_per_iteration,
+            avg_us_per_iteration,
+            cache.entries.len(),
+        );
+    }
 
     #[test]
     fn suppression_cache_keeps_refreshed_entry_live() {
