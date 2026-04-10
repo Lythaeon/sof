@@ -43,6 +43,8 @@ use crate::{
 
 /// Maximum derived-state checkpoint bundle accepted from disk during restart recovery.
 const MAX_CHECKPOINT_STORE_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum retained replay record accepted from disk before the loader rejects the segment.
+const MAX_DISK_REPLAY_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 /// Static feed subscriptions requested by one derived-state consumer during host construction.
@@ -1779,8 +1781,17 @@ impl DiskDerivedStateReplaySource {
                 Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(error) => return Err(error),
             }
-            let encoded_len = u32::from_le_bytes(length_bytes);
-            let mut encoded = vec![0_u8; encoded_len as usize];
+            let encoded_len = u32::from_le_bytes(length_bytes) as usize;
+            if encoded_len > MAX_DISK_REPLAY_RECORD_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "derived-state replay record exceeded max {} bytes",
+                        MAX_DISK_REPLAY_RECORD_BYTES
+                    ),
+                ));
+            }
+            let mut encoded = vec![0_u8; encoded_len];
             file.read_exact(&mut encoded)?;
             envelopes.push(Self::decode_envelope(&encoded)?);
         }
@@ -1806,8 +1817,17 @@ impl DiskDerivedStateReplaySource {
                 Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(error) => return Err(error),
             }
-            let encoded_len = u32::from_le_bytes(length_bytes);
-            let mut encoded = vec![0_u8; encoded_len as usize];
+            let encoded_len = u32::from_le_bytes(length_bytes) as usize;
+            if encoded_len > MAX_DISK_REPLAY_RECORD_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "derived-state replay record exceeded max {} bytes",
+                        MAX_DISK_REPLAY_RECORD_BYTES
+                    ),
+                ));
+            }
+            let mut encoded = vec![0_u8; encoded_len];
             file.read_exact(&mut encoded)?;
             let envelope = Self::decode_envelope(&encoded)?;
             first_sequence.get_or_insert(envelope.sequence);
@@ -4810,6 +4830,37 @@ mod tests {
 
         drop(fs::remove_file(&checkpoint_path));
         drop(fs::remove_dir_all(parent));
+    }
+
+    #[test]
+    fn replay_loader_rejects_oversized_segment_record() {
+        let replay_dir = unique_test_replay_dir("oversized-record");
+        let source = DiskDerivedStateReplaySource::new(&replay_dir, 32);
+        assert!(source.is_ok());
+        let source = source.unwrap_or_else(|error| panic!("{error}"));
+
+        let segment_path = replay_dir.join("segment.bin");
+        let file_result = File::create(&segment_path);
+        assert!(file_result.is_ok(), "{file_result:?}");
+        let mut file = file_result.unwrap_or_else(|error| panic!("{error}"));
+        let record_len =
+            u32::try_from(MAX_DISK_REPLAY_RECORD_BYTES.saturating_add(1)).unwrap_or(u32::MAX);
+        let write_result = file.write_all(&record_len.to_le_bytes());
+        assert!(write_result.is_ok(), "{write_result:?}");
+        let flush_result = file.flush();
+        assert!(flush_result.is_ok(), "{flush_result:?}");
+
+        let load_result = source.load_segment_from_disk(&segment_path);
+        assert!(load_result.is_err(), "oversized replay record should fail");
+        let error = match load_result {
+            Ok(value) => panic!("expected oversized replay record failure, got {value:?}"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeded max"));
+
+        drop(fs::remove_file(&segment_path));
+        drop(fs::remove_dir_all(replay_dir));
     }
 
     #[test]
