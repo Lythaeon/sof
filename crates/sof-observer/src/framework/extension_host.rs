@@ -1461,12 +1461,22 @@ fn validate_packet_subscription(
     if matches!(
         subscription.source_kind,
         Some(RuntimePacketSourceKind::ObserverIngress)
-    ) && !capabilities.contains(&ExtensionCapability::ObserveObserverIngress)
-    {
-        return Err(
-            "subscription declares ObserverIngress source without ObserveObserverIngress capability"
-                .to_owned(),
-        );
+    ) {
+        if !capabilities.contains(&ExtensionCapability::ObserveObserverIngress) {
+            return Err(
+                "subscription declares ObserverIngress source without ObserveObserverIngress capability"
+                    .to_owned(),
+            );
+        }
+        if subscription.owner_extension.is_some()
+            || subscription.resource_id.is_some()
+            || subscription.shared_tag.is_some()
+        {
+            return Err(
+                "subscription declares ObserverIngress source with extension-resource-only selectors"
+                    .to_owned(),
+            );
+        }
     }
     if let Some(owner_extension) = subscription.owner_extension.as_ref()
         && owner_extension.trim().is_empty()
@@ -2068,6 +2078,36 @@ mod tests {
             report.failures[0]
                 .reason
                 .contains("ObserveObserverIngress capability")
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_observer_ingress_subscription_with_resource_selectors() {
+        let host = RuntimeExtensionHost::builder()
+            .add_extension(CounterExtension {
+                name: "observer-ingress-resource-selectors",
+                startup_manifest: ExtensionManifest {
+                    capabilities: vec![ExtensionCapability::ObserveObserverIngress],
+                    resources: Vec::new(),
+                    subscriptions: vec![PacketSubscription {
+                        source_kind: Some(RuntimePacketSourceKind::ObserverIngress),
+                        owner_extension: Some("owner".to_owned()),
+                        ..PacketSubscription::default()
+                    }],
+                },
+                packet_count: Arc::new(AtomicUsize::new(0)),
+                shutdown_wait: Duration::ZERO,
+                shutdown_called: Arc::new(AtomicBool::new(false)),
+            })
+            .build();
+
+        let report = host.startup().await;
+        assert_eq!(report.active_extensions, 0);
+        assert_eq!(report.failed_extensions, 1);
+        assert!(
+            report.failures[0]
+                .reason
+                .contains("extension-resource-only selectors")
         );
     }
 
