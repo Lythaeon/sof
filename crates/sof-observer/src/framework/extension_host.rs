@@ -12,10 +12,11 @@ use std::{
         Arc, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use futures_util::{FutureExt, SinkExt, StreamExt};
+use sof_support::time_support::current_unix_ms;
 use tokio::{
     io::AsyncReadExt,
     net::{TcpListener, TcpStream, UdpSocket},
@@ -1459,14 +1460,6 @@ fn record_max_atomic(target: &AtomicU64, value: u64) {
             Err(actual) => observed = actual,
         }
     }
-}
-
-/// Returns the current Unix timestamp in milliseconds.
-fn current_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or_default()
 }
 
 /// Converts a panic payload into a loggable message string.

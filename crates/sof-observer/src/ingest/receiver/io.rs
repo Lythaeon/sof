@@ -22,7 +22,6 @@ use nix::poll::PollFlags;
 use nix::poll::{PollFd, ppoll};
 #[cfg(target_os = "linux")]
 use nix::sys::time::TimeSpec;
-
 #[cfg(target_os = "linux")]
 const SOCKADDR_STORAGE_LEN: libc::socklen_t = size_of::<libc::sockaddr_storage>() as _;
 
@@ -473,14 +472,6 @@ fn flush_batch_baseline(
 ) {
     let drop_on_full = read_udp_drop_on_channel_full();
     flush_batch_inner(tx, batch, drop_on_full, telemetry);
-}
-
-pub(super) fn current_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            duration.as_millis().min(u128::from(u64::MAX)) as u64
-        })
 }
 
 pub(super) fn tune_udp_socket(socket: &std::net::UdpSocket) {

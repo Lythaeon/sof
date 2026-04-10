@@ -155,6 +155,16 @@ pub mod time_support {
             secs.saturating_add(1)
         }
     }
+
+    /// Returns the current Unix timestamp in milliseconds, saturating at `u64::MAX`.
+    #[must_use]
+    pub fn current_unix_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| {
+                duration.as_millis().min(u128::from(u64::MAX)) as u64
+            })
+    }
 }
 
 #[cfg(test)]
@@ -164,13 +174,20 @@ mod tests {
     use super::short_vec::{
         ShortVecDecodeError, decode_short_u16_len, decode_short_u16_len_partial,
     };
-    use super::time_support::duration_secs_ceil;
+    use super::time_support::{current_unix_ms, duration_secs_ceil};
 
     #[test]
     fn duration_secs_ceil_rounds_subsecond_values_up() {
         assert_eq!(duration_secs_ceil(Duration::from_secs(2)), 2);
         assert_eq!(duration_secs_ceil(Duration::from_millis(1)), 1);
         assert_eq!(duration_secs_ceil(Duration::from_millis(1500)), 2);
+    }
+
+    #[test]
+    fn current_unix_ms_is_monotonic_enough_for_smoke_check() {
+        let first = current_unix_ms();
+        let second = current_unix_ms();
+        assert!(second >= first);
     }
 
     #[test]

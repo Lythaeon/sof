@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::os::fd::{AsFd, AsRawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crossbeam_queue::ArrayQueue;
 
@@ -17,6 +17,7 @@ use nix::poll::{PollFd, PollFlags};
 #[cfg(target_os = "linux")]
 use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrStorage, recvmsg};
 use socket2::SockRef;
+use sof_support::time_support::current_unix_ms;
 use thiserror::Error;
 use tokio::task::{self, JoinHandle};
 
@@ -634,6 +635,6 @@ fn should_shutdown(shutdown: Option<&Arc<AtomicBool>>) -> bool {
 #[path = "io.rs"]
 mod io;
 use io::{
-    current_unix_ms, flush_batch, maybe_pin_receiver_thread, recv_udp_batch_coalesced,
-    recv_udp_packet, tune_udp_socket,
+    flush_batch, maybe_pin_receiver_thread, recv_udp_batch_coalesced, recv_udp_packet,
+    tune_udp_socket,
 };
