@@ -1643,12 +1643,12 @@ fn parse_transaction_notification(
             .and_then(|signature| Signature::from_str(&signature).ok())
             .map(SignatureBytes::from)
     });
-    watermarks
-        .observe_transaction_commitment(notification.slot, commitment_status.as_tx_commitment());
+    let commitment_status = commitment_status.as_tx_commitment();
+    watermarks.observe_transaction_commitment(notification.slot, commitment_status);
     let tx_payload = mem::take(tx_bytes).into_boxed_slice();
     Ok(Some(SerializedTransactionEvent {
         slot: notification.slot,
-        commitment_status: commitment_status.as_tx_commitment(),
+        commitment_status,
         confirmed_slot: watermarks.confirmed_slot,
         finalized_slot: watermarks.finalized_slot,
         signature,
@@ -1773,6 +1773,7 @@ fn decode_account_update_event(
     tx_bytes: &mut Vec<u8>,
 ) -> Result<AccountUpdateEvent, WebsocketTransactionError> {
     let owner = parse_pubkey(&account.owner)?;
+    let commitment_status = commitment.as_tx_commitment();
     tx_bytes.clear();
     if account.data.1 != "base64" {
         return Err(WebsocketTransactionError::Convert(
@@ -1780,11 +1781,11 @@ fn decode_account_update_event(
         ));
     }
     decode_account_payload(&account.data.0, tx_bytes)?;
-    observe_non_transaction_commitment(watermarks, slot, commitment.as_tx_commitment());
+    observe_non_transaction_commitment(watermarks, slot, commitment_status);
     let data = mem::take(tx_bytes).into_boxed_slice();
     Ok(AccountUpdateEvent {
         slot,
-        commitment_status: commitment.as_tx_commitment(),
+        commitment_status,
         confirmed_slot: watermarks.confirmed_slot,
         finalized_slot: watermarks.finalized_slot,
         pubkey: pubkey_bytes(pubkey),
@@ -2119,9 +2120,10 @@ fn materialize_transaction_baseline(
             .signature
             .and_then(|signature| Signature::from_str(&signature).ok())
     });
+    let commitment_status = commitment_status.as_tx_commitment();
     Ok(Some(TransactionEvent {
         slot: notification.slot,
-        commitment_status: commitment_status.as_tx_commitment(),
+        commitment_status,
         confirmed_slot: None,
         finalized_slot: None,
         signature: signature_bytes_opt(signature),
@@ -2170,6 +2172,7 @@ async fn replay_websocket_gap(
     }
 
     let start_slot = websocket_replay_start_slot(previous_slot, head, config.replay_max_slots);
+    let commitment_status = config.commitment.as_tx_commitment();
     let mut tx_bytes = Vec::new();
     for slot in start_slot..=head {
         let Some(block) = rpc_get_block(client, &http_endpoint, slot, config.commitment).await?
@@ -2199,12 +2202,12 @@ async fn replay_websocket_gap(
             ) {
                 continue;
             }
-            watermarks.observe_transaction_commitment(slot, config.commitment.as_tx_commitment());
+            watermarks.observe_transaction_commitment(slot, commitment_status);
             sender
                 .send(
                     ProviderStreamUpdate::Transaction(TransactionEvent {
                         slot,
-                        commitment_status: config.commitment.as_tx_commitment(),
+                        commitment_status,
                         confirmed_slot: watermarks.confirmed_slot,
                         finalized_slot: watermarks.finalized_slot,
                         signature: signature_bytes_opt(tx.signatures.first().copied()),
