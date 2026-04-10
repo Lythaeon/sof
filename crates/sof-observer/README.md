@@ -581,7 +581,7 @@ cargo add sof
 Optional gossip bootstrap support at compile time:
 
 ```toml
-sof = { version = "0.18.1", features = ["gossip-bootstrap"] }
+sof = { version = "0.18.2", features = ["gossip-bootstrap"] }
 ```
 
 `gossip-bootstrap` uses the vendored `sof-solana-gossip` backend, but it no longer exact-pins the
@@ -590,7 +590,7 @@ Solana `3.1.11` patch line. Downstream crates can resolve newer compatible `3.1.
 Optional external `kernel-bypass` ingress support:
 
 ```toml
-sof = { version = "0.18.1", features = ["kernel-bypass"] }
+sof = { version = "0.18.2", features = ["kernel-bypass"] }
 ```
 
 The bundled `sof-solana-gossip` backend defaults to SOF's lightweight in-memory duplicate/conflict
@@ -1088,6 +1088,7 @@ Design references:
 - Queue pressure drops hook events instead of stalling ingest.
 - Typed host tuning is available through `sof-gossip-tuning` and `RuntimeSetup::with_gossip_tuning_profile(...)`.
 - `RuntimeExtension` WebSocket connectors support full `ws://` / `wss://` handshake + frame decoding.
+- Runtime extension resources require non-empty `resource_id` / shared tags, and startup bounds `read_buffer_bytes`.
 - WebSocket close frames emit `RuntimePacketEventClass::ConnectionClosed` in `on_packet_received`.
 - WebSocket packet events expose `websocket_frame_type` (`Text`/`Binary`/`Ping`/`Pong`) for startup-time filtering and runtime routing.
 - In gossip mode, SOF runs as an active bounded relay client by default (UDP relay + repair serve), not as an observer-only passive consumer.

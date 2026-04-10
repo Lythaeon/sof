@@ -21,7 +21,10 @@ use tokio::{
     task::JoinHandle,
     time::timeout,
 };
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, connect_async_with_config,
+    tungstenite::{Message, protocol::WebSocketConfig},
+};
 
 use crate::framework::extension::{
     ExtensionCapability, ExtensionContext, ExtensionManifest, ExtensionResourceSpec,
@@ -42,6 +45,10 @@ const DEFAULT_STARTUP_TIMEOUT_SECS: u64 = 5;
 const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 3;
 /// Per-read fallback buffer size used for extension resource sockets.
 const DEFAULT_RESOURCE_READ_BUFFER_BYTES: usize = 2_048;
+/// Maximum extension resource read buffer accepted from one startup manifest.
+const MAX_RESOURCE_READ_BUFFER_BYTES: usize = 1024 * 1024;
+/// Multiplier used to cap extension websocket frames/messages relative to chunk size.
+const EXTENSION_WEBSOCKET_MESSAGE_LIMIT_MULTIPLIER: usize = 64;
 
 /// Startup failure record for one extension.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1175,18 +1182,24 @@ async fn spawn_ws_connector(
     extension: &Arc<ActiveRuntimeExtension>,
     spec: WsConnectorSpec,
 ) -> Result<JoinHandle<()>, String> {
-    let (stream, _response) = connect_async(spec.url.as_str())
-        .await
-        .map_err(|error| format!("failed to connect websocket {}: {error}", spec.url))?;
+    let max_payload_chunk_bytes = spec
+        .read_buffer_bytes
+        .max(DEFAULT_RESOURCE_READ_BUFFER_BYTES);
+    let (stream, _response) = connect_async_with_config(
+        spec.url.as_str(),
+        Some(extension_websocket_transport_config(
+            max_payload_chunk_bytes,
+        )),
+        false,
+    )
+    .await
+    .map_err(|error| format!("failed to connect websocket {}: {error}", spec.url))?;
     let io = stream.get_ref().get_ref();
     let local_addr = io.local_addr().ok();
     let peer_addr = io.peer_addr().ok();
     let owner_extension = extension.name.to_owned();
     let resource_id = spec.resource_id;
     let shared_tag = visibility_tag(spec.visibility);
-    let max_payload_chunk_bytes = spec
-        .read_buffer_bytes
-        .max(DEFAULT_RESOURCE_READ_BUFFER_BYTES);
     let handle = tokio::spawn(async move {
         let emitter = ExtensionResourceEmitter::new(
             host,
@@ -1204,6 +1217,16 @@ async fn spawn_ws_connector(
         .await;
     });
     Ok(handle)
+}
+
+/// Builds bounded websocket transport config for extension-owned connectors.
+fn extension_websocket_transport_config(max_payload_chunk_bytes: usize) -> WebSocketConfig {
+    let max_message_size = max_payload_chunk_bytes
+        .max(DEFAULT_RESOURCE_READ_BUFFER_BYTES)
+        .saturating_mul(EXTENSION_WEBSOCKET_MESSAGE_LIMIT_MULTIPLIER);
+    WebSocketConfig::default()
+        .max_message_size(Some(max_message_size))
+        .max_frame_size(Some(max_message_size))
 }
 
 /// Reads packet chunks from one TCP stream and forwards them into the runtime.
@@ -1353,23 +1376,54 @@ fn validate_manifest(
 
     let mut resource_ids = HashSet::<String>::new();
     for resource in &manifest.resources {
-        let (resource_id, required_capability) = match resource {
-            ExtensionResourceSpec::UdpListener(spec) => {
-                (&spec.resource_id, ExtensionCapability::BindUdp)
-            }
-            ExtensionResourceSpec::TcpListener(spec) => {
-                (&spec.resource_id, ExtensionCapability::BindTcp)
-            }
-            ExtensionResourceSpec::TcpConnector(spec) => {
-                (&spec.resource_id, ExtensionCapability::ConnectTcp)
-            }
-            ExtensionResourceSpec::WsConnector(spec) => {
-                (&spec.resource_id, ExtensionCapability::ConnectWebSocket)
-            }
+        let (resource_id, visibility, read_buffer_bytes, required_capability) = match resource {
+            ExtensionResourceSpec::UdpListener(spec) => (
+                &spec.resource_id,
+                &spec.visibility,
+                spec.read_buffer_bytes,
+                ExtensionCapability::BindUdp,
+            ),
+            ExtensionResourceSpec::TcpListener(spec) => (
+                &spec.resource_id,
+                &spec.visibility,
+                spec.read_buffer_bytes,
+                ExtensionCapability::BindTcp,
+            ),
+            ExtensionResourceSpec::TcpConnector(spec) => (
+                &spec.resource_id,
+                &spec.visibility,
+                spec.read_buffer_bytes,
+                ExtensionCapability::ConnectTcp,
+            ),
+            ExtensionResourceSpec::WsConnector(spec) => (
+                &spec.resource_id,
+                &spec.visibility,
+                spec.read_buffer_bytes,
+                ExtensionCapability::ConnectWebSocket,
+            ),
         };
+        if resource_id.trim().is_empty() {
+            return Err(format!(
+                "extension `{extension_name}` declares empty resource_id"
+            ));
+        }
         if !resource_ids.insert(resource_id.clone()) {
             return Err(format!(
                 "duplicate resource_id `{resource_id}` in startup manifest for extension `{extension_name}`"
+            ));
+        }
+        if read_buffer_bytes > MAX_RESOURCE_READ_BUFFER_BYTES {
+            return Err(format!(
+                "resource `{resource_id}` read_buffer_bytes {read_buffer_bytes} exceeds max {}",
+                MAX_RESOURCE_READ_BUFFER_BYTES
+            ));
+        }
+        if matches!(
+            visibility,
+            ExtensionStreamVisibility::Shared { tag } if tag.trim().is_empty()
+        ) {
+            return Err(format!(
+                "resource `{resource_id}` declares empty shared visibility tag"
             ));
         }
         if !capabilities.contains(&required_capability) {
@@ -1424,6 +1478,7 @@ mod tests {
 
     use crate::framework::ExtensionSetupError;
     use async_trait::async_trait;
+    use tokio::io::AsyncWriteExt;
 
     struct CounterExtension {
         name: &'static str,
@@ -1551,6 +1606,93 @@ mod tests {
         let report = host.startup().await;
         assert_eq!(report.active_extensions, 0);
         assert_eq!(report.failed_extensions, 1);
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_empty_resource_id() {
+        let host = RuntimeExtensionHost::builder()
+            .add_extension(CounterExtension {
+                name: "empty-resource-id",
+                startup_manifest: ExtensionManifest {
+                    capabilities: vec![ExtensionCapability::BindUdp],
+                    resources: vec![ExtensionResourceSpec::UdpListener(UdpListenerSpec {
+                        resource_id: "   ".to_owned(),
+                        bind_addr: SocketAddr::from_str("127.0.0.1:0").expect("valid addr"),
+                        visibility: ExtensionStreamVisibility::Private,
+                        read_buffer_bytes: 128,
+                    })],
+                    subscriptions: Vec::new(),
+                },
+                packet_count: Arc::new(AtomicUsize::new(0)),
+                shutdown_wait: Duration::ZERO,
+                shutdown_called: Arc::new(AtomicBool::new(false)),
+            })
+            .build();
+
+        let report = host.startup().await;
+        assert_eq!(report.active_extensions, 0);
+        assert_eq!(report.failed_extensions, 1);
+        assert!(report.failures[0].reason.contains("empty resource_id"));
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_empty_shared_visibility_tag() {
+        let host = RuntimeExtensionHost::builder()
+            .add_extension(CounterExtension {
+                name: "empty-shared-tag",
+                startup_manifest: ExtensionManifest {
+                    capabilities: vec![ExtensionCapability::BindTcp],
+                    resources: vec![ExtensionResourceSpec::TcpListener(TcpListenerSpec {
+                        resource_id: "tcp-feed".to_owned(),
+                        bind_addr: SocketAddr::from_str("127.0.0.1:0").expect("valid addr"),
+                        visibility: ExtensionStreamVisibility::Shared {
+                            tag: "  ".to_owned(),
+                        },
+                        read_buffer_bytes: 128,
+                    })],
+                    subscriptions: Vec::new(),
+                },
+                packet_count: Arc::new(AtomicUsize::new(0)),
+                shutdown_wait: Duration::ZERO,
+                shutdown_called: Arc::new(AtomicBool::new(false)),
+            })
+            .build();
+
+        let report = host.startup().await;
+        assert_eq!(report.active_extensions, 0);
+        assert_eq!(report.failed_extensions, 1);
+        assert!(
+            report.failures[0]
+                .reason
+                .contains("empty shared visibility tag")
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_oversized_read_buffer_bytes() {
+        let host = RuntimeExtensionHost::builder()
+            .add_extension(CounterExtension {
+                name: "oversized-read-buffer",
+                startup_manifest: ExtensionManifest {
+                    capabilities: vec![ExtensionCapability::ConnectWebSocket],
+                    resources: vec![ExtensionResourceSpec::WsConnector(WsConnectorSpec {
+                        resource_id: "ws-feed".to_owned(),
+                        url: "ws://127.0.0.1:1/feed".to_owned(),
+                        visibility: ExtensionStreamVisibility::Private,
+                        read_buffer_bytes: MAX_RESOURCE_READ_BUFFER_BYTES.saturating_add(1),
+                    })],
+                    subscriptions: Vec::new(),
+                },
+                packet_count: Arc::new(AtomicUsize::new(0)),
+                shutdown_wait: Duration::ZERO,
+                shutdown_called: Arc::new(AtomicBool::new(false)),
+            })
+            .build();
+
+        let report = host.startup().await;
+        assert_eq!(report.active_extensions, 0);
+        assert_eq!(report.failed_extensions, 1);
+        assert!(report.failures[0].reason.contains("read_buffer_bytes"));
     }
 
     #[tokio::test]
@@ -1893,11 +2035,7 @@ mod tests {
         let tcp_server_addr = tcp_server.local_addr().expect("tcp local addr");
         let tcp_server_task = tokio::spawn(async move {
             if let Ok((mut stream, _)) = tcp_server.accept().await {
-                assert!(
-                    tokio::io::AsyncWriteExt::write_all(&mut stream, b"tcp")
-                        .await
-                        .is_ok()
-                );
+                assert!(stream.write_all(b"tcp").await.is_ok());
             }
         });
 
@@ -1965,5 +2103,14 @@ mod tests {
         assert!(tcp_server_task.await.is_ok());
         assert!(ws_server_task.await.is_ok());
         host.shutdown().await;
+    }
+
+    #[test]
+    fn extension_websocket_transport_config_caps_frames_from_chunk_size() {
+        let config = extension_websocket_transport_config(4_096);
+        let expected = 4_096_usize.saturating_mul(EXTENSION_WEBSOCKET_MESSAGE_LIMIT_MULTIPLIER);
+
+        assert_eq!(config.max_frame_size, Some(expected));
+        assert_eq!(config.max_message_size, Some(expected));
     }
 }
