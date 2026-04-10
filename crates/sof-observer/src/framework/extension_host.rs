@@ -1565,6 +1565,7 @@ mod tests {
     use async_trait::async_trait;
     use sof_support::bench::{avg_ns_per_iteration, profile_iterations};
     use tokio::io::AsyncWriteExt;
+    use tokio::time::{Instant as TokioInstant, sleep};
     use tokio_tungstenite::accept_async;
 
     struct CounterExtension {
@@ -1595,7 +1596,7 @@ mod tests {
         async fn shutdown(&self, _ctx: ExtensionContext) {
             self.shutdown_called.store(true, Ordering::Relaxed);
             if !self.shutdown_wait.is_zero() {
-                tokio::time::sleep(self.shutdown_wait).await;
+                sleep(self.shutdown_wait).await;
             }
         }
     }
@@ -1727,7 +1728,7 @@ mod tests {
             SocketAddr::from_str("127.0.0.1:8001").expect("valid addr"),
             &[1, 2, 3],
         );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
         assert_eq!(ok_counter.load(Ordering::Relaxed), 1);
     }
 
@@ -2013,7 +2014,7 @@ mod tests {
             },
             Arc::from(&[1_u8][..]),
         );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
         assert_eq!(owner_counter.load(Ordering::Relaxed), 1);
         assert_eq!(shared_counter.load(Ordering::Relaxed), 0);
 
@@ -2031,7 +2032,7 @@ mod tests {
             },
             Arc::from(&[2_u8][..]),
         );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
         assert_eq!(owner_counter.load(Ordering::Relaxed), 2);
         assert_eq!(shared_counter.load(Ordering::Relaxed), 1);
     }
@@ -2107,7 +2108,7 @@ mod tests {
             Arc::from(&[2_u8][..]),
         );
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
         assert_eq!(text_counter.load(Ordering::Relaxed), 1);
         assert_eq!(any_counter.load(Ordering::Relaxed), 2);
     }
@@ -2151,7 +2152,7 @@ mod tests {
             },
             Arc::from(&[][..]),
         );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
         assert_eq!(close_counter.load(Ordering::Relaxed), 1);
     }
 
@@ -2196,7 +2197,7 @@ mod tests {
             .expect("connect second tcp client");
         assert!(second.write_all(b"second").await.is_ok());
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
         assert_eq!(packet_count.load(Ordering::Relaxed), 1);
 
         host.shutdown().await;
@@ -2227,7 +2228,7 @@ mod tests {
         }
 
         async fn on_packet_received(&self, _event: RuntimePacketEvent) {
-            tokio::time::sleep(Duration::from_millis(120)).await;
+            sleep(Duration::from_millis(120)).await;
             self.counter.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -2248,7 +2249,7 @@ mod tests {
         for _ in 0..16 {
             host.on_observer_packet(source, &[7_u8; 32]);
         }
-        tokio::time::sleep(Duration::from_millis(350)).await;
+        sleep(Duration::from_millis(350)).await;
         assert!(counter.load(Ordering::Relaxed) < 16);
         assert!(host.dropped_event_count() > 0);
 
@@ -2276,7 +2277,7 @@ mod tests {
         host.on_observer_packet(source, &[1_u8; 8]);
         host.on_observer_packet(source, &[2_u8; 8]);
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
         assert_eq!(packet_count.load(Ordering::Relaxed), 1);
 
         host.shutdown().await;
@@ -2423,7 +2424,7 @@ mod tests {
         let report = host.startup().await;
         assert_eq!(report.active_extensions, 1);
 
-        let started = tokio::time::Instant::now();
+        let started = TokioInstant::now();
         host.shutdown().await;
         let elapsed = started.elapsed();
         assert!(elapsed >= shutdown_timeout);
@@ -2554,7 +2555,7 @@ mod tests {
         let report = host.startup().await;
         assert_eq!(report.active_extensions, 1);
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
         assert_eq!(closed_count.load(Ordering::Relaxed), 1);
 
         assert!(ws_server_task.await.is_ok());
@@ -2569,7 +2570,7 @@ mod tests {
         let ws_server_addr = ws_server.local_addr().expect("ws local addr");
         let ws_server_task = tokio::spawn(async move {
             if let Ok((_stream, _)) = ws_server.accept().await {
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                sleep(Duration::from_secs(5)).await;
             }
         });
 

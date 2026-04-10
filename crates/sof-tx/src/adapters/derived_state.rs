@@ -1,12 +1,16 @@
 //! `sof` derived-state adapter that bridges replayable control-plane state into `sof-tx` providers.
 
-use std::path::PathBuf;
+use std::{
+    path::{Path, PathBuf},
+    process::id,
+};
 
 use arcshift::ArcShift;
 use sof::framework::{
     DerivedStateCheckpoint, DerivedStateCheckpointStore, DerivedStateConsumer,
-    DerivedStateConsumerFault, DerivedStateControlPlaneQuality, DerivedStateControlPlaneStateEvent,
-    DerivedStateFeedEnvelope, DerivedStateFeedEvent, DerivedStatePersistedCheckpoint,
+    DerivedStateConsumerConfig, DerivedStateConsumerFault, DerivedStateControlPlaneQuality,
+    DerivedStateControlPlaneStateEvent, DerivedStateFeedEnvelope, DerivedStateFeedEvent,
+    DerivedStatePersistedCheckpoint, ForkSlotStatus,
 };
 
 use crate::{
@@ -15,6 +19,7 @@ use crate::{
         TxProviderControlPlaneSnapshot, TxProviderFlowSafetyPolicy, TxProviderFlowSafetyReport,
         take_next_leader_identity_targets,
     },
+    adapters::{TxProviderControlPlaneQuality, TxProviderFlowSafetyIssue},
     providers::{LeaderProvider, LeaderTarget, RecentBlockhashProvider},
     submit::{TxFlowSafetyIssue, TxFlowSafetyQuality, TxFlowSafetySnapshot, TxFlowSafetySource},
 };
@@ -47,7 +52,7 @@ impl DerivedStateTxProviderAdapterPersistence {
 
     /// Returns the persisted checkpoint path.
     #[must_use]
-    pub fn checkpoint_path(&self) -> &std::path::Path {
+    pub fn checkpoint_path(&self) -> &Path {
         &self.checkpoint_path
     }
 }
@@ -211,16 +216,10 @@ impl TxFlowSafetySource for DerivedStateTxProviderAdapter {
                 let report = self.evaluate_flow_safety(TxProviderFlowSafetyPolicy::default());
                 TxFlowSafetySnapshot {
                     quality: match report.quality {
-                        crate::adapters::TxProviderControlPlaneQuality::Stable => {
-                            TxFlowSafetyQuality::Stable
-                        }
-                        crate::adapters::TxProviderControlPlaneQuality::Degraded => {
-                            TxFlowSafetyQuality::Degraded
-                        }
-                        crate::adapters::TxProviderControlPlaneQuality::Stale => {
-                            TxFlowSafetyQuality::Stale
-                        }
-                        crate::adapters::TxProviderControlPlaneQuality::IncompleteControlPlane => {
+                        TxProviderControlPlaneQuality::Stable => TxFlowSafetyQuality::Stable,
+                        TxProviderControlPlaneQuality::Degraded => TxFlowSafetyQuality::Degraded,
+                        TxProviderControlPlaneQuality::Stale => TxFlowSafetyQuality::Stale,
+                        TxProviderControlPlaneQuality::IncompleteControlPlane => {
                             TxFlowSafetyQuality::IncompleteControlPlane
                         }
                     },
@@ -305,8 +304,8 @@ impl DerivedStateConsumer for DerivedStateTxProviderAdapter {
         Ok(Some(checkpoint))
     }
 
-    fn config(&self) -> sof::framework::DerivedStateConsumerConfig {
-        sof::framework::DerivedStateConsumerConfig::new().with_control_plane_observed()
+    fn config(&self) -> DerivedStateConsumerConfig {
+        DerivedStateConsumerConfig::new().with_control_plane_observed()
     }
 
     fn apply(
@@ -409,7 +408,7 @@ mod tests {
     fn unique_temp_path(label: &str) -> PathBuf {
         env::temp_dir().join(format!(
             "sof-tx-{label}-{}-{}.json",
-            std::process::id(),
+            id(),
             current_unix_nanos()
         ))
     }
@@ -430,17 +429,17 @@ mod tests {
         assert!(
             report
                 .issues
-                .contains(&crate::adapters::TxProviderFlowSafetyIssue::MissingRecentBlockhash)
+                .contains(&TxProviderFlowSafetyIssue::MissingRecentBlockhash)
         );
         assert!(
             report
                 .issues
-                .contains(&crate::adapters::TxProviderFlowSafetyIssue::MissingClusterTopology)
+                .contains(&TxProviderFlowSafetyIssue::MissingClusterTopology)
         );
         assert!(
             report
                 .issues
-                .contains(&crate::adapters::TxProviderFlowSafetyIssue::MissingLeaderSchedule)
+                .contains(&TxProviderFlowSafetyIssue::MissingLeaderSchedule)
         );
     }
 
@@ -505,7 +504,7 @@ mod tests {
                     slot: 41,
                     parent_slot: Some(40),
                     previous_status: None,
-                    status: sof::framework::ForkSlotStatus::Processed,
+                    status: ForkSlotStatus::Processed,
                 },
             ))),
         );
