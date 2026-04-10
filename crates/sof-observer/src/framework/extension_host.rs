@@ -1458,6 +1458,16 @@ fn validate_packet_subscription(
     subscription: &PacketSubscription,
     capabilities: &HashSet<ExtensionCapability>,
 ) -> Result<(), String> {
+    if matches!(
+        subscription.source_kind,
+        Some(RuntimePacketSourceKind::ObserverIngress)
+    ) && !capabilities.contains(&ExtensionCapability::ObserveObserverIngress)
+    {
+        return Err(
+            "subscription declares ObserverIngress source without ObserveObserverIngress capability"
+                .to_owned(),
+        );
+    }
     if let Some(owner_extension) = subscription.owner_extension.as_ref()
         && owner_extension.trim().is_empty()
     {
@@ -2029,6 +2039,35 @@ mod tests {
             report.failures[0]
                 .reason
                 .contains("ObserveSharedExtensionStream capability")
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_observer_ingress_subscription_without_capability() {
+        let host = RuntimeExtensionHost::builder()
+            .add_extension(CounterExtension {
+                name: "missing-observer-ingress-capability",
+                startup_manifest: ExtensionManifest {
+                    capabilities: vec![ExtensionCapability::ObserveSharedExtensionStream],
+                    resources: Vec::new(),
+                    subscriptions: vec![PacketSubscription {
+                        source_kind: Some(RuntimePacketSourceKind::ObserverIngress),
+                        ..PacketSubscription::default()
+                    }],
+                },
+                packet_count: Arc::new(AtomicUsize::new(0)),
+                shutdown_wait: Duration::ZERO,
+                shutdown_called: Arc::new(AtomicBool::new(false)),
+            })
+            .build();
+
+        let report = host.startup().await;
+        assert_eq!(report.active_extensions, 0);
+        assert_eq!(report.failed_extensions, 1);
+        assert!(
+            report.failures[0]
+                .reason
+                .contains("ObserveObserverIngress capability")
         );
     }
 
