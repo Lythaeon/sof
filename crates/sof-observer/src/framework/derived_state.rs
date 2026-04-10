@@ -1624,8 +1624,18 @@ impl DiskDerivedStateReplaySource {
 
     /// Serializes one feed envelope into an on-disk record payload.
     fn encode_envelope(envelope: &DerivedStateFeedEnvelope) -> io::Result<Vec<u8>> {
-        bincode::serialize(envelope)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+        let encoded = bincode::serialize(envelope)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        if encoded.len() > MAX_DISK_REPLAY_RECORD_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "derived-state replay record exceeded max {} bytes",
+                    MAX_DISK_REPLAY_RECORD_BYTES
+                ),
+            ));
+        }
+        Ok(encoded)
     }
 
     /// Deserializes one feed envelope from an on-disk record payload.
@@ -4878,6 +4888,47 @@ mod tests {
         if let Some(parent) = checkpoint_path.parent() {
             drop(fs::remove_dir_all(parent));
         }
+    }
+
+    #[test]
+    fn replay_encode_rejects_oversized_records() {
+        let envelope = DerivedStateFeedEnvelope {
+            session_id: FeedSessionId(55),
+            sequence: FeedSequence(1),
+            emitted_at: SystemTime::UNIX_EPOCH,
+            watermarks: FeedWatermarks::default(),
+            event: DerivedStateFeedEvent::RootedAccountObserved(RootedAccountObservedEvent {
+                slot: 1,
+                commitment_status: TxCommitmentStatus::Finalized,
+                finalized_slot: Some(1),
+                pubkey: PubkeyBytes::from([1_u8; 32]),
+                owner: PubkeyBytes::from([2_u8; 32]),
+                lamports: 1,
+                executable: false,
+                rent_epoch: 0,
+                data: Arc::from(
+                    vec![7_u8; MAX_DISK_REPLAY_RECORD_BYTES.saturating_add(1)].into_boxed_slice(),
+                ),
+                write_version: None,
+                txn_signature: None,
+                is_startup: false,
+                matched_filter: None,
+                provider_source: None,
+                kind: RootedAccountObservedKind::Other,
+            }),
+        };
+
+        let encoded = DiskDerivedStateReplaySource::encode_envelope(&envelope);
+        assert!(encoded.is_err(), "oversized replay record should fail");
+        let error = match encoded {
+            Ok(value) => panic!(
+                "expected oversized replay encode failure, got {}",
+                value.len()
+            ),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeded max"));
     }
 
     #[test]
