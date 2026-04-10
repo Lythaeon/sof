@@ -12,7 +12,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use sof_support::bench::avg_ns_per_iteration;
+use sof_support::{bench::avg_ns_per_iteration, short_vec::decode_short_u16_len_prefix};
 use sof_types::SignatureBytes;
 use solana_keypair::Keypair;
 use solana_signature::Signature;
@@ -263,20 +263,6 @@ fn target(port: u16) -> LeaderTarget {
     LeaderTarget::new(None, SocketAddr::from(([127, 0, 0, 1], port)))
 }
 
-/// Decodes the first short-vec length prefix in a serialized transaction.
-fn decode_short_vec_len(bytes: &[u8]) -> Option<(usize, usize)> {
-    let mut value = 0_usize;
-    let mut shift = 0_u32;
-    for (idx, byte) in bytes.iter().copied().take(3).enumerate() {
-        value |= usize::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Some((value, idx.saturating_add(1)));
-        }
-        shift = shift.saturating_add(7);
-    }
-    None
-}
-
 /// Rewrites the first signature bytes so repeated profile iterations do not trip dedupe.
 fn rewrite_first_signature(bytes: &mut [u8], seed: u64) {
     const BYTE_SHIFTS: [u32; 64] = [
@@ -284,7 +270,7 @@ fn rewrite_first_signature(bytes: &mut [u8], seed: u64) {
         0, 8, 16, 24, 32, 40, 48, 56, 0, 8, 16, 24, 32, 40, 48, 56, 0, 8, 16, 24, 32, 40, 48, 56,
         0, 8, 16, 24, 32, 40, 48, 56, 0, 8, 16, 24, 32, 40, 48, 56,
     ];
-    let decoded = decode_short_vec_len(bytes);
+    let decoded = decode_short_u16_len_prefix(bytes);
     assert!(decoded.is_some());
     let (signature_count, offset) = decoded.unwrap_or((0, 0));
     assert!(signature_count > 0);

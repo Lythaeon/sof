@@ -20,7 +20,7 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, Stream, StreamExt};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Value, from_slice as json_from_slice, json};
 use simd_json::{Buffers as SimdJsonBuffers, serde::from_slice as simd_from_slice};
 use sof_support::short_vec::decode_short_u16_len;
 use sof_types::{PubkeyBytes, SignatureBytes};
@@ -1663,6 +1663,7 @@ const MAX_BASE64_ACCOUNT_DATA_LEN: usize = MAX_ACCOUNT_DATA_LEN.div_ceil(3) * 4;
 const WEBSOCKET_TRANSACTION_MAX_MESSAGE_SIZE: usize = 64 * 1024;
 const WEBSOCKET_ACCOUNT_MAX_MESSAGE_SIZE: usize = MAX_BASE64_ACCOUNT_DATA_LEN + (128 * 1024);
 const WEBSOCKET_LOGS_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+const WEBSOCKET_REPLAY_HTTP_MAX_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
 
 fn decode_transaction_wire_payload(
     encoded: &str,
@@ -2357,6 +2358,26 @@ async fn rpc_post<T>(
 where
     T: for<'de> Deserialize<'de>,
 {
+    rpc_post_with_max_response_bytes(
+        client,
+        endpoint,
+        method,
+        payload,
+        WEBSOCKET_REPLAY_HTTP_MAX_RESPONSE_BYTES,
+    )
+    .await
+}
+
+async fn rpc_post_with_max_response_bytes<T>(
+    client: &reqwest::Client,
+    endpoint: &str,
+    method: &'static str,
+    payload: Value,
+    max_response_bytes: usize,
+) -> Result<RpcJsonResponse<T>, WebsocketTransactionError>
+where
+    T: for<'de> Deserialize<'de>,
+{
     let response = client
         .post(endpoint)
         .json(&payload)
@@ -2371,13 +2392,58 @@ where
             method,
             detail: error.to_string(),
         })?;
-    Ok(response
-        .json()
-        .await
-        .map_err(|error| WebsocketProtocolError::HttpRpcDecodeFailed {
+    let response_body =
+        read_http_response_bytes_bounded(response, method, max_response_bytes).await?;
+    Ok(json_from_slice(&response_body).map_err(|error| {
+        WebsocketProtocolError::HttpRpcDecodeFailed {
             method,
             detail: error.to_string(),
-        })?)
+        }
+    })?)
+}
+
+async fn read_http_response_bytes_bounded(
+    mut response: reqwest::Response,
+    method: &'static str,
+    max_response_bytes: usize,
+) -> Result<Vec<u8>, WebsocketTransactionError> {
+    if response
+        .content_length()
+        .is_some_and(|content_length| content_length > max_response_bytes as u64)
+    {
+        return Err(WebsocketProtocolError::HttpRpcFailed {
+            method,
+            detail: format!("response body exceeded max size of {max_response_bytes} bytes"),
+        }
+        .into());
+    }
+
+    let initial_capacity = response
+        .content_length()
+        .and_then(|content_length| usize::try_from(content_length).ok())
+        .unwrap_or(0)
+        .min(max_response_bytes);
+    let mut body = Vec::with_capacity(initial_capacity);
+    while let Some(chunk) =
+        response
+            .chunk()
+            .await
+            .map_err(|error| WebsocketProtocolError::HttpRpcFailed {
+                method,
+                detail: error.to_string(),
+            })?
+    {
+        let remaining = max_response_bytes.saturating_sub(body.len());
+        if chunk.len() > remaining {
+            return Err(WebsocketProtocolError::HttpRpcFailed {
+                method,
+                detail: format!("response body exceeded max size of {max_response_bytes} bytes"),
+            }
+            .into());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 fn websocket_transaction_matches_filter(
@@ -2691,7 +2757,7 @@ mod tests {
         .into_bytes()
     }
 
-    async fn spawn_http_response_server(status_line: &'static str, body: &'static str) -> String {
+    async fn spawn_raw_http_response_server(response: String) -> String {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("http listener");
@@ -2700,14 +2766,60 @@ mod tests {
             let (mut stream, _) = listener.accept().await.expect("http accept");
             let mut request = [0_u8; 1024];
             let _ = stream.read(&mut request).await;
-            let response = format!(
-                "{status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
             stream
                 .write_all(response.as_bytes())
                 .await
                 .expect("http response write");
+        });
+        format!("http://{addr}")
+    }
+
+    async fn spawn_http_response_server(status_line: &'static str, body: &'static str) -> String {
+        spawn_raw_http_response_server(format!(
+            "{status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        ))
+        .await
+    }
+
+    async fn spawn_chunked_http_response_server(
+        status_line: &'static str,
+        chunks: Vec<String>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("http listener");
+        let addr = listener.local_addr().expect("http local addr");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("http accept");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let header = format!(
+                "{status_line}\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+            );
+            stream
+                .write_all(header.as_bytes())
+                .await
+                .expect("http response header write");
+            for chunk in chunks {
+                let chunk_header = format!("{:X}\r\n", chunk.len());
+                stream
+                    .write_all(chunk_header.as_bytes())
+                    .await
+                    .expect("http chunk header write");
+                stream
+                    .write_all(chunk.as_bytes())
+                    .await
+                    .expect("http chunk body write");
+                stream
+                    .write_all(b"\r\n")
+                    .await
+                    .expect("http chunk terminator write");
+            }
+            stream
+                .write_all(b"0\r\n\r\n")
+                .await
+                .expect("http final chunk write");
         });
         format!("http://{addr}")
     }
@@ -2755,6 +2867,68 @@ mod tests {
 
         assert!(
             error.to_string().contains("503 Service Unavailable"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_rpc_get_slot_rejects_oversized_content_length() {
+        let endpoint = spawn_raw_http_response_server(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 99\r\nconnection: close\r\n\r\n{}".to_owned(),
+        )
+        .await;
+        let client = reqwest::Client::new();
+
+        let error = rpc_post_with_max_response_bytes::<u64>(
+            &client,
+            &endpoint,
+            "getSlot",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getSlot",
+                "params": []
+            }),
+            32,
+        )
+        .await
+        .expect_err("oversized content-length should be rejected");
+
+        assert!(
+            error.to_string().contains("exceeded max size"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_rpc_get_slot_rejects_oversized_chunked_response() {
+        let endpoint = spawn_chunked_http_response_server(
+            "HTTP/1.1 200 OK",
+            vec![
+                "{\"jsonrpc\":\"2.0\",\"result\":".to_owned(),
+                "12345678901234567890}".to_owned(),
+            ],
+        )
+        .await;
+        let client = reqwest::Client::new();
+
+        let error = rpc_post_with_max_response_bytes::<u64>(
+            &client,
+            &endpoint,
+            "getSlot",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getSlot",
+                "params": []
+            }),
+            16,
+        )
+        .await
+        .expect_err("oversized chunked response should be rejected");
+
+        assert!(
+            error.to_string().contains("exceeded max size"),
             "unexpected error: {error}"
         );
     }

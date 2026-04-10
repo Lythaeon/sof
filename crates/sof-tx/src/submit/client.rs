@@ -14,6 +14,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use sof_support::short_vec::decode_short_u16_len_prefix;
 use sof_types::SignatureBytes;
 use tokio::{
     net::TcpStream,
@@ -1055,7 +1056,7 @@ fn reporter_identity(reporter: &Arc<dyn TxSubmitOutcomeReporter>) -> usize {
 
 /// Extracts the first transaction signature from serialized transaction bytes.
 fn extract_first_signature(tx_bytes: &[u8]) -> Result<Option<SignatureBytes>, SubmitError> {
-    let Some((signature_count, offset)) = decode_short_vec_len(tx_bytes) else {
+    let Some((signature_count, offset)) = decode_short_u16_len_prefix(tx_bytes) else {
         return Err(decode_signed_bytes_error(
             "transaction bytes did not contain a valid signature vector prefix",
         ));
@@ -1072,20 +1073,6 @@ fn extract_first_signature(tx_bytes: &[u8]) -> Result<Option<SignatureBytes>, Su
     let mut signature = [0_u8; 64];
     signature.copy_from_slice(signature_bytes);
     Ok(Some(SignatureBytes::new(signature)))
-}
-
-/// Decodes Solana's short-vec length prefix and returns the decoded length plus payload offset.
-fn decode_short_vec_len(bytes: &[u8]) -> Option<(usize, usize)> {
-    let mut value = 0_usize;
-    let mut shift = 0_u32;
-    for (idx, byte) in bytes.iter().copied().take(3).enumerate() {
-        value |= usize::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Some((value, idx.saturating_add(1)));
-        }
-        shift = shift.saturating_add(7);
-    }
-    None
 }
 
 /// Builds one signed-byte decode error from a static message.

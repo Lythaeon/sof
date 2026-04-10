@@ -125,6 +125,17 @@ pub mod short_vec {
         None
     }
 
+    /// Decodes one Solana short-vector length prefix from the start of `payload`.
+    ///
+    /// Returns the decoded length together with the payload offset immediately
+    /// after the prefix bytes.
+    #[must_use]
+    pub fn decode_short_u16_len_prefix(payload: &[u8]) -> Option<(usize, usize)> {
+        let mut offset = 0;
+        let value = decode_short_u16_len(payload, &mut offset)?;
+        Some((value, offset))
+    }
+
     /// Decodes one Solana short-vector length from a possibly partial payload.
     ///
     /// # Errors
@@ -209,6 +220,7 @@ mod tests {
     use super::collections_support::prune_recent_slots;
     use super::short_vec::{
         ShortVecDecodeError, decode_short_u16_len, decode_short_u16_len_partial,
+        decode_short_u16_len_prefix,
     };
     use super::time_support::{
         current_unix_ms, current_unix_nanos, current_unix_secs, duration_secs_ceil,
@@ -264,6 +276,12 @@ mod tests {
             decode_short_u16_len_partial(&[0x80, 0x80, 0x80], &mut invalid_offset),
             Err(ShortVecDecodeError::Invalid)
         );
+    }
+
+    #[test]
+    fn short_vec_decode_prefix_returns_offset() {
+        assert_eq!(decode_short_u16_len_prefix(&[0x7f]), Some((127, 1)));
+        assert_eq!(decode_short_u16_len_prefix(&[0x80, 0x01]), Some((128, 2)));
     }
 
     #[test]
