@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, VecDeque, hash_map::Entry},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -148,15 +148,27 @@ impl RecentShredRingBuffer {
             });
         }
 
-        let mut matches: Vec<(u32, Arc<[u8]>)> = self
-            .entries
-            .iter()
-            .filter(|(key, _)| {
-                key.slot == request.slot
-                    && key.index >= request.start_index
-                    && key.index <= request.end_index
-            })
-            .map(|(key, entry)| (key.index, entry.bytes.clone()))
+        let mut latest_by_index: HashMap<u32, (Instant, Arc<[u8]>)> = HashMap::new();
+        for (key, entry) in self.entries.iter().filter(|(key, _)| {
+            key.slot == request.slot
+                && key.index >= request.start_index
+                && key.index <= request.end_index
+        }) {
+            let candidate = (entry.seen_at, entry.bytes.clone());
+            match latest_by_index.entry(key.index) {
+                Entry::Occupied(mut current) => {
+                    if candidate.0 > current.get().0 {
+                        current.insert(candidate);
+                    }
+                }
+                Entry::Vacant(vacant) => {
+                    vacant.insert(candidate);
+                }
+            }
+        }
+        let mut matches: Vec<(u32, Arc<[u8]>)> = latest_by_index
+            .into_iter()
+            .map(|(index, (_, bytes))| (index, bytes))
             .collect();
         matches.sort_unstable_by_key(|(index, _)| *index);
 
@@ -369,8 +381,7 @@ impl SharedRelayCache {
             });
         }
 
-        let mut response: Vec<Arc<[u8]>> = Vec::new();
-        let mut response_bytes = 0usize;
+        let mut latest_by_index: HashMap<u32, (Instant, Arc<[u8]>)> = HashMap::new();
         let start = slot_index_range_start(request.slot, request.start_index);
         let end = slot_index_range_end(request.slot, request.end_index);
         for entry in self.slot_index.range(start..=end) {
@@ -378,7 +389,27 @@ impl SharedRelayCache {
             let Some(cached) = self.entries.get(&key) else {
                 continue;
             };
-            let bytes = cached.value().bytes.clone();
+            let candidate = (cached.value().seen_at, cached.value().bytes.clone());
+            match latest_by_index.entry(key.index) {
+                Entry::Occupied(mut current) => {
+                    if candidate.0 > current.get().0 {
+                        current.insert(candidate);
+                    }
+                }
+                Entry::Vacant(vacant) => {
+                    vacant.insert(candidate);
+                }
+            }
+        }
+        let mut matches: Vec<(u32, Arc<[u8]>)> = latest_by_index
+            .into_iter()
+            .map(|(index, (_, bytes))| (index, bytes))
+            .collect();
+        matches.sort_unstable_by_key(|(index, _)| *index);
+
+        let mut response: Vec<Arc<[u8]>> = Vec::new();
+        let mut response_bytes = 0usize;
+        for (_, bytes) in matches {
             if response.len() >= limits.max_response_shreds {
                 break;
             }
@@ -737,6 +768,36 @@ mod tests {
     }
 
     #[test]
+    fn query_range_prefers_latest_seen_variant_per_index() {
+        let old_packet = build_data_shred_packet(9, 5, 1, 0, b"old");
+        let new_packet = build_data_shred_packet(9, 5, 2, 0, b"new");
+        let old_header = parse_shred_header(&old_packet).expect("valid");
+        let new_header = parse_shred_header(&new_packet).expect("valid");
+        let mut cache = RecentShredRingBuffer::new(16, Duration::from_secs(2));
+        let now = Instant::now();
+        let _ = cache.insert(&old_packet, &old_header, now);
+        let _ = cache.insert(&new_packet, &new_header, now + Duration::from_millis(1));
+
+        let result = cache
+            .query_range(
+                RelayRangeRequest {
+                    slot: 9,
+                    start_index: 5,
+                    end_index: 5,
+                },
+                RelayRangeLimits {
+                    max_request_span: 4,
+                    max_response_shreds: 4,
+                    max_response_bytes: usize::MAX,
+                },
+                now + Duration::from_millis(2),
+            )
+            .expect("query succeeds");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].as_ref(), new_packet.as_slice());
+    }
+
+    #[test]
     fn query_exact_returns_matching_shred() {
         let p1 = build_data_shred_packet(10, 1, 1, 0, b"a");
         let p2 = build_data_shred_packet(10, 2, 1, 0, b"b");
@@ -882,6 +943,40 @@ mod tests {
             .expect("highest above threshold");
         assert_eq!(index, 9);
         assert_eq!(found.as_ref(), packet_new_top.as_slice());
+    }
+
+    #[test]
+    fn shared_query_range_prefers_latest_seen_variant_per_index() {
+        let old_packet = build_data_shred_packet(14, 9, 1, 0, b"old-top");
+        let new_packet = build_data_shred_packet(14, 9, 2, 0, b"new-top");
+        let old_header = parse_shred_header(&old_packet).expect("valid");
+        let new_header = parse_shred_header(&new_packet).expect("valid");
+        let cache = SharedRelayCache::new(RecentShredRingBuffer::new(16, Duration::from_secs(2)));
+        let now = Instant::now();
+        assert!(cache.insert(&old_packet, &old_header, now).inserted);
+        assert!(
+            cache
+                .insert(&new_packet, &new_header, now + Duration::from_millis(1))
+                .inserted
+        );
+
+        let result = cache
+            .query_range(
+                RelayRangeRequest {
+                    slot: 14,
+                    start_index: 9,
+                    end_index: 9,
+                },
+                RelayRangeLimits {
+                    max_request_span: 4,
+                    max_response_shreds: 4,
+                    max_response_bytes: usize::MAX,
+                },
+                now + Duration::from_millis(2),
+            )
+            .expect("query succeeds");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].as_ref(), new_packet.as_slice());
     }
 
     #[test]
