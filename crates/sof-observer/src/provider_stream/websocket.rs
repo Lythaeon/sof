@@ -11,8 +11,8 @@ use std::{borrow::Cow, str::FromStr, sync::Arc, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, StreamExt};
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde::{Deserialize, de::DeserializeOwned};
+use serde_json::{Value, from_slice as json_from_slice, json};
 use simd_json::{Buffers as SimdJsonBuffers, serde::from_slice as simd_from_slice};
 use sof_types::{PubkeyBytes, SignatureBytes};
 use solana_pubkey::Pubkey;
@@ -47,6 +47,12 @@ use crate::{
 const MAX_PROVIDER_WEBSOCKET_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum provider websocket message size accepted from upstream RPC sources.
 const MAX_PROVIDER_WEBSOCKET_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum replay HTTP response body accepted from companion RPC endpoints.
+const MAX_WEBSOCKET_REPLAY_HTTP_BODY_BYTES: usize = 64 * 1024 * 1024;
+/// Connect timeout for websocket replay HTTP companion requests.
+const WEBSOCKET_REPLAY_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Whole-request timeout for websocket replay HTTP companion requests.
+const WEBSOCKET_REPLAY_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Commitment level used for websocket `transactionSubscribe` notifications.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2119,7 +2125,7 @@ async fn replay_websocket_gap(
         return Err(WebsocketProtocolError::MissingReplayHttpEndpoint.into());
     };
 
-    let client = reqwest::Client::new();
+    let client = websocket_replay_http_client()?;
     let head = rpc_get_slot(&client, &http_endpoint, config.commitment).await?;
     if head < previous_slot {
         return Ok(());
@@ -2231,12 +2237,78 @@ fn websocket_http_endpoint(config: &WebsocketTransactionConfig) -> Option<String
     None
 }
 
+fn websocket_replay_http_client() -> Result<reqwest::Client, WebsocketTransactionError> {
+    reqwest::Client::builder()
+        .connect_timeout(WEBSOCKET_REPLAY_HTTP_CONNECT_TIMEOUT)
+        .timeout(WEBSOCKET_REPLAY_HTTP_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|error| WebsocketProtocolError::HttpRpcFailed {
+            method: "replay-client",
+            detail: error.to_string(),
+        })
+        .map_err(Into::into)
+}
+
+async fn read_http_rpc_json_response<T>(
+    response: reqwest::Response,
+    method: &'static str,
+) -> Result<RpcJsonResponse<T>, WebsocketTransactionError>
+where
+    T: DeserializeOwned,
+{
+    if !response.status().is_success() {
+        return Err(WebsocketProtocolError::HttpRpcFailed {
+            method,
+            detail: format!("unexpected http status {}", response.status()),
+        }
+        .into());
+    }
+    if let Some(body_len) = response.content_length()
+        && body_len > u64::try_from(MAX_WEBSOCKET_REPLAY_HTTP_BODY_BYTES).unwrap_or(u64::MAX)
+    {
+        return Err(WebsocketProtocolError::HttpRpcFailed {
+            method,
+            detail: format!(
+                "response body {body_len} exceeds max {} bytes",
+                MAX_WEBSOCKET_REPLAY_HTTP_BODY_BYTES
+            ),
+        }
+        .into());
+    }
+    let mut body = Vec::new();
+    let mut response = response;
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        WebsocketProtocolError::HttpRpcFailed {
+            method,
+            detail: error.to_string(),
+        }
+    })? {
+        let next_len = body.len().saturating_add(chunk.len());
+        if next_len > MAX_WEBSOCKET_REPLAY_HTTP_BODY_BYTES {
+            return Err(WebsocketProtocolError::HttpRpcFailed {
+                method,
+                detail: format!(
+                    "response body exceeds max {} bytes",
+                    MAX_WEBSOCKET_REPLAY_HTTP_BODY_BYTES
+                ),
+            }
+            .into());
+        }
+        body.extend_from_slice(chunk.as_ref());
+    }
+    json_from_slice(&body).map_err(|error| WebsocketProtocolError::HttpRpcDecodeFailed {
+        method,
+        detail: error.to_string(),
+    })
+    .map_err(Into::into)
+}
+
 async fn rpc_get_slot(
     client: &reqwest::Client,
     endpoint: &str,
     commitment: WebsocketTransactionCommitment,
 ) -> Result<u64, WebsocketTransactionError> {
-    let response: RpcJsonResponse<u64> = client
+    let response = client
         .post(endpoint)
         .json(&json!({
             "jsonrpc": "2.0",
@@ -2249,13 +2321,8 @@ async fn rpc_get_slot(
         .map_err(|error| WebsocketProtocolError::HttpRpcFailed {
             method: "getSlot",
             detail: error.to_string(),
-        })?
-        .json()
-        .await
-        .map_err(|error| WebsocketProtocolError::HttpRpcDecodeFailed {
-            method: "getSlot",
-            detail: error.to_string(),
         })?;
+    let response: RpcJsonResponse<u64> = read_http_rpc_json_response(response, "getSlot").await?;
     if let Some(error) = response.error {
         return Err(WebsocketProtocolError::HttpRpcFailed {
             method: "getSlot",
@@ -2274,7 +2341,7 @@ async fn rpc_get_block(
     slot: u64,
     commitment: WebsocketTransactionCommitment,
 ) -> Result<Option<RpcBlockResponse>, WebsocketTransactionError> {
-    let response: RpcJsonResponse<RpcBlockResponse> = client
+    let response = client
         .post(endpoint)
         .json(&json!({
             "jsonrpc": "2.0",
@@ -2296,13 +2363,9 @@ async fn rpc_get_block(
         .map_err(|error| WebsocketProtocolError::HttpRpcFailed {
             method: "getBlock",
             detail: error.to_string(),
-        })?
-        .json()
-        .await
-        .map_err(|error| WebsocketProtocolError::HttpRpcDecodeFailed {
-            method: "getBlock",
-            detail: error.to_string(),
         })?;
+    let response: RpcJsonResponse<RpcBlockResponse> =
+        read_http_rpc_json_response(response, "getBlock").await?;
     if let Some(error) = response.error {
         return Err(WebsocketProtocolError::HttpRpcFailed {
             method: "getBlock",
@@ -2588,6 +2651,7 @@ mod tests {
     use solana_message::{Message, VersionedMessage};
     use solana_signer::Signer;
     use std::time::Instant;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::time::{Duration, timeout};
     use tokio_tungstenite::{accept_async, tungstenite::protocol::Message as WsMessage};
@@ -2625,6 +2689,21 @@ mod tests {
         })
         .to_string()
         .into_bytes()
+    }
+
+    async fn spawn_http_response_server(response: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await.expect("read request");
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+        format!("http://{addr}")
     }
 
     #[cfg(feature = "provider-grpc")]
@@ -2884,6 +2963,38 @@ mod tests {
             websocket_http_endpoint(&config).as_deref(),
             Some("https://example.invalid/?api-key=1")
         );
+    }
+
+    #[tokio::test]
+    async fn websocket_rpc_get_slot_rejects_non_success_status() {
+        let endpoint = spawn_http_response_server(
+            "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n".to_owned(),
+        )
+        .await;
+        let client = websocket_replay_http_client().expect("client");
+        let error = rpc_get_slot(&client, &endpoint, WebsocketTransactionCommitment::Processed)
+            .await
+            .expect_err("non-success status should fail");
+        assert!(error.to_string().contains("unexpected http status 503"));
+    }
+
+    #[tokio::test]
+    async fn websocket_rpc_get_block_rejects_oversized_body() {
+        let oversized = MAX_WEBSOCKET_REPLAY_HTTP_BODY_BYTES.saturating_add(1);
+        let endpoint = spawn_http_response_server(format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {oversized}\r\ncontent-type: application/json\r\n\r\n"
+        ))
+        .await;
+        let client = websocket_replay_http_client().expect("client");
+        let error = rpc_get_block(
+            &client,
+            &endpoint,
+            1,
+            WebsocketTransactionCommitment::Processed,
+        )
+        .await
+        .expect_err("oversized body should fail");
+        assert!(error.to_string().contains("exceeds max"));
     }
 
     #[test]
