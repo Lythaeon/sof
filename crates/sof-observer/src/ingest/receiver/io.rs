@@ -16,6 +16,8 @@ use crate::ingest::config::read_udp_drop_on_channel_full;
 use crate::ingest::config::{
     read_udp_busy_poll_budget, read_udp_busy_poll_us, read_udp_prefer_busy_poll,
 };
+#[cfg(target_os = "linux")]
+use nix::errno::Errno;
 #[cfg(all(target_os = "linux", test))]
 use nix::poll::PollFlags;
 #[cfg(target_os = "linux")]
@@ -102,7 +104,7 @@ pub(super) fn recv_udp_packet(
                 Some(&mut cmsg_space),
                 MsgFlags::empty(),
             ) {
-                Err(nix::errno::Errno::EINTR) => continue,
+                Err(Errno::EINTR) => continue,
                 result => break result.map_err(nix_errno_to_io_error),
             }
         }?;
@@ -668,6 +670,7 @@ pub(super) fn maybe_pin_receiver_thread(socket: &UdpSocket) {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use std::os::fd::AsFd;
     use std::thread;
 
     use crate::ingest::create_raw_packet_batch_queue;
@@ -752,10 +755,10 @@ mod tests {
     #[test]
     fn recvmmsg_source_address_rejects_truncated_name() {
         // SAFETY: The test initializes the family tag before conversion.
-        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut storage: libc::sockaddr_storage = unsafe { zeroed() };
         storage.ss_family = libc::AF_INET as libc::sa_family_t;
 
-        let truncated = std::mem::size_of::<libc::sockaddr_in>().saturating_sub(1);
+        let truncated = size_of::<libc::sockaddr_in>().saturating_sub(1);
         let namelen = libc::socklen_t::try_from(truncated).unwrap_or(0);
         assert!(sockaddr_storage_to_socket_addr_libc(&storage, namelen).is_none());
     }
@@ -956,8 +959,6 @@ mod tests {
     #[test]
     #[ignore = "profiling fixture for UDP receiver coalesced ingress"]
     fn udp_receiver_recvmmsg_coalesced_profile_fixture() {
-        use std::os::fd::AsFd;
-
         let iterations = read_positive_usize("SOF_UDP_RECEIVER_PROFILE_ITERS", 1_000);
         let packet_count = read_positive_usize("SOF_UDP_RECEIVER_PROFILE_BURST", 64);
         let chunk_size = read_positive_usize("SOF_UDP_RECEIVER_PROFILE_CHUNK", 8);
