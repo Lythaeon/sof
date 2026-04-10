@@ -942,6 +942,17 @@ impl DerivedStateCheckpointStore {
                     format!("failed to serialize derived-state checkpoint: {error}"),
                 )
             })?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_CHECKPOINT_STORE_BYTES {
+            return Err(DerivedStateConsumerFault::new(
+                DerivedStateConsumerFaultKind::CheckpointWriteFailed,
+                Some(checkpoint.last_applied_sequence),
+                format!(
+                    "derived-state checkpoint {} exceeds max {} bytes",
+                    self.path.display(),
+                    MAX_CHECKPOINT_STORE_BYTES
+                ),
+            ));
+        }
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|error| {
                 DerivedStateConsumerFault::new(
@@ -4830,6 +4841,43 @@ mod tests {
 
         drop(fs::remove_file(&checkpoint_path));
         drop(fs::remove_dir_all(parent));
+    }
+
+    #[test]
+    fn checkpoint_store_rejects_oversized_writes() {
+        let checkpoint_path = unique_test_checkpoint_path("store-oversized-write");
+        let store = DerivedStateCheckpointStore::new(&checkpoint_path);
+        let checkpoint = DerivedStateCheckpoint {
+            session_id: FeedSessionId(123),
+            last_applied_sequence: FeedSequence(9),
+            watermarks: FeedWatermarks::default(),
+            state_version: 1,
+            extension_version: "oversized-write-test".to_owned(),
+        };
+        let oversized = "x".repeat(
+            usize::try_from(MAX_CHECKPOINT_STORE_BYTES)
+                .unwrap_or(0)
+                .saturating_add(1),
+        );
+
+        let store_result = store.store(&checkpoint, &oversized);
+        assert!(
+            store_result.is_err(),
+            "oversized checkpoint write should fail"
+        );
+        let error = match store_result {
+            Ok(()) => panic!("expected oversized checkpoint write failure"),
+            Err(error) => error,
+        };
+        assert!(error.message.contains("exceeds max"));
+        assert!(
+            !checkpoint_path.exists(),
+            "oversized checkpoint should not be written"
+        );
+
+        if let Some(parent) = checkpoint_path.parent() {
+            drop(fs::remove_dir_all(parent));
+        }
     }
 
     #[test]
