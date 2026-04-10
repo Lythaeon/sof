@@ -19,6 +19,7 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
+use reqwest::redirect::Policy;
 use serde::Deserialize;
 use serde_json::{Value, from_slice as json_from_slice, json};
 use simd_json::{Buffers as SimdJsonBuffers, serde::from_slice as simd_from_slice};
@@ -2158,9 +2159,23 @@ fn frame_bytes_mut<'buffer>(buffer: &'buffer mut Vec<u8>, bytes: &[u8]) -> &'buf
     buffer.as_mut_slice()
 }
 
-fn websocket_replay_http_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(reqwest::Client::new)
+fn websocket_replay_http_client() -> Result<&'static reqwest::Client, WebsocketTransactionError> {
+    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .redirect(Policy::none())
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|detail| {
+            WebsocketProtocolError::HttpRpcFailed {
+                method: "client",
+                detail: detail.clone(),
+            }
+            .into()
+        })
 }
 
 async fn replay_websocket_gap(
@@ -2177,7 +2192,7 @@ async fn replay_websocket_gap(
         return Err(WebsocketProtocolError::MissingReplayHttpEndpoint.into());
     };
 
-    let client = websocket_replay_http_client();
+    let client = websocket_replay_http_client()?;
     let head = rpc_get_slot(client, &http_endpoint, config.commitment).await?;
     if head < previous_slot {
         return Ok(());
@@ -2401,12 +2416,21 @@ where
         .map_err(|error| WebsocketProtocolError::HttpRpcFailed {
             method,
             detail: error.to_string(),
-        })?
-        .error_for_status()
-        .map_err(|error| WebsocketProtocolError::HttpRpcFailed {
-            method,
-            detail: error.to_string(),
         })?;
+    if response.status().is_redirection() {
+        return Err(WebsocketProtocolError::HttpRpcFailed {
+            method,
+            detail: format!("unexpected redirect response: {}", response.status()),
+        }
+        .into());
+    }
+    let response =
+        response
+            .error_for_status()
+            .map_err(|error| WebsocketProtocolError::HttpRpcFailed {
+                method,
+                detail: error.to_string(),
+            })?;
     let response_body =
         read_http_response_bytes_bounded(response, method, max_response_bytes).await?;
     Ok(json_from_slice(&response_body).map_err(|error| {
@@ -2800,6 +2824,16 @@ mod tests {
         .await
     }
 
+    async fn spawn_redirect_http_response_server(
+        status_line: &'static str,
+        location: &str,
+    ) -> String {
+        spawn_raw_http_response_server(format!(
+            "{status_line}\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        ))
+        .await
+    }
+
     async fn spawn_chunked_http_response_server(
         status_line: &'static str,
         chunks: Vec<String>,
@@ -2885,6 +2919,28 @@ mod tests {
 
         assert!(
             error.to_string().contains("503 Service Unavailable"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_rpc_get_slot_rejects_redirects() {
+        let target =
+            spawn_http_response_server("HTTP/1.1 200 OK", "{\"jsonrpc\":\"2.0\",\"result\":99}")
+                .await;
+        let endpoint =
+            spawn_redirect_http_response_server("HTTP/1.1 307 Temporary Redirect", &target).await;
+
+        let client = match websocket_replay_http_client() {
+            Ok(client) => client,
+            Err(error) => panic!("shared replay client: {error}"),
+        };
+        let error = rpc_get_slot(client, &endpoint, WebsocketTransactionCommitment::Confirmed)
+            .await
+            .expect_err("redirect replay response should be rejected");
+
+        assert!(
+            error.to_string().contains("307 Temporary Redirect"),
             "unexpected error: {error}"
         );
     }
