@@ -21,6 +21,7 @@ impl OutstandingRepairKey {
 #[derive(Debug)]
 pub struct OutstandingRepairRequests {
     entries: HashMap<OutstandingRepairKey, Instant>,
+    #[cfg(any(feature = "gossip-bootstrap", test))]
     highest_window_by_slot: BTreeSet<(u64, u32)>,
     #[cfg(any(feature = "gossip-bootstrap", test))]
     /// Insertion order for expiry, including stale superseded timestamps.
@@ -35,6 +36,7 @@ impl OutstandingRepairRequests {
         let _ = timeout;
         Self {
             entries: HashMap::new(),
+            #[cfg(any(feature = "gossip-bootstrap", test))]
             highest_window_by_slot: BTreeSet::new(),
             #[cfg(any(feature = "gossip-bootstrap", test))]
             order: VecDeque::new(),
@@ -100,26 +102,29 @@ impl OutstandingRepairRequests {
         {
             removed = removed.saturating_add(1);
         }
-        let highest_to_clear: Vec<_> = self
-            .highest_window_by_slot
-            .range((slot, 0)..=(slot, index))
-            .copied()
-            .collect();
-        for (highest_slot, highest_index) in highest_to_clear {
-            if self
-                .entries
-                .remove(&OutstandingRepairKey {
-                    slot: highest_slot,
-                    index: highest_index,
-                    kind: MissingShredRequestKind::HighestWindowIndex,
-                })
-                .is_some()
-            {
-                removed = removed.saturating_add(1);
-            }
-            let _ = self
+        #[cfg(any(feature = "gossip-bootstrap", test))]
+        {
+            let highest_to_clear: Vec<_> = self
                 .highest_window_by_slot
-                .remove(&(highest_slot, highest_index));
+                .range((slot, 0)..=(slot, index))
+                .copied()
+                .collect();
+            for (highest_slot, highest_index) in highest_to_clear {
+                if self
+                    .entries
+                    .remove(&OutstandingRepairKey {
+                        slot: highest_slot,
+                        index: highest_index,
+                        kind: MissingShredRequestKind::HighestWindowIndex,
+                    })
+                    .is_some()
+                {
+                    removed = removed.saturating_add(1);
+                }
+                let _ = self
+                    .highest_window_by_slot
+                    .remove(&(highest_slot, highest_index));
+            }
         }
         removed
     }
@@ -128,12 +133,14 @@ impl OutstandingRepairRequests {
         self.entries.len()
     }
 
+    #[cfg(any(feature = "gossip-bootstrap", test))]
     fn insert_highest_window_index(&mut self, key: OutstandingRepairKey) {
         if key.kind == MissingShredRequestKind::HighestWindowIndex {
             let _ = self.highest_window_by_slot.insert((key.slot, key.index));
         }
     }
 
+    #[cfg(any(feature = "gossip-bootstrap", test))]
     fn remove_highest_window_index(&mut self, key: OutstandingRepairKey) {
         if key.kind == MissingShredRequestKind::HighestWindowIndex {
             let _ = self.highest_window_by_slot.remove(&(key.slot, key.index));

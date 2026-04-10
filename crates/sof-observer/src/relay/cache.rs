@@ -110,7 +110,9 @@ impl RecentShredRingBuffer {
             },
         );
         self.order.push_back((now, key));
-        self.evict(now, &mut evicted);
+        if replaced.is_none() {
+            self.evict(now, &mut evicted);
+        }
 
         CacheInsertOutcome {
             inserted: replaced.is_none(),
@@ -219,6 +221,41 @@ impl RecentShredRingBuffer {
                 }
                 *evicted = evicted.saturating_add(1);
             }
+        }
+    }
+
+    #[cfg(test)]
+    fn insert_baseline(
+        &mut self,
+        packet: &[u8],
+        parsed_shred: &ParsedShredHeader,
+        now: Instant,
+    ) -> CacheInsertOutcome {
+        let mut evicted = 0usize;
+        self.evict(now, &mut evicted);
+
+        let Some(key) = make_cached_shred_key(packet, parsed_shred) else {
+            return CacheInsertOutcome {
+                inserted: false,
+                replaced: false,
+                evicted,
+            };
+        };
+
+        let replaced = self.entries.insert(
+            key,
+            CachedShred {
+                seen_at: now,
+                bytes: Arc::from(packet),
+            },
+        );
+        self.order.push_back((now, key));
+        self.evict(now, &mut evicted);
+
+        CacheInsertOutcome {
+            inserted: replaced.is_none(),
+            replaced: replaced.is_some(),
+            evicted,
         }
     }
 }
@@ -561,6 +598,38 @@ mod tests {
         assert!(!second.inserted);
         assert!(second.replaced);
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for relay ring-buffer replacement churn"]
+    fn relay_ring_buffer_replace_profile_fixture() {
+        let iterations = profile_iterations(200_000);
+        let packet = build_data_shred_packet(42, 7, 1, 9, b"hello");
+        let parsed = parse_shred_header(&packet).expect("valid");
+        let mut baseline = RecentShredRingBuffer::new(16, Duration::from_secs(60));
+        let mut optimized = RecentShredRingBuffer::new(16, Duration::from_secs(60));
+        let started_at = Instant::now();
+
+        let baseline_started = Instant::now();
+        for i in 0..iterations {
+            let now = started_at + Duration::from_nanos(u64::try_from(i).expect("iterations fit"));
+            black_box(baseline.insert_baseline(&packet, &parsed, now));
+        }
+        let baseline_elapsed = baseline_started.elapsed();
+
+        let optimized_started = Instant::now();
+        for i in 0..iterations {
+            let now = started_at + Duration::from_nanos(u64::try_from(i).expect("iterations fit"));
+            black_box(optimized.insert(&packet, &parsed, now));
+        }
+        let optimized_elapsed = optimized_started.elapsed();
+
+        eprintln!(
+            "relay_ring_buffer_replace_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            iterations,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
+        );
     }
 
     #[test]
