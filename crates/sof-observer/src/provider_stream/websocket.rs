@@ -1574,13 +1574,16 @@ const fn websocket_logs_health_reason(error: &WebsocketLogsError) -> ProviderSou
     }
 }
 
-async fn wait_for_subscription_ack<S>(read: &mut S) -> Result<(), WebsocketTransactionError>
+async fn wait_for_subscription_ack<S>(
+    read: &mut S,
+    ack_timeout: Duration,
+) -> Result<(), WebsocketTransactionError>
 where
     S: Stream<Item = Result<WsMessage, TungsteniteError>>
         + Sink<WsMessage, Error = TungsteniteError>
         + Unpin,
 {
-    wait_for_subscription_ack_with(read, handle_subscription_text).await
+    wait_for_subscription_ack_with(read, ack_timeout, handle_subscription_text).await
 }
 
 fn handle_subscription_text(bytes: &mut [u8]) -> Result<bool, WebsocketTransactionError> {
@@ -1995,20 +1998,28 @@ async fn establish_websocket_logs_session(
             config.subscribe_request().to_string().into(),
         ))
         .await?;
-    wait_for_logs_subscription_ack(&mut stream).await?;
+    wait_for_logs_subscription_ack(&mut stream, websocket_ack_timeout(config.stall_timeout))
+        .await?;
     Ok(stream)
 }
 
-async fn wait_for_logs_subscription_ack<S>(read: &mut S) -> Result<(), WebsocketLogsError>
+async fn wait_for_logs_subscription_ack<S>(
+    read: &mut S,
+    ack_timeout: Duration,
+) -> Result<(), WebsocketLogsError>
 where
     S: Stream<Item = Result<WsMessage, TungsteniteError>>
         + Sink<WsMessage, Error = TungsteniteError>
         + Unpin,
 {
-    wait_for_subscription_ack_with(read, handle_logs_subscription_text).await
+    wait_for_subscription_ack_with(read, ack_timeout, handle_logs_subscription_text).await
 }
 
-async fn wait_for_subscription_ack_with<S, E, F>(read: &mut S, mut handle_text: F) -> Result<(), E>
+async fn wait_for_subscription_ack_with<S, E, F>(
+    read: &mut S,
+    ack_timeout: Duration,
+    mut handle_text: F,
+) -> Result<(), E>
 where
     S: Stream<Item = Result<WsMessage, TungsteniteError>>
         + Sink<WsMessage, Error = TungsteniteError>
@@ -2016,7 +2027,6 @@ where
     E: From<TungsteniteError> + From<WebsocketProtocolError>,
     F: FnMut(&mut [u8]) -> Result<bool, E>,
 {
-    let ack_timeout = Duration::from_secs(10);
     let mut frame_bytes = Vec::new();
     tokio::time::timeout(ack_timeout, async {
         loop {
@@ -2274,7 +2284,7 @@ async fn establish_websocket_primary_session(
             config.subscribe_request().to_string().into(),
         ))
         .await?;
-    wait_for_subscription_ack(&mut stream).await?;
+    wait_for_subscription_ack(&mut stream, websocket_ack_timeout(config.stall_timeout)).await?;
     Ok(stream)
 }
 
@@ -2305,6 +2315,13 @@ fn websocket_transport_config(max_message_size: usize) -> WebSocketConfig {
 }
 
 const fn websocket_connect_timeout(stall_timeout: Option<Duration>) -> Duration {
+    match websocket_stall_timeout(stall_timeout) {
+        Some(timeout) => timeout,
+        None => DEFAULT_WEBSOCKET_CONNECT_TIMEOUT,
+    }
+}
+
+const fn websocket_ack_timeout(stall_timeout: Option<Duration>) -> Duration {
     match websocket_stall_timeout(stall_timeout) {
         Some(timeout) => timeout,
         None => DEFAULT_WEBSOCKET_CONNECT_TIMEOUT,
@@ -3666,6 +3683,35 @@ mod tests {
         let error = spawn_websocket_source(&config, tx)
             .await
             .expect_err("stalled websocket handshake should time out");
+        assert!(
+            error.to_string().contains("timed out"),
+            "unexpected error: {error}"
+        );
+
+        server.abort();
+        drop(server.await);
+    }
+
+    #[tokio::test]
+    async fn websocket_spawn_times_out_stalled_subscription_ack() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        let server = tokio::spawn(async move {
+            let accepted = listener.accept().await;
+            assert!(accepted.is_ok());
+            let (stream, _) = accepted.unwrap_or_else(|error| panic!("{error}"));
+            let _ws = accept_async(stream).await.expect("websocket handshake");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        let (tx, _rx) = create_provider_stream_queue(1);
+        let config = WebsocketTransactionConfig::new(format!("ws://{addr}"))
+            .with_stall_timeout(Duration::from_millis(25));
+
+        let error = spawn_websocket_source(&config, tx)
+            .await
+            .expect_err("stalled subscription ack should time out");
         assert!(
             error.to_string().contains("timed out"),
             "unexpected error: {error}"
