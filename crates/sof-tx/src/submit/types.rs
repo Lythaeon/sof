@@ -319,6 +319,16 @@ impl DirectSubmitConfig {
     /// Returns this config with minimum valid retry counters.
     #[must_use]
     pub const fn normalized(self) -> Self {
+        let per_target_timeout = if self.per_target_timeout.is_zero() {
+            Duration::from_millis(1)
+        } else {
+            self.per_target_timeout
+        };
+        let global_timeout = if self.global_timeout.is_zero() {
+            Duration::from_millis(1)
+        } else {
+            self.global_timeout
+        };
         let direct_target_rounds = if self.direct_target_rounds == 0 {
             1
         } else {
@@ -349,9 +359,14 @@ impl DirectSubmitConfig {
         } else {
             self.agave_rebroadcast_interval
         };
+        let latency_probe_timeout = if self.latency_probe_timeout.is_zero() {
+            Duration::from_millis(1)
+        } else {
+            self.latency_probe_timeout
+        };
         Self {
-            per_target_timeout: self.per_target_timeout,
-            global_timeout: self.global_timeout,
+            per_target_timeout,
+            global_timeout,
             direct_target_rounds,
             direct_submit_attempts,
             hybrid_direct_attempts,
@@ -361,7 +376,7 @@ impl DirectSubmitConfig {
             agave_rebroadcast_interval,
             hybrid_rpc_broadcast: self.hybrid_rpc_broadcast,
             latency_aware_targeting: self.latency_aware_targeting,
-            latency_probe_timeout: self.latency_probe_timeout,
+            latency_probe_timeout,
             latency_probe_port: self.latency_probe_port,
             latency_probe_max_targets,
         }
@@ -1070,5 +1085,30 @@ mod tests {
             refreshed_at + ttl + Duration::from_millis(1),
             ttl,
         ));
+    }
+
+    #[test]
+    fn direct_submit_config_clamps_zero_timeouts() {
+        let normalized = DirectSubmitConfig {
+            per_target_timeout: Duration::ZERO,
+            global_timeout: Duration::ZERO,
+            direct_target_rounds: 1,
+            direct_submit_attempts: 1,
+            hybrid_direct_attempts: 1,
+            rebroadcast_interval: Duration::from_millis(5),
+            agave_rebroadcast_enabled: false,
+            agave_rebroadcast_window: Duration::ZERO,
+            agave_rebroadcast_interval: Duration::from_millis(5),
+            hybrid_rpc_broadcast: false,
+            latency_aware_targeting: true,
+            latency_probe_timeout: Duration::ZERO,
+            latency_probe_port: None,
+            latency_probe_max_targets: 1,
+        }
+        .normalized();
+
+        assert_eq!(normalized.per_target_timeout, Duration::from_millis(1));
+        assert_eq!(normalized.global_timeout, Duration::from_millis(1));
+        assert_eq!(normalized.latency_probe_timeout, Duration::from_millis(1));
     }
 }
