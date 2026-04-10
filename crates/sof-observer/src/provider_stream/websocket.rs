@@ -1323,6 +1323,7 @@ async fn run_websocket_primary_connection(
 ) -> Result<(), WebsocketTransactionError> {
     *session_established = false;
     let (mut write, mut read) = stream.split();
+    let provider_source = Arc::new(source.clone());
     *session_established = true;
     send_primary_provider_health(
         source,
@@ -1337,7 +1338,7 @@ async fn run_websocket_primary_connection(
         && config.replay_on_reconnect
         && last_seen_slot.is_some()
     {
-        replay_websocket_gap(config, source, sender, last_seen_slot, watermarks).await?;
+        replay_websocket_gap(config, &provider_source, sender, last_seen_slot, watermarks).await?;
     }
     let mut ping = config.ping_interval.map(tokio::time::interval);
     let mut scratch = WebsocketParseScratch::default();
@@ -1383,7 +1384,7 @@ async fn run_websocket_primary_connection(
                         };
                         handle_primary_notification(
                             config,
-                            source,
+                            &provider_source,
                             sender,
                             frame_bytes_mut(&mut scratch.frame_bytes, text.as_str().as_bytes()),
                             &mut state,
@@ -1399,7 +1400,7 @@ async fn run_websocket_primary_connection(
                         };
                         handle_primary_notification(
                             config,
-                            source,
+                            &provider_source,
                             sender,
                             frame_bytes_mut(&mut scratch.frame_bytes, bytes.as_ref()),
                             &mut state,
@@ -1844,7 +1845,7 @@ struct WebsocketPrimaryNotificationState<'state> {
 
 async fn handle_primary_notification(
     config: &WebsocketTransactionConfig,
-    source: &ProviderSourceIdentity,
+    source: &Arc<ProviderSourceIdentity>,
     sender: &ProviderStreamSender,
     bytes: &mut [u8],
     state: &mut WebsocketPrimaryNotificationState<'_>,
@@ -1866,7 +1867,7 @@ async fn handle_primary_notification(
                 sender
                     .send(
                         ProviderStreamUpdate::SerializedTransaction(update)
-                            .with_provider_source(source.clone()),
+                            .with_provider_source_ref(source),
                     )
                     .await
                     .map_err(|_error| WebsocketTransactionError::QueueClosed)?;
@@ -1888,7 +1889,7 @@ async fn handle_primary_notification(
                 sender
                     .send(
                         ProviderStreamUpdate::AccountUpdate(update)
-                            .with_provider_source(source.clone()),
+                            .with_provider_source_ref(source),
                     )
                     .await
                     .map_err(|_error| WebsocketTransactionError::QueueClosed)?;
@@ -1907,6 +1908,7 @@ async fn run_websocket_logs_connection(
 ) -> Result<(), WebsocketLogsError> {
     *session_established = false;
     let (mut write, mut read) = stream.split();
+    let provider_source = Arc::new(source.clone());
     *session_established = true;
     send_provider_logs_health(
         source,
@@ -1960,7 +1962,7 @@ async fn run_websocket_logs_connection(
                             sender
                                 .send(
                                     ProviderStreamUpdate::TransactionLog(update)
-                                        .with_provider_source(source.clone()),
+                                        .with_provider_source_ref(&provider_source),
                                 )
                                 .await
                                 .map_err(|_error| WebsocketLogsError::QueueClosed)?;
@@ -1974,7 +1976,7 @@ async fn run_websocket_logs_connection(
                             sender
                                 .send(
                                     ProviderStreamUpdate::TransactionLog(update)
-                                        .with_provider_source(source.clone()),
+                                        .with_provider_source_ref(&provider_source),
                                 )
                                 .await
                                 .map_err(|_error| WebsocketLogsError::QueueClosed)?;
@@ -2163,7 +2165,7 @@ fn websocket_replay_http_client() -> &'static reqwest::Client {
 
 async fn replay_websocket_gap(
     config: &WebsocketTransactionConfig,
-    source: &ProviderSourceIdentity,
+    source: &Arc<ProviderSourceIdentity>,
     sender: &ProviderStreamSender,
     last_seen_slot: &mut Option<u64>,
     watermarks: &mut ProviderCommitmentWatermarks,
@@ -2225,7 +2227,7 @@ async fn replay_websocket_gap(
                         kind,
                         tx: Arc::new(tx),
                     })
-                    .with_provider_source(source.clone()),
+                    .with_provider_source_ref(source),
                 )
                 .await
                 .map_err(|_error| WebsocketTransactionError::QueueClosed)?;
@@ -2730,7 +2732,10 @@ mod tests {
     use crate::provider_stream::yellowstone::{YellowstoneGrpcCommitment, YellowstoneGrpcConfig};
     use crate::{
         event::TxKind,
-        provider_stream::{create_provider_stream_fan_in, create_provider_stream_queue},
+        provider_stream::{
+            ProviderSourceId, ProviderSourceIdentity, ProviderStreamUpdate,
+            create_provider_stream_fan_in, create_provider_stream_queue,
+        },
     };
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use serde_json::json;
@@ -4679,6 +4684,58 @@ mod tests {
 
         eprintln!(
             "websocket_transaction_parse_profile_fixture iterations={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.3} optimized_avg_us_per_iteration={:.3}",
+            iterations,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
+            baseline_avg_ns,
+            optimized_avg_ns,
+            baseline_avg_ns as f64 / 1_000.0,
+            optimized_avg_ns as f64 / 1_000.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for websocket provider source attachment path"]
+    fn websocket_provider_source_attachment_profile_fixture() {
+        let iterations = profile_iterations(500_000);
+        let payload = sample_notification_payload();
+        let mut frame_bytes = Vec::new();
+        let mut json_buffers = SimdJsonBuffers::default();
+        let mut tx_bytes = Vec::new();
+        let mut watermarks = ProviderCommitmentWatermarks::default();
+        let update = ProviderStreamUpdate::SerializedTransaction(
+            parse_transaction_notification(
+                frame_bytes_mut(&mut frame_bytes, &payload),
+                &mut json_buffers,
+                &mut tx_bytes,
+                WebsocketTransactionCommitment::Confirmed,
+                &mut watermarks,
+            )
+            .expect("parse update")
+            .expect("transaction update"),
+        );
+        let source = ProviderSourceIdentity::new(
+            ProviderSourceId::WebsocketTransaction,
+            "websocket-source-a",
+        );
+        let source_ref = Arc::new(source.clone());
+
+        let baseline_started = Instant::now();
+        for _ in 0..iterations {
+            black_box(update.clone().with_provider_source(source.clone()));
+        }
+        let baseline_elapsed = baseline_started.elapsed();
+
+        let optimized_started = Instant::now();
+        for _ in 0..iterations {
+            black_box(update.clone().with_provider_source_ref(&source_ref));
+        }
+        let optimized_elapsed = optimized_started.elapsed();
+        let baseline_avg_ns = avg_ns_per_iteration(baseline_elapsed, iterations);
+        let optimized_avg_ns = avg_ns_per_iteration(optimized_elapsed, iterations);
+
+        eprintln!(
+            "websocket_provider_source_attachment_profile_fixture iterations={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.3} optimized_avg_us_per_iteration={:.3}",
             iterations,
             baseline_elapsed.as_micros(),
             optimized_elapsed.as_micros(),
