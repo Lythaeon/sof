@@ -44,6 +44,25 @@ pub mod env_support {
     }
 }
 
+/// Collection helpers reused across runtime caches and provider adapters.
+pub mod collections_support {
+    use std::collections::HashMap;
+
+    /// Prunes one slot-keyed map down to the retained recent window once the threshold is crossed.
+    pub fn prune_recent_slots<T>(
+        slot_states: &mut HashMap<u64, T>,
+        slot: u64,
+        retained_lag: u64,
+        prune_threshold: usize,
+    ) {
+        if slot_states.len() <= prune_threshold {
+            return;
+        }
+        let slot_floor = slot.saturating_sub(retained_lag);
+        slot_states.retain(|tracked_slot, _| *tracked_slot >= slot_floor);
+    }
+}
+
 /// Typed byte-slice conversion helpers reused across provider adapters.
 pub mod bytes {
     use super::{PubkeyBytes, SignatureBytes};
@@ -171,6 +190,7 @@ pub mod time_support {
 mod tests {
     use std::time::Duration;
 
+    use super::collections_support::prune_recent_slots;
     use super::short_vec::{
         ShortVecDecodeError, decode_short_u16_len, decode_short_u16_len_partial,
     };
@@ -220,5 +240,17 @@ mod tests {
             decode_short_u16_len_partial(&[0x80, 0x80, 0x80], &mut invalid_offset),
             Err(ShortVecDecodeError::Invalid)
         );
+    }
+
+    #[test]
+    fn prune_recent_slots_drops_old_entries_after_threshold() {
+        let mut slot_states = (0_u64..10_u64).map(|slot| (slot, slot)).collect();
+
+        prune_recent_slots(&mut slot_states, 9, 3, 4);
+
+        assert_eq!(slot_states.len(), 4);
+        assert!(!slot_states.contains_key(&5));
+        assert!(slot_states.contains_key(&6));
+        assert!(slot_states.contains_key(&9));
     }
 }

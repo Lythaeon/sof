@@ -28,6 +28,7 @@ use laserstream_core_proto::tonic::{
     Status, codec::CompressionEncoding, metadata::MetadataValue, transport::Endpoint,
 };
 use sof_support::bytes::{pubkey_bytes_from_slice, signature_bytes_from_slice};
+use sof_support::collections_support::prune_recent_slots;
 use sof_support::time_support::duration_secs_ceil;
 use solana_hash::Hash;
 use solana_message::{
@@ -2100,7 +2101,12 @@ fn slot_status_event_from_update(
         | grpc::SlotStatus::SlotCreatedBank => ForkSlotStatus::Processed,
     };
     let previous_status = slot_states.insert(slot, mapped);
-    prune_slot_status_states(slot, slot_states);
+    prune_recent_slots(
+        slot_states,
+        slot,
+        SLOT_STATUS_RETAINED_LAG,
+        SLOT_STATUS_PRUNE_THRESHOLD,
+    );
     if previous_status == Some(mapped) {
         return None;
     }
@@ -2114,14 +2120,6 @@ fn slot_status_event_from_update(
         finalized_slot: watermarks.finalized_slot,
         provider_source: None,
     })
-}
-
-fn prune_slot_status_states(slot: u64, slot_states: &mut HashMap<u64, ForkSlotStatus>) {
-    if slot_states.len() <= SLOT_STATUS_PRUNE_THRESHOLD {
-        return;
-    }
-    let slot_floor = slot.saturating_sub(SLOT_STATUS_RETAINED_LAG);
-    slot_states.retain(|tracked_slot, _| *tracked_slot >= slot_floor);
 }
 
 impl ProviderStreamFanIn {
@@ -2343,7 +2341,12 @@ mod tests {
             let _ = slot_states.insert(slot, ForkSlotStatus::Processed);
         }
 
-        prune_slot_status_states(10_000, &mut slot_states);
+        prune_recent_slots(
+            &mut slot_states,
+            10_000,
+            SLOT_STATUS_RETAINED_LAG,
+            SLOT_STATUS_PRUNE_THRESHOLD,
+        );
 
         assert!(
             !slot_states.contains_key(&0),
