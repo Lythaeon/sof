@@ -29,7 +29,7 @@ use laserstream_core_proto::tonic::{
 };
 use sof_support::bytes::{pubkey_bytes_from_slice, signature_bytes_from_slice};
 use sof_support::collections_support::prune_recent_slots;
-use sof_support::time_support::duration_secs_ceil;
+use sof_support::time_support::{duration_secs_ceil, nonzero_duration_or};
 use sof_types::SignatureBytes;
 use solana_hash::Hash;
 use solana_message::{
@@ -662,10 +662,16 @@ struct LaserStreamClientConfigInputs<'config> {
 fn laserstream_client_config(inputs: &LaserStreamClientConfigInputs<'_>) -> ClientConfig {
     let mut options = ChannelOptions::default();
     if let Some(connect_timeout) = inputs.connect_timeout {
-        options.connect_timeout_secs = Some(duration_secs_ceil(connect_timeout));
+        options.connect_timeout_secs = Some(duration_secs_ceil(nonzero_duration_or(
+            connect_timeout,
+            Duration::from_millis(1),
+        )));
     }
     if let Some(request_timeout) = inputs.request_timeout {
-        options.timeout_secs = Some(duration_secs_ceil(request_timeout));
+        options.timeout_secs = Some(duration_secs_ceil(nonzero_duration_or(
+            request_timeout,
+            Duration::from_millis(1),
+        )));
     }
     if let Some(bytes) = inputs.max_decoding_message_size {
         options.max_decoding_message_size = Some(bytes);
@@ -2587,6 +2593,23 @@ mod tests {
         let slots_config = LaserStreamSlotsConfig::new("https://laserstream.example", "token")
             .with_connect_timeout(Duration::from_millis(400))
             .with_timeout(Duration::from_millis(900))
+            .client_config();
+        assert_eq!(slots_config.channel_options.connect_timeout_secs, Some(1));
+        assert_eq!(slots_config.channel_options.timeout_secs, Some(1));
+    }
+
+    #[test]
+    fn laserstream_client_config_clamps_zero_timeouts() {
+        let config = LaserStreamConfig::new("https://laserstream.example", "token")
+            .with_connect_timeout(Duration::ZERO)
+            .with_timeout(Duration::ZERO)
+            .client_config();
+        assert_eq!(config.channel_options.connect_timeout_secs, Some(1));
+        assert_eq!(config.channel_options.timeout_secs, Some(1));
+
+        let slots_config = LaserStreamSlotsConfig::new("https://laserstream.example", "token")
+            .with_connect_timeout(Duration::ZERO)
+            .with_timeout(Duration::ZERO)
             .client_config();
         assert_eq!(slots_config.channel_options.connect_timeout_secs, Some(1));
         assert_eq!(slots_config.channel_options.timeout_secs, Some(1));

@@ -16,6 +16,7 @@ use std::{
 use futures_util::{SinkExt, StreamExt};
 use sof_support::bytes::{pubkey_bytes_from_slice, signature_bytes_from_slice};
 use sof_support::collections_support::prune_recent_slots;
+use sof_support::time_support::nonzero_duration_or;
 use sof_types::SignatureBytes;
 use solana_hash::Hash;
 use solana_message::{
@@ -60,6 +61,7 @@ const MAX_ACCOUNT_DATA_LEN: usize = MAX_PERMITTED_DATA_LENGTH as usize;
 const SLOT_STATUS_RETAINED_LAG: u64 = 4_096;
 const SLOT_STATUS_PRUNE_THRESHOLD: usize = SLOT_STATUS_RETAINED_LAG as usize * 2;
 const DEFAULT_MAX_DECODING_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+const MIN_PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_millis(1);
 const MIN_RECONNECT_DELAY: Duration = Duration::from_millis(1);
 
 /// Yellowstone subscription commitment used for provider-stream transaction updates.
@@ -1663,7 +1665,8 @@ async fn establish_yellowstone_subscribe_session(
         .x_token(x_token)?
         .max_decoding_message_size(max_decoding_message_size);
     if let Some(timeout) = connect_timeout {
-        builder = builder.connect_timeout(timeout);
+        builder =
+            builder.connect_timeout(nonzero_duration_or(timeout, MIN_PROVIDER_CONNECT_TIMEOUT));
     }
     let mut client = builder.connect().await?;
     let (subscribe_tx, stream) = client.subscribe_with_request(Some(request)).await?;
@@ -2256,6 +2259,18 @@ mod tests {
         assert_eq!(
             slots_config.reconnect_delay_effective(),
             Duration::from_millis(1)
+        );
+    }
+
+    #[test]
+    fn yellowstone_connect_timeout_never_zero() {
+        assert_eq!(
+            nonzero_duration_or(Duration::ZERO, MIN_PROVIDER_CONNECT_TIMEOUT),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            nonzero_duration_or(Duration::from_millis(25), MIN_PROVIDER_CONNECT_TIMEOUT),
+            Duration::from_millis(25)
         );
     }
 
