@@ -9,6 +9,9 @@ use sof_types::SignatureBytes;
 
 use crate::providers::{LeaderProvider, LeaderTarget};
 
+/// Initial storage reserved for the signature dedupe window before it grows.
+const INITIAL_SIGNATURE_DEDUPER_CAPACITY: usize = 4_096;
+
 /// Routing controls used for direct and hybrid submit paths.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct RoutingPolicy {
@@ -103,8 +106,8 @@ impl SignatureDeduper {
     pub fn new(ttl: Duration) -> Self {
         Self {
             ttl: ttl.max(Duration::from_millis(1)),
-            seen: HashMap::new(),
-            order: VecDeque::new(),
+            seen: HashMap::with_capacity(INITIAL_SIGNATURE_DEDUPER_CAPACITY),
+            order: VecDeque::with_capacity(INITIAL_SIGNATURE_DEDUPER_CAPACITY),
         }
     }
 
@@ -149,6 +152,8 @@ impl SignatureDeduper {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+
     use super::*;
     use crate::providers::{LeaderTarget, StaticLeaderProvider};
 
@@ -223,12 +228,12 @@ mod tests {
     #[test]
     #[ignore = "profiling fixture for signature dedupe churn"]
     fn signature_deduper_profile_fixture() {
-        let iterations = std::env::var("SOF_TX_SIGNATURE_DEDUPER_PROFILE_ITERS")
+        let iterations = env::var("SOF_TX_SIGNATURE_DEDUPER_PROFILE_ITERS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(50_000);
-        let ttl_ms = std::env::var("SOF_TX_SIGNATURE_DEDUPER_PROFILE_TTL_MS")
+        let ttl_ms = env::var("SOF_TX_SIGNATURE_DEDUPER_PROFILE_TTL_MS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| *value > 0)
@@ -257,5 +262,65 @@ mod tests {
             avg_ns,
             avg_ns as f64 / 1_000.0
         );
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for signature deduper allocation churn"]
+    fn signature_deduper_allocation_profile_fixture() {
+        let iterations = env::var("SOF_TX_SIGNATURE_DEDUPER_PROFILE_ITERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(50_000);
+        let ttl_ms = env::var("SOF_TX_SIGNATURE_DEDUPER_PROFILE_TTL_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(10_000);
+        let ttl = Duration::from_millis(ttl_ms);
+        let mut baseline = signature_deduper_baseline(ttl);
+        let mut optimized = SignatureDeduper::new(ttl);
+        let now = Instant::now();
+
+        let baseline_started = Instant::now();
+        for index in 0..iterations {
+            let signature = make_signature(index);
+            assert!(baseline.check_and_insert(
+                SignatureBytes::from(signature),
+                now + Duration::from_nanos(index as u64)
+            ));
+        }
+        let baseline_elapsed = baseline_started.elapsed();
+
+        let optimized_started = Instant::now();
+        for index in 0..iterations {
+            let signature = make_signature(index);
+            assert!(optimized.check_and_insert(
+                SignatureBytes::from(signature),
+                now + Duration::from_nanos(index as u64)
+            ));
+        }
+        let optimized_elapsed = optimized_started.elapsed();
+
+        println!(
+            "signature_deduper_allocation_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            iterations,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
+        );
+    }
+
+    fn signature_deduper_baseline(ttl: Duration) -> SignatureDeduper {
+        SignatureDeduper {
+            ttl: ttl.max(Duration::from_millis(1)),
+            seen: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn make_signature(index: usize) -> [u8; 64] {
+        let mut signature = [0_u8; 64];
+        signature[..8].copy_from_slice(&(index as u64).to_le_bytes());
+        signature
     }
 }
