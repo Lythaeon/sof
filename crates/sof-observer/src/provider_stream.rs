@@ -188,6 +188,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::SendError;
+#[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
 use tokio::time::{Instant as TokioInstant, Interval, interval_at};
 
 #[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
@@ -211,6 +212,7 @@ use solana_transaction::versioned::VersionedTransaction;
 pub const DEFAULT_PROVIDER_STREAM_QUEUE_CAPACITY: usize = 8_192;
 
 /// Creates one keepalive interval that waits one full period before the first tick.
+#[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
 pub(crate) fn keepalive_interval(period: Duration) -> Interval {
     let start = TokioInstant::now();
     let first_tick = start.checked_add(period).unwrap_or(start);

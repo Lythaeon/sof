@@ -480,20 +480,23 @@ pub(super) fn tune_udp_socket(socket: &UdpSocket) {
         return;
     };
     let sockref = SockRef::from(socket);
-    if let Err(error) = sockref.set_recv_buffer_size(rcvbuf_bytes) {
-        tracing::warn!(
-            requested = rcvbuf_bytes,
-            error = %error,
-            "failed to set UDP receive buffer size"
-        );
-        return;
-    }
-    if let Ok(actual) = sockref.recv_buffer_size() {
-        tracing::debug!(
-            requested = rcvbuf_bytes,
-            actual,
-            "configured UDP receive buffer size"
-        );
+    match sockref.set_recv_buffer_size(rcvbuf_bytes) {
+        Ok(()) => {
+            if let Ok(actual) = sockref.recv_buffer_size() {
+                tracing::debug!(
+                    requested = rcvbuf_bytes,
+                    actual,
+                    "configured UDP receive buffer size"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                requested = rcvbuf_bytes,
+                error = %error,
+                "failed to set UDP receive buffer size"
+            );
+        }
     }
     tune_udp_busy_poll(socket);
 }
