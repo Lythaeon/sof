@@ -306,9 +306,14 @@ async fn read_http_response_bytes_bounded(
         .unwrap_or(0)
         .min(MAX_BLOCKHASH_RPC_RESPONSE_BYTES);
     let mut body = Vec::with_capacity(initial_capacity);
-    while let Some(chunk) = response.chunk().await.map_err(|error| SubmitTransportError::Failure {
-        message: error.to_string(),
-    })? {
+    while let Some(chunk) =
+        response
+            .chunk()
+            .await
+            .map_err(|error| SubmitTransportError::Failure {
+                message: error.to_string(),
+            })?
+    {
         let remaining = MAX_BLOCKHASH_RPC_RESPONSE_BYTES.saturating_sub(body.len());
         if chunk.len() > remaining {
             return Err(SubmitTransportError::Failure {

@@ -294,9 +294,14 @@ async fn read_http_response_bytes_bounded(
         .unwrap_or(0)
         .min(MAX_JITO_SUBMIT_RESPONSE_BYTES);
     let mut body = Vec::with_capacity(initial_capacity);
-    while let Some(chunk) = response.chunk().await.map_err(|error| SubmitTransportError::Failure {
-        message: error.to_string(),
-    })? {
+    while let Some(chunk) =
+        response
+            .chunk()
+            .await
+            .map_err(|error| SubmitTransportError::Failure {
+                message: error.to_string(),
+            })?
+    {
         let remaining = MAX_JITO_SUBMIT_RESPONSE_BYTES.saturating_sub(body.len());
         if chunk.len() > remaining {
             return Err(SubmitTransportError::Failure {
@@ -406,13 +411,14 @@ mod tests {
         );
         assert!(parsed_url.is_ok());
         let parsed_url = parsed_url.unwrap_or_else(|error| panic!("{error}"));
-        let transport = JitoJsonRpcTransport::with_endpoint(JitoBlockEngineEndpoint::custom(
-            parsed_url,
-        ));
+        let transport =
+            JitoJsonRpcTransport::with_endpoint(JitoBlockEngineEndpoint::custom(parsed_url));
         assert!(transport.is_ok());
         let transport = transport.unwrap_or_else(|error| panic!("{error}"));
 
-        let error = transport.submit_jito(&[1, 2, 3], &JitoSubmitConfig::default()).await;
+        let error = transport
+            .submit_jito(&[1, 2, 3], &JitoSubmitConfig::default())
+            .await;
         assert!(error.is_err());
         let error = match error {
             Ok(_response) => panic!("redirect should fail"),
@@ -431,13 +437,14 @@ mod tests {
         let parsed_url = Url::parse(&endpoint);
         assert!(parsed_url.is_ok());
         let parsed_url = parsed_url.unwrap_or_else(|error| panic!("{error}"));
-        let transport = JitoJsonRpcTransport::with_endpoint(JitoBlockEngineEndpoint::custom(
-            parsed_url,
-        ));
+        let transport =
+            JitoJsonRpcTransport::with_endpoint(JitoBlockEngineEndpoint::custom(parsed_url));
         assert!(transport.is_ok());
         let transport = transport.unwrap_or_else(|error| panic!("{error}"));
 
-        let error = transport.submit_jito(&[1, 2, 3], &JitoSubmitConfig::default()).await;
+        let error = transport
+            .submit_jito(&[1, 2, 3], &JitoSubmitConfig::default())
+            .await;
         assert!(error.is_err());
         let error = match error {
             Ok(_response) => panic!("oversized body should fail"),

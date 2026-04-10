@@ -163,9 +163,14 @@ async fn read_http_response_bytes_bounded(
         .unwrap_or(0)
         .min(MAX_RPC_SUBMIT_RESPONSE_BYTES);
     let mut body = Vec::with_capacity(initial_capacity);
-    while let Some(chunk) = response.chunk().await.map_err(|error| SubmitTransportError::Failure {
-        message: error.to_string(),
-    })? {
+    while let Some(chunk) =
+        response
+            .chunk()
+            .await
+            .map_err(|error| SubmitTransportError::Failure {
+                message: error.to_string(),
+            })?
+    {
         let remaining = MAX_RPC_SUBMIT_RESPONSE_BYTES.saturating_sub(body.len());
         if chunk.len() > remaining {
             return Err(SubmitTransportError::Failure {
@@ -219,7 +224,9 @@ mod tests {
         assert!(transport.is_ok());
         let transport = transport.unwrap_or_else(|error| panic!("{error}"));
 
-        let error = transport.submit_rpc(&[1, 2, 3], &RpcSubmitConfig::default()).await;
+        let error = transport
+            .submit_rpc(&[1, 2, 3], &RpcSubmitConfig::default())
+            .await;
         assert!(error.is_err());
         let error = match error {
             Ok(_signature) => panic!("redirect should fail"),
@@ -239,7 +246,9 @@ mod tests {
         assert!(transport.is_ok());
         let transport = transport.unwrap_or_else(|error| panic!("{error}"));
 
-        let error = transport.submit_rpc(&[1, 2, 3], &RpcSubmitConfig::default()).await;
+        let error = transport
+            .submit_rpc(&[1, 2, 3], &RpcSubmitConfig::default())
+            .await;
         assert!(error.is_err());
         let error = match error {
             Ok(_signature) => panic!("oversized body should fail"),
