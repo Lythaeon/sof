@@ -12,6 +12,7 @@ exclude = ["crates/sof-solana-gossip"]
 
 [patch.crates-io]
 sof-solana-gossip = { path = "crates/sof-solana-gossip" }
+helius-laserstream = { path = "vendor/helius-laserstream" }
 
 [workspace.package]
 edition = "2024"
