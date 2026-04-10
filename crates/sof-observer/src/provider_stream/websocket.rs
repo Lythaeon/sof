@@ -1559,49 +1559,7 @@ where
         + Sink<WsMessage, Error = TungsteniteError>
         + Unpin,
 {
-    let ack_timeout = Duration::from_secs(10);
-    let mut frame_bytes = Vec::new();
-    tokio::time::timeout(ack_timeout, async {
-        loop {
-            let Some(frame) = read.next().await else {
-                return Err(WebsocketTransactionError::Protocol(
-                    WebsocketProtocolError::ClosedBeforeSubscriptionAck,
-                ));
-            };
-            let frame = frame?;
-            match frame {
-                WsMessage::Text(text) => {
-                    if handle_subscription_text(frame_bytes_mut(
-                        &mut frame_bytes,
-                        text.as_str().as_bytes(),
-                    ))? {
-                        return Ok(());
-                    }
-                }
-                WsMessage::Binary(bytes) => {
-                    if handle_subscription_text(frame_bytes_mut(&mut frame_bytes, bytes.as_ref()))?
-                    {
-                        return Ok(());
-                    }
-                }
-                WsMessage::Ping(payload) => {
-                    read.send(WsMessage::Pong(payload)).await?;
-                }
-                WsMessage::Pong(_) => {}
-                WsMessage::Close(frame) => {
-                    return Err(
-                        WebsocketProtocolError::ClosedBeforeSubscriptionAckWithFrame(format!(
-                            "{frame:?}"
-                        ))
-                        .into(),
-                    );
-                }
-                _ => {}
-            }
-        }
-    })
-    .await
-    .map_err(|_elapsed| WebsocketProtocolError::SubscriptionAckTimeout)?
+    wait_for_subscription_ack_with(read, handle_subscription_text).await
 }
 
 fn handle_subscription_text(bytes: &mut [u8]) -> Result<bool, WebsocketTransactionError> {
@@ -2022,30 +1980,33 @@ where
         + Sink<WsMessage, Error = TungsteniteError>
         + Unpin,
 {
+    wait_for_subscription_ack_with(read, handle_logs_subscription_text).await
+}
+
+async fn wait_for_subscription_ack_with<S, E, F>(read: &mut S, mut handle_text: F) -> Result<(), E>
+where
+    S: Stream<Item = Result<WsMessage, TungsteniteError>>
+        + Sink<WsMessage, Error = TungsteniteError>
+        + Unpin,
+    E: From<TungsteniteError> + From<WebsocketProtocolError>,
+    F: FnMut(&mut [u8]) -> Result<bool, E>,
+{
     let ack_timeout = Duration::from_secs(10);
     let mut frame_bytes = Vec::new();
     tokio::time::timeout(ack_timeout, async {
         loop {
             let Some(frame) = read.next().await else {
-                return Err(WebsocketLogsError::Protocol(
-                    WebsocketProtocolError::ClosedBeforeSubscriptionAck,
-                ));
+                return Err(E::from(WebsocketProtocolError::ClosedBeforeSubscriptionAck));
             };
             let frame = frame?;
             match frame {
                 WsMessage::Text(text) => {
-                    if handle_logs_subscription_text(frame_bytes_mut(
-                        &mut frame_bytes,
-                        text.as_str().as_bytes(),
-                    ))? {
+                    if handle_text(frame_bytes_mut(&mut frame_bytes, text.as_str().as_bytes()))? {
                         return Ok(());
                     }
                 }
                 WsMessage::Binary(bytes) => {
-                    if handle_logs_subscription_text(frame_bytes_mut(
-                        &mut frame_bytes,
-                        bytes.as_ref(),
-                    ))? {
+                    if handle_text(frame_bytes_mut(&mut frame_bytes, bytes.as_ref()))? {
                         return Ok(());
                     }
                 }
@@ -2054,19 +2015,18 @@ where
                 }
                 WsMessage::Pong(_) => {}
                 WsMessage::Close(frame) => {
-                    return Err(
+                    return Err(E::from(
                         WebsocketProtocolError::ClosedBeforeSubscriptionAckWithFrame(format!(
                             "{frame:?}"
-                        ))
-                        .into(),
-                    );
+                        )),
+                    ));
                 }
                 _ => {}
             }
         }
     })
     .await
-    .map_err(|_elapsed| WebsocketProtocolError::SubscriptionAckTimeout)?
+    .map_err(|_elapsed| E::from(WebsocketProtocolError::SubscriptionAckTimeout))?
 }
 
 fn parse_logs_notification(
