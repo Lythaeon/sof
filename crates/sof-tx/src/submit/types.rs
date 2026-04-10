@@ -1,7 +1,7 @@
 //! Shared submission types, errors, and transport traits.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     hash::{Hash, Hasher},
     sync::{
         Arc,
@@ -932,6 +932,8 @@ impl TxSubmitOutcomeReporter for TxToxicFlowTelemetry {
 pub(crate) struct TxSuppressionCache {
     /// Active suppression entries keyed by opportunity identity.
     entries: HashMap<TxSubmitSuppressionKey, SystemTime>,
+    /// Insertion order used for amortized expiry without scanning the full map.
+    order: VecDeque<(TxSubmitSuppressionKey, SystemTime)>,
 }
 
 impl TxSuppressionCache {
@@ -949,17 +951,27 @@ impl TxSuppressionCache {
     /// Inserts all provided suppression keys with the current timestamp.
     pub(crate) fn insert_all(&mut self, keys: &[TxSubmitSuppressionKey], now: SystemTime) {
         for key in keys {
-            let _ = self.entries.insert(key.clone(), now);
+            let key = key.clone();
+            self.order.push_back((key.clone(), now));
+            let _ = self.entries.insert(key, now);
         }
     }
 
     /// Removes entries older than the current TTL window.
     fn evict_expired(&mut self, now: SystemTime, ttl: Duration) {
-        self.entries.retain(|_, inserted_at| {
-            now.duration_since(*inserted_at)
+        while let Some((key, inserted_at)) = self.order.front().cloned() {
+            let still_live = now
+                .duration_since(inserted_at)
                 .map(|elapsed| elapsed <= ttl)
-                .unwrap_or(false)
-        });
+                .unwrap_or(false);
+            if still_live {
+                break;
+            }
+            self.order.pop_front();
+            if self.entries.get(&key).copied() == Some(inserted_at) {
+                self.entries.remove(&key);
+            }
+        }
     }
 }
 
@@ -996,4 +1008,32 @@ pub trait DirectSubmitTransport: Send + Sync {
         policy: RoutingPolicy,
         config: &DirectSubmitConfig,
     ) -> Result<LeaderTarget, SubmitTransportError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suppression_cache_keeps_refreshed_entry_live() {
+        let mut cache = TxSuppressionCache::default();
+        let key = TxSubmitSuppressionKey::Opportunity([7_u8; 32]);
+        let ttl = Duration::from_millis(750);
+        let first_inserted_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        let refreshed_at = first_inserted_at + Duration::from_millis(500);
+
+        cache.insert_all(std::slice::from_ref(&key), first_inserted_at);
+        cache.insert_all(std::slice::from_ref(&key), refreshed_at);
+
+        assert!(cache.is_suppressed(
+            std::slice::from_ref(&key),
+            refreshed_at + Duration::from_millis(100),
+            ttl,
+        ));
+        assert!(!cache.is_suppressed(
+            std::slice::from_ref(&key),
+            refreshed_at + ttl + Duration::from_millis(1),
+            ttl,
+        ));
+    }
 }

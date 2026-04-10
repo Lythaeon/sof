@@ -1915,20 +1915,21 @@ impl DiskDerivedStateReplaySource {
         mut envelopes_to_remove: usize,
     ) -> io::Result<usize> {
         let mut removed = 0_usize;
+        let mut removed_segments = 0_usize;
         while envelopes_to_remove > 0 {
-            let Some(oldest_segment) = metadata.segments.first().cloned() else {
+            let Some(oldest_segment) = metadata.segments.get(removed_segments).cloned() else {
                 break;
             };
             if oldest_segment.retained_envelopes <= envelopes_to_remove {
                 Self::evict_cached_appender(&oldest_segment.path);
                 fs::remove_file(&oldest_segment.path)?;
-                metadata.segments.remove(0);
                 metadata.retained_envelopes = metadata
                     .retained_envelopes
                     .saturating_sub(oldest_segment.retained_envelopes);
                 envelopes_to_remove =
                     envelopes_to_remove.saturating_sub(oldest_segment.retained_envelopes);
                 removed = removed.saturating_add(oldest_segment.retained_envelopes);
+                removed_segments = removed_segments.saturating_add(1);
                 continue;
             }
 
@@ -1943,7 +1944,7 @@ impl DiskDerivedStateReplaySource {
             };
             let new_path = self.segment_path(session_id, new_first_sequence);
             self.rewrite_records(&oldest_segment.path, &new_path, &retained)?;
-            let Some(oldest_segment_metadata) = metadata.segments.first_mut() else {
+            let Some(oldest_segment_metadata) = metadata.segments.get_mut(removed_segments) else {
                 break;
             };
             *oldest_segment_metadata = DiskDerivedStateSegmentMetadata {
@@ -1957,6 +1958,9 @@ impl DiskDerivedStateReplaySource {
                 .saturating_sub(envelopes_to_remove);
             removed = removed.saturating_add(envelopes_to_remove);
             envelopes_to_remove = 0;
+        }
+        if removed_segments > 0 {
+            metadata.segments.drain(..removed_segments);
         }
         Ok(removed)
     }
@@ -1982,8 +1986,10 @@ impl DiskDerivedStateReplaySource {
             .collect::<Vec<_>>();
         retained_sessions.sort_by_key(|(session_id, _path)| *session_id);
         let mut removed_any = false;
-        while retained_sessions.len() > self.max_retained_sessions {
-            let Some((session_id, path)) = retained_sessions.first().cloned() else {
+        let mut removed_sessions = 0_usize;
+        while retained_sessions.len().saturating_sub(removed_sessions) > self.max_retained_sessions
+        {
+            let Some((session_id, path)) = retained_sessions.get(removed_sessions).cloned() else {
                 break;
             };
             if session_id == current_session_id {
@@ -1992,8 +1998,11 @@ impl DiskDerivedStateReplaySource {
             Self::evict_cached_appenders_in_dir(&path);
             fs::remove_dir_all(&path)?;
             self.update_session_metadata(session_id, DiskDerivedStateSessionMetadata::default());
-            retained_sessions.remove(0);
+            removed_sessions = removed_sessions.saturating_add(1);
             removed_any = true;
+        }
+        if removed_sessions > 0 {
+            retained_sessions.drain(..removed_sessions);
         }
         if removed_any {
             let _ = self.compactions.fetch_add(1, Ordering::Relaxed);
