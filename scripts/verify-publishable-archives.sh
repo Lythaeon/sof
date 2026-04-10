@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-crates=("sof-types" "sof-gossip-tuning" "sof-solana-gossip" "sof" "sof-tx" "sof-solana-compat")
+crates=("sof-types" "sof-gossip-tuning" "sof-support" "sof-solana-gossip" "sof" "sof-tx" "sof-solana-compat")
 package_dir="target/package"
 verify_root="$(mktemp -d)"
 cargo_home_root="$(mktemp -d)"
@@ -16,6 +16,7 @@ sof-solana-gossip = { path = "$(pwd)/crates/sof-solana-gossip" }
 sof = { path = "$(pwd)/crates/sof-observer" }
 sof-tx = { path = "$(pwd)/crates/sof-tx" }
 sof-solana-compat = { path = "$(pwd)/crates/sof-solana-compat" }
+sof-support = { path = "$(pwd)/crates/sof-support" }
 EOF
 
 export CARGO_HOME="${cargo_home_root}"
@@ -62,6 +63,7 @@ extract_crate() {
 
 package_crate "sof-types" ""
 package_crate "sof-gossip-tuning" ""
+package_crate "sof-support" ""
 package_crate "sof-solana-gossip" "--no-verify"
 package_crate "sof" "--no-verify"
 package_crate "sof-tx" "--no-verify"
@@ -73,6 +75,7 @@ done
 
 sof_types_version="$(version_for "sof-types")"
 sof_gossip_tuning_version="$(version_for "sof-gossip-tuning")"
+sof_support_version="$(version_for "sof-support")"
 sof_solana_gossip_version="$(version_for "sof-solana-gossip")"
 sof_version="$(version_for "sof")"
 sof_tx_version="$(version_for "sof-tx")"
@@ -84,6 +87,7 @@ resolver = "3"
 members = [
   "sof-types-${sof_types_version}",
   "sof-gossip-tuning-${sof_gossip_tuning_version}",
+  "sof-support-${sof_support_version}",
   "sof-${sof_version}",
   "sof-tx-${sof_tx_version}",
   "sof-solana-compat-${sof_solana_compat_version}",
@@ -92,6 +96,7 @@ members = [
 [patch.crates-io]
 sof-types = { path = "sof-types-${sof_types_version}" }
 sof-gossip-tuning = { path = "sof-gossip-tuning-${sof_gossip_tuning_version}" }
+sof-support = { path = "sof-support-${sof_support_version}" }
 sof-solana-gossip = { path = "sof-solana-gossip-${sof_solana_gossip_version}" }
 sof = { path = "sof-${sof_version}" }
 sof-tx = { path = "sof-tx-${sof_tx_version}" }
