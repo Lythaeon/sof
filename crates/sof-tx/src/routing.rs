@@ -1,7 +1,7 @@
 //! Routing policy, target selection, and signature-level duplicate suppression.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque, hash_map::Entry},
     time::{Duration, Instant},
 };
 
@@ -111,12 +111,14 @@ impl SignatureDeduper {
     /// Returns true when signature is new (and records it), false when duplicate.
     pub fn check_and_insert(&mut self, signature: SignatureBytes, now: Instant) -> bool {
         self.evict_expired(now);
-        if self.seen.contains_key(&signature) {
-            return false;
+        match self.seen.entry(signature) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(entry) => {
+                entry.insert(now);
+                self.order.push_back((signature, now));
+                true
+            }
         }
-        let _ = self.seen.insert(signature, now);
-        self.order.push_back((signature, now));
-        true
     }
 
     /// Returns number of signatures currently tracked.
