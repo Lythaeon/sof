@@ -9,12 +9,15 @@ use std::{
 use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
 use serde_json::from_slice as json_from_slice;
+use sof_support::time_support::nonzero_duration_or;
 use sof_types::PubkeyBytes;
 
 use crate::submit::SubmitTransportError;
 
 /// Maximum HTTP body size accepted from `getLatestBlockhash` RPC responses.
 const MAX_BLOCKHASH_RPC_RESPONSE_BYTES: usize = 64 * 1024;
+/// Default timeout used for recent-blockhash HTTP requests.
+const DEFAULT_RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One leader/validator target that can receive transactions directly.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -49,7 +52,7 @@ pub struct RpcRecentBlockhashProviderConfig {
 impl Default for RpcRecentBlockhashProviderConfig {
     fn default() -> Self {
         Self {
-            request_timeout: Duration::from_secs(10),
+            request_timeout: DEFAULT_RPC_REQUEST_TIMEOUT,
         }
     }
 }
@@ -86,10 +89,12 @@ impl RpcRecentBlockhashProvider {
         config: &RpcRecentBlockhashProviderConfig,
     ) -> Result<Self, SubmitTransportError> {
         let rpc_url = rpc_url.into();
+        let request_timeout =
+            nonzero_duration_or(config.request_timeout, DEFAULT_RPC_REQUEST_TIMEOUT);
         let client = reqwest::Client::builder()
             .redirect(Policy::none())
-            .connect_timeout(config.request_timeout)
-            .timeout(config.request_timeout)
+            .connect_timeout(request_timeout)
+            .timeout(request_timeout)
             .build()
             .map_err(|error| SubmitTransportError::Config {
                 message: error.to_string(),
@@ -370,6 +375,17 @@ mod tests {
             assert!(write.is_ok());
         });
         format!("http://{addr}")
+    }
+
+    #[test]
+    fn rpc_recent_blockhash_provider_accepts_zero_timeout_config() {
+        let provider = RpcRecentBlockhashProvider::with_config(
+            "http://127.0.0.1:8899",
+            &RpcRecentBlockhashProviderConfig {
+                request_timeout: Duration::ZERO,
+            },
+        );
+        assert!(provider.is_ok());
     }
 
     #[tokio::test]

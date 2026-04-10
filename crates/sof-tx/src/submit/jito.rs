@@ -7,6 +7,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use reqwest::{Url, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use serde_json::from_slice as json_from_slice;
+use sof_support::time_support::nonzero_duration_or;
 
 use super::{JitoSubmitConfig, JitoSubmitResponse, JitoSubmitTransport, SubmitTransportError};
 
@@ -14,6 +15,8 @@ use super::{JitoSubmitConfig, JitoSubmitResponse, JitoSubmitTransport, SubmitTra
 const DEFAULT_JITO_BLOCK_ENGINE_URL: &str = "https://mainnet.block-engine.jito.wtf";
 /// Maximum HTTP body size accepted from Jito submit responses.
 const MAX_JITO_SUBMIT_RESPONSE_BYTES: usize = 64 * 1024;
+/// Default timeout used for Jito HTTP requests.
+const DEFAULT_JITO_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Typed Jito mainnet region.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -111,7 +114,7 @@ impl Default for JitoTransportConfig {
     fn default() -> Self {
         Self {
             endpoint: JitoBlockEngineEndpoint::default(),
-            request_timeout: Duration::from_secs(10),
+            request_timeout: DEFAULT_JITO_REQUEST_TIMEOUT,
         }
     }
 }
@@ -155,10 +158,14 @@ impl JitoJsonRpcTransport {
     pub fn with_config(
         transport_config: JitoTransportConfig,
     ) -> Result<Self, SubmitTransportError> {
+        let request_timeout = nonzero_duration_or(
+            transport_config.request_timeout,
+            DEFAULT_JITO_REQUEST_TIMEOUT,
+        );
         let client = reqwest::Client::builder()
             .redirect(Policy::none())
-            .connect_timeout(transport_config.request_timeout)
-            .timeout(transport_config.request_timeout)
+            .connect_timeout(request_timeout)
+            .timeout(request_timeout)
             .build()
             .map_err(|error| SubmitTransportError::Config {
                 message: error.to_string(),
@@ -388,6 +395,15 @@ mod tests {
 
         assert_eq!(config.endpoint, JitoBlockEngineEndpoint::mainnet());
         assert_eq!(config.request_timeout, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn transport_accepts_zero_timeout_config() {
+        let transport = JitoJsonRpcTransport::with_config(JitoTransportConfig {
+            endpoint: JitoBlockEngineEndpoint::default(),
+            request_timeout: Duration::ZERO,
+        });
+        assert!(transport.is_ok());
     }
 
     #[test]

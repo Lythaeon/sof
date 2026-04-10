@@ -192,6 +192,16 @@ pub mod time_support {
         duration.as_millis().min(u128::from(u64::MAX)) as u64
     }
 
+    /// Returns `duration` unless it is zero, in which case returns `fallback`.
+    #[must_use]
+    pub const fn nonzero_duration_or(duration: Duration, fallback: Duration) -> Duration {
+        if duration.is_zero() {
+            fallback
+        } else {
+            duration
+        }
+    }
+
     /// Returns the current Unix timestamp in milliseconds, saturating at `u64::MAX`.
     #[must_use]
     pub fn current_unix_ms() -> u64 {
@@ -228,7 +238,7 @@ mod tests {
     };
     use super::time_support::{
         current_unix_ms, current_unix_nanos, current_unix_secs, duration_millis_u64,
-        duration_secs_ceil,
+        duration_secs_ceil, nonzero_duration_or,
     };
 
     #[test]
@@ -249,6 +259,18 @@ mod tests {
     fn duration_millis_u64_saturates() {
         assert_eq!(duration_millis_u64(Duration::from_millis(7)), 7);
         assert_eq!(duration_millis_u64(Duration::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn nonzero_duration_or_clamps_zero() {
+        assert_eq!(
+            nonzero_duration_or(Duration::ZERO, Duration::from_secs(7)),
+            Duration::from_secs(7)
+        );
+        assert_eq!(
+            nonzero_duration_or(Duration::from_millis(5), Duration::from_secs(7)),
+            Duration::from_millis(5)
+        );
     }
 
     #[test]
