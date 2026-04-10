@@ -58,6 +58,7 @@ const INTERNAL_SLOT_FILTER: &str = "__sof_internal_slots";
 const MAX_ACCOUNT_DATA_LEN: usize = MAX_PERMITTED_DATA_LENGTH as usize;
 const SLOT_STATUS_RETAINED_LAG: u64 = 4_096;
 const SLOT_STATUS_PRUNE_THRESHOLD: usize = SLOT_STATUS_RETAINED_LAG as usize * 2;
+const DEFAULT_MAX_DECODING_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 
 /// Yellowstone subscription commitment used for provider-stream transaction updates.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -208,7 +209,7 @@ impl YellowstoneGrpcConfig {
             accounts: Vec::new(),
             owners: Vec::new(),
             require_txn_signature: false,
-            max_decoding_message_size: 64 * 1024 * 1024,
+            max_decoding_message_size: DEFAULT_MAX_DECODING_MESSAGE_SIZE,
             connect_timeout: Some(Duration::from_secs(10)),
             stall_timeout: Some(Duration::from_secs(30)),
             ping_interval: Some(Duration::from_secs(30)),
@@ -1609,33 +1610,45 @@ async fn establish_yellowstone_session(
     config: &YellowstoneGrpcConfig,
     tracked_slot: u64,
 ) -> Result<(YellowstoneSubscribeSink, YellowstoneUpdateStream), YellowstoneGrpcError> {
-    let mut builder = GeyserGrpcClient::build_from_shared(config.endpoint.clone())?
-        .x_token(config.x_token.clone())?
-        .max_decoding_message_size(config.max_decoding_message_size);
-    if let Some(timeout) = config.connect_timeout {
-        builder = builder.connect_timeout(timeout);
-    }
-    let mut client = builder.connect().await?;
-    let (subscribe_tx, stream) = client
-        .subscribe_with_request(Some(config.subscribe_request_with_state(tracked_slot)))
-        .await?;
-    Ok((Box::pin(subscribe_tx), Box::pin(stream)))
+    establish_yellowstone_subscribe_session(
+        config.endpoint.clone(),
+        config.x_token.clone(),
+        config.max_decoding_message_size,
+        config.connect_timeout,
+        config.subscribe_request_with_state(tracked_slot),
+    )
+    .await
 }
 
 async fn establish_yellowstone_slot_session(
     config: &YellowstoneGrpcSlotsConfig,
     tracked_slot: u64,
 ) -> Result<(YellowstoneSubscribeSink, YellowstoneUpdateStream), YellowstoneGrpcError> {
-    let mut builder = GeyserGrpcClient::build_from_shared(config.endpoint.clone())?
-        .x_token(config.x_token.clone())?
-        .max_decoding_message_size(64 * 1024 * 1024);
-    if let Some(timeout) = config.connect_timeout {
+    establish_yellowstone_subscribe_session(
+        config.endpoint.clone(),
+        config.x_token.clone(),
+        DEFAULT_MAX_DECODING_MESSAGE_SIZE,
+        config.connect_timeout,
+        config.subscribe_request_with_state(tracked_slot),
+    )
+    .await
+}
+
+async fn establish_yellowstone_subscribe_session(
+    endpoint: String,
+    x_token: Option<String>,
+    max_decoding_message_size: usize,
+    connect_timeout: Option<Duration>,
+    request: SubscribeRequest,
+) -> Result<(YellowstoneSubscribeSink, YellowstoneUpdateStream), YellowstoneGrpcError> {
+    let mut builder = GeyserGrpcClient::build_from_shared(endpoint)?
+        .x_token(x_token)?
+        .max_decoding_message_size(max_decoding_message_size);
+    if let Some(timeout) = connect_timeout {
         builder = builder.connect_timeout(timeout);
     }
     let mut client = builder.connect().await?;
-    let (subscribe_tx, stream) = client
-        .subscribe_with_request(Some(config.subscribe_request_with_state(tracked_slot)))
-        .await?;
+    let (subscribe_tx, stream) = client.subscribe_with_request(Some(request)).await?;
     Ok((Box::pin(subscribe_tx), Box::pin(stream)))
 }
 

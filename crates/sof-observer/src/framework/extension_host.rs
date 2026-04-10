@@ -1143,6 +1143,9 @@ async fn spawn_tcp_listener(
                             ));
                         }
                         Err(error) => {
+                            if error.kind() == ErrorKind::Interrupted {
+                                continue;
+                            }
                             tracing::warn!(
                                 extension = owner_extension,
                                 resource_id,
