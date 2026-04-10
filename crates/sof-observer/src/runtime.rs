@@ -2702,6 +2702,7 @@ fn dispatch_provider_stream_serialized_transaction(
     let wants_recent_blockhash = plugin_host.wants_recent_blockhash();
     let wants_derived_state_transaction =
         !derived_state_empty && derived_state_host.wants_transaction_applied();
+    let needs_transaction_event = wants_transaction || wants_derived_state_transaction;
     if !wants_transaction && !wants_recent_blockhash && !wants_derived_state_transaction {
         return;
     }
@@ -2724,7 +2725,7 @@ fn dispatch_provider_stream_serialized_transaction(
     if should_try_view
         && let Ok(view) = SanitizedTransactionView::try_new_sanitized(event.bytes.as_ref(), true)
     {
-        if signature.is_none() {
+        if needs_transaction_event && signature.is_none() {
             signature = view
                 .signatures()
                 .first()
@@ -2755,7 +2756,7 @@ fn dispatch_provider_stream_serialized_transaction(
                 return;
             }
         }
-        if !wants_transaction && !wants_derived_state_transaction {
+        if !needs_transaction_event {
             if let Some(recent_blockhash) = recent_blockhash {
                 plugin_host.on_recent_blockhash(ObservedRecentBlockhashEvent {
                     slot: event.slot,
@@ -2781,6 +2782,16 @@ fn dispatch_provider_stream_serialized_transaction(
         return;
     };
     let tx = Arc::new(tx);
+    if !needs_transaction_event {
+        plugin_host.on_recent_blockhash(ObservedRecentBlockhashEvent {
+            slot: event.slot,
+            recent_blockhash: recent_blockhash
+                .unwrap_or_else(|| tx.message.recent_blockhash().to_bytes()),
+            dataset_tx_count: 1,
+            provider_source: event.provider_source.clone(),
+        });
+        return;
+    }
     let event = TransactionEvent {
         slot: event.slot,
         commitment_status: event.commitment_status,
