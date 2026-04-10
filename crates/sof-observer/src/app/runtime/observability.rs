@@ -13,6 +13,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::oneshot,
     task::JoinHandle,
+    time::timeout,
 };
 
 #[cfg(test)]
@@ -33,6 +34,7 @@ const METRICS_PATH: &str = "/metrics";
 const HEALTH_PATH: &str = "/healthz";
 const READY_PATH: &str = "/readyz";
 const REQUEST_BUFFER_BYTES: usize = 8 * 1024;
+const REQUEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const CONTENT_TYPE_TEXT: &str = "text/plain; charset=utf-8";
 const CONTENT_TYPE_PROMETHEUS: &str = "text/plain; version=0.0.4; charset=utf-8";
 
@@ -272,8 +274,17 @@ async fn handle_connection(
 }
 
 async fn read_request_path(stream: &mut TcpStream) -> io::Result<Option<&'static str>> {
+    read_request_path_with_timeout(stream, REQUEST_READ_TIMEOUT).await
+}
+
+async fn read_request_path_with_timeout(
+    stream: &mut TcpStream,
+    request_timeout: std::time::Duration,
+) -> io::Result<Option<&'static str>> {
     let mut buffer = [0_u8; REQUEST_BUFFER_BYTES];
-    let read = stream.read(&mut buffer).await?;
+    let read = timeout(request_timeout, stream.read(&mut buffer))
+        .await
+        .map_err(|_elapsed| io::Error::new(io::ErrorKind::TimedOut, "request read timed out"))??;
     if read == 0 {
         return Ok(None);
     }
@@ -2993,5 +3004,35 @@ mod tests {
             .await
             .expect("response should read");
         response
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_request_path_times_out_slow_clients() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            let accepted = listener.accept().await;
+            assert!(accepted.is_ok());
+            let (mut stream, _) = accepted.unwrap_or_else(|error| panic!("{error}"));
+            let result =
+                read_request_path_with_timeout(&mut stream, std::time::Duration::from_millis(25))
+                    .await;
+            assert!(result.is_err(), "slow client should time out");
+            let error = match result {
+                Ok(value) => panic!("expected timeout, got {value:?}"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        });
+
+        let client = TcpStream::connect(addr).await;
+        assert!(client.is_ok());
+        let client = client.unwrap_or_else(|error| panic!("{error}"));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(client);
+
+        assert!(server.await.is_ok());
     }
 }
