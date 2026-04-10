@@ -3,6 +3,9 @@
 #![allow(clippy::arithmetic_side_effects)]
 
 use super::*;
+use crate::ingest::RawPacketBatchSender;
+#[cfg(test)]
+use crate::ingest::config::read_udp_drop_on_channel_full;
 use crate::ingest::config::{
     read_udp_busy_poll_budget, read_udp_busy_poll_us, read_udp_prefer_busy_poll,
 };
@@ -431,8 +434,18 @@ fn sockaddr_storage_to_socket_addr_libc(
 }
 
 pub(super) fn flush_batch(
-    tx: &crate::ingest::RawPacketBatchSender,
+    tx: &RawPacketBatchSender,
     batch: &mut RawPacketBatch,
+    drop_on_full: bool,
+    telemetry: Option<&ReceiverTelemetry>,
+) {
+    flush_batch_inner(tx, batch, drop_on_full, telemetry);
+}
+
+fn flush_batch_inner(
+    tx: &RawPacketBatchSender,
+    batch: &mut RawPacketBatch,
+    drop_on_full: bool,
     telemetry: Option<&ReceiverTelemetry>,
 ) {
     if batch.is_empty() {
@@ -440,7 +453,6 @@ pub(super) fn flush_batch(
     }
     let packet_count = batch.len();
     let outbound = batch.take_for_send();
-    let drop_on_full = crate::ingest::config::read_udp_drop_on_channel_full();
     if tx.send_batch(outbound, drop_on_full) {
         if let Some(telemetry) = telemetry {
             telemetry.record_sent_batch(packet_count);
@@ -448,6 +460,16 @@ pub(super) fn flush_batch(
     } else if let Some(telemetry) = telemetry {
         telemetry.record_dropped_batch(packet_count);
     }
+}
+
+#[cfg(test)]
+fn flush_batch_baseline(
+    tx: &RawPacketBatchSender,
+    batch: &mut RawPacketBatch,
+    telemetry: Option<&ReceiverTelemetry>,
+) {
+    let drop_on_full = read_udp_drop_on_channel_full();
+    flush_batch_inner(tx, batch, drop_on_full, telemetry);
 }
 
 pub(super) fn current_unix_ms() -> u64 {
@@ -608,6 +630,9 @@ pub(super) fn maybe_pin_receiver_thread(socket: &std::net::UdpSocket) {
 mod tests {
     use super::*;
     use std::{env, thread};
+
+    use crate::ingest::create_raw_packet_batch_queue;
+    use crate::runtime_env::with_runtime_env_overrides_for_test;
 
     #[derive(Debug)]
     struct LegacyRawPacket {
@@ -830,6 +855,62 @@ mod tests {
             optimized_avg_ns,
             baseline_avg_ns as f64 / 1_000.0,
             optimized_avg_ns as f64 / 1_000.0
+        );
+    }
+
+    #[test]
+    #[ignore = "profiling fixture for UDP receiver flush-path config lookup"]
+    fn udp_receiver_flush_batch_profile_fixture() {
+        let iterations = env::var("SOF_UDP_RECEIVER_PROFILE_ITERS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(10_000);
+        let capacity = iterations.saturating_mul(2).max(1).to_string();
+
+        with_runtime_env_overrides_for_test(
+            [("SOF_INGEST_QUEUE_CAPACITY".to_owned(), capacity)],
+            || {
+                let source: SocketAddr = "127.0.0.1:8899".parse().expect("source addr");
+                let payload = [11_u8; 256];
+                let recycler = RawPacketBatch::recycler_for_tests(1);
+
+                let (baseline_tx, _baseline_rx) = create_raw_packet_batch_queue();
+                let baseline_started_at = Instant::now();
+                for _ in 0..iterations {
+                    let mut batch = RawPacketBatch::from_recycler_for_tests(&recycler);
+                    batch
+                        .push_packet(source, RawPacketIngress::Udp, &payload)
+                        .expect("push packet");
+                    flush_batch_baseline(&baseline_tx, &mut batch, None);
+                }
+                let baseline_elapsed = baseline_started_at.elapsed();
+
+                let (optimized_tx, _optimized_rx) = create_raw_packet_batch_queue();
+                let drop_on_full = read_udp_drop_on_channel_full();
+                let optimized_started_at = Instant::now();
+                for _ in 0..iterations {
+                    let mut batch = RawPacketBatch::from_recycler_for_tests(&recycler);
+                    batch
+                        .push_packet(source, RawPacketIngress::Udp, &payload)
+                        .expect("push packet");
+                    flush_batch(&optimized_tx, &mut batch, drop_on_full, None);
+                }
+                let optimized_elapsed = optimized_started_at.elapsed();
+                let baseline_avg_ns = avg_ns_per_iteration(baseline_elapsed, iterations);
+                let optimized_avg_ns = avg_ns_per_iteration(optimized_elapsed, iterations);
+
+                println!(
+                    "udp_receiver_flush_batch_profile_fixture iterations={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.3} optimized_avg_us_per_iteration={:.3}",
+                    iterations,
+                    baseline_elapsed.as_micros(),
+                    optimized_elapsed.as_micros(),
+                    baseline_avg_ns,
+                    optimized_avg_ns,
+                    baseline_avg_ns as f64 / 1_000.0,
+                    optimized_avg_ns as f64 / 1_000.0
+                );
+            },
         );
     }
 

@@ -23,7 +23,8 @@ use tokio::task::{self, JoinHandle};
 use crate::ingest::RawPacketBatchSender;
 use crate::ingest::config::{
     enable_rxq_ovfl_tracking, read_udp_batch_max_wait_ms, read_udp_batch_size,
-    read_udp_idle_wait_ms, read_udp_rcvbuf_bytes, read_udp_receiver_core,
+    read_udp_drop_on_channel_full, read_udp_idle_wait_ms, read_udp_rcvbuf_bytes,
+    read_udp_receiver_core,
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -518,9 +519,10 @@ fn run_udp_receiver_with_socket(
     let mut batch = recycler.allocate();
     let mut batch_started_at: Option<Instant> = None;
     let mut last_rxq_ovfl_counter: Option<u64> = None;
+    let drop_on_full = read_udp_drop_on_channel_full();
     loop {
         if should_shutdown(shutdown) {
-            flush_batch(tx, &mut batch, telemetry);
+            flush_batch(tx, &mut batch, drop_on_full, telemetry);
             return Ok(());
         }
         #[cfg(target_os = "linux")]
@@ -540,7 +542,7 @@ fn run_udp_receiver_with_socket(
                     if let Some(telemetry) = telemetry {
                         telemetry.record_packets(received);
                     }
-                    flush_batch(tx, &mut batch, telemetry);
+                    flush_batch(tx, &mut batch, drop_on_full, telemetry);
                     continue;
                 }
                 Err(error)
@@ -593,7 +595,7 @@ fn run_udp_receiver_with_socket(
                     .map(|started_at| started_at.elapsed())
                     .unwrap_or_default();
                 if batch.len() >= batch_size || batch_elapsed >= batch_max_wait {
-                    flush_batch(tx, &mut batch, telemetry);
+                    flush_batch(tx, &mut batch, drop_on_full, telemetry);
                     batch_started_at = None;
                     if current_wait != idle_wait {
                         std_socket
@@ -606,7 +608,7 @@ fn run_udp_receiver_with_socket(
             Err(error)
                 if error.kind() == ErrorKind::WouldBlock || error.kind() == ErrorKind::TimedOut =>
             {
-                flush_batch(tx, &mut batch, telemetry);
+                flush_batch(tx, &mut batch, drop_on_full, telemetry);
                 batch_started_at = None;
                 if current_wait != idle_wait {
                     std_socket
