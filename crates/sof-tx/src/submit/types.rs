@@ -1,7 +1,7 @@
 //! Shared submission types, errors, and transport traits.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     hash::{Hash, Hasher},
     sync::{
         Arc,
@@ -932,8 +932,6 @@ impl TxSubmitOutcomeReporter for TxToxicFlowTelemetry {
 pub(crate) struct TxSuppressionCache {
     /// Active suppression entries keyed by opportunity identity.
     entries: HashMap<TxSubmitSuppressionKey, SystemTime>,
-    /// Insertion order used for amortized expiry without scanning the full map.
-    order: VecDeque<(TxSubmitSuppressionKey, SystemTime)>,
 }
 
 impl TxSuppressionCache {
@@ -951,27 +949,17 @@ impl TxSuppressionCache {
     /// Inserts all provided suppression keys with the current timestamp.
     pub(crate) fn insert_all(&mut self, keys: &[TxSubmitSuppressionKey], now: SystemTime) {
         for key in keys {
-            let key = key.clone();
-            self.order.push_back((key.clone(), now));
-            let _ = self.entries.insert(key, now);
+            let _ = self.entries.insert(key.clone(), now);
         }
     }
 
     /// Removes entries older than the current TTL window.
     fn evict_expired(&mut self, now: SystemTime, ttl: Duration) {
-        while let Some((key, inserted_at)) = self.order.front().cloned() {
-            let still_live = now
-                .duration_since(inserted_at)
+        self.entries.retain(|_, inserted_at| {
+            now.duration_since(*inserted_at)
                 .map(|elapsed| elapsed <= ttl)
-                .unwrap_or(false);
-            if still_live {
-                break;
-            }
-            self.order.pop_front();
-            if self.entries.get(&key).copied() == Some(inserted_at) {
-                self.entries.remove(&key);
-            }
-        }
+                .unwrap_or(false)
+        });
     }
 }
 
