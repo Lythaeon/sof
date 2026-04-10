@@ -1234,7 +1234,7 @@ async fn spawn_yellowstone_grpc_slot_source_inner(
         let mut attempts = 0_u32;
         let mut tracked_slot = 0_u64;
         let mut watermarks = ProviderCommitmentWatermarks::default();
-        let mut slot_states = HashMap::new();
+        let mut slot_states = HashMap::with_capacity(SLOT_STATUS_PRUNE_THRESHOLD);
         let mut first_session = Some(first_session);
         loop {
             let mut session_established = false;
