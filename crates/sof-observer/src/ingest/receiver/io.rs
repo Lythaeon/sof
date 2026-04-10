@@ -228,13 +228,16 @@ fn recv_udp_batch_append(
     for index in 0..received {
         let len = usize::try_from(scratch.headers[index].msg_len).unwrap_or(0);
         let buffer_index = start_index.saturating_add(index);
-        let source =
-            sockaddr_storage_to_socket_addr_libc(&scratch.addrs[index]).ok_or_else(|| {
-                std::io::Error::new(
-                    ErrorKind::InvalidData,
-                    "udp recvmmsg source address is not inet/inet6",
-                )
-            })?;
+        let source = sockaddr_storage_to_socket_addr_libc(
+            &scratch.addrs[index],
+            scratch.headers[index].msg_hdr.msg_namelen,
+        )
+        .ok_or_else(|| {
+            std::io::Error::new(
+                ErrorKind::InvalidData,
+                "udp recvmmsg source address is not inet/inet6",
+            )
+        })?;
         batch
             .push_received_metadata(source, RawPacketIngress::Udp, buffer_index, len)
             .map_err(|error| match error {
@@ -282,9 +285,16 @@ fn sockaddr_storage_to_socket_addr(storage: &SockaddrStorage) -> Option<SocketAd
 }
 
 #[cfg(target_os = "linux")]
-fn sockaddr_storage_to_socket_addr_libc(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
+fn sockaddr_storage_to_socket_addr_libc(
+    storage: &libc::sockaddr_storage,
+    namelen: libc::socklen_t,
+) -> Option<SocketAddr> {
+    let namelen = usize::try_from(namelen).ok()?;
     match i32::from(storage.ss_family) {
         libc::AF_INET => {
+            if namelen < std::mem::size_of::<libc::sockaddr_in>() {
+                return None;
+            }
             // SAFETY: `ss_family` confirmed AF_INET, so reinterpret as sockaddr_in.
             let address = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
             Some(SocketAddr::from(std::net::SocketAddrV4::new(
@@ -293,6 +303,9 @@ fn sockaddr_storage_to_socket_addr_libc(storage: &libc::sockaddr_storage) -> Opt
             )))
         }
         libc::AF_INET6 => {
+            if namelen < std::mem::size_of::<libc::sockaddr_in6>() {
+                return None;
+            }
             // SAFETY: `ss_family` confirmed AF_INET6, so reinterpret as sockaddr_in6.
             let address = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
             Some(SocketAddr::from(std::net::SocketAddrV6::new(
@@ -566,6 +579,17 @@ mod tests {
         send_burst(&sender, destination, packet_count).expect("send burst");
         let legacy_received = receive_legacy_burst(&receiver, packet_count).expect("legacy burst");
         assert_eq!(legacy_received, packet_count);
+    }
+
+    #[test]
+    fn recvmmsg_source_address_rejects_truncated_name() {
+        // SAFETY: The test initializes the family tag before conversion.
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        storage.ss_family = libc::AF_INET as libc::sa_family_t;
+
+        let truncated = std::mem::size_of::<libc::sockaddr_in>().saturating_sub(1);
+        let namelen = libc::socklen_t::try_from(truncated).unwrap_or(0);
+        assert!(sockaddr_storage_to_socket_addr_libc(&storage, namelen).is_none());
     }
 
     #[test]
