@@ -2,8 +2,13 @@
 
 //! Yellowstone gRPC adapters for SOF processed provider-stream ingress.
 
+#[cfg(test)]
+use std::hint::black_box;
 use std::{
+    array::TryFromSliceError,
     collections::HashMap,
+    fmt,
+    pin::Pin,
     str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
@@ -34,8 +39,8 @@ use yellowstone_grpc_proto::prelude::{
 use crate::{
     event::{ForkSlotStatus, TxCommitmentStatus, TxKind},
     framework::{
-        AccountUpdateEvent, BlockMetaEvent, SlotStatusEvent, TransactionEvent,
-        TransactionStatusEvent, pubkey_bytes, signature_bytes_opt,
+        AccountUpdateEvent, BlockMetaEvent, PubkeyBytes, SignatureBytes, SlotStatusEvent,
+        TransactionEvent, TransactionStatusEvent,
     },
     provider_stream::{
         ProviderCommitmentWatermarks, ProviderReplayMode, ProviderSourceArbitrationMode,
@@ -88,7 +93,7 @@ impl YellowstoneGrpcCommitment {
 pub struct YellowstoneGrpcConfig {
     endpoint: String,
     x_token: Option<String>,
-    source_instance: Option<std::sync::Arc<str>>,
+    source_instance: Option<Arc<str>>,
     readiness: ProviderSourceReadiness,
     source_role: ProviderSourceRole,
     source_priority: u16,
@@ -137,8 +142,8 @@ pub enum YellowstoneGrpcConfigOption {
     RequireTransactionSignature,
 }
 
-impl std::fmt::Display for YellowstoneGrpcConfigOption {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for YellowstoneGrpcConfigOption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::VoteFilter => f.write_str("vote filter"),
             Self::FailedFilter => f.write_str("failed filter"),
@@ -220,7 +225,7 @@ impl YellowstoneGrpcConfig {
 
     /// Sets one stable source instance label for observability and redundancy intent.
     #[must_use]
-    pub fn with_source_instance(mut self, instance: impl Into<std::sync::Arc<str>>) -> Self {
+    pub fn with_source_instance(mut self, instance: impl Into<Arc<str>>) -> Self {
         self.source_instance = Some(instance.into());
         self
     }
@@ -650,7 +655,7 @@ pub enum YellowstoneGrpcStream {
 pub struct YellowstoneGrpcSlotsConfig {
     endpoint: String,
     x_token: Option<String>,
-    source_instance: Option<std::sync::Arc<str>>,
+    source_instance: Option<Arc<str>>,
     readiness: ProviderSourceReadiness,
     source_role: ProviderSourceRole,
     source_priority: u16,
@@ -694,7 +699,7 @@ impl YellowstoneGrpcSlotsConfig {
 
     /// Sets one stable source instance label for observability and redundancy intent.
     #[must_use]
-    pub fn with_source_instance(mut self, instance: impl Into<std::sync::Arc<str>>) -> Self {
+    pub fn with_source_instance(mut self, instance: impl Into<Arc<str>>) -> Self {
         self.source_instance = Some(instance.into());
         self
     }
@@ -933,8 +938,8 @@ pub enum YellowstoneGrpcStreamKind {
     Slots,
 }
 
-impl std::fmt::Display for YellowstoneGrpcStreamKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for YellowstoneGrpcStreamKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Transaction => f.write_str("transaction"),
             Self::TransactionStatus => f.write_str("transaction-status"),
@@ -945,10 +950,10 @@ impl std::fmt::Display for YellowstoneGrpcStreamKind {
     }
 }
 
-type YellowstoneSubscribeSink = std::pin::Pin<
+type YellowstoneSubscribeSink = Pin<
     Box<dyn futures_util::Sink<SubscribeRequest, Error = futures_channel::mpsc::SendError> + Send>,
 >;
-type YellowstoneUpdateStream = std::pin::Pin<
+type YellowstoneUpdateStream = Pin<
     Box<
         dyn futures_util::Stream<
                 Item = Result<SubscribeUpdate, yellowstone_grpc_proto::tonic::Status>,
@@ -1759,9 +1764,10 @@ fn transaction_event_from_update(
         transaction.ok_or(YellowstoneGrpcError::Convert("missing transaction payload"))?;
     let is_vote = transaction.is_vote;
     let signature = if is_vote {
-        Signature::try_from(transaction.signature.as_slice())
-            .map(Some)
-            .map_err(|_error| YellowstoneGrpcError::Convert("invalid signature"))?
+        Some(signature_bytes_from_slice(
+            transaction.signature.as_slice(),
+            "invalid signature",
+        )?)
     } else {
         None
     };
@@ -1777,14 +1783,14 @@ fn transaction_event_from_update(
         commitment_status,
         confirmed_slot: watermarks.confirmed_slot,
         finalized_slot: watermarks.finalized_slot,
-        signature: signature_bytes_opt(signature.or_else(|| tx.signatures.first().copied())),
+        signature: signature.or_else(|| tx.signatures.first().copied().map(SignatureBytes::from)),
         provider_source: None,
         kind: if is_vote {
             TxKind::VoteOnly
         } else {
             classify_provider_transaction_kind(&tx)
         },
-        tx: std::sync::Arc::new(tx),
+        tx: Arc::new(tx),
     })
 }
 
@@ -1793,14 +1799,16 @@ fn transaction_status_event_from_update(
     watermarks: ProviderCommitmentWatermarks,
     update: yellowstone_grpc_proto::prelude::SubscribeUpdateTransactionStatus,
 ) -> Result<TransactionStatusEvent, YellowstoneGrpcError> {
-    let signature = Signature::try_from(update.signature.as_slice())
-        .map_err(|_error| YellowstoneGrpcError::Convert("invalid transaction-status signature"))?;
+    let signature = signature_bytes_from_slice(
+        update.signature.as_slice(),
+        "invalid transaction-status signature",
+    )?;
     Ok(TransactionStatusEvent {
         slot: update.slot,
         commitment_status,
         confirmed_slot: watermarks.confirmed_slot,
         finalized_slot: watermarks.finalized_slot,
-        signature: signature.into(),
+        signature,
         is_vote: update.is_vote,
         index: Some(update.index),
         err: update.err.map(|error| format!("{error:?}")),
@@ -1816,15 +1824,13 @@ fn account_update_event_from_yellowstone(
     let account = update
         .account
         .ok_or(YellowstoneGrpcError::Convert("missing account payload"))?;
-    let pubkey = Pubkey::try_from(account.pubkey.as_slice())
-        .map_err(|_error| YellowstoneGrpcError::Convert("invalid account pubkey"))?;
-    let owner = Pubkey::try_from(account.owner.as_slice())
-        .map_err(|_error| YellowstoneGrpcError::Convert("invalid account owner"))?;
+    let pubkey = pubkey_bytes_from_slice(account.pubkey.as_slice(), "invalid account pubkey")?;
+    let owner = pubkey_bytes_from_slice(account.owner.as_slice(), "invalid account owner")?;
     let txn_signature = match account.txn_signature {
-        Some(signature) => Some(
-            Signature::try_from(signature.as_slice())
-                .map_err(|_error| YellowstoneGrpcError::Convert("invalid account txn signature"))?,
-        ),
+        Some(signature) => Some(signature_bytes_from_slice(
+            signature.as_slice(),
+            "invalid account txn signature",
+        )?),
         None => None,
     };
     if account.data.len() > MAX_ACCOUNT_DATA_LEN {
@@ -1837,14 +1843,14 @@ fn account_update_event_from_yellowstone(
         commitment_status,
         confirmed_slot: watermarks.confirmed_slot,
         finalized_slot: watermarks.finalized_slot,
-        pubkey: pubkey_bytes(pubkey),
-        owner: pubkey_bytes(owner),
+        pubkey,
+        owner,
         lamports: account.lamports,
         executable: account.executable,
         rent_epoch: account.rent_epoch,
         data: account.data.into(),
         write_version: Some(account.write_version),
-        txn_signature: signature_bytes_opt(txn_signature),
+        txn_signature,
         is_startup: update.is_startup,
         matched_filter: None,
         provider_source: None,
@@ -1874,6 +1880,26 @@ fn block_meta_event_from_update(
         entries_count: update.entries_count,
         provider_source: None,
     })
+}
+
+fn signature_bytes_from_slice(
+    bytes: &[u8],
+    message: &'static str,
+) -> Result<SignatureBytes, YellowstoneGrpcError> {
+    let raw: [u8; 64] = bytes
+        .try_into()
+        .map_err(|_error: TryFromSliceError| YellowstoneGrpcError::Convert(message))?;
+    Ok(SignatureBytes::from(raw))
+}
+
+fn pubkey_bytes_from_slice(
+    bytes: &[u8],
+    message: &'static str,
+) -> Result<PubkeyBytes, YellowstoneGrpcError> {
+    let raw: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_error: TryFromSliceError| YellowstoneGrpcError::Convert(message))?;
+    Ok(PubkeyBytes::from(raw))
 }
 
 fn observe_non_transaction_commitment(
@@ -2111,6 +2137,11 @@ mod tests {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(default)
+    }
+
+    fn avg_ns_per_iteration(elapsed: Duration, iterations: usize) -> u128 {
+        let iterations = u128::try_from(iterations.max(1)).unwrap_or(1);
+        elapsed.as_nanos().checked_div(iterations).unwrap_or(0)
     }
 
     #[test]
@@ -3009,7 +3040,7 @@ mod tests {
             finalized_slot: None,
             signature,
             kind: classify_provider_transaction_kind(&tx),
-            tx: std::sync::Arc::new(tx),
+            tx: Arc::new(tx),
             provider_source: None,
         })
     }
@@ -3077,7 +3108,7 @@ mod tests {
                 TxCommitmentStatus::Processed,
             )
             .expect("baseline event");
-            std::hint::black_box(event);
+            black_box(event);
         }
         let baseline_elapsed = baseline_started.elapsed();
 
@@ -3090,15 +3121,21 @@ mod tests {
                 ProviderCommitmentWatermarks::default(),
             )
             .expect("optimized event");
-            std::hint::black_box(event);
+            black_box(event);
         }
         let optimized_elapsed = optimized_started.elapsed();
+        let baseline_avg_ns = avg_ns_per_iteration(baseline_elapsed, iterations);
+        let optimized_avg_ns = avg_ns_per_iteration(optimized_elapsed, iterations);
 
         eprintln!(
-            "yellowstone_transaction_conversion_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            "yellowstone_transaction_conversion_profile_fixture iterations={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.3} optimized_avg_us_per_iteration={:.3}",
             iterations,
             baseline_elapsed.as_micros(),
             optimized_elapsed.as_micros(),
+            baseline_avg_ns,
+            optimized_avg_ns,
+            baseline_avg_ns as f64 / 1_000.0,
+            optimized_avg_ns as f64 / 1_000.0,
         );
     }
 
@@ -3115,7 +3152,7 @@ mod tests {
                 TxCommitmentStatus::Processed,
             )
             .expect("baseline event");
-            std::hint::black_box(event);
+            black_box(event);
         }
     }
 
@@ -3133,7 +3170,7 @@ mod tests {
                 ProviderCommitmentWatermarks::default(),
             )
             .expect("optimized event");
-            std::hint::black_box(event);
+            black_box(event);
         }
     }
 
@@ -3152,7 +3189,7 @@ mod tests {
                 TxCommitmentStatus::Processed,
             )
             .expect("baseline event");
-            std::hint::black_box(event);
+            black_box(event);
         }
         let baseline_elapsed = baseline_started.elapsed();
 
@@ -3165,15 +3202,21 @@ mod tests {
                 ProviderCommitmentWatermarks::default(),
             )
             .expect("optimized event");
-            std::hint::black_box(event);
+            black_box(event);
         }
         let optimized_elapsed = optimized_started.elapsed();
+        let baseline_avg_ns = avg_ns_per_iteration(baseline_elapsed, iterations);
+        let optimized_avg_ns = avg_ns_per_iteration(optimized_elapsed, iterations);
 
         eprintln!(
-            "yellowstone_vote_only_conversion_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            "yellowstone_vote_only_conversion_profile_fixture iterations={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.3} optimized_avg_us_per_iteration={:.3}",
             iterations,
             baseline_elapsed.as_micros(),
             optimized_elapsed.as_micros(),
+            baseline_avg_ns,
+            optimized_avg_ns,
+            baseline_avg_ns as f64 / 1_000.0,
+            optimized_avg_ns as f64 / 1_000.0,
         );
     }
 }

@@ -6,8 +6,12 @@
 //! built-in adapter exposes transaction, transaction-status, account-update,
 //! block-meta, and slot feeds through the same typed provider-stream surface.
 
+#[cfg(test)]
+use std::hint::black_box;
 use std::{
     collections::HashMap,
+    fmt,
+    pin::Pin,
     str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
@@ -147,8 +151,8 @@ pub enum LaserStreamConfigOption {
     RequireTransactionSignature,
 }
 
-impl std::fmt::Display for LaserStreamConfigOption {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for LaserStreamConfigOption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::VoteFilter => f.write_str("vote filter"),
             Self::FailedFilter => f.write_str("failed filter"),
@@ -995,8 +999,8 @@ pub enum LaserStreamStreamKind {
     Slots,
 }
 
-impl std::fmt::Display for LaserStreamStreamKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for LaserStreamStreamKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Transaction => f.write_str("transaction"),
             Self::TransactionStatus => f.write_str("transaction-status"),
@@ -1007,10 +1011,10 @@ impl std::fmt::Display for LaserStreamStreamKind {
     }
 }
 
-type LaserStreamSubscribeSink = std::pin::Pin<
+type LaserStreamSubscribeSink = Pin<
     Box<dyn futures_util::Sink<grpc::SubscribeRequest, Error = futures_mpsc::SendError> + Send>,
 >;
-type LaserStreamUpdateStream = std::pin::Pin<
+type LaserStreamUpdateStream = Pin<
     Box<
         dyn futures_util::Stream<
                 Item = Result<grpc::SubscribeUpdate, yellowstone_grpc_proto::tonic::Status>,
@@ -2316,6 +2320,11 @@ mod tests {
             .unwrap_or(default)
     }
 
+    fn avg_ns_per_iteration(elapsed: Duration, iterations: usize) -> u128 {
+        let iterations = u128::try_from(iterations.max(1)).unwrap_or(1);
+        elapsed.as_nanos().checked_div(iterations).unwrap_or(0)
+    }
+
     #[test]
     fn laserstream_account_update_rejects_oversized_data() {
         let pubkey = Pubkey::new_unique();
@@ -3328,22 +3337,28 @@ mod tests {
         let baseline_started = Instant::now();
         for _ in 0..iterations {
             let tx = convert_transaction_sdk_baseline(tx.clone()).expect("baseline tx");
-            std::hint::black_box(tx);
+            black_box(tx);
         }
         let baseline_elapsed = baseline_started.elapsed();
 
         let optimized_started = Instant::now();
         for _ in 0..iterations {
             let tx = convert_transaction(tx.clone()).expect("optimized tx");
-            std::hint::black_box(tx);
+            black_box(tx);
         }
         let optimized_elapsed = optimized_started.elapsed();
+        let baseline_avg_ns = avg_ns_per_iteration(baseline_elapsed, iterations);
+        let optimized_avg_ns = avg_ns_per_iteration(optimized_elapsed, iterations);
 
         eprintln!(
-            "laserstream_local_conversion_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            "laserstream_local_conversion_profile_fixture iterations={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.3} optimized_avg_us_per_iteration={:.3}",
             iterations,
             baseline_elapsed.as_micros(),
             optimized_elapsed.as_micros(),
+            baseline_avg_ns,
+            optimized_avg_ns,
+            baseline_avg_ns as f64 / 1_000.0,
+            optimized_avg_ns as f64 / 1_000.0,
         );
     }
 
@@ -3390,7 +3405,7 @@ mod tests {
                 TxCommitmentStatus::Processed,
             )
             .expect("baseline event");
-            std::hint::black_box(event);
+            black_box(event);
         }
         let baseline_elapsed = baseline_started.elapsed();
 
@@ -3403,15 +3418,21 @@ mod tests {
                 ProviderCommitmentWatermarks::default(),
             )
             .expect("optimized event");
-            std::hint::black_box(event);
+            black_box(event);
         }
         let optimized_elapsed = optimized_started.elapsed();
+        let baseline_avg_ns = avg_ns_per_iteration(baseline_elapsed, iterations);
+        let optimized_avg_ns = avg_ns_per_iteration(optimized_elapsed, iterations);
 
         eprintln!(
-            "laserstream_transaction_conversion_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            "laserstream_transaction_conversion_profile_fixture iterations={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.3} optimized_avg_us_per_iteration={:.3}",
             iterations,
             baseline_elapsed.as_micros(),
             optimized_elapsed.as_micros(),
+            baseline_avg_ns,
+            optimized_avg_ns,
+            baseline_avg_ns as f64 / 1_000.0,
+            optimized_avg_ns as f64 / 1_000.0,
         );
     }
 
@@ -3428,7 +3449,7 @@ mod tests {
                 TxCommitmentStatus::Processed,
             )
             .expect("baseline event");
-            std::hint::black_box(event);
+            black_box(event);
         }
     }
 
@@ -3446,7 +3467,7 @@ mod tests {
                 ProviderCommitmentWatermarks::default(),
             )
             .expect("optimized event");
-            std::hint::black_box(event);
+            black_box(event);
         }
     }
 
@@ -3465,7 +3486,7 @@ mod tests {
                 TxCommitmentStatus::Processed,
             )
             .expect("baseline event");
-            std::hint::black_box(event);
+            black_box(event);
         }
         let baseline_elapsed = baseline_started.elapsed();
 
@@ -3478,15 +3499,21 @@ mod tests {
                 ProviderCommitmentWatermarks::default(),
             )
             .expect("optimized event");
-            std::hint::black_box(event);
+            black_box(event);
         }
         let optimized_elapsed = optimized_started.elapsed();
+        let baseline_avg_ns = avg_ns_per_iteration(baseline_elapsed, iterations);
+        let optimized_avg_ns = avg_ns_per_iteration(optimized_elapsed, iterations);
 
         eprintln!(
-            "laserstream_vote_only_conversion_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            "laserstream_vote_only_conversion_profile_fixture iterations={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.3} optimized_avg_us_per_iteration={:.3}",
             iterations,
             baseline_elapsed.as_micros(),
             optimized_elapsed.as_micros(),
+            baseline_avg_ns,
+            optimized_avg_ns,
+            baseline_avg_ns as f64 / 1_000.0,
+            optimized_avg_ns as f64 / 1_000.0,
         );
     }
 }
