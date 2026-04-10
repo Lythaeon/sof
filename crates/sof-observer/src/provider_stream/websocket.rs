@@ -25,7 +25,8 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async, tungstenite::protocol::Message as WsMessage,
+    MaybeTlsStream, WebSocketStream, connect_async_with_config,
+    tungstenite::protocol::{Message as WsMessage, WebSocketConfig},
 };
 
 #[cfg(test)]
@@ -1647,6 +1648,9 @@ fn parse_transaction_notification(
 const MAX_BASE64_TRANSACTION_WIRE_LEN: usize = PACKET_DATA_SIZE.div_ceil(3) * 4;
 const MAX_ACCOUNT_DATA_LEN: usize = MAX_PERMITTED_DATA_LENGTH as usize;
 const MAX_BASE64_ACCOUNT_DATA_LEN: usize = MAX_ACCOUNT_DATA_LEN.div_ceil(3) * 4;
+const WEBSOCKET_TRANSACTION_MAX_MESSAGE_SIZE: usize = 64 * 1024;
+const WEBSOCKET_ACCOUNT_MAX_MESSAGE_SIZE: usize = MAX_BASE64_ACCOUNT_DATA_LEN + (128 * 1024);
+const WEBSOCKET_LOGS_MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 
 fn decode_transaction_wire_payload(
     encoded: &str,
@@ -1992,7 +1996,12 @@ async fn run_websocket_logs_connection(
 async fn establish_websocket_logs_session(
     config: &WebsocketLogsConfig,
 ) -> Result<WebsocketProviderStream, WebsocketLogsError> {
-    let (mut stream, _response) = connect_async(config.endpoint()).await?;
+    let (mut stream, _response) = connect_async_with_config(
+        config.endpoint(),
+        Some(websocket_transport_config(WEBSOCKET_LOGS_MAX_MESSAGE_SIZE)),
+        false,
+    )
+    .await?;
     stream
         .send(WsMessage::Text(
             config.subscribe_request().to_string().into(),
@@ -2222,7 +2231,12 @@ async fn establish_websocket_primary_session(
     {
         return Err(WebsocketProtocolError::MissingReplayHttpEndpoint.into());
     }
-    let (mut stream, _response) = connect_async(config.endpoint()).await?;
+    let (mut stream, _response) = connect_async_with_config(
+        config.endpoint(),
+        Some(websocket_primary_transport_config(config)),
+        false,
+    )
+    .await?;
     stream
         .send(WsMessage::Text(
             config.subscribe_request().to_string().into(),
@@ -2250,6 +2264,23 @@ fn websocket_http_endpoint(config: &WebsocketTransactionConfig) -> Option<String
         return Some(format!("http://{rest}"));
     }
     None
+}
+
+fn websocket_transport_config(max_message_size: usize) -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(max_message_size))
+        .max_frame_size(Some(max_message_size))
+}
+
+fn websocket_primary_transport_config(config: &WebsocketTransactionConfig) -> WebSocketConfig {
+    match config.stream {
+        WebsocketPrimaryStream::Transaction => {
+            websocket_transport_config(WEBSOCKET_TRANSACTION_MAX_MESSAGE_SIZE)
+        }
+        WebsocketPrimaryStream::Account(_) | WebsocketPrimaryStream::Program(_) => {
+            websocket_transport_config(WEBSOCKET_ACCOUNT_MAX_MESSAGE_SIZE)
+        }
+    }
 }
 
 async fn rpc_get_slot(
@@ -2605,29 +2636,17 @@ mod tests {
     use crate::provider_stream::{create_provider_stream_fan_in, create_provider_stream_queue};
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use serde_json::json;
+    use sof_support::bench::{avg_ns_per_iteration, profile_iterations};
     use solana_keypair::Keypair;
     use solana_message::{Message, VersionedMessage};
     use solana_signer::Signer;
-    use std::{env, time::Instant};
+    use std::time::Instant;
     use tokio::net::TcpListener;
     use tokio::time::{Duration, timeout};
     use tokio_tungstenite::{accept_async, tungstenite::protocol::Message as WsMessage};
 
     #[cfg(feature = "provider-grpc")]
     use crate::provider_stream::yellowstone::{YellowstoneGrpcCommitment, YellowstoneGrpcConfig};
-
-    fn profile_iterations(default: usize) -> usize {
-        env::var("SOF_PROFILE_ITERATIONS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(default)
-    }
-
-    fn avg_ns_per_iteration(elapsed: Duration, iterations: usize) -> u128 {
-        let iterations = u128::try_from(iterations.max(1)).unwrap_or(1);
-        elapsed.as_nanos().checked_div(iterations).unwrap_or(0)
-    }
 
     fn sample_notification_payload() -> Vec<u8> {
         let signer = Keypair::new();
@@ -2924,6 +2943,48 @@ mod tests {
                 .to_string()
                 .contains("websocket transaction payload exceeds max wire size"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn websocket_transport_config_caps_transaction_stream_frames() {
+        let config = WebsocketTransactionConfig::new("ws://example.invalid");
+        let transport = websocket_primary_transport_config(&config);
+
+        assert_eq!(
+            transport.max_message_size,
+            Some(WEBSOCKET_TRANSACTION_MAX_MESSAGE_SIZE),
+        );
+        assert_eq!(
+            transport.max_frame_size,
+            Some(WEBSOCKET_TRANSACTION_MAX_MESSAGE_SIZE),
+        );
+    }
+
+    #[test]
+    fn websocket_transport_config_caps_account_stream_frames() {
+        let config = WebsocketTransactionConfig::new("ws://example.invalid")
+            .with_stream(WebsocketPrimaryStream::Account(Pubkey::new_unique()));
+        let transport = websocket_primary_transport_config(&config);
+
+        assert_eq!(
+            transport.max_message_size,
+            Some(WEBSOCKET_ACCOUNT_MAX_MESSAGE_SIZE),
+        );
+        assert!(transport.max_message_size.unwrap_or_default() > MAX_BASE64_ACCOUNT_DATA_LEN,);
+    }
+
+    #[test]
+    fn websocket_logs_transport_config_caps_frames() {
+        let transport = websocket_transport_config(WEBSOCKET_LOGS_MAX_MESSAGE_SIZE);
+
+        assert_eq!(
+            transport.max_message_size,
+            Some(WEBSOCKET_LOGS_MAX_MESSAGE_SIZE),
+        );
+        assert_eq!(
+            transport.max_frame_size,
+            Some(WEBSOCKET_LOGS_MAX_MESSAGE_SIZE)
         );
     }
 

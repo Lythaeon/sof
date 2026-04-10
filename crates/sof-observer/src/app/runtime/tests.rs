@@ -1,20 +1,13 @@
 use std::{
-    env,
     hint::black_box,
     time::{Duration, Instant},
 };
 
+use sof_support::bench::{avg_ns_per_iteration, profile_iterations};
+
 use crate::repair::{MissingShredRequest, MissingShredRequestKind};
 
 use super::OutstandingRepairRequests;
-
-fn profile_iterations(default: usize) -> usize {
-    env::var("SOF_PROFILE_ITERATIONS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default)
-}
 
 #[test]
 #[ignore = "profiling fixture for outstanding repair request churn"]
@@ -54,7 +47,7 @@ fn outstanding_repairs_profile_fixture() {
     }
 
     let elapsed = started.elapsed();
-    let avg_ns_per_iteration = elapsed.as_nanos() / u128::try_from(iterations).unwrap_or(1);
+    let avg_ns_per_iteration = avg_ns_per_iteration(elapsed, iterations);
     let avg_us_per_iteration = avg_ns_per_iteration as f64 / 1_000.0;
     eprintln!(
         "outstanding_repairs_profile_fixture iterations={} elapsed_us={} avg_ns_per_iteration={} avg_us_per_iteration={:.3} entries={}",

@@ -781,7 +781,6 @@ const fn derive_parent_slot(slot: u64, parent_offset: u16) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
 
     #[cfg(feature = "gossip-bootstrap")]
     use crate::verify::ShredVerifier;
@@ -793,6 +792,7 @@ mod tests {
         shred::wire::{SIZE_OF_DATA_SHRED_HEADERS, parse_shred_header},
     };
     use reed_solomon_erasure::galois_8::ReedSolomon;
+    use sof_support::{bench::avg_ns_per_iteration, env_support::read_positive_usize};
     #[cfg(feature = "gossip-bootstrap")]
     use solana_keypair::Keypair;
     #[cfg(feature = "gossip-bootstrap")]
@@ -857,11 +857,6 @@ mod tests {
         packet[SIZE_OF_SIGNATURE..SIZE_OF_SIGNATURE + shard_len].to_vec()
     }
 
-    fn avg_ns_per_iteration(elapsed: Duration, iterations: usize) -> u128 {
-        let iterations = u128::try_from(iterations.max(1)).unwrap_or(1);
-        elapsed.as_nanos().checked_div(iterations).unwrap_or(0)
-    }
-
     #[cfg(feature = "gossip-bootstrap")]
     #[test]
     fn shared_known_pubkeys_skips_equivalent_updates() {
@@ -884,16 +879,9 @@ mod tests {
     #[test]
     #[ignore = "profiling fixture for equivalent known-pubkey refresh churn"]
     fn shared_known_pubkeys_equivalent_refresh_profile_fixture() {
-        let iterations = env::var("SOF_PACKET_WORKER_KNOWN_PUBKEY_PROFILE_ITERS")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(200_000);
-        let key_count = env::var("SOF_PACKET_WORKER_KNOWN_PUBKEY_COUNT")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(64);
+        let iterations =
+            read_positive_usize("SOF_PACKET_WORKER_KNOWN_PUBKEY_PROFILE_ITERS", 200_000);
+        let key_count = read_positive_usize("SOF_PACKET_WORKER_KNOWN_PUBKEY_COUNT", 64);
         let mut canonical = (0..key_count)
             .map(|_| Keypair::new().pubkey().to_bytes())
             .collect::<Vec<_>>();
@@ -952,11 +940,7 @@ mod tests {
     #[test]
     #[ignore = "profiling fixture for packet worker primary FEC ingest"]
     fn packet_worker_primary_fec_profile_fixture() {
-        let iterations = env::var("SOF_PACKET_WORKER_FEC_PROFILE_ITERS")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(50_000);
+        let iterations = read_positive_usize("SOF_PACKET_WORKER_FEC_PROFILE_ITERS", 50_000);
         let packets = (0..iterations)
             .map(|iteration| {
                 let slot =
@@ -1014,11 +998,8 @@ mod tests {
     #[test]
     #[ignore = "profiling fixture for packet worker FEC recovery"]
     fn packet_worker_recovery_fec_profile_fixture() {
-        let iterations = env::var("SOF_PACKET_WORKER_FEC_RECOVERY_PROFILE_ITERS")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(20_000);
+        let iterations =
+            read_positive_usize("SOF_PACKET_WORKER_FEC_RECOVERY_PROFILE_ITERS", 20_000);
         let batches = (0..iterations)
             .map(|iteration| {
                 let slot =

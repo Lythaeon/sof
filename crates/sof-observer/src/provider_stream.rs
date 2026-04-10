@@ -1300,6 +1300,7 @@ pub mod websocket;
 #[cfg(all(test, any(feature = "provider-grpc", feature = "provider-websocket")))]
 mod tests {
     use super::*;
+    use sof_support::bench::profile_iterations;
     use solana_instruction::Instruction;
     use solana_keypair::Keypair;
     use solana_message::{Message, VersionedMessage};
@@ -1308,14 +1309,6 @@ mod tests {
     use std::{sync::Arc, time::Instant};
     use tokio::runtime::Runtime;
     use tokio::time::{Duration, sleep, timeout};
-
-    fn profile_iterations(default: usize) -> usize {
-        std::env::var("SOF_PROFILE_ITERATIONS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(default)
-    }
 
     fn sample_mixed_transaction() -> VersionedTransaction {
         let signer = Keypair::new();

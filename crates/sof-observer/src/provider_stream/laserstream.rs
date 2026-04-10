@@ -27,7 +27,8 @@ use laserstream_core_proto::prelude::Transaction as LaserStreamTransaction;
 use laserstream_core_proto::tonic::{
     Status, codec::CompressionEncoding, metadata::MetadataValue, transport::Endpoint,
 };
-use sof_types::{PubkeyBytes, SignatureBytes};
+use sof_support::bytes::{pubkey_bytes_from_slice, signature_bytes_from_slice};
+use sof_types::SignatureBytes;
 use solana_hash::Hash;
 use solana_message::{
     Message, MessageHeader, VersionedMessage,
@@ -1948,7 +1949,7 @@ fn transaction_event_from_update(
     let signature = if is_vote {
         Some(signature_bytes_from_slice(
             transaction.signature.as_slice(),
-            "invalid signature",
+            || LaserStreamError::Convert("invalid signature"),
         )?)
     } else {
         None
@@ -1979,10 +1980,9 @@ fn transaction_status_event_from_update(
     watermarks: ProviderCommitmentWatermarks,
     update: grpc::SubscribeUpdateTransactionStatus,
 ) -> Result<TransactionStatusEvent, LaserStreamError> {
-    let signature = signature_bytes_from_slice(
-        update.signature.as_slice(),
-        "invalid transaction-status signature",
-    )?;
+    let signature = signature_bytes_from_slice(update.signature.as_slice(), || {
+        LaserStreamError::Convert("invalid transaction-status signature")
+    })?;
     Ok(TransactionStatusEvent {
         slot: update.slot,
         commitment_status,
@@ -2004,13 +2004,16 @@ fn account_update_event_from_laserstream(
     let account = update
         .account
         .ok_or(LaserStreamError::Convert("missing account payload"))?;
-    let pubkey = pubkey_bytes_from_slice(account.pubkey.as_slice(), "invalid account pubkey")?;
-    let owner = pubkey_bytes_from_slice(account.owner.as_slice(), "invalid account owner")?;
+    let pubkey = pubkey_bytes_from_slice(account.pubkey.as_slice(), || {
+        LaserStreamError::Convert("invalid account pubkey")
+    })?;
+    let owner = pubkey_bytes_from_slice(account.owner.as_slice(), || {
+        LaserStreamError::Convert("invalid account owner")
+    })?;
     let txn_signature = match account.txn_signature {
-        Some(signature) => Some(signature_bytes_from_slice(
-            signature.as_slice(),
-            "invalid account txn signature",
-        )?),
+        Some(signature) => Some(signature_bytes_from_slice(signature.as_slice(), || {
+            LaserStreamError::Convert("invalid account txn signature")
+        })?),
         None => None,
     };
     if account.data.len() > MAX_ACCOUNT_DATA_LEN {
@@ -2060,26 +2063,6 @@ fn block_meta_event_from_update(
         entries_count: update.entries_count,
         provider_source: None,
     })
-}
-
-fn signature_bytes_from_slice(
-    bytes: &[u8],
-    message: &'static str,
-) -> Result<SignatureBytes, LaserStreamError> {
-    let raw: [u8; 64] = bytes
-        .try_into()
-        .map_err(|_error: std::array::TryFromSliceError| LaserStreamError::Convert(message))?;
-    Ok(SignatureBytes::from(raw))
-}
-
-fn pubkey_bytes_from_slice(
-    bytes: &[u8],
-    message: &'static str,
-) -> Result<PubkeyBytes, LaserStreamError> {
-    let raw: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_error: std::array::TryFromSliceError| LaserStreamError::Convert(message))?;
-    Ok(PubkeyBytes::from(raw))
 }
 
 fn observe_non_transaction_commitment(
@@ -2308,22 +2291,11 @@ mod tests {
     use solana_message::{Message, VersionedMessage};
     use solana_sdk_ids::{compute_budget, system_program, vote};
     use solana_signer::Signer;
-    use std::{env, pin::Pin, time::Instant};
+    use std::{pin::Pin, time::Instant};
+
+    use sof_support::bench::{avg_ns_per_iteration, profile_iterations};
     use tokio::sync::oneshot;
     use tokio::time::{Duration, timeout};
-
-    fn profile_iterations(default: usize) -> usize {
-        env::var("SOF_PROFILE_ITERATIONS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(default)
-    }
-
-    fn avg_ns_per_iteration(elapsed: Duration, iterations: usize) -> u128 {
-        let iterations = u128::try_from(iterations.max(1)).unwrap_or(1);
-        elapsed.as_nanos().checked_div(iterations).unwrap_or(0)
-    }
 
     #[test]
     fn laserstream_account_update_rejects_oversized_data() {

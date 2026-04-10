@@ -714,8 +714,9 @@ const fn mix_seed(seed: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{env, sync::Arc};
+    use std::sync::Arc;
 
+    use sof_support::{bench::avg_ns_per_iteration, env_support::read_positive_usize};
     use solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo, node::Node};
     use solana_signer::Signer;
     use solana_streamer::socket::SocketAddrSpace;
@@ -745,11 +746,6 @@ mod tests {
             1_000,
             1_000 + REPAIR_PEER_SWITCH_SCORE_MARGIN,
         ));
-    }
-
-    fn avg_ns_per_iteration(elapsed: Duration, iterations: usize) -> u128 {
-        let iterations = u128::try_from(iterations.max(1)).unwrap_or(1);
-        elapsed.as_nanos().checked_div(iterations).unwrap_or(0)
     }
 
     fn profile_repair_client(peer_count: usize) -> GossipRepairClient {
@@ -788,16 +784,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "profiling fixture for repair peer refresh"]
     async fn repair_refresh_peer_snapshot_profile_fixture() {
-        let iterations = env::var("SOF_REPAIR_REFRESH_PROFILE_ITERS")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(50_000);
-        let peer_count = env::var("SOF_REPAIR_REFRESH_PROFILE_PEERS")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(64);
+        let iterations = read_positive_usize("SOF_REPAIR_REFRESH_PROFILE_ITERS", 50_000);
+        let peer_count = read_positive_usize("SOF_REPAIR_REFRESH_PROFILE_PEERS", 64);
         let slot = 77_u64;
         let mut baseline_client = profile_repair_client(peer_count);
         baseline_client.peer_cache_ttl = Duration::ZERO;
@@ -849,16 +837,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "profiling fixture for cached repair peer selection"]
     async fn repair_pick_peer_cached_profile_fixture() {
-        let iterations = env::var("SOF_REPAIR_PICK_PEER_PROFILE_ITERS")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(200_000);
-        let peer_count = env::var("SOF_REPAIR_PICK_PEER_PROFILE_PEERS")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(64);
+        let iterations = read_positive_usize("SOF_REPAIR_PICK_PEER_PROFILE_ITERS", 200_000);
+        let peer_count = read_positive_usize("SOF_REPAIR_PICK_PEER_PROFILE_PEERS", 64);
         let slot = 42_u64;
         let mut client = profile_repair_client(0);
         let peers = (0..peer_count)
@@ -904,16 +884,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "profiling fixture for repair source note batching"]
     async fn repair_note_shred_sources_profile_fixture() {
-        let iterations = env::var("SOF_REPAIR_NOTE_SOURCES_PROFILE_ITERS")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(100_000);
-        let source_count = env::var("SOF_REPAIR_NOTE_SOURCES_PROFILE_BATCH")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(64);
+        let iterations = read_positive_usize("SOF_REPAIR_NOTE_SOURCES_PROFILE_ITERS", 100_000);
+        let source_count = read_positive_usize("SOF_REPAIR_NOTE_SOURCES_PROFILE_BATCH", 64);
         let mut client = profile_repair_client(0);
         let mut sources = Vec::with_capacity(source_count);
         for index in 0..source_count {

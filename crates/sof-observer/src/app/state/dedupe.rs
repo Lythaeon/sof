@@ -238,17 +238,12 @@ fn make_shred_dedupe_key(
 
 #[cfg(test)]
 mod tests {
+    use sof_support::bench::avg_ns_per_iteration;
+
     use super::*;
     use crate::{
         protocol::shred_wire::SIZE_OF_DATA_SHRED_PAYLOAD, shred::wire::parse_shred_header,
     };
-
-    fn avg_ns_per_iteration(elapsed: Duration, iterations: usize) -> u128 {
-        elapsed
-            .as_nanos()
-            .checked_div(u128::try_from(iterations.max(1)).unwrap_or(1))
-            .unwrap_or(0)
-    }
 
     fn test_key(slot: u64, index: u32) -> ShredDedupeIdentity {
         ShredDedupeIdentity {

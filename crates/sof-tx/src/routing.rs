@@ -152,17 +152,10 @@ impl SignatureDeduper {
 
 #[cfg(test)]
 mod tests {
-    use std::env;
+    use sof_support::{bench::avg_ns_per_iteration, env_support::read_positive_usize};
 
     use super::*;
     use crate::providers::{LeaderTarget, StaticLeaderProvider};
-
-    fn avg_ns_per_iteration(elapsed: Duration, iterations: usize) -> u128 {
-        elapsed
-            .as_nanos()
-            .checked_div(u128::try_from(iterations.max(1)).unwrap_or(1))
-            .unwrap_or(0)
-    }
 
     fn target(port: u16) -> LeaderTarget {
         LeaderTarget::new(None, std::net::SocketAddr::from(([127, 0, 0, 1], port)))
@@ -228,16 +221,12 @@ mod tests {
     #[test]
     #[ignore = "profiling fixture for signature dedupe churn"]
     fn signature_deduper_profile_fixture() {
-        let iterations = env::var("SOF_TX_SIGNATURE_DEDUPER_PROFILE_ITERS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(50_000);
-        let ttl_ms = env::var("SOF_TX_SIGNATURE_DEDUPER_PROFILE_TTL_MS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(10_000);
+        let iterations = read_positive_usize("SOF_TX_SIGNATURE_DEDUPER_PROFILE_ITERS", 50_000);
+        let ttl_ms = u64::try_from(read_positive_usize(
+            "SOF_TX_SIGNATURE_DEDUPER_PROFILE_TTL_MS",
+            10_000,
+        ))
+        .unwrap_or(10_000);
         let mut deduper = SignatureDeduper::new(Duration::from_millis(ttl_ms));
         let start = Instant::now();
         let now = Instant::now();
@@ -267,16 +256,12 @@ mod tests {
     #[test]
     #[ignore = "profiling fixture for signature deduper allocation churn"]
     fn signature_deduper_allocation_profile_fixture() {
-        let iterations = env::var("SOF_TX_SIGNATURE_DEDUPER_PROFILE_ITERS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(50_000);
-        let ttl_ms = env::var("SOF_TX_SIGNATURE_DEDUPER_PROFILE_TTL_MS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(10_000);
+        let iterations = read_positive_usize("SOF_TX_SIGNATURE_DEDUPER_PROFILE_ITERS", 50_000);
+        let ttl_ms = u64::try_from(read_positive_usize(
+            "SOF_TX_SIGNATURE_DEDUPER_PROFILE_TTL_MS",
+            10_000,
+        ))
+        .unwrap_or(10_000);
         let ttl = Duration::from_millis(ttl_ms);
         let mut baseline = signature_deduper_baseline(ttl);
         let mut optimized = SignatureDeduper::new(ttl);

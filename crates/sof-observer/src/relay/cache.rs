@@ -604,7 +604,9 @@ const fn max_cached_shred_key() -> CachedShredKey {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, hint::black_box};
+    use std::hint::black_box;
+
+    use sof_support::env_support::read_positive_usize;
 
     use super::*;
     use crate::{
@@ -1014,11 +1016,7 @@ mod tests {
     }
 
     fn profile_iterations(default: usize) -> usize {
-        env::var("SOF_PROFILE_ITERS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(default)
+        read_positive_usize("SOF_PROFILE_ITERS", default)
     }
 
     fn build_data_shred_packet(

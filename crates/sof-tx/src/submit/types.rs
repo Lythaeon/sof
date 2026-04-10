@@ -1014,15 +1014,9 @@ pub trait DirectSubmitTransport: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{env, hint::black_box, time::Instant};
+    use std::{hint::black_box, time::Instant};
 
-    fn profile_iterations(default: usize) -> usize {
-        env::var("SOF_PROFILE_ITERATIONS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(default)
-    }
+    use sof_support::bench::profile_iterations;
 
     #[test]
     #[ignore = "profiling fixture for submit suppression cache churn"]

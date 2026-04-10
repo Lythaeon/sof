@@ -78,10 +78,11 @@ impl SignatureCache {
 mod tests {
     use std::{
         collections::{HashMap, VecDeque},
-        env,
         hint::black_box,
         time::Instant,
     };
+
+    use sof_support::bench::profile_iterations;
 
     use super::{SIZE_OF_SIGNATURE, SignatureCache, SignatureCacheEntry};
 
@@ -138,14 +139,6 @@ mod tests {
             baseline_elapsed.as_micros(),
             optimized_elapsed.as_micros(),
         );
-    }
-
-    fn profile_iterations(default: usize) -> usize {
-        env::var("SOF_PROFILE_ITERATIONS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(default)
     }
 
     fn signature_cache_baseline(capacity: usize) -> SignatureCache {

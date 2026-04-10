@@ -5,7 +5,6 @@
 #[cfg(test)]
 use std::hint::black_box;
 use std::{
-    array::TryFromSliceError,
     collections::HashMap,
     fmt,
     pin::Pin,
@@ -15,6 +14,7 @@ use std::{
 };
 
 use futures_util::{SinkExt, StreamExt};
+use sof_support::bytes::{pubkey_bytes_from_slice, signature_bytes_from_slice};
 use solana_hash::Hash;
 use solana_message::{
     Message, MessageHeader, VersionedMessage,
@@ -39,8 +39,8 @@ use yellowstone_grpc_proto::prelude::{
 use crate::{
     event::{ForkSlotStatus, TxCommitmentStatus, TxKind},
     framework::{
-        AccountUpdateEvent, BlockMetaEvent, PubkeyBytes, SignatureBytes, SlotStatusEvent,
-        TransactionEvent, TransactionStatusEvent,
+        AccountUpdateEvent, BlockMetaEvent, SignatureBytes, SlotStatusEvent, TransactionEvent,
+        TransactionStatusEvent,
     },
     provider_stream::{
         ProviderCommitmentWatermarks, ProviderReplayMode, ProviderSourceArbitrationMode,
@@ -1766,7 +1766,7 @@ fn transaction_event_from_update(
     let signature = if is_vote {
         Some(signature_bytes_from_slice(
             transaction.signature.as_slice(),
-            "invalid signature",
+            || YellowstoneGrpcError::Convert("invalid signature"),
         )?)
     } else {
         None
@@ -1799,10 +1799,9 @@ fn transaction_status_event_from_update(
     watermarks: ProviderCommitmentWatermarks,
     update: yellowstone_grpc_proto::prelude::SubscribeUpdateTransactionStatus,
 ) -> Result<TransactionStatusEvent, YellowstoneGrpcError> {
-    let signature = signature_bytes_from_slice(
-        update.signature.as_slice(),
-        "invalid transaction-status signature",
-    )?;
+    let signature = signature_bytes_from_slice(update.signature.as_slice(), || {
+        YellowstoneGrpcError::Convert("invalid transaction-status signature")
+    })?;
     Ok(TransactionStatusEvent {
         slot: update.slot,
         commitment_status,
@@ -1824,13 +1823,16 @@ fn account_update_event_from_yellowstone(
     let account = update
         .account
         .ok_or(YellowstoneGrpcError::Convert("missing account payload"))?;
-    let pubkey = pubkey_bytes_from_slice(account.pubkey.as_slice(), "invalid account pubkey")?;
-    let owner = pubkey_bytes_from_slice(account.owner.as_slice(), "invalid account owner")?;
+    let pubkey = pubkey_bytes_from_slice(account.pubkey.as_slice(), || {
+        YellowstoneGrpcError::Convert("invalid account pubkey")
+    })?;
+    let owner = pubkey_bytes_from_slice(account.owner.as_slice(), || {
+        YellowstoneGrpcError::Convert("invalid account owner")
+    })?;
     let txn_signature = match account.txn_signature {
-        Some(signature) => Some(signature_bytes_from_slice(
-            signature.as_slice(),
-            "invalid account txn signature",
-        )?),
+        Some(signature) => Some(signature_bytes_from_slice(signature.as_slice(), || {
+            YellowstoneGrpcError::Convert("invalid account txn signature")
+        })?),
         None => None,
     };
     if account.data.len() > MAX_ACCOUNT_DATA_LEN {
@@ -1880,26 +1882,6 @@ fn block_meta_event_from_update(
         entries_count: update.entries_count,
         provider_source: None,
     })
-}
-
-fn signature_bytes_from_slice(
-    bytes: &[u8],
-    message: &'static str,
-) -> Result<SignatureBytes, YellowstoneGrpcError> {
-    let raw: [u8; 64] = bytes
-        .try_into()
-        .map_err(|_error: TryFromSliceError| YellowstoneGrpcError::Convert(message))?;
-    Ok(SignatureBytes::from(raw))
-}
-
-fn pubkey_bytes_from_slice(
-    bytes: &[u8],
-    message: &'static str,
-) -> Result<PubkeyBytes, YellowstoneGrpcError> {
-    let raw: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_error: TryFromSliceError| YellowstoneGrpcError::Convert(message))?;
-    Ok(PubkeyBytes::from(raw))
 }
 
 fn observe_non_transaction_commitment(
@@ -2114,7 +2096,9 @@ mod tests {
     use solana_sdk_ids::system_program;
     use solana_sdk_ids::{compute_budget, vote};
     use solana_signer::Signer;
-    use std::{env, pin::Pin, time::Instant};
+    use std::{pin::Pin, time::Instant};
+
+    use sof_support::bench::{avg_ns_per_iteration, profile_iterations};
     use tokio::sync::oneshot;
     use tokio::time::{Duration, timeout};
     use yellowstone_grpc_proto::geyser::geyser_server::{Geyser, GeyserServer};
@@ -2130,19 +2114,6 @@ mod tests {
         SubscribeUpdateTransactionInfo, SubscribeUpdateTransactionStatus, Transaction,
     };
     use yellowstone_grpc_proto::tonic::{self, Request, Response, Status, transport::Server};
-
-    fn profile_iterations(default: usize) -> usize {
-        env::var("SOF_PROFILE_ITERATIONS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(default)
-    }
-
-    fn avg_ns_per_iteration(elapsed: Duration, iterations: usize) -> u128 {
-        let iterations = u128::try_from(iterations.max(1)).unwrap_or(1);
-        elapsed.as_nanos().checked_div(iterations).unwrap_or(0)
-    }
 
     #[test]
     fn yellowstone_account_update_rejects_oversized_data() {

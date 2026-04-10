@@ -12,6 +12,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use sof_support::bench::avg_ns_per_iteration;
 use sof_types::SignatureBytes;
 use solana_keypair::Keypair;
 use solana_signature::Signature;
@@ -28,13 +29,6 @@ use crate::{
     providers::{LeaderTarget, StaticLeaderProvider, StaticRecentBlockhashProvider},
     routing::RoutingPolicy,
 };
-
-fn avg_ns_per_iteration(elapsed: Duration, iterations: u64) -> u128 {
-    elapsed
-        .as_nanos()
-        .checked_div(u128::from(iterations.max(1)))
-        .unwrap_or(0)
-}
 
 /// Mock RPC transport with configurable response.
 #[derive(Debug)]

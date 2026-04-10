@@ -629,10 +629,11 @@ pub(super) fn maybe_pin_receiver_thread(socket: &std::net::UdpSocket) {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use std::{env, thread};
+    use std::thread;
 
     use crate::ingest::create_raw_packet_batch_queue;
     use crate::runtime_env::with_runtime_env_overrides_for_test;
+    use sof_support::{bench::avg_ns_per_iteration, env_support::read_positive_usize};
 
     #[derive(Debug)]
     struct LegacyRawPacket {
@@ -689,11 +690,6 @@ mod tests {
         Ok(received)
     }
 
-    fn avg_ns_per_iteration(elapsed: Duration, iterations: usize) -> u128 {
-        let iterations = u128::try_from(iterations.max(1)).unwrap_or(1);
-        elapsed.as_nanos().checked_div(iterations).unwrap_or(0)
-    }
-
     #[test]
     fn recvmmsg_batch_matches_legacy_receive_count() {
         let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
@@ -731,16 +727,8 @@ mod tests {
     #[test]
     #[ignore = "profiling fixture for UDP receiver ingress"]
     fn udp_receiver_recvmmsg_profile_fixture() {
-        let iterations = env::var("SOF_UDP_RECEIVER_PROFILE_ITERS")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(1_000);
-        let packet_count = env::var("SOF_UDP_RECEIVER_PROFILE_BURST")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(64);
+        let iterations = read_positive_usize("SOF_UDP_RECEIVER_PROFILE_ITERS", 1_000);
+        let packet_count = read_positive_usize("SOF_UDP_RECEIVER_PROFILE_BURST", 64);
 
         let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
         let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind sender");
@@ -787,16 +775,8 @@ mod tests {
     #[test]
     #[ignore = "profiling fixture for UDP receiver recvmmsg setup A/B"]
     fn udp_receiver_recvmmsg_setup_profile_fixture() {
-        let iterations = env::var("SOF_UDP_RECEIVER_PROFILE_ITERS")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(1_000);
-        let packet_count = env::var("SOF_UDP_RECEIVER_PROFILE_BURST")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(64);
+        let iterations = read_positive_usize("SOF_UDP_RECEIVER_PROFILE_ITERS", 1_000);
+        let packet_count = read_positive_usize("SOF_UDP_RECEIVER_PROFILE_BURST", 64);
 
         let baseline_receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
         let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind sender");
@@ -861,11 +841,7 @@ mod tests {
     #[test]
     #[ignore = "profiling fixture for UDP receiver flush-path config lookup"]
     fn udp_receiver_flush_batch_profile_fixture() {
-        let iterations = env::var("SOF_UDP_RECEIVER_PROFILE_ITERS")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(10_000);
+        let iterations = read_positive_usize("SOF_UDP_RECEIVER_PROFILE_ITERS", 10_000);
         let capacity = iterations.saturating_mul(2).max(1).to_string();
 
         with_runtime_env_overrides_for_test(
@@ -919,25 +895,10 @@ mod tests {
     fn udp_receiver_recvmmsg_coalesced_profile_fixture() {
         use std::os::fd::AsFd;
 
-        let iterations = env::var("SOF_UDP_RECEIVER_PROFILE_ITERS")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(1_000);
-        let packet_count = env::var("SOF_UDP_RECEIVER_PROFILE_BURST")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(64);
-        let chunk_size = env::var("SOF_UDP_RECEIVER_PROFILE_CHUNK")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(8);
-        let gap_us = env::var("SOF_UDP_RECEIVER_PROFILE_GAP_US")
-            .ok()
-            .and_then(|raw| raw.parse::<u64>().ok())
-            .filter(|value| *value > 0)
+        let iterations = read_positive_usize("SOF_UDP_RECEIVER_PROFILE_ITERS", 1_000);
+        let packet_count = read_positive_usize("SOF_UDP_RECEIVER_PROFILE_BURST", 64);
+        let chunk_size = read_positive_usize("SOF_UDP_RECEIVER_PROFILE_CHUNK", 8);
+        let gap_us = u64::try_from(read_positive_usize("SOF_UDP_RECEIVER_PROFILE_GAP_US", 100))
             .unwrap_or(100);
         let gap = Duration::from_micros(gap_us);
         let idle_wait = Duration::from_millis(200);
@@ -1033,16 +994,8 @@ mod tests {
     #[test]
     #[ignore = "profiling fixture for contiguous raw packet batch materialization"]
     fn udp_receiver_batch_materialization_profile_fixture() {
-        let iterations = env::var("SOF_UDP_RECEIVER_PROFILE_ITERS")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(20_000);
-        let packet_count = env::var("SOF_UDP_RECEIVER_PROFILE_BURST")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(64);
+        let iterations = read_positive_usize("SOF_UDP_RECEIVER_PROFILE_ITERS", 20_000);
+        let packet_count = read_positive_usize("SOF_UDP_RECEIVER_PROFILE_BURST", 64);
         let source: SocketAddr = "127.0.0.1:8899".parse().expect("source addr");
         let payloads: Vec<Vec<u8>> = (0..packet_count)
             .map(|index| vec![u8::try_from(index % 251).unwrap_or(0); 256])
@@ -1108,16 +1061,8 @@ mod tests {
     #[test]
     #[ignore = "profiling fixture for recycled raw packet batch materialization"]
     fn udp_receiver_batch_recycler_profile_fixture() {
-        let iterations = env::var("SOF_UDP_RECEIVER_PROFILE_ITERS")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(50_000);
-        let packet_count = env::var("SOF_UDP_RECEIVER_PROFILE_BURST")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(64);
+        let iterations = read_positive_usize("SOF_UDP_RECEIVER_PROFILE_ITERS", 50_000);
+        let packet_count = read_positive_usize("SOF_UDP_RECEIVER_PROFILE_BURST", 64);
         let source: SocketAddr = "127.0.0.1:8899".parse().expect("source addr");
         let payloads: Vec<Vec<u8>> = (0..packet_count)
             .map(|index| vec![u8::try_from(index % 251).unwrap_or(0); 256])

@@ -3394,7 +3394,6 @@ pub async fn run_async_with_hosts_and_setup(
 mod tests {
     use std::{
         collections::BTreeMap,
-        env,
         future::Future,
         sync::{
             Arc, Mutex,
@@ -3413,18 +3412,11 @@ mod tests {
     };
     use async_trait::async_trait;
     use sof_gossip_tuning::{GossipTuningProfile, HostProfilePreset, IngestQueueMode};
+    use sof_support::bench::profile_iterations;
     use solana_keypair::Keypair;
     use solana_message::{Message, VersionedMessage};
     use solana_signer::Signer;
     use solana_transaction::versioned::VersionedTransaction;
-
-    fn profile_iterations(default: usize) -> usize {
-        env::var("SOF_PROFILE_ITERATIONS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(default)
-    }
 
     fn with_runtime_env_overrides<T>(
         overrides: impl IntoIterator<Item = (String, String)>,

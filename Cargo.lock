@@ -5528,6 +5528,7 @@ dependencies = [
  "socket2 0.5.10",
  "sof-gossip-tuning",
  "sof-solana-gossip",
+ "sof-support",
  "sof-types",
  "solana-entry",
  "solana-epoch-schedule",
@@ -5652,6 +5653,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sof-support"
+version = "0.18.1"
+dependencies = [
+ "sof-types",
+]
+
+[[package]]
 name = "sof-tx"
 version = "0.18.1"
 dependencies = [
@@ -5665,6 +5673,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sof",
+ "sof-support",
  "sof-types",
  "solana-compute-budget-interface",
  "solana-connection-cache",
