@@ -28,6 +28,7 @@ use laserstream_core_proto::tonic::{
     Status, codec::CompressionEncoding, metadata::MetadataValue, transport::Endpoint,
 };
 use sof_support::bytes::{pubkey_bytes_from_slice, signature_bytes_from_slice};
+use sof_support::time_support::duration_secs_ceil;
 use sof_types::SignatureBytes;
 use solana_hash::Hash;
 use solana_message::{
@@ -66,15 +67,6 @@ const LASERSTREAM_SDK_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_ACCOUNT_DATA_LEN: usize = MAX_PERMITTED_DATA_LENGTH as usize;
 const SLOT_STATUS_RETAINED_LAG: u64 = 4_096;
 const SLOT_STATUS_PRUNE_THRESHOLD: usize = SLOT_STATUS_RETAINED_LAG as usize * 2;
-
-const fn duration_secs_ceil(duration: Duration) -> u64 {
-    let secs = duration.as_secs();
-    if duration.subsec_nanos() == 0 {
-        secs
-    } else {
-        secs.saturating_add(1)
-    }
-}
 
 /// LaserStream subscription commitment used for provider-stream transaction updates.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2283,8 +2275,14 @@ fn convert_transaction(
 )]
 mod tests {
     use super::*;
-    use crate::provider_stream::create_provider_stream_queue;
-    use crate::provider_stream::yellowstone::{YellowstoneGrpcCommitment, YellowstoneGrpcConfig};
+    use crate::{
+        event::TxKind,
+        framework::signature_bytes,
+        provider_stream::{
+            create_provider_stream_queue,
+            yellowstone::{YellowstoneGrpcCommitment, YellowstoneGrpcConfig},
+        },
+    };
     use futures_channel::mpsc as futures_mpsc;
     use futures_util::stream::{self, Stream};
     use laserstream_core_proto::geyser::geyser_server::{Geyser, GeyserServer};
@@ -2306,7 +2304,11 @@ mod tests {
     use solana_message::{Message, VersionedMessage};
     use solana_sdk_ids::{compute_budget, system_program, vote};
     use solana_signer::Signer;
-    use std::{pin::Pin, time::Instant};
+    use std::{
+        net::{SocketAddr, TcpListener as StdTcpListener},
+        pin::Pin,
+        time::Instant,
+    };
 
     use sof_support::bench::{avg_ns_per_iteration, profile_iterations};
     use tokio::sync::oneshot;
@@ -3150,12 +3152,8 @@ mod tests {
 
     async fn spawn_laserstream_test_server(
         service: MockLaserStream,
-    ) -> (
-        std::net::SocketAddr,
-        oneshot::Sender<()>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind LaserStream test");
+    ) -> (SocketAddr, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind LaserStream test");
         let addr = listener.local_addr().expect("LaserStream test addr");
         drop(listener);
 
@@ -3181,7 +3179,7 @@ mod tests {
         let transaction =
             transaction.ok_or(LaserStreamError::Convert("missing transaction payload"))?;
         let signature = Signature::try_from(transaction.signature.as_slice())
-            .map(crate::framework::signature_bytes)
+            .map(signature_bytes)
             .map(Some)
             .map_err(|_error| LaserStreamError::Convert("invalid signature"))?;
         let tx = convert_transaction(
@@ -3306,7 +3304,7 @@ mod tests {
 
     #[tokio::test]
     async fn laserstream_spawn_rejects_account_filters_for_block_meta_stream() {
-        let (tx, _rx) = crate::provider_stream::create_provider_stream_queue(1);
+        let (tx, _rx) = create_provider_stream_queue(1);
         let config = LaserStreamConfig::new("http://127.0.0.1:1", "test-api-key")
             .with_stream(LaserStreamStream::BlockMeta)
             .with_accounts([Pubkey::new_unique()]);
@@ -3376,7 +3374,7 @@ mod tests {
         )
         .expect("event");
         assert_eq!(event.slot, 77);
-        assert_eq!(event.kind, crate::event::TxKind::Mixed);
+        assert_eq!(event.kind, TxKind::Mixed);
         assert!(event.signature.is_some());
     }
 
@@ -3390,7 +3388,7 @@ mod tests {
         )
         .expect("event");
         assert_eq!(event.slot, 78);
-        assert_eq!(event.kind, crate::event::TxKind::VoteOnly);
+        assert_eq!(event.kind, TxKind::VoteOnly);
         assert!(event.signature.is_some());
     }
 

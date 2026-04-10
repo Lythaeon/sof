@@ -14,6 +14,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use simd_json::{Buffers as SimdJsonBuffers, serde::from_slice as simd_from_slice};
+use sof_support::short_vec::decode_short_u16_len;
 use sof_types::{PubkeyBytes, SignatureBytes};
 use solana_packet::PACKET_DATA_SIZE;
 use solana_pubkey::Pubkey;
@@ -1809,24 +1810,6 @@ fn serialized_transaction_first_signature(payload: &[u8]) -> Option<SignatureByt
     let end = offset.checked_add(64)?;
     let bytes: [u8; 64] = payload.get(offset..end)?.try_into().ok()?;
     Some(SignatureBytes::from(bytes))
-}
-
-fn decode_short_u16_len(payload: &[u8], offset: &mut usize) -> Option<usize> {
-    let mut value = 0_usize;
-    let mut shift = 0_u32;
-    for byte_index in 0..3 {
-        let byte = usize::from(*payload.get(*offset)?);
-        *offset = (*offset).saturating_add(1);
-        value |= (byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Some(value);
-        }
-        shift = shift.saturating_add(7);
-        if byte_index == 2 {
-            return None;
-        }
-    }
-    None
 }
 
 fn parse_pubkey(input: &str) -> Result<Pubkey, WebsocketTransactionError> {
