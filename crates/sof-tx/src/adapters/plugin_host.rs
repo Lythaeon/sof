@@ -5,17 +5,16 @@ use std::net::SocketAddr;
 use async_trait::async_trait;
 use sof::framework::{
     ClusterTopologyEvent, LeaderScheduleEvent, ObservedRecentBlockhashEvent, ObserverPlugin,
-    PluginConfig, PluginHost, SlotStatusChangedEvent,
+    PluginConfig, PluginHost,
 };
 use sof_types::PubkeyBytes;
 
 use crate::{
+    adapters::TxProviderControlPlaneQuality,
     adapters::common::{
         TxProviderAdapterConfig, TxProviderAdapterCore, TxProviderControlPlaneSnapshot,
         TxProviderFlowSafetyPolicy, TxProviderFlowSafetyReport, take_next_leader_identity_targets,
     },
-    adapters::{TxProviderControlPlaneQuality, TxProviderFlowSafetyIssue},
-    event::ForkSlotStatus,
     providers::{LeaderProvider, LeaderTarget, RecentBlockhashProvider},
     submit::{TxFlowSafetyIssue, TxFlowSafetyQuality, TxFlowSafetySnapshot, TxFlowSafetySource},
 };
@@ -206,9 +205,17 @@ mod tests {
     use std::net::SocketAddr;
 
     use super::*;
-    use sof::framework::{ClusterNodeInfo, ControlPlaneSource, LeaderScheduleEntry, PluginHost};
+    use sof::{
+        event::ForkSlotStatus,
+        framework::{
+            ClusterNodeInfo, ControlPlaneSource, LeaderScheduleEntry, PluginHost,
+            SlotStatusChangedEvent,
+        },
+    };
     use sof_types::PubkeyBytes;
     use solana_pubkey::Pubkey;
+
+    use crate::adapters::TxProviderFlowSafetyIssue;
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))

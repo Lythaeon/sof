@@ -1,25 +1,22 @@
 //! `sof` derived-state adapter that bridges replayable control-plane state into `sof-tx` providers.
 
-use std::{
-    path::{Path, PathBuf},
-    process::id,
-};
+use std::path::{Path, PathBuf};
 
 use arcshift::ArcShift;
 use sof::framework::{
     DerivedStateCheckpoint, DerivedStateCheckpointStore, DerivedStateConsumer,
     DerivedStateConsumerConfig, DerivedStateConsumerFault, DerivedStateControlPlaneQuality,
     DerivedStateControlPlaneStateEvent, DerivedStateFeedEnvelope, DerivedStateFeedEvent,
-    DerivedStatePersistedCheckpoint, ForkSlotStatus,
+    DerivedStatePersistedCheckpoint,
 };
 
 use crate::{
+    adapters::TxProviderControlPlaneQuality,
     adapters::common::{
         TxProviderAdapterConfig, TxProviderAdapterCore, TxProviderAdapterSnapshot,
         TxProviderControlPlaneSnapshot, TxProviderFlowSafetyPolicy, TxProviderFlowSafetyReport,
         take_next_leader_identity_targets,
     },
-    adapters::{TxProviderControlPlaneQuality, TxProviderFlowSafetyIssue},
     providers::{LeaderProvider, LeaderTarget, RecentBlockhashProvider},
     submit::{TxFlowSafetyIssue, TxFlowSafetyQuality, TxFlowSafetySnapshot, TxFlowSafetySource},
 };
@@ -357,18 +354,21 @@ impl DerivedStateConsumer for DerivedStateTxProviderAdapter {
 #[allow(clippy::panic)]
 mod tests {
     use sof_support::time_support::current_unix_nanos;
-    use std::{env, fs, net::SocketAddr, path::PathBuf, sync::Arc, time::UNIX_EPOCH};
+    use std::{env, fs, net::SocketAddr, path::PathBuf, process::id, sync::Arc, time::UNIX_EPOCH};
 
     use sof::framework::{
         BranchReorgedEvent, CheckpointBarrierEvent, CheckpointBarrierReason, ClusterNodeInfo,
         ClusterTopologyEvent, ControlPlaneSource, DerivedStateConsumer, DerivedStateFeedEnvelope,
-        DerivedStateFeedEvent, FeedSequence, FeedSessionId, FeedWatermarks, LeaderScheduleEntry,
-        LeaderScheduleEvent, ObservedRecentBlockhashEvent, SlotStatusChangedEvent,
+        DerivedStateFeedEvent, FeedSequence, FeedSessionId, FeedWatermarks, ForkSlotStatus,
+        LeaderScheduleEntry, LeaderScheduleEvent, ObservedRecentBlockhashEvent,
+        SlotStatusChangedEvent,
     };
     use sof_types::PubkeyBytes;
     use solana_pubkey::Pubkey;
 
     use super::*;
+
+    use crate::adapters::TxProviderFlowSafetyIssue;
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
