@@ -21,6 +21,7 @@ impl OutstandingRepairKey {
 #[derive(Debug)]
 pub struct OutstandingRepairRequests {
     entries: HashMap<OutstandingRepairKey, Instant>,
+    #[cfg(any(feature = "gossip-bootstrap", test))]
     /// Insertion order for expiry, including stale superseded timestamps.
     order: VecDeque<(OutstandingRepairKey, Instant)>,
     #[cfg(any(feature = "gossip-bootstrap", test))]
@@ -33,13 +34,14 @@ impl OutstandingRepairRequests {
         let _ = timeout;
         Self {
             entries: HashMap::new(),
+            #[cfg(any(feature = "gossip-bootstrap", test))]
             order: VecDeque::new(),
             #[cfg(any(feature = "gossip-bootstrap", test))]
             timeout,
         }
     }
 
-    #[cfg(feature = "gossip-bootstrap")]
+    #[cfg(any(feature = "gossip-bootstrap", test))]
     pub fn purge_expired(&mut self, now: Instant) -> usize {
         let mut removed = 0_usize;
         while let Some((_, front_sent_at)) = self.order.front() {
