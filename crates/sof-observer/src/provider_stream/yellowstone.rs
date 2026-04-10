@@ -50,6 +50,8 @@ use crate::{
 
 const INTERNAL_SLOT_FILTER: &str = "__sof_internal_slots";
 const MAX_ACCOUNT_DATA_LEN: usize = MAX_PERMITTED_DATA_LENGTH as usize;
+const SLOT_STATUS_RETAINED_LAG: u64 = 4_096;
+const SLOT_STATUS_PRUNE_THRESHOLD: usize = SLOT_STATUS_RETAINED_LAG as usize * 2;
 
 /// Yellowstone subscription commitment used for provider-stream transaction updates.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1909,6 +1911,7 @@ fn slot_status_event_from_update(
         | SlotStatus::SlotCreatedBank => ForkSlotStatus::Processed,
     };
     let previous_status = slot_states.insert(slot, mapped);
+    prune_slot_status_states(slot, slot_states);
     if previous_status == Some(mapped) {
         return None;
     }
@@ -1922,6 +1925,14 @@ fn slot_status_event_from_update(
         finalized_slot: watermarks.finalized_slot,
         provider_source: None,
     })
+}
+
+fn prune_slot_status_states(slot: u64, slot_states: &mut HashMap<u64, ForkSlotStatus>) {
+    if slot_states.len() <= SLOT_STATUS_PRUNE_THRESHOLD {
+        return;
+    }
+    let slot_floor = slot.saturating_sub(SLOT_STATUS_RETAINED_LAG);
+    slot_states.retain(|tracked_slot, _| *tracked_slot >= slot_floor);
 }
 
 impl ProviderStreamFanIn {
@@ -2127,6 +2138,30 @@ mod tests {
             error,
             YellowstoneGrpcError::Convert("account data exceeds max permitted size")
         ));
+    }
+
+    #[test]
+    fn yellowstone_slot_state_pruning_evicts_old_slots() {
+        let mut slot_states = HashMap::new();
+        for slot in 0..=u64::try_from(SLOT_STATUS_PRUNE_THRESHOLD).unwrap_or(u64::MAX) {
+            let _ = slot_states.insert(slot, ForkSlotStatus::Processed);
+        }
+
+        prune_slot_status_states(10_000, &mut slot_states);
+
+        assert!(
+            !slot_states.contains_key(&0),
+            "old tracked slots should be pruned"
+        );
+        assert!(
+            slot_states.contains_key(&10_000_u64.saturating_sub(SLOT_STATUS_RETAINED_LAG)),
+            "recent tracked slots should stay resident"
+        );
+        assert!(
+            slot_states.len()
+                <= usize::try_from(SLOT_STATUS_RETAINED_LAG + 1).unwrap_or(usize::MAX),
+            "tracked slot state should stay bounded"
+        );
     }
 
     fn sample_transaction() -> VersionedTransaction {
