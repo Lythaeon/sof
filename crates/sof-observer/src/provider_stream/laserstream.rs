@@ -538,47 +538,20 @@ impl LaserStreamConfig {
     }
 
     fn client_config(&self) -> ClientConfig {
-        let mut options = ChannelOptions::default();
-        if let Some(timeout) = self.connect_timeout {
-            options.connect_timeout_secs = Some(duration_secs_ceil(timeout));
-        }
-        if let Some(timeout) = self.timeout {
-            options.timeout_secs = Some(duration_secs_ceil(timeout));
-        }
-        if let Some(bytes) = self.max_decoding_message_size {
-            options.max_decoding_message_size = Some(bytes);
-        }
-        if let Some(bytes) = self.max_encoding_message_size {
-            options.max_encoding_message_size = Some(bytes);
-        }
-
-        let mut config = ClientConfig::new(self.endpoint.clone(), self.api_key.clone())
-            .with_channel_options(options)
-            .with_replay(!matches!(self.replay_mode, ProviderReplayMode::Live));
-        if let Some(attempts) = self.max_reconnect_attempts {
-            config = config.with_max_reconnect_attempts(attempts);
-        }
-        config
+        laserstream_client_config(&LaserStreamClientConfigInputs {
+            endpoint: &self.endpoint,
+            api_key: &self.api_key,
+            connect_timeout: self.connect_timeout,
+            request_timeout: self.timeout,
+            max_decoding_message_size: self.max_decoding_message_size,
+            max_encoding_message_size: self.max_encoding_message_size,
+            replay_mode: self.replay_mode,
+            max_reconnect_attempts: self.max_reconnect_attempts,
+        })
     }
 
     const fn replay_from_slot(&self, tracked_slot: u64) -> Option<u64> {
-        match self.replay_mode {
-            ProviderReplayMode::Live => None,
-            ProviderReplayMode::Resume => {
-                if tracked_slot == 0 {
-                    None
-                } else {
-                    Some(tracked_slot)
-                }
-            }
-            ProviderReplayMode::FromSlot(slot) => {
-                if tracked_slot == 0 {
-                    Some(slot)
-                } else {
-                    Some(tracked_slot)
-                }
-            }
-        }
+        laserstream_replay_from_slot(self.replay_mode, tracked_slot)
     }
 
     fn transaction_filter(&self) -> grpc::SubscribeRequestFilterTransactions {
@@ -665,6 +638,64 @@ impl LaserStreamConfig {
             LaserStreamStream::TransactionStatus => LaserStreamStreamKind::TransactionStatus,
             LaserStreamStream::Accounts => LaserStreamStreamKind::Accounts,
             LaserStreamStream::BlockMeta => LaserStreamStreamKind::BlockMeta,
+        }
+    }
+}
+
+struct LaserStreamClientConfigInputs<'config> {
+    endpoint: &'config str,
+    api_key: &'config str,
+    connect_timeout: Option<Duration>,
+    request_timeout: Option<Duration>,
+    max_decoding_message_size: Option<usize>,
+    max_encoding_message_size: Option<usize>,
+    replay_mode: ProviderReplayMode,
+    max_reconnect_attempts: Option<u32>,
+}
+
+fn laserstream_client_config(inputs: &LaserStreamClientConfigInputs<'_>) -> ClientConfig {
+    let mut options = ChannelOptions::default();
+    if let Some(connect_timeout) = inputs.connect_timeout {
+        options.connect_timeout_secs = Some(duration_secs_ceil(connect_timeout));
+    }
+    if let Some(request_timeout) = inputs.request_timeout {
+        options.timeout_secs = Some(duration_secs_ceil(request_timeout));
+    }
+    if let Some(bytes) = inputs.max_decoding_message_size {
+        options.max_decoding_message_size = Some(bytes);
+    }
+    if let Some(bytes) = inputs.max_encoding_message_size {
+        options.max_encoding_message_size = Some(bytes);
+    }
+
+    let mut config = ClientConfig::new(inputs.endpoint.to_owned(), inputs.api_key.to_owned())
+        .with_channel_options(options)
+        .with_replay(!matches!(inputs.replay_mode, ProviderReplayMode::Live));
+    if let Some(attempts) = inputs.max_reconnect_attempts {
+        config = config.with_max_reconnect_attempts(attempts);
+    }
+    config
+}
+
+const fn laserstream_replay_from_slot(
+    replay_mode: ProviderReplayMode,
+    tracked_slot: u64,
+) -> Option<u64> {
+    match replay_mode {
+        ProviderReplayMode::Live => None,
+        ProviderReplayMode::Resume => {
+            if tracked_slot == 0 {
+                None
+            } else {
+                Some(tracked_slot)
+            }
+        }
+        ProviderReplayMode::FromSlot(slot) => {
+            if tracked_slot == 0 {
+                Some(slot)
+            } else {
+                Some(tracked_slot)
+            }
         }
     }
 }
@@ -885,47 +916,20 @@ impl LaserStreamSlotsConfig {
     }
 
     fn client_config(&self) -> ClientConfig {
-        let mut options = ChannelOptions::default();
-        if let Some(timeout) = self.connect_timeout {
-            options.connect_timeout_secs = Some(duration_secs_ceil(timeout));
-        }
-        if let Some(timeout) = self.timeout {
-            options.timeout_secs = Some(duration_secs_ceil(timeout));
-        }
-        if let Some(bytes) = self.max_decoding_message_size {
-            options.max_decoding_message_size = Some(bytes);
-        }
-        if let Some(bytes) = self.max_encoding_message_size {
-            options.max_encoding_message_size = Some(bytes);
-        }
-
-        let mut config = ClientConfig::new(self.endpoint.clone(), self.api_key.clone())
-            .with_channel_options(options)
-            .with_replay(!matches!(self.replay_mode, ProviderReplayMode::Live));
-        if let Some(attempts) = self.max_reconnect_attempts {
-            config = config.with_max_reconnect_attempts(attempts);
-        }
-        config
+        laserstream_client_config(&LaserStreamClientConfigInputs {
+            endpoint: &self.endpoint,
+            api_key: &self.api_key,
+            connect_timeout: self.connect_timeout,
+            request_timeout: self.timeout,
+            max_decoding_message_size: self.max_decoding_message_size,
+            max_encoding_message_size: self.max_encoding_message_size,
+            replay_mode: self.replay_mode,
+            max_reconnect_attempts: self.max_reconnect_attempts,
+        })
     }
 
     const fn replay_from_slot(&self, tracked_slot: u64) -> Option<u64> {
-        match self.replay_mode {
-            ProviderReplayMode::Live => None,
-            ProviderReplayMode::Resume => {
-                if tracked_slot == 0 {
-                    None
-                } else {
-                    Some(tracked_slot)
-                }
-            }
-            ProviderReplayMode::FromSlot(slot) => {
-                if tracked_slot == 0 {
-                    Some(slot)
-                } else {
-                    Some(tracked_slot)
-                }
-            }
-        }
+        laserstream_replay_from_slot(self.replay_mode, tracked_slot)
     }
 }
 
