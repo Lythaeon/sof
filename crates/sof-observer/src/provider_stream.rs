@@ -210,6 +210,9 @@ use solana_transaction::versioned::VersionedTransaction;
 
 /// Default queue capacity for processed provider-stream ingress.
 pub const DEFAULT_PROVIDER_STREAM_QUEUE_CAPACITY: usize = 8_192;
+/// Smallest keepalive period accepted by provider intervals to avoid Tokio zero-period panics.
+#[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
+const MIN_KEEPALIVE_INTERVAL: Duration = Duration::from_millis(1);
 /// Stable compute-budget program id reused in provider transaction classifiers.
 const COMPUTE_BUDGET_PROGRAM_ID: solana_pubkey::Pubkey = compute_budget::ID;
 /// Stable vote program id reused in provider transaction classifiers.
@@ -218,6 +221,11 @@ const VOTE_PROGRAM_ID: solana_pubkey::Pubkey = vote::ID;
 /// Creates one keepalive interval that waits one full period before the first tick.
 #[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
 pub(crate) fn keepalive_interval(period: Duration) -> Interval {
+    let period = if period.is_zero() {
+        MIN_KEEPALIVE_INTERVAL
+    } else {
+        period
+    };
     let start = TokioInstant::now();
     let first_tick = start.checked_add(period).unwrap_or(start);
     interval_at(first_tick, period)
@@ -1387,6 +1395,14 @@ mod tests {
         timeout(Duration::from_millis(50), interval.tick())
             .await
             .expect("keepalive interval should tick after one full period");
+    }
+
+    #[tokio::test]
+    async fn keepalive_interval_zero_period_is_clamped() {
+        let mut interval = keepalive_interval(Duration::ZERO);
+        timeout(Duration::from_millis(50), interval.tick())
+            .await
+            .expect("zero keepalive period should not panic or stall");
     }
 
     fn classify_provider_transaction_kind_baseline(tx: &VersionedTransaction) -> TxKind {
