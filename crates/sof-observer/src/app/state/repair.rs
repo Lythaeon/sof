@@ -21,6 +21,8 @@ impl OutstandingRepairKey {
 #[derive(Debug)]
 pub struct OutstandingRepairRequests {
     entries: HashMap<OutstandingRepairKey, Instant>,
+    /// Insertion order for expiry, including stale superseded timestamps.
+    order: VecDeque<(OutstandingRepairKey, Instant)>,
     #[cfg(any(feature = "gossip-bootstrap", test))]
     timeout: Duration,
 }
@@ -31,6 +33,7 @@ impl OutstandingRepairRequests {
         let _ = timeout;
         Self {
             entries: HashMap::new(),
+            order: VecDeque::new(),
             #[cfg(any(feature = "gossip-bootstrap", test))]
             timeout,
         }
@@ -38,10 +41,20 @@ impl OutstandingRepairRequests {
 
     #[cfg(feature = "gossip-bootstrap")]
     pub fn purge_expired(&mut self, now: Instant) -> usize {
-        let before = self.entries.len();
-        self.entries
-            .retain(|_, sent_at| now.saturating_duration_since(*sent_at) < self.timeout);
-        before.saturating_sub(self.entries.len())
+        let mut removed = 0_usize;
+        while let Some((_, front_sent_at)) = self.order.front() {
+            if now.saturating_duration_since(*front_sent_at) < self.timeout {
+                break;
+            }
+            let Some((key, queued_sent_at)) = self.order.pop_front() else {
+                break;
+            };
+            if self.entries.get(&key) == Some(&queued_sent_at) {
+                let _ = self.entries.remove(&key);
+                removed = removed.saturating_add(1);
+            }
+        }
+        removed
     }
 
     #[cfg(any(feature = "gossip-bootstrap", test))]
@@ -52,9 +65,11 @@ impl OutstandingRepairRequests {
                 return false;
             }
             *sent_at = now;
+            self.order.push_back((key, now));
             return true;
         }
         let _ = self.entries.insert(key, now);
+        self.order.push_back((key, now));
         true
     }
 
