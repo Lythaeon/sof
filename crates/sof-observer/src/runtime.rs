@@ -2728,13 +2728,6 @@ fn dispatch_provider_stream_serialized_transaction(
     if should_try_view
         && let Ok(view) = SanitizedTransactionView::try_new_sanitized(event.bytes.as_ref(), true)
     {
-        if needs_transaction_event && signature.is_none() {
-            signature = view
-                .signatures()
-                .first()
-                .copied()
-                .map(SignatureBytes::from_solana);
-        }
         if wants_recent_blockhash {
             recent_blockhash = Some(view.recent_blockhash().to_bytes());
         }
@@ -2771,6 +2764,13 @@ fn dispatch_provider_stream_serialized_transaction(
             return;
         }
         if wants_transaction || wants_derived_state_transaction {
+            if signature.is_none() {
+                signature = view
+                    .signatures()
+                    .first()
+                    .copied()
+                    .map(SignatureBytes::from_solana);
+            }
             kind = Some(provider_stream::classify_provider_transaction_kind_view(
                 &view,
             ));
