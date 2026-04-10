@@ -364,12 +364,23 @@ impl GossipRepairClient {
                 .cmp(&self.score_for(left.pubkey))
                 .then_with(|| left.pubkey.to_bytes().cmp(&right.pubkey.to_bytes()))
         });
-        let mut peers = candidates.clone();
-        if peers.len() > self.active_peer_count {
-            peers.truncate(self.active_peer_count);
-        }
+        let peers = candidates
+            .iter()
+            .take(self.active_peer_count)
+            .copied()
+            .collect::<Vec<_>>();
         self.addr_to_pubkey.clear();
         self.ip_to_pubkeys.clear();
+        self.addr_to_pubkey.reserve(
+            candidates
+                .len()
+                .saturating_sub(self.addr_to_pubkey.capacity()),
+        );
+        self.ip_to_pubkeys.reserve(
+            candidates
+                .len()
+                .saturating_sub(self.ip_to_pubkeys.capacity()),
+        );
         for peer in &candidates {
             let _ = self.addr_to_pubkey.insert(peer.addr, peer.pubkey);
             self.ip_to_pubkeys
@@ -412,8 +423,9 @@ impl GossipRepairClient {
         slot: u64,
         all_peers: &[(ContactInfo, u64)],
     ) -> Vec<RepairPeer> {
-        let mut seen = HashSet::new();
-        let mut peers = Vec::new();
+        let estimated_peers = all_peers.len().saturating_add(1);
+        let mut seen = HashSet::with_capacity(estimated_peers);
+        let mut peers = Vec::with_capacity(estimated_peers);
         for contact_info in self.cluster_info.repair_peers(slot) {
             let Some(addr) = contact_info.serve_repair(Protocol::UDP) else {
                 continue;
@@ -778,30 +790,50 @@ mod tests {
             .filter(|value| *value > 0)
             .unwrap_or(64);
         let slot = 77_u64;
-        let mut client = profile_repair_client(peer_count);
-        client.peer_cache_ttl = Duration::ZERO;
+        let mut baseline_client = profile_repair_client(peer_count);
+        baseline_client.peer_cache_ttl = Duration::ZERO;
+        let mut optimized_client = profile_repair_client(peer_count);
+        optimized_client.peer_cache_ttl = Duration::ZERO;
 
-        let started_at = Instant::now();
-        let mut total_candidates = 0_u64;
-        let mut active_candidates = 0_u64;
+        let baseline_started_at = Instant::now();
+        let mut baseline_total_candidates = 0_u64;
+        let mut baseline_active_candidates = 0_u64;
         for _ in 0..iterations {
-            let (total, active) = client.refresh_peer_snapshot(slot);
-            total_candidates =
-                total_candidates.saturating_add(u64::try_from(total).unwrap_or(u64::MAX));
-            active_candidates =
-                active_candidates.saturating_add(u64::try_from(active).unwrap_or(u64::MAX));
+            let (total, active) = refresh_peer_snapshot_baseline(&mut baseline_client, slot);
+            baseline_total_candidates =
+                baseline_total_candidates.saturating_add(u64::try_from(total).unwrap_or(u64::MAX));
+            baseline_active_candidates = baseline_active_candidates
+                .saturating_add(u64::try_from(active).unwrap_or(u64::MAX));
         }
-        let elapsed = started_at.elapsed();
-        let avg_ns = avg_ns_per_iteration(elapsed, iterations);
+        let baseline_elapsed = baseline_started_at.elapsed();
+
+        let optimized_started_at = Instant::now();
+        let mut optimized_total_candidates = 0_u64;
+        let mut optimized_active_candidates = 0_u64;
+        for _ in 0..iterations {
+            let (total, active) = optimized_client.refresh_peer_snapshot(slot);
+            optimized_total_candidates =
+                optimized_total_candidates.saturating_add(u64::try_from(total).unwrap_or(u64::MAX));
+            optimized_active_candidates = optimized_active_candidates
+                .saturating_add(u64::try_from(active).unwrap_or(u64::MAX));
+        }
+        let optimized_elapsed = optimized_started_at.elapsed();
+        let baseline_avg_ns = avg_ns_per_iteration(baseline_elapsed, iterations);
+        let optimized_avg_ns = avg_ns_per_iteration(optimized_elapsed, iterations);
         println!(
-            "repair_refresh_peer_snapshot_profile_fixture iterations={} peer_count={} total_candidates={} active_candidates={} elapsed_ms={} avg_ns_per_iteration={} avg_us_per_iteration={:.3}",
+            "repair_refresh_peer_snapshot_profile_fixture iterations={} peer_count={} baseline_total_candidates={} baseline_active_candidates={} optimized_total_candidates={} optimized_active_candidates={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.3} optimized_avg_us_per_iteration={:.3}",
             iterations,
             peer_count,
-            total_candidates,
-            active_candidates,
-            elapsed.as_millis(),
-            avg_ns,
-            avg_ns as f64 / 1_000.0
+            baseline_total_candidates,
+            baseline_active_candidates,
+            optimized_total_candidates,
+            optimized_active_candidates,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
+            baseline_avg_ns,
+            optimized_avg_ns,
+            baseline_avg_ns as f64 / 1_000.0,
+            optimized_avg_ns as f64 / 1_000.0
         );
     }
 
@@ -904,5 +936,138 @@ mod tests {
             avg_ns,
             avg_ns as f64 / 1_000.0
         );
+    }
+
+    fn refresh_peer_snapshot_baseline(
+        client: &mut GossipRepairClient,
+        slot: u64,
+    ) -> (usize, usize) {
+        refresh_peers_baseline(client, slot);
+        let snapshot = client.peer_snapshot.shared_get();
+        (snapshot.total_candidates, snapshot.active_candidates)
+    }
+
+    fn refresh_peers_baseline(client: &mut GossipRepairClient, slot: u64) {
+        client.decay_peer_scores();
+        client
+            .peers_by_slot
+            .retain(|_, cached| cached.updated_at.elapsed() < client.peer_cache_ttl);
+        client.sticky_peer_by_slot.retain(|slot_key, sticky| {
+            client.peers_by_slot.contains_key(slot_key)
+                && sticky.selected_at.elapsed() < client.peer_cache_ttl
+        });
+        if client.peers_by_slot.len() > client.peer_cache_capacity {
+            let mut keys: Vec<_> = client.peers_by_slot.keys().copied().collect();
+            keys.sort_unstable_by_key(|key| {
+                client
+                    .peers_by_slot
+                    .get(key)
+                    .map(|cached| cached.updated_at)
+                    .unwrap_or_else(Instant::now)
+            });
+            let overflow = client
+                .peers_by_slot
+                .len()
+                .saturating_sub(client.peer_cache_capacity);
+            for key in keys.into_iter().take(overflow) {
+                let _ = client.peers_by_slot.remove(&key);
+                let _ = client.sticky_peer_by_slot.remove(&key);
+            }
+        }
+        let should_refresh = client
+            .peers_by_slot
+            .get(&slot)
+            .map(|cached| cached.updated_at.elapsed() >= client.peer_cache_ttl)
+            .unwrap_or(true);
+        if !should_refresh {
+            return;
+        }
+        let all_peers = client.cluster_info.all_peers();
+        client.refresh_stake_map(&all_peers);
+        let mut candidates = collect_candidate_peers_baseline(client, slot, &all_peers);
+        let total_candidates = candidates.len();
+        candidates.sort_unstable_by(|left, right| {
+            client
+                .score_for(right.pubkey)
+                .cmp(&client.score_for(left.pubkey))
+                .then_with(|| left.pubkey.to_bytes().cmp(&right.pubkey.to_bytes()))
+        });
+        let mut peers = candidates.clone();
+        if peers.len() > client.active_peer_count {
+            peers.truncate(client.active_peer_count);
+        }
+        client.addr_to_pubkey.clear();
+        client.ip_to_pubkeys.clear();
+        for peer in &candidates {
+            let _ = client.addr_to_pubkey.insert(peer.addr, peer.pubkey);
+            client
+                .ip_to_pubkeys
+                .entry(peer.addr.ip())
+                .or_default()
+                .push(peer.pubkey);
+            let _ = client.peer_scores.entry(peer.pubkey).or_default();
+        }
+        for pubkeys in client.ip_to_pubkeys.values_mut() {
+            pubkeys.sort_unstable_by_key(Pubkey::to_bytes);
+            pubkeys.dedup();
+        }
+        let _ = client.peers_by_slot.insert(
+            slot,
+            CachedPeers {
+                updated_at: Instant::now(),
+                peers: peers.clone(),
+            },
+        );
+        client.publish_peer_snapshot(total_candidates, &peers, &all_peers);
+    }
+
+    fn collect_candidate_peers_baseline(
+        client: &GossipRepairClient,
+        slot: u64,
+        all_peers: &[(ContactInfo, u64)],
+    ) -> Vec<RepairPeer> {
+        let mut seen = HashSet::new();
+        let mut peers = Vec::new();
+        for contact_info in client.cluster_info.repair_peers(slot) {
+            let Some(addr) = contact_info.serve_repair(Protocol::UDP) else {
+                continue;
+            };
+            let peer = RepairPeer {
+                pubkey: *contact_info.pubkey(),
+                addr,
+                stake_lamports: client
+                    .stake_by_pubkey
+                    .get(contact_info.pubkey())
+                    .copied()
+                    .unwrap_or_default(),
+            };
+            if seen.insert((peer.pubkey, peer.addr)) {
+                peers.push(peer);
+            }
+        }
+        if peers.is_empty() {
+            let self_pubkey = client.cluster_info.id();
+            let self_shred_version = client.cluster_info.my_shred_version();
+            for (contact_info, stake_lamports) in all_peers {
+                if contact_info.pubkey() == &self_pubkey
+                    || contact_info.shred_version() != self_shred_version
+                    || contact_info.tvu(Protocol::UDP).is_none()
+                {
+                    continue;
+                }
+                let Some(addr) = contact_info.serve_repair(Protocol::UDP) else {
+                    continue;
+                };
+                let peer = RepairPeer {
+                    pubkey: *contact_info.pubkey(),
+                    addr,
+                    stake_lamports: *stake_lamports,
+                };
+                if seen.insert((peer.pubkey, peer.addr)) {
+                    peers.push(peer);
+                }
+            }
+        }
+        peers
     }
 }
