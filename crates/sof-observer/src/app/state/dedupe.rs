@@ -164,7 +164,6 @@ impl ShredDedupeCache {
             if matches!(observation, ShredDedupeObservation::Accepted) {
                 existing.seen_at = now;
                 self.order.push_back((now, key));
-                self.evict(now);
                 self.observe_depths();
             }
             return observation;
