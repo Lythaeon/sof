@@ -45,7 +45,6 @@ use sof_gossip_tuning::{
     TvuReceiveSocketCount,
 };
 use solana_packet::PACKET_DATA_SIZE;
-use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 use thiserror::Error;
 
@@ -2149,7 +2148,7 @@ const fn provider_stream_mode_accepts_source_kind(
 enum ProviderReplayLogicalKey {
     Transaction {
         slot: u64,
-        signature: Signature,
+        signature: SignatureBytes,
         commitment_status: u8,
         confirmed_slot: Option<u64>,
         finalized_slot: Option<u64>,
@@ -2425,8 +2424,14 @@ fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderR
     match update {
         ProviderStreamUpdate::Transaction(event) => event
             .signature
-            .map(SignatureBytes::to_solana)
-            .or_else(|| event.tx.signatures.first().copied())
+            .or_else(|| {
+                event
+                    .tx
+                    .signatures
+                    .first()
+                    .copied()
+                    .map(SignatureBytes::from_solana)
+            })
             .map(|signature| ProviderReplayLogicalKey::Transaction {
                 slot: event.slot,
                 signature,
@@ -2434,28 +2439,26 @@ fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderR
                 confirmed_slot: event.confirmed_slot,
                 finalized_slot: event.finalized_slot,
             }),
-        ProviderStreamUpdate::SerializedTransaction(event) => {
-            event.signature.map(SignatureBytes::to_solana).map_or_else(
-                || {
-                    Some(ProviderReplayLogicalKey::SerializedTransaction {
-                        slot: event.slot,
-                        commitment_status: provider_replay_commitment_key(event.commitment_status),
-                        confirmed_slot: event.confirmed_slot,
-                        finalized_slot: event.finalized_slot,
-                        fingerprint: provider_replay_fingerprint(&event.bytes),
-                    })
-                },
-                |signature| {
-                    Some(ProviderReplayLogicalKey::Transaction {
-                        slot: event.slot,
-                        signature,
-                        commitment_status: provider_replay_commitment_key(event.commitment_status),
-                        confirmed_slot: event.confirmed_slot,
-                        finalized_slot: event.finalized_slot,
-                    })
-                },
-            )
-        }
+        ProviderStreamUpdate::SerializedTransaction(event) => event.signature.map_or_else(
+            || {
+                Some(ProviderReplayLogicalKey::SerializedTransaction {
+                    slot: event.slot,
+                    commitment_status: provider_replay_commitment_key(event.commitment_status),
+                    confirmed_slot: event.confirmed_slot,
+                    finalized_slot: event.finalized_slot,
+                    fingerprint: provider_replay_fingerprint(&event.bytes),
+                })
+            },
+            |signature| {
+                Some(ProviderReplayLogicalKey::Transaction {
+                    slot: event.slot,
+                    signature,
+                    commitment_status: provider_replay_commitment_key(event.commitment_status),
+                    confirmed_slot: event.confirmed_slot,
+                    finalized_slot: event.finalized_slot,
+                })
+            },
+        ),
         ProviderStreamUpdate::RecentBlockhash(event) => {
             Some(ProviderReplayLogicalKey::ControlPlane {
                 slot: event.slot,
@@ -3415,9 +3418,10 @@ mod tests {
     };
     use async_trait::async_trait;
     use sof_gossip_tuning::{GossipTuningProfile, HostProfilePreset, IngestQueueMode};
-    use sof_support::bench::profile_iterations;
+    use sof_support::bench::{avg_ns_per_iteration, profile_iterations};
     use solana_keypair::Keypair;
     use solana_message::{Message, VersionedMessage};
+    use solana_signature::Signature;
     use solana_signer::Signer;
     use solana_transaction::versioned::VersionedTransaction;
 
@@ -5980,12 +5984,18 @@ mod tests {
             optimized.observe(update);
         }
         let optimized_elapsed = optimized_started.elapsed();
+        let baseline_avg_ns = avg_ns_per_iteration(baseline_elapsed, iterations);
+        let optimized_avg_ns = avg_ns_per_iteration(optimized_elapsed, iterations);
 
         eprintln!(
-            "provider_replay_dedupe_eviction_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            "provider_replay_dedupe_eviction_profile_fixture iterations={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.3} optimized_avg_us_per_iteration={:.3}",
             iterations,
             baseline_elapsed.as_micros(),
             optimized_elapsed.as_micros(),
+            baseline_avg_ns,
+            optimized_avg_ns,
+            baseline_avg_ns as f64 / 1_000.0,
+            optimized_avg_ns as f64 / 1_000.0,
         );
     }
 }
