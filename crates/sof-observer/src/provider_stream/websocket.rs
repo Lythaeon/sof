@@ -2645,15 +2645,16 @@ impl RpcLoadedAddresses {
 )]
 mod tests {
     use super::*;
+    #[cfg(feature = "provider-grpc")]
+    use crate::provider_stream::yellowstone::{YellowstoneGrpcCommitment, YellowstoneGrpcConfig};
     use crate::{
         event::TxKind,
-        provider_stream::{
-            create_provider_stream_fan_in, create_provider_stream_queue,
-            yellowstone::{YellowstoneGrpcCommitment, YellowstoneGrpcConfig},
-        },
+        provider_stream::{create_provider_stream_fan_in, create_provider_stream_queue},
     };
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-    use serde_json::{json, to_value};
+    use serde_json::json;
+    #[cfg(feature = "provider-grpc")]
+    use serde_json::to_value;
     use sof_support::bench::{avg_ns_per_iteration, profile_iterations};
     use solana_keypair::Keypair;
     use solana_message::{Message, VersionedMessage};
