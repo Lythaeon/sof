@@ -2192,9 +2192,12 @@ fn convert_transaction(
 ) -> Result<VersionedTransaction, LaserStreamError> {
     let mut signatures = Vec::with_capacity(tx.signatures.len());
     for signature in tx.signatures {
-        signatures.push(Signature::try_from(signature.as_slice()).map_err(|_error| {
-            LaserStreamError::Convert("failed to parse transaction signature")
-        })?);
+        signatures.push(
+            signature_bytes_from_slice(signature.as_slice(), || {
+                LaserStreamError::Convert("failed to parse transaction signature")
+            })?
+            .into(),
+        );
     }
     let message = tx
         .message
@@ -2219,8 +2222,10 @@ fn convert_transaction(
     let mut account_keys = Vec::with_capacity(message.account_keys.len());
     for key in message.account_keys {
         account_keys.push(
-            Pubkey::try_from(key.as_slice())
-                .map_err(|_error| LaserStreamError::Convert("invalid account key"))?,
+            pubkey_bytes_from_slice(key.as_slice(), || {
+                LaserStreamError::Convert("invalid account key")
+            })?
+            .into(),
         );
     }
 
@@ -2239,9 +2244,10 @@ fn convert_transaction(
         let mut address_table_lookups = Vec::with_capacity(message.address_table_lookups.len());
         for lookup in message.address_table_lookups {
             address_table_lookups.push(MessageAddressTableLookup {
-                account_key: Pubkey::try_from(lookup.account_key.as_slice()).map_err(|_error| {
+                account_key: pubkey_bytes_from_slice(lookup.account_key.as_slice(), || {
                     LaserStreamError::Convert("invalid address table account key")
-                })?,
+                })?
+                .into(),
                 writable_indexes: lookup.writable_indexes,
                 readonly_indexes: lookup.readonly_indexes,
             });

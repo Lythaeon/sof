@@ -1998,9 +1998,12 @@ fn convert_transaction(
 ) -> Result<VersionedTransaction, YellowstoneGrpcError> {
     let mut signatures = Vec::with_capacity(tx.signatures.len());
     for signature in tx.signatures {
-        signatures.push(Signature::try_from(signature.as_slice()).map_err(|_error| {
-            YellowstoneGrpcError::Convert("failed to parse transaction signature")
-        })?);
+        signatures.push(
+            signature_bytes_from_slice(signature.as_slice(), || {
+                YellowstoneGrpcError::Convert("failed to parse transaction signature")
+            })?
+            .into(),
+        );
     }
     let message = convert_message(
         tx.message
@@ -2033,8 +2036,10 @@ fn convert_message(
     let mut account_keys = Vec::with_capacity(message.account_keys.len());
     for key in message.account_keys {
         account_keys.push(
-            Pubkey::try_from(key.as_slice())
-                .map_err(|_error| YellowstoneGrpcError::Convert("invalid account key"))?,
+            pubkey_bytes_from_slice(key.as_slice(), || {
+                YellowstoneGrpcError::Convert("invalid account key")
+            })?
+            .into(),
         );
     }
     let recent_blockhash = <[u8; 32]>::try_from(message.recent_blockhash.as_slice())
@@ -2054,9 +2059,10 @@ fn convert_message(
         let mut address_table_lookups = Vec::with_capacity(message.address_table_lookups.len());
         for lookup in message.address_table_lookups {
             address_table_lookups.push(MessageAddressTableLookup {
-                account_key: Pubkey::try_from(lookup.account_key.as_slice()).map_err(|_error| {
+                account_key: pubkey_bytes_from_slice(lookup.account_key.as_slice(), || {
                     YellowstoneGrpcError::Convert("invalid address table account key")
-                })?,
+                })?
+                .into(),
                 writable_indexes: lookup.writable_indexes,
                 readonly_indexes: lookup.readonly_indexes,
             });
