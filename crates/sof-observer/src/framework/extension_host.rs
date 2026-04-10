@@ -18,7 +18,7 @@ use tokio::{
     io::AsyncReadExt,
     net::{TcpListener, TcpStream, UdpSocket},
     sync::mpsc,
-    task::JoinHandle,
+    task::{JoinHandle, JoinSet},
     time::timeout,
 };
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
@@ -1099,34 +1099,39 @@ async fn spawn_tcp_listener(
         .read_buffer_bytes
         .max(DEFAULT_RESOURCE_READ_BUFFER_BYTES);
     let handle = tokio::spawn(async move {
+        let mut connections = JoinSet::new();
         loop {
-            match listener.accept().await {
-                Ok((stream, remote_addr)) => {
-                    let local_addr = stream.local_addr().ok();
-                    let emitter = ExtensionResourceEmitter::new(
-                        host.clone(),
-                        &owner_extension,
-                        &resource_id,
-                        shared_tag.clone(),
-                        RuntimePacketTransport::Tcp,
-                        local_addr,
-                        Some(remote_addr),
-                    );
-                    read_tcp_stream_packets(
-                        ExtensionResourceReadContext::new(emitter, read_buffer_bytes),
-                        stream,
-                    )
-                    .await;
+            tokio::select! {
+                accepted = listener.accept() => {
+                    match accepted {
+                        Ok((stream, remote_addr)) => {
+                            let local_addr = stream.local_addr().ok();
+                            let emitter = ExtensionResourceEmitter::new(
+                                host.clone(),
+                                &owner_extension,
+                                &resource_id,
+                                shared_tag.clone(),
+                                RuntimePacketTransport::Tcp,
+                                local_addr,
+                                Some(remote_addr),
+                            );
+                            connections.spawn(read_tcp_stream_packets(
+                                ExtensionResourceReadContext::new(emitter, read_buffer_bytes),
+                                stream,
+                            ));
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                extension = owner_extension,
+                                resource_id,
+                                error = %error,
+                                "tcp extension listener accept loop terminated"
+                            );
+                            break;
+                        }
+                    }
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        extension = owner_extension,
-                        resource_id,
-                        error = %error,
-                        "tcp extension listener accept loop terminated"
-                    );
-                    break;
-                }
+                Some(_result) = connections.join_next(), if !connections.is_empty() => {}
             }
         }
     });
@@ -1790,6 +1795,55 @@ mod tests {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(close_counter.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn tcp_listener_accepts_new_connections_while_existing_stream_stays_open() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
+        let bind_addr = probe.local_addr().expect("probe local addr");
+        drop(probe);
+
+        let packet_count = Arc::new(AtomicUsize::new(0));
+        let host = RuntimeExtensionHost::builder()
+            .add_extension(CounterExtension {
+                name: "tcp-listener-extension",
+                startup_manifest: ExtensionManifest {
+                    capabilities: vec![ExtensionCapability::BindTcp],
+                    resources: vec![ExtensionResourceSpec::TcpListener(TcpListenerSpec {
+                        resource_id: "tcp-listener".to_owned(),
+                        bind_addr,
+                        visibility: ExtensionStreamVisibility::Private,
+                        read_buffer_bytes: 128,
+                    })],
+                    subscriptions: vec![PacketSubscription {
+                        source_kind: Some(RuntimePacketSourceKind::ExtensionResource),
+                        transport: Some(RuntimePacketTransport::Tcp),
+                        owner_extension: Some("tcp-listener-extension".to_owned()),
+                        ..PacketSubscription::default()
+                    }],
+                },
+                packet_count: Arc::clone(&packet_count),
+                shutdown_wait: Duration::ZERO,
+                shutdown_called: Arc::new(AtomicBool::new(false)),
+            })
+            .build();
+        let report = host.startup().await;
+        assert_eq!(report.active_extensions, 1);
+
+        let _first = TcpStream::connect(bind_addr)
+            .await
+            .expect("connect first tcp client");
+        let mut second = TcpStream::connect(bind_addr)
+            .await
+            .expect("connect second tcp client");
+        assert!(tokio::io::AsyncWriteExt::write_all(&mut second, b"second")
+            .await
+            .is_ok());
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(packet_count.load(Ordering::Relaxed), 1);
+
+        host.shutdown().await;
     }
 
     struct SlowExtension {
