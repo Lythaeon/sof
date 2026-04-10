@@ -2285,26 +2285,18 @@ async fn rpc_get_slot(
     endpoint: &str,
     commitment: WebsocketTransactionCommitment,
 ) -> Result<u64, WebsocketTransactionError> {
-    let response: RpcJsonResponse<u64> = client
-        .post(endpoint)
-        .json(&json!({
+    let response = rpc_post(
+        client,
+        endpoint,
+        "getSlot",
+        json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "getSlot",
             "params": [{ "commitment": commitment.as_str() }],
-        }))
-        .send()
-        .await
-        .map_err(|error| WebsocketProtocolError::HttpRpcFailed {
-            method: "getSlot",
-            detail: error.to_string(),
-        })?
-        .json()
-        .await
-        .map_err(|error| WebsocketProtocolError::HttpRpcDecodeFailed {
-            method: "getSlot",
-            detail: error.to_string(),
-        })?;
+        }),
+    )
+    .await?;
     if let Some(error) = response.error {
         return Err(WebsocketProtocolError::HttpRpcFailed {
             method: "getSlot",
@@ -2323,9 +2315,11 @@ async fn rpc_get_block(
     slot: u64,
     commitment: WebsocketTransactionCommitment,
 ) -> Result<Option<RpcBlockResponse>, WebsocketTransactionError> {
-    let response: RpcJsonResponse<RpcBlockResponse> = client
-        .post(endpoint)
-        .json(&json!({
+    let response = rpc_post(
+        client,
+        endpoint,
+        "getBlock",
+        json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "getBlock",
@@ -2339,19 +2333,9 @@ async fn rpc_get_block(
                     "rewards": false
                 }
             ],
-        }))
-        .send()
-        .await
-        .map_err(|error| WebsocketProtocolError::HttpRpcFailed {
-            method: "getBlock",
-            detail: error.to_string(),
-        })?
-        .json()
-        .await
-        .map_err(|error| WebsocketProtocolError::HttpRpcDecodeFailed {
-            method: "getBlock",
-            detail: error.to_string(),
-        })?;
+        }),
+    )
+    .await?;
     if let Some(error) = response.error {
         return Err(WebsocketProtocolError::HttpRpcFailed {
             method: "getBlock",
@@ -2360,6 +2344,38 @@ async fn rpc_get_block(
         .into());
     }
     Ok(response.result)
+}
+
+async fn rpc_post<T>(
+    client: &reqwest::Client,
+    endpoint: &str,
+    method: &'static str,
+    payload: Value,
+) -> Result<RpcJsonResponse<T>, WebsocketTransactionError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let response = client
+        .post(endpoint)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|error| WebsocketProtocolError::HttpRpcFailed {
+            method,
+            detail: error.to_string(),
+        })?
+        .error_for_status()
+        .map_err(|error| WebsocketProtocolError::HttpRpcFailed {
+            method,
+            detail: error.to_string(),
+        })?;
+    Ok(response
+        .json()
+        .await
+        .map_err(|error| WebsocketProtocolError::HttpRpcDecodeFailed {
+            method,
+            detail: error.to_string(),
+        })?)
 }
 
 fn websocket_transaction_matches_filter(
@@ -2643,6 +2659,7 @@ mod tests {
     use solana_message::{Message, VersionedMessage};
     use solana_signer::Signer;
     use std::time::Instant;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::time::{Duration, timeout};
     use tokio_tungstenite::{accept_async, tungstenite::protocol::Message as WsMessage};
@@ -2669,6 +2686,74 @@ mod tests {
         })
         .to_string()
         .into_bytes()
+    }
+
+    async fn spawn_http_response_server(status_line: &'static str, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("http listener");
+        let addr = listener.local_addr().expect("http local addr");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("http accept");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let response = format!(
+                "{status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("http response write");
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn websocket_rpc_get_slot_surfaces_http_status_failures() {
+        let endpoint = spawn_http_response_server(
+            "HTTP/1.1 500 Internal Server Error",
+            "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32000,\"message\":\"boom\"}}",
+        )
+        .await;
+        let client = reqwest::Client::new();
+
+        let error = rpc_get_slot(
+            &client,
+            &endpoint,
+            WebsocketTransactionCommitment::Confirmed,
+        )
+        .await
+        .expect_err("http failure should surface as rpc failure");
+
+        assert!(
+            error.to_string().contains("500 Internal Server Error"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_rpc_get_block_surfaces_http_status_failures() {
+        let endpoint = spawn_http_response_server(
+            "HTTP/1.1 503 Service Unavailable",
+            "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32000,\"message\":\"down\"}}",
+        )
+        .await;
+        let client = reqwest::Client::new();
+
+        let error = rpc_get_block(
+            &client,
+            &endpoint,
+            55,
+            WebsocketTransactionCommitment::Confirmed,
+        )
+        .await
+        .expect_err("http failure should surface as rpc failure");
+
+        assert!(
+            error.to_string().contains("503 Service Unavailable"),
+            "unexpected error: {error}"
+        );
     }
 
     #[cfg(feature = "provider-grpc")]
