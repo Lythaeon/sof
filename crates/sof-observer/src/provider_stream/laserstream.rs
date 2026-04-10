@@ -2188,7 +2188,7 @@ impl ProviderStreamFanIn {
     }
 }
 
-#[inline]
+#[inline(always)]
 fn convert_transaction(
     tx: LaserStreamTransaction,
     first_signature: Option<SignatureBytes>,
@@ -2196,18 +2196,13 @@ fn convert_transaction(
     let mut signatures = Vec::with_capacity(tx.signatures.len());
     let mut tx_signatures = tx.signatures.into_iter();
     if let Some(signature) = tx_signatures.next() {
-        signatures.push(
-            first_signature
-                .map_or_else(
-                    || {
-                        signature_bytes_from_slice(signature.as_slice(), || {
-                            LaserStreamError::Convert("failed to parse transaction signature")
-                        })
-                    },
-                    Ok,
-                )?
-                .into(),
-        );
+        signatures.push(match first_signature {
+            Some(first_signature) => first_signature.into(),
+            None => signature_bytes_from_slice(signature.as_slice(), || {
+                LaserStreamError::Convert("failed to parse transaction signature")
+            })?
+            .into(),
+        });
     }
     for signature in tx_signatures {
         signatures.push(
