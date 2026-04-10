@@ -23,7 +23,10 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async, tungstenite::protocol::Message as WsMessage,
+    MaybeTlsStream, WebSocketStream, connect_async_with_config,
+    tungstenite::{
+        protocol::{Message as WsMessage, WebSocketConfig},
+    },
 };
 
 use crate::{
@@ -39,6 +42,11 @@ use crate::{
         emit_provider_source_removed_with_reservation,
     },
 };
+
+/// Maximum provider websocket frame size accepted from upstream RPC sources.
+const MAX_PROVIDER_WEBSOCKET_FRAME_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum provider websocket message size accepted from upstream RPC sources.
+const MAX_PROVIDER_WEBSOCKET_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Commitment level used for websocket `transactionSubscribe` notifications.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1941,7 +1949,12 @@ async fn run_websocket_logs_connection(
 async fn establish_websocket_logs_session(
     config: &WebsocketLogsConfig,
 ) -> Result<WebsocketProviderStream, WebsocketLogsError> {
-    let (mut stream, _response) = connect_async(config.endpoint()).await?;
+    let (mut stream, _response) = connect_async_with_config(
+        config.endpoint(),
+        Some(provider_websocket_transport_config()),
+        false,
+    )
+    .await?;
     stream
         .send(WsMessage::Text(
             config.subscribe_request().to_string().into(),
@@ -2177,7 +2190,12 @@ async fn establish_websocket_primary_session(
     {
         return Err(WebsocketProtocolError::MissingReplayHttpEndpoint.into());
     }
-    let (mut stream, _response) = connect_async(config.endpoint()).await?;
+    let (mut stream, _response) = connect_async_with_config(
+        config.endpoint(),
+        Some(provider_websocket_transport_config()),
+        false,
+    )
+    .await?;
     stream
         .send(WsMessage::Text(
             config.subscribe_request().to_string().into(),
@@ -2185,6 +2203,12 @@ async fn establish_websocket_primary_session(
         .await?;
     wait_for_subscription_ack(&mut stream).await?;
     Ok(stream)
+}
+
+fn provider_websocket_transport_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_frame_size(Some(MAX_PROVIDER_WEBSOCKET_FRAME_BYTES))
+        .max_message_size(Some(MAX_PROVIDER_WEBSOCKET_MESSAGE_BYTES))
 }
 
 fn websocket_replay_start_slot(previous_slot: u64, head: u64, replay_max_slots: u64) -> u64 {
@@ -2689,6 +2713,19 @@ mod tests {
             br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"boom"}}"#.to_vec();
         let error = handle_subscription_text(&mut error).expect_err("provider error should fail");
         assert!(error.to_string().contains("subscription error"));
+    }
+
+    #[test]
+    fn provider_websocket_transport_config_bounds_frames_and_messages() {
+        let config = provider_websocket_transport_config();
+        assert_eq!(
+            config.max_frame_size,
+            Some(MAX_PROVIDER_WEBSOCKET_FRAME_BYTES)
+        );
+        assert_eq!(
+            config.max_message_size,
+            Some(MAX_PROVIDER_WEBSOCKET_MESSAGE_BYTES)
+        );
     }
 
     #[test]
