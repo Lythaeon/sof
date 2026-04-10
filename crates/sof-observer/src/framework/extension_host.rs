@@ -28,6 +28,7 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async_with_config,
     tungstenite::{
         Error as WebSocketError, Message,
+        client::IntoClientRequest,
         protocol::{CloseFrame, WebSocketConfig},
     },
 };
@@ -1440,6 +1441,18 @@ struct ValidatedManifest {
     subscriptions: Vec<PacketSubscription>,
 }
 
+/// Validates one websocket connector URL before startup attempts any network work.
+fn validate_websocket_resource_url(resource_id: &str, url: &str) -> Result<(), String> {
+    if url.trim().is_empty() {
+        return Err(format!(
+            "resource `{resource_id}` declares empty websocket url"
+        ));
+    }
+    url.into_client_request().map(|_| ()).map_err(|error| {
+        format!("resource `{resource_id}` declares invalid websocket url `{url}`: {error}")
+    })
+}
+
 /// Validates one extension manifest against the active runtime policy.
 fn validate_manifest(
     extension_name: &'static str,
@@ -1520,6 +1533,9 @@ fn validate_manifest(
             return Err(format!(
                 "resource `{resource_id}` requires undeclared capability `{required_capability:?}`"
             ));
+        }
+        if let ExtensionResourceSpec::WsConnector(spec) = resource {
+            validate_websocket_resource_url(resource_id, &spec.url)?;
         }
     }
 
@@ -1899,6 +1915,33 @@ mod tests {
         assert_eq!(report.active_extensions, 0);
         assert_eq!(report.failed_extensions, 1);
         assert!(report.failures[0].reason.contains("zero read_buffer_bytes"));
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_invalid_websocket_url() {
+        let host = RuntimeExtensionHost::builder()
+            .add_extension(CounterExtension {
+                name: "invalid-websocket-url",
+                startup_manifest: ExtensionManifest {
+                    capabilities: vec![ExtensionCapability::ConnectWebSocket],
+                    resources: vec![ExtensionResourceSpec::WsConnector(WsConnectorSpec {
+                        resource_id: "ws-feed".to_owned(),
+                        url: "not a websocket url".to_owned(),
+                        visibility: ExtensionStreamVisibility::Private,
+                        read_buffer_bytes: 128,
+                    })],
+                    subscriptions: Vec::new(),
+                },
+                packet_count: Arc::new(AtomicUsize::new(0)),
+                shutdown_wait: Duration::ZERO,
+                shutdown_called: Arc::new(AtomicBool::new(false)),
+            })
+            .build();
+
+        let report = host.startup().await;
+        assert_eq!(report.active_extensions, 0);
+        assert_eq!(report.failed_extensions, 1);
+        assert!(report.failures[0].reason.contains("invalid websocket url"));
     }
 
     #[test]
