@@ -1364,6 +1364,9 @@ fn validate_manifest(
     manifest: &ExtensionManifest,
     policy: &RuntimeExtensionCapabilityPolicy,
 ) -> Result<ValidatedManifest, String> {
+    if extension_name.trim().is_empty() {
+        return Err("extension declares empty name".to_owned());
+    }
     let capabilities: HashSet<ExtensionCapability> =
         manifest.capabilities.iter().copied().collect();
     for capability in &capabilities {
@@ -1633,6 +1636,33 @@ mod tests {
         assert_eq!(report.active_extensions, 0);
         assert_eq!(report.failed_extensions, 1);
         assert!(report.failures[0].reason.contains("empty resource_id"));
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_empty_extension_name() {
+        let host = RuntimeExtensionHost::builder()
+            .add_extension(CounterExtension {
+                name: "   ",
+                startup_manifest: ExtensionManifest {
+                    capabilities: vec![ExtensionCapability::BindUdp],
+                    resources: vec![ExtensionResourceSpec::UdpListener(UdpListenerSpec {
+                        resource_id: "udp-feed".to_owned(),
+                        bind_addr: SocketAddr::from_str("127.0.0.1:0").expect("valid addr"),
+                        visibility: ExtensionStreamVisibility::Private,
+                        read_buffer_bytes: 128,
+                    })],
+                    subscriptions: Vec::new(),
+                },
+                packet_count: Arc::new(AtomicUsize::new(0)),
+                shutdown_wait: Duration::ZERO,
+                shutdown_called: Arc::new(AtomicBool::new(false)),
+            })
+            .build();
+
+        let report = host.startup().await;
+        assert_eq!(report.active_extensions, 0);
+        assert_eq!(report.failed_extensions, 1);
+        assert!(report.failures[0].reason.contains("empty name"));
     }
 
     #[tokio::test]

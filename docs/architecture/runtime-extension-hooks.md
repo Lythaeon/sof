@@ -71,9 +71,10 @@ Startup manifests can request runtime-managed resources:
 
 Manifest validation rules:
 
-1. `resource_id` must be non-empty,
-2. `Shared { tag }` tags must be non-empty,
-3. `read_buffer_bytes` is bounded by runtime startup validation.
+1. extension names must be non-empty,
+2. `resource_id` must be non-empty,
+3. `Shared { tag }` tags must be non-empty,
+4. `read_buffer_bytes` is bounded by runtime startup validation.
 
 `WsConnector` supports full WebSocket protocol handling:
 

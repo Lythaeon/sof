@@ -1088,7 +1088,7 @@ Design references:
 - Queue pressure drops hook events instead of stalling ingest.
 - Typed host tuning is available through `sof-gossip-tuning` and `RuntimeSetup::with_gossip_tuning_profile(...)`.
 - `RuntimeExtension` WebSocket connectors support full `ws://` / `wss://` handshake + frame decoding.
-- Runtime extension resources require non-empty `resource_id` / shared tags, and startup bounds `read_buffer_bytes`.
+- Runtime extensions require non-empty names and resource metadata; startup rejects empty `resource_id` / shared tags and bounds `read_buffer_bytes`.
 - WebSocket close frames emit `RuntimePacketEventClass::ConnectionClosed` in `on_packet_received`.
 - WebSocket packet events expose `websocket_frame_type` (`Text`/`Binary`/`Ping`/`Pong`) for startup-time filtering and runtime routing.
 - In gossip mode, SOF runs as an active bounded relay client by default (UDP relay + repair serve), not as an observer-only passive consumer.
