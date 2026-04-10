@@ -25,7 +25,7 @@ use tokio::{
 };
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async_with_config,
-    tungstenite::{Message, protocol::WebSocketConfig},
+    tungstenite::{Error as WebSocketError, Message, protocol::WebSocketConfig},
 };
 
 use crate::framework::extension::{
@@ -1320,42 +1320,68 @@ async fn read_websocket_messages(
                 );
             }
             Some(Ok(Message::Close(frame))) => {
-                let close_payload = frame
-                    .as_ref()
-                    .map(|frame| frame.reason.as_bytes())
-                    .unwrap_or_default();
-                context.emitter.emit_event(
-                    RuntimePacketEventClass::ConnectionClosed,
-                    None,
-                    Arc::from(close_payload),
-                );
-                tracing::info!(
-                    extension = context.emitter.owner_extension.as_str(),
-                    resource_id = context.emitter.resource_id.as_str(),
-                    close_code = frame.as_ref().map(|frame| u16::from(frame.code)),
-                    close_reason = frame
-                        .as_ref()
-                        .map(|frame| frame.reason.to_string())
-                        .unwrap_or_default(),
-                    "websocket connector closed by remote peer"
-                );
+                emit_websocket_close_event(&context, frame.as_ref());
+                if let Err(error) = stream.close(None).await
+                    && !matches!(
+                        error,
+                        WebSocketError::ConnectionClosed | WebSocketError::AlreadyClosed
+                    )
+                {
+                    tracing::warn!(
+                        extension = context.emitter.owner_extension.as_str(),
+                        resource_id = context.emitter.resource_id.as_str(),
+                        error = %error,
+                        "failed to complete websocket close handshake"
+                    );
+                }
                 break;
             }
             Some(Ok(Message::Frame(_))) => {
                 // Internal tungstenite frame detail; user-facing callbacks receive decoded messages.
             }
             Some(Err(error)) => {
-                tracing::warn!(
-                    extension = context.emitter.owner_extension.as_str(),
-                    resource_id = context.emitter.resource_id.as_str(),
-                    error = %error,
-                    "websocket connector read loop terminated"
-                );
+                if matches!(
+                    error,
+                    WebSocketError::ConnectionClosed | WebSocketError::AlreadyClosed
+                ) {
+                    emit_websocket_close_event(&context, None);
+                } else {
+                    tracing::warn!(
+                        extension = context.emitter.owner_extension.as_str(),
+                        resource_id = context.emitter.resource_id.as_str(),
+                        error = %error,
+                        "websocket connector read loop terminated"
+                    );
+                }
                 break;
             }
             None => break,
         }
     }
+}
+
+/// Emits one websocket connection-closed event with close-frame metadata when available.
+fn emit_websocket_close_event(
+    context: &ExtensionResourceReadContext,
+    frame: Option<&tokio_tungstenite::tungstenite::protocol::CloseFrame>,
+) {
+    let close_payload = frame
+        .map(|close_frame| close_frame.reason.as_bytes())
+        .unwrap_or_default();
+    context.emitter.emit_event(
+        RuntimePacketEventClass::ConnectionClosed,
+        None,
+        Arc::from(close_payload),
+    );
+    tracing::info!(
+        extension = context.emitter.owner_extension.as_str(),
+        resource_id = context.emitter.resource_id.as_str(),
+        close_code = frame.map(|close_frame| u16::from(close_frame.code)),
+        close_reason = frame
+            .map(|close_frame| close_frame.reason.to_string())
+            .unwrap_or_default(),
+        "websocket connector closed by remote peer"
+    );
 }
 
 /// Converts extension stream visibility into the optional shared stream tag.
@@ -2249,6 +2275,56 @@ mod tests {
         assert_eq!(report.active_extensions, 1);
         assert_eq!(report.failed_extensions, 0);
         assert!(tcp_server_task.await.is_ok());
+        assert!(ws_server_task.await.is_ok());
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local socket bind/connect permissions"]
+    async fn websocket_connector_remote_close_dispatches_connection_closed() {
+        let ws_server = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ws server");
+        let ws_server_addr = ws_server.local_addr().expect("ws local addr");
+        let ws_server_task = tokio::spawn(async move {
+            if let Ok((stream, _)) = ws_server.accept().await
+                && let Ok(mut websocket) = tokio_tungstenite::accept_async(stream).await
+            {
+                assert!(websocket.close(None).await.is_ok());
+            }
+        });
+
+        let closed_count = Arc::new(AtomicUsize::new(0));
+        let host = RuntimeExtensionHost::builder()
+            .add_extension(CounterExtension {
+                name: "ws-close-extension",
+                startup_manifest: ExtensionManifest {
+                    capabilities: vec![ExtensionCapability::ConnectWebSocket],
+                    resources: vec![ExtensionResourceSpec::WsConnector(WsConnectorSpec {
+                        resource_id: "ws-connector".to_owned(),
+                        url: format!("ws://{ws_server_addr}/feed"),
+                        visibility: ExtensionStreamVisibility::Private,
+                        read_buffer_bytes: 128,
+                    })],
+                    subscriptions: vec![PacketSubscription {
+                        source_kind: Some(RuntimePacketSourceKind::ExtensionResource),
+                        transport: Some(RuntimePacketTransport::WebSocket),
+                        event_class: Some(RuntimePacketEventClass::ConnectionClosed),
+                        owner_extension: Some("ws-close-extension".to_owned()),
+                        ..PacketSubscription::default()
+                    }],
+                },
+                packet_count: Arc::clone(&closed_count),
+                shutdown_wait: Duration::ZERO,
+                shutdown_called: Arc::new(AtomicBool::new(false)),
+            })
+            .build();
+        let report = host.startup().await;
+        assert_eq!(report.active_extensions, 1);
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(closed_count.load(Ordering::Relaxed), 1);
+
         assert!(ws_server_task.await.is_ok());
         host.shutdown().await;
     }
