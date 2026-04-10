@@ -4,10 +4,10 @@ use async_trait::async_trait;
 use tonic::{
     Request, Status,
     client::Grpc,
-    codec::ProstCodec,
     codegen::http::uri::PathAndQuery,
     transport::{Channel, ClientTlsConfig, Endpoint},
 };
+use tonic_prost::ProstCodec;
 
 use super::{
     JitoBlockEngineEndpoint, JitoSubmitConfig, JitoSubmitResponse, JitoSubmitTransport,
@@ -176,7 +176,7 @@ impl JitoGrpcTransport {
             .unary(
                 Request::new(request),
                 PathAndQuery::from_static("/searcher.SearcherService/SendBundle"),
-                ProstCodec::default(),
+                ProstCodec::<SendBundleRequest, SendBundleResponse>::default(),
             )
             .await?;
         Ok(response.into_inner())
