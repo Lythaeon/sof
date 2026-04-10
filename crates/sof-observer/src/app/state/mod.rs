@@ -16,7 +16,7 @@ pub use latest::note_latest_shred_slot;
 pub use repair::OutstandingRepairRequests;
 
 pub(super) use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     time::{Duration, Instant},
 };
 
