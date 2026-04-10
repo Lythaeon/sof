@@ -2153,7 +2153,13 @@ async fn replay_websocket_gap(
     };
 
     let client = websocket_replay_http_client()?;
-    let head = rpc_get_slot(client, &http_endpoint, config.commitment).await?;
+    let head = rpc_get_slot(
+        client,
+        &http_endpoint,
+        config.commitment,
+        config.stall_timeout,
+    )
+    .await?;
     if head < previous_slot {
         return Ok(());
     }
@@ -2162,7 +2168,14 @@ async fn replay_websocket_gap(
     let commitment_status = config.commitment.as_tx_commitment();
     let mut tx_bytes = Vec::new();
     for slot in start_slot..=head {
-        let Some(block) = rpc_get_block(client, &http_endpoint, slot, config.commitment).await?
+        let Some(block) = rpc_get_block(
+            client,
+            &http_endpoint,
+            slot,
+            config.commitment,
+            config.stall_timeout,
+        )
+        .await?
         else {
             continue;
         };
@@ -2262,6 +2275,13 @@ fn websocket_transport_config(max_message_size: usize) -> WebSocketConfig {
         .max_frame_size(Some(max_message_size))
 }
 
+fn http_rpc_error_detail(error: &reqwest::Error) -> String {
+    if error.is_timeout() {
+        return format!("request timed out: {error}");
+    }
+    error.to_string()
+}
+
 fn websocket_primary_transport_config(config: &WebsocketTransactionConfig) -> WebSocketConfig {
     match config.stream {
         WebsocketPrimaryStream::Transaction => {
@@ -2277,6 +2297,7 @@ async fn rpc_get_slot(
     client: &reqwest::Client,
     endpoint: &str,
     commitment: WebsocketTransactionCommitment,
+    timeout: Option<Duration>,
 ) -> Result<u64, WebsocketTransactionError> {
     let response = rpc_post(
         client,
@@ -2288,6 +2309,7 @@ async fn rpc_get_slot(
             "method": "getSlot",
             "params": [{ "commitment": commitment.as_str() }],
         }),
+        timeout,
     )
     .await?;
     if let Some(error) = response.error {
@@ -2307,6 +2329,7 @@ async fn rpc_get_block(
     endpoint: &str,
     slot: u64,
     commitment: WebsocketTransactionCommitment,
+    timeout: Option<Duration>,
 ) -> Result<Option<RpcBlockResponse>, WebsocketTransactionError> {
     let response = rpc_post(
         client,
@@ -2327,6 +2350,7 @@ async fn rpc_get_block(
                 }
             ],
         }),
+        timeout,
     )
     .await?;
     if let Some(error) = response.error {
@@ -2344,6 +2368,7 @@ async fn rpc_post<T>(
     endpoint: &str,
     method: &'static str,
     payload: Value,
+    timeout: Option<Duration>,
 ) -> Result<RpcJsonResponse<T>, WebsocketTransactionError>
 where
     T: for<'de> Deserialize<'de>,
@@ -2354,6 +2379,7 @@ where
         method,
         payload,
         WEBSOCKET_REPLAY_HTTP_MAX_RESPONSE_BYTES,
+        timeout,
     )
     .await
 }
@@ -2364,18 +2390,21 @@ async fn rpc_post_with_max_response_bytes<T>(
     method: &'static str,
     payload: Value,
     max_response_bytes: usize,
+    timeout: Option<Duration>,
 ) -> Result<RpcJsonResponse<T>, WebsocketTransactionError>
 where
     T: for<'de> Deserialize<'de>,
 {
-    let response = client
-        .post(endpoint)
-        .json(&payload)
+    let mut request = client.post(endpoint).json(&payload);
+    if let Some(timeout) = timeout {
+        request = request.timeout(timeout);
+    }
+    let response = request
         .send()
         .await
         .map_err(|error| WebsocketProtocolError::HttpRpcFailed {
             method,
-            detail: error.to_string(),
+            detail: http_rpc_error_detail(&error),
         })?;
     if response.status().is_redirection() {
         return Err(WebsocketProtocolError::HttpRpcFailed {
@@ -2429,7 +2458,7 @@ async fn read_http_response_bytes_bounded(
             .await
             .map_err(|error| WebsocketProtocolError::HttpRpcFailed {
                 method,
-                detail: error.to_string(),
+                detail: http_rpc_error_detail(&error),
             })?
     {
         let remaining = max_response_bytes.saturating_sub(body.len());
@@ -2836,6 +2865,18 @@ mod tests {
         format!("http://{addr}")
     }
 
+    async fn spawn_stalled_http_response_server(stall: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("http listener");
+        let addr = listener.local_addr().expect("http local addr");
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.expect("http accept");
+            tokio::time::sleep(stall).await;
+        });
+        format!("http://{addr}")
+    }
+
     #[tokio::test]
     async fn websocket_rpc_get_slot_surfaces_http_status_failures() {
         let endpoint = spawn_http_response_server(
@@ -2849,6 +2890,7 @@ mod tests {
             &client,
             &endpoint,
             WebsocketTransactionCommitment::Confirmed,
+            None,
         )
         .await
         .expect_err("http failure should surface as rpc failure");
@@ -2873,6 +2915,7 @@ mod tests {
             &endpoint,
             55,
             WebsocketTransactionCommitment::Confirmed,
+            None,
         )
         .await
         .expect_err("http failure should surface as rpc failure");
@@ -2895,9 +2938,14 @@ mod tests {
             Ok(client) => client,
             Err(error) => panic!("shared replay client: {error}"),
         };
-        let error = rpc_get_slot(client, &endpoint, WebsocketTransactionCommitment::Confirmed)
-            .await
-            .expect_err("redirect replay response should be rejected");
+        let error = rpc_get_slot(
+            client,
+            &endpoint,
+            WebsocketTransactionCommitment::Confirmed,
+            None,
+        )
+        .await
+        .expect_err("redirect replay response should be rejected");
 
         assert!(
             error.to_string().contains("307 Temporary Redirect"),
@@ -2924,6 +2972,7 @@ mod tests {
                 "params": []
             }),
             32,
+            None,
         )
         .await
         .expect_err("oversized content-length should be rejected");
@@ -2957,12 +3006,33 @@ mod tests {
                 "params": []
             }),
             16,
+            None,
         )
         .await
         .expect_err("oversized chunked response should be rejected");
 
         assert!(
             error.to_string().contains("exceeded max size"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_rpc_get_slot_times_out_stalled_response() {
+        let endpoint = spawn_stalled_http_response_server(Duration::from_millis(200)).await;
+        let client = reqwest::Client::new();
+
+        let error = rpc_get_slot(
+            &client,
+            &endpoint,
+            WebsocketTransactionCommitment::Confirmed,
+            Some(Duration::from_millis(25)),
+        )
+        .await
+        .expect_err("stalled replay response should time out");
+
+        assert!(
+            error.to_string().contains("timed out"),
             "unexpected error: {error}"
         );
     }
