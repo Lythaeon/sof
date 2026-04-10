@@ -51,7 +51,9 @@ const DEFAULT_STARTUP_TIMEOUT_SECS: u64 = 5;
 const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 3;
 /// Per-read fallback buffer size used for extension resource sockets.
 const DEFAULT_RESOURCE_READ_BUFFER_BYTES: usize = 2_048;
-/// Multiplier used to cap extension websocket frames/messages relative to the chunk size.
+/// Maximum extension resource read buffer accepted from one startup manifest.
+const MAX_RESOURCE_READ_BUFFER_BYTES: usize = 1024 * 1024;
+/// Multiplier used to cap extension websocket frames/messages relative to chunk size.
 const EXTENSION_WEBSOCKET_MESSAGE_LIMIT_MULTIPLIER: usize = 64;
 
 /// Startup failure record for one extension.
@@ -1412,6 +1414,9 @@ fn validate_manifest(
     manifest: &ExtensionManifest,
     policy: &RuntimeExtensionCapabilityPolicy,
 ) -> Result<ValidatedManifest, String> {
+    if extension_name.trim().is_empty() {
+        return Err("extension declares empty name".to_owned());
+    }
     let capabilities: HashSet<ExtensionCapability> =
         manifest.capabilities.iter().copied().collect();
     for capability in &capabilities {
@@ -1424,23 +1429,54 @@ fn validate_manifest(
 
     let mut resource_ids = HashSet::<String>::new();
     for resource in &manifest.resources {
-        let (resource_id, required_capability) = match resource {
-            ExtensionResourceSpec::UdpListener(spec) => {
-                (&spec.resource_id, ExtensionCapability::BindUdp)
-            }
-            ExtensionResourceSpec::TcpListener(spec) => {
-                (&spec.resource_id, ExtensionCapability::BindTcp)
-            }
-            ExtensionResourceSpec::TcpConnector(spec) => {
-                (&spec.resource_id, ExtensionCapability::ConnectTcp)
-            }
-            ExtensionResourceSpec::WsConnector(spec) => {
-                (&spec.resource_id, ExtensionCapability::ConnectWebSocket)
-            }
+        let (resource_id, visibility, read_buffer_bytes, required_capability) = match resource {
+            ExtensionResourceSpec::UdpListener(spec) => (
+                &spec.resource_id,
+                &spec.visibility,
+                spec.read_buffer_bytes,
+                ExtensionCapability::BindUdp,
+            ),
+            ExtensionResourceSpec::TcpListener(spec) => (
+                &spec.resource_id,
+                &spec.visibility,
+                spec.read_buffer_bytes,
+                ExtensionCapability::BindTcp,
+            ),
+            ExtensionResourceSpec::TcpConnector(spec) => (
+                &spec.resource_id,
+                &spec.visibility,
+                spec.read_buffer_bytes,
+                ExtensionCapability::ConnectTcp,
+            ),
+            ExtensionResourceSpec::WsConnector(spec) => (
+                &spec.resource_id,
+                &spec.visibility,
+                spec.read_buffer_bytes,
+                ExtensionCapability::ConnectWebSocket,
+            ),
         };
+        if resource_id.trim().is_empty() {
+            return Err(format!(
+                "extension `{extension_name}` declares empty resource_id"
+            ));
+        }
         if !resource_ids.insert(resource_id.clone()) {
             return Err(format!(
                 "duplicate resource_id `{resource_id}` in startup manifest for extension `{extension_name}`"
+            ));
+        }
+        if read_buffer_bytes > MAX_RESOURCE_READ_BUFFER_BYTES {
+            return Err(format!(
+                "resource `{resource_id}` read_buffer_bytes {read_buffer_bytes} exceeds max {}",
+                MAX_RESOURCE_READ_BUFFER_BYTES
+            ));
+        }
+        if matches!(
+            visibility,
+            ExtensionStreamVisibility::Shared { tag } if tag.trim().is_empty()
+        ) {
+            return Err(format!(
+                "resource `{resource_id}` declares empty shared visibility tag"
             ));
         }
         if !capabilities.contains(&required_capability) {
@@ -1684,6 +1720,120 @@ mod tests {
         let report = host.startup().await;
         assert_eq!(report.active_extensions, 0);
         assert_eq!(report.failed_extensions, 1);
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_empty_resource_id() {
+        let host = RuntimeExtensionHost::builder()
+            .add_extension(CounterExtension {
+                name: "empty-resource-id",
+                startup_manifest: ExtensionManifest {
+                    capabilities: vec![ExtensionCapability::BindUdp],
+                    resources: vec![ExtensionResourceSpec::UdpListener(UdpListenerSpec {
+                        resource_id: "   ".to_owned(),
+                        bind_addr: SocketAddr::from_str("127.0.0.1:0").expect("valid addr"),
+                        visibility: ExtensionStreamVisibility::Private,
+                        read_buffer_bytes: 128,
+                    })],
+                    subscriptions: Vec::new(),
+                },
+                packet_count: Arc::new(AtomicUsize::new(0)),
+                shutdown_wait: Duration::ZERO,
+                shutdown_called: Arc::new(AtomicBool::new(false)),
+            })
+            .build();
+
+        let report = host.startup().await;
+        assert_eq!(report.active_extensions, 0);
+        assert_eq!(report.failed_extensions, 1);
+        assert!(report.failures[0].reason.contains("empty resource_id"));
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_empty_extension_name() {
+        let host = RuntimeExtensionHost::builder()
+            .add_extension(CounterExtension {
+                name: "   ",
+                startup_manifest: ExtensionManifest {
+                    capabilities: vec![ExtensionCapability::BindUdp],
+                    resources: vec![ExtensionResourceSpec::UdpListener(UdpListenerSpec {
+                        resource_id: "udp-feed".to_owned(),
+                        bind_addr: SocketAddr::from_str("127.0.0.1:0").expect("valid addr"),
+                        visibility: ExtensionStreamVisibility::Private,
+                        read_buffer_bytes: 128,
+                    })],
+                    subscriptions: Vec::new(),
+                },
+                packet_count: Arc::new(AtomicUsize::new(0)),
+                shutdown_wait: Duration::ZERO,
+                shutdown_called: Arc::new(AtomicBool::new(false)),
+            })
+            .build();
+
+        let report = host.startup().await;
+        assert_eq!(report.active_extensions, 0);
+        assert_eq!(report.failed_extensions, 1);
+        assert!(report.failures[0].reason.contains("empty name"));
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_empty_shared_visibility_tag() {
+        let host = RuntimeExtensionHost::builder()
+            .add_extension(CounterExtension {
+                name: "empty-shared-tag",
+                startup_manifest: ExtensionManifest {
+                    capabilities: vec![ExtensionCapability::BindTcp],
+                    resources: vec![ExtensionResourceSpec::TcpListener(TcpListenerSpec {
+                        resource_id: "tcp-feed".to_owned(),
+                        bind_addr: SocketAddr::from_str("127.0.0.1:0").expect("valid addr"),
+                        visibility: ExtensionStreamVisibility::Shared {
+                            tag: "  ".to_owned(),
+                        },
+                        read_buffer_bytes: 128,
+                    })],
+                    subscriptions: Vec::new(),
+                },
+                packet_count: Arc::new(AtomicUsize::new(0)),
+                shutdown_wait: Duration::ZERO,
+                shutdown_called: Arc::new(AtomicBool::new(false)),
+            })
+            .build();
+
+        let report = host.startup().await;
+        assert_eq!(report.active_extensions, 0);
+        assert_eq!(report.failed_extensions, 1);
+        assert!(
+            report.failures[0]
+                .reason
+                .contains("empty shared visibility tag")
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_oversized_read_buffer_bytes() {
+        let host = RuntimeExtensionHost::builder()
+            .add_extension(CounterExtension {
+                name: "oversized-read-buffer",
+                startup_manifest: ExtensionManifest {
+                    capabilities: vec![ExtensionCapability::ConnectWebSocket],
+                    resources: vec![ExtensionResourceSpec::WsConnector(WsConnectorSpec {
+                        resource_id: "ws-feed".to_owned(),
+                        url: "ws://127.0.0.1:1/feed".to_owned(),
+                        visibility: ExtensionStreamVisibility::Private,
+                        read_buffer_bytes: MAX_RESOURCE_READ_BUFFER_BYTES.saturating_add(1),
+                    })],
+                    subscriptions: Vec::new(),
+                },
+                packet_count: Arc::new(AtomicUsize::new(0)),
+                shutdown_wait: Duration::ZERO,
+                shutdown_called: Arc::new(AtomicBool::new(false)),
+            })
+            .build();
+
+        let report = host.startup().await;
+        assert_eq!(report.active_extensions, 0);
+        assert_eq!(report.failed_extensions, 1);
+        assert!(report.failures[0].reason.contains("read_buffer_bytes"));
     }
 
     #[tokio::test]
@@ -2334,17 +2484,24 @@ mod tests {
     #[test]
     fn extension_websocket_transport_config_caps_frames_from_chunk_size() {
         let transport = extension_websocket_transport_config(4_096);
-        assert_eq!(transport.max_message_size, Some(4_096 * 64));
-        assert_eq!(transport.max_frame_size, Some(4_096 * 64));
+        let expected = 4_096_usize.saturating_mul(EXTENSION_WEBSOCKET_MESSAGE_LIMIT_MULTIPLIER);
+        assert_eq!(transport.max_message_size, Some(expected));
+        assert_eq!(transport.max_frame_size, Some(expected));
 
         let floor_transport = extension_websocket_transport_config(1);
         assert_eq!(
             floor_transport.max_message_size,
-            Some(DEFAULT_RESOURCE_READ_BUFFER_BYTES * 64)
+            Some(
+                DEFAULT_RESOURCE_READ_BUFFER_BYTES
+                    .saturating_mul(EXTENSION_WEBSOCKET_MESSAGE_LIMIT_MULTIPLIER)
+            )
         );
         assert_eq!(
             floor_transport.max_frame_size,
-            Some(DEFAULT_RESOURCE_READ_BUFFER_BYTES * 64)
+            Some(
+                DEFAULT_RESOURCE_READ_BUFFER_BYTES
+                    .saturating_mul(EXTENSION_WEBSOCKET_MESSAGE_LIMIT_MULTIPLIER)
+            )
         );
     }
 }
