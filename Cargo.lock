@@ -5558,6 +5558,7 @@ dependencies = [
  "solana-signature",
  "solana-signer",
  "solana-streamer",
+ "solana-system-interface 3.1.0",
  "solana-transaction",
  "solana-vote",
  "solana-vote-program",
