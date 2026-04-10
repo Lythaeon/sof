@@ -184,6 +184,22 @@ pub mod time_support {
                 duration.as_millis().min(u128::from(u64::MAX)) as u64
             })
     }
+
+    /// Returns the current Unix timestamp in whole seconds.
+    #[must_use]
+    pub fn current_unix_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs())
+    }
+
+    /// Returns the current Unix timestamp in nanoseconds as one `u128`.
+    #[must_use]
+    pub fn current_unix_nanos() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos())
+    }
 }
 
 #[cfg(test)]
@@ -194,7 +210,9 @@ mod tests {
     use super::short_vec::{
         ShortVecDecodeError, decode_short_u16_len, decode_short_u16_len_partial,
     };
-    use super::time_support::{current_unix_ms, duration_secs_ceil};
+    use super::time_support::{
+        current_unix_ms, current_unix_nanos, current_unix_secs, duration_secs_ceil,
+    };
 
     #[test]
     fn duration_secs_ceil_rounds_subsecond_values_up() {
@@ -208,6 +226,12 @@ mod tests {
         let first = current_unix_ms();
         let second = current_unix_ms();
         assert!(second >= first);
+    }
+
+    #[test]
+    fn current_unix_time_helpers_are_nonzero_or_zero_safely() {
+        assert!(current_unix_secs() <= current_unix_ms() / 1_000 + 1);
+        assert!(current_unix_nanos() / 1_000_000 <= u128::from(current_unix_ms()) + 1);
     }
 
     #[test]

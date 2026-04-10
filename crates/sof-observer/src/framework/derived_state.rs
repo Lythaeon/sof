@@ -5,6 +5,7 @@
 //! It defines the feed envelope, event families, checkpoints, and consumer-facing
 //! fault types without yet wiring a runtime producer.
 
+use sof_support::time_support::{current_unix_nanos, current_unix_secs};
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -18,7 +19,7 @@ use std::{
         mpsc,
     },
     thread::JoinHandle,
-    time::{SystemTime, UNIX_EPOCH},
+    time::SystemTime,
 };
 
 use arcshift::ArcShift;
@@ -4402,7 +4403,7 @@ fn classify_rooted_account_observed_kind(event: &AccountUpdateEvent) -> RootedAc
 
 /// Returns the maximum wallclock skew across topology nodes when present.
 fn topology_max_wallclock_skew_ms(event: &ClusterTopologyEvent) -> Option<u64> {
-    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let now_secs = current_unix_secs();
     event
         .snapshot_nodes
         .iter()
@@ -4624,9 +4625,7 @@ impl RegisteredDerivedStateConsumer {
 
 /// Generates a best-effort unique session id for one process lifetime.
 fn generate_session_id() -> FeedSessionId {
-    let now_nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0_u128, |duration| duration.as_nanos());
+    let now_nanos = current_unix_nanos();
     let pid = u128::from(std::process::id());
     FeedSessionId(now_nanos ^ pid)
 }
@@ -4648,9 +4647,7 @@ mod tests {
     };
 
     fn unique_test_replay_dir(name: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0_u128, |duration| duration.as_nanos());
+        let unique = current_unix_nanos();
         env::temp_dir().join(format!(
             "sof-derived-state-{name}-{}-{unique}",
             std::process::id()

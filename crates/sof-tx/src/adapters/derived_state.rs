@@ -357,13 +357,8 @@ impl DerivedStateConsumer for DerivedStateTxProviderAdapter {
 #[cfg(test)]
 #[allow(clippy::panic)]
 mod tests {
-    use std::{
-        env, fs,
-        net::SocketAddr,
-        path::PathBuf,
-        sync::Arc,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use sof_support::time_support::current_unix_nanos;
+    use std::{env, fs, net::SocketAddr, path::PathBuf, sync::Arc, time::UNIX_EPOCH};
 
     use sof::framework::{
         BranchReorgedEvent, CheckpointBarrierEvent, CheckpointBarrierReason, ClusterNodeInfo,
@@ -415,10 +410,7 @@ mod tests {
         env::temp_dir().join(format!(
             "sof-tx-{label}-{}-{}.json",
             std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or_default()
+            current_unix_nanos()
         ))
     }
 
