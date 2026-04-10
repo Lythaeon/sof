@@ -1,6 +1,6 @@
 [package]
 name = "sof-support"
-version = "0.18.1"
+version = "0.18.2"
 edition.workspace = true
 description = "Shared internal support utilities reused across SOF crates"
 license = "Apache-2.0 OR MIT"
@@ -11,4 +11,4 @@ homepage = "https://github.com/Lythaeon/sof"
 workspace = true
 
 [dependencies]
-sof-types = { version = "0.18.1", path = "../sof-types" }
+sof-types = { version = "0.18.2", path = "../sof-types" }

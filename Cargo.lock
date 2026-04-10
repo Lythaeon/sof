@@ -5429,7 +5429,7 @@ dependencies = [
 
 [[package]]
 name = "sof-support"
-version = "0.18.1"
+version = "0.18.2"
 dependencies = [
  "sof-types",
 ]
