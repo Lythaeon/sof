@@ -18,6 +18,7 @@ use solana_message::{
 };
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
+use solana_system_interface::MAX_PERMITTED_DATA_LENGTH;
 use solana_transaction::versioned::VersionedTransaction;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -48,6 +49,7 @@ use crate::{
 };
 
 const INTERNAL_SLOT_FILTER: &str = "__sof_internal_slots";
+const MAX_ACCOUNT_DATA_LEN: usize = MAX_PERMITTED_DATA_LENGTH as usize;
 
 /// Yellowstone subscription commitment used for provider-stream transaction updates.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1823,6 +1825,11 @@ fn account_update_event_from_yellowstone(
         ),
         None => None,
     };
+    if account.data.len() > MAX_ACCOUNT_DATA_LEN {
+        return Err(YellowstoneGrpcError::Convert(
+            "account data exceeds max permitted size",
+        ));
+    }
     Ok(AccountUpdateEvent {
         slot: update.slot,
         commitment_status,
@@ -2070,7 +2077,7 @@ mod tests {
     use solana_sdk_ids::system_program;
     use solana_sdk_ids::{compute_budget, vote};
     use solana_signer::Signer;
-    use std::{pin::Pin, time::Instant};
+    use std::{env, pin::Pin, time::Instant};
     use tokio::sync::oneshot;
     use tokio::time::{Duration, timeout};
     use yellowstone_grpc_proto::geyser::geyser_server::{Geyser, GeyserServer};
@@ -2088,11 +2095,38 @@ mod tests {
     use yellowstone_grpc_proto::tonic::{self, Request, Response, Status, transport::Server};
 
     fn profile_iterations(default: usize) -> usize {
-        std::env::var("SOF_PROFILE_ITERATIONS")
+        env::var("SOF_PROFILE_ITERATIONS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(default)
+    }
+
+    #[test]
+    fn yellowstone_account_update_rejects_oversized_data() {
+        let pubkey = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let update = sample_account_update(92, pubkey, owner);
+        let account_update = match update.update_oneof {
+            Some(UpdateOneof::Account(account_update)) => account_update,
+            other => panic!("expected account update, got {other:?}"),
+        };
+
+        let mut oversized = account_update;
+        oversized.account.as_mut().expect("account payload").data =
+            vec![7_u8; MAX_ACCOUNT_DATA_LEN + 1];
+
+        let error = account_update_event_from_yellowstone(
+            oversized,
+            TxCommitmentStatus::Confirmed,
+            ProviderCommitmentWatermarks::default(),
+        )
+        .expect_err("oversized account payload must fail");
+
+        assert!(matches!(
+            error,
+            YellowstoneGrpcError::Convert("account data exceeds max permitted size")
+        ));
     }
 
     fn sample_transaction() -> VersionedTransaction {
