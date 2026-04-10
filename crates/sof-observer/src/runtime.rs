@@ -2709,6 +2709,14 @@ fn dispatch_provider_stream_serialized_transaction(
         );
         return;
     }
+    if wants_transaction
+        && !wants_recent_blockhash
+        && !wants_derived_state_transaction
+        && !plugin_host.has_transaction_prefilter_at_commitment(event.commitment_status)
+    {
+        dispatch_provider_stream_serialized_transaction_decode_only(plugin_host, event);
+        return;
+    }
 
     let mut signature = event.signature;
     let mut recent_blockhash = None;
@@ -2818,6 +2826,35 @@ fn dispatch_provider_stream_serialized_transaction(
     if wants_transaction {
         plugin_host.on_transaction(event);
     }
+}
+
+fn dispatch_provider_stream_serialized_transaction_decode_only(
+    plugin_host: &PluginHost,
+    event: &provider_stream::SerializedTransactionEvent,
+) {
+    let Ok(tx) = bincode::deserialize::<VersionedTransaction>(event.bytes.as_ref()) else {
+        tracing::warn!(
+            slot = event.slot,
+            "failed to deserialize provider serialized transaction"
+        );
+        return;
+    };
+    let tx = Arc::new(tx);
+    plugin_host.on_transaction(TransactionEvent {
+        slot: event.slot,
+        commitment_status: event.commitment_status,
+        confirmed_slot: event.confirmed_slot,
+        finalized_slot: event.finalized_slot,
+        signature: event.signature.or_else(|| {
+            tx.signatures
+                .first()
+                .copied()
+                .map(SignatureBytes::from_solana)
+        }),
+        provider_source: event.provider_source.clone(),
+        kind: provider_stream::classify_provider_transaction_kind(&tx),
+        tx,
+    });
 }
 
 fn provider_stream_unsupported_hooks(
