@@ -188,6 +188,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::SendError;
+use tokio::time::{Instant as TokioInstant, Interval, interval_at};
 
 #[cfg(any(feature = "provider-grpc", feature = "provider-websocket"))]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -208,6 +209,13 @@ use solana_transaction::versioned::VersionedTransaction;
 
 /// Default queue capacity for processed provider-stream ingress.
 pub const DEFAULT_PROVIDER_STREAM_QUEUE_CAPACITY: usize = 8_192;
+
+/// Creates one keepalive interval that waits one full period before the first tick.
+pub(crate) fn keepalive_interval(period: Duration) -> Interval {
+    let start = TokioInstant::now();
+    let first_tick = start.checked_add(period).unwrap_or(start);
+    interval_at(first_tick, period)
+}
 
 /// Identifies the processed provider family driving SOF's direct plugin ingress.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1363,6 +1371,20 @@ mod tests {
             dataset_tx_count: 0,
             provider_source: None,
         })
+    }
+
+    #[tokio::test]
+    async fn keepalive_interval_waits_one_full_period_before_first_tick() {
+        let mut interval = keepalive_interval(Duration::from_millis(25));
+        assert!(
+            timeout(Duration::from_millis(5), interval.tick())
+                .await
+                .is_err(),
+            "keepalive interval should not tick immediately"
+        );
+        timeout(Duration::from_millis(50), interval.tick())
+            .await
+            .expect("keepalive interval should tick after one full period");
     }
 
     fn classify_provider_transaction_kind_baseline(tx: &VersionedTransaction) -> TxKind {

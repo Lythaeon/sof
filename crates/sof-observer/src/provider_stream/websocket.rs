@@ -57,7 +57,7 @@ use crate::{
         ProviderSourceReservation, ProviderSourceRole, ProviderSourceTaskGuard,
         ProviderStreamFanIn, ProviderStreamMode, ProviderStreamSender, ProviderStreamUpdate,
         SerializedTransactionEvent, classify_provider_transaction_kind,
-        emit_provider_source_removed_with_reservation,
+        emit_provider_source_removed_with_reservation, keepalive_interval,
     },
 };
 
@@ -1340,7 +1340,7 @@ async fn run_websocket_primary_connection(
     {
         replay_websocket_gap(config, &provider_source, sender, last_seen_slot, watermarks).await?;
     }
-    let mut ping = config.ping_interval.map(tokio::time::interval);
+    let mut ping = config.ping_interval.map(keepalive_interval);
     let mut scratch = WebsocketParseScratch::default();
     let mut last_progress = tokio::time::Instant::now();
 
@@ -1919,7 +1919,7 @@ async fn run_websocket_logs_connection(
         PROVIDER_SUBSCRIPTION_ACKNOWLEDGED.to_owned(),
     )
     .await?;
-    let mut ping = config.ping_interval.map(tokio::time::interval);
+    let mut ping = config.ping_interval.map(keepalive_interval);
     let mut frame_bytes = Vec::new();
     let mut last_progress = tokio::time::Instant::now();
 
