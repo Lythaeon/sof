@@ -23,7 +23,10 @@ use tokio::{
     task::{JoinHandle, JoinSet},
     time::timeout,
 };
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, connect_async_with_config,
+    tungstenite::{Message, protocol::WebSocketConfig},
+};
 
 use crate::framework::extension::{
     ExtensionCapability, ExtensionContext, ExtensionManifest, ExtensionResourceSpec,
@@ -44,6 +47,8 @@ const DEFAULT_STARTUP_TIMEOUT_SECS: u64 = 5;
 const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 3;
 /// Per-read fallback buffer size used for extension resource sockets.
 const DEFAULT_RESOURCE_READ_BUFFER_BYTES: usize = 2_048;
+/// Multiplier used to cap extension websocket frames/messages relative to the chunk size.
+const EXTENSION_WEBSOCKET_MESSAGE_LIMIT_MULTIPLIER: usize = 64;
 
 /// Startup failure record for one extension.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1193,18 +1198,24 @@ async fn spawn_ws_connector(
     extension: &Arc<ActiveRuntimeExtension>,
     spec: WsConnectorSpec,
 ) -> Result<JoinHandle<()>, String> {
-    let (stream, _response) = connect_async(spec.url.as_str())
-        .await
-        .map_err(|error| format!("failed to connect websocket {}: {error}", spec.url))?;
+    let max_payload_chunk_bytes = spec
+        .read_buffer_bytes
+        .max(DEFAULT_RESOURCE_READ_BUFFER_BYTES);
+    let (stream, _response) = connect_async_with_config(
+        spec.url.as_str(),
+        Some(extension_websocket_transport_config(
+            max_payload_chunk_bytes,
+        )),
+        false,
+    )
+    .await
+    .map_err(|error| format!("failed to connect websocket {}: {error}", spec.url))?;
     let io = stream.get_ref().get_ref();
     let local_addr = io.local_addr().ok();
     let peer_addr = io.peer_addr().ok();
     let owner_extension = extension.name.to_owned();
     let resource_id = spec.resource_id;
     let shared_tag = visibility_tag(spec.visibility);
-    let max_payload_chunk_bytes = spec
-        .read_buffer_bytes
-        .max(DEFAULT_RESOURCE_READ_BUFFER_BYTES);
     let handle = tokio::spawn(async move {
         let emitter = ExtensionResourceEmitter::new(
             host,
@@ -1222,6 +1233,16 @@ async fn spawn_ws_connector(
         .await;
     });
     Ok(handle)
+}
+
+/// Builds one bounded websocket transport config for extension-owned connectors.
+fn extension_websocket_transport_config(max_payload_chunk_bytes: usize) -> WebSocketConfig {
+    let max_message_size = max_payload_chunk_bytes
+        .max(DEFAULT_RESOURCE_READ_BUFFER_BYTES)
+        .saturating_mul(EXTENSION_WEBSOCKET_MESSAGE_LIMIT_MULTIPLIER);
+    WebSocketConfig::default()
+        .max_message_size(Some(max_message_size))
+        .max_frame_size(Some(max_message_size))
 }
 
 /// Reads packet chunks from one TCP stream and forwards them into the runtime.
@@ -2230,5 +2251,22 @@ mod tests {
         assert!(tcp_server_task.await.is_ok());
         assert!(ws_server_task.await.is_ok());
         host.shutdown().await;
+    }
+
+    #[test]
+    fn extension_websocket_transport_config_caps_frames_from_chunk_size() {
+        let transport = extension_websocket_transport_config(4_096);
+        assert_eq!(transport.max_message_size, Some(4_096 * 64));
+        assert_eq!(transport.max_frame_size, Some(4_096 * 64));
+
+        let floor_transport = extension_websocket_transport_config(1);
+        assert_eq!(
+            floor_transport.max_message_size,
+            Some(DEFAULT_RESOURCE_READ_BUFFER_BYTES * 64)
+        );
+        assert_eq!(
+            floor_transport.max_frame_size,
+            Some(DEFAULT_RESOURCE_READ_BUFFER_BYTES * 64)
+        );
     }
 }
