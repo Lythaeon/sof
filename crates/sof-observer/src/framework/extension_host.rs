@@ -891,6 +891,7 @@ impl RuntimeExtensionHost {
         extension: &Arc<ActiveRuntimeExtension>,
         resources: &[ExtensionResourceSpec],
     ) -> Result<(), String> {
+        let startup_timeout = self.inner.startup_timeout;
         for resource in resources {
             let handle = match resource {
                 ExtensionResourceSpec::UdpListener(spec) => {
@@ -900,10 +901,12 @@ impl RuntimeExtensionHost {
                     spawn_tcp_listener(self.clone(), extension, spec.clone()).await?
                 }
                 ExtensionResourceSpec::TcpConnector(spec) => {
-                    spawn_tcp_connector(self.clone(), extension, spec.clone()).await?
+                    spawn_tcp_connector(self.clone(), extension, spec.clone(), startup_timeout)
+                        .await?
                 }
                 ExtensionResourceSpec::WsConnector(spec) => {
-                    spawn_ws_connector(self.clone(), extension, spec.clone()).await?
+                    spawn_ws_connector(self.clone(), extension, spec.clone(), startup_timeout)
+                        .await?
                 }
             };
             extension.push_resource_handle(handle);
@@ -1171,9 +1174,17 @@ async fn spawn_tcp_connector(
     host: RuntimeExtensionHost,
     extension: &Arc<ActiveRuntimeExtension>,
     spec: TcpConnectorSpec,
+    startup_timeout: Duration,
 ) -> Result<JoinHandle<()>, String> {
-    let stream = TcpStream::connect(spec.remote_addr)
+    let stream = timeout(startup_timeout, TcpStream::connect(spec.remote_addr))
         .await
+        .map_err(|_elapsed| {
+            format!(
+                "tcp connector {} timed out after {}ms during startup",
+                spec.remote_addr,
+                startup_timeout.as_millis()
+            )
+        })?
         .map_err(|error| format!("failed to connect tcp {}: {error}", spec.remote_addr))?;
     let local_addr = stream.local_addr().ok();
     let remote_addr = stream.peer_addr().ok();
@@ -1207,18 +1218,29 @@ async fn spawn_ws_connector(
     host: RuntimeExtensionHost,
     extension: &Arc<ActiveRuntimeExtension>,
     spec: WsConnectorSpec,
+    startup_timeout: Duration,
 ) -> Result<JoinHandle<()>, String> {
     let max_payload_chunk_bytes = spec
         .read_buffer_bytes
         .max(DEFAULT_RESOURCE_READ_BUFFER_BYTES);
-    let (stream, _response) = connect_async_with_config(
-        spec.url.as_str(),
-        Some(extension_websocket_transport_config(
-            max_payload_chunk_bytes,
-        )),
-        false,
+    let (stream, _response) = timeout(
+        startup_timeout,
+        connect_async_with_config(
+            spec.url.as_str(),
+            Some(extension_websocket_transport_config(
+                max_payload_chunk_bytes,
+            )),
+            false,
+        ),
     )
     .await
+    .map_err(|_elapsed| {
+        format!(
+            "websocket connector {} timed out after {}ms during startup",
+            spec.url,
+            startup_timeout.as_millis()
+        )
+    })?
     .map_err(|error| format!("failed to connect websocket {}: {error}", spec.url))?;
     let io = stream.get_ref().get_ref();
     let local_addr = io.local_addr().ok();
@@ -2479,6 +2501,47 @@ mod tests {
 
         assert!(ws_server_task.await.is_ok());
         host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn startup_times_out_hung_websocket_connector() {
+        let ws_server = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ws server");
+        let ws_server_addr = ws_server.local_addr().expect("ws local addr");
+        let ws_server_task = tokio::spawn(async move {
+            if let Ok((_stream, _)) = ws_server.accept().await {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+
+        let host = RuntimeExtensionHost::builder()
+            .with_startup_timeout(Duration::from_millis(50))
+            .add_extension(CounterExtension {
+                name: "hung-ws-connector",
+                startup_manifest: ExtensionManifest {
+                    capabilities: vec![ExtensionCapability::ConnectWebSocket],
+                    resources: vec![ExtensionResourceSpec::WsConnector(WsConnectorSpec {
+                        resource_id: "ws-connector".to_owned(),
+                        url: format!("ws://{ws_server_addr}/feed"),
+                        visibility: ExtensionStreamVisibility::Private,
+                        read_buffer_bytes: 128,
+                    })],
+                    subscriptions: Vec::new(),
+                },
+                packet_count: Arc::new(AtomicUsize::new(0)),
+                shutdown_wait: Duration::ZERO,
+                shutdown_called: Arc::new(AtomicBool::new(false)),
+            })
+            .build();
+
+        let report = host.startup().await;
+        assert_eq!(report.active_extensions, 0);
+        assert_eq!(report.failed_extensions, 1);
+        assert!(report.failures[0].reason.contains("timed out"));
+
+        ws_server_task.abort();
+        drop(ws_server_task.await);
     }
 
     #[test]
