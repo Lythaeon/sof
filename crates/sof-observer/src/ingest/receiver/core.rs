@@ -229,19 +229,15 @@ impl RawPacketBatch {
         let buffer_index = storage.packets.len();
         if buffer_index == storage.buffers.len() {
             storage.buffers.push([0_u8; UDP_PACKET_BUFFER_BYTES]);
-        } else if buffer_index > storage.buffers.len() {
-            storage.buffers.resize(
-                buffer_index.saturating_add(1),
-                [0_u8; UDP_PACKET_BUFFER_BYTES],
-            );
         }
-        let buffer = &mut storage.buffers[buffer_index];
-        buffer[..bytes.len()].copy_from_slice(bytes);
+        let packet_len = bytes.len();
+        debug_assert!(buffer_index < storage.buffers.len());
+        storage.buffers[buffer_index][..packet_len].copy_from_slice(bytes);
         storage.packets.push(RawPacket {
             source,
             ingress,
             buffer_index,
-            len: bytes.len(),
+            len: packet_len,
         });
         Ok(())
     }
