@@ -55,6 +55,8 @@ const DEFAULT_RESOURCE_READ_BUFFER_BYTES: usize = 2_048;
 const MAX_RESOURCE_READ_BUFFER_BYTES: usize = 1024 * 1024;
 /// Multiplier used to cap extension websocket frames/messages relative to chunk size.
 const EXTENSION_WEBSOCKET_MESSAGE_LIMIT_MULTIPLIER: usize = 64;
+/// Minimum non-zero timeout accepted for host startup/shutdown deadlines.
+const MIN_EXTENSION_HOST_TIMEOUT: Duration = Duration::from_millis(1);
 
 /// Startup failure record for one extension.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -232,14 +234,22 @@ impl RuntimeExtensionHostBuilder {
     /// Sets startup timeout for `RuntimeExtension::setup`.
     #[must_use]
     pub const fn with_startup_timeout(mut self, timeout: Duration) -> Self {
-        self.startup_timeout = timeout;
+        self.startup_timeout = if timeout.is_zero() {
+            MIN_EXTENSION_HOST_TIMEOUT
+        } else {
+            timeout
+        };
         self
     }
 
     /// Sets shutdown timeout for `RuntimeExtension::shutdown`.
     #[must_use]
     pub const fn with_shutdown_timeout(mut self, timeout: Duration) -> Self {
-        self.shutdown_timeout = timeout;
+        self.shutdown_timeout = if timeout.is_zero() {
+            MIN_EXTENSION_HOST_TIMEOUT
+        } else {
+            timeout
+        };
         self
     }
 
@@ -1888,6 +1898,22 @@ mod tests {
         assert_eq!(report.active_extensions, 0);
         assert_eq!(report.failed_extensions, 1);
         assert!(report.failures[0].reason.contains("zero read_buffer_bytes"));
+    }
+
+    #[test]
+    fn builder_clamps_zero_startup_timeout() {
+        let host = RuntimeExtensionHost::builder()
+            .with_startup_timeout(Duration::ZERO)
+            .build();
+        assert_eq!(host.inner.startup_timeout, Duration::from_millis(1));
+    }
+
+    #[test]
+    fn builder_clamps_zero_shutdown_timeout() {
+        let host = RuntimeExtensionHost::builder()
+            .with_shutdown_timeout(Duration::ZERO)
+            .build();
+        assert_eq!(host.inner.shutdown_timeout, Duration::from_millis(1));
     }
 
     #[tokio::test]
