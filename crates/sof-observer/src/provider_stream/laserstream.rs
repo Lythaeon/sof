@@ -30,6 +30,7 @@ use laserstream_core_proto::tonic::{
 use sof_support::bytes::{pubkey_bytes_from_slice, signature_bytes_from_slice};
 use sof_support::collections_support::prune_recent_slots;
 use sof_support::time_support::duration_secs_ceil;
+use sof_types::SignatureBytes;
 use solana_hash::Hash;
 use solana_message::{
     Message, MessageHeader, VersionedMessage,
@@ -1963,21 +1964,21 @@ fn transaction_event_from_update(
     let transaction =
         transaction.ok_or(LaserStreamError::Convert("missing transaction payload"))?;
     let is_vote = transaction.is_vote;
-    let signature = Some(signature_bytes_from_slice(
-        transaction.signature.as_slice(),
-        || LaserStreamError::Convert("invalid signature"),
-    )?);
+    let signature = signature_bytes_from_slice(transaction.signature.as_slice(), || {
+        LaserStreamError::Convert("invalid signature")
+    })?;
     let tx = convert_transaction(
         transaction
             .transaction
             .ok_or(LaserStreamError::Convert("missing versioned transaction"))?,
+        Some(signature),
     )?;
     Ok(TransactionEvent {
         slot,
         commitment_status,
         confirmed_slot: watermarks.confirmed_slot,
         finalized_slot: watermarks.finalized_slot,
-        signature,
+        signature: Some(signature),
         provider_source: None,
         kind: if is_vote {
             TxKind::VoteOnly
@@ -2190,9 +2191,16 @@ impl ProviderStreamFanIn {
 #[inline]
 fn convert_transaction(
     tx: LaserStreamTransaction,
+    first_signature: Option<SignatureBytes>,
 ) -> Result<VersionedTransaction, LaserStreamError> {
     let mut signatures = Vec::with_capacity(tx.signatures.len());
-    for signature in tx.signatures {
+    for (index, signature) in tx.signatures.into_iter().enumerate() {
+        if index == 0
+            && let Some(first_signature) = first_signature
+        {
+            signatures.push(first_signature.into());
+            continue;
+        }
         signatures.push(
             signature_bytes_from_slice(signature.as_slice(), || {
                 LaserStreamError::Convert("failed to parse transaction signature")
@@ -3200,6 +3208,7 @@ mod tests {
             transaction
                 .transaction
                 .ok_or(LaserStreamError::Convert("missing versioned transaction"))?,
+            None,
         )?;
         Ok(TransactionEvent {
             slot,
@@ -3339,7 +3348,7 @@ mod tests {
     #[test]
     fn laserstream_local_conversion_matches_sdk_baseline() {
         let tx = proto_transaction_from_versioned(&sample_transaction());
-        let local = convert_transaction(tx.clone()).expect("local tx");
+        let local = convert_transaction(tx.clone(), None).expect("local tx");
         let baseline = convert_transaction_sdk_baseline(tx).expect("baseline tx");
         assert_eq!(local, baseline);
     }
@@ -3359,7 +3368,7 @@ mod tests {
 
         let optimized_started = Instant::now();
         for _ in 0..iterations {
-            let tx = convert_transaction(tx.clone()).expect("optimized tx");
+            let tx = convert_transaction(tx.clone(), None).expect("optimized tx");
             black_box(tx);
         }
         let optimized_elapsed = optimized_started.elapsed();

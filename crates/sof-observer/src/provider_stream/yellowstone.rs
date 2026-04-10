@@ -16,6 +16,7 @@ use std::{
 use futures_util::{SinkExt, StreamExt};
 use sof_support::bytes::{pubkey_bytes_from_slice, signature_bytes_from_slice};
 use sof_support::collections_support::prune_recent_slots;
+use sof_types::SignatureBytes;
 use solana_hash::Hash;
 use solana_message::{
     Message, MessageHeader, VersionedMessage,
@@ -1779,23 +1780,23 @@ fn transaction_event_from_update(
     let transaction =
         transaction.ok_or(YellowstoneGrpcError::Convert("missing transaction payload"))?;
     let is_vote = transaction.is_vote;
-    let signature = Some(signature_bytes_from_slice(
-        transaction.signature.as_slice(),
-        || YellowstoneGrpcError::Convert("invalid signature"),
-    )?);
+    let signature = signature_bytes_from_slice(transaction.signature.as_slice(), || {
+        YellowstoneGrpcError::Convert("invalid signature")
+    })?;
     let tx = convert_transaction(
         transaction
             .transaction
             .ok_or(YellowstoneGrpcError::Convert(
                 "missing versioned transaction",
             ))?,
+        Some(signature),
     )?;
     Ok(TransactionEvent {
         slot,
         commitment_status,
         confirmed_slot: watermarks.confirmed_slot,
         finalized_slot: watermarks.finalized_slot,
-        signature,
+        signature: Some(signature),
         provider_source: None,
         kind: if is_vote {
             TxKind::VoteOnly
@@ -2004,9 +2005,16 @@ impl ProviderStreamFanIn {
 #[inline]
 fn convert_transaction(
     tx: yellowstone_grpc_proto::prelude::Transaction,
+    first_signature: Option<SignatureBytes>,
 ) -> Result<VersionedTransaction, YellowstoneGrpcError> {
     let mut signatures = Vec::with_capacity(tx.signatures.len());
-    for signature in tx.signatures {
+    for (index, signature) in tx.signatures.into_iter().enumerate() {
+        if index == 0
+            && let Some(first_signature) = first_signature
+        {
+            signatures.push(first_signature.into());
+            continue;
+        }
         signatures.push(
             signature_bytes_from_slice(signature.as_slice(), || {
                 YellowstoneGrpcError::Convert("failed to parse transaction signature")
