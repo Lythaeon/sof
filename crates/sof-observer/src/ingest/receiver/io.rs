@@ -474,7 +474,7 @@ fn flush_batch_baseline(
     flush_batch_inner(tx, batch, drop_on_full, telemetry);
 }
 
-pub(super) fn tune_udp_socket(socket: &std::net::UdpSocket) {
+pub(super) fn tune_udp_socket(socket: &UdpSocket) {
     let Some(rcvbuf_bytes) = read_udp_rcvbuf_bytes() else {
         tune_udp_busy_poll(socket);
         return;
@@ -499,7 +499,7 @@ pub(super) fn tune_udp_socket(socket: &std::net::UdpSocket) {
 }
 
 #[cfg(target_os = "linux")]
-fn tune_udp_busy_poll(socket: &std::net::UdpSocket) {
+fn tune_udp_busy_poll(socket: &UdpSocket) {
     const SO_BUSY_POLL: libc::c_int = 46;
     const SO_PREFER_BUSY_POLL: libc::c_int = 69;
     const SO_BUSY_POLL_BUDGET: libc::c_int = 70;
@@ -512,23 +512,36 @@ fn tune_udp_busy_poll(socket: &std::net::UdpSocket) {
     }
 
     if let Some(timeout_us) = busy_poll_us {
-        set_udp_socket_int_sockopt(
-            socket,
-            SO_BUSY_POLL,
-            timeout_us as libc::c_int,
-            "SO_BUSY_POLL",
-        );
+        if let Some(timeout_us) = udp_sockopt_int_value(timeout_us) {
+            set_udp_socket_int_sockopt(socket, SO_BUSY_POLL, timeout_us, "SO_BUSY_POLL");
+        } else {
+            tracing::warn!(
+                option = "SO_BUSY_POLL",
+                value = timeout_us,
+                local_addr = ?socket.local_addr().ok(),
+                "skipping UDP socket option outside libc::c_int range"
+            );
+        }
     }
     if prefer_busy_poll {
         set_udp_socket_int_sockopt(socket, SO_PREFER_BUSY_POLL, 1, "SO_PREFER_BUSY_POLL");
     }
     if let Some(packet_budget) = busy_poll_budget {
-        set_udp_socket_int_sockopt(
-            socket,
-            SO_BUSY_POLL_BUDGET,
-            packet_budget as libc::c_int,
-            "SO_BUSY_POLL_BUDGET",
-        );
+        if let Some(packet_budget) = udp_sockopt_int_value(packet_budget) {
+            set_udp_socket_int_sockopt(
+                socket,
+                SO_BUSY_POLL_BUDGET,
+                packet_budget,
+                "SO_BUSY_POLL_BUDGET",
+            );
+        } else {
+            tracing::warn!(
+                option = "SO_BUSY_POLL_BUDGET",
+                value = packet_budget,
+                local_addr = ?socket.local_addr().ok(),
+                "skipping UDP socket option outside libc::c_int range"
+            );
+        }
     }
 
     tracing::info!(
@@ -541,11 +554,16 @@ fn tune_udp_busy_poll(socket: &std::net::UdpSocket) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn tune_udp_busy_poll(_socket: &std::net::UdpSocket) {}
+fn tune_udp_busy_poll(_socket: &UdpSocket) {}
+
+#[cfg(target_os = "linux")]
+fn udp_sockopt_int_value(raw_value: u32) -> Option<libc::c_int> {
+    libc::c_int::try_from(raw_value).ok()
+}
 
 #[cfg(target_os = "linux")]
 fn set_udp_socket_int_sockopt(
-    socket: &std::net::UdpSocket,
+    socket: &UdpSocket,
     option_name: libc::c_int,
     option_value: libc::c_int,
     option_label: &str,
@@ -558,13 +576,13 @@ fn set_udp_socket_int_sockopt(
             libc::SOL_SOCKET,
             option_name,
             &option_value as *const libc::c_int as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            size_of::<libc::c_int>() as libc::socklen_t,
         )
     };
     if result == 0 {
         return;
     }
-    let error = std::io::Error::last_os_error();
+    let error = io::Error::last_os_error();
     tracing::warn!(
         option = option_label,
         value = option_value,
@@ -574,7 +592,7 @@ fn set_udp_socket_int_sockopt(
     );
 }
 
-pub(super) fn maybe_pin_receiver_thread(socket: &std::net::UdpSocket) {
+pub(super) fn maybe_pin_receiver_thread(socket: &UdpSocket) {
     let local_port = socket
         .local_addr()
         .map(|address| address.port())
@@ -716,6 +734,17 @@ mod tests {
         let truncated = std::mem::size_of::<libc::sockaddr_in>().saturating_sub(1);
         let namelen = libc::socklen_t::try_from(truncated).unwrap_or(0);
         assert!(sockaddr_storage_to_socket_addr_libc(&storage, namelen).is_none());
+    }
+
+    #[test]
+    fn udp_sockopt_int_value_rejects_out_of_range_values() {
+        assert_eq!(udp_sockopt_int_value(1), Some(1));
+        assert_eq!(udp_sockopt_int_value(i32::MAX as u32), Some(i32::MAX));
+        assert_eq!(
+            udp_sockopt_int_value((i32::MAX as u32).saturating_add(1)),
+            None
+        );
+        assert_eq!(udp_sockopt_int_value(u32::MAX), None);
     }
 
     #[test]
