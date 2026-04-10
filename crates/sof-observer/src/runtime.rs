@@ -2621,11 +2621,6 @@ fn dispatch_provider_stream_serialized_transaction(
                 .copied()
                 .map(framework::SignatureBytes::from_solana);
         }
-        if wants_transaction || wants_derived_state_transaction {
-            kind = Some(provider_stream::classify_provider_transaction_kind_view(
-                &view,
-            ));
-        }
         if wants_recent_blockhash {
             recent_blockhash = Some(view.recent_blockhash().to_bytes());
         }
@@ -2660,6 +2655,11 @@ fn dispatch_provider_stream_serialized_transaction(
                 });
             }
             return;
+        }
+        if wants_transaction || wants_derived_state_transaction {
+            kind = Some(provider_stream::classify_provider_transaction_kind_view(
+                &view,
+            ));
         }
     }
 
