@@ -1487,6 +1487,11 @@ fn validate_manifest(
                 "duplicate resource_id `{resource_id}` in startup manifest for extension `{extension_name}`"
             ));
         }
+        if read_buffer_bytes == 0 {
+            return Err(format!(
+                "resource `{resource_id}` declares zero read_buffer_bytes"
+            ));
+        }
         if read_buffer_bytes > MAX_RESOURCE_READ_BUFFER_BYTES {
             return Err(format!(
                 "resource `{resource_id}` read_buffer_bytes {read_buffer_bytes} exceeds max {}",
@@ -1856,6 +1861,33 @@ mod tests {
         assert_eq!(report.active_extensions, 0);
         assert_eq!(report.failed_extensions, 1);
         assert!(report.failures[0].reason.contains("read_buffer_bytes"));
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_zero_read_buffer_bytes() {
+        let host = RuntimeExtensionHost::builder()
+            .add_extension(CounterExtension {
+                name: "zero-read-buffer",
+                startup_manifest: ExtensionManifest {
+                    capabilities: vec![ExtensionCapability::ConnectWebSocket],
+                    resources: vec![ExtensionResourceSpec::WsConnector(WsConnectorSpec {
+                        resource_id: "ws-feed".to_owned(),
+                        url: "ws://127.0.0.1:1/feed".to_owned(),
+                        visibility: ExtensionStreamVisibility::Private,
+                        read_buffer_bytes: 0,
+                    })],
+                    subscriptions: Vec::new(),
+                },
+                packet_count: Arc::new(AtomicUsize::new(0)),
+                shutdown_wait: Duration::ZERO,
+                shutdown_called: Arc::new(AtomicBool::new(false)),
+            })
+            .build();
+
+        let report = host.startup().await;
+        assert_eq!(report.active_extensions, 0);
+        assert_eq!(report.failed_extensions, 1);
+        assert!(report.failures[0].reason.contains("zero read_buffer_bytes"));
     }
 
     #[tokio::test]
