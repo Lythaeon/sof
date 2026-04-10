@@ -1429,6 +1429,7 @@ mod tests {
 
     use crate::framework::ExtensionSetupError;
     use async_trait::async_trait;
+    use tokio::io::AsyncWriteExt;
 
     struct CounterExtension {
         name: &'static str,
@@ -1836,9 +1837,7 @@ mod tests {
         let mut second = TcpStream::connect(bind_addr)
             .await
             .expect("connect second tcp client");
-        assert!(tokio::io::AsyncWriteExt::write_all(&mut second, b"second")
-            .await
-            .is_ok());
+        assert!(second.write_all(b"second").await.is_ok());
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(packet_count.load(Ordering::Relaxed), 1);
@@ -1947,11 +1946,7 @@ mod tests {
         let tcp_server_addr = tcp_server.local_addr().expect("tcp local addr");
         let tcp_server_task = tokio::spawn(async move {
             if let Ok((mut stream, _)) = tcp_server.accept().await {
-                assert!(
-                    tokio::io::AsyncWriteExt::write_all(&mut stream, b"tcp")
-                        .await
-                        .is_ok()
-                );
+                assert!(stream.write_all(b"tcp").await.is_ok());
             }
         });
 
