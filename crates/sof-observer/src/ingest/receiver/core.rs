@@ -215,11 +215,6 @@ impl RawPacketBatch {
         ingress: RawPacketIngress,
         bytes: &[u8],
     ) -> Result<(), UdpReceiverError> {
-        if self.storage.is_none() {
-            return Err(UdpReceiverError::Receive {
-                source: std::io::Error::other("raw packet batch storage missing"),
-            });
-        }
         if bytes.len() > UDP_PACKET_BUFFER_BYTES {
             return Err(UdpReceiverError::InvalidPacketLength {
                 len: bytes.len(),
@@ -228,23 +223,19 @@ impl RawPacketBatch {
         }
         let Some(storage) = self.storage.as_mut() else {
             return Err(UdpReceiverError::Receive {
-                source: std::io::Error::other("raw packet batch storage missing"),
+                source: IoError::other("raw packet batch storage missing"),
             });
         };
         let buffer_index = storage.packets.len();
-        if buffer_index >= storage.buffers.len() {
+        if buffer_index == storage.buffers.len() {
+            storage.buffers.push([0_u8; UDP_PACKET_BUFFER_BYTES]);
+        } else if buffer_index > storage.buffers.len() {
             storage.buffers.resize(
                 buffer_index.saturating_add(1),
                 [0_u8; UDP_PACKET_BUFFER_BYTES],
             );
         }
-        let buffer =
-            storage
-                .buffers
-                .get_mut(buffer_index)
-                .ok_or_else(|| UdpReceiverError::Receive {
-                    source: IoError::other("raw packet receive buffer missing"),
-                })?;
+        let buffer = &mut storage.buffers[buffer_index];
         buffer[..bytes.len()].copy_from_slice(bytes);
         storage.packets.push(RawPacket {
             source,
