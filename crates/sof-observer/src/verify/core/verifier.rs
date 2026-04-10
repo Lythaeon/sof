@@ -52,6 +52,32 @@ impl ShredVerifier {
         slot_leader_window: u64,
         unknown_retry: Duration,
     ) -> Self {
+        let slot_state_capacity = usize::try_from(slot_leader_window)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1)
+            .min(65_536);
+        Self {
+            known_pubkey_verifiers: Vec::new(),
+            slot_leaders: HashMap::with_capacity(slot_state_capacity),
+            unknown_slots: HashMap::with_capacity(slot_state_capacity),
+            pending_added_slot_leaders: HashMap::with_capacity(slot_state_capacity),
+            pending_updated_slot_leaders: HashMap::with_capacity(slot_state_capacity),
+            pending_removed_slots: HashSet::with_capacity(slot_state_capacity),
+            latest_slot: 0,
+            has_latest_slot: false,
+            slot_leader_window,
+            signature_cache: SignatureCache::new(signature_cache_capacity),
+            unknown_retry,
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn new_baseline(
+        signature_cache_capacity: usize,
+        slot_leader_window: u64,
+        unknown_retry: Duration,
+    ) -> Self {
         Self {
             known_pubkey_verifiers: Vec::new(),
             slot_leaders: HashMap::new(),
