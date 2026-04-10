@@ -91,16 +91,25 @@ impl GossipRepairClient {
     }
 
     fn source_pubkeys(&self, source_addr: SocketAddr) -> SmallVec<[Pubkey; 4]> {
-        let mut seen = SmallVec::<[Pubkey; 4]>::new();
-        if let Some(pubkey) = self.addr_to_pubkey.get(&source_addr).copied() {
+        let direct_pubkey = self.addr_to_pubkey.get(&source_addr).copied();
+        let Some(ip_pubkeys) = self.ip_to_pubkeys.get(&source_addr.ip()) else {
+            return direct_pubkey.into_iter().collect();
+        };
+        let mut seen = SmallVec::<[Pubkey; 4]>::with_capacity(
+            ip_pubkeys
+                .len()
+                .saturating_add(usize::from(direct_pubkey.is_some())),
+        );
+        if let Some(pubkey) = direct_pubkey {
             seen.push(pubkey);
-        }
-        if let Some(pubkeys) = self.ip_to_pubkeys.get(&source_addr.ip()) {
-            for &pubkey in pubkeys {
-                if !seen.contains(&pubkey) {
-                    seen.push(pubkey);
-                }
-            }
+            seen.extend(
+                ip_pubkeys
+                    .iter()
+                    .copied()
+                    .filter(|ip_pubkey| *ip_pubkey != pubkey),
+            );
+        } else {
+            seen.extend(ip_pubkeys.iter().copied());
         }
         seen
     }
