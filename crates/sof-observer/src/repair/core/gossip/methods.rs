@@ -7,6 +7,7 @@ use crate::{
     shred::wire::{ParsedShredHeader, parse_shred_header},
 };
 use smallvec::SmallVec;
+use sof_support::time_support::duration_millis_u64;
 use solana_gossip::contact_info::ContactInfo;
 use solana_keypair::signable::Signable;
 
@@ -666,10 +667,7 @@ impl GossipRepairClient {
         self.last_request_sent_at
             .get(&addr)
             .copied()
-            .map(|sent_at| {
-                u64::try_from(now.saturating_duration_since(sent_at).as_millis())
-                    .unwrap_or(u64::MAX)
-            })
+            .map(|sent_at| duration_millis_u64(now.saturating_duration_since(sent_at)))
             .unwrap_or(u64::MAX)
     }
 

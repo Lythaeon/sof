@@ -186,14 +186,18 @@ pub mod time_support {
         }
     }
 
+    /// Returns one duration in whole milliseconds, saturating at `u64::MAX`.
+    #[must_use]
+    pub fn duration_millis_u64(duration: Duration) -> u64 {
+        duration.as_millis().min(u128::from(u64::MAX)) as u64
+    }
+
     /// Returns the current Unix timestamp in milliseconds, saturating at `u64::MAX`.
     #[must_use]
     pub fn current_unix_ms() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |duration| {
-                duration.as_millis().min(u128::from(u64::MAX)) as u64
-            })
+            .map_or(0, duration_millis_u64)
     }
 
     /// Returns the current Unix timestamp in whole seconds.
@@ -223,7 +227,8 @@ mod tests {
         decode_short_u16_len_prefix,
     };
     use super::time_support::{
-        current_unix_ms, current_unix_nanos, current_unix_secs, duration_secs_ceil,
+        current_unix_ms, current_unix_nanos, current_unix_secs, duration_millis_u64,
+        duration_secs_ceil,
     };
 
     #[test]
@@ -238,6 +243,12 @@ mod tests {
         let first = current_unix_ms();
         let second = current_unix_ms();
         assert!(second >= first);
+    }
+
+    #[test]
+    fn duration_millis_u64_saturates() {
+        assert_eq!(duration_millis_u64(Duration::from_millis(7)), 7);
+        assert_eq!(duration_millis_u64(Duration::MAX), u64::MAX);
     }
 
     #[test]

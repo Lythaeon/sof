@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use sof_support::short_vec::decode_short_u16_len_prefix;
+use sof_support::{short_vec::decode_short_u16_len_prefix, time_support::duration_millis_u64};
 use sof_types::SignatureBytes;
 use tokio::{
     net::TcpStream,
@@ -392,11 +392,11 @@ impl TxSubmitClient {
         let opportunity_age_ms = context
             .opportunity_created_at
             .and_then(|created_at| now.duration_since(created_at).ok())
-            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64);
+            .map(duration_millis_u64);
         if let Some(age_ms) = opportunity_age_ms
             && let Some(max_age) = self.guard_policy.max_opportunity_age
         {
-            let max_allowed_ms = max_age.as_millis().min(u128::from(u64::MAX)) as u64;
+            let max_allowed_ms = duration_millis_u64(max_age);
             if age_ms > max_allowed_ms {
                 return Err(self.reject_with_outcome(
                     TxToxicFlowRejectionReason::OpportunityStale {
