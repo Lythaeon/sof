@@ -606,7 +606,7 @@ const fn max_cached_shred_key() -> CachedShredKey {
 mod tests {
     use std::hint::black_box;
 
-    use sof_support::env_support::read_positive_usize;
+    use sof_support::{bench::avg_ns_per_iteration, env_support::read_positive_usize};
 
     use super::*;
     use crate::{
@@ -656,12 +656,18 @@ mod tests {
             black_box(optimized.insert(&packet, &parsed, now));
         }
         let optimized_elapsed = optimized_started.elapsed();
+        let baseline_avg_ns = avg_ns_per_iteration(baseline_elapsed, iterations);
+        let optimized_avg_ns = avg_ns_per_iteration(optimized_elapsed, iterations);
 
         eprintln!(
-            "relay_ring_buffer_replace_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            "relay_ring_buffer_replace_profile_fixture iterations={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.3} optimized_avg_us_per_iteration={:.3}",
             iterations,
             baseline_elapsed.as_micros(),
             optimized_elapsed.as_micros(),
+            baseline_avg_ns,
+            optimized_avg_ns,
+            baseline_avg_ns as f64 / 1_000.0,
+            optimized_avg_ns as f64 / 1_000.0,
         );
     }
 
@@ -1006,12 +1012,18 @@ mod tests {
             black_box(optimized.insert(&packet, &parsed, now));
         }
         let optimized_elapsed = optimized_started.elapsed();
+        let baseline_avg_ns = avg_ns_per_iteration(baseline_elapsed, iterations);
+        let optimized_avg_ns = avg_ns_per_iteration(optimized_elapsed, iterations);
 
         eprintln!(
-            "shared_relay_cache_replace_profile_fixture iterations={} baseline_us={} optimized_us={}",
+            "shared_relay_cache_replace_profile_fixture iterations={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.3} optimized_avg_us_per_iteration={:.3}",
             iterations,
             baseline_elapsed.as_micros(),
             optimized_elapsed.as_micros(),
+            baseline_avg_ns,
+            optimized_avg_ns,
+            baseline_avg_ns as f64 / 1_000.0,
+            optimized_avg_ns as f64 / 1_000.0,
         );
     }
 
