@@ -1453,6 +1453,35 @@ fn validate_websocket_resource_url(resource_id: &str, url: &str) -> Result<(), S
     })
 }
 
+/// Validates one packet subscription against startup invariants and granted capabilities.
+fn validate_packet_subscription(
+    subscription: &PacketSubscription,
+    capabilities: &HashSet<ExtensionCapability>,
+) -> Result<(), String> {
+    if let Some(owner_extension) = subscription.owner_extension.as_ref()
+        && owner_extension.trim().is_empty()
+    {
+        return Err("subscription declares empty owner_extension".to_owned());
+    }
+    if let Some(resource_id) = subscription.resource_id.as_ref()
+        && resource_id.trim().is_empty()
+    {
+        return Err("subscription declares empty resource_id".to_owned());
+    }
+    if let Some(shared_tag) = subscription.shared_tag.as_ref() {
+        if shared_tag.trim().is_empty() {
+            return Err("subscription declares empty shared_tag".to_owned());
+        }
+        if !capabilities.contains(&ExtensionCapability::ObserveSharedExtensionStream) {
+            return Err(
+                "subscription declares shared_tag without ObserveSharedExtensionStream capability"
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Validates one extension manifest against the active runtime policy.
 fn validate_manifest(
     extension_name: &'static str,
@@ -1537,6 +1566,9 @@ fn validate_manifest(
         if let ExtensionResourceSpec::WsConnector(spec) = resource {
             validate_websocket_resource_url(resource_id, &spec.url)?;
         }
+    }
+    for subscription in &manifest.subscriptions {
+        validate_packet_subscription(subscription, &capabilities)?;
     }
 
     Ok(ValidatedManifest {
@@ -1942,6 +1974,62 @@ mod tests {
         assert_eq!(report.active_extensions, 0);
         assert_eq!(report.failed_extensions, 1);
         assert!(report.failures[0].reason.contains("invalid websocket url"));
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_empty_subscription_shared_tag() {
+        let host = RuntimeExtensionHost::builder()
+            .add_extension(CounterExtension {
+                name: "empty-subscription-shared-tag",
+                startup_manifest: ExtensionManifest {
+                    capabilities: vec![ExtensionCapability::ObserveSharedExtensionStream],
+                    resources: Vec::new(),
+                    subscriptions: vec![PacketSubscription {
+                        source_kind: Some(RuntimePacketSourceKind::ExtensionResource),
+                        shared_tag: Some("   ".to_owned()),
+                        ..PacketSubscription::default()
+                    }],
+                },
+                packet_count: Arc::new(AtomicUsize::new(0)),
+                shutdown_wait: Duration::ZERO,
+                shutdown_called: Arc::new(AtomicBool::new(false)),
+            })
+            .build();
+
+        let report = host.startup().await;
+        assert_eq!(report.active_extensions, 0);
+        assert_eq!(report.failed_extensions, 1);
+        assert!(report.failures[0].reason.contains("empty shared_tag"));
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_shared_stream_subscription_without_capability() {
+        let host = RuntimeExtensionHost::builder()
+            .add_extension(CounterExtension {
+                name: "missing-shared-stream-capability",
+                startup_manifest: ExtensionManifest {
+                    capabilities: vec![ExtensionCapability::ObserveObserverIngress],
+                    resources: Vec::new(),
+                    subscriptions: vec![PacketSubscription {
+                        source_kind: Some(RuntimePacketSourceKind::ExtensionResource),
+                        shared_tag: Some("shared-feed".to_owned()),
+                        ..PacketSubscription::default()
+                    }],
+                },
+                packet_count: Arc::new(AtomicUsize::new(0)),
+                shutdown_wait: Duration::ZERO,
+                shutdown_called: Arc::new(AtomicBool::new(false)),
+            })
+            .build();
+
+        let report = host.startup().await;
+        assert_eq!(report.active_extensions, 0);
+        assert_eq!(report.failed_extensions, 1);
+        assert!(
+            report.failures[0]
+                .reason
+                .contains("ObserveSharedExtensionStream capability")
+        );
     }
 
     #[test]
