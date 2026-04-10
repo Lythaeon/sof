@@ -70,12 +70,6 @@ fn parse_data_shred_header(
     let flags = read_u8(packet, OFFSET_FLAGS)?;
     let payload_offset = super::SIZE_OF_DATA_SHRED_HEADERS;
     let payload_len = declared_size.saturating_sub(payload_offset);
-    if packet.get(payload_offset..declared_size).is_none() {
-        return Err(ParseError::PacketTooShort {
-            actual: packet.len(),
-            minimum: declared_size,
-        });
-    }
 
     Ok(ParsedDataShredHeader {
         common,
@@ -117,14 +111,14 @@ fn max_data_shred_size(variant: ShredVariant) -> Option<usize> {
         return None;
     }
     let proof = usize::from(variant.proof_size);
-    let trailer = SIZE_OF_MERKLE_ROOT
-        .checked_add(proof.checked_mul(SIZE_OF_MERKLE_PROOF_ENTRY)?)?
-        .checked_add(if variant.resigned {
-            SIZE_OF_SIGNATURE
-        } else {
-            0
-        })?;
-    let capacity = super::SIZE_OF_DATA_SHRED_PAYLOAD
-        .checked_sub(super::SIZE_OF_DATA_SHRED_HEADERS.checked_add(trailer)?)?;
-    super::SIZE_OF_DATA_SHRED_HEADERS.checked_add(capacity)
+    let proof_bytes = proof.checked_mul(SIZE_OF_MERKLE_PROOF_ENTRY)?;
+    let trailer =
+        SIZE_OF_MERKLE_ROOT
+            .checked_add(proof_bytes)?
+            .checked_add(if variant.resigned {
+                SIZE_OF_SIGNATURE
+            } else {
+                0
+            })?;
+    super::SIZE_OF_DATA_SHRED_PAYLOAD.checked_sub(trailer)
 }

@@ -244,6 +244,13 @@ mod tests {
         protocol::shred_wire::SIZE_OF_DATA_SHRED_PAYLOAD, shred::wire::parse_shred_header,
     };
 
+    fn avg_ns_per_iteration(elapsed: Duration, iterations: usize) -> u128 {
+        elapsed
+            .as_nanos()
+            .checked_div(u128::try_from(iterations.max(1)).unwrap_or(1))
+            .unwrap_or(0)
+    }
+
     fn test_key(slot: u64, index: u32) -> ShredDedupeIdentity {
         ShredDedupeIdentity {
             slot,
@@ -529,12 +536,15 @@ mod tests {
             );
         }
         let elapsed = start.elapsed();
+        let avg_ns = avg_ns_per_iteration(elapsed, iterations);
         let metrics = cache.metrics();
         println!(
-            "duplicate_ingress_profile_fixture iterations={} unique_keys={} elapsed_us={} queue_depth={} entries={}",
+            "duplicate_ingress_profile_fixture iterations={} unique_keys={} elapsed_us={} avg_ns_per_iteration={} avg_us_per_iteration={:.3} queue_depth={} entries={}",
             iterations,
             unique_keys,
             elapsed.as_micros(),
+            avg_ns,
+            avg_ns as f64 / 1_000.0,
             metrics.queue_depth,
             metrics.entries,
         );
@@ -569,11 +579,14 @@ mod tests {
             );
         }
         let elapsed = start.elapsed();
+        let avg_ns = avg_ns_per_iteration(elapsed, iterations);
         let metrics = cache.metrics();
         println!(
-            "duplicate_parse_and_ingress_profile_fixture iterations={} elapsed_us={} queue_depth={} entries={}",
+            "duplicate_parse_and_ingress_profile_fixture iterations={} elapsed_us={} avg_ns_per_iteration={} avg_us_per_iteration={:.3} queue_depth={} entries={}",
             iterations,
             elapsed.as_micros(),
+            avg_ns,
+            avg_ns as f64 / 1_000.0,
             metrics.queue_depth,
             metrics.entries,
         );
