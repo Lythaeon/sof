@@ -385,6 +385,7 @@ impl ProviderStreamUpdate {
 
     /// Tags one provider-origin update with one shared source reference.
     #[must_use]
+    #[cfg_attr(not(feature = "provider-grpc"), allow(dead_code))]
     pub(crate) fn with_provider_source_ref(mut self, source: &Arc<ProviderSourceIdentity>) -> Self {
         match &mut self {
             Self::Transaction(event) => event.provider_source = Some(Arc::clone(source)),
