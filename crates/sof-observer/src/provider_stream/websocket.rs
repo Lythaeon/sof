@@ -9,6 +9,8 @@
 
 use std::{
     borrow::Cow,
+    fmt,
+    future::pending,
     mem,
     str::FromStr,
     sync::{Arc, OnceLock},
@@ -16,7 +18,7 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use simd_json::{Buffers as SimdJsonBuffers, serde::from_slice as simd_from_slice};
@@ -33,7 +35,10 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async_with_config,
-    tungstenite::protocol::{Message as WsMessage, WebSocketConfig},
+    tungstenite::{
+        Error as TungsteniteError,
+        protocol::{Message as WsMessage, WebSocketConfig},
+    },
 };
 
 #[cfg(test)]
@@ -141,8 +146,8 @@ pub enum WebsocketConfigOption {
     ProgramFilters,
 }
 
-impl std::fmt::Display for WebsocketConfigOption {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for WebsocketConfigOption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::HttpEndpoint => f.write_str("http replay endpoint"),
             Self::VoteFilter => f.write_str("vote filter"),
@@ -840,7 +845,7 @@ pub enum WebsocketTransactionError {
     Config(#[from] WebsocketConfigError),
     /// Websocket transport failure.
     #[error(transparent)]
-    Transport(#[from] tokio_tungstenite::tungstenite::Error),
+    Transport(#[from] TungsteniteError),
     /// Upstream payload shape/protocol failure.
     #[error(transparent)]
     Protocol(#[from] WebsocketProtocolError),
@@ -860,7 +865,7 @@ pub enum WebsocketTransactionError {
 pub enum WebsocketLogsError {
     /// Websocket transport failure.
     #[error(transparent)]
-    Transport(#[from] tokio_tungstenite::tungstenite::Error),
+    Transport(#[from] TungsteniteError),
     /// Upstream payload shape/protocol failure.
     #[error(transparent)]
     Protocol(#[from] WebsocketProtocolError),
@@ -953,8 +958,8 @@ pub enum WebsocketStreamKind {
     Program,
 }
 
-impl std::fmt::Display for WebsocketStreamKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for WebsocketStreamKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Transaction => f.write_str("websocket transaction"),
             Self::Logs => f.write_str("websocket logs"),
@@ -1344,7 +1349,7 @@ async fn run_websocket_primary_connection(
                 if let Some(interval) = ping.as_mut() {
                     interval.tick().await;
                 } else {
-                    std::future::pending::<()>().await;
+                    pending::<()>().await;
                 }
             } => {
                 write.send(WsMessage::Ping(Vec::new().into())).await?;
@@ -1354,7 +1359,7 @@ async fn run_websocket_primary_connection(
                     let deadline = last_progress.checked_add(timeout).unwrap_or(last_progress);
                     tokio::time::sleep_until(deadline).await;
                 } else {
-                    std::future::pending::<()>().await;
+                    pending::<()>().await;
                 }
             } => {
                 return Err(WebsocketProtocolError::StreamStalled {
@@ -1547,8 +1552,7 @@ const fn websocket_logs_health_reason(error: &WebsocketLogsError) -> ProviderSou
 
 async fn wait_for_subscription_ack<S>(read: &mut S) -> Result<(), WebsocketTransactionError>
 where
-    S: futures_util::Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
-        + Unpin,
+    S: Stream<Item = Result<WsMessage, TungsteniteError>> + Unpin,
 {
     let ack_timeout = Duration::from_secs(10);
     let mut frame_bytes = Vec::new();
@@ -1915,7 +1919,7 @@ async fn run_websocket_logs_connection(
                 if let Some(interval) = ping.as_mut() {
                     interval.tick().await;
                 } else {
-                    std::future::pending::<()>().await;
+                    pending::<()>().await;
                 }
             } => {
                 write.send(WsMessage::Ping(Vec::new().into())).await?;
@@ -1925,7 +1929,7 @@ async fn run_websocket_logs_connection(
                     let deadline = last_progress.checked_add(timeout).unwrap_or(last_progress);
                     tokio::time::sleep_until(deadline).await;
                 } else {
-                    std::future::pending::<()>().await;
+                    pending::<()>().await;
                 }
             } => {
                 return Err(WebsocketProtocolError::StreamStalled {
@@ -2002,8 +2006,7 @@ async fn establish_websocket_logs_session(
 
 async fn wait_for_logs_subscription_ack<S>(read: &mut S) -> Result<(), WebsocketLogsError>
 where
-    S: futures_util::Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
-        + Unpin,
+    S: Stream<Item = Result<WsMessage, TungsteniteError>> + Unpin,
 {
     let ack_timeout = Duration::from_secs(10);
     let mut frame_bytes = Vec::new();
@@ -2626,10 +2629,15 @@ impl RpcLoadedAddresses {
 )]
 mod tests {
     use super::*;
-    use crate::event::TxKind;
-    use crate::provider_stream::{create_provider_stream_fan_in, create_provider_stream_queue};
+    use crate::{
+        event::TxKind,
+        provider_stream::{
+            create_provider_stream_fan_in, create_provider_stream_queue,
+            yellowstone::{YellowstoneGrpcCommitment, YellowstoneGrpcConfig},
+        },
+    };
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-    use serde_json::json;
+    use serde_json::{json, to_value};
     use sof_support::bench::{avg_ns_per_iteration, profile_iterations};
     use solana_keypair::Keypair;
     use solana_message::{Message, VersionedMessage};
@@ -2638,9 +2646,6 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::time::{Duration, timeout};
     use tokio_tungstenite::{accept_async, tungstenite::protocol::Message as WsMessage};
-
-    #[cfg(feature = "provider-grpc")]
-    use crate::provider_stream::yellowstone::{YellowstoneGrpcCommitment, YellowstoneGrpcConfig};
 
     fn sample_notification_payload() -> Vec<u8> {
         let signer = Keypair::new();
@@ -2716,24 +2721,15 @@ mod tests {
         );
         assert_eq!(
             websocket_filter.get("accountInclude"),
-            Some(
-                &serde_json::to_value(yellowstone_filter.account_include.clone())
-                    .expect("include json")
-            )
+            Some(&to_value(yellowstone_filter.account_include.clone()).expect("include json"))
         );
         assert_eq!(
             websocket_filter.get("accountExclude"),
-            Some(
-                &serde_json::to_value(yellowstone_filter.account_exclude.clone())
-                    .expect("exclude json")
-            )
+            Some(&to_value(yellowstone_filter.account_exclude.clone()).expect("exclude json"))
         );
         assert_eq!(
             websocket_filter.get("accountRequired"),
-            Some(
-                &serde_json::to_value(yellowstone_filter.account_required.clone())
-                    .expect("required json")
-            )
+            Some(&to_value(yellowstone_filter.account_required.clone()).expect("required json"))
         );
     }
 

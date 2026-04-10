@@ -3,7 +3,7 @@
 #[cfg(test)]
 use std::str::FromStr;
 use std::{
-    any::Any,
+    any::{Any, type_name_of_val},
     collections::HashSet,
     io::ErrorKind,
     net::SocketAddr,
@@ -25,7 +25,10 @@ use tokio::{
 };
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async_with_config,
-    tungstenite::{Error as WebSocketError, Message, protocol::WebSocketConfig},
+    tungstenite::{
+        Error as WebSocketError, Message,
+        protocol::{CloseFrame, WebSocketConfig},
+    },
 };
 
 use crate::framework::extension::{
@@ -670,7 +673,7 @@ impl RuntimeExtensionHost {
             let has_explicit_name = extension.has_explicit_name();
 
             if !has_explicit_name {
-                let concrete_type_name = std::any::type_name_of_val(extension.as_ref());
+                let concrete_type_name = type_name_of_val(extension.as_ref());
                 tracing::warn!(
                     extension = extension_name,
                     concrete_type = concrete_type_name,
@@ -1361,10 +1364,7 @@ async fn read_websocket_messages(
 }
 
 /// Emits one websocket connection-closed event with close-frame metadata when available.
-fn emit_websocket_close_event(
-    context: &ExtensionResourceReadContext,
-    frame: Option<&tokio_tungstenite::tungstenite::protocol::CloseFrame>,
-) {
+fn emit_websocket_close_event(context: &ExtensionResourceReadContext, frame: Option<&CloseFrame>) {
     let close_payload = frame
         .map(|close_frame| close_frame.reason.as_bytes())
         .unwrap_or_default();
@@ -1470,7 +1470,7 @@ fn current_unix_ms() -> u64 {
 }
 
 /// Converts a panic payload into a loggable message string.
-fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
+fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
     payload.downcast_ref::<&str>().map_or_else(
         || {
             payload
@@ -1485,12 +1485,16 @@ fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::{
+        net::TcpListener as StdTcpListener,
+        sync::atomic::{AtomicBool, AtomicUsize},
+    };
 
     use crate::framework::ExtensionSetupError;
     use async_trait::async_trait;
     use sof_support::bench::{avg_ns_per_iteration, profile_iterations};
     use tokio::io::AsyncWriteExt;
+    use tokio_tungstenite::accept_async;
 
     struct CounterExtension {
         name: &'static str,
@@ -1925,7 +1929,7 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_listener_accepts_new_connections_while_existing_stream_stays_open() {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
+        let probe = StdTcpListener::bind("127.0.0.1:0").expect("bind probe listener");
         let bind_addr = probe.local_addr().expect("probe local addr");
         drop(probe);
 
@@ -2219,7 +2223,7 @@ mod tests {
         let ws_server_addr = ws_server.local_addr().expect("ws local addr");
         let ws_server_task = tokio::spawn(async move {
             if let Ok((stream, _)) = ws_server.accept().await
-                && let Ok(mut websocket) = tokio_tungstenite::accept_async(stream).await
+                && let Ok(mut websocket) = accept_async(stream).await
             {
                 assert!(websocket.send(Message::Text("ws".into())).await.is_ok());
             }
@@ -2288,7 +2292,7 @@ mod tests {
         let ws_server_addr = ws_server.local_addr().expect("ws local addr");
         let ws_server_task = tokio::spawn(async move {
             if let Ok((stream, _)) = ws_server.accept().await
-                && let Ok(mut websocket) = tokio_tungstenite::accept_async(stream).await
+                && let Ok(mut websocket) = accept_async(stream).await
             {
                 assert!(websocket.close(None).await.is_ok());
             }
