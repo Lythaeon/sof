@@ -7,7 +7,7 @@
 //! and LaserStream by requesting full base64 transaction payloads and converting
 //! them into [`crate::framework::TransactionEvent`] values before dispatch.
 
-use std::{borrow::Cow, str::FromStr, sync::Arc, time::Duration};
+use std::{borrow::Cow, mem, str::FromStr, sync::Arc, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, StreamExt};
@@ -15,6 +15,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use simd_json::{Buffers as SimdJsonBuffers, serde::from_slice as simd_from_slice};
 use sof_types::{PubkeyBytes, SignatureBytes};
+use solana_packet::PACKET_DATA_SIZE;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
@@ -26,9 +27,15 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async, tungstenite::protocol::Message as WsMessage,
 };
 
+#[cfg(test)]
+use std::hint::black_box;
+
 use crate::{
-    event::TxCommitmentStatus,
-    framework::{AccountUpdateEvent, TransactionEvent, pubkey_bytes, signature_bytes_opt},
+    event::{TxCommitmentStatus, TxKind},
+    framework::{
+        AccountUpdateEvent, TransactionEvent, TransactionLogEvent, pubkey_bytes,
+        signature_bytes_opt,
+    },
     provider_stream::{
         ProviderCommitmentWatermarks, ProviderSourceArbitrationMode, ProviderSourceHealthEvent,
         ProviderSourceHealthReason, ProviderSourceHealthStatus, ProviderSourceId,
@@ -1615,12 +1622,7 @@ fn parse_transaction_notification(
             "unsupported websocket transaction encoding",
         ));
     }
-    tx_bytes.clear();
-    STANDARD
-        .decode_vec(notification.transaction.transaction.0.as_bytes(), tx_bytes)
-        .map_err(|_error| {
-            WebsocketTransactionError::Convert("invalid base64 transaction payload")
-        })?;
+    decode_transaction_wire_payload(&notification.transaction.transaction.0, tx_bytes)?;
     let signature = serialized_transaction_first_signature(tx_bytes).or_else(|| {
         notification
             .signature
@@ -1629,7 +1631,7 @@ fn parse_transaction_notification(
     });
     watermarks
         .observe_transaction_commitment(notification.slot, commitment_status.as_tx_commitment());
-    let tx_payload = std::mem::take(tx_bytes).into_boxed_slice();
+    let tx_payload = mem::take(tx_bytes).into_boxed_slice();
     Ok(Some(SerializedTransactionEvent {
         slot: notification.slot,
         commitment_status: commitment_status.as_tx_commitment(),
@@ -1639,6 +1641,32 @@ fn parse_transaction_notification(
         provider_source: None,
         bytes: tx_payload,
     }))
+}
+
+const MAX_BASE64_TRANSACTION_WIRE_LEN: usize = PACKET_DATA_SIZE.div_ceil(3) * 4;
+
+fn decode_transaction_wire_payload(
+    encoded: &str,
+    tx_bytes: &mut Vec<u8>,
+) -> Result<(), WebsocketTransactionError> {
+    if encoded.len() > MAX_BASE64_TRANSACTION_WIRE_LEN {
+        return Err(WebsocketTransactionError::Convert(
+            "websocket transaction payload exceeds max wire size",
+        ));
+    }
+    tx_bytes.clear();
+    STANDARD
+        .decode_vec(encoded.as_bytes(), tx_bytes)
+        .map_err(|_error| {
+            WebsocketTransactionError::Convert("invalid base64 transaction payload")
+        })?;
+    if tx_bytes.len() > PACKET_DATA_SIZE {
+        tx_bytes.clear();
+        return Err(WebsocketTransactionError::Convert(
+            "websocket transaction payload exceeds max wire size",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_account_notification(
@@ -1713,7 +1741,7 @@ fn decode_account_update_event(
         .decode_vec(account.data.0.as_bytes(), tx_bytes)
         .map_err(|_error| WebsocketTransactionError::Convert("invalid base64 account payload"))?;
     observe_non_transaction_commitment(watermarks, slot, commitment.as_tx_commitment());
-    let data = std::mem::take(tx_bytes).into_boxed_slice();
+    let data = mem::take(tx_bytes).into_boxed_slice();
     Ok(AccountUpdateEvent {
         slot,
         commitment_status: commitment.as_tx_commitment(),
@@ -2003,7 +2031,7 @@ where
 fn parse_logs_notification(
     bytes: &mut [u8],
     config: &WebsocketLogsConfig,
-) -> Result<Option<crate::framework::TransactionLogEvent>, WebsocketLogsError> {
+) -> Result<Option<TransactionLogEvent>, WebsocketLogsError> {
     let value: WebsocketLogsEnvelopeMessage = simd_from_slice(bytes)
         .map_err(|error| WebsocketProtocolError::InvalidJson(error.to_string()))?;
     if let Some(error) = value.error {
@@ -2018,7 +2046,7 @@ fn parse_logs_notification(
         WebsocketLogsFilter::Mentions(pubkey) => Some(PubkeyBytes::from(pubkey)),
         WebsocketLogsFilter::All | WebsocketLogsFilter::AllWithVotes => None,
     };
-    Ok(Some(crate::framework::TransactionLogEvent {
+    Ok(Some(TransactionLogEvent {
         slot: notification.context.slot,
         commitment_status: config.commitment.as_tx_commitment(),
         signature: signature.into(),
@@ -2054,11 +2082,8 @@ fn materialize_transaction_baseline(
             "unsupported websocket transaction encoding",
         ));
     }
-    let tx_bytes = STANDARD
-        .decode(notification.transaction.transaction.0.as_bytes())
-        .map_err(|_error| {
-            WebsocketTransactionError::Convert("invalid base64 transaction payload")
-        })?;
+    let mut tx_bytes = Vec::new();
+    decode_transaction_wire_payload(&notification.transaction.transaction.0, &mut tx_bytes)?;
     let tx = bincode::deserialize::<VersionedTransaction>(&tx_bytes).map_err(|_error| {
         WebsocketTransactionError::Convert("failed to deserialize transaction")
     })?;
@@ -2113,17 +2138,14 @@ async fn replay_websocket_gap(
     }
 
     let start_slot = websocket_replay_start_slot(previous_slot, head, config.replay_max_slots);
+    let mut tx_bytes = Vec::new();
     for slot in start_slot..=head {
         let Some(block) = rpc_get_block(&client, &http_endpoint, slot, config.commitment).await?
         else {
             continue;
         };
         for transaction in block.transactions {
-            let tx_bytes = STANDARD
-                .decode(transaction.transaction.0.as_bytes())
-                .map_err(|_error| {
-                    WebsocketTransactionError::Convert("invalid base64 transaction payload")
-                })?;
+            decode_transaction_wire_payload(&transaction.transaction.0, &mut tx_bytes)?;
             let tx = bincode::deserialize::<VersionedTransaction>(&tx_bytes).map_err(|_error| {
                 WebsocketTransactionError::Convert("failed to deserialize transaction")
             })?;
@@ -2293,7 +2315,7 @@ fn websocket_transaction_matches_filter(
     config: &WebsocketTransactionConfig,
     tx: &VersionedTransaction,
     loaded_addresses: Option<&RpcLoadedAddresses>,
-    kind: crate::event::TxKind,
+    kind: TxKind,
     failed: bool,
 ) -> bool {
     if let Some(signature) = config.signature
@@ -2302,7 +2324,7 @@ fn websocket_transaction_matches_filter(
         return false;
     }
     if let Some(expect_vote) = config.vote {
-        let is_vote = kind == crate::event::TxKind::VoteOnly;
+        let is_vote = kind == TxKind::VoteOnly;
         if is_vote != expect_vote {
             return false;
         }
@@ -2563,7 +2585,7 @@ mod tests {
     use solana_keypair::Keypair;
     use solana_message::{Message, VersionedMessage};
     use solana_signer::Signer;
-    use std::time::Instant;
+    use std::{env, time::Instant};
     use tokio::net::TcpListener;
     use tokio::time::{Duration, timeout};
     use tokio_tungstenite::{accept_async, tungstenite::protocol::Message as WsMessage};
@@ -2572,7 +2594,7 @@ mod tests {
     use crate::provider_stream::yellowstone::{YellowstoneGrpcCommitment, YellowstoneGrpcConfig};
 
     fn profile_iterations(default: usize) -> usize {
-        std::env::var("SOF_PROFILE_ITERATIONS")
+        env::var("SOF_PROFILE_ITERATIONS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
@@ -2838,6 +2860,43 @@ mod tests {
         .expect("serialized event");
         assert_eq!(event.confirmed_slot, Some(55));
         assert_eq!(event.finalized_slot, None);
+    }
+
+    #[test]
+    fn websocket_transaction_notification_rejects_oversized_payload() {
+        let mut payload = json!({
+            "jsonrpc":"2.0",
+            "method":"transactionNotification",
+            "params":{
+                "result":{
+                    "slot":55,
+                    "transaction":{
+                        "transaction":[BASE64_STANDARD.encode(vec![7_u8; PACKET_DATA_SIZE + 1]),"base64"]
+                    }
+                }
+            }
+        })
+        .to_string()
+        .into_bytes();
+        let mut json_buffers = SimdJsonBuffers::default();
+        let mut tx_bytes = Vec::new();
+        let mut watermarks = ProviderCommitmentWatermarks::default();
+
+        let error = parse_transaction_notification(
+            &mut payload,
+            &mut json_buffers,
+            &mut tx_bytes,
+            WebsocketTransactionCommitment::Confirmed,
+            &mut watermarks,
+        )
+        .expect_err("oversized payload should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("websocket transaction payload exceeds max wire size"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -3539,10 +3598,7 @@ mod tests {
             match update {
                 ProviderStreamUpdate::Health(event) => {
                     saw_health = true;
-                    assert_eq!(
-                        event.source.kind,
-                        crate::provider_stream::ProviderSourceId::WebsocketTransaction
-                    );
+                    assert_eq!(event.source.kind, ProviderSourceId::WebsocketTransaction);
                     continue;
                 }
                 ProviderStreamUpdate::SerializedTransaction(event) => break event,
@@ -3798,14 +3854,8 @@ mod tests {
         }
 
         assert_eq!(sources.len(), 2);
-        assert_eq!(
-            sources[0].kind,
-            crate::provider_stream::ProviderSourceId::WebsocketTransaction
-        );
-        assert_eq!(
-            sources[1].kind,
-            crate::provider_stream::ProviderSourceId::WebsocketTransaction
-        );
+        assert_eq!(sources[0].kind, ProviderSourceId::WebsocketTransaction);
+        assert_eq!(sources[1].kind, ProviderSourceId::WebsocketTransaction);
         assert_ne!(sources[0], sources[1]);
 
         handle_a.abort();
@@ -3987,7 +4037,7 @@ mod tests {
             )
             .expect("baseline parse")
             .expect("baseline event");
-            std::hint::black_box(event);
+            black_box(event);
         }
         let baseline_elapsed = baseline_started.elapsed();
 
@@ -4007,7 +4057,7 @@ mod tests {
             )
             .expect("optimized parse")
             .expect("optimized event");
-            std::hint::black_box(event);
+            black_box(event);
         }
         let optimized_elapsed = optimized_started.elapsed();
 
@@ -4033,7 +4083,7 @@ mod tests {
             )
             .expect("baseline parse")
             .expect("baseline event");
-            std::hint::black_box(event);
+            black_box(event);
         }
     }
 
@@ -4058,7 +4108,7 @@ mod tests {
             )
             .expect("optimized parse")
             .expect("optimized event");
-            std::hint::black_box(event);
+            black_box(event);
         }
     }
 }

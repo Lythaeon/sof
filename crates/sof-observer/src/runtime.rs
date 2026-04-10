@@ -19,8 +19,9 @@ pub use crate::app::config::GossipRuntimeMode;
 use crate::app::config::read_observability_bind_addr;
 use crate::framework::host::TransactionDispatchScope;
 use crate::framework::{
-    DerivedStateHost, DerivedStateReplayBackend, DerivedStateReplayDurability, PluginHost,
-    RuntimeExtensionHost, TransactionEvent,
+    DerivedStateHost, DerivedStateReplayBackend, DerivedStateReplayDurability,
+    ObservedRecentBlockhashEvent, PluginHost, RuntimeExtensionHost, SignatureBytes,
+    TransactionEvent,
 };
 #[cfg(feature = "kernel-bypass")]
 use crate::ingest::{RawPacketBatchReceiver, RawPacketBatchSender, create_raw_packet_batch_queue};
@@ -43,6 +44,7 @@ use sof_gossip_tuning::{
     QueueCapacity, ReceiverCoalesceWindow, RuntimeTuningPort, SofRuntimeTuning,
     TvuReceiveSocketCount,
 };
+use solana_packet::PACKET_DATA_SIZE;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 use thiserror::Error;
@@ -50,6 +52,7 @@ use thiserror::Error;
 type ShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 const PROVIDER_REPLAY_DEDUPE_CAPACITY: usize = 65_536;
 const PROVIDER_REPLAY_DEDUPE_SLOT_WINDOW: u64 = 4_096;
+const MAX_PROVIDER_SERIALIZED_TRANSACTION_BYTES: usize = PACKET_DATA_SIZE;
 #[cfg(feature = "gossip-bootstrap")]
 const PROVIDER_GOSSIP_CONTROL_PLANE_POLL_MS: u64 = 250;
 #[cfg(feature = "gossip-bootstrap")]
@@ -2330,7 +2333,7 @@ fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderR
     match update {
         ProviderStreamUpdate::Transaction(event) => event
             .signature
-            .map(framework::SignatureBytes::to_solana)
+            .map(SignatureBytes::to_solana)
             .or_else(|| event.tx.signatures.first().copied())
             .map(|signature| ProviderReplayLogicalKey::Transaction {
                 slot: event.slot,
@@ -2339,10 +2342,8 @@ fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderR
                 confirmed_slot: event.confirmed_slot,
                 finalized_slot: event.finalized_slot,
             }),
-        ProviderStreamUpdate::SerializedTransaction(event) => event
-            .signature
-            .map(framework::SignatureBytes::to_solana)
-            .map_or_else(
+        ProviderStreamUpdate::SerializedTransaction(event) => {
+            event.signature.map(SignatureBytes::to_solana).map_or_else(
                 || {
                     Some(ProviderReplayLogicalKey::SerializedTransaction {
                         slot: event.slot,
@@ -2361,7 +2362,8 @@ fn provider_replay_dedupe_key(update: &ProviderStreamUpdate) -> Option<ProviderR
                         finalized_slot: event.finalized_slot,
                     })
                 },
-            ),
+            )
+        }
         ProviderStreamUpdate::RecentBlockhash(event) => {
             Some(ProviderReplayLogicalKey::ControlPlane {
                 slot: event.slot,
@@ -2488,7 +2490,7 @@ fn dispatch_provider_stream_update(
     match update {
         ProviderStreamUpdate::Transaction(event) => {
             if plugin_host.wants_recent_blockhash() {
-                plugin_host.on_recent_blockhash(framework::ObservedRecentBlockhashEvent {
+                plugin_host.on_recent_blockhash(ObservedRecentBlockhashEvent {
                     slot: event.slot,
                     recent_blockhash: event.tx.message.recent_blockhash().to_bytes(),
                     dataset_tx_count: 1,
@@ -2603,6 +2605,14 @@ fn dispatch_provider_stream_serialized_transaction(
     if !wants_transaction && !wants_recent_blockhash && !wants_derived_state_transaction {
         return;
     }
+    if event.bytes.len() > MAX_PROVIDER_SERIALIZED_TRANSACTION_BYTES {
+        tracing::warn!(
+            slot = event.slot,
+            payload_len = event.bytes.len(),
+            "provider serialized transaction exceeds max wire size"
+        );
+        return;
+    }
 
     let mut signature = event.signature;
     let mut recent_blockhash = None;
@@ -2619,7 +2629,7 @@ fn dispatch_provider_stream_serialized_transaction(
                 .signatures()
                 .first()
                 .copied()
-                .map(framework::SignatureBytes::from_solana);
+                .map(SignatureBytes::from_solana);
         }
         if wants_recent_blockhash {
             recent_blockhash = Some(view.recent_blockhash().to_bytes());
@@ -2635,7 +2645,7 @@ fn dispatch_provider_stream_serialized_transaction(
                 && !wants_derived_state_transaction
             {
                 if let Some(recent_blockhash) = recent_blockhash {
-                    plugin_host.on_recent_blockhash(framework::ObservedRecentBlockhashEvent {
+                    plugin_host.on_recent_blockhash(ObservedRecentBlockhashEvent {
                         slot: event.slot,
                         recent_blockhash,
                         dataset_tx_count: 1,
@@ -2647,7 +2657,7 @@ fn dispatch_provider_stream_serialized_transaction(
         }
         if !wants_transaction && !wants_derived_state_transaction {
             if let Some(recent_blockhash) = recent_blockhash {
-                plugin_host.on_recent_blockhash(framework::ObservedRecentBlockhashEvent {
+                plugin_host.on_recent_blockhash(ObservedRecentBlockhashEvent {
                     slot: event.slot,
                     recent_blockhash,
                     dataset_tx_count: 1,
@@ -2680,14 +2690,14 @@ fn dispatch_provider_stream_serialized_transaction(
             tx.signatures
                 .first()
                 .copied()
-                .map(framework::SignatureBytes::from_solana)
+                .map(SignatureBytes::from_solana)
         }),
         provider_source: event.provider_source.clone(),
         kind: kind.unwrap_or_else(|| provider_stream::classify_provider_transaction_kind(&tx)),
         tx,
     };
     if wants_recent_blockhash {
-        plugin_host.on_recent_blockhash(framework::ObservedRecentBlockhashEvent {
+        plugin_host.on_recent_blockhash(ObservedRecentBlockhashEvent {
             slot: event.slot,
             recent_blockhash: recent_blockhash
                 .unwrap_or_else(|| event.tx.message.recent_blockhash().to_bytes()),
@@ -3284,6 +3294,8 @@ pub async fn run_async_with_hosts_and_setup(
 mod tests {
     use std::{
         collections::BTreeMap,
+        env,
+        future::Future,
         sync::{
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
@@ -3307,7 +3319,7 @@ mod tests {
     use solana_transaction::versioned::VersionedTransaction;
 
     fn profile_iterations(default: usize) -> usize {
-        std::env::var("SOF_PROFILE_ITERATIONS")
+        env::var("SOF_PROFILE_ITERATIONS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
@@ -3326,7 +3338,7 @@ mod tests {
         f: impl FnOnce() -> Fut,
     ) -> T
     where
-        Fut: std::future::Future<Output = T>,
+        Fut: Future<Output = T>,
     {
         runtime_env::with_runtime_env_overrides_for_test_async(overrides, f).await
     }
@@ -3345,7 +3357,7 @@ mod tests {
                 .signatures
                 .first()
                 .copied()
-                .map(framework::SignatureBytes::from_solana),
+                .map(SignatureBytes::from_solana),
             provider_source: None,
             kind: TxKind::NonVote,
             tx: Arc::new(tx),
@@ -3360,6 +3372,10 @@ mod tests {
 
     struct TransactionOnlyPlugin;
     struct RecentBlockhashPlugin;
+    struct TransactionAndRecentBlockhashCounterPlugin {
+        transaction_count: Arc<AtomicUsize>,
+        recent_blockhash_count: Arc<AtomicUsize>,
+    }
     #[cfg(feature = "gossip-bootstrap")]
     struct ClusterTopologyOnlyPlugin;
     struct StartupCounterPlugin {
@@ -3423,6 +3439,23 @@ mod tests {
     impl ObserverPlugin for RecentBlockhashPlugin {
         fn config(&self) -> PluginConfig {
             PluginConfig::new().with_recent_blockhash()
+        }
+    }
+
+    #[async_trait]
+    impl ObserverPlugin for TransactionAndRecentBlockhashCounterPlugin {
+        fn config(&self) -> PluginConfig {
+            PluginConfig::new()
+                .with_transaction()
+                .with_recent_blockhash()
+        }
+
+        async fn on_transaction(&self, _event: &TransactionEvent) {
+            self.transaction_count.fetch_add(1, Ordering::Relaxed);
+        }
+
+        async fn on_recent_blockhash(&self, _event: ObservedRecentBlockhashEvent) {
+            self.recent_blockhash_count.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -3764,7 +3797,7 @@ mod tests {
     ) {
         match update {
             ProviderStreamUpdate::Transaction(event) => {
-                plugin_host.on_recent_blockhash(framework::ObservedRecentBlockhashEvent {
+                plugin_host.on_recent_blockhash(ObservedRecentBlockhashEvent {
                     slot: event.slot,
                     recent_blockhash: event.tx.message.recent_blockhash().to_bytes(),
                     dataset_tx_count: 1,
@@ -3826,6 +3859,9 @@ mod tests {
         if !wants_transaction && !wants_recent_blockhash && !wants_derived_state_transaction {
             return;
         }
+        if event.bytes.len() > MAX_PROVIDER_SERIALIZED_TRANSACTION_BYTES {
+            return;
+        }
 
         let mut signature = event.signature;
         let mut recent_blockhash = None;
@@ -3836,7 +3872,7 @@ mod tests {
                     .signatures()
                     .first()
                     .copied()
-                    .map(framework::SignatureBytes::from_solana);
+                    .map(SignatureBytes::from_solana);
             }
             kind = Some(provider_stream::classify_provider_transaction_kind_view(
                 &view,
@@ -3855,7 +3891,7 @@ mod tests {
                     && !wants_derived_state_transaction
                 {
                     if let Some(recent_blockhash) = recent_blockhash {
-                        plugin_host.on_recent_blockhash(framework::ObservedRecentBlockhashEvent {
+                        plugin_host.on_recent_blockhash(ObservedRecentBlockhashEvent {
                             slot: event.slot,
                             recent_blockhash,
                             dataset_tx_count: 1,
@@ -3867,7 +3903,7 @@ mod tests {
             }
             if !wants_transaction && !wants_derived_state_transaction {
                 if let Some(recent_blockhash) = recent_blockhash {
-                    plugin_host.on_recent_blockhash(framework::ObservedRecentBlockhashEvent {
+                    plugin_host.on_recent_blockhash(ObservedRecentBlockhashEvent {
                         slot: event.slot,
                         recent_blockhash,
                         dataset_tx_count: 1,
@@ -3891,14 +3927,14 @@ mod tests {
                 tx.signatures
                     .first()
                     .copied()
-                    .map(framework::SignatureBytes::from_solana)
+                    .map(SignatureBytes::from_solana)
             }),
             provider_source: event.provider_source.clone(),
             kind: kind.unwrap_or_else(|| provider_stream::classify_provider_transaction_kind(&tx)),
             tx,
         };
         if wants_recent_blockhash {
-            plugin_host.on_recent_blockhash(framework::ObservedRecentBlockhashEvent {
+            plugin_host.on_recent_blockhash(ObservedRecentBlockhashEvent {
                 slot: event.slot,
                 recent_blockhash: recent_blockhash
                     .unwrap_or_else(|| event.tx.message.recent_blockhash().to_bytes()),
@@ -3994,7 +4030,7 @@ mod tests {
         match sample_provider_transaction_update() {
             ProviderStreamUpdate::Transaction(mut event) => {
                 event.slot = slot;
-                event.signature = Some(framework::SignatureBytes::from_solana(Signature::from(
+                event.signature = Some(SignatureBytes::from_solana(Signature::from(
                     [slot as u8; 64],
                 )));
                 ProviderStreamUpdate::Transaction(event)
@@ -4015,7 +4051,7 @@ mod tests {
     }
 
     fn sample_provider_recent_blockhash_update(slot: u64) -> ProviderStreamUpdate {
-        ProviderStreamUpdate::RecentBlockhash(framework::ObservedRecentBlockhashEvent {
+        ProviderStreamUpdate::RecentBlockhash(ObservedRecentBlockhashEvent {
             slot,
             recent_blockhash: [slot as u8; 32],
             dataset_tx_count: 1,
@@ -4029,7 +4065,7 @@ mod tests {
             commitment_status: TxCommitmentStatus::Processed,
             confirmed_slot: None,
             finalized_slot: None,
-            signature: framework::SignatureBytes::from_solana(Signature::from([slot as u8; 64])),
+            signature: SignatureBytes::from_solana(Signature::from([slot as u8; 64])),
             is_vote: false,
             index: Some(0),
             err: None,
@@ -4070,7 +4106,7 @@ mod tests {
             rent_epoch: 0,
             data: Arc::from([1_u8, 2, 3, 4]),
             write_version: Some(slot),
-            txn_signature: Some(framework::SignatureBytes::from_solana(Signature::from(
+            txn_signature: Some(SignatureBytes::from_solana(Signature::from(
                 [slot as u8; 64],
             ))),
             is_startup: false,
@@ -4083,7 +4119,7 @@ mod tests {
         ProviderStreamUpdate::TransactionLog(framework::TransactionLogEvent {
             slot,
             commitment_status: TxCommitmentStatus::Processed,
-            signature: framework::SignatureBytes::from_solana(Signature::from([slot as u8; 64])),
+            signature: SignatureBytes::from_solana(Signature::from([slot as u8; 64])),
             err: None,
             logs: Arc::from([String::from("program log: hello")]),
             matched_filter: None,
@@ -4914,6 +4950,34 @@ mod tests {
 
         assert!(!dedupe.observe(&update));
         assert!(dedupe.observe(&update));
+    }
+
+    #[test]
+    fn oversized_serialized_provider_transaction_is_dropped() {
+        let transaction_count = Arc::new(AtomicUsize::new(0));
+        let recent_blockhash_count = Arc::new(AtomicUsize::new(0));
+        let plugin_host = PluginHost::builder()
+            .add_plugin(TransactionAndRecentBlockhashCounterPlugin {
+                transaction_count: transaction_count.clone(),
+                recent_blockhash_count: recent_blockhash_count.clone(),
+            })
+            .build();
+        let derived_state_host = DerivedStateHost::builder().build();
+        let ProviderStreamUpdate::SerializedTransaction(mut event) =
+            sample_serialized_provider_transaction_update()
+        else {
+            panic!("expected serialized update fixture");
+        };
+        event.bytes = vec![0_u8; MAX_PROVIDER_SERIALIZED_TRANSACTION_BYTES + 1].into_boxed_slice();
+
+        dispatch_provider_stream_update(
+            &plugin_host,
+            &derived_state_host,
+            ProviderStreamUpdate::SerializedTransaction(event),
+        );
+
+        assert_eq!(transaction_count.load(Ordering::Relaxed), 0);
+        assert_eq!(recent_blockhash_count.load(Ordering::Relaxed), 0);
     }
 
     #[test]
