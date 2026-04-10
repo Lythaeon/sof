@@ -67,6 +67,15 @@ const MAX_ACCOUNT_DATA_LEN: usize = MAX_PERMITTED_DATA_LENGTH as usize;
 const SLOT_STATUS_RETAINED_LAG: u64 = 4_096;
 const SLOT_STATUS_PRUNE_THRESHOLD: usize = SLOT_STATUS_RETAINED_LAG as usize * 2;
 
+const fn duration_secs_ceil(duration: Duration) -> u64 {
+    let secs = duration.as_secs();
+    if duration.subsec_nanos() == 0 {
+        secs
+    } else {
+        secs.saturating_add(1)
+    }
+}
+
 /// LaserStream subscription commitment used for provider-stream transaction updates.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum LaserStreamCommitment {
@@ -530,10 +539,10 @@ impl LaserStreamConfig {
     fn client_config(&self) -> ClientConfig {
         let mut options = ChannelOptions::default();
         if let Some(timeout) = self.connect_timeout {
-            options.connect_timeout_secs = Some(timeout.as_secs());
+            options.connect_timeout_secs = Some(duration_secs_ceil(timeout));
         }
         if let Some(timeout) = self.timeout {
-            options.timeout_secs = Some(timeout.as_secs());
+            options.timeout_secs = Some(duration_secs_ceil(timeout));
         }
         if let Some(bytes) = self.max_decoding_message_size {
             options.max_decoding_message_size = Some(bytes);
@@ -877,10 +886,10 @@ impl LaserStreamSlotsConfig {
     fn client_config(&self) -> ClientConfig {
         let mut options = ChannelOptions::default();
         if let Some(timeout) = self.connect_timeout {
-            options.connect_timeout_secs = Some(timeout.as_secs());
+            options.connect_timeout_secs = Some(duration_secs_ceil(timeout));
         }
         if let Some(timeout) = self.timeout {
-            options.timeout_secs = Some(timeout.as_secs());
+            options.timeout_secs = Some(duration_secs_ceil(timeout));
         }
         if let Some(bytes) = self.max_decoding_message_size {
             options.max_decoding_message_size = Some(bytes);
@@ -2513,6 +2522,23 @@ mod tests {
         assert!(request.transactions_status.is_empty());
         assert!(request.blocks_meta.contains_key("sof"));
         assert!(request.slots.contains_key(INTERNAL_WATERMARK_SLOT_FILTER));
+    }
+
+    #[test]
+    fn laserstream_client_config_rounds_subsecond_timeouts_up() {
+        let config = LaserStreamConfig::new("https://laserstream.example", "token")
+            .with_connect_timeout(Duration::from_millis(250))
+            .with_timeout(Duration::from_millis(750))
+            .client_config();
+        assert_eq!(config.channel_options.connect_timeout_secs, Some(1));
+        assert_eq!(config.channel_options.timeout_secs, Some(1));
+
+        let slots_config = LaserStreamSlotsConfig::new("https://laserstream.example", "token")
+            .with_connect_timeout(Duration::from_millis(400))
+            .with_timeout(Duration::from_millis(900))
+            .client_config();
+        assert_eq!(slots_config.channel_options.connect_timeout_secs, Some(1));
+        assert_eq!(slots_config.channel_options.timeout_secs, Some(1));
     }
 
     #[tokio::test]

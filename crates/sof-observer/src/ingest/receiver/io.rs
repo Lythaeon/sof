@@ -3,6 +3,13 @@
 #![allow(clippy::arithmetic_side_effects)]
 
 use super::*;
+use std::{
+    io,
+    mem::{size_of, zeroed},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6, UdpSocket},
+    ptr::null_mut,
+};
+
 use crate::ingest::RawPacketBatchSender;
 #[cfg(test)]
 use crate::ingest::config::read_udp_drop_on_channel_full;
@@ -15,6 +22,9 @@ use nix::poll::PollFlags;
 use nix::poll::{PollFd, ppoll};
 #[cfg(target_os = "linux")]
 use nix::sys::time::TimeSpec;
+
+#[cfg(target_os = "linux")]
+const SOCKADDR_STORAGE_LEN: libc::socklen_t = size_of::<libc::sockaddr_storage>() as _;
 
 pub(super) struct UdpReceive {
     pub(super) len: usize,
@@ -35,24 +45,22 @@ impl UdpBatchScratch {
         let capacity = capacity.max(1);
         // SAFETY: The libc socket structs are plain old data and immediately
         // initialized before each syscall use.
-        let mut io_vectors = vec![unsafe { std::mem::zeroed() }; capacity];
+        let mut io_vectors = vec![unsafe { zeroed() }; capacity];
         // SAFETY: The libc socket structs are plain old data and immediately
         // initialized before each syscall use.
-        let mut addrs = vec![unsafe { std::mem::zeroed() }; capacity];
+        let mut addrs = vec![unsafe { zeroed() }; capacity];
         // SAFETY: The libc socket structs are plain old data and immediately
         // initialized before each syscall use.
-        let mut headers = vec![unsafe { std::mem::zeroed() }; capacity];
-        let name_len =
-            libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_storage>()).unwrap_or(0);
+        let mut headers = vec![unsafe { zeroed() }; capacity];
         for index in 0..capacity {
             headers[index] = libc::mmsghdr {
                 msg_hdr: libc::msghdr {
                     msg_name: (&mut addrs[index]) as *mut libc::sockaddr_storage
                         as *mut libc::c_void,
-                    msg_namelen: name_len,
+                    msg_namelen: SOCKADDR_STORAGE_LEN,
                     msg_iov: (&mut io_vectors[index]) as *mut libc::iovec,
                     msg_iovlen: 1,
-                    msg_control: std::ptr::null_mut(),
+                    msg_control: null_mut(),
                     msg_controllen: 0,
                     msg_flags: 0,
                 },
@@ -68,10 +76,10 @@ impl UdpBatchScratch {
 }
 
 pub(super) fn recv_udp_packet(
-    socket: &std::net::UdpSocket,
+    socket: &UdpSocket,
     buffer: &mut [u8],
     track_rxq_ovfl: bool,
-) -> std::io::Result<UdpReceive> {
+) -> io::Result<UdpReceive> {
     #[cfg(target_os = "linux")]
     if track_rxq_ovfl {
         let mut io_vectors = [IoSliceMut::new(buffer)];
@@ -84,13 +92,13 @@ pub(super) fn recv_udp_packet(
         )
         .map_err(nix_errno_to_io_error)?;
         let Some(source_storage) = message.address.as_ref() else {
-            return Err(std::io::Error::new(
+            return Err(io::Error::new(
                 ErrorKind::InvalidData,
                 "udp recvmsg missing source address",
             ));
         };
         let Some(source) = sockaddr_storage_to_socket_addr(source_storage) else {
-            return Err(std::io::Error::new(
+            return Err(io::Error::new(
                 ErrorKind::InvalidData,
                 "udp recvmsg source address is not inet/inet6",
             ));
@@ -122,33 +130,33 @@ pub(super) fn recv_udp_packet(
 #[cfg(test)]
 #[cfg(target_os = "linux")]
 pub(super) fn recv_udp_batch(
-    socket: &std::net::UdpSocket,
+    socket: &UdpSocket,
     scratch: &mut UdpBatchScratch,
     batch: &mut RawPacketBatch,
-) -> std::io::Result<usize> {
+) -> io::Result<usize> {
     batch.clear();
     recv_udp_batch_append(socket, scratch, batch, scratch.headers.len())
 }
 
 #[cfg(all(test, target_os = "linux"))]
 fn recv_udp_batch_baseline(
-    socket: &std::net::UdpSocket,
+    socket: &UdpSocket,
     scratch: &mut UdpBatchScratch,
     batch: &mut RawPacketBatch,
-) -> std::io::Result<usize> {
+) -> io::Result<usize> {
     batch.clear();
     recv_udp_batch_append_baseline(socket, scratch, batch, scratch.headers.len())
 }
 
 #[cfg(target_os = "linux")]
 pub(super) fn recv_udp_batch_coalesced(
-    socket: &std::net::UdpSocket,
+    socket: &UdpSocket,
     scratch: &mut UdpBatchScratch,
     batch: &mut RawPacketBatch,
     idle_wait: Duration,
     batch_max_wait: Duration,
     poll_fd: &mut [PollFd<'_>],
-) -> std::io::Result<usize> {
+) -> io::Result<usize> {
     batch.clear();
     let mut total_received = 0_usize;
     let deadline = Instant::now() + batch_max_wait;
@@ -184,7 +192,7 @@ pub(super) fn recv_udp_batch_coalesced(
                 };
                 if !wait_udp_readable(poll_fd, wait)? {
                     if total_received == 0 {
-                        return Err(std::io::Error::from(ErrorKind::WouldBlock));
+                        return Err(io::Error::from(ErrorKind::WouldBlock));
                     }
                     break;
                 }
@@ -198,11 +206,11 @@ pub(super) fn recv_udp_batch_coalesced(
 
 #[cfg(target_os = "linux")]
 fn recv_udp_batch_append(
-    socket: &std::net::UdpSocket,
+    socket: &UdpSocket,
     scratch: &mut UdpBatchScratch,
     batch: &mut RawPacketBatch,
     max_packets: usize,
-) -> std::io::Result<usize> {
+) -> io::Result<usize> {
     let capacity = scratch.headers.len();
     let count = capacity.min(max_packets);
     if count == 0 {
@@ -212,16 +220,13 @@ fn recv_udp_batch_append(
     for index in 0..count {
         let buffer_index = start_index.saturating_add(index);
         let Some(buffer) = batch.receive_buffer_mut(buffer_index) else {
-            return Err(std::io::Error::other(
-                "raw packet batch receive buffer missing",
-            ));
+            return Err(io::Error::other("raw packet batch receive buffer missing"));
         };
         scratch.io_vectors[index] = libc::iovec {
             iov_base: buffer.as_mut_ptr().cast(),
             iov_len: buffer.len(),
         };
-        scratch.headers[index].msg_hdr.msg_namelen =
-            libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_storage>()).unwrap_or(0);
+        scratch.headers[index].msg_hdr.msg_namelen = SOCKADDR_STORAGE_LEN;
         scratch.headers[index].msg_hdr.msg_flags = 0;
         scratch.headers[index].msg_len = 0;
     }
@@ -234,11 +239,11 @@ fn recv_udp_batch_append(
             scratch.headers.as_mut_ptr(),
             count.min(u32::MAX as usize) as u32,
             libc::MSG_WAITFORONE,
-            std::ptr::null_mut(),
+            null_mut(),
         )
     };
     if received < 0 {
-        return Err(std::io::Error::last_os_error());
+        return Err(io::Error::last_os_error());
     }
     let received = usize::try_from(received).unwrap_or(0);
     if received == 0 {
@@ -254,7 +259,7 @@ fn recv_udp_batch_append(
             scratch.headers[index].msg_hdr.msg_namelen,
         )
         .ok_or_else(|| {
-            std::io::Error::new(
+            io::Error::new(
                 ErrorKind::InvalidData,
                 "udp recvmmsg source address is not inet/inet6",
             )
@@ -262,7 +267,7 @@ fn recv_udp_batch_append(
         batch
             .push_received_metadata(source, RawPacketIngress::Udp, buffer_index, len)
             .map_err(|error| match error {
-                UdpReceiverError::InvalidPacketLength { len, capacity } => std::io::Error::new(
+                UdpReceiverError::InvalidPacketLength { len, capacity } => io::Error::new(
                     ErrorKind::InvalidData,
                     format!(
                         "udp recvmmsg returned packet length {len} beyond buffer capacity {capacity}"
@@ -271,7 +276,7 @@ fn recv_udp_batch_append(
                 UdpReceiverError::Receive { source: io_error } => io_error,
                 UdpReceiverError::BindSocket { .. }
                 | UdpReceiverError::SetBlockingMode { .. }
-                | UdpReceiverError::SetReadTimeout { .. } => std::io::Error::new(
+                | UdpReceiverError::SetReadTimeout { .. } => io::Error::new(
                     ErrorKind::InvalidData,
                     "udp recvmmsg packet push failed",
                 ),
@@ -282,11 +287,11 @@ fn recv_udp_batch_append(
 
 #[cfg(all(test, target_os = "linux"))]
 fn recv_udp_batch_append_baseline(
-    socket: &std::net::UdpSocket,
+    socket: &UdpSocket,
     scratch: &mut UdpBatchScratch,
     batch: &mut RawPacketBatch,
     max_packets: usize,
-) -> std::io::Result<usize> {
+) -> io::Result<usize> {
     let capacity = scratch.headers.len();
     let count = capacity.min(max_packets);
     if count == 0 {
@@ -296,9 +301,7 @@ fn recv_udp_batch_append_baseline(
     for index in 0..count {
         let buffer_index = start_index.saturating_add(index);
         let Some(buffer) = batch.receive_buffer_mut(buffer_index) else {
-            return Err(std::io::Error::other(
-                "raw packet batch receive buffer missing",
-            ));
+            return Err(io::Error::other("raw packet batch receive buffer missing"));
         };
         scratch.io_vectors[index] = libc::iovec {
             iov_base: buffer.as_mut_ptr().cast(),
@@ -308,10 +311,10 @@ fn recv_udp_batch_append_baseline(
             msg_hdr: libc::msghdr {
                 msg_name: (&mut scratch.addrs[index]) as *mut libc::sockaddr_storage
                     as *mut libc::c_void,
-                msg_namelen: std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
+                msg_namelen: size_of::<libc::sockaddr_storage>() as libc::socklen_t,
                 msg_iov: (&mut scratch.io_vectors[index]) as *mut libc::iovec,
                 msg_iovlen: 1,
-                msg_control: std::ptr::null_mut(),
+                msg_control: null_mut(),
                 msg_controllen: 0,
                 msg_flags: 0,
             },
@@ -327,11 +330,11 @@ fn recv_udp_batch_append_baseline(
             scratch.headers.as_mut_ptr(),
             count.min(u32::MAX as usize) as u32,
             libc::MSG_WAITFORONE,
-            std::ptr::null_mut(),
+            null_mut(),
         )
     };
     if received < 0 {
-        return Err(std::io::Error::last_os_error());
+        return Err(io::Error::last_os_error());
     }
     let received = usize::try_from(received).unwrap_or(0);
     if received == 0 {
@@ -347,7 +350,7 @@ fn recv_udp_batch_append_baseline(
             scratch.headers[index].msg_hdr.msg_namelen,
         )
         .ok_or_else(|| {
-            std::io::Error::new(
+            io::Error::new(
                 ErrorKind::InvalidData,
                 "udp recvmmsg source address is not inet/inet6",
             )
@@ -355,7 +358,7 @@ fn recv_udp_batch_append_baseline(
         batch
             .push_received_metadata(source, RawPacketIngress::Udp, buffer_index, len)
             .map_err(|error| match error {
-                UdpReceiverError::InvalidPacketLength { len, capacity } => std::io::Error::new(
+                UdpReceiverError::InvalidPacketLength { len, capacity } => io::Error::new(
                     ErrorKind::InvalidData,
                     format!(
                         "udp recvmmsg returned packet length {len} beyond buffer capacity {capacity}"
@@ -364,7 +367,7 @@ fn recv_udp_batch_append_baseline(
                 UdpReceiverError::Receive { source: io_error } => io_error,
                 UdpReceiverError::BindSocket { .. }
                 | UdpReceiverError::SetBlockingMode { .. }
-                | UdpReceiverError::SetReadTimeout { .. } => std::io::Error::new(
+                | UdpReceiverError::SetReadTimeout { .. } => io::Error::new(
                     ErrorKind::InvalidData,
                     "udp recvmmsg packet push failed",
                 ),
@@ -374,7 +377,7 @@ fn recv_udp_batch_append_baseline(
 }
 
 #[cfg(target_os = "linux")]
-fn wait_udp_readable(poll_fd: &mut [PollFd<'_>], timeout: Duration) -> std::io::Result<bool> {
+fn wait_udp_readable(poll_fd: &mut [PollFd<'_>], timeout: Duration) -> io::Result<bool> {
     if timeout.is_zero() {
         return Ok(false);
     }
@@ -382,19 +385,19 @@ fn wait_udp_readable(poll_fd: &mut [PollFd<'_>], timeout: Duration) -> std::io::
 }
 
 #[cfg(target_os = "linux")]
-fn nix_errno_to_io_error(error: nix::errno::Errno) -> std::io::Error {
-    std::io::Error::from_raw_os_error(error as i32)
+fn nix_errno_to_io_error(error: nix::errno::Errno) -> io::Error {
+    io::Error::from_raw_os_error(error as i32)
 }
 
 #[cfg(target_os = "linux")]
 fn sockaddr_storage_to_socket_addr(storage: &SockaddrStorage) -> Option<SocketAddr> {
     storage
         .as_sockaddr_in()
-        .map(|address| SocketAddr::from(std::net::SocketAddrV4::from(*address)))
+        .map(|address| SocketAddr::from(SocketAddrV4::from(*address)))
         .or_else(|| {
             storage
                 .as_sockaddr_in6()
-                .map(|address| SocketAddr::from(std::net::SocketAddrV6::from(*address)))
+                .map(|address| SocketAddr::from(SocketAddrV6::from(*address)))
         })
 }
 
@@ -406,24 +409,24 @@ fn sockaddr_storage_to_socket_addr_libc(
     let namelen = usize::try_from(namelen).ok()?;
     match i32::from(storage.ss_family) {
         libc::AF_INET => {
-            if namelen < std::mem::size_of::<libc::sockaddr_in>() {
+            if namelen < size_of::<libc::sockaddr_in>() {
                 return None;
             }
             // SAFETY: `ss_family` confirmed AF_INET, so reinterpret as sockaddr_in.
             let address = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
-            Some(SocketAddr::from(std::net::SocketAddrV4::new(
-                std::net::Ipv4Addr::from(address.sin_addr.s_addr.to_ne_bytes()),
+            Some(SocketAddr::from(SocketAddrV4::new(
+                Ipv4Addr::from(address.sin_addr.s_addr.to_ne_bytes()),
                 u16::from_be(address.sin_port),
             )))
         }
         libc::AF_INET6 => {
-            if namelen < std::mem::size_of::<libc::sockaddr_in6>() {
+            if namelen < size_of::<libc::sockaddr_in6>() {
                 return None;
             }
             // SAFETY: `ss_family` confirmed AF_INET6, so reinterpret as sockaddr_in6.
             let address = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
-            Some(SocketAddr::from(std::net::SocketAddrV6::new(
-                std::net::Ipv6Addr::from(address.sin6_addr.s6_addr),
+            Some(SocketAddr::from(SocketAddrV6::new(
+                Ipv6Addr::from(address.sin6_addr.s6_addr),
                 u16::from_be(address.sin6_port),
                 address.sin6_flowinfo,
                 address.sin6_scope_id,

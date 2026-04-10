@@ -3,9 +3,11 @@
 #[cfg(test)]
 use std::str::FromStr;
 use std::{
+    any::Any,
     collections::HashSet,
     io::ErrorKind,
     net::SocketAddr,
+    panic::AssertUnwindSafe,
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
@@ -13,7 +15,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use tokio::{
     io::AsyncReadExt,
     net::{TcpListener, TcpStream, UdpSocket},
@@ -404,27 +406,15 @@ impl ExtensionDispatcher {
                 record_max_atomic(&worker_max_dispatch_lag_us, queue_lag_us);
 
                 let callback_extension = Arc::clone(&worker_extension);
-                let callback_result = tokio::spawn(async move {
-                    callback_extension
-                        .on_packet_received(queued_event.event)
-                        .await;
-                })
-                .await;
-                if let Err(error) = callback_result {
-                    if error.is_panic() {
-                        let payload = error.into_panic();
-                        let panic_message = panic_payload_to_string(payload.as_ref());
-                        tracing::error!(
-                            extension = extension_name,
-                            panic = %panic_message,
-                            "runtime extension packet callback panicked; continuing runtime"
-                        );
-                    } else {
-                        tracing::error!(
-                            extension = extension_name,
-                            "runtime extension packet callback cancelled"
-                        );
-                    }
+                if let Err(payload) =
+                    invoke_extension_callback(callback_extension, queued_event.event).await
+                {
+                    let panic_message = panic_payload_to_string(payload.as_ref());
+                    tracing::error!(
+                        extension = extension_name,
+                        panic = %panic_message,
+                        "runtime extension packet callback panicked; continuing runtime"
+                    );
                 }
             }
         });
@@ -516,6 +506,16 @@ impl ExtensionDispatcher {
             );
         }
     }
+}
+
+/// Runs one extension packet callback while isolating panic unwinds from the dispatcher loop.
+async fn invoke_extension_callback(
+    extension: Arc<dyn RuntimeExtension>,
+    event: RuntimePacketEvent,
+) -> Result<(), Box<dyn Any + Send>> {
+    AssertUnwindSafe(extension.on_packet_received(event))
+        .catch_unwind()
+        .await
 }
 
 /// Separate runtime extension host from observer plugin host.
@@ -1429,6 +1429,7 @@ mod tests {
 
     use crate::framework::ExtensionSetupError;
     use async_trait::async_trait;
+    use sof_support::bench::{avg_ns_per_iteration, profile_iterations};
     use tokio::io::AsyncWriteExt;
 
     struct CounterExtension {
@@ -1461,6 +1462,70 @@ mod tests {
             if !self.shutdown_wait.is_zero() {
                 tokio::time::sleep(self.shutdown_wait).await;
             }
+        }
+    }
+
+    struct PanicOnceExtension {
+        panic_seen: AtomicBool,
+        packet_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl RuntimeExtension for PanicOnceExtension {
+        fn name(&self) -> &'static str {
+            "panic-once-extension"
+        }
+
+        async fn setup(
+            &self,
+            _ctx: ExtensionContext,
+        ) -> Result<ExtensionManifest, ExtensionSetupError> {
+            Ok(ExtensionManifest {
+                capabilities: vec![ExtensionCapability::ObserveObserverIngress],
+                resources: Vec::new(),
+                subscriptions: vec![PacketSubscription {
+                    source_kind: Some(RuntimePacketSourceKind::ObserverIngress),
+                    ..PacketSubscription::default()
+                }],
+            })
+        }
+
+        async fn on_packet_received(&self, _event: RuntimePacketEvent) {
+            if !self.panic_seen.swap(true, Ordering::Relaxed) {
+                panic!("intentional extension panic");
+            }
+            self.packet_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn sample_runtime_packet_event() -> RuntimePacketEvent {
+        RuntimePacketEvent {
+            source: RuntimePacketSource {
+                kind: RuntimePacketSourceKind::ObserverIngress,
+                transport: RuntimePacketTransport::Udp,
+                event_class: RuntimePacketEventClass::Packet,
+                owner_extension: None,
+                resource_id: None,
+                shared_tag: None,
+                websocket_frame_type: None,
+                local_addr: None,
+                remote_addr: Some(SocketAddr::from_str("127.0.0.1:9001").expect("valid addr")),
+            },
+            bytes: Arc::from(&[7_u8; 32][..]),
+            observed_unix_ms: 0,
+        }
+    }
+
+    async fn invoke_extension_callback_baseline(
+        extension: Arc<dyn RuntimeExtension>,
+        event: RuntimePacketEvent,
+    ) -> Result<(), Box<dyn Any + Send>> {
+        let handle = tokio::spawn(async move {
+            extension.on_packet_received(event).await;
+        });
+        match handle.await {
+            Ok(()) => Ok(()),
+            Err(error) => Err(error.into_panic()),
         }
     }
 
@@ -1901,6 +1966,92 @@ mod tests {
         assert!(metrics[0].max_queue_depth >= 1);
         assert_eq!(metrics[0].queue_depth, 0);
         assert!(metrics[0].dispatched_events >= 1);
+    }
+
+    #[tokio::test]
+    async fn packet_callback_panic_does_not_stop_dispatcher() {
+        let packet_count = Arc::new(AtomicUsize::new(0));
+        let host = RuntimeExtensionHost::builder()
+            .add_extension(PanicOnceExtension {
+                panic_seen: AtomicBool::new(false),
+                packet_count: Arc::clone(&packet_count),
+            })
+            .build();
+        let report = host.startup().await;
+        assert_eq!(report.active_extensions, 1);
+
+        let source = SocketAddr::from_str("127.0.0.1:9001").expect("valid addr");
+        host.on_observer_packet(source, &[1_u8; 8]);
+        host.on_observer_packet(source, &[2_u8; 8]);
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(packet_count.load(Ordering::Relaxed), 1);
+
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "profiling fixture for runtime extension callback isolation"]
+    async fn runtime_extension_callback_isolation_profile_fixture() {
+        let iterations = profile_iterations(50_000);
+        let baseline_extension = Arc::new(CounterExtension {
+            name: "baseline-counter",
+            startup_manifest: ExtensionManifest {
+                capabilities: Vec::new(),
+                resources: Vec::new(),
+                subscriptions: Vec::new(),
+            },
+            packet_count: Arc::new(AtomicUsize::new(0)),
+            shutdown_wait: Duration::ZERO,
+            shutdown_called: Arc::new(AtomicBool::new(false)),
+        });
+        let optimized_extension = Arc::new(CounterExtension {
+            name: "optimized-counter",
+            startup_manifest: ExtensionManifest {
+                capabilities: Vec::new(),
+                resources: Vec::new(),
+                subscriptions: Vec::new(),
+            },
+            packet_count: Arc::new(AtomicUsize::new(0)),
+            shutdown_wait: Duration::ZERO,
+            shutdown_called: Arc::new(AtomicBool::new(false)),
+        });
+        let event = sample_runtime_packet_event();
+
+        let baseline_started_at = Instant::now();
+        for _ in 0..iterations {
+            invoke_extension_callback_baseline(
+                Arc::clone(&baseline_extension) as Arc<dyn RuntimeExtension>,
+                event.clone(),
+            )
+            .await
+            .expect("baseline callback");
+        }
+        let baseline_elapsed = baseline_started_at.elapsed();
+
+        let optimized_started_at = Instant::now();
+        for _ in 0..iterations {
+            invoke_extension_callback(
+                Arc::clone(&optimized_extension) as Arc<dyn RuntimeExtension>,
+                event.clone(),
+            )
+            .await
+            .expect("optimized callback");
+        }
+        let optimized_elapsed = optimized_started_at.elapsed();
+        let baseline_avg_ns = avg_ns_per_iteration(baseline_elapsed, iterations);
+        let optimized_avg_ns = avg_ns_per_iteration(optimized_elapsed, iterations);
+
+        println!(
+            "runtime_extension_callback_isolation_profile_fixture iterations={} baseline_us={} optimized_us={} baseline_avg_ns_per_iteration={} optimized_avg_ns_per_iteration={} baseline_avg_us_per_iteration={:.3} optimized_avg_us_per_iteration={:.3}",
+            iterations,
+            baseline_elapsed.as_micros(),
+            optimized_elapsed.as_micros(),
+            baseline_avg_ns,
+            optimized_avg_ns,
+            baseline_avg_ns as f64 / 1_000.0,
+            optimized_avg_ns as f64 / 1_000.0,
+        );
     }
 
     #[tokio::test]
