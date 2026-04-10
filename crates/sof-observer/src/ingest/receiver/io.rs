@@ -31,6 +31,18 @@ pub(super) struct UdpReceive {
     pub(super) rxq_ovfl_counter: Option<u64>,
 }
 
+fn retry_on_interrupted<T, F>(mut operation: F) -> io::Result<T>
+where
+    F: FnMut() -> io::Result<T>,
+{
+    loop {
+        match operation() {
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub(super) struct UdpBatchScratch {
     io_vectors: Vec<libc::iovec>,
@@ -83,13 +95,17 @@ pub(super) fn recv_udp_packet(
     if track_rxq_ovfl {
         let mut io_vectors = [IoSliceMut::new(buffer)];
         let mut cmsg_space = nix::cmsg_space!([u32; 1]);
-        let message = recvmsg::<SockaddrStorage>(
-            socket.as_raw_fd(),
-            &mut io_vectors,
-            Some(&mut cmsg_space),
-            MsgFlags::empty(),
-        )
-        .map_err(nix_errno_to_io_error)?;
+        let message = loop {
+            match recvmsg::<SockaddrStorage>(
+                socket.as_raw_fd(),
+                &mut io_vectors,
+                Some(&mut cmsg_space),
+                MsgFlags::empty(),
+            ) {
+                Err(nix::errno::Errno::EINTR) => continue,
+                result => break result.map_err(nix_errno_to_io_error),
+            }
+        }?;
         let Some(source_storage) = message.address.as_ref() else {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
@@ -118,7 +134,7 @@ pub(super) fn recv_udp_packet(
         });
     }
 
-    let (len, source) = socket.recv_from(buffer)?;
+    let (len, source) = retry_on_interrupted(|| socket.recv_from(buffer))?;
     Ok(UdpReceive {
         len,
         source,
@@ -230,20 +246,23 @@ fn recv_udp_batch_append(
         scratch.headers[index].msg_len = 0;
     }
 
-    // SAFETY: All message headers, names, and iovecs point to valid writable
-    // memory for the duration of the syscall, and the socket fd remains live.
-    let received = unsafe {
-        libc::recvmmsg(
-            socket.as_raw_fd(),
-            scratch.headers.as_mut_ptr(),
-            count.min(u32::MAX as usize) as u32,
-            libc::MSG_WAITFORONE,
-            null_mut(),
-        )
-    };
-    if received < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let received = retry_on_interrupted(|| {
+        // SAFETY: All message headers, names, and iovecs point to valid writable
+        // memory for the duration of the syscall, and the socket fd remains live.
+        let received = unsafe {
+            libc::recvmmsg(
+                socket.as_raw_fd(),
+                scratch.headers.as_mut_ptr(),
+                count.min(u32::MAX as usize) as u32,
+                libc::MSG_WAITFORONE,
+                null_mut(),
+            )
+        };
+        if received < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(received)
+    })?;
     let received = usize::try_from(received).unwrap_or(0);
     if received == 0 {
         return Ok(0);
@@ -321,20 +340,23 @@ fn recv_udp_batch_append_baseline(
         };
     }
 
-    // SAFETY: All message headers, names, and iovecs point to valid writable
-    // memory for the duration of the syscall, and the socket fd remains live.
-    let received = unsafe {
-        libc::recvmmsg(
-            socket.as_raw_fd(),
-            scratch.headers.as_mut_ptr(),
-            count.min(u32::MAX as usize) as u32,
-            libc::MSG_WAITFORONE,
-            null_mut(),
-        )
-    };
-    if received < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let received = retry_on_interrupted(|| {
+        // SAFETY: All message headers, names, and iovecs point to valid writable
+        // memory for the duration of the syscall, and the socket fd remains live.
+        let received = unsafe {
+            libc::recvmmsg(
+                socket.as_raw_fd(),
+                scratch.headers.as_mut_ptr(),
+                count.min(u32::MAX as usize) as u32,
+                libc::MSG_WAITFORONE,
+                null_mut(),
+            )
+        };
+        if received < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(received)
+    })?;
     let received = usize::try_from(received).unwrap_or(0);
     if received == 0 {
         return Ok(0);
@@ -380,7 +402,9 @@ fn wait_udp_readable(poll_fd: &mut [PollFd<'_>], timeout: Duration) -> io::Resul
     if timeout.is_zero() {
         return Ok(false);
     }
-    Ok(ppoll(poll_fd, Some(TimeSpec::from_duration(timeout)), None)? > 0)
+    Ok(retry_on_interrupted(|| {
+        ppoll(poll_fd, Some(TimeSpec::from_duration(timeout)), None).map_err(nix_errno_to_io_error)
+    })? > 0)
 }
 
 #[cfg(target_os = "linux")]
@@ -657,10 +681,10 @@ mod tests {
     }
 
     fn send_burst(
-        sender: &std::net::UdpSocket,
+        sender: &UdpSocket,
         destination: SocketAddr,
         packet_count: usize,
-    ) -> std::io::Result<()> {
+    ) -> io::Result<()> {
         let payload = [7_u8; 256];
         for _ in 0..packet_count {
             sender.send_to(&payload, destination)?;
@@ -669,12 +693,12 @@ mod tests {
     }
 
     fn send_staggered_burst(
-        sender: std::net::UdpSocket,
+        sender: UdpSocket,
         destination: SocketAddr,
         packet_count: usize,
         packets_per_chunk: usize,
         gap: Duration,
-    ) -> std::thread::JoinHandle<std::io::Result<()>> {
+    ) -> thread::JoinHandle<io::Result<()>> {
         thread::spawn(move || {
             let payload = [9_u8; 256];
             let mut sent = 0_usize;
@@ -692,10 +716,7 @@ mod tests {
         })
     }
 
-    fn receive_legacy_burst(
-        receiver: &std::net::UdpSocket,
-        packet_count: usize,
-    ) -> std::io::Result<usize> {
+    fn receive_legacy_burst(receiver: &UdpSocket, packet_count: usize) -> io::Result<usize> {
         let mut buffer = vec![0_u8; 2048];
         let mut received = 0_usize;
         while received < packet_count {
@@ -707,8 +728,8 @@ mod tests {
 
     #[test]
     fn recvmmsg_batch_matches_legacy_receive_count() {
-        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
-        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind sender");
+        let receiver = UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("bind sender");
         receiver
             .set_read_timeout(Some(Duration::from_millis(200)))
             .expect("set read timeout");
@@ -751,13 +772,29 @@ mod tests {
     }
 
     #[test]
+    fn retry_on_interrupted_retries_until_success() {
+        let mut calls = 0_u8;
+        let result = retry_on_interrupted(|| {
+            calls = calls.saturating_add(1);
+            if calls < 3 {
+                return Err(io::Error::from(ErrorKind::Interrupted));
+            }
+            Ok(calls)
+        })
+        .expect("interrupted helper should retry");
+
+        assert_eq!(result, 3);
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
     #[ignore = "profiling fixture for UDP receiver ingress"]
     fn udp_receiver_recvmmsg_profile_fixture() {
         let iterations = read_positive_usize("SOF_UDP_RECEIVER_PROFILE_ITERS", 1_000);
         let packet_count = read_positive_usize("SOF_UDP_RECEIVER_PROFILE_BURST", 64);
 
-        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
-        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind sender");
+        let receiver = UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("bind sender");
         receiver
             .set_read_timeout(Some(Duration::from_millis(200)))
             .expect("set read timeout");
@@ -804,8 +841,8 @@ mod tests {
         let iterations = read_positive_usize("SOF_UDP_RECEIVER_PROFILE_ITERS", 1_000);
         let packet_count = read_positive_usize("SOF_UDP_RECEIVER_PROFILE_BURST", 64);
 
-        let baseline_receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
-        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind sender");
+        let baseline_receiver = UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("bind sender");
         baseline_receiver
             .set_read_timeout(Some(Duration::from_millis(200)))
             .expect("set read timeout");
@@ -827,7 +864,7 @@ mod tests {
         }
         let baseline_elapsed = baseline_started_at.elapsed();
 
-        let optimized_receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
+        let optimized_receiver = UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
         optimized_receiver
             .set_read_timeout(Some(Duration::from_millis(200)))
             .expect("set read timeout");
@@ -930,8 +967,8 @@ mod tests {
         let idle_wait = Duration::from_millis(200);
         let batch_max_wait = Duration::from_millis(2);
 
-        let blocking_receiver = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
-        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind sender");
+        let blocking_receiver = UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("bind sender");
         blocking_receiver
             .set_read_timeout(Some(idle_wait))
             .expect("set read timeout");
@@ -962,8 +999,7 @@ mod tests {
         }
         let blocking_elapsed = blocking_started_at.elapsed();
 
-        let coalesced_receiver =
-            std::net::UdpSocket::bind("127.0.0.1:0").expect("bind coalesced receiver");
+        let coalesced_receiver = UdpSocket::bind("127.0.0.1:0").expect("bind coalesced receiver");
         let destination = coalesced_receiver
             .local_addr()
             .expect("coalesced receiver addr");
