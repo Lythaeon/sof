@@ -7,7 +7,13 @@
 //! and LaserStream by requesting full base64 transaction payloads and converting
 //! them into [`crate::framework::TransactionEvent`] values before dispatch.
 
-use std::{borrow::Cow, mem, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow,
+    mem,
+    str::FromStr,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, StreamExt};
@@ -2132,6 +2138,11 @@ fn frame_bytes_mut<'buffer>(buffer: &'buffer mut Vec<u8>, bytes: &[u8]) -> &'buf
     buffer.as_mut_slice()
 }
 
+fn websocket_replay_http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
 async fn replay_websocket_gap(
     config: &WebsocketTransactionConfig,
     source: &ProviderSourceIdentity,
@@ -2146,8 +2157,8 @@ async fn replay_websocket_gap(
         return Err(WebsocketProtocolError::MissingReplayHttpEndpoint.into());
     };
 
-    let client = reqwest::Client::new();
-    let head = rpc_get_slot(&client, &http_endpoint, config.commitment).await?;
+    let client = websocket_replay_http_client();
+    let head = rpc_get_slot(client, &http_endpoint, config.commitment).await?;
     if head < previous_slot {
         return Ok(());
     }
@@ -2155,7 +2166,7 @@ async fn replay_websocket_gap(
     let start_slot = websocket_replay_start_slot(previous_slot, head, config.replay_max_slots);
     let mut tx_bytes = Vec::new();
     for slot in start_slot..=head {
-        let Some(block) = rpc_get_block(&client, &http_endpoint, slot, config.commitment).await?
+        let Some(block) = rpc_get_block(client, &http_endpoint, slot, config.commitment).await?
         else {
             continue;
         };
