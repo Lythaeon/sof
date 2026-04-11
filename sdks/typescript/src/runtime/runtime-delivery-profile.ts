@@ -2,6 +2,10 @@ import { brand, type Brand } from "../brand.js";
 import { envVarName } from "../environment.js";
 import { ValidationErrorKind, type ValidationError } from "../errors.js";
 import { err, ok, type Result } from "../result.js";
+import {
+  defaultDerivedStateReplayMaxEnvelopes,
+  defaultDerivedStateReplayMaxSessions,
+} from "./derived-state.js";
 
 export enum RuntimeDeliveryProfile {
   LatencyOptimized = 1,
@@ -42,6 +46,11 @@ export const runtimeDeliveryProfileAllowedValues: readonly RuntimeDeliveryProfil
     runtimeDeliveryProfileEnvValues.deliveryDisciplined,
   ];
 
+export interface RuntimeDeliveryProfileEnvDefaults {
+  readonly derivedStateReplayMaxEnvelopes: number;
+  readonly derivedStateReplayMaxSessions: number;
+}
+
 export function isRuntimeDeliveryProfile(
   value: RuntimeDeliveryProfile,
 ): value is RuntimeDeliveryProfile {
@@ -75,6 +84,32 @@ export function runtimeDeliveryProfileToEnvValue(
       return runtimeDeliveryProfileEnvValues.balanced;
     case RuntimeDeliveryProfile.DeliveryDisciplined:
       return runtimeDeliveryProfileEnvValues.deliveryDisciplined;
+  }
+}
+
+export function runtimeDeliveryProfileEnvDefaults(
+  profile: RuntimeDeliveryProfile,
+): RuntimeDeliveryProfileEnvDefaults {
+  switch (requireRuntimeDeliveryProfile(profile)) {
+    case RuntimeDeliveryProfile.LatencyOptimized:
+      return {
+        derivedStateReplayMaxEnvelopes: defaultDerivedStateReplayMaxEnvelopes,
+        derivedStateReplayMaxSessions: defaultDerivedStateReplayMaxSessions,
+      };
+    case RuntimeDeliveryProfile.Balanced:
+      return {
+        derivedStateReplayMaxEnvelopes:
+          defaultDerivedStateReplayMaxEnvelopes * 2,
+        derivedStateReplayMaxSessions:
+          defaultDerivedStateReplayMaxSessions + 2,
+      };
+    case RuntimeDeliveryProfile.DeliveryDisciplined:
+      return {
+        derivedStateReplayMaxEnvelopes:
+          defaultDerivedStateReplayMaxEnvelopes * 4,
+        derivedStateReplayMaxSessions:
+          defaultDerivedStateReplayMaxSessions * 2,
+      };
   }
 }
 

@@ -12,6 +12,7 @@ import {
   isRuntimeDeliveryProfile,
   parseRuntimeDeliveryProfile,
   RuntimeDeliveryProfile,
+  runtimeDeliveryProfileEnvDefaults,
   type RuntimeDeliveryProfileEnvValue,
   runtimeDeliveryProfileEnvVarName,
   runtimeDeliveryProfileToEnvValue,
@@ -195,9 +196,32 @@ export function observerRuntimeConfigForProfile(
   profile: RuntimeDeliveryProfile,
   init: ObserverRuntimeProfileInit = {},
 ): ObserverRuntimeConfig {
+  const derivedStateDefaults = runtimeDeliveryProfileEnvDefaults(profile);
+  const derivedState = init.derivedState;
+  const replay =
+    derivedState instanceof DerivedStateRuntimeConfig ? derivedState.replay : derivedState?.replay;
+
   return new ObserverRuntimeConfig({
     ...init,
     runtimeDeliveryProfile: profile,
+    derivedState:
+      derivedState instanceof DerivedStateRuntimeConfig
+        ? derivedState
+        : {
+            ...derivedState,
+            replay:
+              replay instanceof DerivedStateReplayConfig
+                ? replay
+                : {
+                    ...replay,
+                    maxEnvelopes:
+                      replay?.maxEnvelopes ??
+                      derivedStateDefaults.derivedStateReplayMaxEnvelopes,
+                    maxSessions:
+                      replay?.maxSessions ??
+                      derivedStateDefaults.derivedStateReplayMaxSessions,
+                  },
+          },
   });
 }
 

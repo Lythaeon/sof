@@ -2,6 +2,13 @@
 
 Unified TypeScript SDK surface for SOF.
 
+## Mental Model
+
+- Use `ObserverRuntimeConfig` when you want to build or parse the SOF env surface safely.
+- Use `ObserverRuntimeConfig.balanced()` / `.deliveryDisciplined()` when you want one-line profile presets.
+- Profile presets in this SDK stamp the profile env plus the derived-state replay retention defaults that SOF applies through env-backed setup.
+- Rust still owns host-builder dispatch defaults such as plugin-host and runtime-extension-host queue and timeout wiring. This SDK currently models the env/config surface, not those in-process host builders.
+
 This initial package slice provides:
 
 - checked `Result<T, E>` primitives
@@ -102,6 +109,23 @@ parsed;
 checkpointOnly;
 ```
 
+## Quick Start
+
+```ts
+import { ObserverRuntimeConfig } from "@sof/sdk";
+
+const config = ObserverRuntimeConfig.deliveryDisciplined();
+const env = config.toEnvironmentRecord();
+
+// {
+//   SOF_RUNTIME_DELIVERY_PROFILE: "delivery_disciplined",
+//   SOF_DERIVED_STATE_REPLAY_MAX_ENVELOPES: "32768",
+//   SOF_DERIVED_STATE_REPLAY_MAX_SESSIONS: "8",
+// }
+
+env;
+```
+
 ## Focused Imports
 
 ```ts
@@ -136,3 +160,10 @@ const config = observerRuntimeConfigForProfile(
 ObserverRuntimeConfig.latencyOptimized();
 config;
 ```
+
+## Choosing An API
+
+- Use `ObserverRuntimeConfig.fromEnvironmentRecord(...)` when you need to validate env from files, CI, or process managers.
+- Use `ObserverRuntimeConfig.balanced(...)` or `observerRuntimeConfigForProfile(...)` when you want profile-first setup.
+- Use `derivedStateRuntimeConfig(...)` or `DerivedStateRuntimeConfig.checkpointOnly()` when your main concern is derived-state recovery behavior.
+- Use the root `@sof/sdk` import for convenience. Use subpath imports when you want a smaller, more explicit import surface in application code.

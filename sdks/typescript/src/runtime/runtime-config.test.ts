@@ -46,6 +46,7 @@ import {
   parseRuntimeBoolean,
   parseShredTrustMode,
   RuntimeDeliveryProfile,
+  runtimeDeliveryProfileEnvDefaults,
   runtimeBooleanAllowedValues,
   runtimeBooleanEnvValues,
   parseRuntimeDeliveryProfile,
@@ -88,6 +89,32 @@ test("runtime delivery profile maps to the documented env values", () => {
   assert.equal(
     runtimeDeliveryProfileToEnvValue(RuntimeDeliveryProfile.DeliveryDisciplined),
     runtimeDeliveryProfileEnvValues.deliveryDisciplined,
+  );
+});
+
+test("runtime delivery profiles expose the expected env-backed defaults", () => {
+  assert.deepEqual(
+    runtimeDeliveryProfileEnvDefaults(RuntimeDeliveryProfile.LatencyOptimized),
+    {
+      derivedStateReplayMaxEnvelopes: 8192,
+      derivedStateReplayMaxSessions: 4,
+    },
+  );
+  assert.deepEqual(
+    runtimeDeliveryProfileEnvDefaults(RuntimeDeliveryProfile.Balanced),
+    {
+      derivedStateReplayMaxEnvelopes: 16384,
+      derivedStateReplayMaxSessions: 6,
+    },
+  );
+  assert.deepEqual(
+    runtimeDeliveryProfileEnvDefaults(
+      RuntimeDeliveryProfile.DeliveryDisciplined,
+    ),
+    {
+      derivedStateReplayMaxEnvelopes: 32768,
+      derivedStateReplayMaxSessions: 8,
+    },
   );
 });
 
@@ -425,6 +452,29 @@ test("runtime config preset helpers create one-line common profiles", () => {
   assert.equal(
     functionPreset.runtimeDeliveryProfile,
     RuntimeDeliveryProfile.DeliveryDisciplined,
+  );
+  assert.equal(balanced.derivedState.replay.maxEnvelopes, 16_384);
+  assert.equal(balanced.derivedState.replay.maxSessions, 6);
+  assert.equal(functionPreset.derivedState.replay.maxEnvelopes, 32_768);
+  assert.equal(functionPreset.derivedState.replay.maxSessions, 8);
+});
+
+test("runtime profile helpers preserve explicit derived-state replay overrides", () => {
+  const config = ObserverRuntimeConfig.deliveryDisciplined({
+    derivedState: {
+      replay: {
+        maxEnvelopes: 512,
+      },
+    },
+  });
+
+  assert.equal(
+    config.derivedState.replay.maxEnvelopes,
+    512,
+  );
+  assert.equal(
+    config.derivedState.replay.maxSessions,
+    8,
   );
 });
 
