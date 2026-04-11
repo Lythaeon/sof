@@ -21,6 +21,14 @@ export interface RuntimeExtensionAck {
   readonly acknowledged: true;
 }
 
+export type RuntimeJsonPrimitive = string | number | boolean | null;
+export type RuntimeJsonValue =
+  | RuntimeJsonPrimitive
+  | readonly RuntimeJsonValue[]
+  | {
+      readonly [key: string]: RuntimeJsonValue;
+    };
+
 export type ExtensionName = Brand<string, "ExtensionName">;
 export type ExtensionResourceId = Brand<string, "ExtensionResourceId">;
 export type SharedStreamTag = Brand<string, "SharedStreamTag">;
@@ -130,6 +138,128 @@ export interface RuntimePacketEvent {
   readonly observedUnixMs: number;
 }
 
+export enum RuntimeProviderEventKind {
+  Transaction = 1,
+  TransactionLog = 2,
+  TransactionStatus = 3,
+  AccountUpdate = 4,
+  BlockMeta = 5,
+  SlotStatus = 6,
+  RecentBlockhash = 7,
+}
+
+export enum RuntimeProviderCommitmentStatus {
+  Processed = 1,
+  Confirmed = 2,
+  Finalized = 3,
+}
+
+export enum RuntimeProviderTransactionKind {
+  VoteOnly = 1,
+  Mixed = 2,
+  NonVote = 3,
+}
+
+export enum RuntimeProviderSlotStatus {
+  Processed = 1,
+  Confirmed = 2,
+  Finalized = 3,
+  Orphaned = 4,
+}
+
+export interface RuntimeProviderSource {
+  readonly kind: string;
+  readonly instance: string;
+  readonly priority: number;
+  readonly role: string;
+  readonly arbitration: string;
+}
+
+interface RuntimeProviderEventBase {
+  readonly kind: RuntimeProviderEventKind;
+  readonly slot: number;
+  readonly providerSource?: RuntimeProviderSource;
+}
+
+interface RuntimeProviderCommittedEventBase extends RuntimeProviderEventBase {
+  readonly commitmentStatus: RuntimeProviderCommitmentStatus;
+  readonly confirmedSlot?: number;
+  readonly finalizedSlot?: number;
+}
+
+export interface RuntimeProviderTransactionEvent extends RuntimeProviderCommittedEventBase {
+  readonly kind: RuntimeProviderEventKind.Transaction;
+  readonly signature?: string;
+  readonly transactionKind: RuntimeProviderTransactionKind;
+  readonly transactionBase64?: string;
+}
+
+export interface RuntimeProviderTransactionLogEvent extends RuntimeProviderCommittedEventBase {
+  readonly kind: RuntimeProviderEventKind.TransactionLog;
+  readonly signature: string;
+  readonly err?: RuntimeJsonValue;
+  readonly logs: readonly string[];
+  readonly matchedFilter?: string;
+}
+
+export interface RuntimeProviderTransactionStatusEvent extends RuntimeProviderCommittedEventBase {
+  readonly kind: RuntimeProviderEventKind.TransactionStatus;
+  readonly signature: string;
+  readonly isVote: boolean;
+  readonly index?: number;
+  readonly err?: string;
+}
+
+export interface RuntimeProviderAccountUpdateEvent extends RuntimeProviderCommittedEventBase {
+  readonly kind: RuntimeProviderEventKind.AccountUpdate;
+  readonly pubkey: string;
+  readonly owner: string;
+  readonly lamports: number;
+  readonly executable: boolean;
+  readonly rentEpoch: number;
+  readonly dataBase64: string;
+  readonly writeVersion?: number;
+  readonly txnSignature?: string;
+  readonly isStartup: boolean;
+  readonly matchedFilter?: string;
+}
+
+export interface RuntimeProviderBlockMetaEvent extends RuntimeProviderCommittedEventBase {
+  readonly kind: RuntimeProviderEventKind.BlockMeta;
+  readonly blockhash: string;
+  readonly parentSlot: number;
+  readonly parentBlockhash: string;
+  readonly blockTime?: number;
+  readonly blockHeight?: number;
+  readonly executedTransactionCount: number;
+  readonly entriesCount: number;
+}
+
+export interface RuntimeProviderSlotStatusEvent extends RuntimeProviderEventBase {
+  readonly kind: RuntimeProviderEventKind.SlotStatus;
+  readonly parentSlot?: number;
+  readonly previousStatus?: RuntimeProviderSlotStatus;
+  readonly status: RuntimeProviderSlotStatus;
+  readonly tipSlot?: number;
+  readonly confirmedSlot?: number;
+  readonly finalizedSlot?: number;
+}
+
+export interface RuntimeProviderRecentBlockhashEvent extends RuntimeProviderEventBase {
+  readonly kind: RuntimeProviderEventKind.RecentBlockhash;
+  readonly recentBlockhash: string;
+  readonly datasetTxCount: number;
+}
+
+export type RuntimeProviderEvent =
+  | RuntimeProviderTransactionEvent
+  | RuntimeProviderTransactionLogEvent
+  | RuntimeProviderTransactionStatusEvent
+  | RuntimeProviderAccountUpdateEvent
+  | RuntimeProviderBlockMetaEvent
+  | RuntimeProviderSlotStatusEvent
+  | RuntimeProviderRecentBlockhashEvent;
+
 export interface PacketSubscription {
   readonly sourceKind?: RuntimePacketSourceKind;
   readonly transport?: RuntimePacketTransport;
@@ -192,6 +322,9 @@ export interface RuntimeExtensionDefinition {
   readonly onPacketReceived?: (
     event: RuntimePacketEvent,
   ) => MaybePromise<Result<RuntimeExtensionAck, RuntimeExtensionError>>;
+  readonly onProviderEvent?: (
+    event: RuntimeProviderEvent,
+  ) => MaybePromise<Result<RuntimeExtensionAck, RuntimeExtensionError>>;
   readonly onShutdown?: (
     context: ExtensionContext,
   ) => MaybePromise<Result<RuntimeExtensionAck, RuntimeExtensionError>>;
@@ -202,6 +335,7 @@ export enum RuntimeExtensionWorkerHostMessageTag {
   Start = 2,
   DeliverPacket = 3,
   Shutdown = 4,
+  DeliverProviderEvent = 5,
 }
 
 export type RuntimeExtensionWorkerHostMessage =
@@ -217,6 +351,10 @@ export type RuntimeExtensionWorkerHostMessage =
       readonly event: RuntimePacketEvent;
     }
   | {
+      readonly tag: RuntimeExtensionWorkerHostMessageTag.DeliverProviderEvent;
+      readonly event: RuntimeProviderEvent;
+    }
+  | {
       readonly tag: RuntimeExtensionWorkerHostMessageTag.Shutdown;
       readonly context: ExtensionContext;
     };
@@ -226,6 +364,7 @@ export enum RuntimeExtensionWorkerResponseTag {
   Started = 2,
   EventHandled = 3,
   ShutdownComplete = 4,
+  ProviderEventHandled = 5,
 }
 
 export type RuntimeExtensionWorkerResponse =
@@ -239,6 +378,10 @@ export type RuntimeExtensionWorkerResponse =
     }
   | {
       readonly tag: RuntimeExtensionWorkerResponseTag.EventHandled;
+      readonly result: Result<RuntimeExtensionAck, RuntimeExtensionError>;
+    }
+  | {
+      readonly tag: RuntimeExtensionWorkerResponseTag.ProviderEventHandled;
       readonly result: Result<RuntimeExtensionAck, RuntimeExtensionError>;
     }
   | {
@@ -706,6 +849,18 @@ export class RuntimeExtensionWorkerRuntime {
                   "onPacketReceived",
                   () =>
                     this.definition.onPacketReceived?.(message.event) ?? ok(runtimeExtensionAck()),
+                ),
+        };
+      case RuntimeExtensionWorkerHostMessageTag.DeliverProviderEvent:
+        return {
+          tag: RuntimeExtensionWorkerResponseTag.ProviderEventHandled,
+          result:
+            this.definition.onProviderEvent === undefined
+              ? ok(runtimeExtensionAck())
+              : await settleExtensionHook(
+                  "onProviderEvent",
+                  () =>
+                    this.definition.onProviderEvent?.(message.event) ?? ok(runtimeExtensionAck()),
                 ),
         };
       case RuntimeExtensionWorkerHostMessageTag.Shutdown:

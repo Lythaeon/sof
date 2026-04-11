@@ -2,30 +2,33 @@ import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 
-import { isErr, isOk, ok } from "../result.js";
+import { ResultTag, isErr, ok } from "../result.js";
 import {
   ExtensionCapability,
   RuntimeExtensionWorkerHostMessageTag,
   RuntimeExtensionWorkerResponseTag,
+  RuntimeProviderEventKind,
   extensionName,
   runtimeExtensionAck,
-  runRuntimeExtensionWorkerStdio,
-  serializeRuntimeExtensionWorkerHostMessageWire,
-  serializeRuntimePacketEventWire,
   socketAddress,
-  tryParseRuntimeExtensionWorkerHostMessageWire,
-  tryParseRuntimePacketEventWire,
   tryCreateRuntimeExtensionWorkerManifest,
   tryDefineRuntimeExtension,
 } from "../runtime.js";
+import {
+  runRuntimeExtensionWorkerStdio,
+  serializeRuntimeExtensionWorkerHostMessageWire,
+  serializeRuntimePacketEventWire,
+  tryParseRuntimeExtensionWorkerHostMessageWire,
+  tryParseRuntimePacketEventWire,
+} from "./runtime-extension-stdio.js";
 
 test("runtime extension wire helpers round-trip packet delivery messages", () => {
   const parsedExtensionName = extensionName("wire-demo");
   const localAddress = socketAddress("127.0.0.1:21011");
 
-  assert.equal(isOk(parsedExtensionName), true);
-  assert.equal(isOk(localAddress), true);
-  if (!isOk(parsedExtensionName) || !isOk(localAddress)) {
+  assert.equal(parsedExtensionName.tag, ResultTag.Ok);
+  assert.equal(localAddress.tag, ResultTag.Ok);
+  if (parsedExtensionName.tag !== ResultTag.Ok || localAddress.tag !== ResultTag.Ok) {
     return;
   }
 
@@ -45,8 +48,8 @@ test("runtime extension wire helpers round-trip packet delivery messages", () =>
   });
 
   const parsedWireMessage = tryParseRuntimeExtensionWorkerHostMessageWire(wireMessage);
-  assert.equal(isOk(parsedWireMessage), true);
-  if (!isOk(parsedWireMessage)) {
+  assert.equal(parsedWireMessage.tag, ResultTag.Ok);
+  if (parsedWireMessage.tag !== ResultTag.Ok) {
     return;
   }
 
@@ -61,7 +64,37 @@ test("runtime extension wire helpers round-trip packet delivery messages", () =>
   const parsedEvent = tryParseRuntimePacketEventWire(
     serializeRuntimePacketEventWire(parsedWireMessage.value.event),
   );
-  assert.equal(isOk(parsedEvent), true);
+  assert.equal(parsedEvent.tag, ResultTag.Ok);
+});
+
+test("runtime extension wire helpers round-trip provider events", () => {
+  const wireMessage = serializeRuntimeExtensionWorkerHostMessageWire({
+    tag: RuntimeExtensionWorkerHostMessageTag.DeliverProviderEvent,
+    event: {
+      kind: RuntimeProviderEventKind.TransactionStatus,
+      slot: 1,
+      commitmentStatus: 1,
+      signature: "sig",
+      isVote: false,
+    },
+  });
+
+  const parsedWireMessage = tryParseRuntimeExtensionWorkerHostMessageWire(wireMessage);
+  assert.equal(parsedWireMessage.tag, ResultTag.Ok);
+  if (parsedWireMessage.tag !== ResultTag.Ok) {
+    return;
+  }
+
+  assert.equal(
+    parsedWireMessage.value.tag,
+    RuntimeExtensionWorkerHostMessageTag.DeliverProviderEvent,
+  );
+  if (parsedWireMessage.value.tag !== RuntimeExtensionWorkerHostMessageTag.DeliverProviderEvent) {
+    return;
+  }
+
+  assert.equal(parsedWireMessage.value.event.kind, RuntimeProviderEventKind.TransactionStatus);
+  assert.equal(parsedWireMessage.value.event.slot, 1);
 });
 
 test("runtime extension stdio worker processes newline-delimited protocol messages", async () => {
@@ -85,8 +118,8 @@ test("runtime extension stdio worker processes newline-delimited protocol messag
     extensionName: "stdio-demo",
     capabilities: [ExtensionCapability.ObserveObserverIngress],
   });
-  assert.equal(isOk(manifest), true);
-  if (!isOk(manifest)) {
+  assert.equal(manifest.tag, ResultTag.Ok);
+  if (manifest.tag !== ResultTag.Ok) {
     return;
   }
 
@@ -94,10 +127,11 @@ test("runtime extension stdio worker processes newline-delimited protocol messag
     manifest: manifest.value,
     onReady: () => ok(runtimeExtensionAck()),
     onPacketReceived: () => ok(runtimeExtensionAck()),
+    onProviderEvent: () => ok(runtimeExtensionAck()),
     onShutdown: () => ok(runtimeExtensionAck()),
   });
-  assert.equal(isOk(definition), true);
-  if (!isOk(definition)) {
+  assert.equal(definition.tag, ResultTag.Ok);
+  if (definition.tag !== ResultTag.Ok) {
     return;
   }
 
@@ -139,6 +173,18 @@ test("runtime extension stdio worker processes newline-delimited protocol messag
     })}\n`,
   );
   input.write(
+    `${JSON.stringify({
+      tag: RuntimeExtensionWorkerHostMessageTag.DeliverProviderEvent,
+      event: {
+        kind: RuntimeProviderEventKind.TransactionStatus,
+        slot: 100,
+        commitmentStatus: 1,
+        signature: "sig",
+        isVote: false,
+      },
+    })}\n`,
+  );
+  input.write(
     `${JSON.stringify(
       serializeRuntimeExtensionWorkerHostMessageWire({
         tag: RuntimeExtensionWorkerHostMessageTag.Shutdown,
@@ -151,7 +197,7 @@ test("runtime extension stdio worker processes newline-delimited protocol messag
   input.end();
 
   const runnerResult = await runner;
-  assert.equal(isOk(runnerResult), true);
+  assert.equal(runnerResult.tag, ResultTag.Ok);
   assert.equal(errorText, "");
 
   const responses = outputText
@@ -160,11 +206,12 @@ test("runtime extension stdio worker processes newline-delimited protocol messag
     .filter((line) => line !== "")
     .map((line) => JSON.parse(line) as { tag: number });
 
-  assert.equal(responses.length, 4);
+  assert.equal(responses.length, 5);
   assert.equal(responses[0]?.tag, RuntimeExtensionWorkerResponseTag.Manifest);
   assert.equal(responses[1]?.tag, RuntimeExtensionWorkerResponseTag.Started);
   assert.equal(responses[2]?.tag, RuntimeExtensionWorkerResponseTag.EventHandled);
-  assert.equal(responses[3]?.tag, RuntimeExtensionWorkerResponseTag.ShutdownComplete);
+  assert.equal(responses[3]?.tag, RuntimeExtensionWorkerResponseTag.ProviderEventHandled);
+  assert.equal(responses[4]?.tag, RuntimeExtensionWorkerResponseTag.ShutdownComplete);
 });
 
 test("runtime extension stdio worker rejects malformed protocol messages", async () => {
@@ -183,8 +230,8 @@ test("runtime extension stdio worker rejects malformed protocol messages", async
     extensionName: "bad-wire-demo",
     capabilities: [ExtensionCapability.ObserveObserverIngress],
   });
-  assert.equal(isOk(manifest), true);
-  if (!isOk(manifest)) {
+  assert.equal(manifest.tag, ResultTag.Ok);
+  if (manifest.tag !== ResultTag.Ok) {
     return;
   }
 
@@ -194,8 +241,8 @@ test("runtime extension stdio worker rejects malformed protocol messages", async
     onPacketReceived: () => ok(runtimeExtensionAck()),
     onShutdown: () => ok(runtimeExtensionAck()),
   });
-  assert.equal(isOk(definition), true);
-  if (!isOk(definition)) {
+  assert.equal(definition.tag, ResultTag.Ok);
+  if (definition.tag !== ResultTag.Ok) {
     return;
   }
 

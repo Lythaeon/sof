@@ -1,135 +1,341 @@
+import { spawn, type ChildProcess } from "node:child_process";
+import { chmodSync, existsSync } from "node:fs";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { brand, type Brand } from "./brand.js";
-import {
-  envVarName,
-  environmentVariablesToRecord,
-  readEnvironmentVariable,
-  type EnvironmentInput,
-} from "./environment.js";
 import { err, isErr, ok, type Result } from "./result.js";
 import {
-  type ExtensionCapability,
+  ExtensionCapability,
   type ExtensionContext,
+  type ExtensionName,
   type ExtensionResourceSpec,
+  extensionName,
+  ObserverRuntimeConfig,
+  observerRuntimeConfig,
   type ObserverRuntimeConfigInput,
-  type ObserverRuntimeEnvironmentOptions,
-  type ObserverRuntimeConfig,
   type PacketSubscription,
-  runRuntimeExtensionWorkerStdio,
   type RuntimeExtensionAck,
+  runtimeExtensionAck,
   type RuntimeExtensionDefinition,
   type RuntimeExtensionError,
+  type RuntimeExtensionWorkerManifest,
+  RuntimePacketEventClass,
+  RuntimePacketSourceKind,
+  RuntimePacketTransport,
   type RuntimePacketEvent,
-  type RuntimeExtensionWorkerStdioOptions,
-  extensionName,
-  tryCreateRuntimeExtensionWorkerManifest,
+  type RuntimeProviderEvent,
+  RuntimeWebSocketFrameType,
+  RuntimeDeliveryProfile,
+  type ShredTrustMode,
+  socketAddress,
   tryCreateRuntimeConfig,
+  tryCreateRuntimeExtensionWorkerManifest,
   tryDefineRuntimeExtension,
-  type ExtensionName,
+  webSocketUrl,
 } from "./runtime.js";
+import { runRuntimeExtensionWorkerStdio } from "./runtime/runtime-extension-stdio.js";
 
-export enum SofApplicationErrorKind {
+export enum AppErrorKind {
   ValidationError = 1,
-  DuplicateRuntimeExtension = 2,
-  MissingRuntimeExtension = 3,
-  MissingRuntimeExtensionSelection = 4,
+  DuplicatePlugin = 2,
+  MissingPlugin = 3,
 }
 
-export interface SofApplicationError {
-  readonly kind: SofApplicationErrorKind;
+export interface AppError {
+  readonly kind: AppErrorKind;
   readonly field: string;
   readonly message: string;
   readonly received?: string;
-  readonly availableExtensionNames?: readonly string[];
+  readonly availablePluginNames?: readonly string[];
 }
 
-export type SofApplicationName = Brand<string, "SofApplicationName">;
+export type AppName = Brand<string, "AppName">;
+export type PluginError = RuntimeExtensionError;
+export type PluginName = ExtensionName;
 
-export interface SofApplicationInit {
-  readonly name: string | SofApplicationName;
-  readonly runtime?: ObserverRuntimeConfigInput;
-  readonly runtimeExtensions?: readonly RuntimeExtensionDefinition[];
-  readonly plugins?: readonly SofPluginInput[];
+export interface PluginHandler {
+  readonly onStart?: (
+    context: ExtensionContext,
+  ) => Promise<Result<RuntimeExtensionAck, PluginError>> | Result<RuntimeExtensionAck, PluginError>;
+  readonly onPacket?: (
+    event: RuntimePacketEvent,
+  ) => Promise<Result<RuntimeExtensionAck, PluginError>> | Result<RuntimeExtensionAck, PluginError>;
+  readonly onProviderEvent?: (
+    event: RuntimeProviderEvent,
+  ) => Promise<Result<RuntimeExtensionAck, PluginError>> | Result<RuntimeExtensionAck, PluginError>;
+  readonly onStop?: (
+    context: ExtensionContext,
+  ) => Promise<Result<RuntimeExtensionAck, PluginError>> | Result<RuntimeExtensionAck, PluginError>;
 }
 
-export type SofApplicationInput = SofApplication | SofApplicationInit;
-export type SofPlugin = RuntimeExtensionDefinition;
-export type SofPluginError = RuntimeExtensionError;
-export type SofPluginInput = SofPlugin | SofPluginInit;
-
-export interface SofPluginInit {
-  readonly name: string | ExtensionName;
+export interface PluginInit extends PluginHandler {
+  readonly name?: string | ExtensionName;
   readonly capabilities?: readonly ExtensionCapability[];
   readonly resources?: readonly ExtensionResourceSpec[];
   readonly subscriptions?: readonly PacketSubscription[];
-  readonly onStart?: (
-    context: ExtensionContext,
-  ) =>
-    | Promise<Result<RuntimeExtensionAck, SofPluginError>>
-    | Result<RuntimeExtensionAck, SofPluginError>;
-  readonly onPacket?: (
-    event: RuntimePacketEvent,
-  ) =>
-    | Promise<Result<RuntimeExtensionAck, SofPluginError>>
-    | Result<RuntimeExtensionAck, SofPluginError>;
-  readonly onStop?: (
-    context: ExtensionContext,
-  ) =>
-    | Promise<Result<RuntimeExtensionAck, SofPluginError>>
-    | Result<RuntimeExtensionAck, SofPluginError>;
+  readonly logPackets?:
+    | boolean
+    | {
+        readonly output?: NodeJS.WritableStream;
+        readonly formatter?: (event: RuntimePacketEvent) => string;
+      };
 }
 
-export interface SofNodeLaunchSpecInit {
-  readonly workerEntrypoint: string;
-  readonly workerCommand?: string;
-  readonly workerArgs?: readonly string[];
-  readonly workerEnvironment?: Readonly<Record<string, string | undefined>>;
-  readonly runtimeEnvironment?: ObserverRuntimeEnvironmentOptions;
+export enum IngressKind {
+  WebSocket = 1,
+  Grpc = 2,
+  Gossip = 3,
+  DirectShreds = 4,
 }
 
-export interface SofNodeRuntimeExtensionLaunchSpec {
-  readonly extensionName: ExtensionName;
-  readonly transport: "stdio";
-  readonly command: string;
-  readonly args: readonly string[];
-  readonly environment: Readonly<Record<string, string>>;
+export enum GrpcIngressStream {
+  Transactions = 1,
+  TransactionStatus = 2,
+  Accounts = 3,
+  BlockMeta = 4,
+  Slots = 5,
 }
 
-export type SofPluginLaunchSpec = SofNodeRuntimeExtensionLaunchSpec;
-
-export interface SofNodeLaunchSpec {
-  readonly appName: SofApplicationName;
-  readonly runtimeEnvironment: Readonly<Record<string, string>>;
-  readonly plugins: readonly SofPluginLaunchSpec[];
-  readonly runtimeExtensions: readonly SofNodeRuntimeExtensionLaunchSpec[];
+export enum ProviderCommitment {
+  Processed = 1,
+  Confirmed = 2,
+  Finalized = 3,
 }
 
-export type SofApplicationWorkerRunError = SofApplicationError | RuntimeExtensionError;
-
-export const sofApplicationNameEnvVarName = envVarName("SOF_SDK_APPLICATION_NAME");
-export const sofRuntimeExtensionNameEnvVarName = envVarName("SOF_SDK_RUNTIME_EXTENSION_NAME");
-export const sofTypeScriptSdkVersion = "0.1.0";
-
-const defaultNodeCommand = "node";
-const sofApplicationValidatedInitTag = Symbol("SofApplicationValidatedInit");
-
-interface SofApplicationValidatedInit {
-  readonly [sofApplicationValidatedInitTag]: true;
-  readonly name: SofApplicationName;
-  readonly runtime: ObserverRuntimeConfig;
-  readonly plugins: readonly SofPlugin[];
-  readonly pluginsByName: ReadonlyMap<string, SofPlugin>;
-  readonly runtimeExtensions: readonly RuntimeExtensionDefinition[];
-  readonly runtimeExtensionsByName: ReadonlyMap<string, RuntimeExtensionDefinition>;
+export enum ProviderIngressReadiness {
+  Required = 1,
+  Optional = 2,
 }
 
-function sofApplicationError(
-  kind: SofApplicationErrorKind,
+export enum ProviderIngressRole {
+  Primary = 1,
+  Secondary = 2,
+  Fallback = 3,
+  ConfirmOnly = 4,
+}
+
+export enum GossipRuntimeMode {
+  Full = 1,
+  BootstrapOnly = 2,
+  ControlPlaneOnly = 3,
+}
+
+export interface WebSocketIngressInit {
+  readonly kind: IngressKind.WebSocket;
+  readonly name?: string;
+  readonly url: string;
+  readonly requests?: readonly WebSocketRequest[];
+}
+
+export interface GrpcIngressInit {
+  readonly kind: IngressKind.Grpc;
+  readonly name?: string;
+  readonly endpoint: string;
+  readonly tls?: boolean;
+  readonly stream?: GrpcIngressStream;
+  readonly xToken?: string;
+  readonly commitment?: ProviderCommitment;
+  readonly vote?: boolean;
+  readonly failed?: boolean;
+  readonly signature?: string;
+  readonly accountInclude?: readonly string[];
+  readonly accountExclude?: readonly string[];
+  readonly accountRequired?: readonly string[];
+  readonly accounts?: readonly string[];
+  readonly owners?: readonly string[];
+  readonly requireTransactionSignature?: boolean;
+  readonly readiness?: ProviderIngressReadiness;
+  readonly role?: ProviderIngressRole;
+  readonly priority?: number;
+}
+
+export interface GossipIngressInit {
+  readonly kind: IngressKind.Gossip;
+  readonly name?: string;
+  readonly bindAddress?: string;
+  readonly entrypoints?: readonly string[];
+  readonly runtimeMode?: GossipRuntimeMode;
+  readonly entrypointPinned?: boolean;
+}
+
+export interface KernelBypassInit {
+  readonly interface: string;
+  readonly queueId?: number;
+  readonly batchSize?: number;
+  readonly umemFrameCount?: number;
+  readonly ringDepth?: number;
+  readonly pollTimeoutMs?: number;
+}
+
+export interface DirectShredsIngressInit {
+  readonly kind: IngressKind.DirectShreds;
+  readonly name?: string;
+  readonly bindAddress: string;
+  readonly trustMode?: ShredTrustMode;
+  readonly kernelBypass?: KernelBypassInit;
+}
+
+export type IngressInit =
+  | WebSocketIngressInit
+  | GrpcIngressInit
+  | GossipIngressInit
+  | DirectShredsIngressInit;
+
+export enum FanInStrategy {
+  EmitAll = 1,
+  FirstSeen = 2,
+  FirstSeenThenPromote = 3,
+}
+
+export interface FanInInit {
+  readonly strategy?: FanInStrategy;
+}
+
+export interface WebSocketIngress {
+  readonly kind: IngressKind.WebSocket;
+  readonly name: string;
+  readonly url: string;
+  readonly requests: readonly string[];
+}
+
+export type JsonPrimitive = string | number | boolean | null;
+export type JsonValue =
+  | JsonPrimitive
+  | readonly JsonValue[]
+  | {
+      readonly [key: string]: JsonValue;
+    };
+
+export interface WebSocketRequest {
+  readonly jsonrpc?: "2.0";
+  readonly id?: string | number;
+  readonly method: string;
+  readonly params?: readonly JsonValue[];
+}
+
+export interface GrpcIngress {
+  readonly kind: IngressKind.Grpc;
+  readonly name: string;
+  readonly endpoint: string;
+  readonly tls: boolean;
+  readonly stream: GrpcIngressStream;
+  readonly xToken?: string;
+  readonly commitment?: ProviderCommitment;
+  readonly vote?: boolean;
+  readonly failed?: boolean;
+  readonly signature?: string;
+  readonly accountInclude: readonly string[];
+  readonly accountExclude: readonly string[];
+  readonly accountRequired: readonly string[];
+  readonly accounts: readonly string[];
+  readonly owners: readonly string[];
+  readonly requireTransactionSignature: boolean;
+  readonly readiness: ProviderIngressReadiness;
+  readonly role: ProviderIngressRole;
+  readonly priority?: number;
+}
+
+export interface GossipIngress {
+  readonly kind: IngressKind.Gossip;
+  readonly name: string;
+  readonly bindAddress?: string;
+  readonly entrypoints: readonly string[];
+  readonly runtimeMode?: GossipRuntimeMode;
+  readonly entrypointPinned?: boolean;
+}
+
+export interface DirectShredsIngress {
+  readonly kind: IngressKind.DirectShreds;
+  readonly name: string;
+  readonly bindAddress: string;
+  readonly trustMode?: ShredTrustMode;
+  readonly kernelBypass?: KernelBypassConfig;
+}
+
+export interface KernelBypassConfig {
+  readonly interface: string;
+  readonly queueId: number;
+  readonly batchSize: number;
+  readonly umemFrameCount: number;
+  readonly ringDepth: number;
+  readonly pollTimeoutMs: number;
+}
+
+export type Ingress = WebSocketIngress | GrpcIngress | GossipIngress | DirectShredsIngress;
+
+export interface FanIn {
+  readonly strategy: FanInStrategy;
+}
+
+export interface AppInit {
+  readonly name?: string | AppName;
+  readonly runtime?: ObserverRuntimeConfigInput;
+  readonly ingress?: readonly IngressInit[];
+  readonly fanIn?: FanInInit;
+  readonly plugins?: readonly Plugin[];
+  readonly extensions?: readonly Plugin[];
+}
+
+export interface AppRunOptions {
+  readonly signal?: AbortSignal;
+}
+
+export type AppRunError = AppError | RuntimeExtensionError;
+export type ExtensionHandler = PluginHandler;
+export type ExtensionError = PluginError;
+export type ExtensionInit = PluginInit;
+export const typeScriptSdkVersion = "0.1.0";
+
+const defaultAppName = "app";
+const autoPluginNamePrefix = "plugin";
+const internalPluginWorkerEnvVarName = "SOF_SDK_INTERNAL_PLUGIN_WORKER";
+const runtimeHostBinaryEnvVarName = "SOF_SDK_RUNTIME_HOST_BINARY";
+const runtimeHostBinaryBaseName = "sof_ts_runtime_host";
+const grpcIngressStreams = [
+  GrpcIngressStream.Transactions,
+  GrpcIngressStream.TransactionStatus,
+  GrpcIngressStream.Accounts,
+  GrpcIngressStream.BlockMeta,
+  GrpcIngressStream.Slots,
+] as const satisfies readonly GrpcIngressStream[];
+const providerCommitments = [
+  ProviderCommitment.Processed,
+  ProviderCommitment.Confirmed,
+  ProviderCommitment.Finalized,
+] as const satisfies readonly ProviderCommitment[];
+const providerIngressReadiness = [
+  ProviderIngressReadiness.Required,
+  ProviderIngressReadiness.Optional,
+] as const satisfies readonly ProviderIngressReadiness[];
+const providerIngressRoles = [
+  ProviderIngressRole.Primary,
+  ProviderIngressRole.Secondary,
+  ProviderIngressRole.Fallback,
+  ProviderIngressRole.ConfirmOnly,
+] as const satisfies readonly ProviderIngressRole[];
+const gossipRuntimeModes = [
+  GossipRuntimeMode.Full,
+  GossipRuntimeMode.BootstrapOnly,
+  GossipRuntimeMode.ControlPlaneOnly,
+] as const satisfies readonly GossipRuntimeMode[];
+const defaultKernelBypassQueueId = 0;
+const defaultKernelBypassBatchSize = 64;
+const defaultKernelBypassUmemFrameCount = 4_096;
+const defaultKernelBypassRingDepth = 2_048;
+const defaultKernelBypassPollTimeoutMs = 100;
+
+let nextAutoPluginOrdinal = 1;
+
+function appError(
+  kind: AppErrorKind,
   field: string,
   message: string,
   received?: string,
-  availableExtensionNames?: readonly string[],
-): SofApplicationError {
-  const error: SofApplicationError = {
+  availablePluginNames?: readonly string[],
+): AppError {
+  const base: AppError = {
     kind,
     field,
     message,
@@ -137,317 +343,154 @@ function sofApplicationError(
 
   if (received !== undefined) {
     return {
-      ...error,
+      ...base,
       received,
-      ...(availableExtensionNames === undefined ? {} : { availableExtensionNames }),
+      ...(availablePluginNames === undefined ? {} : { availablePluginNames }),
     };
   }
 
-  if (availableExtensionNames !== undefined) {
+  if (availablePluginNames !== undefined) {
     return {
-      ...error,
-      availableExtensionNames,
+      ...base,
+      availablePluginNames,
     };
   }
 
-  return error;
+  return base;
 }
 
-function parseNonEmptyAppValue<T>(
+function throwAppError(error: AppError): never {
+  throw new RangeError(error.message);
+}
+
+function parseNonEmptyValue<T>(
   value: string,
   field: string,
   wrap: (normalized: string) => T,
-): Result<T, SofApplicationError> {
+): Result<T, AppError> {
   const normalized = value.trim();
   if (normalized === "") {
-    return err(
-      sofApplicationError(
-        SofApplicationErrorKind.ValidationError,
-        field,
-        `${field} must not be empty`,
-        value,
-      ),
-    );
+    return err(appError(AppErrorKind.ValidationError, field, `${field} must not be empty`, value));
   }
   if (normalized.includes("\u0000")) {
     return err(
-      sofApplicationError(
-        SofApplicationErrorKind.ValidationError,
-        field,
-        `${field} must not contain NUL bytes`,
-        value,
-      ),
+      appError(AppErrorKind.ValidationError, field, `${field} must not contain NUL bytes`, value),
     );
   }
 
   return ok(wrap(normalized));
 }
 
-function asSofApplicationName<const Value extends string>(value: Value): SofApplicationName {
-  return brand<Value, "SofApplicationName">(value);
+function asAppName<const Value extends string>(value: Value): AppName {
+  return brand<Value, "AppName">(value);
 }
 
-function parseSofApplicationName(value: string): Result<SofApplicationName, SofApplicationError> {
-  return parseNonEmptyAppValue(value, "name", asSofApplicationName);
+function parseAppName(value: string): Result<AppName, AppError> {
+  return parseNonEmptyValue(value, "name", asAppName);
 }
 
-function mergeEnvironmentRecords(
-  base: Readonly<Record<string, string | undefined>> = {},
-  overlay: Readonly<Record<string, string | undefined>> = {},
-): Readonly<Record<string, string>> {
-  const variables: Array<{ readonly name: string; readonly value: string }> = [];
-
-  for (const source of [base, overlay]) {
-    for (const [key, value] of Object.entries(source)) {
-      if (value !== undefined) {
-        variables.push({
-          name: key,
-          value,
-        });
-      }
-    }
-  }
-
-  return environmentVariablesToRecord(
-    variables.map((variable) => ({
-      name: envVarName(variable.name),
-      value: variable.value,
-    })),
-  );
+function nextAutoPluginName(): string {
+  const ordinal = nextAutoPluginOrdinal;
+  nextAutoPluginOrdinal += 1;
+  return `${autoPluginNamePrefix}-${ordinal}`;
 }
 
-function throwSofApplicationError(error: SofApplicationError): never {
-  throw new RangeError(error.message);
+function defaultAppNameFromPlugins(plugins: readonly Plugin[]): string {
+  const firstPlugin = plugins[0];
+  if (firstPlugin !== undefined) {
+    return `${String(firstPlugin.name)}-app`;
+  }
+  return defaultAppName;
 }
 
-function toRuntimeExtensionNameKey(value: ExtensionName): string {
-  return value;
+function mergePluginHandlers(base: PluginHandler, overlay: PluginHandler): PluginHandler {
+  return {
+    ...(base.onStart === undefined ? {} : { onStart: base.onStart }),
+    ...(overlay.onStart === undefined ? {} : { onStart: overlay.onStart }),
+    ...(base.onPacket === undefined ? {} : { onPacket: base.onPacket }),
+    ...(overlay.onPacket === undefined ? {} : { onPacket: overlay.onPacket }),
+    ...(base.onProviderEvent === undefined ? {} : { onProviderEvent: base.onProviderEvent }),
+    ...(overlay.onProviderEvent === undefined ? {} : { onProviderEvent: overlay.onProviderEvent }),
+    ...(base.onStop === undefined ? {} : { onStop: base.onStop }),
+    ...(overlay.onStop === undefined ? {} : { onStop: overlay.onStop }),
+  };
 }
 
-export class SofApplication {
-  readonly name!: SofApplicationName;
-  readonly runtime!: ObserverRuntimeConfig;
-  readonly plugins!: readonly SofPlugin[];
-  readonly pluginsByName!: ReadonlyMap<string, SofPlugin>;
-  readonly runtimeExtensions!: readonly RuntimeExtensionDefinition[];
-  readonly runtimeExtensionsByName!: ReadonlyMap<string, RuntimeExtensionDefinition>;
-
-  constructor(init: SofApplicationInit | SofApplicationValidatedInit) {
-    if (sofApplicationValidatedInitTag in init) {
-      this.name = init.name;
-      this.runtime = init.runtime;
-      this.plugins = init.plugins;
-      this.pluginsByName = init.pluginsByName;
-      this.runtimeExtensions = init.runtimeExtensions;
-      this.runtimeExtensionsByName = init.runtimeExtensionsByName;
-      return;
-    }
-
-    const result = tryDefineSofApplication(init);
-    if (isErr(result)) {
-      throwSofApplicationError(result.error);
-    }
-
-    this.name = result.value.name;
-    this.runtime = result.value.runtime;
-    this.plugins = result.value.plugins;
-    this.pluginsByName = result.value.pluginsByName;
-    this.runtimeExtensions = result.value.runtimeExtensions;
-    this.runtimeExtensionsByName = result.value.runtimeExtensionsByName;
-  }
-
-  toRuntimeEnvironmentRecord(
-    options: ObserverRuntimeEnvironmentOptions = {},
-  ): Readonly<Record<string, string>> {
-    return this.runtime.toEnvironmentRecord(options);
-  }
-
-  getRuntimeExtension(
-    name: string | ExtensionName,
-  ): Result<RuntimeExtensionDefinition, SofApplicationError> {
-    const parsedName = typeof name === "string" ? extensionName(name) : ok(name);
-    if (isErr(parsedName)) {
-      return err(
-        sofApplicationError(
-          SofApplicationErrorKind.ValidationError,
-          "runtimeExtensionName",
-          parsedName.error.message,
-          typeof name === "string" ? name : String(name),
-        ),
-      );
-    }
-
-    const found = this.runtimeExtensionsByName.get(toRuntimeExtensionNameKey(parsedName.value));
-    if (found !== undefined) {
-      return ok(found);
-    }
-
-    return err(
-      sofApplicationError(
-        SofApplicationErrorKind.MissingRuntimeExtension,
-        "runtimeExtensionName",
-        `runtime extension ${String(parsedName.value)} is not registered in application ${String(this.name)}`,
-        String(parsedName.value),
-        this.runtimeExtensions.map((definition) => String(definition.manifest.extensionName)),
-      ),
-    );
-  }
-
-  getPlugin(name: string | ExtensionName): Result<SofPlugin, SofApplicationError> {
-    return this.getRuntimeExtension(name);
-  }
-
-  toNodeLaunchSpec(init: SofNodeLaunchSpecInit): Result<SofNodeLaunchSpec, SofApplicationError> {
-    const workerEntrypoint = parseNonEmptyAppValue(
-      init.workerEntrypoint,
-      "workerEntrypoint",
-      (value) => value,
-    );
-    if (isErr(workerEntrypoint)) {
-      return workerEntrypoint;
-    }
-
-    const command = parseNonEmptyAppValue(
-      init.workerCommand ?? defaultNodeCommand,
-      "workerCommand",
-      (value) => value,
-    );
-    if (isErr(command)) {
-      return command;
-    }
-
-    const runtimeEnvironment = this.runtime.toEnvironmentRecord(init.runtimeEnvironment);
-    const runtimeExtensions = this.runtimeExtensions.map((definition) => ({
-      extensionName: definition.manifest.extensionName,
-      transport: "stdio" as const,
-      command: command.value,
-      args: [...(init.workerArgs ?? []), workerEntrypoint.value],
-      environment: mergeEnvironmentRecords(init.workerEnvironment, {
-        [sofApplicationNameEnvVarName]: this.name,
-        [sofRuntimeExtensionNameEnvVarName]: definition.manifest.extensionName,
-      }),
-    }));
-
-    return ok({
-      appName: this.name,
-      runtimeEnvironment,
-      plugins: runtimeExtensions,
-      runtimeExtensions,
-    });
-  }
-
-  static create(init: SofApplicationInit): SofApplication {
-    return defineSofApplication(init);
-  }
-
-  static tryCreate(init: SofApplicationInit): Result<SofApplication, SofApplicationError> {
-    return tryDefineSofApplication(init);
-  }
+function createPacketLoggerHandler(
+  output: NodeJS.WritableStream,
+  formatter?: (event: RuntimePacketEvent) => string,
+): PluginHandler {
+  return {
+    onPacket: (event) => {
+      const line =
+        formatter?.(event) ??
+        JSON.stringify(
+          {
+            observedUnixMs: event.observedUnixMs,
+            source: event.source,
+            bytes: Array.from(event.bytes),
+          },
+          undefined,
+          2,
+        );
+      output.write(`${line}\n`);
+      return ok(runtimeExtensionAck());
+    },
+  };
 }
 
-function createValidatedSofApplication(
-  init: Omit<SofApplicationValidatedInit, typeof sofApplicationValidatedInitTag>,
-): SofApplication {
-  return new SofApplication({
-    [sofApplicationValidatedInitTag]: true,
-    ...init,
-  });
-}
-
-export function tryDefineSofApplication(
-  init: SofApplicationInput,
-): Result<SofApplication, SofApplicationError> {
-  if (init instanceof SofApplication) {
-    return ok(init);
+function normalizePluginName(
+  value: string | ExtensionName | undefined,
+): Result<ExtensionName, PluginError> {
+  if (value === undefined) {
+    return extensionName(nextAutoPluginName());
   }
 
-  const name = typeof init.name === "string" ? parseSofApplicationName(init.name) : ok(init.name);
+  return typeof value === "string" ? extensionName(value) : ok(value);
+}
+
+function defaultPacketCapabilities(handlers: PluginHandler): readonly ExtensionCapability[] {
+  return handlers.onPacket === undefined ? [] : [ExtensionCapability.ObserveObserverIngress];
+}
+
+function defaultPacketSubscriptions(handlers: PluginHandler): readonly PacketSubscription[] {
+  return handlers.onPacket === undefined
+    ? []
+    : [
+        {
+          sourceKind: RuntimePacketSourceKind.ObserverIngress,
+        },
+      ];
+}
+
+function createPluginDefinition(init: PluginInit): Result<RuntimeExtensionDefinition, PluginError> {
+  const name = normalizePluginName(init.name);
   if (isErr(name)) {
     return name;
   }
 
-  const runtime = tryCreateRuntimeConfig(init.runtime);
-  if (isErr(runtime)) {
-    return err(
-      sofApplicationError(
-        SofApplicationErrorKind.ValidationError,
-        "runtime",
-        runtime.error.message,
-      ),
-    );
-  }
-
-  const validatedRuntimeExtensions: RuntimeExtensionDefinition[] = [];
-  const runtimeExtensionsByName = new Map<string, RuntimeExtensionDefinition>();
-  const pluginDefinitions: RuntimeExtensionDefinition[] = [];
-  for (const plugin of init.plugins ?? []) {
-    const validatedPlugin = tryDefineSofPlugin(plugin);
-    if (isErr(validatedPlugin)) {
-      return err(
-        sofApplicationError(
-          SofApplicationErrorKind.ValidationError,
-          "plugins",
-          validatedPlugin.error.message,
-        ),
-      );
-    }
-
-    pluginDefinitions.push(validatedPlugin.value);
-  }
-
-  for (const runtimeExtension of [...(init.runtimeExtensions ?? []), ...pluginDefinitions]) {
-    const validatedRuntimeExtension = tryDefineRuntimeExtension(runtimeExtension);
-    if (isErr(validatedRuntimeExtension)) {
-      return err(
-        sofApplicationError(
-          SofApplicationErrorKind.ValidationError,
-          "runtimeExtensions",
-          validatedRuntimeExtension.error.message,
-        ),
-      );
-    }
-
-    const runtimeExtensionNameKey = toRuntimeExtensionNameKey(
-      validatedRuntimeExtension.value.manifest.extensionName,
-    );
-    if (runtimeExtensionsByName.has(runtimeExtensionNameKey)) {
-      return err(
-        sofApplicationError(
-          SofApplicationErrorKind.DuplicateRuntimeExtension,
-          "runtimeExtensions",
-          `runtime extension ${runtimeExtensionNameKey} is registered more than once`,
-          runtimeExtensionNameKey,
-        ),
-      );
-    }
-
-    validatedRuntimeExtensions.push(validatedRuntimeExtension.value);
-    runtimeExtensionsByName.set(runtimeExtensionNameKey, validatedRuntimeExtension.value);
-  }
-
-  return ok(
-    createValidatedSofApplication({
-      name: name.value,
-      runtime: runtime.value,
-      plugins: validatedRuntimeExtensions,
-      pluginsByName: runtimeExtensionsByName,
-      runtimeExtensions: validatedRuntimeExtensions,
-      runtimeExtensionsByName,
-    }),
-  );
-}
-
-export function tryDefineSofPlugin(init: SofPluginInput): Result<SofPlugin, SofPluginError> {
-  if ("manifest" in init) {
-    return tryDefineRuntimeExtension(init);
-  }
+  const logger =
+    init.logPackets === true
+      ? { output: process.stdout }
+      : init.logPackets === undefined || init.logPackets === false
+        ? undefined
+        : {
+            output: init.logPackets.output ?? process.stdout,
+            ...(init.logPackets.formatter === undefined
+              ? {}
+              : { formatter: init.logPackets.formatter }),
+          };
+  const handlers =
+    logger === undefined
+      ? init
+      : mergePluginHandlers(createPacketLoggerHandler(logger.output, logger.formatter), init);
 
   const manifest = tryCreateRuntimeExtensionWorkerManifest({
-    sdkVersion: sofTypeScriptSdkVersion,
-    extensionName: init.name,
-    ...(init.capabilities === undefined ? {} : { capabilities: init.capabilities }),
+    sdkVersion: typeScriptSdkVersion,
+    extensionName: name.value,
+    capabilities: init.capabilities ?? defaultPacketCapabilities(handlers),
     ...(init.resources === undefined ? {} : { resources: init.resources }),
-    ...(init.subscriptions === undefined ? {} : { subscriptions: init.subscriptions }),
+    subscriptions: init.subscriptions ?? defaultPacketSubscriptions(handlers),
   });
   if (isErr(manifest)) {
     return manifest;
@@ -455,197 +498,1446 @@ export function tryDefineSofPlugin(init: SofPluginInput): Result<SofPlugin, SofP
 
   return tryDefineRuntimeExtension({
     manifest: manifest.value,
-    ...(init.onStart === undefined ? {} : { onReady: init.onStart }),
-    ...(init.onPacket === undefined ? {} : { onPacketReceived: init.onPacket }),
-    ...(init.onStop === undefined ? {} : { onShutdown: init.onStop }),
+    ...(handlers.onStart === undefined ? {} : { onReady: handlers.onStart }),
+    ...(handlers.onPacket === undefined ? {} : { onPacketReceived: handlers.onPacket }),
+    ...(handlers.onProviderEvent === undefined
+      ? {}
+      : { onProviderEvent: handlers.onProviderEvent }),
+    ...(handlers.onStop === undefined ? {} : { onShutdown: handlers.onStop }),
   });
 }
 
-export function defineSofPlugin(init: SofPluginInput): SofPlugin {
-  const result = tryDefineSofPlugin(init);
-  if (isErr(result)) {
-    throw new RangeError(result.error.message);
-  }
-
-  return result.value;
+function parseIngressName(value: string, field: string): Result<string, AppError> {
+  return parseNonEmptyValue(value, field, (normalized) => normalized);
 }
 
-export function defineSofApplication(init: SofApplicationInit): SofApplication {
-  const result = tryDefineSofApplication(init);
-  if (isErr(result)) {
-    throwSofApplicationError(result.error);
+function validateWebSocketIngress(
+  ingress: WebSocketIngressInit,
+  index: number,
+): Result<WebSocketIngress, AppError> {
+  const name = parseIngressName(ingress.name ?? `websocket-${index + 1}`, "ingress.name");
+  if (isErr(name)) {
+    return name;
   }
 
-  return result.value;
+  const url = webSocketUrl(ingress.url);
+  if (isErr(url)) {
+    return err(
+      appError(AppErrorKind.ValidationError, "ingress.url", url.error.message, ingress.url),
+    );
+  }
+
+  const requests: string[] = [];
+  for (const request of ingress.requests ?? []) {
+    const method = parseNonEmptyValue(request.method, "ingress.requests.method", (value) => value);
+    if (isErr(method)) {
+      return method;
+    }
+
+    requests.push(
+      JSON.stringify({
+        jsonrpc: request.jsonrpc ?? "2.0",
+        id: request.id ?? index + requests.length + 1,
+        method: method.value,
+        ...(request.params === undefined ? {} : { params: request.params }),
+      }),
+    );
+  }
+
+  return ok({
+    kind: IngressKind.WebSocket,
+    name: name.value,
+    url: url.value,
+    requests,
+  });
 }
 
-export function tryCreateSofNodeLaunchSpec(
-  app: SofApplicationInput,
-  init: SofNodeLaunchSpecInit,
-): Result<SofNodeLaunchSpec, SofApplicationError> {
-  const application = tryDefineSofApplication(app);
-  if (isErr(application)) {
-    return application;
+function validateGrpcIngress(
+  ingress: GrpcIngressInit,
+  index: number,
+): Result<GrpcIngress, AppError> {
+  const name = parseIngressName(ingress.name ?? `grpc-${index + 1}`, "ingress.name");
+  if (isErr(name)) {
+    return name;
   }
 
-  return application.value.toNodeLaunchSpec(init);
-}
-
-export function createSofNodeLaunchSpec(
-  app: SofApplicationInput,
-  init: SofNodeLaunchSpecInit,
-): SofNodeLaunchSpec {
-  const result = tryCreateSofNodeLaunchSpec(app, init);
-  if (isErr(result)) {
-    throwSofApplicationError(result.error);
+  const endpoint = parseNonEmptyValue(ingress.endpoint, "ingress.endpoint", (value) => value);
+  if (isErr(endpoint)) {
+    return endpoint;
   }
 
-  return result.value;
-}
-
-export function tryRunSofApplicationRuntimeExtensionWorker(
-  app: SofApplicationInput,
-  name: string | ExtensionName,
-  options: RuntimeExtensionWorkerStdioOptions = {},
-): Promise<Result<RuntimeExtensionAck, SofApplicationWorkerRunError>> {
-  const application = tryDefineSofApplication(app);
-  if (isErr(application)) {
-    return Promise.resolve(application);
+  const stream = ingress.stream ?? GrpcIngressStream.Transactions;
+  if (!grpcIngressStreams.includes(stream)) {
+    return err(
+      appError(
+        AppErrorKind.ValidationError,
+        "ingress.stream",
+        "ingress.stream must be a supported gRPC stream",
+        String(stream),
+      ),
+    );
   }
-
-  const runtimeExtension = application.value.getRuntimeExtension(name);
-  if (isErr(runtimeExtension)) {
-    return Promise.resolve(runtimeExtension);
+  if (ingress.commitment !== undefined && !providerCommitments.includes(ingress.commitment)) {
+    return err(
+      appError(
+        AppErrorKind.ValidationError,
+        "ingress.commitment",
+        "ingress.commitment must be a supported provider commitment",
+        String(ingress.commitment),
+      ),
+    );
   }
-
-  return runRuntimeExtensionWorkerStdio(runtimeExtension.value, options);
-}
-
-export async function runSofApplicationRuntimeExtensionWorker(
-  app: SofApplicationInput,
-  name: string | ExtensionName,
-  options: RuntimeExtensionWorkerStdioOptions = {},
-): Promise<RuntimeExtensionAck> {
-  const result = await tryRunSofApplicationRuntimeExtensionWorker(app, name, options);
-  if (isErr(result)) {
-    throw new RangeError(result.error.message);
+  if (ingress.readiness !== undefined && !providerIngressReadiness.includes(ingress.readiness)) {
+    return err(
+      appError(
+        AppErrorKind.ValidationError,
+        "ingress.readiness",
+        "ingress.readiness must be a supported provider readiness policy",
+        String(ingress.readiness),
+      ),
+    );
   }
-
-  return result.value;
-}
-
-export function tryRunSofApplicationRuntimeExtensionWorkerFromEnvironment(
-  app: SofApplicationInput,
-  env: EnvironmentInput = process.env,
-  options: RuntimeExtensionWorkerStdioOptions = {},
-): Promise<Result<RuntimeExtensionAck, SofApplicationWorkerRunError>> {
-  const selectedRuntimeExtensionName = readEnvironmentVariable(
-    env,
-    sofRuntimeExtensionNameEnvVarName,
-  );
-  if (selectedRuntimeExtensionName === undefined || selectedRuntimeExtensionName.trim() === "") {
-    const application = tryDefineSofApplication(app);
-    const availableExtensionNames = isErr(application)
-      ? undefined
-      : application.value.runtimeExtensions.map((definition) =>
-          String(definition.manifest.extensionName),
-        );
-
-    return Promise.resolve(
-      err(
-        sofApplicationError(
-          SofApplicationErrorKind.MissingRuntimeExtensionSelection,
-          String(sofRuntimeExtensionNameEnvVarName),
-          `${String(sofRuntimeExtensionNameEnvVarName)} must be set to select one runtime extension worker`,
-          selectedRuntimeExtensionName,
-          availableExtensionNames,
-        ),
+  if (ingress.role !== undefined && !providerIngressRoles.includes(ingress.role)) {
+    return err(
+      appError(
+        AppErrorKind.ValidationError,
+        "ingress.role",
+        "ingress.role must be a supported provider ingress role",
+        String(ingress.role),
+      ),
+    );
+  }
+  if (
+    ingress.priority !== undefined &&
+    (!Number.isInteger(ingress.priority) || ingress.priority < 0 || ingress.priority > 65_535)
+  ) {
+    return err(
+      appError(
+        AppErrorKind.ValidationError,
+        "ingress.priority",
+        "ingress.priority must be an integer between 0 and 65535",
+        String(ingress.priority),
       ),
     );
   }
 
-  return tryRunSofApplicationRuntimeExtensionWorker(app, selectedRuntimeExtensionName, options);
-}
-
-export async function runSofApplicationRuntimeExtensionWorkerFromEnvironment(
-  app: SofApplicationInput,
-  env: EnvironmentInput = process.env,
-  options: RuntimeExtensionWorkerStdioOptions = {},
-): Promise<RuntimeExtensionAck> {
-  const result = await tryRunSofApplicationRuntimeExtensionWorkerFromEnvironment(app, env, options);
-  if (isErr(result)) {
-    throw new RangeError(result.error.message);
+  const xToken =
+    ingress.xToken === undefined
+      ? undefined
+      : parseNonEmptyValue(ingress.xToken, "ingress.xToken", (value) => value);
+  if (xToken !== undefined && isErr(xToken)) {
+    return xToken;
   }
 
-  return result.value;
+  const signature =
+    ingress.signature === undefined
+      ? undefined
+      : parseNonEmptyValue(ingress.signature, "ingress.signature", (value) => value);
+  if (signature !== undefined && isErr(signature)) {
+    return signature;
+  }
+
+  const parseFilterList = (
+    values: readonly string[] | undefined,
+    field: string,
+  ): Result<readonly string[], AppError> => {
+    const normalized: string[] = [];
+    for (const value of values ?? []) {
+      const parsed = parseNonEmptyValue(value, field, (normalizedValue) => normalizedValue);
+      if (isErr(parsed)) {
+        return parsed;
+      }
+      normalized.push(parsed.value);
+    }
+
+    return ok(normalized);
+  };
+  const accountInclude = parseFilterList(ingress.accountInclude, "ingress.accountInclude");
+  if (isErr(accountInclude)) {
+    return accountInclude;
+  }
+  const accountExclude = parseFilterList(ingress.accountExclude, "ingress.accountExclude");
+  if (isErr(accountExclude)) {
+    return accountExclude;
+  }
+  const accountRequired = parseFilterList(ingress.accountRequired, "ingress.accountRequired");
+  if (isErr(accountRequired)) {
+    return accountRequired;
+  }
+  const accounts = parseFilterList(ingress.accounts, "ingress.accounts");
+  if (isErr(accounts)) {
+    return accounts;
+  }
+  const owners = parseFilterList(ingress.owners, "ingress.owners");
+  if (isErr(owners)) {
+    return owners;
+  }
+
+  return ok({
+    kind: IngressKind.Grpc,
+    name: name.value,
+    endpoint: endpoint.value,
+    tls: ingress.tls ?? true,
+    stream,
+    ...(xToken === undefined ? {} : { xToken: xToken.value }),
+    ...(ingress.commitment === undefined ? {} : { commitment: ingress.commitment }),
+    ...(ingress.vote === undefined ? {} : { vote: ingress.vote }),
+    ...(ingress.failed === undefined ? {} : { failed: ingress.failed }),
+    ...(signature === undefined ? {} : { signature: signature.value }),
+    accountInclude: accountInclude.value,
+    accountExclude: accountExclude.value,
+    accountRequired: accountRequired.value,
+    accounts: accounts.value,
+    owners: owners.value,
+    requireTransactionSignature: ingress.requireTransactionSignature ?? false,
+    readiness: ingress.readiness ?? ProviderIngressReadiness.Required,
+    role: ingress.role ?? ProviderIngressRole.Primary,
+    ...(ingress.priority === undefined ? {} : { priority: ingress.priority }),
+  });
 }
 
-export type SofApp = SofApplication;
-export type SofAppError = SofApplicationError;
-export type SofAppInit = SofApplicationInit;
-export type SofAppInput = SofApplicationInput;
-export type SofAppLaunchSpec = SofNodeLaunchSpec;
-export type SofAppLaunchSpecInit = SofNodeLaunchSpecInit;
-export type SofPluginName = ExtensionName;
+function validateGossipIngress(
+  ingress: GossipIngressInit,
+  index: number,
+): Result<GossipIngress, AppError> {
+  const name = parseIngressName(ingress.name ?? `gossip-${index + 1}`, "ingress.name");
+  if (isErr(name)) {
+    return name;
+  }
 
-export function tryDefineSofApp(init: SofAppInput): Result<SofApp, SofAppError> {
-  return tryDefineSofApplication(init);
+  const bindAddress =
+    ingress.bindAddress === undefined ? undefined : socketAddress(ingress.bindAddress);
+  if (bindAddress !== undefined && isErr(bindAddress)) {
+    return err(
+      appError(
+        AppErrorKind.ValidationError,
+        "ingress.bindAddress",
+        bindAddress.error.message,
+        ingress.bindAddress,
+      ),
+    );
+  }
+
+  if (ingress.runtimeMode !== undefined && !gossipRuntimeModes.includes(ingress.runtimeMode)) {
+    return err(
+      appError(
+        AppErrorKind.ValidationError,
+        "ingress.runtimeMode",
+        "ingress.runtimeMode must be a supported gossip runtime mode",
+        String(ingress.runtimeMode),
+      ),
+    );
+  }
+
+  const entrypoints: string[] = [];
+  for (const value of ingress.entrypoints ?? []) {
+    const parsed = parseNonEmptyValue(value, "ingress.entrypoints", (normalized) => normalized);
+    if (isErr(parsed)) {
+      return parsed;
+    }
+    entrypoints.push(parsed.value);
+  }
+
+  return ok({
+    kind: IngressKind.Gossip,
+    name: name.value,
+    ...(bindAddress === undefined ? {} : { bindAddress: bindAddress.value }),
+    entrypoints,
+    ...(ingress.runtimeMode === undefined ? {} : { runtimeMode: ingress.runtimeMode }),
+    ...(ingress.entrypointPinned === undefined
+      ? {}
+      : { entrypointPinned: ingress.entrypointPinned }),
+  });
 }
 
-export function defineSofApp(init: SofAppInit): SofApp {
-  return defineSofApplication(init);
+function validateDirectShredsIngress(
+  ingress: DirectShredsIngressInit,
+  index: number,
+): Result<DirectShredsIngress, AppError> {
+  const name = parseIngressName(ingress.name ?? `direct-shreds-${index + 1}`, "ingress.name");
+  if (isErr(name)) {
+    return name;
+  }
+
+  const bindAddress = socketAddress(ingress.bindAddress);
+  if (isErr(bindAddress)) {
+    return err(
+      appError(
+        AppErrorKind.ValidationError,
+        "ingress.bindAddress",
+        bindAddress.error.message,
+        ingress.bindAddress,
+      ),
+    );
+  }
+
+  let kernelBypass: KernelBypassConfig | undefined;
+  if (ingress.kernelBypass !== undefined) {
+    const parsedKernelBypass = validateKernelBypassConfig(ingress.kernelBypass);
+    if (isErr(parsedKernelBypass)) {
+      return parsedKernelBypass;
+    }
+    kernelBypass = parsedKernelBypass.value;
+  }
+
+  return ok({
+    kind: IngressKind.DirectShreds,
+    name: name.value,
+    bindAddress: bindAddress.value,
+    ...(ingress.trustMode === undefined ? {} : { trustMode: ingress.trustMode }),
+    ...(kernelBypass === undefined ? {} : { kernelBypass }),
+  });
 }
 
-export function tryCreateSofAppLaunch(
-  app: SofAppInput,
-  init: SofAppLaunchSpecInit,
-): Result<SofAppLaunchSpec, SofAppError> {
-  return tryCreateSofNodeLaunchSpec(app, init);
+function validateKernelBypassConfig(
+  config: KernelBypassInit,
+): Result<KernelBypassConfig, AppError> {
+  const networkInterface = parseNonEmptyValue(
+    config.interface,
+    "ingress.kernelBypass.interface",
+    (value) => value,
+  );
+  if (isErr(networkInterface)) {
+    return networkInterface;
+  }
+
+  const validateNonNegativeInteger = (value: number, field: string): Result<number, AppError> => {
+    if (!Number.isInteger(value) || value < 0) {
+      return err(
+        appError(
+          AppErrorKind.ValidationError,
+          field,
+          `${field} must be a non-negative integer`,
+          String(value),
+        ),
+      );
+    }
+
+    return ok(value);
+  };
+  const validatePositiveIntegerField = (value: number, field: string): Result<number, AppError> => {
+    if (!Number.isInteger(value) || value <= 0) {
+      return err(
+        appError(
+          AppErrorKind.ValidationError,
+          field,
+          `${field} must be a positive integer`,
+          String(value),
+        ),
+      );
+    }
+
+    return ok(value);
+  };
+
+  const queueId = validateNonNegativeInteger(
+    config.queueId ?? defaultKernelBypassQueueId,
+    "ingress.kernelBypass.queueId",
+  );
+  if (isErr(queueId)) {
+    return queueId;
+  }
+  const batchSize = validatePositiveIntegerField(
+    config.batchSize ?? defaultKernelBypassBatchSize,
+    "ingress.kernelBypass.batchSize",
+  );
+  if (isErr(batchSize)) {
+    return batchSize;
+  }
+  const umemFrameCount = validatePositiveIntegerField(
+    config.umemFrameCount ?? defaultKernelBypassUmemFrameCount,
+    "ingress.kernelBypass.umemFrameCount",
+  );
+  if (isErr(umemFrameCount)) {
+    return umemFrameCount;
+  }
+  const ringDepth = validatePositiveIntegerField(
+    config.ringDepth ?? defaultKernelBypassRingDepth,
+    "ingress.kernelBypass.ringDepth",
+  );
+  if (isErr(ringDepth)) {
+    return ringDepth;
+  }
+  const pollTimeoutMs = validatePositiveIntegerField(
+    config.pollTimeoutMs ?? defaultKernelBypassPollTimeoutMs,
+    "ingress.kernelBypass.pollTimeoutMs",
+  );
+  if (isErr(pollTimeoutMs)) {
+    return pollTimeoutMs;
+  }
+
+  return ok({
+    interface: networkInterface.value,
+    queueId: queueId.value,
+    batchSize: batchSize.value,
+    umemFrameCount: umemFrameCount.value,
+    ringDepth: ringDepth.value,
+    pollTimeoutMs: pollTimeoutMs.value,
+  });
 }
 
-export function createSofAppLaunch(app: SofAppInput, init: SofAppLaunchSpecInit): SofAppLaunchSpec {
-  return createSofNodeLaunchSpec(app, init);
+function validateIngress(
+  ingress: readonly IngressInit[] = [],
+): Result<readonly Ingress[], AppError> {
+  const normalized: Ingress[] = [];
+  const names = new Set<string>();
+
+  for (const [index, value] of ingress.entries()) {
+    let parsed: Result<Ingress, AppError>;
+
+    switch (value.kind) {
+      case IngressKind.WebSocket:
+        parsed = validateWebSocketIngress(value, index);
+        break;
+      case IngressKind.Grpc:
+        parsed = validateGrpcIngress(value, index);
+        break;
+      case IngressKind.Gossip:
+        parsed = validateGossipIngress(value, index);
+        break;
+      case IngressKind.DirectShreds:
+        parsed = validateDirectShredsIngress(value, index);
+        break;
+    }
+
+    if (isErr(parsed)) {
+      return parsed;
+    }
+
+    if (names.has(parsed.value.name)) {
+      return err(
+        appError(
+          AppErrorKind.ValidationError,
+          "ingress.name",
+          `ingress ${parsed.value.name} is registered more than once`,
+          parsed.value.name,
+        ),
+      );
+    }
+
+    names.add(parsed.value.name);
+    normalized.push(parsed.value);
+  }
+
+  return ok(normalized);
 }
 
-export function tryRunSofPlugin(
-  app: SofAppInput,
-  name: string | SofPluginName,
-  options: RuntimeExtensionWorkerStdioOptions = {},
-): Promise<Result<RuntimeExtensionAck, SofApplicationWorkerRunError>> {
-  return tryRunSofApplicationRuntimeExtensionWorker(app, name, options);
+function validateFanIn(
+  fanIn: FanInInit | undefined,
+  ingress: readonly Ingress[],
+): Result<FanIn | undefined, AppError> {
+  const noFanIn: FanIn | undefined = undefined;
+  const rawRuntimeComposition = ingress.length > 1 && isRawRuntimeComposition(ingress);
+
+  if (ingress.length <= 1) {
+    if (fanIn === undefined) {
+      return ok(noFanIn);
+    }
+  } else if (rawRuntimeComposition) {
+    if (fanIn === undefined) {
+      return ok(noFanIn);
+    }
+    return err(
+      appError(
+        AppErrorKind.ValidationError,
+        "fanIn",
+        "fanIn is not used for direct-shreds plus gossip runtime composition",
+      ),
+    );
+  } else if (fanIn === undefined) {
+    return err(
+      appError(
+        AppErrorKind.ValidationError,
+        "fanIn",
+        "fanIn is required when more than one ingress source is configured",
+      ),
+    );
+  }
+
+  if (fanIn === undefined) {
+    return ok(noFanIn);
+  }
+
+  const strategy = fanIn.strategy ?? FanInStrategy.FirstSeen;
+
+  return ok({
+    strategy,
+  });
 }
 
-export function runSofPlugin(
-  app: SofAppInput,
-  name: string | SofPluginName,
-  options: RuntimeExtensionWorkerStdioOptions = {},
-): Promise<RuntimeExtensionAck> {
-  return runSofApplicationRuntimeExtensionWorker(app, name, options);
+function isRawRuntimeComposition(ingress: readonly Ingress[]): boolean {
+  let directShredsCount = 0;
+  let gossipCount = 0;
+
+  for (const source of ingress) {
+    switch (source.kind) {
+      case IngressKind.DirectShreds:
+        directShredsCount += 1;
+        break;
+      case IngressKind.Gossip:
+        gossipCount += 1;
+        break;
+      case IngressKind.WebSocket:
+      case IngressKind.Grpc:
+        return false;
+      default:
+        return false;
+    }
+  }
+
+  return directShredsCount <= 1 && gossipCount <= 1 && directShredsCount + gossipCount >= 2;
 }
 
-export function tryRunSelectedSofPlugin(
-  app: SofAppInput,
-  env: EnvironmentInput = process.env,
-  options: RuntimeExtensionWorkerStdioOptions = {},
-): Promise<Result<RuntimeExtensionAck, SofApplicationWorkerRunError>> {
-  return tryRunSofApplicationRuntimeExtensionWorkerFromEnvironment(app, env, options);
+function resolveRuntimeInput(
+  runtime: ObserverRuntimeConfigInput | undefined,
+  ingress: readonly Ingress[],
+): Result<ObserverRuntimeConfig, AppError> {
+  const directShreds = ingress.filter(
+    (value): value is DirectShredsIngress => value.kind === IngressKind.DirectShreds,
+  );
+  const inferredTrustModes = new Set(
+    directShreds
+      .map((value) => value.trustMode)
+      .filter((value): value is ShredTrustMode => value !== undefined),
+  );
+
+  if (inferredTrustModes.size > 1) {
+    return err(
+      appError(
+        AppErrorKind.ValidationError,
+        "ingress",
+        "direct shred ingress sources must agree on trustMode unless runtime.shredTrustMode is set explicitly",
+      ),
+    );
+  }
+
+  const inferredTrustMode = inferredTrustModes.size === 1 ? [...inferredTrustModes][0] : undefined;
+
+  let baseRuntime: ObserverRuntimeConfigInput = runtime ?? {};
+  if (inferredTrustMode !== undefined) {
+    if (runtime === undefined) {
+      baseRuntime = {
+        shredTrustMode: inferredTrustMode,
+      };
+    } else if (
+      !(runtime instanceof ObserverRuntimeConfig) &&
+      runtime.shredTrustMode === undefined
+    ) {
+      baseRuntime = {
+        ...runtime,
+        shredTrustMode: inferredTrustMode,
+      };
+    }
+  }
+
+  const config = tryCreateRuntimeConfig(baseRuntime);
+  if (isErr(config)) {
+    return err(appError(AppErrorKind.ValidationError, "runtime", config.error.message));
+  }
+
+  return ok(config.value);
 }
 
-export function runSelectedSofPlugin(
-  app: SofAppInput,
-  env: EnvironmentInput = process.env,
-  options: RuntimeExtensionWorkerStdioOptions = {},
-): Promise<RuntimeExtensionAck> {
-  return runSofApplicationRuntimeExtensionWorkerFromEnvironment(app, env, options);
+function toPluginNameKey(value: ExtensionName): string {
+  return value;
 }
 
-export const defineApp = defineSofApp;
-export const definePlugin = defineSofPlugin;
-export const tryDefineApp = tryDefineSofApp;
-export const tryDefinePlugin = tryDefineSofPlugin;
-export const createAppLaunch = createSofAppLaunch;
-export const tryCreateAppLaunch = tryCreateSofAppLaunch;
-export const runPlugin = runSofPlugin;
-export const tryRunPlugin = tryRunSofPlugin;
-export const runSelectedPlugin = runSelectedSofPlugin;
-export const tryRunSelectedPlugin = tryRunSelectedSofPlugin;
+interface AppState {
+  readonly name: AppName;
+  readonly runtime: ObserverRuntimeConfig;
+  readonly ingress: readonly Ingress[];
+  readonly fanIn: FanIn | undefined;
+  readonly plugins: readonly Plugin[];
+  readonly pluginsByName: ReadonlyMap<string, Plugin>;
+}
+
+interface RuntimeHostPluginWorkerConfig {
+  readonly name: ExtensionName;
+  readonly manifest: RuntimeExtensionWorkerManifest;
+  readonly command: string;
+  readonly args: readonly string[];
+  readonly environment: Readonly<Record<string, string>>;
+}
+
+interface RuntimeHostConfig {
+  readonly sdkVersion: string;
+  readonly appName: AppName;
+  readonly runtimeEnvironment: Readonly<Record<string, string>>;
+  readonly ingress: readonly Ingress[];
+  readonly fanIn: FanIn | undefined;
+  readonly pluginWorkers: readonly RuntimeHostPluginWorkerConfig[];
+}
+
+interface ChildExit {
+  readonly code: number | null;
+  readonly signal: NodeJS.Signals | null;
+}
+
+function waitForChildExit(child: ChildProcess): Promise<Result<ChildExit, Error>> {
+  return new Promise((resolve) => {
+    const onError = (error: Error) => {
+      child.off("exit", onExit);
+      resolve(err(error));
+    };
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      child.off("error", onError);
+      resolve(ok({ code, signal }));
+    };
+
+    child.once("error", onError);
+    child.once("exit", onExit);
+  });
+}
+
+function runtimeSourceForIngress(_ingress: WebSocketIngress, frameType: RuntimeWebSocketFrameType) {
+  return {
+    kind: RuntimePacketSourceKind.ObserverIngress,
+    transport: RuntimePacketTransport.WebSocket,
+    eventClass: RuntimePacketEventClass.Packet,
+    webSocketFrameType: frameType,
+  } as const;
+}
+
+function toPacketBytes(data: MessageEvent["data"]): Uint8Array {
+  if (typeof data === "string") {
+    return new TextEncoder().encode(data);
+  }
+
+  if (data instanceof ArrayBuffer) {
+    return new Uint8Array(data);
+  }
+
+  if (ArrayBuffer.isView(data)) {
+    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  }
+
+  if (data instanceof Blob) {
+    throw new TypeError("Blob websocket frames are not supported in the synchronous packet path");
+  }
+
+  return new TextEncoder().encode(String(data));
+}
+
+function toWebSocketFrameType(data: MessageEvent["data"]): RuntimeWebSocketFrameType {
+  return typeof data === "string"
+    ? RuntimeWebSocketFrameType.Text
+    : RuntimeWebSocketFrameType.Binary;
+}
+
+function parseJsonRpcErrorMessage(
+  ingress: WebSocketIngress,
+  data: MessageEvent["data"],
+): AppError | undefined {
+  if (typeof data !== "string") {
+    return undefined;
+  }
+
+  try {
+    const parsed: unknown = JSON.parse(data);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return undefined;
+    }
+    const id =
+      "id" in parsed && (typeof parsed.id === "string" || typeof parsed.id === "number")
+        ? parsed.id
+        : undefined;
+    const nestedError =
+      "error" in parsed &&
+      typeof parsed.error === "object" &&
+      parsed.error !== null &&
+      !Array.isArray(parsed.error)
+        ? parsed.error
+        : undefined;
+    const message =
+      nestedError !== undefined &&
+      "message" in nestedError &&
+      typeof nestedError.message === "string"
+        ? nestedError.message
+        : undefined;
+    if (message === undefined) {
+      return undefined;
+    }
+
+    return appError(
+      AppErrorKind.ValidationError,
+      "ingress.requests",
+      `websocket ingress ${ingress.name} rejected request ${String(id ?? "unknown")}: ${message}`,
+      data,
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+function invokePluginReady(plugin: Plugin): Promise<Result<RuntimeExtensionAck, PluginError>> {
+  const onReady = plugin.toDefinition().onReady;
+  if (onReady === undefined) {
+    return Promise.resolve(ok(runtimeExtensionAck()));
+  }
+
+  return Promise.resolve(
+    onReady({
+      extensionName: plugin.name,
+    }),
+  );
+}
+
+function invokePluginShutdown(plugin: Plugin): Promise<Result<RuntimeExtensionAck, PluginError>> {
+  const onShutdown = plugin.toDefinition().onShutdown;
+  if (onShutdown === undefined) {
+    return Promise.resolve(ok(runtimeExtensionAck()));
+  }
+
+  return Promise.resolve(
+    onShutdown({
+      extensionName: plugin.name,
+    }),
+  );
+}
+
+function dispatchPacketToPlugin(
+  plugin: Plugin,
+  event: RuntimePacketEvent,
+): Promise<Result<RuntimeExtensionAck, PluginError>> {
+  const onPacket = plugin.toDefinition().onPacketReceived;
+  if (onPacket === undefined) {
+    return Promise.resolve(ok(runtimeExtensionAck()));
+  }
+
+  return Promise.resolve(onPacket(event));
+}
+
+async function shutdownPlugins(
+  startedPlugins: readonly Plugin[],
+): Promise<Result<RuntimeExtensionAck, PluginError>> {
+  const shutdownResults = await Promise.all(
+    startedPlugins.map((plugin) => invokePluginShutdown(plugin)),
+  );
+  for (const shutdown of shutdownResults) {
+    if (isErr(shutdown)) {
+      return shutdown;
+    }
+  }
+
+  return ok(runtimeExtensionAck());
+}
+
+function stringEnvironmentRecord(
+  env: NodeJS.ProcessEnv = process.env,
+): Readonly<Record<string, string>> {
+  const record: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (value !== undefined) {
+      record[key] = value;
+    }
+  }
+
+  return record;
+}
+
+function currentNodeAppArgs(): Result<readonly string[], AppError> {
+  const entrypoint = process.argv[1];
+  if (entrypoint === undefined || entrypoint.trim() === "") {
+    return err(
+      appError(
+        AppErrorKind.ValidationError,
+        "process.argv[1]",
+        "app.run() needs a Node.js file entrypoint when delegating to the runtime host",
+      ),
+    );
+  }
+
+  return ok([...process.execArgv, ...process.argv.slice(1)]);
+}
+
+function createRuntimeHostConfig(state: AppState): Result<RuntimeHostConfig, AppError> {
+  const appArgs = currentNodeAppArgs();
+  if (isErr(appArgs)) {
+    return appArgs;
+  }
+
+  return ok({
+    sdkVersion: typeScriptSdkVersion,
+    appName: state.name,
+    runtimeEnvironment: state.runtime.toEnvironmentRecord({ includeDefaults: true }),
+    ingress: state.ingress,
+    fanIn: state.fanIn,
+    pluginWorkers: state.plugins.map((plugin) => ({
+      name: plugin.name,
+      manifest: plugin.manifest,
+      command: process.execPath,
+      args: appArgs.value,
+      environment: {
+        ...stringEnvironmentRecord(),
+        [internalPluginWorkerEnvVarName]: plugin.name,
+      },
+    })),
+  });
+}
+
+function validateNativeRuntimeSupport(state: AppState): Result<undefined, AppError> {
+  const nativeIngress = state.ingress.filter((ingress) => ingress.kind !== IngressKind.WebSocket);
+  if (nativeIngress.length === 0) {
+    return ok(void 0);
+  }
+
+  if (state.ingress.some((ingress) => ingress.kind === IngressKind.WebSocket)) {
+    return err(
+      appError(
+        AppErrorKind.ValidationError,
+        "ingress",
+        "app.run() does not yet support mixed websocket and native-host ingress sources in one app",
+      ),
+    );
+  }
+
+  const rawIngress = nativeIngress.filter(
+    (ingress) => ingress.kind === IngressKind.DirectShreds || ingress.kind === IngressKind.Gossip,
+  );
+  const directShredsIngress = rawIngress.filter(
+    (ingress): ingress is DirectShredsIngress => ingress.kind === IngressKind.DirectShreds,
+  );
+  const gossipIngress = rawIngress.filter(
+    (ingress): ingress is GossipIngress => ingress.kind === IngressKind.Gossip,
+  );
+  const providerIngress = nativeIngress.filter((ingress) => ingress.kind === IngressKind.Grpc);
+  if (providerIngress.length > 0 && rawIngress.length > 0) {
+    return err(
+      appError(
+        AppErrorKind.ValidationError,
+        "ingress",
+        "app.run() does not yet support mixed provider-stream and raw native ingress sources in one app",
+      ),
+    );
+  }
+
+  if (directShredsIngress.length > 1) {
+    return err(
+      appError(
+        AppErrorKind.ValidationError,
+        "ingress",
+        "app.run() currently supports one direct shred ingress source per app",
+      ),
+    );
+  }
+  if (gossipIngress.length > 1) {
+    return err(
+      appError(
+        AppErrorKind.ValidationError,
+        "ingress",
+        "app.run() currently supports one gossip ingress source per app",
+      ),
+    );
+  }
+  const kernelBypassIngress = directShredsIngress.find(
+    (ingress) => ingress.kernelBypass !== undefined,
+  );
+  if (kernelBypassIngress !== undefined && process.platform !== "linux") {
+    return err(
+      appError(
+        AppErrorKind.ValidationError,
+        "ingress.kernelBypass",
+        `kernel bypass for ingress ${kernelBypassIngress.name} is only supported on Linux`,
+        kernelBypassIngress.name,
+      ),
+    );
+  }
+
+  return ok(void 0);
+}
+
+function runtimeHostExecutableName(): string {
+  return process.platform === "win32"
+    ? `${runtimeHostBinaryBaseName}.exe`
+    : runtimeHostBinaryBaseName;
+}
+
+function packagedRuntimeHostPath(): string {
+  return join(
+    import.meta.dirname,
+    "native",
+    `${process.platform}-${process.arch}`,
+    runtimeHostExecutableName(),
+  );
+}
+
+function repoRuntimeHostPaths(): readonly string[] {
+  return [
+    join(import.meta.dirname, "..", "..", "..", "target", "debug", runtimeHostExecutableName()),
+    join(import.meta.dirname, "..", "..", "..", "target", "release", runtimeHostExecutableName()),
+  ];
+}
+
+function makeRuntimeHostExecutable(candidate: string): Result<string, AppError> {
+  try {
+    if (process.platform !== "win32") {
+      chmodSync(candidate, 0o755);
+    }
+    return ok(candidate);
+  } catch (error) {
+    return err(
+      appError(
+        AppErrorKind.ValidationError,
+        runtimeHostBinaryEnvVarName,
+        `runtime host binary exists but could not be made executable: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        candidate,
+      ),
+    );
+  }
+}
+
+function runtimeHostBinary(): Result<string, AppError> {
+  const binary = process.env[runtimeHostBinaryEnvVarName]?.trim();
+  if (binary !== undefined && binary !== "") {
+    return ok(binary);
+  }
+
+  const candidates = [packagedRuntimeHostPath(), ...repoRuntimeHostPaths()];
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) {
+      return makeRuntimeHostExecutable(candidate);
+    }
+  }
+
+  return err(
+    appError(
+      AppErrorKind.ValidationError,
+      runtimeHostBinaryEnvVarName,
+      `a compatible runtime host binary was not found; expected one of ${candidates.join(", ")}`,
+    ),
+  );
+}
+
+async function runRuntimeHost(
+  config: RuntimeHostConfig,
+  options: AppRunOptions,
+): Promise<Result<RuntimeExtensionAck, AppRunError>> {
+  const hostBinary = runtimeHostBinary();
+  if (isErr(hostBinary)) {
+    return hostBinary;
+  }
+  if (options.signal?.aborted === true) {
+    return ok(runtimeExtensionAck());
+  }
+
+  const tempDir = await mkdtemp(join(tmpdir(), "sof-sdk-runtime-"));
+  const configPath = join(tempDir, "runtime-host.json");
+  await writeFile(configPath, `${JSON.stringify(config)}\n`, "utf8");
+
+  try {
+    const child = spawn(hostBinary.value, [configPath], {
+      env: process.env,
+      stdio: "inherit",
+    });
+    let aborted = false;
+    let forceKillTimer: NodeJS.Timeout | undefined;
+    const abort = () => {
+      aborted = true;
+      child.kill("SIGTERM");
+      forceKillTimer = setTimeout(() => {
+        child.kill("SIGKILL");
+      }, 2_000);
+      forceKillTimer.unref();
+    };
+    options.signal?.addEventListener("abort", abort, { once: true });
+
+    const exit = await waitForChildExit(child);
+    try {
+      if (isErr(exit)) {
+        return err(
+          appError(
+            AppErrorKind.ValidationError,
+            runtimeHostBinaryEnvVarName,
+            `failed to start runtime host: ${exit.error.message}`,
+            hostBinary.value,
+          ),
+        );
+      }
+
+      if (aborted || exit.value.code === 0) {
+        return ok(runtimeExtensionAck());
+      }
+
+      return err(
+        appError(
+          AppErrorKind.ValidationError,
+          runtimeHostBinaryEnvVarName,
+          `runtime host exited with ${
+            exit.value.signal === null
+              ? `code ${String(exit.value.code)}`
+              : `signal ${exit.value.signal}`
+          }`,
+          hostBinary.value,
+        ),
+      );
+    } finally {
+      options.signal?.removeEventListener("abort", abort);
+      if (forceKillTimer !== undefined) {
+        clearTimeout(forceKillTimer);
+      }
+    }
+  } finally {
+    await rm(tempDir, { force: true, recursive: true });
+  }
+}
+
+function createAppState(init: AppInit): Result<AppState, AppError> {
+  const ingress = validateIngress(init.ingress);
+  if (isErr(ingress)) {
+    return ingress;
+  }
+
+  const fanIn = validateFanIn(init.fanIn, ingress.value);
+  if (isErr(fanIn)) {
+    return fanIn;
+  }
+
+  const plugins = [...(init.plugins ?? []), ...(init.extensions ?? [])];
+  const pluginNames = new Set<string>();
+  const pluginsByName = new Map<string, Plugin>();
+
+  for (const plugin of plugins) {
+    const nameKey = toPluginNameKey(plugin.name);
+    if (pluginNames.has(nameKey)) {
+      return err(
+        appError(
+          AppErrorKind.DuplicatePlugin,
+          "plugins",
+          `plugin ${nameKey} is registered more than once`,
+          nameKey,
+        ),
+      );
+    }
+
+    pluginNames.add(nameKey);
+    pluginsByName.set(nameKey, plugin);
+  }
+
+  const runtime = resolveRuntimeInput(init.runtime, ingress.value);
+  if (isErr(runtime)) {
+    return runtime;
+  }
+
+  const resolvedName =
+    typeof init.name === "string"
+      ? parseAppName(init.name)
+      : init.name === undefined
+        ? parseAppName(defaultAppNameFromPlugins(plugins))
+        : ok(init.name);
+  if (isErr(resolvedName)) {
+    return resolvedName;
+  }
+
+  return ok({
+    name: resolvedName.value,
+    runtime: runtime.value,
+    ingress: ingress.value,
+    fanIn: fanIn.value,
+    plugins,
+    pluginsByName,
+  });
+}
+
+export class Plugin {
+  private readonly definition: RuntimeExtensionDefinition;
+
+  constructor(init: Plugin | PluginInit | RuntimeExtensionDefinition) {
+    if (init instanceof Plugin) {
+      this.definition = init.definition;
+      return;
+    }
+
+    if (typeof init === "object" && init !== null && "manifest" in init) {
+      const validated = tryDefineRuntimeExtension(init);
+      if (isErr(validated)) {
+        throw new RangeError(validated.error.message);
+      }
+      this.definition = validated.value;
+      return;
+    }
+
+    const definition = createPluginDefinition(init);
+    if (isErr(definition)) {
+      throw new RangeError(definition.error.message);
+    }
+
+    this.definition = definition.value;
+  }
+
+  static create(
+    init: Plugin | PluginInit | RuntimeExtensionDefinition,
+  ): Result<Plugin, PluginError> {
+    if (init instanceof Plugin) {
+      return ok(init);
+    }
+
+    if (typeof init === "object" && init !== null && "manifest" in init) {
+      const validated = tryDefineRuntimeExtension(init);
+      return isErr(validated) ? validated : ok(new Plugin(validated.value));
+    }
+
+    const definition = createPluginDefinition(init);
+    return isErr(definition) ? definition : ok(new Plugin(definition.value));
+  }
+
+  get name(): ExtensionName {
+    return this.definition.manifest.extensionName;
+  }
+
+  get manifest(): RuntimeExtensionWorkerManifest {
+    return this.definition.manifest;
+  }
+
+  toDefinition(): RuntimeExtensionDefinition {
+    return this.definition;
+  }
+}
+
+export { Plugin as Extension };
+
+export class App {
+  readonly #name: AppName;
+  readonly #runtime: ObserverRuntimeConfig;
+  readonly #ingress: readonly Ingress[];
+  readonly #fanIn: FanIn | undefined;
+  readonly #plugins: readonly Plugin[];
+  readonly #pluginsByName: ReadonlyMap<string, Plugin>;
+
+  constructor(init: App | AppInit) {
+    if (init instanceof App) {
+      this.#name = init.#name;
+      this.#runtime = init.#runtime;
+      this.#ingress = init.#ingress;
+      this.#fanIn = init.#fanIn;
+      this.#plugins = init.#plugins;
+      this.#pluginsByName = init.#pluginsByName;
+      return;
+    }
+
+    const state = createAppState(init);
+    if (isErr(state)) {
+      throwAppError(state.error);
+    }
+
+    this.#name = state.value.name;
+    this.#runtime = state.value.runtime;
+    this.#ingress = state.value.ingress;
+    this.#fanIn = state.value.fanIn;
+    this.#plugins = state.value.plugins;
+    this.#pluginsByName = state.value.pluginsByName;
+  }
+
+  static create(init: App | AppInit): Result<App, AppError> {
+    if (init instanceof App) {
+      return ok(init);
+    }
+
+    const state = createAppState(init);
+    if (isErr(state)) {
+      return state;
+    }
+
+    return ok(new App(init));
+  }
+
+  get name(): AppName {
+    return this.#name;
+  }
+
+  get runtime(): ObserverRuntimeConfig {
+    return this.#runtime;
+  }
+
+  get ingress(): readonly Ingress[] {
+    return this.#ingress;
+  }
+
+  get fanIn(): FanIn | undefined {
+    return this.#fanIn;
+  }
+
+  get plugins(): readonly Plugin[] {
+    return this.#plugins;
+  }
+
+  get extensions(): readonly Plugin[] {
+    return this.#plugins;
+  }
+
+  getPlugin(name: string | ExtensionName): Result<Plugin, AppError> {
+    const parsedName = typeof name === "string" ? extensionName(name) : ok(name);
+    if (isErr(parsedName)) {
+      return err(
+        appError(
+          AppErrorKind.ValidationError,
+          "pluginName",
+          parsedName.error.message,
+          typeof name === "string" ? name : String(name),
+        ),
+      );
+    }
+
+    const plugin = this.#pluginsByName.get(toPluginNameKey(parsedName.value));
+    if (plugin !== undefined) {
+      return ok(plugin);
+    }
+
+    return err(
+      appError(
+        AppErrorKind.MissingPlugin,
+        "pluginName",
+        `plugin ${String(parsedName.value)} is not registered in app ${String(this.#name)}`,
+        String(parsedName.value),
+        this.#plugins.map((pluginValue) => String(pluginValue.name)),
+      ),
+    );
+  }
+
+  #toState(): AppState {
+    return {
+      name: this.#name,
+      runtime: this.#runtime,
+      ingress: this.#ingress,
+      fanIn: this.#fanIn,
+      plugins: this.#plugins,
+      pluginsByName: this.#pluginsByName,
+    };
+  }
+
+  #runInternalPluginWorker(pluginName: string): Promise<Result<RuntimeExtensionAck, AppRunError>> {
+    const plugin = this.getPlugin(pluginName);
+    if (isErr(plugin)) {
+      return Promise.resolve(plugin);
+    }
+
+    return runRuntimeExtensionWorkerStdio(plugin.value.toDefinition());
+  }
+
+  run(options: AppRunOptions = {}): Promise<Result<RuntimeExtensionAck, AppRunError>> {
+    return this.runRuntime(options);
+  }
+
+  async runRuntime(options: AppRunOptions = {}): Promise<Result<RuntimeExtensionAck, AppRunError>> {
+    if (this.#plugins.length === 0) {
+      return err(
+        appError(AppErrorKind.ValidationError, "plugins", "app must define at least one plugin"),
+      );
+    }
+
+    const internalWorkerPluginName = process.env[internalPluginWorkerEnvVarName];
+    if (internalWorkerPluginName !== undefined) {
+      return this.#runInternalPluginWorker(internalWorkerPluginName);
+    }
+
+    if (this.#ingress.some((ingress) => ingress.kind !== IngressKind.WebSocket)) {
+      const state = this.#toState();
+      const support = validateNativeRuntimeSupport(state);
+      if (isErr(support)) {
+        return support;
+      }
+
+      const runtimeHostConfig = createRuntimeHostConfig(state);
+      if (isErr(runtimeHostConfig)) {
+        return runtimeHostConfig;
+      }
+
+      return runRuntimeHost(runtimeHostConfig.value, options);
+    }
+
+    if (this.#ingress.length > 1) {
+      return err(
+        appError(
+          AppErrorKind.ValidationError,
+          "ingress",
+          "app.run() does not yet support multi-websocket ingress fan-in",
+        ),
+      );
+    }
+
+    const readyResults = await Promise.all(
+      this.#plugins.map((plugin) => invokePluginReady(plugin)),
+    );
+    for (const ready of readyResults) {
+      if (isErr(ready)) {
+        return ready;
+      }
+    }
+    const startedPlugins = [...this.#plugins];
+
+    if (this.#ingress.length === 0) {
+      if (options.signal !== undefined) {
+        if (options.signal.aborted) {
+          return ok(runtimeExtensionAck());
+        }
+
+        await new Promise<void>((resolve) => {
+          options.signal?.addEventListener(
+            "abort",
+            () => {
+              resolve();
+            },
+            { once: true },
+          );
+        });
+      }
+
+      return shutdownPlugins(startedPlugins);
+    }
+
+    const sockets: WebSocket[] = [];
+    let runtimeError: AppRunError | undefined;
+    let settleRuntime: (() => void) | undefined;
+    const runtimeSettled = new Promise<void>((resolve) => {
+      settleRuntime = resolve;
+    });
+
+    const finishRuntime = () => {
+      settleRuntime?.();
+    };
+
+    try {
+      await Promise.all(
+        this.#ingress.map(
+          (ingress) =>
+            new Promise<void>((resolve, reject) => {
+              if (ingress.kind !== IngressKind.WebSocket) {
+                reject(
+                  new RangeError(
+                    `unsupported ingress kind during websocket runtime execution: ${IngressKind[ingress.kind]}`,
+                  ),
+                );
+                return;
+              }
+
+              const socket = new WebSocket(ingress.url);
+              sockets.push(socket);
+
+              socket.binaryType = "arraybuffer";
+              socket.addEventListener(
+                "open",
+                () => {
+                  for (const request of ingress.requests) {
+                    socket.send(request);
+                  }
+                  resolve();
+                },
+                { once: true },
+              );
+              socket.addEventListener(
+                "error",
+                () => {
+                  reject(new RangeError(`failed to open websocket ingress ${ingress.name}`));
+                },
+                { once: true },
+              );
+              socket.addEventListener("message", (message) => {
+                void (async () => {
+                  try {
+                    const jsonRpcError = parseJsonRpcErrorMessage(ingress, message.data);
+                    if (jsonRpcError !== undefined) {
+                      runtimeError = jsonRpcError;
+                      socket.close();
+                      finishRuntime();
+                      return;
+                    }
+
+                    const event: RuntimePacketEvent = {
+                      source: runtimeSourceForIngress(ingress, toWebSocketFrameType(message.data)),
+                      bytes: toPacketBytes(message.data),
+                      observedUnixMs: Date.now(),
+                    };
+
+                    const handledResults = await Promise.all(
+                      this.#plugins.map((plugin) => dispatchPacketToPlugin(plugin, event)),
+                    );
+                    for (const handled of handledResults) {
+                      if (isErr(handled)) {
+                        runtimeError = handled.error;
+                        socket.close();
+                        finishRuntime();
+                      }
+                    }
+                  } catch (error) {
+                    runtimeError = appError(
+                      AppErrorKind.ValidationError,
+                      "ingress",
+                      error instanceof Error ? error.message : String(error),
+                    );
+                    socket.close();
+                    finishRuntime();
+                  }
+                })();
+              });
+              socket.addEventListener("close", () => {
+                if (options.signal === undefined || runtimeError !== undefined) {
+                  finishRuntime();
+                }
+              });
+            }),
+        ),
+      );
+
+      if (options.signal?.aborted === true) {
+        finishRuntime();
+      } else {
+        options.signal?.addEventListener(
+          "abort",
+          () => {
+            finishRuntime();
+          },
+          { once: true },
+        );
+      }
+
+      await runtimeSettled;
+    } catch (error) {
+      runtimeError = appError(
+        AppErrorKind.ValidationError,
+        "ingress",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+
+    for (const socket of sockets) {
+      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+        socket.close();
+      }
+    }
+
+    const shutdown = await shutdownPlugins(startedPlugins);
+    if (isErr(shutdown)) {
+      return shutdown;
+    }
+
+    return runtimeError === undefined ? ok(runtimeExtensionAck()) : err(runtimeError);
+  }
+}
+
+export function createBalancedRuntime(
+  init: Omit<ObserverRuntimeConfigInput, "runtimeDeliveryProfile"> = {},
+): ObserverRuntimeConfig {
+  return observerRuntimeConfig({
+    ...init,
+    runtimeDeliveryProfile: RuntimeDeliveryProfile.Balanced,
+  });
+}
+
+export function createLatencyOptimizedRuntime(
+  init: Omit<ObserverRuntimeConfigInput, "runtimeDeliveryProfile"> = {},
+): ObserverRuntimeConfig {
+  return observerRuntimeConfig({
+    ...init,
+    runtimeDeliveryProfile: RuntimeDeliveryProfile.LatencyOptimized,
+  });
+}
+
+export function createDeliveryDisciplinedRuntime(
+  init: Omit<ObserverRuntimeConfigInput, "runtimeDeliveryProfile"> = {},
+): ObserverRuntimeConfig {
+  return observerRuntimeConfig({
+    ...init,
+    runtimeDeliveryProfile: RuntimeDeliveryProfile.DeliveryDisciplined,
+  });
+}

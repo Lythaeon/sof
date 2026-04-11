@@ -1,7 +1,7 @@
 {
   "name": "@sof/sdk",
   "version": "0.1.0",
-  "description": "Unified SOF TypeScript SDK",
+  "description": "TypeScript App SDK",
   "license": "MIT OR Apache-2.0",
   "sideEffects": false,
   "packageManager": "pnpm@10.28.2",
@@ -64,18 +64,19 @@
   "scripts": {
     "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true }); rmSync('dist-test', { recursive: true, force: true }); rmSync('dist-examples', { recursive: true, force: true });\"",
     "build": "pnpm run clean && tsdown --config tsdown.config.ts",
+    "build:native": "node scripts/build-native-host.mjs",
     "build:test": "tsc -p tsconfig.test.json",
     "build:examples": "pnpm run build && tsc -p tsconfig.examples.json",
-    "format": "biome format --config-path biome.json --write src examples tsdown.config.ts",
-    "format:check": "biome format --config-path biome.json src examples tsdown.config.ts",
-    "lint": "oxlint --config .oxlintrc.json --tsconfig tsconfig.lint.json --type-aware --deny-warnings --report-unused-disable-directives src tsdown.config.ts",
-    "lint:fix": "oxlint --config .oxlintrc.json --tsconfig tsconfig.lint.json --type-aware --fix --fix-suggestions src tsdown.config.ts",
-    "check:examples": "pnpm run build:examples && node dist-examples/runtime-config-balanced.js && node dist-examples/runtime-config-parse.js && node dist-examples/runtime-extension-manifest.js && node dist-examples/runtime-extension-worker.js && node dist-examples/sof-app-entrypoint.js && node dist-examples/sof-app-launch-spec.js",
+    "format": "biome format --config-path biome.json --write src examples scripts tsdown.config.ts",
+    "format:check": "biome format --config-path biome.json src examples scripts tsdown.config.ts",
+    "lint": "oxlint --config .oxlintrc.json --tsconfig tsconfig.lint.json --type-aware --deny-warnings --report-unused-disable-directives src tsdown.config.ts && oxlint --config .oxlintrc.json --deny-warnings --report-unused-disable-directives examples scripts",
+    "lint:fix": "oxlint --config .oxlintrc.json --tsconfig tsconfig.lint.json --type-aware --fix --fix-suggestions src tsdown.config.ts && oxlint --config .oxlintrc.json --fix --fix-suggestions examples scripts",
+    "check:examples": "pnpm run build:examples && node dist-examples/runtime-config-balanced.js && node dist-examples/runtime-config-parse.js && node dist-examples/runtime-extension-manifest.js && node dist-examples/runtime-extension-worker.js && node dist-examples/app-entrypoint.js && node dist-examples/app-config.js",
     "check:package": "publint run --strict --pack pnpm",
     "check": "pnpm run format:check && pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run check:examples && pnpm run check:package",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "pnpm run build && pnpm run build:test && node --test dist-test/*.test.js dist-test/**/*.test.js",
-    "prepack": "pnpm run build"
+    "prepack": "pnpm run build && pnpm run build:native"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",

@@ -1,27 +1,21 @@
 import { PassThrough } from "node:stream";
 
 import {
-  ExtensionCapability,
-  RuntimeExtensionWorkerHostMessageTag,
   SdkLanguage,
-  extensionName,
+  createRuntimeExtensionWorkerManifest,
   isErr,
   ok,
   runtimeExtensionAck,
-  serializeRuntimeExtensionWorkerHostMessageWire,
   socketAddress,
-  tryDefineApp,
-  tryDefinePlugin,
-  tryRunPlugin,
+  tryDefineRuntimeExtension,
 } from "../dist/index.js";
+import {
+  RuntimeExtensionWorkerHostMessageTag,
+  runRuntimeExtensionWorkerStdio,
+  serializeRuntimeExtensionWorkerHostMessageWire,
+} from "../dist/runtime/extension-stdio.js";
 
 async function main(): Promise<number> {
-  const extension = extensionName("demo-extension-worker");
-  if (isErr(extension)) {
-    process.stderr.write(`${extension.error.message}\n`);
-    return 1;
-  }
-
   const localAddress = socketAddress("127.0.0.1:21011");
   if (isErr(localAddress)) {
     process.stderr.write(`${localAddress.error.message}\n`);
@@ -29,30 +23,23 @@ async function main(): Promise<number> {
   }
 
   let observedPacketLog = "";
-  const plugin = tryDefinePlugin({
-    name: extension.value,
-    capabilities: [ExtensionCapability.ObserveObserverIngress],
-    onStart: () => ok(runtimeExtensionAck()),
-    onPacket: (event) => {
+  const definition = tryDefineRuntimeExtension({
+    manifest: createRuntimeExtensionWorkerManifest({
+      sdkVersion: "0.1.0",
+      extensionName: "demo-extension-worker",
+    }),
+    onReady: () => ok(runtimeExtensionAck()),
+    onPacketReceived: (event) => {
       observedPacketLog = `received ${event.bytes.length} bytes from ${String(event.source.localAddress)}`;
       return ok(runtimeExtensionAck());
     },
-    onStop: () => ok(runtimeExtensionAck()),
+    onShutdown: () => ok(runtimeExtensionAck()),
   });
-  if (isErr(plugin)) {
-    process.stderr.write(`${plugin.error.message}\n`);
+
+  if (isErr(definition)) {
+    process.stderr.write(`${definition.error.message}\n`);
     return 1;
   }
-
-  const app = tryDefineApp({
-    name: "demo-sof-app",
-    plugins: [plugin.value],
-  });
-  if (isErr(app)) {
-    process.stderr.write(`${app.error.message}\n`);
-    return 1;
-  }
-
   const input = new PassThrough();
   const output = new PassThrough();
   const errorOutput = new PassThrough();
@@ -68,7 +55,7 @@ async function main(): Promise<number> {
     protocolErrors += chunk;
   });
 
-  const runner = tryRunPlugin(app.value, extension.value, {
+  const runner = runRuntimeExtensionWorkerStdio(definition.value, {
     input,
     output,
     error: errorOutput,
@@ -79,7 +66,7 @@ async function main(): Promise<number> {
       serializeRuntimeExtensionWorkerHostMessageWire({
         tag: RuntimeExtensionWorkerHostMessageTag.Start,
         context: {
-          extensionName: extension.value,
+          extensionName: definition.value.manifest.extensionName,
         },
       }),
     )}\n`,
@@ -104,7 +91,7 @@ async function main(): Promise<number> {
       serializeRuntimeExtensionWorkerHostMessageWire({
         tag: RuntimeExtensionWorkerHostMessageTag.Shutdown,
         context: {
-          extensionName: extension.value,
+          extensionName: definition.value.manifest.extensionName,
         },
       }),
     )}\n`,

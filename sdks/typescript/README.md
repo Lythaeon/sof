@@ -1,6 +1,6 @@
 # `@sof/sdk`
 
-Unified TypeScript SDK surface for SOF apps and plugins.
+TypeScript SDK for building apps with a typed `App`, `Plugin`, `runtime`, and `derivedState` model.
 
 ## Tooling
 
@@ -12,204 +12,309 @@ Unified TypeScript SDK surface for SOF apps and plugins.
 
 ## Mental Model
 
-- Start with the app-facing APIs: `tryDefinePlugin(...)`, `tryDefineApp(...)`, `tryCreateAppLaunch(...)`, and `runSelectedPlugin(...)`.
-- Use runtime-config helpers such as `createRuntimeConfigForProfile(...)`, `serializeRuntimeConfigRecord(...)`, and `parseRuntimeConfig(...)` when you need to build or validate env-backed config.
-- Prefer `try...` helpers when invalid input should stay in `Result` form instead of throwing.
-- Use subpath imports such as `@sof/sdk/app` or `@sof/sdk/runtime/config` when you want a smaller import surface.
+- Build one `App`.
+- Put ingress on the app with `ingress`.
+- Put merge behavior on the app with `fanIn` when you have multiple sources.
+- Put runtime behavior on the app with `runtime`, including `derivedState`.
+- Put app logic in `Plugin`.
+- Start the app with `app.run()`.
 
-The current package provides:
-
-- checked `Result<T, E>` primitives
-- branded/value-object types for domain strings
-- enum-backed runtime policy types
-- typed runtime config parsing and serialization
-- nested derived-state config with safe defaults
-- app-first TS APIs for defining apps and plugins
-- launch-spec generation for Node-based app entrypoints
-- plugin entrypoint helpers for selected-plugin execution
+`name` is optional on `App`. If you omit it, the SDK derives one from the first plugin.
 
 ## Quick Start
 
 ```ts
-import {
-  ExtensionCapability,
-  RuntimeDeliveryProfile,
-  createRuntimeConfigForProfile,
-  isErr,
-  tryCreateAppLaunch,
-  tryDefineApp,
-  tryDefinePlugin,
-} from "@sof/sdk";
+import { App, IngressKind, Plugin } from "@sof/sdk";
 
-const plugin = tryDefinePlugin({
-  name: "demo-plugin",
-  capabilities: [ExtensionCapability.ObserveObserverIngress],
+const app = new App({
+  ingress: [
+    {
+      kind: IngressKind.WebSocket,
+      name: "solana-websocket",
+      url: "wss://example.invalid",
+    },
+  ],
+  plugins: [
+    new Plugin({
+      name: "tx-logger",
+      logPackets: true,
+    }),
+  ],
 });
 
-if (!isErr(plugin)) {
-  const app = tryDefineApp({
-    name: "demo-sof-app",
-    runtime: createRuntimeConfigForProfile(RuntimeDeliveryProfile.Balanced),
-    plugins: [plugin.value],
-  });
-
-  if (!isErr(app)) {
-    const launch = tryCreateAppLaunch(app.value, {
-      workerEntrypoint: "./dist/app.js",
-    });
-
-    if (!isErr(launch)) {
-      launch.value.runtimeEnvironment;
-      launch.value.plugins;
-    }
-  }
-}
+await app.run();
 ```
 
-## Plugin API
+`app.run()` is the normal execution path. It runs until the app is stopped.
+
+Current executable coverage:
+- `app.run()` supports one WebSocket ingress source today.
+- `DirectShreds` runs through the packaged native runtime host for one raw packet source per app.
+- `Grpc` runs through the packaged native runtime host with Yellowstone provider-stream events delivered to `Plugin.onProviderEvent`.
+- `Gossip` runs through the packaged native runtime host with gossip-bootstrap support.
+- Direct shreds can enable kernel bypass on Linux through a typed `kernelBypass` object.
+- One `DirectShreds` ingress plus one `Gossip` ingress run together as one raw runtime composition without `fanIn`.
+- Mixed WebSocket/native ingress and multi-WebSocket fan-in still return typed errors instead of silently falling through.
+- Multi-gRPC fan-in uses the Rust arbitration model: `EmitAll`, `FirstSeen`, or `FirstSeenThenPromote`.
+- The package build includes the native host under `dist/native/<platform>-<arch>/`; `SOF_SDK_RUNTIME_HOST_BINARY` is only an override for development or custom deployments.
+- If the host is missing, `app.run()` returns a typed `Result` error instead of throwing.
+
+## Runtime
+
+Use the runtime object when you want to control delivery profile, provider policy, shred trust mode, or derived state.
 
 ```ts
 import {
-  ExtensionCapability,
-  isErr,
-  ok,
-  runtimeExtensionAck,
-  tryDefinePlugin,
+  App,
+  DerivedStateReplayBackend,
+  DerivedStateReplayDurability,
+  IngressKind,
+  Plugin,
+  createBalancedRuntime,
 } from "@sof/sdk";
 
-const plugin = tryDefinePlugin({
-  name: "demo-plugin",
-  capabilities: [ExtensionCapability.ObserveObserverIngress],
+const app = new App({
+  runtime: createBalancedRuntime({
+    derivedState: {
+      replay: {
+        backend: DerivedStateReplayBackend.Disk,
+        durability: DerivedStateReplayDurability.Fsync,
+        maxEnvelopes: 4096,
+        maxSessions: 4,
+      },
+    },
+  }),
+  ingress: [
+    {
+      kind: IngressKind.WebSocket,
+      url: "wss://example.invalid",
+    },
+  ],
+  plugins: [new Plugin({ logPackets: true })],
+});
+
+app;
+```
+
+## gRPC Provider Ingress
+
+gRPC provider ingress delivers provider-stream events, not raw packets.
+
+```ts
+import {
+  App,
+  GrpcIngressStream,
+  IngressKind,
+  Plugin,
+  ProviderCommitment,
+  RuntimeProviderEventKind,
+  ok,
+  runtimeExtensionAck,
+} from "@sof/sdk";
+
+const app = new App({
+  ingress: [
+    {
+      kind: IngressKind.Grpc,
+      name: "yellowstone",
+      endpoint: "https://example.invalid",
+      stream: GrpcIngressStream.TransactionStatus,
+      commitment: ProviderCommitment.Processed,
+    },
+  ],
+  plugins: [
+    new Plugin({
+      name: "provider-logger",
+      onProviderEvent: (event) => {
+        if (event.kind === RuntimeProviderEventKind.TransactionStatus) {
+          process.stdout.write(`${event.slot} ${event.signature}\n`);
+        }
+        return ok(runtimeExtensionAck());
+      },
+    }),
+  ],
+});
+
+await app.run();
+```
+
+## Multi-Source Ingress
+
+When you configure more than one provider ingress source, `fanIn` is required. The SDK maps it to the Rust provider arbitration model. If you want promotion behavior, set source roles or priorities on each ingress.
+
+```ts
+import {
+  App,
+  FanInStrategy,
+  IngressKind,
+  Plugin,
+  ProviderIngressRole,
+} from "@sof/sdk";
+
+const app = new App({
+  ingress: [
+    {
+      kind: IngressKind.Grpc,
+      name: "grpc-a",
+      endpoint: "https://one.example.invalid",
+      role: ProviderIngressRole.Primary,
+    },
+    {
+      kind: IngressKind.Grpc,
+      name: "grpc-b",
+      endpoint: "https://two.example.invalid",
+      role: ProviderIngressRole.Fallback,
+    },
+  ],
+  fanIn: {
+    strategy: FanInStrategy.FirstSeenThenPromote,
+  },
+  plugins: [new Plugin({ name: "provider-logger" })],
+});
+
+app;
+```
+
+## Direct Shreds
+
+Direct shred ingress belongs on the app, not on a plugin.
+
+```ts
+import {
+  App,
+  IngressKind,
+  Plugin,
+  ShredTrustMode,
+} from "@sof/sdk";
+
+const app = new App({
+  ingress: [
+    {
+      kind: IngressKind.DirectShreds,
+      name: "trusted-shreds",
+      bindAddress: "0.0.0.0:20000",
+      trustMode: ShredTrustMode.TrustedRawShredProvider,
+      kernelBypass: {
+        interface: "eth0",
+      },
+    },
+  ],
+  plugins: [new Plugin({ name: "observer" })],
+});
+
+app;
+```
+
+## Plugins
+
+`Plugin` is the app extension surface. A plugin can implement lifecycle hooks and packet handlers:
+
+```ts
+import {
+  App,
+  IngressKind,
+  Plugin,
+  ok,
+  runtimeExtensionAck,
+} from "@sof/sdk";
+
+const plugin = new Plugin({
+  name: "packet-audit",
   onStart: () => ok(runtimeExtensionAck()),
-  onPacket: () => ok(runtimeExtensionAck()),
+  onPacket: (event) => {
+    process.stdout.write(`${event.bytes.length}\n`);
+    return ok(runtimeExtensionAck());
+  },
   onStop: () => ok(runtimeExtensionAck()),
 });
 
-if (!isErr(plugin)) {
-  plugin.value.manifest.extensionName;
-}
-```
-
-## App Entrypoint
-
-```ts
-import {
-  ExtensionCapability,
-  isErr,
-  ok,
-  runSelectedPlugin,
-  runtimeExtensionAck,
-  tryDefineApp,
-  tryDefinePlugin,
-} from "@sof/sdk";
-
-const plugin = tryDefinePlugin({
-  name: "demo-plugin",
-  capabilities: [ExtensionCapability.ObserveObserverIngress],
-  onStart: () => ok(runtimeExtensionAck()),
-  onPacket: () => ok(runtimeExtensionAck()),
-  onStop: () => ok(runtimeExtensionAck()),
+const app = new App({
+  ingress: [
+    {
+      kind: IngressKind.WebSocket,
+      url: "wss://example.invalid",
+    },
+  ],
+  plugins: [plugin],
 });
 
-if (!isErr(plugin)) {
-  const app = tryDefineApp({
-    name: "demo-sof-app",
-    plugins: [plugin.value],
-  });
-
-  if (!isErr(app)) {
-    await runSelectedPlugin(app.value);
-  }
-}
+app;
 ```
 
-## Runtime Config
+`Extension` is also exported as an alias of `Plugin` if you prefer that name.
+
+## Derived State
+
+Use `runtime.derivedState` when the app needs replay/backfill/checkpoint behavior:
 
 ```ts
 import {
-  RuntimeDeliveryProfile,
-  isErr,
-  tryCreateRuntimeConfigForProfile,
-  trySerializeRuntimeConfigRecord,
+  App,
+  DerivedStateReplayBackend,
+  DerivedStateReplayDurability,
+  IngressKind,
+  Plugin,
+  createBalancedRuntime,
 } from "@sof/sdk";
 
-const config = tryCreateRuntimeConfigForProfile(
-  RuntimeDeliveryProfile.DeliveryDisciplined,
-);
+const app = new App({
+  runtime: createBalancedRuntime({
+    derivedState: {
+      replay: {
+        backend: DerivedStateReplayBackend.Disk,
+        durability: DerivedStateReplayDurability.Fsync,
+        directory: ".sof-derived-state",
+      },
+    },
+  }),
+  ingress: [{ kind: IngressKind.WebSocket, url: "wss://example.invalid" }],
+  plugins: [new Plugin({ name: "stateful-app" })],
+});
 
-if (!isErr(config)) {
-  const env = trySerializeRuntimeConfigRecord(config.value);
-
-  env;
-}
+app;
 ```
 
 ## Focused Imports
 
 ```ts
-import {
-  createAppLaunch,
-  runSelectedPlugin,
-  tryDefineApp,
-  tryDefinePlugin,
-} from "@sof/sdk/app";
-import {
-  ObserverRuntimeConfig,
-  observerRuntimeConfigForProfile,
-} from "@sof/sdk/runtime/config";
-import {
-  ProviderStreamCapabilityPolicy,
-  ShredTrustMode,
-} from "@sof/sdk/runtime/policy";
+import { App, IngressKind, Plugin } from "@sof/sdk/app";
+import { ObserverRuntimeConfig } from "@sof/sdk/runtime/config";
+import { ShredTrustMode } from "@sof/sdk/runtime/policy";
 import {
   DerivedStateReplayBackend,
   DerivedStateReplayDurability,
 } from "@sof/sdk/runtime/derived-state";
 import { RuntimeDeliveryProfile } from "@sof/sdk/runtime/delivery-profile";
 
-const config = observerRuntimeConfigForProfile(
-  RuntimeDeliveryProfile.DeliveryDisciplined,
-  {
-    shredTrustMode: ShredTrustMode.TrustedRawShredProvider,
-    providerStreamCapabilityPolicy: ProviderStreamCapabilityPolicy.Strict,
-    derivedState: {
-      replay: {
-        backend: DerivedStateReplayBackend.Disk,
-        durability: DerivedStateReplayDurability.Fsync,
-      },
+const runtime = ObserverRuntimeConfig.forProfile(RuntimeDeliveryProfile.Balanced, {
+  shredTrustMode: ShredTrustMode.TrustedRawShredProvider,
+  derivedState: {
+    replay: {
+      backend: DerivedStateReplayBackend.Disk,
+      durability: DerivedStateReplayDurability.Fsync,
     },
   },
-);
+});
 
-tryDefinePlugin;
-tryDefineApp;
-createAppLaunch;
-runSelectedPlugin;
-ObserverRuntimeConfig.latencyOptimized();
-config;
+new App({
+  runtime,
+  ingress: [{ kind: IngressKind.WebSocket, url: "wss://example.invalid" }],
+  plugins: [new Plugin({ name: "tx-logger" })],
+});
 ```
 
 ## Examples
 
 Runnable examples live in `sdks/typescript/examples`:
 
-- `sof-app-entrypoint.ts`
-- `sof-app-launch-spec.ts`
+- `app-config.ts`
+- `app-entrypoint.ts`
 - `runtime-config-balanced.ts`
 - `runtime-config-parse.ts`
 - `runtime-extension-manifest.ts`
-- `runtime-extension-worker.ts`
 
 Run them with:
 
 ```bash
 pnpm run check:examples
 ```
-
-## Choosing An API
-
-- Use `tryDefinePlugin(...)`, `tryDefineApp(...)`, and `tryCreateAppLaunch(...)` for the normal app authoring flow.
-- Use `runSelectedPlugin(...)` in your plugin entrypoint when the app should select the plugin to run from its environment.
-- Use `parseRuntimeConfig(...)` or `ObserverRuntimeConfig.fromEnvironmentRecord(...)` when you need to validate env input.
-- Use `createRuntimeConfigForProfile(...)` for the simplest runtime-profile workflow.
-- Use the root `@sof/sdk` import for convenience. Use subpath imports when you want a smaller, more explicit import surface.

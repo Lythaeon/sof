@@ -20,6 +20,8 @@ import {
   type RuntimePacketSource,
   type RuntimePacketSourceKind,
   type RuntimePacketTransport,
+  type RuntimeProviderEvent,
+  type RuntimeProviderEventKind,
   type RuntimeWebSocketFrameType,
   extensionName,
   extensionResourceId,
@@ -37,6 +39,9 @@ const runtimePacketEventClasses = [1, 2] as const satisfies readonly RuntimePack
 const runtimeWebSocketFrameTypes = [
   1, 2, 3, 4,
 ] as const satisfies readonly RuntimeWebSocketFrameType[];
+const runtimeProviderEventKinds = [
+  1, 2, 3, 4, 5, 6, 7,
+] as const satisfies readonly RuntimeProviderEventKind[];
 const maxPacketByteValue = 255;
 
 type JsonRecord = Record<string, unknown>;
@@ -58,6 +63,10 @@ export type RuntimeExtensionWorkerWireHostMessage =
   | {
       readonly tag: RuntimeExtensionWorkerHostMessageTag.DeliverPacket;
       readonly event: RuntimePacketEventWire;
+    }
+  | {
+      readonly tag: RuntimeExtensionWorkerHostMessageTag.DeliverProviderEvent;
+      readonly event: RuntimeProviderEvent;
     }
   | {
       readonly tag: RuntimeExtensionWorkerHostMessageTag.Shutdown;
@@ -165,6 +174,7 @@ function parseRuntimeExtensionWorkerHostMessageTag(
     RuntimeExtensionWorkerHostMessageTag.Start,
     RuntimeExtensionWorkerHostMessageTag.DeliverPacket,
     RuntimeExtensionWorkerHostMessageTag.Shutdown,
+    RuntimeExtensionWorkerHostMessageTag.DeliverProviderEvent,
   ]);
   if (isErr(parsed)) {
     return parsed;
@@ -181,6 +191,9 @@ function parseRuntimeExtensionWorkerHostMessageTag(
   }
   if (parsed.value === 4) {
     return ok(RuntimeExtensionWorkerHostMessageTag.Shutdown);
+  }
+  if (parsed.value === 5) {
+    return ok(RuntimeExtensionWorkerHostMessageTag.DeliverProviderEvent);
   }
 
   return err(
@@ -453,6 +466,18 @@ function parseRuntimePacketSource(
   });
 }
 
+function isRuntimeProviderEventKind(value: unknown): value is RuntimeProviderEventKind {
+  return (
+    typeof value === "number" &&
+    Number.isInteger(value) &&
+    runtimeProviderEventKinds.some((kind) => kind === value)
+  );
+}
+
+function isRuntimeProviderEvent(value: unknown): value is RuntimeProviderEvent {
+  return isJsonRecord(value) && isRuntimeProviderEventKind(value.kind);
+}
+
 export function serializeRuntimePacketEventWire(event: RuntimePacketEvent): RuntimePacketEventWire {
   return {
     source: event.source,
@@ -500,6 +525,27 @@ export function tryParseRuntimePacketEventWire(
   });
 }
 
+export function tryParseRuntimeProviderEventWire(
+  value: unknown,
+): Result<RuntimeProviderEvent, RuntimeExtensionError> {
+  const eventRecord = parseJsonRecord(value, "event");
+  if (isErr(eventRecord)) {
+    return eventRecord;
+  }
+
+  if (!isRuntimeProviderEvent(eventRecord.value)) {
+    return err(
+      runtimeExtensionProtocolError(
+        "event.kind",
+        `event.kind must be one of ${runtimeProviderEventKinds.join(", ")}`,
+        JSON.stringify(eventRecord.value.kind),
+      ),
+    );
+  }
+
+  return ok(eventRecord.value);
+}
+
 export function serializeRuntimeExtensionWorkerHostMessageWire(
   message: RuntimeExtensionWorkerHostMessage,
 ): RuntimeExtensionWorkerWireHostMessage {
@@ -515,6 +561,11 @@ export function serializeRuntimeExtensionWorkerHostMessageWire(
       return {
         tag: RuntimeExtensionWorkerHostMessageTag.DeliverPacket,
         event: serializeRuntimePacketEventWire(message.event),
+      };
+    case RuntimeExtensionWorkerHostMessageTag.DeliverProviderEvent:
+      return {
+        tag: RuntimeExtensionWorkerHostMessageTag.DeliverProviderEvent,
+        event: message.event,
       };
     case RuntimeExtensionWorkerHostMessageTag.Shutdown:
       return {
@@ -563,6 +614,17 @@ export function tryParseRuntimeExtensionWorkerHostMessageWire(
 
       return ok({
         tag: RuntimeExtensionWorkerHostMessageTag.DeliverPacket,
+        event: event.value,
+      });
+    }
+    case RuntimeExtensionWorkerHostMessageTag.DeliverProviderEvent: {
+      const event = tryParseRuntimeProviderEventWire(messageRecord.value.event);
+      if (isErr(event)) {
+        return event;
+      }
+
+      return ok({
+        tag: RuntimeExtensionWorkerHostMessageTag.DeliverProviderEvent,
         event: event.value,
       });
     }
