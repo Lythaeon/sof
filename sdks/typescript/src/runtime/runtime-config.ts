@@ -334,6 +334,79 @@ export function observerRuntimeConfigForProfile(
   return result.value;
 }
 
+export function createRuntimeConfig(
+  init: ObserverRuntimeConfigInput = {},
+): ObserverRuntimeConfig {
+  return observerRuntimeConfig(init);
+}
+
+export function tryCreateRuntimeConfig(
+  init: ObserverRuntimeConfigInput = {},
+): Result<ObserverRuntimeConfig, ObserverRuntimeValidationError> {
+  return tryObserverRuntimeConfig(init);
+}
+
+export function createRuntimeConfigForProfile(
+  profile: RuntimeDeliveryProfile,
+  init: ObserverRuntimeProfileInit = {},
+): ObserverRuntimeConfig {
+  return observerRuntimeConfigForProfile(profile, init);
+}
+
+export function tryCreateRuntimeConfigForProfile(
+  profile: RuntimeDeliveryProfile,
+  init: ObserverRuntimeProfileInit = {},
+): Result<ObserverRuntimeConfig, ObserverRuntimeValidationError> {
+  return tryObserverRuntimeConfigForProfile(profile, init);
+}
+
+export function parseRuntimeConfig(
+  env: EnvironmentInput,
+): Result<ObserverRuntimeConfig, ObserverRuntimeValidationError> {
+  return ObserverRuntimeConfig.fromEnvironment(env);
+}
+
+export function serializeRuntimeConfig(
+  init: ObserverRuntimeConfigInput = {},
+  options: ObserverRuntimeEnvironmentOptions = {},
+): readonly ObserverRuntimeEnvironmentVariable[] {
+  return observerRuntimeConfig(init).toEnvironment(options);
+}
+
+export function trySerializeRuntimeConfig(
+  init: ObserverRuntimeConfigInput = {},
+  options: ObserverRuntimeEnvironmentOptions = {},
+): Result<
+  readonly ObserverRuntimeEnvironmentVariable[],
+  ObserverRuntimeValidationError
+> {
+  const config = tryObserverRuntimeConfig(init);
+  if (isErr(config)) {
+    return config;
+  }
+
+  return ok(config.value.toEnvironment(options));
+}
+
+export function serializeRuntimeConfigRecord(
+  init: ObserverRuntimeConfigInput = {},
+  options: ObserverRuntimeEnvironmentOptions = {},
+): Readonly<Record<string, string>> {
+  return observerRuntimeConfig(init).toEnvironmentRecord(options);
+}
+
+export function trySerializeRuntimeConfigRecord(
+  init: ObserverRuntimeConfigInput = {},
+  options: ObserverRuntimeEnvironmentOptions = {},
+): Result<Readonly<Record<string, string>>, ObserverRuntimeValidationError> {
+  const config = tryObserverRuntimeConfig(init);
+  if (isErr(config)) {
+    return config;
+  }
+
+  return ok(config.value.toEnvironmentRecord(options));
+}
+
 export class ObserverRuntimeConfig {
   readonly runtimeDeliveryProfile: RuntimeDeliveryProfile;
   readonly shredTrustMode: ShredTrustMode;

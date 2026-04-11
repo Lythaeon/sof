@@ -18,12 +18,20 @@ test("package exports resolve the documented public entry points", async () => {
     (config as { ObserverRuntimeConfig: unknown }).ObserverRuntimeConfig,
   );
   assert.equal(
+    (root as { createRuntimeConfig: unknown }).createRuntimeConfig,
+    (config as { createRuntimeConfig: unknown }).createRuntimeConfig,
+  );
+  assert.equal(
     (root as { observerRuntimeConfig: unknown }).observerRuntimeConfig,
     (config as { observerRuntimeConfig: unknown }).observerRuntimeConfig,
   );
   assert.equal(
     (root as { tryObserverRuntimeConfig: unknown }).tryObserverRuntimeConfig,
     (config as { tryObserverRuntimeConfig: unknown }).tryObserverRuntimeConfig,
+  );
+  assert.equal(
+    (root as { tryCreateRuntimeConfig: unknown }).tryCreateRuntimeConfig,
+    (config as { tryCreateRuntimeConfig: unknown }).tryCreateRuntimeConfig,
   );
   assert.equal(
     (runtime as { ObserverRuntimeConfig: unknown }).ObserverRuntimeConfig,

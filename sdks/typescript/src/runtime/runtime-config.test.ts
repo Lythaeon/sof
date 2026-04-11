@@ -8,6 +8,8 @@ import {
 import { ValidationErrorKind } from "../errors.js";
 import { isErr, isOk, ResultTag } from "../result.js";
 import {
+  createRuntimeConfig,
+  createRuntimeConfigForProfile,
   defaultDerivedStateReplayDirectory,
   derivedStateCheckpointIntervalEnvVarName,
   DerivedStateReplayBackend,
@@ -36,6 +38,7 @@ import {
   parseDerivedStateReplayBackend,
   parseDerivedStateReplayDurability,
   parseNonNegativeInteger,
+  parseRuntimeConfig,
   ObserverRuntimeConfig,
   ProviderStreamCapabilityPolicy,
   providerStreamAllowEofEnvVarName,
@@ -49,6 +52,8 @@ import {
   RuntimeDeliveryProfile,
   tryDerivedStateReplayBackendToEnvValue,
   tryDerivedStateReplayDurabilityToEnvValue,
+  tryCreateRuntimeConfig,
+  tryCreateRuntimeConfigForProfile,
   tryNonNegativeIntegerToEnvValue,
   tryObserverRuntimeConfig,
   tryObserverRuntimeConfigForProfile,
@@ -56,10 +61,14 @@ import {
   tryRuntimeDeliveryProfileEnvDefaults,
   tryRuntimeDeliveryProfileToEnvValue,
   tryShredTrustModeToEnvValue,
+  trySerializeRuntimeConfig,
+  trySerializeRuntimeConfigRecord,
   runtimeDeliveryProfileEnvDefaults,
   runtimeBooleanAllowedValues,
   runtimeBooleanEnvValues,
   parseRuntimeDeliveryProfile,
+  serializeRuntimeConfig,
+  serializeRuntimeConfigRecord,
   shredTrustModeAllowedValues,
   shredTrustModeEnvValues,
   shredTrustModeEnvVarName,
@@ -422,6 +431,48 @@ test("runtime config parses typed environment variables into typed config", () =
   }
 });
 
+test("functional runtime config facade keeps common env workflows simple", () => {
+  const created = createRuntimeConfig({
+    runtimeDeliveryProfile: RuntimeDeliveryProfile.Balanced,
+  });
+  const config = createRuntimeConfigForProfile(
+    RuntimeDeliveryProfile.Balanced,
+    {
+      providerStreamAllowEof: true,
+      derivedState: {
+        replay: {
+          maxEnvelopes: 512,
+        },
+      },
+    },
+  );
+  const serialized = serializeRuntimeConfig({
+    runtimeDeliveryProfile: RuntimeDeliveryProfile.Balanced,
+    providerStreamAllowEof: true,
+    derivedState: {
+      replay: {
+        maxEnvelopes: 512,
+      },
+    },
+  });
+  const record = serializeRuntimeConfigRecord(config);
+  const parsed = parseRuntimeConfig(record);
+
+  assert.equal(created.runtimeDeliveryProfile, RuntimeDeliveryProfile.Balanced);
+  assert.equal(config.runtimeDeliveryProfile, RuntimeDeliveryProfile.Balanced);
+  assert.equal(config.providerStreamAllowEof, true);
+  assert.equal(config.derivedState.replay.maxEnvelopes, 512);
+  assert.equal(Array.isArray(serialized), true);
+  assert.equal(record[runtimeDeliveryProfileEnvVarName], "balanced");
+  assert.equal(isOk(parsed), true);
+
+  if (isOk(parsed)) {
+    assert.equal(parsed.value.runtimeDeliveryProfile, RuntimeDeliveryProfile.Balanced);
+    assert.equal(parsed.value.providerStreamAllowEof, true);
+    assert.equal(parsed.value.derivedState.replay.maxEnvelopes, 512);
+  }
+});
+
 test("runtime config preset helpers create one-line common profiles", () => {
   const latency = ObserverRuntimeConfig.latencyOptimized();
   const balanced = ObserverRuntimeConfig.balanced({
@@ -467,6 +518,37 @@ test("runtime config preset helpers create one-line common profiles", () => {
   assert.equal(balanced.derivedState.replay.maxSessions, 6);
   assert.equal(functionPreset.derivedState.replay.maxEnvelopes, 32_768);
   assert.equal(functionPreset.derivedState.replay.maxSessions, 8);
+});
+
+test("functional runtime config facade exposes result-return creation and serialization", () => {
+  const created = tryCreateRuntimeConfig({
+    providerStreamAllowEof: true,
+  });
+  const profiled = tryCreateRuntimeConfigForProfile(
+    RuntimeDeliveryProfile.DeliveryDisciplined,
+  );
+  const serialized = trySerializeRuntimeConfig({
+    runtimeDeliveryProfile: RuntimeDeliveryProfile.Balanced,
+  });
+  const record = trySerializeRuntimeConfigRecord({
+    runtimeDeliveryProfile: RuntimeDeliveryProfile.Balanced,
+  });
+
+  assert.equal(isOk(created), true);
+  assert.equal(isOk(profiled), true);
+  assert.equal(isOk(serialized), true);
+  assert.equal(isOk(record), true);
+
+  if (isOk(profiled)) {
+    assert.equal(
+      profiled.value.runtimeDeliveryProfile,
+      RuntimeDeliveryProfile.DeliveryDisciplined,
+    );
+  }
+
+  if (isOk(record)) {
+    assert.equal(record.value[runtimeDeliveryProfileEnvVarName], "balanced");
+  }
 });
 
 test("runtime profile helpers preserve explicit derived-state replay overrides", () => {
@@ -801,6 +883,12 @@ test("result-return helpers reject invalid programmatic enum and profile values"
   const invalidProfileConfig = tryObserverRuntimeConfigForProfile(
     99 as RuntimeDeliveryProfile,
   );
+  const invalidCreated = tryCreateRuntimeConfig({
+    providerStreamAllowEof: "true" as unknown as boolean,
+  });
+  const invalidSerialized = trySerializeRuntimeConfigRecord({
+    providerStreamAllowEof: "true" as unknown as boolean,
+  });
 
   assert.equal(isErr(invalidProfile), true);
   assert.equal(isErr(invalidProfileDefaults), true);
@@ -810,6 +898,8 @@ test("result-return helpers reject invalid programmatic enum and profile values"
   assert.equal(isErr(invalidReplayDurability), true);
   assert.equal(isErr(invalidRuntimeConfig), true);
   assert.equal(isErr(invalidProfileConfig), true);
+  assert.equal(isErr(invalidCreated), true);
+  assert.equal(isErr(invalidSerialized), true);
 
   if (isErr(invalidProfile)) {
     assert.equal(
@@ -869,6 +959,20 @@ test("result-return helpers reject invalid programmatic enum and profile values"
     assert.equal(
       invalidProfileConfig.error.kind,
       ValidationErrorKind.InvalidRuntimeDeliveryProfile,
+    );
+  }
+
+  if (isErr(invalidCreated)) {
+    assert.equal(
+      invalidCreated.error.kind,
+      ValidationErrorKind.InvalidProviderStreamAllowEof,
+    );
+  }
+
+  if (isErr(invalidSerialized)) {
+    assert.equal(
+      invalidSerialized.error.kind,
+      ValidationErrorKind.InvalidProviderStreamAllowEof,
     );
   }
 });

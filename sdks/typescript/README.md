@@ -11,9 +11,10 @@ Unified TypeScript SDK surface for SOF.
 
 ## Mental Model
 
-- Use `ObserverRuntimeConfig` when you want to build or parse the SOF env surface safely.
-- Prefer `ObserverRuntimeConfig.tryCreate(...)`, `.tryBalanced(...)`, and `fromEnvironmentRecord(...)` when you want validation errors as `Result` values instead of thrown exceptions.
-- Use `ObserverRuntimeConfig.balanced()` / `.deliveryDisciplined()` when you want one-line profile presets.
+- Prefer the functional runtime-config helpers first: `createRuntimeConfigForProfile(...)`, `serializeRuntimeConfigRecord(...)`, and `parseRuntimeConfig(...)`.
+- Use `ObserverRuntimeConfig` when you want an explicit config object with instance methods and class-based presets.
+- Prefer `tryCreateRuntimeConfig(...)`, `tryCreateRuntimeConfigForProfile(...)`, and `parseRuntimeConfig(...)` when you want validation errors as `Result` values instead of thrown exceptions.
+- Use `createRuntimeConfigForProfile(...)` or `ObserverRuntimeConfig.balanced()` / `.deliveryDisciplined()` when you want one-line profile presets.
 - Profile presets in this SDK stamp the profile env plus the derived-state replay retention defaults that SOF applies through env-backed setup.
 - Rust still owns host-builder dispatch defaults such as plugin-host and runtime-extension-host queue and timeout wiring. This SDK currently models the env/config surface, not those in-process host builders.
 
@@ -38,60 +39,42 @@ This initial package slice provides:
 - typed environment entry helpers instead of only raw string maps
 - plain-object nested config construction, so common cases do not require chained `new` calls
 - one-line runtime profile presets such as `ObserverRuntimeConfig.balanced()`
+- small functional helpers for the common create/serialize/parse path, so most consumers do not need to learn the class API first
 - result-return factory and serialization helpers for programmatic validation, so SDK consumers do not need to rely on exceptions for normal invalid-input handling
 - focused subpath imports when you only want one SDK slice, for example `@sof/sdk/runtime/config`
 
-## Example
+## Quick Start
 
 ```ts
 import {
+  createRuntimeConfigForProfile,
   DerivedStateReplayBackend,
-  DerivedStateReplayConfig,
   DerivedStateReplayDurability,
-  ObserverRuntimeConfig,
+  parseRuntimeConfig,
   ProviderStreamCapabilityPolicy,
   RuntimeDeliveryProfile,
+  serializeRuntimeConfigRecord,
   ShredTrustMode,
-  providerStreamAllowEofEnvVarName,
-  providerStreamCapabilityPolicyEnvVarName,
-  runtimeDeliveryProfileEnvValues,
-  runtimeDeliveryProfileEnvVarName,
-  shredTrustModeEnvVarName,
 } from "@sof/sdk";
 
-const config = ObserverRuntimeConfig.balanced({
-  shredTrustMode: ShredTrustMode.TrustedRawShredProvider,
-  providerStreamCapabilityPolicy: ProviderStreamCapabilityPolicy.Strict,
-  providerStreamAllowEof: true,
-  derivedState: {
-    checkpointIntervalMs: 60_000,
-    recoveryIntervalMs: 10_000,
-    replay: {
-      backend: DerivedStateReplayBackend.Disk,
-      replayDirectory: ".sof-replay",
-      durability: DerivedStateReplayDurability.Fsync,
-      maxEnvelopes: 1024,
-      maxSessions: 2,
+const config = createRuntimeConfigForProfile(
+  RuntimeDeliveryProfile.Balanced,
+  {
+    shredTrustMode: ShredTrustMode.TrustedRawShredProvider,
+    providerStreamCapabilityPolicy: ProviderStreamCapabilityPolicy.Strict,
+    providerStreamAllowEof: true,
+    derivedState: {
+      replay: {
+        backend: DerivedStateReplayBackend.Disk,
+        durability: DerivedStateReplayDurability.Fsync,
+        maxEnvelopes: 1024,
+        maxSessions: 2,
+      },
     },
   },
-});
+);
 
-const env = config.toEnvironment();
-// [
-//   { name: "SOF_RUNTIME_DELIVERY_PROFILE", value: "balanced" },
-//   { name: "SOF_SHRED_TRUST_MODE", value: "trusted_raw_shred_provider" },
-//   { name: "SOF_PROVIDER_STREAM_CAPABILITY_POLICY", value: "strict" },
-//   { name: "SOF_PROVIDER_STREAM_ALLOW_EOF", value: "true" },
-//   { name: "SOF_DERIVED_STATE_CHECKPOINT_INTERVAL_MS", value: "60000" },
-//   { name: "SOF_DERIVED_STATE_RECOVERY_INTERVAL_MS", value: "10000" },
-//   { name: "SOF_DERIVED_STATE_REPLAY_BACKEND", value: "disk" },
-//   { name: "SOF_DERIVED_STATE_REPLAY_DIR", value: ".sof-replay" },
-//   { name: "SOF_DERIVED_STATE_REPLAY_DURABILITY", value: "fsync" },
-//   { name: "SOF_DERIVED_STATE_REPLAY_MAX_ENVELOPES", value: "1024" },
-//   { name: "SOF_DERIVED_STATE_REPLAY_MAX_SESSIONS", value: "2" },
-// ]
-
-const envRecord = config.toEnvironmentRecord();
+const envRecord = serializeRuntimeConfigRecord(config);
 // {
 //   SOF_RUNTIME_DELIVERY_PROFILE: "balanced",
 //   SOF_SHRED_TRUST_MODE: "trusted_raw_shred_provider",
@@ -106,30 +89,42 @@ const envRecord = config.toEnvironmentRecord();
 //   SOF_DERIVED_STATE_REPLAY_MAX_SESSIONS: "2",
 // }
 
-const parsed = ObserverRuntimeConfig.fromEnvironmentRecord(envRecord);
-const checkpointOnly = DerivedStateReplayConfig.checkpointOnly();
+const parsed = parseRuntimeConfig(envRecord);
 
-runtimeDeliveryProfileEnvVarName;
-runtimeDeliveryProfileEnvValues.deliveryDisciplined;
-shredTrustModeEnvVarName;
-providerStreamCapabilityPolicyEnvVarName;
-providerStreamAllowEofEnvVarName;
+config;
 parsed;
-checkpointOnly;
 ```
 
-## Quick Start
+## Result Path
 
 ```ts
-import { isErr, ObserverRuntimeConfig } from "@sof/sdk";
+import {
+  isErr,
+  RuntimeDeliveryProfile,
+  tryCreateRuntimeConfigForProfile,
+  trySerializeRuntimeConfigRecord,
+} from "@sof/sdk";
 
-const config = ObserverRuntimeConfig.tryDeliveryDisciplined();
+const config = tryCreateRuntimeConfigForProfile(
+  RuntimeDeliveryProfile.DeliveryDisciplined,
+);
 
 if (isErr(config)) {
   throw new Error(config.error.message);
 }
 
-const env = config.value.toEnvironmentRecord();
+const env = trySerializeRuntimeConfigRecord(config.value);
+
+env;
+```
+
+## Class API
+
+```ts
+import { ObserverRuntimeConfig } from "@sof/sdk";
+
+const config = ObserverRuntimeConfig.deliveryDisciplined();
+const env = config.toEnvironmentRecord();
 
 env;
 ```
@@ -172,7 +167,9 @@ config;
 ## Choosing An API
 
 - Use `ObserverRuntimeConfig.fromEnvironmentRecord(...)` when you need to validate env from files, CI, or process managers.
-- Use `ObserverRuntimeConfig.tryCreate(...)` or `tryObserverRuntimeConfigForProfile(...)` when invalid programmatic input should stay in `Result` form.
-- Use `ObserverRuntimeConfig.balanced(...)` or `observerRuntimeConfigForProfile(...)` when you want profile-first setup.
+- Use `parseRuntimeConfig(...)` for env parsing. It accepts either env records or typed environment-variable lists.
+- Use `tryCreateRuntimeConfig(...)`, `tryCreateRuntimeConfigForProfile(...)`, or `trySerializeRuntimeConfigRecord(...)` when invalid programmatic input should stay in `Result` form.
+- Use `createRuntimeConfigForProfile(...)` or `serializeRuntimeConfigRecord(...)` for the simplest create-and-emit workflow.
+- Use `ObserverRuntimeConfig.balanced(...)` or `observerRuntimeConfigForProfile(...)` when you explicitly want the class-oriented surface.
 - Use `derivedStateRuntimeConfig(...)` or `DerivedStateRuntimeConfig.checkpointOnly()` when your main concern is derived-state recovery behavior.
 - Use the root `@sof/sdk` import for convenience. Use subpath imports when you want a smaller, more explicit import surface in application code.
