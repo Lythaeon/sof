@@ -24,10 +24,10 @@ export function envVarName<const Name extends string>(value: Name): EnvVarName {
   return brand<Name, "EnvVarName">(value);
 }
 
-export function environmentVariable<
-  Name extends EnvVarName,
-  Value extends string,
->(name: Name, value: Value): EnvironmentVariable<Name, Value> {
+export function environmentVariable<Name extends EnvVarName, Value extends string>(
+  name: Name,
+  value: Value,
+): EnvironmentVariable<Name, Value> {
   return { name, value };
 }
 

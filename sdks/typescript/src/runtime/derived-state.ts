@@ -16,27 +16,17 @@ export enum DerivedStateReplayDurability {
 export const defaultDerivedStateCheckpointIntervalMs = 30_000;
 export const defaultDerivedStateRecoveryIntervalMs = 5_000;
 export const defaultDerivedStateReplayBackend = DerivedStateReplayBackend.Memory;
-export const defaultDerivedStateReplayDurability =
-  DerivedStateReplayDurability.Flush;
+export const defaultDerivedStateReplayDurability = DerivedStateReplayDurability.Flush;
 export const defaultDerivedStateReplayMaxEnvelopes = 8_192;
 export const defaultDerivedStateReplayMaxSessions = 4;
 
-export type DerivedStateReplayBackendEnvValue = Brand<
-  string,
-  "DerivedStateReplayBackendEnvValue"
->;
+export type DerivedStateReplayBackendEnvValue = Brand<string, "DerivedStateReplayBackendEnvValue">;
 export type DerivedStateReplayDurabilityEnvValue = Brand<
   string,
   "DerivedStateReplayDurabilityEnvValue"
 >;
-export type NonNegativeIntegerEnvValue = Brand<
-  string,
-  "NonNegativeIntegerEnvValue"
->;
-export type DerivedStateReplayDirectory = Brand<
-  string,
-  "DerivedStateReplayDirectory"
->;
+export type NonNegativeIntegerEnvValue = Brand<string, "NonNegativeIntegerEnvValue">;
+export type DerivedStateReplayDirectory = Brand<string, "DerivedStateReplayDirectory">;
 
 function asDerivedStateReplayBackendEnvValue<const Value extends string>(
   value: Value,
@@ -68,12 +58,8 @@ export const derivedStateCheckpointIntervalEnvVarName = envVarName(
 export const derivedStateRecoveryIntervalEnvVarName = envVarName(
   "SOF_DERIVED_STATE_RECOVERY_INTERVAL_MS",
 );
-export const derivedStateReplayBackendEnvVarName = envVarName(
-  "SOF_DERIVED_STATE_REPLAY_BACKEND",
-);
-export const derivedStateReplayDirEnvVarName = envVarName(
-  "SOF_DERIVED_STATE_REPLAY_DIR",
-);
+export const derivedStateReplayBackendEnvVarName = envVarName("SOF_DERIVED_STATE_REPLAY_BACKEND");
+export const derivedStateReplayDirEnvVarName = envVarName("SOF_DERIVED_STATE_REPLAY_DIR");
 export const derivedStateReplayDurabilityEnvVarName = envVarName(
   "SOF_DERIVED_STATE_REPLAY_DURABILITY",
 );
@@ -95,16 +81,10 @@ export const derivedStateReplayDurabilityEnvValues = {
 } as const;
 
 export const derivedStateReplayBackendAllowedValues: readonly DerivedStateReplayBackendEnvValue[] =
-  [
-    derivedStateReplayBackendEnvValues.memory,
-    derivedStateReplayBackendEnvValues.disk,
-  ];
+  [derivedStateReplayBackendEnvValues.memory, derivedStateReplayBackendEnvValues.disk];
 
 export const derivedStateReplayDurabilityAllowedValues: readonly DerivedStateReplayDurabilityEnvValue[] =
-  [
-    derivedStateReplayDurabilityEnvValues.flush,
-    derivedStateReplayDurabilityEnvValues.fsync,
-  ];
+  [derivedStateReplayDurabilityEnvValues.flush, derivedStateReplayDurabilityEnvValues.fsync];
 
 export const defaultDerivedStateReplayDirectory = asDerivedStateReplayDirectory(
   ".sof-derived-state-replay",
@@ -133,9 +113,7 @@ export function parseDerivedStateReplayDirectory(
   return ok(asDerivedStateReplayDirectory(value));
 }
 
-export function derivedStateReplayDirectory(
-  value: string,
-): DerivedStateReplayDirectory {
+export function derivedStateReplayDirectory(value: string): DerivedStateReplayDirectory {
   const result = parseDerivedStateReplayDirectory(value);
   if (!isErr(result)) {
     return result.value;
@@ -170,10 +148,7 @@ export function isDerivedStateReplayDurability(
 
 export function validateDerivedStateReplayBackend(
   value: DerivedStateReplayBackend,
-): Result<
-  DerivedStateReplayBackend,
-  ValidationError<DerivedStateReplayBackendEnvValue>
-> {
+): Result<DerivedStateReplayBackend, ValidationError<DerivedStateReplayBackendEnvValue>> {
   if (!isDerivedStateReplayBackend(value)) {
     return err({
       kind: ValidationErrorKind.InvalidDerivedStateReplayBackend,
@@ -189,10 +164,7 @@ export function validateDerivedStateReplayBackend(
 
 export function validateDerivedStateReplayDurability(
   value: DerivedStateReplayDurability,
-): Result<
-  DerivedStateReplayDurability,
-  ValidationError<DerivedStateReplayDurabilityEnvValue>
-> {
+): Result<DerivedStateReplayDurability, ValidationError<DerivedStateReplayDurabilityEnvValue>> {
   if (!isDerivedStateReplayDurability(value)) {
     return err({
       kind: ValidationErrorKind.InvalidDerivedStateReplayDurability,
@@ -242,17 +214,12 @@ function requireDerivedStateReplayDurability(
     return validated.value;
   }
 
-  throw new RangeError(
-    `unknown derived-state replay durability: ${String(value)}`,
-  );
+  throw new RangeError(`unknown derived-state replay durability: ${String(value)}`);
 }
 
 export function tryDerivedStateReplayBackendToEnvValue(
   backend: DerivedStateReplayBackend,
-): Result<
-  DerivedStateReplayBackendEnvValue,
-  ValidationError<DerivedStateReplayBackendEnvValue>
-> {
+): Result<DerivedStateReplayBackendEnvValue, ValidationError<DerivedStateReplayBackendEnvValue>> {
   const validated = validateDerivedStateReplayBackend(backend);
   if (isErr(validated)) {
     return validated;
@@ -320,17 +287,12 @@ export function derivedStateReplayDurabilityToEnvValue(
     return result.value;
   }
 
-  throw new RangeError(
-    `unknown derived-state replay durability: ${String(durability)}`,
-  );
+  throw new RangeError(`unknown derived-state replay durability: ${String(durability)}`);
 }
 
 export function parseDerivedStateReplayBackend(
   input: string,
-): Result<
-  DerivedStateReplayBackend,
-  ValidationError<DerivedStateReplayBackendEnvValue>
-> {
+): Result<DerivedStateReplayBackend, ValidationError<DerivedStateReplayBackendEnvValue>> {
   const normalized = input.trim().toLowerCase();
 
   switch (normalized) {
@@ -351,10 +313,7 @@ export function parseDerivedStateReplayBackend(
 
 export function parseDerivedStateReplayDurability(
   input: string,
-): Result<
-  DerivedStateReplayDurability,
-  ValidationError<DerivedStateReplayDurabilityEnvValue>
-> {
+): Result<DerivedStateReplayDurability, ValidationError<DerivedStateReplayDurabilityEnvValue>> {
   const normalized = input.trim().toLowerCase();
 
   switch (normalized) {
@@ -435,9 +394,7 @@ export function tryNonNegativeIntegerToEnvValue(
   return ok(asNonNegativeIntegerEnvValue(`${validated.value}`));
 }
 
-export function nonNegativeIntegerToEnvValue(
-  value: number,
-): NonNegativeIntegerEnvValue {
+export function nonNegativeIntegerToEnvValue(value: number): NonNegativeIntegerEnvValue {
   const result = tryNonNegativeIntegerToEnvValue(value);
   if (!isErr(result)) {
     return result.value;
@@ -454,9 +411,7 @@ export interface DerivedStateReplayConfigInit {
   readonly maxSessions?: number;
 }
 
-export type DerivedStateReplayConfigInput =
-  | DerivedStateReplayConfig
-  | DerivedStateReplayConfigInit;
+export type DerivedStateReplayConfigInput = DerivedStateReplayConfig | DerivedStateReplayConfigInit;
 
 export type DerivedStateValidationError =
   | ValidationError<DerivedStateReplayBackendEnvValue>
@@ -497,9 +452,7 @@ export class DerivedStateReplayConfig {
     });
   }
 
-  static create(
-    init: DerivedStateReplayConfigInput = {},
-  ): DerivedStateReplayConfig {
+  static create(init: DerivedStateReplayConfigInput = {}): DerivedStateReplayConfig {
     return derivedStateReplayConfig(init);
   }
 
@@ -518,9 +471,7 @@ export class DerivedStateReplayConfig {
     });
   }
 
-  static disk(
-    init: Omit<DerivedStateReplayConfigInit, "backend"> = {},
-  ): DerivedStateReplayConfig {
+  static disk(init: Omit<DerivedStateReplayConfigInit, "backend"> = {}): DerivedStateReplayConfig {
     return new DerivedStateReplayConfig({
       ...init,
       backend: DerivedStateReplayBackend.Disk,
@@ -582,9 +533,7 @@ export class DerivedStateRuntimeConfig {
         : new DerivedStateReplayConfig(init.replay);
   }
 
-  static create(
-    init: DerivedStateRuntimeConfigInput = {},
-  ): DerivedStateRuntimeConfig {
+  static create(init: DerivedStateRuntimeConfigInput = {}): DerivedStateRuntimeConfig {
     return derivedStateRuntimeConfig(init);
   }
 
@@ -615,10 +564,7 @@ export class DerivedStateRuntimeConfig {
 
 function validateDerivedStateReplayConfigInit(
   init: DerivedStateReplayConfigInit,
-): Result<
-  Required<DerivedStateReplayConfigInit>,
-  DerivedStateValidationError
-> {
+): Result<Required<DerivedStateReplayConfigInit>, DerivedStateValidationError> {
   const backend = validateDerivedStateReplayBackend(
     init.backend ?? defaultDerivedStateReplayBackend,
   );
@@ -668,9 +614,7 @@ function validateDerivedStateReplayConfigInit(
   });
 }
 
-function validateDerivedStateRuntimeConfigInit(
-  init: DerivedStateRuntimeConfigInit,
-): Result<
+function validateDerivedStateRuntimeConfigInit(init: DerivedStateRuntimeConfigInit): Result<
   {
     readonly checkpointIntervalMs: number;
     readonly recoveryIntervalMs: number;
@@ -718,9 +662,7 @@ export function derivedStateReplayConfig(
     return new DerivedStateReplayConfig();
   }
 
-  return init instanceof DerivedStateReplayConfig
-    ? init
-    : new DerivedStateReplayConfig(init);
+  return init instanceof DerivedStateReplayConfig ? init : new DerivedStateReplayConfig(init);
 }
 
 export function tryDerivedStateReplayConfig(
@@ -749,9 +691,7 @@ export function derivedStateRuntimeConfig(
     return new DerivedStateRuntimeConfig();
   }
 
-  return init instanceof DerivedStateRuntimeConfig
-    ? init
-    : new DerivedStateRuntimeConfig(init);
+  return init instanceof DerivedStateRuntimeConfig ? init : new DerivedStateRuntimeConfig(init);
 }
 
 export function tryDerivedStateRuntimeConfig(

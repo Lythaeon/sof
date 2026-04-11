@@ -1,10 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import {
-  environmentVariable,
-  environmentVariablesToRecord,
-} from "../environment.js";
+import { environmentVariable, environmentVariablesToRecord } from "../environment.js";
 import { ValidationErrorKind } from "../errors.js";
 import { isErr, isOk, ResultTag } from "../result.js";
 import {
@@ -112,29 +109,18 @@ test("runtime delivery profile maps to the documented env values", () => {
 });
 
 test("runtime delivery profiles expose the expected env-backed defaults", () => {
-  assert.deepEqual(
-    runtimeDeliveryProfileEnvDefaults(RuntimeDeliveryProfile.LatencyOptimized),
-    {
-      derivedStateReplayMaxEnvelopes: 8192,
-      derivedStateReplayMaxSessions: 4,
-    },
-  );
-  assert.deepEqual(
-    runtimeDeliveryProfileEnvDefaults(RuntimeDeliveryProfile.Balanced),
-    {
-      derivedStateReplayMaxEnvelopes: 16384,
-      derivedStateReplayMaxSessions: 6,
-    },
-  );
-  assert.deepEqual(
-    runtimeDeliveryProfileEnvDefaults(
-      RuntimeDeliveryProfile.DeliveryDisciplined,
-    ),
-    {
-      derivedStateReplayMaxEnvelopes: 32768,
-      derivedStateReplayMaxSessions: 8,
-    },
-  );
+  assert.deepEqual(runtimeDeliveryProfileEnvDefaults(RuntimeDeliveryProfile.LatencyOptimized), {
+    derivedStateReplayMaxEnvelopes: 8192,
+    derivedStateReplayMaxSessions: 4,
+  });
+  assert.deepEqual(runtimeDeliveryProfileEnvDefaults(RuntimeDeliveryProfile.Balanced), {
+    derivedStateReplayMaxEnvelopes: 16384,
+    derivedStateReplayMaxSessions: 6,
+  });
+  assert.deepEqual(runtimeDeliveryProfileEnvDefaults(RuntimeDeliveryProfile.DeliveryDisciplined), {
+    derivedStateReplayMaxEnvelopes: 32768,
+    derivedStateReplayMaxSessions: 8,
+  });
 });
 
 test("runtime policy enums map to the documented env values", () => {
@@ -147,15 +133,11 @@ test("runtime policy enums map to the documented env values", () => {
     shredTrustModeEnvValues.trustedRawShredProvider,
   );
   assert.equal(
-    providerStreamCapabilityPolicyToEnvValue(
-      ProviderStreamCapabilityPolicy.Warn,
-    ),
+    providerStreamCapabilityPolicyToEnvValue(ProviderStreamCapabilityPolicy.Warn),
     providerStreamCapabilityPolicyEnvValues.warn,
   );
   assert.equal(
-    providerStreamCapabilityPolicyToEnvValue(
-      ProviderStreamCapabilityPolicy.Strict,
-    ),
+    providerStreamCapabilityPolicyToEnvValue(ProviderStreamCapabilityPolicy.Strict),
     providerStreamCapabilityPolicyEnvValues.strict,
   );
   assert.equal(
@@ -188,10 +170,7 @@ test("runtime delivery profile parser accepts documented aliases", () => {
     assert.equal(balanced.value, RuntimeDeliveryProfile.Balanced);
   }
   if (isOk(disciplined)) {
-    assert.equal(
-      disciplined.value,
-      RuntimeDeliveryProfile.DeliveryDisciplined,
-    );
+    assert.equal(disciplined.value, RuntimeDeliveryProfile.DeliveryDisciplined);
   }
 });
 
@@ -239,23 +218,22 @@ test("runtime config omits default policy values unless requested", () => {
 
   assert.deepEqual(config.toEnvironment(), []);
   assert.equal(Object.getPrototypeOf(envRecord), null);
-  assert.deepEqual({ ...envRecord }, {
-    [runtimeDeliveryProfileEnvVarName]:
-      runtimeDeliveryProfileEnvValues.latencyOptimized,
-    [shredTrustModeEnvVarName]: shredTrustModeEnvValues.publicUntrusted,
-    [providerStreamCapabilityPolicyEnvVarName]:
-      providerStreamCapabilityPolicyEnvValues.warn,
-    [providerStreamAllowEofEnvVarName]: runtimeBooleanEnvValues.false,
-    [derivedStateCheckpointIntervalEnvVarName]: "30000",
-    [derivedStateRecoveryIntervalEnvVarName]: "5000",
-    [derivedStateReplayBackendEnvVarName]:
-      derivedStateReplayBackendEnvValues.memory,
-    [derivedStateReplayDirEnvVarName]: defaultDerivedStateReplayDirectory,
-    [derivedStateReplayDurabilityEnvVarName]:
-      derivedStateReplayDurabilityEnvValues.flush,
-    [derivedStateReplayMaxEnvelopesEnvVarName]: "8192",
-    [derivedStateReplayMaxSessionsEnvVarName]: "4",
-  });
+  assert.deepEqual(
+    { ...envRecord },
+    {
+      [runtimeDeliveryProfileEnvVarName]: runtimeDeliveryProfileEnvValues.latencyOptimized,
+      [shredTrustModeEnvVarName]: shredTrustModeEnvValues.publicUntrusted,
+      [providerStreamCapabilityPolicyEnvVarName]: providerStreamCapabilityPolicyEnvValues.warn,
+      [providerStreamAllowEofEnvVarName]: runtimeBooleanEnvValues.false,
+      [derivedStateCheckpointIntervalEnvVarName]: "30000",
+      [derivedStateRecoveryIntervalEnvVarName]: "5000",
+      [derivedStateReplayBackendEnvVarName]: derivedStateReplayBackendEnvValues.memory,
+      [derivedStateReplayDirEnvVarName]: defaultDerivedStateReplayDirectory,
+      [derivedStateReplayDurabilityEnvVarName]: derivedStateReplayDurabilityEnvValues.flush,
+      [derivedStateReplayMaxEnvelopesEnvVarName]: "8192",
+      [derivedStateReplayMaxSessionsEnvVarName]: "4",
+    },
+  );
 });
 
 test("runtime config serializes explicit runtime policy selection", () => {
@@ -278,22 +256,13 @@ test("runtime config serializes explicit runtime policy selection", () => {
   });
 
   assert.deepEqual(config.toEnvironment(), [
-    environmentVariable(
-      runtimeDeliveryProfileEnvVarName,
-      runtimeDeliveryProfileEnvValues.balanced,
-    ),
-    environmentVariable(
-      shredTrustModeEnvVarName,
-      shredTrustModeEnvValues.trustedRawShredProvider,
-    ),
+    environmentVariable(runtimeDeliveryProfileEnvVarName, runtimeDeliveryProfileEnvValues.balanced),
+    environmentVariable(shredTrustModeEnvVarName, shredTrustModeEnvValues.trustedRawShredProvider),
     environmentVariable(
       providerStreamCapabilityPolicyEnvVarName,
       providerStreamCapabilityPolicyEnvValues.strict,
     ),
-    environmentVariable(
-      providerStreamAllowEofEnvVarName,
-      runtimeBooleanEnvValues.true,
-    ),
+    environmentVariable(providerStreamAllowEofEnvVarName, runtimeBooleanEnvValues.true),
     environmentVariable(derivedStateCheckpointIntervalEnvVarName, "60000"),
     environmentVariable(derivedStateRecoveryIntervalEnvVarName, "10000"),
     environmentVariable(
@@ -315,11 +284,9 @@ test("runtime config serializes explicit runtime policy selection", () => {
 
 test("runtime config parses environment values into typed runtime policy config", () => {
   const config = ObserverRuntimeConfig.fromEnvironment({
-    [runtimeDeliveryProfileEnvVarName]:
-      runtimeDeliveryProfileEnvValues.deliveryDisciplined,
+    [runtimeDeliveryProfileEnvVarName]: runtimeDeliveryProfileEnvValues.deliveryDisciplined,
     [shredTrustModeEnvVarName]: shredTrustModeEnvValues.trustedRawShredProvider,
-    [providerStreamCapabilityPolicyEnvVarName]:
-      providerStreamCapabilityPolicyEnvValues.strict,
+    [providerStreamCapabilityPolicyEnvVarName]: providerStreamCapabilityPolicyEnvValues.strict,
     [providerStreamAllowEofEnvVarName]: "on",
     [derivedStateCheckpointIntervalEnvVarName]: "45000",
     [derivedStateRecoveryIntervalEnvVarName]: "7000",
@@ -332,14 +299,8 @@ test("runtime config parses environment values into typed runtime policy config"
 
   assert.equal(isOk(config), true);
   if (isOk(config)) {
-    assert.equal(
-      config.value.runtimeDeliveryProfile,
-      RuntimeDeliveryProfile.DeliveryDisciplined,
-    );
-    assert.equal(
-      config.value.shredTrustMode,
-      ShredTrustMode.TrustedRawShredProvider,
-    );
+    assert.equal(config.value.runtimeDeliveryProfile, RuntimeDeliveryProfile.DeliveryDisciplined);
+    assert.equal(config.value.shredTrustMode, ShredTrustMode.TrustedRawShredProvider);
     assert.equal(
       config.value.providerStreamCapabilityPolicy,
       ProviderStreamCapabilityPolicy.Strict,
@@ -347,18 +308,12 @@ test("runtime config parses environment values into typed runtime policy config"
     assert.equal(config.value.providerStreamAllowEof, true);
     assert.equal(config.value.derivedState.checkpointIntervalMs, 45_000);
     assert.equal(config.value.derivedState.recoveryIntervalMs, 7_000);
-    assert.equal(
-      config.value.derivedState.replay.backend,
-      DerivedStateReplayBackend.Disk,
-    );
+    assert.equal(config.value.derivedState.replay.backend, DerivedStateReplayBackend.Disk);
     assert.equal(
       config.value.derivedState.replay.replayDirectory,
       derivedStateReplayDirectory(".sof-disk-tail"),
     );
-    assert.equal(
-      config.value.derivedState.replay.durability,
-      DerivedStateReplayDurability.Fsync,
-    );
+    assert.equal(config.value.derivedState.replay.durability, DerivedStateReplayDurability.Fsync);
     assert.equal(config.value.derivedState.replay.maxEnvelopes, 2048);
     assert.equal(config.value.derivedState.replay.maxSessions, 6);
   }
@@ -366,22 +321,13 @@ test("runtime config parses environment values into typed runtime policy config"
 
 test("runtime config parses typed environment variables into typed config", () => {
   const config = ObserverRuntimeConfig.fromEnvironmentVariables([
-    environmentVariable(
-      runtimeDeliveryProfileEnvVarName,
-      runtimeDeliveryProfileEnvValues.balanced,
-    ),
-    environmentVariable(
-      shredTrustModeEnvVarName,
-      shredTrustModeEnvValues.publicUntrusted,
-    ),
+    environmentVariable(runtimeDeliveryProfileEnvVarName, runtimeDeliveryProfileEnvValues.balanced),
+    environmentVariable(shredTrustModeEnvVarName, shredTrustModeEnvValues.publicUntrusted),
     environmentVariable(
       providerStreamCapabilityPolicyEnvVarName,
       providerStreamCapabilityPolicyEnvValues.warn,
     ),
-    environmentVariable(
-      providerStreamAllowEofEnvVarName,
-      runtimeBooleanEnvValues.false,
-    ),
+    environmentVariable(providerStreamAllowEofEnvVarName, runtimeBooleanEnvValues.false),
     environmentVariable(
       derivedStateCheckpointIntervalEnvVarName,
       nonNegativeIntegerToEnvValue(30_000),
@@ -394,10 +340,7 @@ test("runtime config parses typed environment variables into typed config", () =
       derivedStateReplayBackendEnvVarName,
       derivedStateReplayBackendEnvValues.memory,
     ),
-    environmentVariable(
-      derivedStateReplayDirEnvVarName,
-      defaultDerivedStateReplayDirectory,
-    ),
+    environmentVariable(derivedStateReplayDirEnvVarName, defaultDerivedStateReplayDirectory),
     environmentVariable(
       derivedStateReplayDurabilityEnvVarName,
       derivedStateReplayDurabilityEnvValues.flush,
@@ -406,28 +349,16 @@ test("runtime config parses typed environment variables into typed config", () =
       derivedStateReplayMaxEnvelopesEnvVarName,
       nonNegativeIntegerToEnvValue(8_192),
     ),
-    environmentVariable(
-      derivedStateReplayMaxSessionsEnvVarName,
-      nonNegativeIntegerToEnvValue(4),
-    ),
+    environmentVariable(derivedStateReplayMaxSessionsEnvVarName, nonNegativeIntegerToEnvValue(4)),
   ]);
 
   assert.equal(isOk(config), true);
   if (isOk(config)) {
-    assert.equal(
-      config.value.runtimeDeliveryProfile,
-      RuntimeDeliveryProfile.Balanced,
-    );
+    assert.equal(config.value.runtimeDeliveryProfile, RuntimeDeliveryProfile.Balanced);
     assert.equal(config.value.shredTrustMode, ShredTrustMode.PublicUntrusted);
-    assert.equal(
-      config.value.providerStreamCapabilityPolicy,
-      ProviderStreamCapabilityPolicy.Warn,
-    );
+    assert.equal(config.value.providerStreamCapabilityPolicy, ProviderStreamCapabilityPolicy.Warn);
     assert.equal(config.value.providerStreamAllowEof, false);
-    assert.equal(
-      config.value.derivedState.replay.backend,
-      DerivedStateReplayBackend.Memory,
-    );
+    assert.equal(config.value.derivedState.replay.backend, DerivedStateReplayBackend.Memory);
   }
 });
 
@@ -435,17 +366,14 @@ test("functional runtime config facade keeps common env workflows simple", () =>
   const created = createRuntimeConfig({
     runtimeDeliveryProfile: RuntimeDeliveryProfile.Balanced,
   });
-  const config = createRuntimeConfigForProfile(
-    RuntimeDeliveryProfile.Balanced,
-    {
-      providerStreamAllowEof: true,
-      derivedState: {
-        replay: {
-          maxEnvelopes: 512,
-        },
+  const config = createRuntimeConfigForProfile(RuntimeDeliveryProfile.Balanced, {
+    providerStreamAllowEof: true,
+    derivedState: {
+      replay: {
+        maxEnvelopes: 512,
       },
     },
-  );
+  });
   const serialized = serializeRuntimeConfig({
     runtimeDeliveryProfile: RuntimeDeliveryProfile.Balanced,
     providerStreamAllowEof: true,
@@ -481,39 +409,21 @@ test("runtime config preset helpers create one-line common profiles", () => {
   const disciplined = ObserverRuntimeConfig.deliveryDisciplined({
     shredTrustMode: ShredTrustMode.TrustedRawShredProvider,
   });
-  const explicit = ObserverRuntimeConfig.forProfile(
-    RuntimeDeliveryProfile.Balanced,
-    {
-      providerStreamCapabilityPolicy: ProviderStreamCapabilityPolicy.Strict,
-    },
-  );
+  const explicit = ObserverRuntimeConfig.forProfile(RuntimeDeliveryProfile.Balanced, {
+    providerStreamCapabilityPolicy: ProviderStreamCapabilityPolicy.Strict,
+  });
   const functionPreset = observerRuntimeConfigForProfile(
     RuntimeDeliveryProfile.DeliveryDisciplined,
   );
 
-  assert.equal(
-    latency.runtimeDeliveryProfile,
-    RuntimeDeliveryProfile.LatencyOptimized,
-  );
+  assert.equal(latency.runtimeDeliveryProfile, RuntimeDeliveryProfile.LatencyOptimized);
   assert.equal(balanced.runtimeDeliveryProfile, RuntimeDeliveryProfile.Balanced);
   assert.equal(balanced.providerStreamAllowEof, true);
-  assert.equal(
-    disciplined.runtimeDeliveryProfile,
-    RuntimeDeliveryProfile.DeliveryDisciplined,
-  );
-  assert.equal(
-    disciplined.shredTrustMode,
-    ShredTrustMode.TrustedRawShredProvider,
-  );
+  assert.equal(disciplined.runtimeDeliveryProfile, RuntimeDeliveryProfile.DeliveryDisciplined);
+  assert.equal(disciplined.shredTrustMode, ShredTrustMode.TrustedRawShredProvider);
   assert.equal(explicit.runtimeDeliveryProfile, RuntimeDeliveryProfile.Balanced);
-  assert.equal(
-    explicit.providerStreamCapabilityPolicy,
-    ProviderStreamCapabilityPolicy.Strict,
-  );
-  assert.equal(
-    functionPreset.runtimeDeliveryProfile,
-    RuntimeDeliveryProfile.DeliveryDisciplined,
-  );
+  assert.equal(explicit.providerStreamCapabilityPolicy, ProviderStreamCapabilityPolicy.Strict);
+  assert.equal(functionPreset.runtimeDeliveryProfile, RuntimeDeliveryProfile.DeliveryDisciplined);
   assert.equal(balanced.derivedState.replay.maxEnvelopes, 16_384);
   assert.equal(balanced.derivedState.replay.maxSessions, 6);
   assert.equal(functionPreset.derivedState.replay.maxEnvelopes, 32_768);
@@ -524,9 +434,7 @@ test("functional runtime config facade exposes result-return creation and serial
   const created = tryCreateRuntimeConfig({
     providerStreamAllowEof: true,
   });
-  const profiled = tryCreateRuntimeConfigForProfile(
-    RuntimeDeliveryProfile.DeliveryDisciplined,
-  );
+  const profiled = tryCreateRuntimeConfigForProfile(RuntimeDeliveryProfile.DeliveryDisciplined);
   const serialized = trySerializeRuntimeConfig({
     runtimeDeliveryProfile: RuntimeDeliveryProfile.Balanced,
   });
@@ -540,10 +448,7 @@ test("functional runtime config facade exposes result-return creation and serial
   assert.equal(isOk(record), true);
 
   if (isOk(profiled)) {
-    assert.equal(
-      profiled.value.runtimeDeliveryProfile,
-      RuntimeDeliveryProfile.DeliveryDisciplined,
-    );
+    assert.equal(profiled.value.runtimeDeliveryProfile, RuntimeDeliveryProfile.DeliveryDisciplined);
   }
 
   if (isOk(record)) {
@@ -560,14 +465,8 @@ test("runtime profile helpers preserve explicit derived-state replay overrides",
     },
   });
 
-  assert.equal(
-    config.derivedState.replay.maxEnvelopes,
-    512,
-  );
-  assert.equal(
-    config.derivedState.replay.maxSessions,
-    8,
-  );
+  assert.equal(config.derivedState.replay.maxEnvelopes, 512);
+  assert.equal(config.derivedState.replay.maxSessions, 8);
 });
 
 test("runtime config supports nested plain-object construction", () => {
@@ -643,17 +542,11 @@ test("environment helpers ignore inherited env values and use a null-prototype r
 
   assert.equal(isOk(parsed), true);
   if (isOk(parsed)) {
-    assert.equal(
-      parsed.value.runtimeDeliveryProfile,
-      RuntimeDeliveryProfile.LatencyOptimized,
-    );
+    assert.equal(parsed.value.runtimeDeliveryProfile, RuntimeDeliveryProfile.LatencyOptimized);
   }
 
   const record = environmentVariablesToRecord([
-    environmentVariable(
-      runtimeDeliveryProfileEnvVarName,
-      runtimeDeliveryProfileEnvValues.balanced,
-    ),
+    environmentVariable(runtimeDeliveryProfileEnvVarName, runtimeDeliveryProfileEnvValues.balanced),
   ]);
 
   assert.equal(Object.getPrototypeOf(record), null);
@@ -667,16 +560,10 @@ test("runtime config rejects invalid delivery profile values", () => {
 
   assert.equal(isErr(config), true);
   if (isErr(config)) {
-    assert.equal(
-      config.error.kind,
-      ValidationErrorKind.InvalidRuntimeDeliveryProfile,
-    );
+    assert.equal(config.error.kind, ValidationErrorKind.InvalidRuntimeDeliveryProfile);
     assert.equal(config.error.field, runtimeDeliveryProfileEnvVarName);
     assert.equal(config.error.received, "fastest");
-    assert.deepEqual(
-      config.error.allowedValues,
-      runtimeDeliveryProfileAllowedValues,
-    );
+    assert.deepEqual(config.error.allowedValues, runtimeDeliveryProfileAllowedValues);
   }
 });
 
@@ -700,15 +587,9 @@ test("runtime config rejects invalid provider stream capability policy values", 
 
   assert.equal(isErr(config), true);
   if (isErr(config)) {
-    assert.equal(
-      config.error.kind,
-      ValidationErrorKind.InvalidProviderStreamCapabilityPolicy,
-    );
+    assert.equal(config.error.kind, ValidationErrorKind.InvalidProviderStreamCapabilityPolicy);
     assert.equal(config.error.field, providerStreamCapabilityPolicyEnvVarName);
-    assert.deepEqual(
-      config.error.allowedValues,
-      providerStreamCapabilityPolicyAllowedValues,
-    );
+    assert.deepEqual(config.error.allowedValues, providerStreamCapabilityPolicyAllowedValues);
   }
 });
 
@@ -719,10 +600,7 @@ test("runtime config rejects invalid provider stream eof values", () => {
 
   assert.equal(isErr(config), true);
   if (isErr(config)) {
-    assert.equal(
-      config.error.kind,
-      ValidationErrorKind.InvalidProviderStreamAllowEof,
-    );
+    assert.equal(config.error.kind, ValidationErrorKind.InvalidProviderStreamAllowEof);
     assert.equal(config.error.field, providerStreamAllowEofEnvVarName);
     assert.deepEqual(config.error.allowedValues, runtimeBooleanAllowedValues);
   }
@@ -735,15 +613,9 @@ test("runtime config rejects invalid derived-state replay backend values", () =>
 
   assert.equal(isErr(config), true);
   if (isErr(config)) {
-    assert.equal(
-      config.error.kind,
-      ValidationErrorKind.InvalidDerivedStateReplayBackend,
-    );
+    assert.equal(config.error.kind, ValidationErrorKind.InvalidDerivedStateReplayBackend);
     assert.equal(config.error.field, derivedStateReplayBackendEnvVarName);
-    assert.deepEqual(
-      config.error.allowedValues,
-      derivedStateReplayBackendAllowedValues,
-    );
+    assert.deepEqual(config.error.allowedValues, derivedStateReplayBackendAllowedValues);
   }
 });
 
@@ -754,15 +626,9 @@ test("runtime config rejects invalid derived-state replay durability values", ()
 
   assert.equal(isErr(config), true);
   if (isErr(config)) {
-    assert.equal(
-      config.error.kind,
-      ValidationErrorKind.InvalidDerivedStateReplayDurability,
-    );
+    assert.equal(config.error.kind, ValidationErrorKind.InvalidDerivedStateReplayDurability);
     assert.equal(config.error.field, derivedStateReplayDurabilityEnvVarName);
-    assert.deepEqual(
-      config.error.allowedValues,
-      derivedStateReplayDurabilityAllowedValues,
-    );
+    assert.deepEqual(config.error.allowedValues, derivedStateReplayDurabilityAllowedValues);
   }
 });
 
@@ -806,14 +672,8 @@ test("result-return helpers validate programmatic numeric and path values", () =
   assert.equal(isErr(invalidDirectory), true);
 
   if (isErr(invalidRuntime)) {
-    assert.equal(
-      invalidRuntime.error.kind,
-      ValidationErrorKind.InvalidNonNegativeInteger,
-    );
-    assert.equal(
-      invalidRuntime.error.field,
-      derivedStateCheckpointIntervalEnvVarName,
-    );
+    assert.equal(invalidRuntime.error.kind, ValidationErrorKind.InvalidNonNegativeInteger);
+    assert.equal(invalidRuntime.error.field, derivedStateCheckpointIntervalEnvVarName);
     assert.equal(
       invalidRuntime.error.message,
       "checkpointIntervalMs must be a non-negative integer",
@@ -821,33 +681,15 @@ test("result-return helpers validate programmatic numeric and path values", () =
   }
 
   if (isErr(invalidReplay)) {
-    assert.equal(
-      invalidReplay.error.kind,
-      ValidationErrorKind.InvalidNonNegativeInteger,
-    );
-    assert.equal(
-      invalidReplay.error.field,
-      derivedStateReplayMaxSessionsEnvVarName,
-    );
-    assert.equal(
-      invalidReplay.error.message,
-      "maxSessions must be a non-negative integer",
-    );
+    assert.equal(invalidReplay.error.kind, ValidationErrorKind.InvalidNonNegativeInteger);
+    assert.equal(invalidReplay.error.field, derivedStateReplayMaxSessionsEnvVarName);
+    assert.equal(invalidReplay.error.message, "maxSessions must be a non-negative integer");
   }
 
   if (isErr(invalidInteger)) {
-    assert.equal(
-      invalidInteger.error.kind,
-      ValidationErrorKind.InvalidNonNegativeInteger,
-    );
-    assert.equal(
-      invalidInteger.error.field,
-      derivedStateReplayMaxEnvelopesEnvVarName,
-    );
-    assert.equal(
-      invalidInteger.error.message,
-      "value must be a non-negative integer",
-    );
+    assert.equal(invalidInteger.error.kind, ValidationErrorKind.InvalidNonNegativeInteger);
+    assert.equal(invalidInteger.error.field, derivedStateReplayMaxEnvelopesEnvVarName);
+    assert.equal(invalidInteger.error.message, "value must be a non-negative integer");
   }
 
   if (isErr(invalidDirectory)) {
@@ -861,12 +703,8 @@ test("result-return helpers validate programmatic numeric and path values", () =
 });
 
 test("result-return helpers reject invalid programmatic enum and profile values", () => {
-  const invalidProfile = tryRuntimeDeliveryProfileToEnvValue(
-    99 as RuntimeDeliveryProfile,
-  );
-  const invalidProfileDefaults = tryRuntimeDeliveryProfileEnvDefaults(
-    99 as RuntimeDeliveryProfile,
-  );
+  const invalidProfile = tryRuntimeDeliveryProfileToEnvValue(99 as RuntimeDeliveryProfile);
+  const invalidProfileDefaults = tryRuntimeDeliveryProfileEnvDefaults(99 as RuntimeDeliveryProfile);
   const invalidShredTrustMode = tryShredTrustModeToEnvValue(99 as ShredTrustMode);
   const invalidCapabilityPolicy = tryProviderStreamCapabilityPolicyToEnvValue(
     99 as ProviderStreamCapabilityPolicy,
@@ -880,9 +718,7 @@ test("result-return helpers reject invalid programmatic enum and profile values"
   const invalidRuntimeConfig = tryObserverRuntimeConfig({
     providerStreamAllowEof: "true" as unknown as boolean,
   });
-  const invalidProfileConfig = tryObserverRuntimeConfigForProfile(
-    99 as RuntimeDeliveryProfile,
-  );
+  const invalidProfileConfig = tryObserverRuntimeConfigForProfile(99 as RuntimeDeliveryProfile);
   const invalidCreated = tryCreateRuntimeConfig({
     providerStreamAllowEof: "true" as unknown as boolean,
   });
@@ -902,10 +738,7 @@ test("result-return helpers reject invalid programmatic enum and profile values"
   assert.equal(isErr(invalidSerialized), true);
 
   if (isErr(invalidProfile)) {
-    assert.equal(
-      invalidProfile.error.kind,
-      ValidationErrorKind.InvalidRuntimeDeliveryProfile,
-    );
+    assert.equal(invalidProfile.error.kind, ValidationErrorKind.InvalidRuntimeDeliveryProfile);
     assert.equal(invalidProfile.error.field, runtimeDeliveryProfileEnvVarName);
   }
 
@@ -917,10 +750,7 @@ test("result-return helpers reject invalid programmatic enum and profile values"
   }
 
   if (isErr(invalidShredTrustMode)) {
-    assert.equal(
-      invalidShredTrustMode.error.kind,
-      ValidationErrorKind.InvalidShredTrustMode,
-    );
+    assert.equal(invalidShredTrustMode.error.kind, ValidationErrorKind.InvalidShredTrustMode);
   }
 
   if (isErr(invalidCapabilityPolicy)) {
@@ -949,10 +779,7 @@ test("result-return helpers reject invalid programmatic enum and profile values"
       invalidRuntimeConfig.error.kind,
       ValidationErrorKind.InvalidProviderStreamAllowEof,
     );
-    assert.equal(
-      invalidRuntimeConfig.error.message,
-      "providerStreamAllowEof must be a boolean",
-    );
+    assert.equal(invalidRuntimeConfig.error.message, "providerStreamAllowEof must be a boolean");
   }
 
   if (isErr(invalidProfileConfig)) {
@@ -963,16 +790,10 @@ test("result-return helpers reject invalid programmatic enum and profile values"
   }
 
   if (isErr(invalidCreated)) {
-    assert.equal(
-      invalidCreated.error.kind,
-      ValidationErrorKind.InvalidProviderStreamAllowEof,
-    );
+    assert.equal(invalidCreated.error.kind, ValidationErrorKind.InvalidProviderStreamAllowEof);
   }
 
   if (isErr(invalidSerialized)) {
-    assert.equal(
-      invalidSerialized.error.kind,
-      ValidationErrorKind.InvalidProviderStreamAllowEof,
-    );
+    assert.equal(invalidSerialized.error.kind, ValidationErrorKind.InvalidProviderStreamAllowEof);
   }
 });

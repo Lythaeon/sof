@@ -48,6 +48,10 @@
     "./runtime/extension": {
       "types": "./dist/runtime/extension.d.ts",
       "import": "./dist/runtime/extension.js"
+    },
+    "./runtime/extension-stdio": {
+      "types": "./dist/runtime/extension-stdio.d.ts",
+      "import": "./dist/runtime/extension-stdio.js"
     }
   },
   "files": [
@@ -58,16 +62,19 @@
     "build": "pnpm run clean && tsdown --config tsdown.config.ts",
     "build:test": "tsc -p tsconfig.test.json",
     "build:examples": "pnpm run build && tsc -p tsconfig.examples.json",
-    "lint": "oxlint --config .oxlintrc.json --tsconfig tsconfig.json --type-aware --deny-warnings --report-unused-disable-directives src tsdown.config.ts",
-    "lint:fix": "oxlint --config .oxlintrc.json --tsconfig tsconfig.json --type-aware --fix --fix-suggestions src tsdown.config.ts",
+    "format": "biome format --config-path biome.json --write src examples tsdown.config.ts",
+    "format:check": "biome format --config-path biome.json src examples tsdown.config.ts",
+    "lint": "oxlint --config .oxlintrc.json --tsconfig tsconfig.lint.json --type-aware --deny-warnings --report-unused-disable-directives src tsdown.config.ts",
+    "lint:fix": "oxlint --config .oxlintrc.json --tsconfig tsconfig.lint.json --type-aware --fix --fix-suggestions src tsdown.config.ts",
     "check:examples": "pnpm run build:examples && node dist-examples/runtime-config-balanced.js && node dist-examples/runtime-config-parse.js && node dist-examples/runtime-extension-manifest.js && node dist-examples/runtime-extension-worker.js",
     "check:package": "publint run --strict --pack pnpm",
-    "check": "pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run check:examples && pnpm run check:package",
+    "check": "pnpm run format:check && pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run check:examples && pnpm run check:package",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "pnpm run build && pnpm run build:test && node --test dist-test/*.test.js dist-test/**/*.test.js",
     "prepack": "pnpm run build"
   },
   "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
     "@types/node": "^24.6.0",
     "oxlint": "^1.59.0",
     "oxlint-tsgolint": "^0.20.0",

@@ -13,6 +13,7 @@ test("package exports resolve the documented public entry points", async () => {
   const derivedState = await importPackageEntry("@sof/sdk/runtime/derived-state");
   const deliveryProfile = await importPackageEntry("@sof/sdk/runtime/delivery-profile");
   const extension = await importPackageEntry("@sof/sdk/runtime/extension");
+  const extensionStdio = await importPackageEntry("@sof/sdk/runtime/extension-stdio");
 
   assert.equal(
     (root as { ObserverRuntimeConfig: unknown }).ObserverRuntimeConfig,
@@ -55,5 +56,9 @@ test("package exports resolve the documented public entry points", async () => {
       .createRuntimeExtensionWorkerManifest,
     (extension as { createRuntimeExtensionWorkerManifest: unknown })
       .createRuntimeExtensionWorkerManifest,
+  );
+  assert.equal(
+    (root as { runRuntimeExtensionWorkerStdio: unknown }).runRuntimeExtensionWorkerStdio,
+    (extensionStdio as { runRuntimeExtensionWorkerStdio: unknown }).runRuntimeExtensionWorkerStdio,
   );
 });

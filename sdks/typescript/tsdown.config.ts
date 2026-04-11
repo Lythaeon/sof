@@ -3,6 +3,9 @@ import { defineConfig } from "tsdown";
 export default defineConfig({
   clean: true,
   dts: true,
+  deps: {
+    neverBundle: [/^node:/],
+  },
   entry: {
     index: "src/index.ts",
     runtime: "src/runtime.ts",
@@ -11,6 +14,7 @@ export default defineConfig({
     "runtime/derived-state": "src/runtime/derived-state.ts",
     "runtime/delivery-profile": "src/runtime/runtime-delivery-profile.ts",
     "runtime/extension": "src/runtime/runtime-extension.ts",
+    "runtime/extension-stdio": "src/runtime/runtime-extension-stdio.ts",
   },
   format: ["esm"],
   minify: true,

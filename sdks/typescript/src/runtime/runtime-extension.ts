@@ -167,11 +167,10 @@ export interface RuntimeExtensionProtocolVersion {
   readonly minor: number;
 }
 
-export const defaultRuntimeExtensionProtocolVersion: RuntimeExtensionProtocolVersion =
-  {
-    major: 1,
-    minor: 0,
-  };
+export const defaultRuntimeExtensionProtocolVersion: RuntimeExtensionProtocolVersion = {
+  major: 1,
+  minor: 0,
+};
 
 export interface RuntimeExtensionWorkerManifest {
   readonly protocolVersion: RuntimeExtensionProtocolVersion;
@@ -232,10 +231,7 @@ export enum RuntimeExtensionWorkerResponseTag {
 export type RuntimeExtensionWorkerResponse =
   | {
       readonly tag: RuntimeExtensionWorkerResponseTag.Manifest;
-      readonly result: Result<
-        RuntimeExtensionWorkerManifest,
-        RuntimeExtensionError
-      >;
+      readonly result: Result<RuntimeExtensionWorkerManifest, RuntimeExtensionError>;
     }
   | {
       readonly tag: RuntimeExtensionWorkerResponseTag.Started;
@@ -298,9 +294,7 @@ function asExtensionName<const Value extends string>(value: Value): ExtensionNam
   return brand<Value, "ExtensionName">(value);
 }
 
-function asExtensionResourceId<const Value extends string>(
-  value: Value,
-): ExtensionResourceId {
+function asExtensionResourceId<const Value extends string>(value: Value): ExtensionResourceId {
   return brand<Value, "ExtensionResourceId">(value);
 }
 
@@ -356,29 +350,20 @@ export function extensionResourceId(
   return parseNonEmptyValueObject(value, "resourceId", asExtensionResourceId);
 }
 
-export function sharedStreamTag(
-  value: string,
-): Result<SharedStreamTag, RuntimeExtensionError> {
+export function sharedStreamTag(value: string): Result<SharedStreamTag, RuntimeExtensionError> {
   return parseNonEmptyValueObject(value, "sharedTag", asSharedStreamTag);
 }
 
-export function socketAddress(
-  value: string,
-): Result<SocketAddress, RuntimeExtensionError> {
+export function socketAddress(value: string): Result<SocketAddress, RuntimeExtensionError> {
   return parseNonEmptyValueObject(value, "socketAddress", asSocketAddress);
 }
 
-export function webSocketUrl(
-  value: string,
-): Result<WebSocketUrl, RuntimeExtensionError> {
+export function webSocketUrl(value: string): Result<WebSocketUrl, RuntimeExtensionError> {
   const parsed = parseNonEmptyValueObject(value, "url", asWebSocketUrl);
   if (isErr(parsed)) {
     return parsed;
   }
-  if (
-    !parsed.value.startsWith("ws://") &&
-    !parsed.value.startsWith("wss://")
-  ) {
+  if (!parsed.value.startsWith("ws://") && !parsed.value.startsWith("wss://")) {
     return err(
       runtimeExtensionError(
         RuntimeExtensionErrorKind.ValidationError,
@@ -430,9 +415,7 @@ function validatePositiveInteger(
   return ok(value);
 }
 
-function validateResourceReadBufferBytes(
-  value: number,
-): Result<number, RuntimeExtensionError> {
+function validateResourceReadBufferBytes(value: number): Result<number, RuntimeExtensionError> {
   const parsed = validatePositiveInteger(value, "readBufferBytes");
   if (isErr(parsed)) {
     return parsed;
@@ -478,9 +461,7 @@ function validateRuntimeExtensionProtocolVersion(
 function validateRuntimeExtensionWorkerManifest(
   manifest: RuntimeExtensionWorkerManifest,
 ): Result<RuntimeExtensionWorkerManifest, RuntimeExtensionError> {
-  const protocolVersion = validateRuntimeExtensionProtocolVersion(
-    manifest.protocolVersion,
-  );
+  const protocolVersion = validateRuntimeExtensionProtocolVersion(manifest.protocolVersion);
   if (isErr(protocolVersion)) {
     return protocolVersion;
   }
@@ -497,19 +478,14 @@ function validateRuntimeExtensionWorkerManifest(
     );
   }
 
-  const manifestVersion = validatePositiveInteger(
-    manifest.manifestVersion,
-    "manifestVersion",
-  );
+  const manifestVersion = validatePositiveInteger(manifest.manifestVersion, "manifestVersion");
   if (isErr(manifestVersion)) {
     return manifestVersion;
   }
 
   const duplicateResourceIds = new Set<string>();
   for (const resource of manifest.manifest.resources) {
-    const validatedReadBuffer = validateResourceReadBufferBytes(
-      resource.readBufferBytes,
-    );
+    const validatedReadBuffer = validateResourceReadBufferBytes(resource.readBufferBytes);
     if (isErr(validatedReadBuffer)) {
       return validatedReadBuffer;
     }
@@ -561,8 +537,7 @@ export function tryCreateRuntimeExtensionWorkerManifest(
   }
 
   const manifest: RuntimeExtensionWorkerManifest = {
-    protocolVersion:
-      init.protocolVersion ?? defaultRuntimeExtensionProtocolVersion,
+    protocolVersion: init.protocolVersion ?? defaultRuntimeExtensionProtocolVersion,
     sdkLanguage: SdkLanguage.TypeScript,
     sdkVersion: init.sdkVersion,
     manifestVersion: init.manifestVersion ?? 1,
@@ -582,16 +557,10 @@ export function packetSubscriptionMatches(
   subscription: PacketSubscription,
   event: RuntimePacketEvent,
 ): boolean {
-  if (
-    subscription.sourceKind !== undefined &&
-    subscription.sourceKind !== event.source.kind
-  ) {
+  if (subscription.sourceKind !== undefined && subscription.sourceKind !== event.source.kind) {
     return false;
   }
-  if (
-    subscription.transport !== undefined &&
-    subscription.transport !== event.source.transport
-  ) {
+  if (subscription.transport !== undefined && subscription.transport !== event.source.transport) {
     return false;
   }
   if (
@@ -608,8 +577,7 @@ export function packetSubscriptionMatches(
   }
   if (
     subscription.localPort !== undefined &&
-    event.source.localAddress?.split(":").at(-1) !==
-      String(subscription.localPort)
+    event.source.localAddress?.split(":").at(-1) !== String(subscription.localPort)
   ) {
     return false;
   }
@@ -621,8 +589,7 @@ export function packetSubscriptionMatches(
   }
   if (
     subscription.remotePort !== undefined &&
-    event.source.remoteAddress?.split(":").at(-1) !==
-      String(subscription.remotePort)
+    event.source.remoteAddress?.split(":").at(-1) !== String(subscription.remotePort)
   ) {
     return false;
   }
@@ -638,10 +605,7 @@ export function packetSubscriptionMatches(
   ) {
     return false;
   }
-  if (
-    subscription.sharedTag !== undefined &&
-    subscription.sharedTag !== event.source.sharedTag
-  ) {
+  if (subscription.sharedTag !== undefined && subscription.sharedTag !== event.source.sharedTag) {
     return false;
   }
   if (
@@ -727,9 +691,9 @@ export class RuntimeExtensionWorkerRuntime {
           result:
             this.definition.onReady === undefined
               ? ok(runtimeExtensionAck())
-              : await settleExtensionHook("onReady", () =>
-                  this.definition.onReady?.(message.context) ??
-                  ok(runtimeExtensionAck()),
+              : await settleExtensionHook(
+                  "onReady",
+                  () => this.definition.onReady?.(message.context) ?? ok(runtimeExtensionAck()),
                 ),
         };
       case RuntimeExtensionWorkerHostMessageTag.DeliverPacket:
@@ -738,9 +702,10 @@ export class RuntimeExtensionWorkerRuntime {
           result:
             this.definition.onPacketReceived === undefined
               ? ok(runtimeExtensionAck())
-              : await settleExtensionHook("onPacketReceived", () =>
-                  this.definition.onPacketReceived?.(message.event) ??
-                  ok(runtimeExtensionAck()),
+              : await settleExtensionHook(
+                  "onPacketReceived",
+                  () =>
+                    this.definition.onPacketReceived?.(message.event) ?? ok(runtimeExtensionAck()),
                 ),
         };
       case RuntimeExtensionWorkerHostMessageTag.Shutdown:
@@ -749,9 +714,9 @@ export class RuntimeExtensionWorkerRuntime {
           result:
             this.definition.onShutdown === undefined
               ? ok(runtimeExtensionAck())
-              : await settleExtensionHook("onShutdown", () =>
-                  this.definition.onShutdown?.(message.context) ??
-                  ok(runtimeExtensionAck()),
+              : await settleExtensionHook(
+                  "onShutdown",
+                  () => this.definition.onShutdown?.(message.context) ?? ok(runtimeExtensionAck()),
                 ),
         };
     }

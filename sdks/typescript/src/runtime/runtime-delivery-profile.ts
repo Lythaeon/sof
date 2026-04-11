@@ -13,13 +13,9 @@ export enum RuntimeDeliveryProfile {
   DeliveryDisciplined = 3,
 }
 
-export const defaultRuntimeDeliveryProfile =
-  RuntimeDeliveryProfile.LatencyOptimized;
+export const defaultRuntimeDeliveryProfile = RuntimeDeliveryProfile.LatencyOptimized;
 
-export type RuntimeDeliveryProfileEnvValue = Brand<
-  string,
-  "RuntimeDeliveryProfileEnvValue"
->;
+export type RuntimeDeliveryProfileEnvValue = Brand<string, "RuntimeDeliveryProfileEnvValue">;
 
 function asRuntimeDeliveryProfileEnvValue<const Value extends string>(
   value: Value,
@@ -27,24 +23,19 @@ function asRuntimeDeliveryProfileEnvValue<const Value extends string>(
   return brand<Value, "RuntimeDeliveryProfileEnvValue">(value);
 }
 
-export const runtimeDeliveryProfileEnvVarName = envVarName(
-  "SOF_RUNTIME_DELIVERY_PROFILE",
-);
+export const runtimeDeliveryProfileEnvVarName = envVarName("SOF_RUNTIME_DELIVERY_PROFILE");
 
 export const runtimeDeliveryProfileEnvValues = {
   latencyOptimized: asRuntimeDeliveryProfileEnvValue("latency_optimized"),
   balanced: asRuntimeDeliveryProfileEnvValue("balanced"),
-  deliveryDisciplined: asRuntimeDeliveryProfileEnvValue(
-    "delivery_disciplined",
-  ),
+  deliveryDisciplined: asRuntimeDeliveryProfileEnvValue("delivery_disciplined"),
 } as const;
 
-export const runtimeDeliveryProfileAllowedValues: readonly RuntimeDeliveryProfileEnvValue[] =
-  [
-    runtimeDeliveryProfileEnvValues.latencyOptimized,
-    runtimeDeliveryProfileEnvValues.balanced,
-    runtimeDeliveryProfileEnvValues.deliveryDisciplined,
-  ];
+export const runtimeDeliveryProfileAllowedValues: readonly RuntimeDeliveryProfileEnvValue[] = [
+  runtimeDeliveryProfileEnvValues.latencyOptimized,
+  runtimeDeliveryProfileEnvValues.balanced,
+  runtimeDeliveryProfileEnvValues.deliveryDisciplined,
+];
 
 export interface RuntimeDeliveryProfileEnvDefaults {
   readonly derivedStateReplayMaxEnvelopes: number;
@@ -66,10 +57,7 @@ export function isRuntimeDeliveryProfile(
 
 export function validateRuntimeDeliveryProfile(
   value: RuntimeDeliveryProfile,
-): Result<
-  RuntimeDeliveryProfile,
-  ValidationError<RuntimeDeliveryProfileEnvValue>
-> {
+): Result<RuntimeDeliveryProfile, ValidationError<RuntimeDeliveryProfileEnvValue>> {
   if (!isRuntimeDeliveryProfile(value)) {
     return err({
       kind: ValidationErrorKind.InvalidRuntimeDeliveryProfile,
@@ -86,10 +74,7 @@ export function validateRuntimeDeliveryProfile(
 
 export function tryRuntimeDeliveryProfileToEnvValue(
   profile: RuntimeDeliveryProfile,
-): Result<
-  RuntimeDeliveryProfileEnvValue,
-  ValidationError<RuntimeDeliveryProfileEnvValue>
-> {
+): Result<RuntimeDeliveryProfileEnvValue, ValidationError<RuntimeDeliveryProfileEnvValue>> {
   const validated = validateRuntimeDeliveryProfile(profile);
   if (isErr(validated)) {
     return validated;
@@ -127,10 +112,7 @@ export function runtimeDeliveryProfileToEnvValue(
 
 export function tryRuntimeDeliveryProfileEnvDefaults(
   profile: RuntimeDeliveryProfile,
-): Result<
-  RuntimeDeliveryProfileEnvDefaults,
-  ValidationError<RuntimeDeliveryProfileEnvValue>
-> {
+): Result<RuntimeDeliveryProfileEnvDefaults, ValidationError<RuntimeDeliveryProfileEnvValue>> {
   const validated = validateRuntimeDeliveryProfile(profile);
   if (isErr(validated)) {
     return validated;
@@ -144,17 +126,13 @@ export function tryRuntimeDeliveryProfileEnvDefaults(
       });
     case RuntimeDeliveryProfile.Balanced:
       return ok({
-        derivedStateReplayMaxEnvelopes:
-          defaultDerivedStateReplayMaxEnvelopes * 2,
-        derivedStateReplayMaxSessions:
-          defaultDerivedStateReplayMaxSessions + 2,
+        derivedStateReplayMaxEnvelopes: defaultDerivedStateReplayMaxEnvelopes * 2,
+        derivedStateReplayMaxSessions: defaultDerivedStateReplayMaxSessions + 2,
       });
     case RuntimeDeliveryProfile.DeliveryDisciplined:
       return ok({
-        derivedStateReplayMaxEnvelopes:
-          defaultDerivedStateReplayMaxEnvelopes * 4,
-        derivedStateReplayMaxSessions:
-          defaultDerivedStateReplayMaxSessions * 2,
+        derivedStateReplayMaxEnvelopes: defaultDerivedStateReplayMaxEnvelopes * 4,
+        derivedStateReplayMaxSessions: defaultDerivedStateReplayMaxSessions * 2,
       });
   }
 
@@ -181,10 +159,7 @@ export function runtimeDeliveryProfileEnvDefaults(
 
 export function parseRuntimeDeliveryProfile(
   input: string,
-): Result<
-  RuntimeDeliveryProfile,
-  ValidationError<RuntimeDeliveryProfileEnvValue>
-> {
+): Result<RuntimeDeliveryProfile, ValidationError<RuntimeDeliveryProfileEnvValue>> {
   const normalized = input.trim().toLowerCase().replaceAll("-", "_");
 
   switch (normalized) {

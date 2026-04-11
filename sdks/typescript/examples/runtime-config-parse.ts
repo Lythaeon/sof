@@ -1,21 +1,27 @@
 import {
+  type Result,
   isErr,
   parseRuntimeConfig,
   runtimeDeliveryProfileEnvVarName,
   runtimeDeliveryProfileEnvValues,
 } from "../dist/index.js";
 
-const parsed = parseRuntimeConfig({
-  [runtimeDeliveryProfileEnvVarName]: runtimeDeliveryProfileEnvValues.balanced,
-  SOF_PROVIDER_STREAM_ALLOW_EOF: "true",
-  SOF_DERIVED_STATE_REPLAY_MAX_ENVELOPES: "2048",
-});
+function expectOk<Value, Error extends { readonly message: string }>(
+  result: Result<Value, Error>,
+): Value {
+  if (isErr(result)) {
+    throw new Error(result.error.message);
+  }
 
-if (isErr(parsed)) {
-  process.stderr.write(`${parsed.error.message}\n`);
-  process.exit(1);
+  return result.value;
 }
 
-process.stdout.write(
-  `${JSON.stringify(parsed.value.toEnvironmentRecord(), undefined, 2)}\n`,
+const parsed = expectOk(
+  parseRuntimeConfig({
+    [runtimeDeliveryProfileEnvVarName]: runtimeDeliveryProfileEnvValues.balanced,
+    SOF_PROVIDER_STREAM_ALLOW_EOF: "true",
+    SOF_DERIVED_STATE_REPLAY_MAX_ENVELOPES: "2048",
+  }),
 );
+
+process.stdout.write(`${JSON.stringify(parsed.toEnvironmentRecord(), undefined, 2)}\n`);

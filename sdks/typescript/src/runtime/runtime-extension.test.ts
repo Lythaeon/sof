@@ -206,10 +206,7 @@ test("runtime extension worker runtime handles manifest lifecycle and exceptions
   assert.equal(isOk(shutdown.result), true);
 
   if (isErr(delivered.result)) {
-    assert.equal(
-      delivered.result.error.kind,
-      RuntimeExtensionErrorKind.UnhandledException,
-    );
+    assert.equal(delivered.result.error.kind, RuntimeExtensionErrorKind.UnhandledException);
     assert.equal(delivered.result.error.field, "onPacketReceived");
   }
 });

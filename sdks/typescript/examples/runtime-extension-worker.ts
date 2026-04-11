@@ -1,108 +1,126 @@
+import { PassThrough } from "node:stream";
+
 import {
   ExtensionCapability,
   RuntimeExtensionWorkerHostMessageTag,
-  RuntimePacketEventClass,
-  RuntimePacketSourceKind,
-  RuntimePacketTransport,
   SdkLanguage,
-  createRuntimePacketEvent,
+  type Result,
   extensionName,
   isErr,
   ok,
   runtimeExtensionAck,
+  runRuntimeExtensionWorkerStdio,
+  serializeRuntimeExtensionWorkerHostMessageWire,
   socketAddress,
   tryDefineRuntimeExtension,
   tryCreateRuntimeExtensionWorkerManifest,
-  tryCreateRuntimeExtensionWorkerRuntime,
 } from "../dist/index.js";
 
-const extension = extensionName("demo-extension-worker");
-if (isErr(extension)) {
-  process.stderr.write(`${extension.error.message}\n`);
-  process.exit(1);
+function expectOk<Value, Error extends { readonly message: string }>(
+  result: Result<Value, Error>,
+): Value {
+  if (isErr(result)) {
+    throw new Error(result.error.message);
+  }
+
+  return result.value;
 }
 
-const localAddress = socketAddress("127.0.0.1:21011");
-if (isErr(localAddress)) {
-  process.stderr.write(`${localAddress.error.message}\n`);
-  process.exit(1);
-}
+const extension = expectOk(extensionName("demo-extension-worker"));
+const localAddress = expectOk(socketAddress("127.0.0.1:21011"));
 
-const manifest = tryCreateRuntimeExtensionWorkerManifest({
-  sdkVersion: "0.1.0",
-  extensionName: extension.value,
-  capabilities: [ExtensionCapability.ObserveObserverIngress],
-  subscriptions: [
-    {
-      sourceKind: RuntimePacketSourceKind.ObserverIngress,
-      transport: RuntimePacketTransport.Udp,
-      eventClass: RuntimePacketEventClass.Packet,
-      localAddress: localAddress.value,
+const manifest = expectOk(
+  tryCreateRuntimeExtensionWorkerManifest({
+    sdkVersion: "0.1.0",
+    extensionName: extension,
+    capabilities: [ExtensionCapability.ObserveObserverIngress],
+  }),
+);
+
+let observedPacketLog = "";
+const definition = expectOk(
+  tryDefineRuntimeExtension({
+    manifest,
+    onReady: () => ok(runtimeExtensionAck()),
+    onPacketReceived: (event) => {
+      observedPacketLog = `received ${event.bytes.length} bytes from ${String(event.source.localAddress)}`;
+      return ok(runtimeExtensionAck());
     },
-  ],
+    onShutdown: () => ok(runtimeExtensionAck()),
+  }),
+);
+
+const input = new PassThrough();
+const output = new PassThrough();
+const errorOutput = new PassThrough();
+
+let protocolOutput = "";
+let protocolErrors = "";
+output.setEncoding("utf8");
+errorOutput.setEncoding("utf8");
+output.on("data", (chunk: string) => {
+  protocolOutput += chunk;
 });
-if (isErr(manifest)) {
-  process.stderr.write(`${manifest.error.message}\n`);
-  process.exit(1);
-}
-
-const definition = tryDefineRuntimeExtension({
-  manifest: manifest.value,
-  onReady: () => ok(runtimeExtensionAck()),
-  onPacketReceived: (event) => {
-    process.stdout.write(
-      `received ${event.bytes.length} bytes from ${String(event.source.localAddress)}\n`,
-    );
-    return ok(runtimeExtensionAck());
-  },
-  onShutdown: () => ok(runtimeExtensionAck()),
-});
-if (isErr(definition)) {
-  process.stderr.write(`${definition.error.message}\n`);
-  process.exit(1);
-}
-
-const worker = tryCreateRuntimeExtensionWorkerRuntime(definition.value);
-if (isErr(worker)) {
-  process.stderr.write(`${worker.error.message}\n`);
-  process.exit(1);
-}
-
-const started = await worker.value.handleMessage({
-  tag: RuntimeExtensionWorkerHostMessageTag.Start,
-  context: {
-    extensionName: extension.value,
-  },
+errorOutput.on("data", (chunk: string) => {
+  protocolErrors += chunk;
 });
 
-const delivered = await worker.value.handleMessage({
-  tag: RuntimeExtensionWorkerHostMessageTag.DeliverPacket,
-  event: createRuntimePacketEvent(
-    {
-      kind: RuntimePacketSourceKind.ObserverIngress,
-      transport: RuntimePacketTransport.Udp,
-      eventClass: RuntimePacketEventClass.Packet,
-      localAddress: localAddress.value,
+const runner = runRuntimeExtensionWorkerStdio(definition, {
+  input,
+  output,
+  error: errorOutput,
+});
+
+input.write(
+  `${JSON.stringify(
+    serializeRuntimeExtensionWorkerHostMessageWire({
+      tag: RuntimeExtensionWorkerHostMessageTag.Start,
+      context: {
+        extensionName: extension,
+      },
+    }),
+  )}\n`,
+);
+input.write(
+  `${JSON.stringify({
+    tag: RuntimeExtensionWorkerHostMessageTag.DeliverPacket,
+    event: {
+      source: {
+        kind: 1,
+        transport: 1,
+        eventClass: 1,
+        localAddress,
+      },
+      bytes: [1, 2, 3, 4],
+      observedUnixMs: Date.now(),
     },
-    Uint8Array.from([1, 2, 3, 4]),
-    Date.now(),
-  ),
-});
+  })}\n`,
+);
+input.write(
+  `${JSON.stringify(
+    serializeRuntimeExtensionWorkerHostMessageWire({
+      tag: RuntimeExtensionWorkerHostMessageTag.Shutdown,
+      context: {
+        extensionName: extension,
+      },
+    }),
+  )}\n`,
+);
+input.end();
 
-const shutdown = await worker.value.handleMessage({
-  tag: RuntimeExtensionWorkerHostMessageTag.Shutdown,
-  context: {
-    extensionName: extension.value,
-  },
-});
+expectOk(await runner);
 
 process.stdout.write(
   `${JSON.stringify(
     {
       sdkLanguage: SdkLanguage.TypeScript,
-      started,
-      delivered,
-      shutdown,
+      observedPacketLog,
+      protocolErrors: protocolErrors.trim(),
+      responses: protocolOutput
+        .trim()
+        .split("\n")
+        .filter((line) => line !== "")
+        .map((line) => JSON.parse(line) as unknown),
     },
     undefined,
     2,

@@ -14,8 +14,7 @@ export enum ProviderStreamCapabilityPolicy {
 }
 
 export const defaultShredTrustMode = ShredTrustMode.PublicUntrusted;
-export const defaultProviderStreamCapabilityPolicy =
-  ProviderStreamCapabilityPolicy.Warn;
+export const defaultProviderStreamCapabilityPolicy = ProviderStreamCapabilityPolicy.Warn;
 export const defaultProviderStreamAllowEof = false;
 
 export type ShredTrustModeEnvValue = Brand<string, "ShredTrustModeEnvValue">;
@@ -47,15 +46,11 @@ export const shredTrustModeEnvVarName = envVarName("SOF_SHRED_TRUST_MODE");
 export const providerStreamCapabilityPolicyEnvVarName = envVarName(
   "SOF_PROVIDER_STREAM_CAPABILITY_POLICY",
 );
-export const providerStreamAllowEofEnvVarName = envVarName(
-  "SOF_PROVIDER_STREAM_ALLOW_EOF",
-);
+export const providerStreamAllowEofEnvVarName = envVarName("SOF_PROVIDER_STREAM_ALLOW_EOF");
 
 export const shredTrustModeEnvValues = {
   publicUntrusted: asShredTrustModeEnvValue("public_untrusted"),
-  trustedRawShredProvider: asShredTrustModeEnvValue(
-    "trusted_raw_shred_provider",
-  ),
+  trustedRawShredProvider: asShredTrustModeEnvValue("trusted_raw_shred_provider"),
 } as const;
 
 export const providerStreamCapabilityPolicyEnvValues = {
@@ -74,10 +69,7 @@ export const shredTrustModeAllowedValues: readonly ShredTrustModeEnvValue[] = [
 ];
 
 export const providerStreamCapabilityPolicyAllowedValues: readonly ProviderStreamCapabilityPolicyEnvValue[] =
-  [
-    providerStreamCapabilityPolicyEnvValues.warn,
-    providerStreamCapabilityPolicyEnvValues.strict,
-  ];
+  [providerStreamCapabilityPolicyEnvValues.warn, providerStreamCapabilityPolicyEnvValues.strict];
 
 export const runtimeBooleanAllowedValues: readonly RuntimeBooleanEnvValue[] = [
   runtimeBooleanEnvValues.true,
@@ -114,8 +106,7 @@ export function validateShredTrustMode(
       kind: ValidationErrorKind.InvalidShredTrustMode,
       field: shredTrustModeEnvVarName,
       received: String(value),
-      message:
-        "shred trust mode must be public_untrusted or trusted_raw_shred_provider",
+      message: "shred trust mode must be public_untrusted or trusted_raw_shred_provider",
       allowedValues: shredTrustModeAllowedValues,
     });
   }
@@ -125,10 +116,7 @@ export function validateShredTrustMode(
 
 export function validateProviderStreamCapabilityPolicy(
   value: ProviderStreamCapabilityPolicy,
-): Result<
-  ProviderStreamCapabilityPolicy,
-  ValidationError<ProviderStreamCapabilityPolicyEnvValue>
-> {
+): Result<ProviderStreamCapabilityPolicy, ValidationError<ProviderStreamCapabilityPolicyEnvValue>> {
   if (!isProviderStreamCapabilityPolicy(value)) {
     return err({
       kind: ValidationErrorKind.InvalidProviderStreamCapabilityPolicy,
@@ -178,8 +166,7 @@ export function tryShredTrustModeToEnvValue(
     kind: ValidationErrorKind.InvalidShredTrustMode,
     field: shredTrustModeEnvVarName,
     received: String(mode),
-    message:
-      "shred trust mode must be public_untrusted or trusted_raw_shred_provider",
+    message: "shred trust mode must be public_untrusted or trusted_raw_shred_provider",
     allowedValues: shredTrustModeAllowedValues,
   });
 }
@@ -211,9 +198,7 @@ export function tryProviderStreamCapabilityPolicyToEnvValue(
   });
 }
 
-export function shredTrustModeToEnvValue(
-  mode: ShredTrustMode,
-): ShredTrustModeEnvValue {
+export function shredTrustModeToEnvValue(mode: ShredTrustMode): ShredTrustModeEnvValue {
   const result = tryShredTrustModeToEnvValue(mode);
   if (!isErr(result)) {
     return result.value;
@@ -230,9 +215,7 @@ export function providerStreamCapabilityPolicyToEnvValue(
     return result.value;
   }
 
-  throw new RangeError(
-    `unknown provider stream capability policy: ${String(policy)}`,
-  );
+  throw new RangeError(`unknown provider stream capability policy: ${String(policy)}`);
 }
 
 export function runtimeBooleanToEnvValue(value: boolean): RuntimeBooleanEnvValue {
@@ -254,8 +237,7 @@ export function parseShredTrustMode(
         kind: ValidationErrorKind.InvalidShredTrustMode,
         field: shredTrustModeEnvVarName,
         received: input,
-        message:
-          "shred trust mode must be public_untrusted or trusted_raw_shred_provider",
+        message: "shred trust mode must be public_untrusted or trusted_raw_shred_provider",
         allowedValues: shredTrustModeAllowedValues,
       });
   }
@@ -263,10 +245,7 @@ export function parseShredTrustMode(
 
 export function parseProviderStreamCapabilityPolicy(
   input: string,
-): Result<
-  ProviderStreamCapabilityPolicy,
-  ValidationError<ProviderStreamCapabilityPolicyEnvValue>
-> {
+): Result<ProviderStreamCapabilityPolicy, ValidationError<ProviderStreamCapabilityPolicyEnvValue>> {
   const normalized = input.trim().toLowerCase();
 
   switch (normalized) {
