@@ -1,7 +1,7 @@
 import { brand, type Brand } from "../brand.js";
 import { envVarName } from "../environment.js";
 import { ValidationErrorKind, type ValidationError } from "../errors.js";
-import { err, ok, type Result } from "../result.js";
+import { err, isErr, ok, type Result } from "../result.js";
 import {
   defaultDerivedStateReplayMaxEnvelopes,
   defaultDerivedStateReplayMaxSessions,
@@ -64,53 +64,119 @@ export function isRuntimeDeliveryProfile(
   }
 }
 
-function requireRuntimeDeliveryProfile(
+export function validateRuntimeDeliveryProfile(
   value: RuntimeDeliveryProfile,
-): RuntimeDeliveryProfile {
+): Result<
+  RuntimeDeliveryProfile,
+  ValidationError<RuntimeDeliveryProfileEnvValue>
+> {
   if (!isRuntimeDeliveryProfile(value)) {
-    throw new RangeError(`unknown runtime delivery profile: ${String(value)}`);
+    return err({
+      kind: ValidationErrorKind.InvalidRuntimeDeliveryProfile,
+      field: runtimeDeliveryProfileEnvVarName,
+      received: String(value),
+      message:
+        "runtime delivery profile must be latency_optimized, balanced, or delivery_disciplined",
+      allowedValues: runtimeDeliveryProfileAllowedValues,
+    });
   }
 
-  return value;
+  return ok(value);
+}
+
+export function tryRuntimeDeliveryProfileToEnvValue(
+  profile: RuntimeDeliveryProfile,
+): Result<
+  RuntimeDeliveryProfileEnvValue,
+  ValidationError<RuntimeDeliveryProfileEnvValue>
+> {
+  const validated = validateRuntimeDeliveryProfile(profile);
+  if (isErr(validated)) {
+    return validated;
+  }
+
+  switch (validated.value) {
+    case RuntimeDeliveryProfile.LatencyOptimized:
+      return ok(runtimeDeliveryProfileEnvValues.latencyOptimized);
+    case RuntimeDeliveryProfile.Balanced:
+      return ok(runtimeDeliveryProfileEnvValues.balanced);
+    case RuntimeDeliveryProfile.DeliveryDisciplined:
+      return ok(runtimeDeliveryProfileEnvValues.deliveryDisciplined);
+  }
+
+  return err({
+    kind: ValidationErrorKind.InvalidRuntimeDeliveryProfile,
+    field: runtimeDeliveryProfileEnvVarName,
+    received: String(profile),
+    message:
+      "runtime delivery profile must be latency_optimized, balanced, or delivery_disciplined",
+    allowedValues: runtimeDeliveryProfileAllowedValues,
+  });
 }
 
 export function runtimeDeliveryProfileToEnvValue(
   profile: RuntimeDeliveryProfile,
 ): RuntimeDeliveryProfileEnvValue {
-  switch (requireRuntimeDeliveryProfile(profile)) {
-    case RuntimeDeliveryProfile.LatencyOptimized:
-      return runtimeDeliveryProfileEnvValues.latencyOptimized;
-    case RuntimeDeliveryProfile.Balanced:
-      return runtimeDeliveryProfileEnvValues.balanced;
-    case RuntimeDeliveryProfile.DeliveryDisciplined:
-      return runtimeDeliveryProfileEnvValues.deliveryDisciplined;
+  const result = tryRuntimeDeliveryProfileToEnvValue(profile);
+  if (!isErr(result)) {
+    return result.value;
   }
+
+  throw new RangeError(`unknown runtime delivery profile: ${String(profile)}`);
+}
+
+export function tryRuntimeDeliveryProfileEnvDefaults(
+  profile: RuntimeDeliveryProfile,
+): Result<
+  RuntimeDeliveryProfileEnvDefaults,
+  ValidationError<RuntimeDeliveryProfileEnvValue>
+> {
+  const validated = validateRuntimeDeliveryProfile(profile);
+  if (isErr(validated)) {
+    return validated;
+  }
+
+  switch (validated.value) {
+    case RuntimeDeliveryProfile.LatencyOptimized:
+      return ok({
+        derivedStateReplayMaxEnvelopes: defaultDerivedStateReplayMaxEnvelopes,
+        derivedStateReplayMaxSessions: defaultDerivedStateReplayMaxSessions,
+      });
+    case RuntimeDeliveryProfile.Balanced:
+      return ok({
+        derivedStateReplayMaxEnvelopes:
+          defaultDerivedStateReplayMaxEnvelopes * 2,
+        derivedStateReplayMaxSessions:
+          defaultDerivedStateReplayMaxSessions + 2,
+      });
+    case RuntimeDeliveryProfile.DeliveryDisciplined:
+      return ok({
+        derivedStateReplayMaxEnvelopes:
+          defaultDerivedStateReplayMaxEnvelopes * 4,
+        derivedStateReplayMaxSessions:
+          defaultDerivedStateReplayMaxSessions * 2,
+      });
+  }
+
+  return err({
+    kind: ValidationErrorKind.InvalidRuntimeDeliveryProfile,
+    field: runtimeDeliveryProfileEnvVarName,
+    received: String(profile),
+    message:
+      "runtime delivery profile must be latency_optimized, balanced, or delivery_disciplined",
+    allowedValues: runtimeDeliveryProfileAllowedValues,
+  });
 }
 
 export function runtimeDeliveryProfileEnvDefaults(
   profile: RuntimeDeliveryProfile,
 ): RuntimeDeliveryProfileEnvDefaults {
-  switch (requireRuntimeDeliveryProfile(profile)) {
-    case RuntimeDeliveryProfile.LatencyOptimized:
-      return {
-        derivedStateReplayMaxEnvelopes: defaultDerivedStateReplayMaxEnvelopes,
-        derivedStateReplayMaxSessions: defaultDerivedStateReplayMaxSessions,
-      };
-    case RuntimeDeliveryProfile.Balanced:
-      return {
-        derivedStateReplayMaxEnvelopes:
-          defaultDerivedStateReplayMaxEnvelopes * 2,
-        derivedStateReplayMaxSessions:
-          defaultDerivedStateReplayMaxSessions + 2,
-      };
-    case RuntimeDeliveryProfile.DeliveryDisciplined:
-      return {
-        derivedStateReplayMaxEnvelopes:
-          defaultDerivedStateReplayMaxEnvelopes * 4,
-        derivedStateReplayMaxSessions:
-          defaultDerivedStateReplayMaxSessions * 2,
-      };
+  const result = tryRuntimeDeliveryProfileEnvDefaults(profile);
+  if (!isErr(result)) {
+    return result.value;
   }
+
+  throw new RangeError(`unknown runtime delivery profile: ${String(profile)}`);
 }
 
 export function parseRuntimeDeliveryProfile(

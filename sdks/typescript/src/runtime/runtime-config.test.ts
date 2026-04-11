@@ -15,6 +15,7 @@ import {
   derivedStateReplayBackendEnvValues,
   derivedStateReplayBackendEnvVarName,
   derivedStateReplayBackendToEnvValue,
+  parseDerivedStateReplayDirectory,
   derivedStateReplayDirectory,
   derivedStateReplayDirEnvVarName,
   derivedStateRecoveryIntervalEnvVarName,
@@ -46,6 +47,15 @@ import {
   parseRuntimeBoolean,
   parseShredTrustMode,
   RuntimeDeliveryProfile,
+  tryDerivedStateReplayBackendToEnvValue,
+  tryDerivedStateReplayDurabilityToEnvValue,
+  tryNonNegativeIntegerToEnvValue,
+  tryObserverRuntimeConfig,
+  tryObserverRuntimeConfigForProfile,
+  tryProviderStreamCapabilityPolicyToEnvValue,
+  tryRuntimeDeliveryProfileEnvDefaults,
+  tryRuntimeDeliveryProfileToEnvValue,
+  tryShredTrustModeToEnvValue,
   runtimeDeliveryProfileEnvDefaults,
   runtimeBooleanAllowedValues,
   runtimeBooleanEnvValues,
@@ -694,64 +704,171 @@ test("derived-state replay config exposes checkpoint-only helper", () => {
   assert.equal(replay.isEnabled(), false);
 });
 
-test("derived-state configs reject invalid programmatic numeric values", () => {
-  assert.throws(
-    () =>
-      new DerivedStateRuntimeConfig({
-        checkpointIntervalMs: -1,
-      }),
-    /checkpointIntervalMs must be a non-negative integer/,
+test("result-return helpers validate programmatic numeric and path values", () => {
+  const invalidRuntime = DerivedStateRuntimeConfig.tryCreate({
+    checkpointIntervalMs: -1,
+  });
+  const invalidReplay = DerivedStateReplayConfig.tryCreate({
+    maxSessions: -1,
+  });
+  const invalidInteger = tryNonNegativeIntegerToEnvValue(
+    -1,
+    derivedStateReplayMaxEnvelopesEnvVarName,
+    "value",
   );
-  assert.throws(
-    () =>
-      new DerivedStateReplayConfig({
-        maxSessions: -1,
-      }),
-    /maxSessions must be a non-negative integer/,
-  );
-  assert.throws(
-    () => nonNegativeIntegerToEnvValue(-1),
-    /value must be a non-negative integer/,
-  );
+  const invalidDirectory = parseDerivedStateReplayDirectory("   ");
+
+  assert.equal(isErr(invalidRuntime), true);
+  assert.equal(isErr(invalidReplay), true);
+  assert.equal(isErr(invalidInteger), true);
+  assert.equal(isErr(invalidDirectory), true);
+
+  if (isErr(invalidRuntime)) {
+    assert.equal(
+      invalidRuntime.error.kind,
+      ValidationErrorKind.InvalidNonNegativeInteger,
+    );
+    assert.equal(
+      invalidRuntime.error.field,
+      derivedStateCheckpointIntervalEnvVarName,
+    );
+    assert.equal(
+      invalidRuntime.error.message,
+      "checkpointIntervalMs must be a non-negative integer",
+    );
+  }
+
+  if (isErr(invalidReplay)) {
+    assert.equal(
+      invalidReplay.error.kind,
+      ValidationErrorKind.InvalidNonNegativeInteger,
+    );
+    assert.equal(
+      invalidReplay.error.field,
+      derivedStateReplayMaxSessionsEnvVarName,
+    );
+    assert.equal(
+      invalidReplay.error.message,
+      "maxSessions must be a non-negative integer",
+    );
+  }
+
+  if (isErr(invalidInteger)) {
+    assert.equal(
+      invalidInteger.error.kind,
+      ValidationErrorKind.InvalidNonNegativeInteger,
+    );
+    assert.equal(
+      invalidInteger.error.field,
+      derivedStateReplayMaxEnvelopesEnvVarName,
+    );
+    assert.equal(
+      invalidInteger.error.message,
+      "value must be a non-negative integer",
+    );
+  }
+
+  if (isErr(invalidDirectory)) {
+    assert.equal(
+      invalidDirectory.error.kind,
+      ValidationErrorKind.InvalidDerivedStateReplayDirectory,
+    );
+    assert.equal(invalidDirectory.error.field, derivedStateReplayDirEnvVarName);
+    assert.equal(invalidDirectory.error.message, "replayDirectory must not be empty");
+  }
 });
 
-test("runtime config helpers reject invalid programmatic enum and path values", () => {
-  assert.throws(
-    () => runtimeDeliveryProfileToEnvValue(99 as RuntimeDeliveryProfile),
-    /unknown runtime delivery profile/,
+test("result-return helpers reject invalid programmatic enum and profile values", () => {
+  const invalidProfile = tryRuntimeDeliveryProfileToEnvValue(
+    99 as RuntimeDeliveryProfile,
   );
-  assert.throws(
-    () => shredTrustModeToEnvValue(99 as ShredTrustMode),
-    /unknown shred trust mode/,
+  const invalidProfileDefaults = tryRuntimeDeliveryProfileEnvDefaults(
+    99 as RuntimeDeliveryProfile,
   );
-  assert.throws(
-    () =>
-      providerStreamCapabilityPolicyToEnvValue(
-        99 as ProviderStreamCapabilityPolicy,
-      ),
-    /unknown provider stream capability policy/,
+  const invalidShredTrustMode = tryShredTrustModeToEnvValue(99 as ShredTrustMode);
+  const invalidCapabilityPolicy = tryProviderStreamCapabilityPolicyToEnvValue(
+    99 as ProviderStreamCapabilityPolicy,
   );
-  assert.throws(
-    () =>
-      derivedStateReplayBackendToEnvValue(99 as DerivedStateReplayBackend),
-    /unknown derived-state replay backend/,
+  const invalidReplayBackend = tryDerivedStateReplayBackendToEnvValue(
+    99 as DerivedStateReplayBackend,
   );
-  assert.throws(
-    () =>
-      derivedStateReplayDurabilityToEnvValue(
-        99 as DerivedStateReplayDurability,
-      ),
-    /unknown derived-state replay durability/,
+  const invalidReplayDurability = tryDerivedStateReplayDurabilityToEnvValue(
+    99 as DerivedStateReplayDurability,
   );
-  assert.throws(
-    () => derivedStateReplayDirectory("   "),
-    /replayDirectory must not be empty/,
+  const invalidRuntimeConfig = tryObserverRuntimeConfig({
+    providerStreamAllowEof: "true" as unknown as boolean,
+  });
+  const invalidProfileConfig = tryObserverRuntimeConfigForProfile(
+    99 as RuntimeDeliveryProfile,
   );
-  assert.throws(
-    () =>
-      new ObserverRuntimeConfig({
-        providerStreamAllowEof: "true" as unknown as boolean,
-      }),
-    /providerStreamAllowEof must be a boolean/,
-  );
+
+  assert.equal(isErr(invalidProfile), true);
+  assert.equal(isErr(invalidProfileDefaults), true);
+  assert.equal(isErr(invalidShredTrustMode), true);
+  assert.equal(isErr(invalidCapabilityPolicy), true);
+  assert.equal(isErr(invalidReplayBackend), true);
+  assert.equal(isErr(invalidReplayDurability), true);
+  assert.equal(isErr(invalidRuntimeConfig), true);
+  assert.equal(isErr(invalidProfileConfig), true);
+
+  if (isErr(invalidProfile)) {
+    assert.equal(
+      invalidProfile.error.kind,
+      ValidationErrorKind.InvalidRuntimeDeliveryProfile,
+    );
+    assert.equal(invalidProfile.error.field, runtimeDeliveryProfileEnvVarName);
+  }
+
+  if (isErr(invalidProfileDefaults)) {
+    assert.equal(
+      invalidProfileDefaults.error.kind,
+      ValidationErrorKind.InvalidRuntimeDeliveryProfile,
+    );
+  }
+
+  if (isErr(invalidShredTrustMode)) {
+    assert.equal(
+      invalidShredTrustMode.error.kind,
+      ValidationErrorKind.InvalidShredTrustMode,
+    );
+  }
+
+  if (isErr(invalidCapabilityPolicy)) {
+    assert.equal(
+      invalidCapabilityPolicy.error.kind,
+      ValidationErrorKind.InvalidProviderStreamCapabilityPolicy,
+    );
+  }
+
+  if (isErr(invalidReplayBackend)) {
+    assert.equal(
+      invalidReplayBackend.error.kind,
+      ValidationErrorKind.InvalidDerivedStateReplayBackend,
+    );
+  }
+
+  if (isErr(invalidReplayDurability)) {
+    assert.equal(
+      invalidReplayDurability.error.kind,
+      ValidationErrorKind.InvalidDerivedStateReplayDurability,
+    );
+  }
+
+  if (isErr(invalidRuntimeConfig)) {
+    assert.equal(
+      invalidRuntimeConfig.error.kind,
+      ValidationErrorKind.InvalidProviderStreamAllowEof,
+    );
+    assert.equal(
+      invalidRuntimeConfig.error.message,
+      "providerStreamAllowEof must be a boolean",
+    );
+  }
+
+  if (isErr(invalidProfileConfig)) {
+    assert.equal(
+      invalidProfileConfig.error.kind,
+      ValidationErrorKind.InvalidRuntimeDeliveryProfile,
+    );
+  }
 });

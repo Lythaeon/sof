@@ -3,6 +3,8 @@
   "version": "0.1.0",
   "description": "Unified SOF TypeScript SDK",
   "license": "MIT OR Apache-2.0",
+  "sideEffects": false,
+  "packageManager": "pnpm@10.28.2",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Lythaeon/sof.git",
@@ -12,6 +14,9 @@
     "url": "https://github.com/Lythaeon/sof/issues"
   },
   "homepage": "https://github.com/Lythaeon/sof/tree/main/sdks/typescript",
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -25,20 +30,20 @@
       "import": "./dist/runtime.js"
     },
     "./runtime/config": {
-      "types": "./dist/runtime/runtime-config.d.ts",
-      "import": "./dist/runtime/runtime-config.js"
+      "types": "./dist/runtime/config.d.ts",
+      "import": "./dist/runtime/config.js"
     },
     "./runtime/policy": {
-      "types": "./dist/runtime/runtime-policy.d.ts",
-      "import": "./dist/runtime/runtime-policy.js"
+      "types": "./dist/runtime/policy.d.ts",
+      "import": "./dist/runtime/policy.js"
     },
     "./runtime/derived-state": {
       "types": "./dist/runtime/derived-state.d.ts",
       "import": "./dist/runtime/derived-state.js"
     },
     "./runtime/delivery-profile": {
-      "types": "./dist/runtime/runtime-delivery-profile.d.ts",
-      "import": "./dist/runtime/runtime-delivery-profile.js"
+      "types": "./dist/runtime/delivery-profile.d.ts",
+      "import": "./dist/runtime/delivery-profile.js"
     }
   },
   "files": [
@@ -46,14 +51,22 @@
   ],
   "scripts": {
     "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true }); rmSync('dist-test', { recursive: true, force: true });\"",
-    "build": "npm run clean && tsc -p tsconfig.build.json",
+    "build": "pnpm run clean && tsdown --config tsdown.config.ts",
     "build:test": "tsc -p tsconfig.test.json",
+    "lint": "oxlint --config .oxlintrc.json --tsconfig tsconfig.json --type-aware --deny-warnings --report-unused-disable-directives src tsdown.config.ts",
+    "lint:fix": "oxlint --config .oxlintrc.json --tsconfig tsconfig.json --type-aware --fix --fix-suggestions src tsdown.config.ts",
+    "check:package": "publint run --strict --pack pnpm",
+    "check": "pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run check:package",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && npm run build:test && node --test dist-test/*.test.js dist-test/**/*.test.js",
-    "prepack": "npm run build"
+    "test": "pnpm run build && pnpm run build:test && node --test dist-test/*.test.js dist-test/**/*.test.js",
+    "prepack": "pnpm run build"
   },
   "devDependencies": {
     "@types/node": "^24.6.0",
+    "oxlint": "^1.59.0",
+    "oxlint-tsgolint": "^0.20.0",
+    "publint": "^0.3.18",
+    "tsdown": "^0.21.7",
     "typescript": "^5.9.3"
   }
 }

@@ -9,10 +9,10 @@ import type { ValidationError } from "../errors.js";
 import { isErr, ok, type Result } from "../result.js";
 import {
   defaultRuntimeDeliveryProfile,
-  isRuntimeDeliveryProfile,
   parseRuntimeDeliveryProfile,
   RuntimeDeliveryProfile,
-  runtimeDeliveryProfileEnvDefaults,
+  tryRuntimeDeliveryProfileEnvDefaults,
+  validateRuntimeDeliveryProfile,
   type RuntimeDeliveryProfileEnvValue,
   runtimeDeliveryProfileEnvVarName,
   runtimeDeliveryProfileToEnvValue,
@@ -30,10 +30,12 @@ import {
   derivedStateReplayBackendEnvVarName,
   derivedStateReplayBackendToEnvValue,
   derivedStateReplayDirEnvVarName,
+  parseDerivedStateReplayDirectory,
   derivedStateReplayDurabilityEnvVarName,
   derivedStateReplayDurabilityToEnvValue,
   derivedStateReplayMaxEnvelopesEnvVarName,
   derivedStateReplayMaxSessionsEnvVarName,
+  type DerivedStateValidationError,
   DerivedStateReplayConfig,
   type DerivedStateReplayBackendEnvValue,
   type DerivedStateReplayDirectory,
@@ -46,25 +48,26 @@ import {
   parseDerivedStateReplayBackend,
   parseDerivedStateReplayDurability,
   parseNonNegativeInteger,
-  derivedStateReplayDirectory,
+  tryDerivedStateRuntimeConfig,
 } from "./derived-state.js";
 import {
   defaultProviderStreamAllowEof,
   defaultProviderStreamCapabilityPolicy,
   defaultShredTrustMode,
-  isProviderStreamCapabilityPolicy,
-  isShredTrustMode,
   parseProviderStreamCapabilityPolicy,
   parseRuntimeBoolean,
   parseShredTrustMode,
-  ProviderStreamCapabilityPolicy,
+  type ProviderStreamCapabilityPolicy,
   providerStreamAllowEofEnvVarName,
   providerStreamCapabilityPolicyEnvVarName,
   providerStreamCapabilityPolicyToEnvValue,
   type ProviderStreamCapabilityPolicyEnvValue,
   runtimeBooleanToEnvValue,
   type RuntimeBooleanEnvValue,
-  ShredTrustMode,
+  type ShredTrustMode,
+  validateProviderStreamCapabilityPolicy,
+  validateRuntimeBooleanInput,
+  validateShredTrustMode,
   shredTrustModeEnvVarName,
   shredTrustModeToEnvValue,
   type ShredTrustModeEnvValue,
@@ -136,44 +139,56 @@ export type ObserverRuntimeValidationError =
   | ValidationError<RuntimeBooleanEnvValue>
   | ValidationError<DerivedStateReplayBackendEnvValue>
   | ValidationError<DerivedStateReplayDurabilityEnvValue>
-  | ValidationError;
+  | DerivedStateValidationError;
+
+function throwObserverRuntimeValidationError(
+  error: ObserverRuntimeValidationError,
+): never {
+  throw new RangeError(error.message);
+}
 
 function requireBoolean(field: string, value: boolean): boolean {
-  if (typeof value !== "boolean") {
-    throw new TypeError(`${field} must be a boolean`);
+  const validated = validateRuntimeBooleanInput(
+    value,
+    providerStreamAllowEofEnvVarName,
+    field,
+  );
+  if (isErr(validated)) {
+    throw new TypeError(validated.error.message);
   }
 
-  return value;
+  return validated.value;
 }
 
 function requireObserverRuntimeDeliveryProfile(
   value: RuntimeDeliveryProfile,
 ): RuntimeDeliveryProfile {
-  if (!isRuntimeDeliveryProfile(value)) {
-    throw new RangeError(`unknown runtime delivery profile: ${String(value)}`);
+  const validated = validateRuntimeDeliveryProfile(value);
+  if (isErr(validated)) {
+    throw new RangeError(validated.error.message);
   }
 
-  return value;
+  return validated.value;
 }
 
 function requireObserverShredTrustMode(value: ShredTrustMode): ShredTrustMode {
-  if (!isShredTrustMode(value)) {
-    throw new RangeError(`unknown shred trust mode: ${String(value)}`);
+  const validated = validateShredTrustMode(value);
+  if (isErr(validated)) {
+    throw new RangeError(validated.error.message);
   }
 
-  return value;
+  return validated.value;
 }
 
 function requireObserverProviderStreamCapabilityPolicy(
   value: ProviderStreamCapabilityPolicy,
 ): ProviderStreamCapabilityPolicy {
-  if (!isProviderStreamCapabilityPolicy(value)) {
-    throw new RangeError(
-      `unknown provider stream capability policy: ${String(value)}`,
-    );
+  const validated = validateProviderStreamCapabilityPolicy(value);
+  if (isErr(validated)) {
+    throw new RangeError(validated.error.message);
   }
 
-  return value;
+  return validated.value;
 }
 
 function shouldIncludeValue<T>(
@@ -184,24 +199,25 @@ function shouldIncludeValue<T>(
   return options.includeDefaults === true || currentValue !== defaultValue;
 }
 
-export function observerRuntimeConfig(
-  init: ObserverRuntimeConfigInput = {},
-): ObserverRuntimeConfig {
-  return init instanceof ObserverRuntimeConfig
-    ? init
-    : new ObserverRuntimeConfig(init);
-}
-
-export function observerRuntimeConfigForProfile(
+function applyRuntimeProfileDerivedStateDefaults(
   profile: RuntimeDeliveryProfile,
-  init: ObserverRuntimeProfileInit = {},
-): ObserverRuntimeConfig {
-  const derivedStateDefaults = runtimeDeliveryProfileEnvDefaults(profile);
+  init: ObserverRuntimeProfileInit,
+): Result<
+  ObserverRuntimeConfigInit,
+  ValidationError<RuntimeDeliveryProfileEnvValue>
+> {
+  const derivedStateDefaults = tryRuntimeDeliveryProfileEnvDefaults(profile);
+  if (isErr(derivedStateDefaults)) {
+    return derivedStateDefaults;
+  }
+
   const derivedState = init.derivedState;
   const replay =
-    derivedState instanceof DerivedStateRuntimeConfig ? derivedState.replay : derivedState?.replay;
+    derivedState instanceof DerivedStateRuntimeConfig
+      ? derivedState.replay
+      : derivedState?.replay;
 
-  return new ObserverRuntimeConfig({
+  return ok({
     ...init,
     runtimeDeliveryProfile: profile,
     derivedState:
@@ -216,13 +232,106 @@ export function observerRuntimeConfigForProfile(
                     ...replay,
                     maxEnvelopes:
                       replay?.maxEnvelopes ??
-                      derivedStateDefaults.derivedStateReplayMaxEnvelopes,
+                      derivedStateDefaults.value.derivedStateReplayMaxEnvelopes,
                     maxSessions:
                       replay?.maxSessions ??
-                      derivedStateDefaults.derivedStateReplayMaxSessions,
+                      derivedStateDefaults.value.derivedStateReplayMaxSessions,
                   },
           },
   });
+}
+
+export function tryObserverRuntimeConfig(
+  init: ObserverRuntimeConfigInput = {},
+): Result<ObserverRuntimeConfig, ObserverRuntimeValidationError> {
+  if (init instanceof ObserverRuntimeConfig) {
+    return ok(init);
+  }
+
+  const runtimeDeliveryProfile = validateRuntimeDeliveryProfile(
+    init.runtimeDeliveryProfile ?? defaultRuntimeDeliveryProfile,
+  );
+  if (isErr(runtimeDeliveryProfile)) {
+    return runtimeDeliveryProfile;
+  }
+
+  const shredTrustMode = validateShredTrustMode(
+    init.shredTrustMode ?? defaultShredTrustMode,
+  );
+  if (isErr(shredTrustMode)) {
+    return shredTrustMode;
+  }
+
+  const providerStreamCapabilityPolicy =
+    validateProviderStreamCapabilityPolicy(
+      init.providerStreamCapabilityPolicy ??
+        defaultProviderStreamCapabilityPolicy,
+    );
+  if (isErr(providerStreamCapabilityPolicy)) {
+    return providerStreamCapabilityPolicy;
+  }
+
+  const providerStreamAllowEof = validateRuntimeBooleanInput(
+    init.providerStreamAllowEof ?? defaultProviderStreamAllowEof,
+    providerStreamAllowEofEnvVarName,
+    "providerStreamAllowEof",
+  );
+  if (isErr(providerStreamAllowEof)) {
+    return providerStreamAllowEof;
+  }
+
+  const derivedState = tryDerivedStateRuntimeConfig(init.derivedState);
+  if (isErr(derivedState)) {
+    return derivedState;
+  }
+
+  return ok(
+    new ObserverRuntimeConfig({
+      runtimeDeliveryProfile: runtimeDeliveryProfile.value,
+      shredTrustMode: shredTrustMode.value,
+      providerStreamCapabilityPolicy: providerStreamCapabilityPolicy.value,
+      providerStreamAllowEof: providerStreamAllowEof.value,
+      derivedState: derivedState.value,
+    }),
+  );
+}
+
+export function tryObserverRuntimeConfigForProfile(
+  profile: RuntimeDeliveryProfile,
+  init: ObserverRuntimeProfileInit = {},
+): Result<ObserverRuntimeConfig, ObserverRuntimeValidationError> {
+  const withProfileDefaults = applyRuntimeProfileDerivedStateDefaults(
+    profile,
+    init,
+  );
+  if (isErr(withProfileDefaults)) {
+    return withProfileDefaults;
+  }
+
+  return tryObserverRuntimeConfig(withProfileDefaults.value);
+}
+
+export function observerRuntimeConfig(
+  init: ObserverRuntimeConfigInput = {},
+): ObserverRuntimeConfig {
+  const result = tryObserverRuntimeConfig(init);
+  if (isErr(result)) {
+    throwObserverRuntimeValidationError(result.error);
+  }
+
+  return result.value;
+}
+
+export function observerRuntimeConfigForProfile(
+  profile: RuntimeDeliveryProfile,
+  init: ObserverRuntimeProfileInit = {},
+): ObserverRuntimeConfig {
+  const result = tryObserverRuntimeConfigForProfile(profile, init);
+  if (isErr(result)) {
+    throwObserverRuntimeValidationError(result.error);
+  }
+
+  return result.value;
 }
 
 export class ObserverRuntimeConfig {
@@ -255,11 +364,24 @@ export class ObserverRuntimeConfig {
     return observerRuntimeConfig(init);
   }
 
+  static tryCreate(
+    init: ObserverRuntimeConfigInput = {},
+  ): Result<ObserverRuntimeConfig, ObserverRuntimeValidationError> {
+    return tryObserverRuntimeConfig(init);
+  }
+
   static forProfile(
     profile: RuntimeDeliveryProfile,
     init: ObserverRuntimeProfileInit = {},
   ): ObserverRuntimeConfig {
     return observerRuntimeConfigForProfile(profile, init);
+  }
+
+  static tryForProfile(
+    profile: RuntimeDeliveryProfile,
+    init: ObserverRuntimeProfileInit = {},
+  ): Result<ObserverRuntimeConfig, ObserverRuntimeValidationError> {
+    return tryObserverRuntimeConfigForProfile(profile, init);
   }
 
   static latencyOptimized(
@@ -279,6 +401,33 @@ export class ObserverRuntimeConfig {
     init: ObserverRuntimeProfileInit = {},
   ): ObserverRuntimeConfig {
     return observerRuntimeConfigForProfile(
+      RuntimeDeliveryProfile.DeliveryDisciplined,
+      init,
+    );
+  }
+
+  static tryLatencyOptimized(
+    init: ObserverRuntimeProfileInit = {},
+  ): Result<ObserverRuntimeConfig, ObserverRuntimeValidationError> {
+    return tryObserverRuntimeConfigForProfile(
+      RuntimeDeliveryProfile.LatencyOptimized,
+      init,
+    );
+  }
+
+  static tryBalanced(
+    init: ObserverRuntimeProfileInit = {},
+  ): Result<ObserverRuntimeConfig, ObserverRuntimeValidationError> {
+    return tryObserverRuntimeConfigForProfile(
+      RuntimeDeliveryProfile.Balanced,
+      init,
+    );
+  }
+
+  static tryDeliveryDisciplined(
+    init: ObserverRuntimeProfileInit = {},
+  ): Result<ObserverRuntimeConfig, ObserverRuntimeValidationError> {
+    return tryObserverRuntimeConfigForProfile(
       RuntimeDeliveryProfile.DeliveryDisciplined,
       init,
     );
@@ -603,9 +752,13 @@ export class ObserverRuntimeConfig {
 
     let parsedDerivedStateReplayDirectory = defaultDerivedStateReplayDirectory;
     if (derivedStateReplayDir !== undefined && derivedStateReplayDir.trim() !== "") {
-      parsedDerivedStateReplayDirectory = derivedStateReplayDirectory(
+      const parsed = parseDerivedStateReplayDirectory(
         derivedStateReplayDir,
       );
+      if (isErr(parsed)) {
+        return parsed;
+      }
+      parsedDerivedStateReplayDirectory = parsed.value;
     }
 
     let parsedDerivedStateReplayDurability = defaultDerivedStateReplayDurability;
@@ -654,25 +807,23 @@ export class ObserverRuntimeConfig {
       parsedDerivedStateReplayMaxSessions = parsed.value;
     }
 
-    return ok(
-      new ObserverRuntimeConfig({
-        runtimeDeliveryProfile: parsedRuntimeDeliveryProfile,
-        shredTrustMode: parsedShredTrustMode,
-        providerStreamCapabilityPolicy: parsedProviderStreamCapabilityPolicy,
-        providerStreamAllowEof: parsedProviderStreamAllowEof,
-        derivedState: new DerivedStateRuntimeConfig({
-          checkpointIntervalMs: parsedCheckpointIntervalMs,
-          recoveryIntervalMs: parsedRecoveryIntervalMs,
-          replay: new DerivedStateReplayConfig({
-            backend: parsedDerivedStateReplayBackend,
-            replayDirectory: parsedDerivedStateReplayDirectory,
-            durability: parsedDerivedStateReplayDurability,
-            maxEnvelopes: parsedDerivedStateReplayMaxEnvelopes,
-            maxSessions: parsedDerivedStateReplayMaxSessions,
-          }),
-        }),
-      }),
-    );
+    return tryObserverRuntimeConfig({
+      runtimeDeliveryProfile: parsedRuntimeDeliveryProfile,
+      shredTrustMode: parsedShredTrustMode,
+      providerStreamCapabilityPolicy: parsedProviderStreamCapabilityPolicy,
+      providerStreamAllowEof: parsedProviderStreamAllowEof,
+      derivedState: {
+        checkpointIntervalMs: parsedCheckpointIntervalMs,
+        recoveryIntervalMs: parsedRecoveryIntervalMs,
+        replay: {
+          backend: parsedDerivedStateReplayBackend,
+          replayDirectory: parsedDerivedStateReplayDirectory,
+          durability: parsedDerivedStateReplayDurability,
+          maxEnvelopes: parsedDerivedStateReplayMaxEnvelopes,
+          maxSessions: parsedDerivedStateReplayMaxSessions,
+        },
+      },
+    });
   }
 
   static fromEnvironmentRecord(

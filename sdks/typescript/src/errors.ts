@@ -8,6 +8,7 @@ export enum ValidationErrorKind {
   InvalidDerivedStateReplayBackend = 5,
   InvalidDerivedStateReplayDurability = 6,
   InvalidNonNegativeInteger = 7,
+  InvalidDerivedStateReplayDirectory = 8,
 }
 
 export interface ValidationError<AllowedValue extends string = string> {

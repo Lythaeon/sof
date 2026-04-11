@@ -2,9 +2,17 @@
 
 Unified TypeScript SDK surface for SOF.
 
+## Tooling
+
+- Use `pnpm` for this package.
+- `pnpm run build` produces minified ESM library output plus `.d.ts` files.
+- `pnpm run lint` runs the `oxlint` production lint profile.
+- `pnpm run check` runs lint, typecheck, tests, and package-shape validation.
+
 ## Mental Model
 
 - Use `ObserverRuntimeConfig` when you want to build or parse the SOF env surface safely.
+- Prefer `ObserverRuntimeConfig.tryCreate(...)`, `.tryBalanced(...)`, and `fromEnvironmentRecord(...)` when you want validation errors as `Result` values instead of thrown exceptions.
 - Use `ObserverRuntimeConfig.balanced()` / `.deliveryDisciplined()` when you want one-line profile presets.
 - Profile presets in this SDK stamp the profile env plus the derived-state replay retention defaults that SOF applies through env-backed setup.
 - Rust still owns host-builder dispatch defaults such as plugin-host and runtime-extension-host queue and timeout wiring. This SDK currently models the env/config surface, not those in-process host builders.
@@ -30,6 +38,7 @@ This initial package slice provides:
 - typed environment entry helpers instead of only raw string maps
 - plain-object nested config construction, so common cases do not require chained `new` calls
 - one-line runtime profile presets such as `ObserverRuntimeConfig.balanced()`
+- result-return factory and serialization helpers for programmatic validation, so SDK consumers do not need to rely on exceptions for normal invalid-input handling
 - focused subpath imports when you only want one SDK slice, for example `@sof/sdk/runtime/config`
 
 ## Example
@@ -112,16 +121,15 @@ checkpointOnly;
 ## Quick Start
 
 ```ts
-import { ObserverRuntimeConfig } from "@sof/sdk";
+import { isErr, ObserverRuntimeConfig } from "@sof/sdk";
 
-const config = ObserverRuntimeConfig.deliveryDisciplined();
-const env = config.toEnvironmentRecord();
+const config = ObserverRuntimeConfig.tryDeliveryDisciplined();
 
-// {
-//   SOF_RUNTIME_DELIVERY_PROFILE: "delivery_disciplined",
-//   SOF_DERIVED_STATE_REPLAY_MAX_ENVELOPES: "32768",
-//   SOF_DERIVED_STATE_REPLAY_MAX_SESSIONS: "8",
-// }
+if (isErr(config)) {
+  throw new Error(config.error.message);
+}
+
+const env = config.value.toEnvironmentRecord();
 
 env;
 ```
@@ -164,6 +172,7 @@ config;
 ## Choosing An API
 
 - Use `ObserverRuntimeConfig.fromEnvironmentRecord(...)` when you need to validate env from files, CI, or process managers.
+- Use `ObserverRuntimeConfig.tryCreate(...)` or `tryObserverRuntimeConfigForProfile(...)` when invalid programmatic input should stay in `Result` form.
 - Use `ObserverRuntimeConfig.balanced(...)` or `observerRuntimeConfigForProfile(...)` when you want profile-first setup.
 - Use `derivedStateRuntimeConfig(...)` or `DerivedStateRuntimeConfig.checkpointOnly()` when your main concern is derived-state recovery behavior.
 - Use the root `@sof/sdk` import for convenience. Use subpath imports when you want a smaller, more explicit import surface in application code.

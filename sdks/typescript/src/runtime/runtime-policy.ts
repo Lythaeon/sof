@@ -1,7 +1,7 @@
 import { brand, type Brand } from "../brand.js";
 import { envVarName, type EnvVarName } from "../environment.js";
 import { ValidationErrorKind, type ValidationError } from "../errors.js";
-import { err, ok, type Result } from "../result.js";
+import { err, isErr, ok, type Result } from "../result.js";
 
 export enum ShredTrustMode {
   PublicUntrusted = 1,
@@ -106,46 +106,133 @@ export function isProviderStreamCapabilityPolicy(
   }
 }
 
-function requireShredTrustMode(value: ShredTrustMode): ShredTrustMode {
+export function validateShredTrustMode(
+  value: ShredTrustMode,
+): Result<ShredTrustMode, ValidationError<ShredTrustModeEnvValue>> {
   if (!isShredTrustMode(value)) {
-    throw new RangeError(`unknown shred trust mode: ${String(value)}`);
+    return err({
+      kind: ValidationErrorKind.InvalidShredTrustMode,
+      field: shredTrustModeEnvVarName,
+      received: String(value),
+      message:
+        "shred trust mode must be public_untrusted or trusted_raw_shred_provider",
+      allowedValues: shredTrustModeAllowedValues,
+    });
   }
 
-  return value;
+  return ok(value);
 }
 
-function requireProviderStreamCapabilityPolicy(
+export function validateProviderStreamCapabilityPolicy(
   value: ProviderStreamCapabilityPolicy,
-): ProviderStreamCapabilityPolicy {
+): Result<
+  ProviderStreamCapabilityPolicy,
+  ValidationError<ProviderStreamCapabilityPolicyEnvValue>
+> {
   if (!isProviderStreamCapabilityPolicy(value)) {
-    throw new RangeError(
-      `unknown provider stream capability policy: ${String(value)}`,
-    );
+    return err({
+      kind: ValidationErrorKind.InvalidProviderStreamCapabilityPolicy,
+      field: providerStreamCapabilityPolicyEnvVarName,
+      received: String(value),
+      message: "provider stream capability policy must be warn or strict",
+      allowedValues: providerStreamCapabilityPolicyAllowedValues,
+    });
   }
 
-  return value;
+  return ok(value);
+}
+
+export function validateRuntimeBooleanInput(
+  value: unknown,
+  field: EnvVarName,
+  propertyName: string,
+): Result<boolean, ValidationError<RuntimeBooleanEnvValue>> {
+  if (typeof value !== "boolean") {
+    return err({
+      kind: ValidationErrorKind.InvalidProviderStreamAllowEof,
+      field,
+      received: String(value),
+      message: `${propertyName} must be a boolean`,
+    });
+  }
+
+  return ok(value);
+}
+
+export function tryShredTrustModeToEnvValue(
+  mode: ShredTrustMode,
+): Result<ShredTrustModeEnvValue, ValidationError<ShredTrustModeEnvValue>> {
+  const validated = validateShredTrustMode(mode);
+  if (isErr(validated)) {
+    return validated;
+  }
+
+  switch (validated.value) {
+    case ShredTrustMode.PublicUntrusted:
+      return ok(shredTrustModeEnvValues.publicUntrusted);
+    case ShredTrustMode.TrustedRawShredProvider:
+      return ok(shredTrustModeEnvValues.trustedRawShredProvider);
+  }
+
+  return err({
+    kind: ValidationErrorKind.InvalidShredTrustMode,
+    field: shredTrustModeEnvVarName,
+    received: String(mode),
+    message:
+      "shred trust mode must be public_untrusted or trusted_raw_shred_provider",
+    allowedValues: shredTrustModeAllowedValues,
+  });
+}
+
+export function tryProviderStreamCapabilityPolicyToEnvValue(
+  policy: ProviderStreamCapabilityPolicy,
+): Result<
+  ProviderStreamCapabilityPolicyEnvValue,
+  ValidationError<ProviderStreamCapabilityPolicyEnvValue>
+> {
+  const validated = validateProviderStreamCapabilityPolicy(policy);
+  if (isErr(validated)) {
+    return validated;
+  }
+
+  switch (validated.value) {
+    case ProviderStreamCapabilityPolicy.Warn:
+      return ok(providerStreamCapabilityPolicyEnvValues.warn);
+    case ProviderStreamCapabilityPolicy.Strict:
+      return ok(providerStreamCapabilityPolicyEnvValues.strict);
+  }
+
+  return err({
+    kind: ValidationErrorKind.InvalidProviderStreamCapabilityPolicy,
+    field: providerStreamCapabilityPolicyEnvVarName,
+    received: String(policy),
+    message: "provider stream capability policy must be warn or strict",
+    allowedValues: providerStreamCapabilityPolicyAllowedValues,
+  });
 }
 
 export function shredTrustModeToEnvValue(
   mode: ShredTrustMode,
 ): ShredTrustModeEnvValue {
-  switch (requireShredTrustMode(mode)) {
-    case ShredTrustMode.PublicUntrusted:
-      return shredTrustModeEnvValues.publicUntrusted;
-    case ShredTrustMode.TrustedRawShredProvider:
-      return shredTrustModeEnvValues.trustedRawShredProvider;
+  const result = tryShredTrustModeToEnvValue(mode);
+  if (!isErr(result)) {
+    return result.value;
   }
+
+  throw new RangeError(`unknown shred trust mode: ${String(mode)}`);
 }
 
 export function providerStreamCapabilityPolicyToEnvValue(
   policy: ProviderStreamCapabilityPolicy,
 ): ProviderStreamCapabilityPolicyEnvValue {
-  switch (requireProviderStreamCapabilityPolicy(policy)) {
-    case ProviderStreamCapabilityPolicy.Warn:
-      return providerStreamCapabilityPolicyEnvValues.warn;
-    case ProviderStreamCapabilityPolicy.Strict:
-      return providerStreamCapabilityPolicyEnvValues.strict;
+  const result = tryProviderStreamCapabilityPolicyToEnvValue(policy);
+  if (!isErr(result)) {
+    return result.value;
   }
+
+  throw new RangeError(
+    `unknown provider stream capability policy: ${String(policy)}`,
+  );
 }
 
 export function runtimeBooleanToEnvValue(value: boolean): RuntimeBooleanEnvValue {

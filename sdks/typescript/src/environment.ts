@@ -14,6 +14,12 @@ export type EnvironmentInput =
   | Readonly<Record<string, string | undefined>>
   | readonly EnvironmentVariable[];
 
+function isEnvironmentVariableList(
+  input: EnvironmentInput,
+): input is readonly EnvironmentVariable[] {
+  return Array.isArray(input);
+}
+
 export function envVarName<const Name extends string>(value: Name): EnvVarName {
   return brand<Name, "EnvVarName">(value);
 }
@@ -28,36 +34,47 @@ export function environmentVariable<
 export function environmentVariablesToRecord(
   variables: readonly EnvironmentVariable[],
 ): Readonly<Record<string, string>> {
-  const record: Record<string, string> = Object.create(null) as Record<
-    string,
-    string
-  >;
+  const record = Object.fromEntries(
+    variables.map((variable) => [variable.name, variable.value] as const),
+  );
 
-  for (const variable of variables) {
-    record[variable.name] = variable.value;
-  }
+  Object.setPrototypeOf(record, null);
 
   return record;
+}
+
+function readEnvironmentVariableFromList(
+  variables: readonly EnvironmentVariable[],
+  name: EnvVarName,
+): string | undefined {
+  for (let index = variables.length - 1; index >= 0; index -= 1) {
+    const variable = variables[index];
+    if (variable?.name === name) {
+      return variable.value;
+    }
+  }
+
+  return undefined;
+}
+
+function readEnvironmentVariableFromRecord(
+  input: Readonly<Record<string, string | undefined>>,
+  name: EnvVarName,
+): string | undefined {
+  if (!Object.prototype.hasOwnProperty.call(input, name)) {
+    return undefined;
+  }
+
+  return input[name];
 }
 
 export function readEnvironmentVariable(
   input: EnvironmentInput,
   name: EnvVarName,
 ): string | undefined {
-  if (Array.isArray(input)) {
-    for (let index = input.length - 1; index >= 0; index -= 1) {
-      const variable = input[index];
-      if (variable?.name === name) {
-        return variable.value;
-      }
-    }
-    return undefined;
+  if (isEnvironmentVariableList(input)) {
+    return readEnvironmentVariableFromList(input, name);
   }
 
-  const record = input as Readonly<Record<string, string | undefined>>;
-  if (!Object.prototype.hasOwnProperty.call(record, name)) {
-    return undefined;
-  }
-
-  return record[name];
+  return readEnvironmentVariableFromRecord(input, name);
 }

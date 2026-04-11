@@ -12,6 +12,9 @@
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,
     "noFallthroughCasesInSwitch": true,
+    "types": [
+      "node"
+    ],
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true
   },
