@@ -36,6 +36,7 @@ User-facing crate docs:
 - ADR-0010: `adr/0010-dedicated-derived-state-feed.md` (Implemented)
 - ADR-0011: `adr/0011-plugin-config-and-lifecycle-hooks.md` (Implemented)
 - ADR-0012: `adr/0012-runtime-owned-observability-endpoints.md` (Implemented)
+- ADR-0013: `adr/0013-runtime-delivery-profiles.md` (Proposed)
 - Framework Hooks: `framework-plugin-hooks.md`
 - Derived-State Extension Contract: `derived-state-extension-contract.md`
 - Derived-State Feed Contract: `derived-state-feed-contract.md`
@@ -50,3 +51,4 @@ User-facing crate docs:
 - ARD-0007: `ard/0007-infrastructure-composition-and-runtime-model.md`
 - ARD-0008: `ard/0008-observability-and-operability-standards.md`
 - ARD-0009: `ard/0009-adr-process-and-governance.md`
+- ARD-0010: `ard/0010-simplification-without-capability-regression.md`

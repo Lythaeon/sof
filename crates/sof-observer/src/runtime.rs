@@ -177,6 +177,41 @@ pub struct RuntimeObservabilityConfig {
     pub bind_addr: Option<SocketAddr>,
 }
 
+/// Typed runtime-level downstream delivery bias.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RuntimeDeliveryProfile {
+    /// Preserve current SOF behavior: tight bounded queues and freshness-first shedding.
+    #[default]
+    LatencyOptimized,
+    /// Keep ingest bounded while allowing more buffering and earlier pressure signaling.
+    Balanced,
+    /// Favor stronger downstream ordering and drain discipline on runtime-owned non-hot lanes.
+    DeliveryDisciplined,
+}
+
+impl RuntimeDeliveryProfile {
+    /// Returns env-string representation used by `SOF_RUNTIME_DELIVERY_PROFILE`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LatencyOptimized => "latency_optimized",
+            Self::Balanced => "balanced",
+            Self::DeliveryDisciplined => "delivery_disciplined",
+        }
+    }
+
+    /// Parses config/env string into one typed delivery profile.
+    #[must_use]
+    pub fn from_config_value(value: &str) -> Option<Self> {
+        match value {
+            "latency_optimized" | "latency-optimized" => Some(Self::LatencyOptimized),
+            "balanced" => Some(Self::Balanced),
+            "delivery_disciplined" | "delivery-disciplined" => Some(Self::DeliveryDisciplined),
+            _ => None,
+        }
+    }
+}
+
 /// Explicit trust posture for raw-shred ingest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShredTrustMode {
@@ -380,6 +415,12 @@ impl RuntimeSetup {
             Some(bind_addr) => self.with_observability_bind_addr(bind_addr),
             None => self,
         }
+    }
+
+    /// Sets `SOF_RUNTIME_DELIVERY_PROFILE`.
+    #[must_use]
+    pub fn with_runtime_delivery_profile(self, profile: RuntimeDeliveryProfile) -> Self {
+        self.with_env("SOF_RUNTIME_DELIVERY_PROFILE", profile.as_str())
     }
 
     /// Sets `SOF_GOSSIP_ENTRYPOINT` from a list of entrypoints.
@@ -4527,6 +4568,19 @@ mod tests {
         assert_eq!(
             overrides.get("SOF_OBSERVABILITY_BIND"),
             Some(&"127.0.0.1:9108".to_owned())
+        );
+    }
+
+    #[test]
+    fn typed_runtime_delivery_profile_uses_expected_strings() {
+        let setup =
+            RuntimeSetup::new().with_runtime_delivery_profile(RuntimeDeliveryProfile::Balanced);
+        assert_eq!(
+            setup.env_overrides.last(),
+            Some(&(
+                String::from("SOF_RUNTIME_DELIVERY_PROFILE"),
+                String::from("balanced"),
+            ))
         );
     }
 
