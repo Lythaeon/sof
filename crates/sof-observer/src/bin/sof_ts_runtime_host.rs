@@ -143,6 +143,7 @@ const WORKER_FRAME_START: u8 = 2;
 const WORKER_FRAME_PACKET_BATCH: u8 = 3;
 /// Frame tag for shutdown request.
 const WORKER_FRAME_SHUTDOWN: u8 = 4;
+#[cfg(feature = "provider-grpc")]
 /// Frame tag for provider-event batch delivery.
 const WORKER_FRAME_PROVIDER_BATCH: u8 = 5;
 
