@@ -4,7 +4,7 @@ function main(): number {
   const plugin = new Plugin({
     name: "demo-plugin",
     onStart: () => ok(runtimeExtensionAck()),
-    onPacket: () => ok(runtimeExtensionAck()),
+    onProviderEvent: () => ok(runtimeExtensionAck()),
     onStop: () => ok(runtimeExtensionAck()),
   });
 

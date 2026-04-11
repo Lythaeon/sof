@@ -37,7 +37,9 @@ const app = new App({
   plugins: [
     new Plugin({
       name: "tx-logger",
-      logPackets: true,
+      onProviderEvent: (event) => {
+        console.log(event);
+      },
     }),
   ],
 });
@@ -48,14 +50,14 @@ await app.run();
 `app.run()` is the normal execution path. It runs until the app is stopped.
 
 Current executable coverage:
-- `app.run()` supports one WebSocket ingress source today.
+- `app.run()` delegates every non-empty ingress config to the packaged native runtime host.
+- WebSocket ingress uses SOF's native provider-stream websocket adapter and delivers events to `Plugin.onProviderEvent`.
 - `DirectShreds` runs through the packaged native runtime host for one raw packet source per app.
 - `Grpc` runs through the packaged native runtime host with Yellowstone provider-stream events delivered to `Plugin.onProviderEvent`.
 - `Gossip` runs through the packaged native runtime host with gossip-bootstrap support.
 - Direct shreds can enable kernel bypass on Linux through a typed `kernelBypass` object.
 - One `DirectShreds` ingress plus one `Gossip` ingress run together as one raw runtime composition without `fanIn`.
-- Mixed WebSocket/native ingress and multi-WebSocket fan-in still return typed errors instead of silently falling through.
-- Multi-gRPC fan-in uses the Rust arbitration model: `EmitAll`, `FirstSeen`, or `FirstSeenThenPromote`.
+- Multi-provider fan-in uses the Rust arbitration model: `EmitAll`, `FirstSeen`, or `FirstSeenThenPromote`.
 - The package build includes the native host under `dist/native/<platform>-<arch>/`; `SOF_SDK_RUNTIME_HOST_BINARY` is only an override for development or custom deployments.
 - If the host is missing, `app.run()` returns a typed `Result` error instead of throwing.
 
@@ -221,8 +223,8 @@ import {
 const plugin = new Plugin({
   name: "packet-audit",
   onStart: () => ok(runtimeExtensionAck()),
-  onPacket: (event) => {
-    process.stdout.write(`${event.bytes.length}\n`);
+  onProviderEvent: (event) => {
+    process.stdout.write(`${event.kind}\n`);
     return ok(runtimeExtensionAck());
   },
   onStop: () => ok(runtimeExtensionAck()),

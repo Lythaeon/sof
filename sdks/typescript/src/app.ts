@@ -21,12 +21,9 @@ import {
   type RuntimeExtensionDefinition,
   type RuntimeExtensionError,
   type RuntimeExtensionWorkerManifest,
-  RuntimePacketEventClass,
   RuntimePacketSourceKind,
-  RuntimePacketTransport,
   type RuntimePacketEvent,
   type RuntimeProviderEvent,
-  RuntimeWebSocketFrameType,
   RuntimeDeliveryProfile,
   type ShredTrustMode,
   socketAddress,
@@ -126,7 +123,6 @@ export interface WebSocketIngressInit {
   readonly kind: IngressKind.WebSocket;
   readonly name?: string;
   readonly url: string;
-  readonly requests?: readonly WebSocketRequest[];
 }
 
 export interface GrpcIngressInit {
@@ -197,22 +193,6 @@ export interface WebSocketIngress {
   readonly kind: IngressKind.WebSocket;
   readonly name: string;
   readonly url: string;
-  readonly requests: readonly string[];
-}
-
-export type JsonPrimitive = string | number | boolean | null;
-export type JsonValue =
-  | JsonPrimitive
-  | readonly JsonValue[]
-  | {
-      readonly [key: string]: JsonValue;
-    };
-
-export interface WebSocketRequest {
-  readonly jsonrpc?: "2.0";
-  readonly id?: string | number;
-  readonly method: string;
-  readonly params?: readonly JsonValue[];
 }
 
 export interface GrpcIngress {
@@ -527,28 +507,10 @@ function validateWebSocketIngress(
     );
   }
 
-  const requests: string[] = [];
-  for (const request of ingress.requests ?? []) {
-    const method = parseNonEmptyValue(request.method, "ingress.requests.method", (value) => value);
-    if (isErr(method)) {
-      return method;
-    }
-
-    requests.push(
-      JSON.stringify({
-        jsonrpc: request.jsonrpc ?? "2.0",
-        id: request.id ?? index + requests.length + 1,
-        method: method.value,
-        ...(request.params === undefined ? {} : { params: request.params }),
-      }),
-    );
-  }
-
   return ok({
     kind: IngressKind.WebSocket,
     name: name.value,
     url: url.value,
-    requests,
   });
 }
 
@@ -1089,86 +1051,6 @@ function waitForChildExit(child: ChildProcess): Promise<Result<ChildExit, Error>
   });
 }
 
-function runtimeSourceForIngress(_ingress: WebSocketIngress, frameType: RuntimeWebSocketFrameType) {
-  return {
-    kind: RuntimePacketSourceKind.ObserverIngress,
-    transport: RuntimePacketTransport.WebSocket,
-    eventClass: RuntimePacketEventClass.Packet,
-    webSocketFrameType: frameType,
-  } as const;
-}
-
-function toPacketBytes(data: MessageEvent["data"]): Uint8Array {
-  if (typeof data === "string") {
-    return new TextEncoder().encode(data);
-  }
-
-  if (data instanceof ArrayBuffer) {
-    return new Uint8Array(data);
-  }
-
-  if (ArrayBuffer.isView(data)) {
-    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-  }
-
-  if (data instanceof Blob) {
-    throw new TypeError("Blob websocket frames are not supported in the synchronous packet path");
-  }
-
-  return new TextEncoder().encode(String(data));
-}
-
-function toWebSocketFrameType(data: MessageEvent["data"]): RuntimeWebSocketFrameType {
-  return typeof data === "string"
-    ? RuntimeWebSocketFrameType.Text
-    : RuntimeWebSocketFrameType.Binary;
-}
-
-function parseJsonRpcErrorMessage(
-  ingress: WebSocketIngress,
-  data: MessageEvent["data"],
-): AppError | undefined {
-  if (typeof data !== "string") {
-    return undefined;
-  }
-
-  try {
-    const parsed: unknown = JSON.parse(data);
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-      return undefined;
-    }
-    const id =
-      "id" in parsed && (typeof parsed.id === "string" || typeof parsed.id === "number")
-        ? parsed.id
-        : undefined;
-    const nestedError =
-      "error" in parsed &&
-      typeof parsed.error === "object" &&
-      parsed.error !== null &&
-      !Array.isArray(parsed.error)
-        ? parsed.error
-        : undefined;
-    const message =
-      nestedError !== undefined &&
-      "message" in nestedError &&
-      typeof nestedError.message === "string"
-        ? nestedError.message
-        : undefined;
-    if (message === undefined) {
-      return undefined;
-    }
-
-    return appError(
-      AppErrorKind.ValidationError,
-      "ingress.requests",
-      `websocket ingress ${ingress.name} rejected request ${String(id ?? "unknown")}: ${message}`,
-      data,
-    );
-  } catch {
-    return undefined;
-  }
-}
-
 function invokePluginReady(plugin: Plugin): Promise<Result<RuntimeExtensionAck, PluginError>> {
   const onReady = plugin.toDefinition().onReady;
   if (onReady === undefined) {
@@ -1193,18 +1075,6 @@ function invokePluginShutdown(plugin: Plugin): Promise<Result<RuntimeExtensionAc
       extensionName: plugin.name,
     }),
   );
-}
-
-function dispatchPacketToPlugin(
-  plugin: Plugin,
-  event: RuntimePacketEvent,
-): Promise<Result<RuntimeExtensionAck, PluginError>> {
-  const onPacket = plugin.toDefinition().onPacketReceived;
-  if (onPacket === undefined) {
-    return Promise.resolve(ok(runtimeExtensionAck()));
-  }
-
-  return Promise.resolve(onPacket(event));
 }
 
 async function shutdownPlugins(
@@ -1273,77 +1143,6 @@ function createRuntimeHostConfig(state: AppState): Result<RuntimeHostConfig, App
       },
     })),
   });
-}
-
-function validateNativeRuntimeSupport(state: AppState): Result<undefined, AppError> {
-  const nativeIngress = state.ingress.filter((ingress) => ingress.kind !== IngressKind.WebSocket);
-  if (nativeIngress.length === 0) {
-    return ok(void 0);
-  }
-
-  if (state.ingress.some((ingress) => ingress.kind === IngressKind.WebSocket)) {
-    return err(
-      appError(
-        AppErrorKind.ValidationError,
-        "ingress",
-        "app.run() does not yet support mixed websocket and native-host ingress sources in one app",
-      ),
-    );
-  }
-
-  const rawIngress = nativeIngress.filter(
-    (ingress) => ingress.kind === IngressKind.DirectShreds || ingress.kind === IngressKind.Gossip,
-  );
-  const directShredsIngress = rawIngress.filter(
-    (ingress): ingress is DirectShredsIngress => ingress.kind === IngressKind.DirectShreds,
-  );
-  const gossipIngress = rawIngress.filter(
-    (ingress): ingress is GossipIngress => ingress.kind === IngressKind.Gossip,
-  );
-  const providerIngress = nativeIngress.filter((ingress) => ingress.kind === IngressKind.Grpc);
-  if (providerIngress.length > 0 && rawIngress.length > 0) {
-    return err(
-      appError(
-        AppErrorKind.ValidationError,
-        "ingress",
-        "app.run() does not yet support mixed provider-stream and raw native ingress sources in one app",
-      ),
-    );
-  }
-
-  if (directShredsIngress.length > 1) {
-    return err(
-      appError(
-        AppErrorKind.ValidationError,
-        "ingress",
-        "app.run() currently supports one direct shred ingress source per app",
-      ),
-    );
-  }
-  if (gossipIngress.length > 1) {
-    return err(
-      appError(
-        AppErrorKind.ValidationError,
-        "ingress",
-        "app.run() currently supports one gossip ingress source per app",
-      ),
-    );
-  }
-  const kernelBypassIngress = directShredsIngress.find(
-    (ingress) => ingress.kernelBypass !== undefined,
-  );
-  if (kernelBypassIngress !== undefined && process.platform !== "linux") {
-    return err(
-      appError(
-        AppErrorKind.ValidationError,
-        "ingress.kernelBypass",
-        `kernel bypass for ingress ${kernelBypassIngress.name} is only supported on Linux`,
-        kernelBypassIngress.name,
-      ),
-    );
-  }
-
-  return ok(void 0);
 }
 
 function runtimeHostExecutableName(): string {
@@ -1731,42 +1530,17 @@ export class App {
       return this.#runInternalPluginWorker(internalWorkerPluginName);
     }
 
-    if (this.#ingress.some((ingress) => ingress.kind !== IngressKind.WebSocket)) {
-      const state = this.#toState();
-      const support = validateNativeRuntimeSupport(state);
-      if (isErr(support)) {
-        return support;
-      }
-
-      const runtimeHostConfig = createRuntimeHostConfig(state);
-      if (isErr(runtimeHostConfig)) {
-        return runtimeHostConfig;
-      }
-
-      return runRuntimeHost(runtimeHostConfig.value, options);
-    }
-
-    if (this.#ingress.length > 1) {
-      return err(
-        appError(
-          AppErrorKind.ValidationError,
-          "ingress",
-          "app.run() does not yet support multi-websocket ingress fan-in",
-        ),
-      );
-    }
-
-    const readyResults = await Promise.all(
-      this.#plugins.map((plugin) => invokePluginReady(plugin)),
-    );
-    for (const ready of readyResults) {
-      if (isErr(ready)) {
-        return ready;
-      }
-    }
-    const startedPlugins = [...this.#plugins];
-
     if (this.#ingress.length === 0) {
+      const readyResults = await Promise.all(
+        this.#plugins.map((plugin) => invokePluginReady(plugin)),
+      );
+      for (const ready of readyResults) {
+        if (isErr(ready)) {
+          return ready;
+        }
+      }
+      const startedPlugins = [...this.#plugins];
+
       if (options.signal !== undefined) {
         if (options.signal.aborted) {
           return ok(runtimeExtensionAck());
@@ -1786,132 +1560,13 @@ export class App {
       return shutdownPlugins(startedPlugins);
     }
 
-    const sockets: WebSocket[] = [];
-    let runtimeError: AppRunError | undefined;
-    let settleRuntime: (() => void) | undefined;
-    const runtimeSettled = new Promise<void>((resolve) => {
-      settleRuntime = resolve;
-    });
-
-    const finishRuntime = () => {
-      settleRuntime?.();
-    };
-
-    try {
-      await Promise.all(
-        this.#ingress.map(
-          (ingress) =>
-            new Promise<void>((resolve, reject) => {
-              if (ingress.kind !== IngressKind.WebSocket) {
-                reject(
-                  new RangeError(
-                    `unsupported ingress kind during websocket runtime execution: ${IngressKind[ingress.kind]}`,
-                  ),
-                );
-                return;
-              }
-
-              const socket = new WebSocket(ingress.url);
-              sockets.push(socket);
-
-              socket.binaryType = "arraybuffer";
-              socket.addEventListener(
-                "open",
-                () => {
-                  for (const request of ingress.requests) {
-                    socket.send(request);
-                  }
-                  resolve();
-                },
-                { once: true },
-              );
-              socket.addEventListener(
-                "error",
-                () => {
-                  reject(new RangeError(`failed to open websocket ingress ${ingress.name}`));
-                },
-                { once: true },
-              );
-              socket.addEventListener("message", (message) => {
-                void (async () => {
-                  try {
-                    const jsonRpcError = parseJsonRpcErrorMessage(ingress, message.data);
-                    if (jsonRpcError !== undefined) {
-                      runtimeError = jsonRpcError;
-                      socket.close();
-                      finishRuntime();
-                      return;
-                    }
-
-                    const event: RuntimePacketEvent = {
-                      source: runtimeSourceForIngress(ingress, toWebSocketFrameType(message.data)),
-                      bytes: toPacketBytes(message.data),
-                      observedUnixMs: Date.now(),
-                    };
-
-                    const handledResults = await Promise.all(
-                      this.#plugins.map((plugin) => dispatchPacketToPlugin(plugin, event)),
-                    );
-                    for (const handled of handledResults) {
-                      if (isErr(handled)) {
-                        runtimeError = handled.error;
-                        socket.close();
-                        finishRuntime();
-                      }
-                    }
-                  } catch (error) {
-                    runtimeError = appError(
-                      AppErrorKind.ValidationError,
-                      "ingress",
-                      error instanceof Error ? error.message : String(error),
-                    );
-                    socket.close();
-                    finishRuntime();
-                  }
-                })();
-              });
-              socket.addEventListener("close", () => {
-                if (options.signal === undefined || runtimeError !== undefined) {
-                  finishRuntime();
-                }
-              });
-            }),
-        ),
-      );
-
-      if (options.signal?.aborted === true) {
-        finishRuntime();
-      } else {
-        options.signal?.addEventListener(
-          "abort",
-          () => {
-            finishRuntime();
-          },
-          { once: true },
-        );
-      }
-
-      await runtimeSettled;
-    } catch (error) {
-      runtimeError = appError(
-        AppErrorKind.ValidationError,
-        "ingress",
-        error instanceof Error ? error.message : String(error),
-      );
+    const state = this.#toState();
+    const runtimeHostConfig = createRuntimeHostConfig(state);
+    if (isErr(runtimeHostConfig)) {
+      return runtimeHostConfig;
     }
 
-    for (const socket of sockets) {
-      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
-        socket.close();
-      }
-    }
-
-    const shutdown = await shutdownPlugins(startedPlugins);
-    if (isErr(shutdown)) {
-      return shutdown;
-    }
-
-    return runtimeError === undefined ? ok(runtimeExtensionAck()) : err(runtimeError);
+    return runRuntimeHost(runtimeHostConfig.value, options);
   }
 }
 

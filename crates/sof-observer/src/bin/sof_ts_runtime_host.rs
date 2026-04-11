@@ -6,25 +6,26 @@ mod af_xdp;
 
 #[cfg(feature = "provider-grpc")]
 use std::str::FromStr;
+use std::sync::Arc;
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
 use std::time::Duration;
-use std::{collections::HashMap, env, fs, net::SocketAddr, path::PathBuf, sync::Mutex};
+use std::{collections::HashMap, env, fs, net::SocketAddr, path::PathBuf};
 
 use async_trait::async_trait;
 #[cfg(feature = "provider-grpc")]
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+#[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
+use sof::provider_stream::websocket::{
+    WebsocketTransactionCommitment, WebsocketTransactionConfig, spawn_websocket_source,
+};
 #[cfg(feature = "provider-grpc")]
 use sof::provider_stream::yellowstone::{
-    YellowstoneGrpcCommitment, YellowstoneGrpcConfig, YellowstoneGrpcError,
-    YellowstoneGrpcSlotsConfig, YellowstoneGrpcStream, spawn_yellowstone_grpc_slot_source,
-    spawn_yellowstone_grpc_source,
+    YellowstoneGrpcCommitment, YellowstoneGrpcConfig, YellowstoneGrpcSlotsConfig,
+    YellowstoneGrpcStream, spawn_yellowstone_grpc_slot_source, spawn_yellowstone_grpc_source,
 };
 #[cfg(feature = "provider-grpc")]
 use sof::provider_stream::{
@@ -66,6 +67,7 @@ use tokio::task::spawn_blocking;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
     process::{Child, ChildStdin, ChildStdout, Command},
+    sync::Mutex,
 };
 
 /// Wire tag for websocket ingress handoff.
@@ -155,7 +157,7 @@ struct RuntimeHostConfig {
     /// Ingress sources delegated to the native host.
     ingress: Vec<IngressConfig>,
     #[cfg(feature = "provider-grpc")]
-    /// Provider fan-in policy for multi-source gRPC ingress.
+    /// Provider fan-in policy for multi-source provider ingress.
     fan_in: Option<FanInConfig>,
     /// Plugin workers launched through the stdio worker bridge.
     plugin_workers: Vec<PluginWorkerConfig>,
@@ -230,8 +232,12 @@ struct IngressConfig {
     priority: Option<u16>,
     /// Websocket URL for SDK-side validation errors.
     url: Option<String>,
+    #[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
+    /// Legacy custom JSON-RPC subscribe messages rejected by the native host.
+    requests: Option<Vec<String>>,
     /// Gossip bootstrap entrypoints.
     entrypoints: Option<Vec<String>>,
+    #[cfg(feature = "gossip-bootstrap")]
     /// Gossip runtime mode selector.
     runtime_mode: Option<u8>,
     /// Whether the active gossip entrypoint is pinned.
@@ -356,18 +362,20 @@ struct PacketSubscriptionConfig {
 
 /// Runtime extension adapter that forwards packet events into one TS worker.
 struct TypeScriptRuntimeExtension {
-    /// Extension name registered with the runtime.
-    name: &'static str,
-    /// Worker launch configuration.
-    config: PluginWorkerConfig,
-    /// Live worker process handle.
-    process: Mutex<Option<TypeScriptWorkerProcess>>,
+    /// Shared worker bridge used for lifecycle and packet delivery.
+    bridge: Arc<TypeScriptWorkerBridge>,
 }
 
 #[cfg(feature = "provider-grpc")]
 /// Observer plugin adapter that forwards provider events into one TS worker.
 struct TypeScriptObserverPlugin {
-    /// Plugin name registered with the observer plugin host.
+    /// Shared worker bridge used for lifecycle and provider-event delivery.
+    bridge: Arc<TypeScriptWorkerBridge>,
+}
+
+/// Shared worker bridge for one TypeScript plugin process.
+struct TypeScriptWorkerBridge {
+    /// Extension/plugin name registered with the runtime.
     name: &'static str,
     /// Worker launch configuration.
     config: PluginWorkerConfig,
@@ -413,48 +421,170 @@ async fn main() -> Result<(), HostError> {
     run_config(config).await
 }
 
-/// Routes the parsed host config into the raw or provider runtime path.
+/// Routes the parsed host config into one unified runtime host composition.
 async fn run_config(config: RuntimeHostConfig) -> Result<(), HostError> {
     validate_ingress(&config)?;
 
-    if config
-        .ingress
-        .iter()
-        .any(|ingress| ingress.kind == INGRESS_KIND_GRPC)
-    {
-        return run_provider_stream_config(config).await;
-    }
-
-    run_raw_ingress_config(config).await
-}
-
-/// Runs one raw-ingress observer runtime through the extension host bridge.
-async fn run_raw_ingress_config(config: RuntimeHostConfig) -> Result<(), HostError> {
-    let setup = runtime_setup(&config)?;
+    let setup = runtime_setup(&config);
     let kernel_bypass = direct_shreds_ingress(&config)
         .and_then(|ingress| ingress.kernel_bypass.as_ref())
         .cloned();
+    let (extension_host, worker_bridges) = build_worker_bridges(&config.plugin_workers)?;
+    #[cfg(not(feature = "provider-grpc"))]
+    drop(worker_bridges);
+
+    let runtime = ObserverRuntime::new()
+        .with_setup(setup)
+        .with_extension_host(extension_host);
+
+    #[cfg(feature = "provider-grpc")]
+    let mut runtime = runtime;
+
+    #[cfg(feature = "provider-grpc")]
+    let mut provider_source_handles = Vec::new();
+
+    #[cfg(feature = "provider-grpc")]
+    if config
+        .ingress
+        .iter()
+        .any(|ingress| ingress.kind == INGRESS_KIND_GRPC || ingress.kind == INGRESS_KIND_WEB_SOCKET)
+    {
+        let (provider_stream_tx, provider_stream_rx) =
+            create_provider_stream_queue(PROVIDER_STREAM_QUEUE_CAPACITY);
+        let mut modes = Vec::new();
+        for ingress in config
+            .ingress
+            .iter()
+            .filter(|ingress| ingress.kind == INGRESS_KIND_GRPC)
+        {
+            let source = spawn_yellowstone_ingress(
+                ingress,
+                config.fan_in.as_ref(),
+                provider_stream_tx.clone(),
+            )
+            .await?;
+            modes.push(source.mode);
+            provider_source_handles.push(source);
+        }
+        #[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
+        for ingress in config
+            .ingress
+            .iter()
+            .filter(|ingress| ingress.kind == INGRESS_KIND_WEB_SOCKET)
+        {
+            let source = spawn_websocket_provider_ingress(
+                ingress,
+                config.fan_in.as_ref(),
+                provider_stream_tx.clone(),
+            )
+            .await?;
+            modes.push(source.mode);
+            provider_source_handles.push(source);
+        }
+        #[cfg(not(feature = "provider-websocket"))]
+        if config
+            .ingress
+            .iter()
+            .any(|ingress| ingress.kind == INGRESS_KIND_WEB_SOCKET)
+        {
+            let ingress = config
+                .ingress
+                .iter()
+                .find(|ingress| ingress.kind == INGRESS_KIND_WEB_SOCKET)
+                .map(|ingress| ingress.name.as_str())
+                .unwrap_or("unknown");
+            return Err(HostError::InvalidConfig(format!(
+                "websocket ingress `{ingress}` requires a runtime host built with the provider-websocket feature"
+            )));
+        }
+        drop(provider_stream_tx);
+
+        runtime = runtime
+            .with_plugin_host(plugin_host_from_worker_bridges(&worker_bridges))
+            .with_provider_stream_ingress(
+                provider_stream_mode(modes.as_slice()),
+                provider_stream_rx,
+            );
+        if has_raw_ingress(&config) {
+            runtime = runtime.with_raw_ingress_alongside_provider_stream();
+        }
+    }
+
+    #[cfg(not(feature = "provider-grpc"))]
+    if config
+        .ingress
+        .iter()
+        .any(|ingress| ingress.kind == INGRESS_KIND_GRPC || ingress.kind == INGRESS_KIND_WEB_SOCKET)
+    {
+        let ingress = config
+            .ingress
+            .iter()
+            .find(|ingress| {
+                ingress.kind == INGRESS_KIND_GRPC || ingress.kind == INGRESS_KIND_WEB_SOCKET
+            })
+            .map(|ingress| (ingress.name.as_str(), ingress.kind))
+            .unwrap_or(("unknown", INGRESS_KIND_GRPC));
+        if ingress.1 == INGRESS_KIND_WEB_SOCKET {
+            return Err(HostError::InvalidConfig(format!(
+                "websocket ingress `{}` requires a runtime host built with the provider-grpc and provider-websocket features",
+                ingress.0
+            )));
+        }
+        return Err(HostError::InvalidConfig(format!(
+            "gRPC ingress `{}` requires a runtime host built with the provider-grpc feature",
+            ingress.0
+        )));
+    }
+
+    let run_result = run_runtime_with_optional_kernel_bypass(runtime, kernel_bypass.as_ref()).await;
+
+    #[cfg(feature = "provider-grpc")]
+    for handle in provider_source_handles {
+        handle.abort();
+    }
+
+    run_result
+}
+
+/// Builds the extension host plus one shared worker bridge per TypeScript plugin.
+fn build_worker_bridges(
+    workers: &[PluginWorkerConfig],
+) -> Result<(RuntimeExtensionHost, Vec<Arc<TypeScriptWorkerBridge>>), HostError> {
     let mut extension_host_builder = RuntimeExtensionHost::builder();
-    for worker in config.plugin_workers {
+    let mut bridges = Vec::with_capacity(workers.len());
+
+    for worker in workers.iter().cloned() {
         let extension_name = leak_extension_name(worker.manifest.extension_name.clone())?;
-        extension_host_builder = extension_host_builder.add_extension(TypeScriptRuntimeExtension {
+        let bridge = Arc::new(TypeScriptWorkerBridge {
             name: extension_name,
             config: worker,
             process: Mutex::new(None),
         });
+        extension_host_builder = extension_host_builder.add_extension(TypeScriptRuntimeExtension {
+            bridge: Arc::clone(&bridge),
+        });
+        bridges.push(bridge);
     }
 
-    let runtime = ObserverRuntime::new()
-        .with_setup(setup)
-        .with_extension_host(extension_host_builder.build());
-    run_raw_runtime_with_optional_kernel_bypass(runtime, kernel_bypass.as_ref()).await?;
+    Ok((extension_host_builder.build(), bridges))
+}
 
-    Ok(())
+#[cfg(feature = "provider-grpc")]
+/// Builds a plugin host that reuses the shared TypeScript worker bridges.
+fn plugin_host_from_worker_bridges(bridges: &[Arc<TypeScriptWorkerBridge>]) -> PluginHost {
+    let mut plugin_host_builder = PluginHost::builder();
+    for bridge in bridges {
+        plugin_host_builder = plugin_host_builder.add_plugin(TypeScriptObserverPlugin {
+            bridge: Arc::clone(bridge),
+        });
+    }
+
+    plugin_host_builder.build()
 }
 
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
-/// Runs one raw observer runtime and optionally attaches AF_XDP ingest.
-async fn run_raw_runtime_with_optional_kernel_bypass(
+/// Runs one observer runtime and optionally attaches AF_XDP ingest until termination.
+async fn run_runtime_with_optional_kernel_bypass(
     runtime: ObserverRuntime,
     kernel_bypass: Option<&KernelBypassConfig>,
 ) -> Result<(), HostError> {
@@ -493,8 +623,8 @@ async fn run_raw_runtime_with_optional_kernel_bypass(
 }
 
 #[cfg(not(all(target_os = "linux", feature = "kernel-bypass")))]
-/// Runs one raw observer runtime when kernel bypass is unavailable.
-async fn run_raw_runtime_with_optional_kernel_bypass(
+/// Runs one observer runtime when kernel bypass is unavailable.
+async fn run_runtime_with_optional_kernel_bypass(
     runtime: ObserverRuntime,
     kernel_bypass: Option<&KernelBypassConfig>,
 ) -> Result<(), HostError> {
@@ -509,71 +639,6 @@ async fn run_raw_runtime_with_optional_kernel_bypass(
     Ok(())
 }
 
-#[cfg(feature = "provider-grpc")]
-/// Runs one provider-stream observer runtime through the plugin host bridge.
-async fn run_provider_stream_config(config: RuntimeHostConfig) -> Result<(), HostError> {
-    let setup = runtime_setup(&config)?;
-    let (provider_stream_tx, provider_stream_rx) =
-        create_provider_stream_queue(PROVIDER_STREAM_QUEUE_CAPACITY);
-    let mut modes = Vec::new();
-    let mut source_handles = Vec::new();
-
-    for ingress in &config.ingress {
-        if ingress.kind != INGRESS_KIND_GRPC {
-            return Err(HostError::InvalidConfig(format!(
-                "ingress `{}` cannot be mixed with gRPC provider-stream ingress in one TypeScript runtime host",
-                ingress.name
-            )));
-        }
-
-        let source =
-            spawn_yellowstone_ingress(ingress, config.fan_in.as_ref(), provider_stream_tx.clone())
-                .await?;
-        modes.push(source.mode);
-        source_handles.push(source.handle);
-    }
-    drop(provider_stream_tx);
-
-    let mut plugin_host_builder = PluginHost::builder();
-    for worker in config.plugin_workers {
-        let plugin_name = leak_extension_name(worker.manifest.extension_name.clone())?;
-        plugin_host_builder = plugin_host_builder.add_plugin(TypeScriptObserverPlugin {
-            name: plugin_name,
-            config: worker,
-            process: Mutex::new(None),
-        });
-    }
-
-    let mode = provider_stream_mode(modes.as_slice());
-    let runtime_result = ObserverRuntime::new()
-        .with_setup(setup)
-        .with_plugin_host(plugin_host_builder.build())
-        .with_provider_stream_ingress(mode, provider_stream_rx)
-        .run_until_termination_signal()
-        .await;
-
-    for handle in source_handles {
-        handle.abort();
-    }
-
-    runtime_result?;
-    Ok(())
-}
-
-#[cfg(not(feature = "provider-grpc"))]
-/// Rejects provider-stream configs when the host was built without gRPC support.
-async fn run_provider_stream_config(config: RuntimeHostConfig) -> Result<(), HostError> {
-    let ingress = config
-        .ingress
-        .iter()
-        .find(|ingress| ingress.kind == INGRESS_KIND_GRPC)
-        .map(|ingress| ingress.name.as_str())
-        .unwrap_or("unknown");
-    Err(HostError::InvalidConfig(format!(
-        "gRPC ingress `{ingress}` requires a runtime host built with the provider-grpc feature"
-    )))
-}
-
 /// Validates ingress combinations accepted by the native host.
 fn validate_ingress(config: &RuntimeHostConfig) -> Result<(), HostError> {
     let mut direct_shreds_count = 0_usize;
@@ -581,24 +646,18 @@ fn validate_ingress(config: &RuntimeHostConfig) -> Result<(), HostError> {
     let mut gossip_count = 0_usize;
     #[cfg(not(feature = "gossip-bootstrap"))]
     let gossip_count = 0_usize;
-    let mut provider_ingress_count = 0_usize;
     for ingress in &config.ingress {
         match ingress.kind {
-            INGRESS_KIND_WEB_SOCKET => {
-                return Err(HostError::InvalidConfig(format!(
-                    "websocket ingress `{}` should run on the TypeScript websocket path (url={})",
-                    ingress.name,
-                    ingress.url.as_deref().unwrap_or("unknown"),
-                )));
-            }
-            INGRESS_KIND_GRPC => {
-                provider_ingress_count =
-                    provider_ingress_count.checked_add(1).ok_or_else(|| {
-                        HostError::InvalidConfig(
-                            "provider ingress count overflowed during validation".to_owned(),
-                        )
-                    })?;
-            }
+            INGRESS_KIND_WEB_SOCKET => match ingress.url.as_deref().map(str::trim) {
+                Some(url) if !url.is_empty() => {}
+                _ => {
+                    return Err(HostError::InvalidConfig(format!(
+                        "websocket ingress `{}` is missing a valid url",
+                        ingress.name
+                    )));
+                }
+            },
+            INGRESS_KIND_GRPC => {}
             INGRESS_KIND_GOSSIP => {
                 #[cfg(not(feature = "gossip-bootstrap"))]
                 {
@@ -618,6 +677,13 @@ fn validate_ingress(config: &RuntimeHostConfig) -> Result<(), HostError> {
                         return Err(HostError::InvalidConfig(format!(
                             "gossip ingress `{}` cannot declare kernel bypass directly; attach kernel-bypass config to direct shred ingress instead",
                             ingress.name
+                        )));
+                    }
+                    if let Some(runtime_mode) = ingress.runtime_mode
+                        && gossip_runtime_mode_from_wire(runtime_mode).is_none()
+                    {
+                        return Err(HostError::InvalidConfig(format!(
+                            "unsupported gossip runtime mode {runtime_mode}"
                         )));
                     }
                 }
@@ -644,18 +710,6 @@ fn validate_ingress(config: &RuntimeHostConfig) -> Result<(), HostError> {
                 )));
             }
         }
-    }
-
-    let raw_ingress_count = direct_shreds_count
-        .checked_add(gossip_count)
-        .ok_or_else(|| {
-            HostError::InvalidConfig("raw ingress count overflowed during validation".to_owned())
-        })?;
-    if provider_ingress_count > 0 && raw_ingress_count > 0 {
-        return Err(HostError::InvalidConfig(
-            "TypeScript runtime host does not support mixing provider-stream ingress and raw packet ingress in one app run"
-                .to_owned(),
-        ));
     }
 
     if direct_shreds_count > 1 {
@@ -718,7 +772,7 @@ fn validate_kernel_bypass_config(
 }
 
 /// Builds the runtime setup derived from the TypeScript config.
-fn runtime_setup(config: &RuntimeHostConfig) -> Result<RuntimeSetup, HostError> {
+fn runtime_setup(config: &RuntimeHostConfig) -> RuntimeSetup {
     let mut setup = RuntimeSetup::new();
     for (key, value) in &config.runtime_environment {
         setup = setup.with_env(key, value);
@@ -734,23 +788,21 @@ fn runtime_setup(config: &RuntimeHostConfig) -> Result<RuntimeSetup, HostError> 
             setup = setup.with_gossip_entrypoint_pinned(pinned);
         }
         #[cfg(feature = "gossip-bootstrap")]
-        if let Some(runtime_mode) = ingress.runtime_mode {
-            setup = setup.with_gossip_runtime_mode(gossip_runtime_mode_from_wire(runtime_mode)?);
+        if let Some(runtime_mode) = ingress.runtime_mode.and_then(gossip_runtime_mode_from_wire) {
+            setup = setup.with_gossip_runtime_mode(runtime_mode);
         }
     }
-    Ok(setup.with_env("SOF_TS_APP_NAME", &config.app_name))
+    setup.with_env("SOF_TS_APP_NAME", &config.app_name)
 }
 
 #[cfg(feature = "gossip-bootstrap")]
 /// Maps the wire gossip runtime mode into the Rust runtime enum.
-fn gossip_runtime_mode_from_wire(value: u8) -> Result<GossipRuntimeMode, HostError> {
+const fn gossip_runtime_mode_from_wire(value: u8) -> Option<GossipRuntimeMode> {
     match value {
-        1 => Ok(GossipRuntimeMode::Full),
-        2 => Ok(GossipRuntimeMode::BootstrapOnly),
-        3 => Ok(GossipRuntimeMode::ControlPlaneOnly),
-        other => Err(HostError::InvalidConfig(format!(
-            "unsupported gossip runtime mode {other}"
-        ))),
+        1 => Some(GossipRuntimeMode::Full),
+        2 => Some(GossipRuntimeMode::BootstrapOnly),
+        3 => Some(GossipRuntimeMode::ControlPlaneOnly),
+        _ => None,
     }
 }
 
@@ -770,6 +822,14 @@ fn gossip_ingress(config: &RuntimeHostConfig) -> Option<&IngressConfig> {
         .find(|ingress| ingress.kind == INGRESS_KIND_GOSSIP)
 }
 
+#[cfg(feature = "provider-grpc")]
+/// Returns whether the config declares any raw packet ingress.
+fn has_raw_ingress(config: &RuntimeHostConfig) -> bool {
+    config.ingress.iter().any(|ingress| {
+        ingress.kind == INGRESS_KIND_DIRECT_SHREDS || ingress.kind == INGRESS_KIND_GOSSIP
+    })
+}
+
 /// Returns the bind address that should drive raw runtime setup.
 fn effective_bind_address(config: &RuntimeHostConfig) -> Option<&str> {
     direct_shreds_ingress(config)
@@ -782,8 +842,48 @@ fn effective_bind_address(config: &RuntimeHostConfig) -> Option<&str> {
 struct ProviderSourceHandle {
     /// Runtime mode inferred from the configured source.
     mode: ProviderStreamMode,
-    /// Join handle for the spawned Yellowstone source task.
-    handle: JoinHandle<Result<(), YellowstoneGrpcError>>,
+    /// Abort handle for the underlying provider source task.
+    abort_handle: tokio::task::AbortHandle,
+    /// Join guard that logs provider source task failures.
+    join_guard: JoinHandle<()>,
+}
+
+#[cfg(feature = "provider-grpc")]
+impl ProviderSourceHandle {
+    /// Stops the provider source task and its join guard.
+    fn abort(self) {
+        self.abort_handle.abort();
+        self.join_guard.abort();
+    }
+}
+
+#[cfg(feature = "provider-grpc")]
+/// Wraps one provider source task so failures are not silently detached.
+fn spawn_provider_source_join_guard<E>(
+    source_name: &str,
+    handle: JoinHandle<Result<(), E>>,
+) -> (tokio::task::AbortHandle, JoinHandle<()>)
+where
+    E: std::fmt::Display + Send + 'static,
+{
+    let abort_handle = handle.abort_handle();
+    let source_name = source_name.to_owned();
+    let join_guard = tokio::spawn(async move {
+        match handle.await {
+            Ok(Ok(())) => {
+                tracing::warn!(source = source_name, "provider source task ended");
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(source = source_name, error = %error, "provider source task failed");
+            }
+            Err(error) => {
+                if !error.is_cancelled() {
+                    tracing::warn!(source = source_name, error = %error, "provider source task join failed");
+                }
+            }
+        }
+    });
+    (abort_handle, join_guard)
 }
 
 #[cfg(feature = "provider-grpc")]
@@ -816,7 +916,12 @@ async fn spawn_yellowstone_ingress(
         let handle = spawn_yellowstone_grpc_slot_source(config, sender)
             .await
             .map_err(|error| HostError::InvalidConfig(error.to_string()))?;
-        return Ok(ProviderSourceHandle { mode, handle });
+        let (abort_handle, join_guard) = spawn_provider_source_join_guard(&ingress.name, handle);
+        return Ok(ProviderSourceHandle {
+            mode,
+            abort_handle,
+            join_guard,
+        });
     }
 
     let mut config = YellowstoneGrpcConfig::new(endpoint)
@@ -868,7 +973,100 @@ async fn spawn_yellowstone_ingress(
     let handle = spawn_yellowstone_grpc_source(config, sender)
         .await
         .map_err(|error| HostError::InvalidConfig(error.to_string()))?;
-    Ok(ProviderSourceHandle { mode, handle })
+    let (abort_handle, join_guard) = spawn_provider_source_join_guard(&ingress.name, handle);
+    Ok(ProviderSourceHandle {
+        mode,
+        abort_handle,
+        join_guard,
+    })
+}
+
+#[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
+/// Spawns one websocket provider-stream source from the wire config.
+async fn spawn_websocket_provider_ingress(
+    ingress: &IngressConfig,
+    fan_in: Option<&FanInConfig>,
+    sender: ProviderStreamSender,
+) -> Result<ProviderSourceHandle, HostError> {
+    if !ingress.requests.as_deref().unwrap_or(&[]).is_empty() {
+        return Err(HostError::InvalidConfig(format!(
+            "websocket ingress `{}` must use the native SOF provider-stream websocket adapter; custom JSON-RPC requests are not accepted by the runtime host",
+            ingress.name
+        )));
+    }
+    let endpoint = ingress.url.as_deref().ok_or_else(|| {
+        HostError::InvalidConfig(format!(
+            "websocket ingress `{}` is missing url",
+            ingress.name
+        ))
+    })?;
+    let mut config =
+        WebsocketTransactionConfig::new(endpoint).with_source_instance(ingress.name.clone());
+    config = apply_websocket_source_policy(config, ingress)?;
+    config = apply_websocket_fan_in(config, fan_in)?;
+    if let Some(commitment) = ingress.commitment {
+        config = config.with_commitment(websocket_commitment_from_wire(commitment)?);
+    }
+    if let Some(vote) = ingress.vote {
+        config = config.with_vote(vote);
+    }
+    if let Some(failed) = ingress.failed {
+        config = config.with_failed(failed);
+    }
+    if let Some(signature) = non_empty_optional(ingress.signature.as_deref()) {
+        config = config.with_signature(parse_signature(signature, "ingress.signature")?);
+    }
+    config = config
+        .with_account_include(parse_pubkeys(
+            ingress.account_include.as_deref().unwrap_or(&[]),
+            "ingress.accountInclude",
+        )?)
+        .with_account_exclude(parse_pubkeys(
+            ingress.account_exclude.as_deref().unwrap_or(&[]),
+            "ingress.accountExclude",
+        )?)
+        .with_account_required(parse_pubkeys(
+            ingress.account_required.as_deref().unwrap_or(&[]),
+            "ingress.accountRequired",
+        )?);
+
+    let mode = config.runtime_mode();
+    let handle = spawn_websocket_source(&config, sender)
+        .await
+        .map_err(|error| HostError::InvalidConfig(error.to_string()))?;
+    let (abort_handle, join_guard) = spawn_provider_source_join_guard(&ingress.name, handle);
+    Ok(ProviderSourceHandle {
+        mode,
+        abort_handle,
+        join_guard,
+    })
+}
+
+#[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
+/// Applies per-source readiness, role, and priority to one websocket config.
+fn apply_websocket_source_policy(
+    mut config: WebsocketTransactionConfig,
+    ingress: &IngressConfig,
+) -> Result<WebsocketTransactionConfig, HostError> {
+    if let Some(readiness) = ingress.readiness {
+        config = config.with_readiness(provider_readiness_from_wire(readiness)?);
+    }
+    if let Some(role) = ingress.role {
+        config = config.with_source_role(provider_role_from_wire(role)?);
+    }
+    if let Some(priority) = ingress.priority {
+        config = config.with_source_priority(priority);
+    }
+    Ok(config)
+}
+
+#[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
+/// Applies fan-in arbitration to one websocket config.
+fn apply_websocket_fan_in(
+    config: WebsocketTransactionConfig,
+    fan_in: Option<&FanInConfig>,
+) -> Result<WebsocketTransactionConfig, HostError> {
+    Ok(config.with_source_arbitration(provider_source_arbitration(fan_in)?))
 }
 
 #[cfg(feature = "provider-grpc")]
@@ -1005,6 +1203,19 @@ fn yellowstone_commitment_from_wire(value: u8) -> Result<YellowstoneGrpcCommitme
     }
 }
 
+#[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
+/// Maps the wire websocket commitment selector into the Rust enum.
+fn websocket_commitment_from_wire(value: u8) -> Result<WebsocketTransactionCommitment, HostError> {
+    match value {
+        1 => Ok(WebsocketTransactionCommitment::Processed),
+        2 => Ok(WebsocketTransactionCommitment::Confirmed),
+        3 => Ok(WebsocketTransactionCommitment::Finalized),
+        other => Err(HostError::InvalidConfig(format!(
+            "unsupported websocket commitment {other}"
+        ))),
+    }
+}
+
 #[cfg(feature = "provider-grpc")]
 /// Trims and filters empty optional string values.
 fn non_empty_optional(value: Option<&str>) -> Option<&str> {
@@ -1048,106 +1259,27 @@ fn leak_extension_name(name: String) -> Result<&'static str, HostError> {
 #[async_trait]
 impl RuntimeExtension for TypeScriptRuntimeExtension {
     fn name(&self) -> &'static str {
-        self.name
+        self.bridge.name
     }
 
     async fn setup(
         &self,
         _ctx: ExtensionContext,
     ) -> Result<ExtensionManifest, ExtensionSetupError> {
-        let process = start_worker_process(self.name, &self.config)
+        self.bridge
+            .ensure_started()
             .await
             .map_err(ExtensionSetupError::new)?;
-
-        let manifest = extension_manifest_from_config(&self.config.manifest.manifest)
-            .map_err(ExtensionSetupError::new)?;
-        let mut guard = self
-            .process
-            .lock()
-            .map_err(|_error| ExtensionSetupError::new("worker process lock poisoned"))?;
-        *guard = Some(process);
-        Ok(manifest)
+        extension_manifest_from_config(&self.bridge.config.manifest.manifest)
+            .map_err(ExtensionSetupError::new)
     }
 
     async fn on_packet_received(&self, event: RuntimePacketEvent) {
-        let process = match self.process.lock() {
-            Ok(mut guard) => guard.take(),
-            Err(error) => {
-                tracing::warn!(extension = self.name, error = %error, "worker process lock poisoned");
-                None
-            }
-        };
-        let Some(mut process) = process else {
-            tracing::warn!(
-                extension = self.name,
-                "worker process is not available for packet"
-            );
-            return;
-        };
-
-        if let Err(error) = send_worker_message(
-            &mut process,
-            json!({
-                "tag": 3,
-                "event": runtime_packet_event_wire(&event),
-            }),
-        )
-        .await
-        {
-            tracing::warn!(extension = self.name, error = %error, "failed to deliver packet to worker");
-        } else {
-            match read_worker_response(&mut process, RESPONSE_TAG_EVENT_HANDLED).await {
-                Ok(response) => {
-                    if let Err(error) = response_result_ok(self.name, &response) {
-                        tracing::warn!(extension = self.name, error = %error, "worker rejected packet");
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(extension = self.name, error = %error, "worker did not acknowledge packet");
-                }
-            }
-        }
-
-        if let Ok(mut guard) = self.process.lock() {
-            *guard = Some(process);
-        }
+        self.bridge.deliver_packet(event).await;
     }
 
     async fn shutdown(&self, _ctx: ExtensionContext) {
-        let process = match self.process.lock() {
-            Ok(mut guard) => guard.take(),
-            Err(error) => {
-                tracing::warn!(extension = self.name, error = %error, "worker process lock poisoned");
-                None
-            }
-        };
-        let Some(mut process) = process else {
-            return;
-        };
-
-        if let Err(error) = send_worker_message(
-            &mut process,
-            json!({
-                "tag": 4,
-                "context": WorkerContext {
-                    extension_name: self.name,
-                },
-            }),
-        )
-        .await
-        {
-            tracing::warn!(extension = self.name, error = %error, "failed to request worker shutdown");
-        } else if let Err(error) =
-            read_worker_response(&mut process, RESPONSE_TAG_SHUTDOWN_COMPLETE)
-                .await
-                .and_then(|response| response_result_ok(self.name, &response))
-        {
-            tracing::warn!(extension = self.name, error = %error, "worker shutdown was not acknowledged");
-        }
-
-        if let Err(error) = process.child.wait().await {
-            tracing::warn!(extension = self.name, error = %error, "failed to wait for worker process");
-        }
+        self.bridge.shutdown().await;
     }
 }
 
@@ -1155,7 +1287,7 @@ impl RuntimeExtension for TypeScriptRuntimeExtension {
 #[cfg(feature = "provider-grpc")]
 impl ObserverPlugin for TypeScriptObserverPlugin {
     fn name(&self) -> &'static str {
-        self.name
+        self.bridge.name
     }
 
     fn config(&self) -> PluginConfig {
@@ -1172,69 +1304,111 @@ impl ObserverPlugin for TypeScriptObserverPlugin {
     }
 
     async fn setup(&self, _ctx: PluginContext) -> Result<(), PluginSetupError> {
-        let process = start_worker_process(self.name, &self.config)
+        self.bridge
+            .ensure_started()
             .await
-            .map_err(PluginSetupError::new)?;
-        let mut guard = self
-            .process
-            .lock()
-            .map_err(|_error| PluginSetupError::new("worker process lock poisoned"))?;
-        *guard = Some(process);
-        Ok(())
+            .map_err(PluginSetupError::new)
     }
 
     async fn on_transaction(&self, event: &TransactionEvent) {
-        self.deliver_provider_event(provider_transaction_event_wire(event))
+        self.bridge
+            .deliver_provider_event(provider_transaction_event_wire(event))
             .await;
     }
 
     async fn on_transaction_log(&self, event: &TransactionLogEvent) {
-        self.deliver_provider_event(provider_transaction_log_event_wire(event))
+        self.bridge
+            .deliver_provider_event(provider_transaction_log_event_wire(event))
             .await;
     }
 
     async fn on_transaction_status(&self, event: &TransactionStatusEvent) {
-        self.deliver_provider_event(provider_transaction_status_event_wire(event))
+        self.bridge
+            .deliver_provider_event(provider_transaction_status_event_wire(event))
             .await;
     }
 
     async fn on_account_update(&self, event: &AccountUpdateEvent) {
-        self.deliver_provider_event(provider_account_update_event_wire(event))
+        self.bridge
+            .deliver_provider_event(provider_account_update_event_wire(event))
             .await;
     }
 
     async fn on_block_meta(&self, event: &BlockMetaEvent) {
-        self.deliver_provider_event(provider_block_meta_event_wire(event))
+        self.bridge
+            .deliver_provider_event(provider_block_meta_event_wire(event))
             .await;
     }
 
     async fn on_slot_status(&self, event: SlotStatusEvent) {
-        self.deliver_provider_event(provider_slot_status_event_wire(&event))
+        self.bridge
+            .deliver_provider_event(provider_slot_status_event_wire(&event))
             .await;
     }
 
     async fn on_recent_blockhash(&self, event: ObservedRecentBlockhashEvent) {
-        self.deliver_provider_event(provider_recent_blockhash_event_wire(&event))
+        self.bridge
+            .deliver_provider_event(provider_recent_blockhash_event_wire(&event))
             .await;
     }
 
     async fn shutdown(&self, _ctx: PluginContext) {
-        shutdown_worker_process(self.name, &self.process).await;
+        self.bridge.shutdown().await;
     }
 }
 
-#[cfg(feature = "provider-grpc")]
-impl TypeScriptObserverPlugin {
-    /// Delivers one provider event into the bound TypeScript worker.
-    async fn deliver_provider_event(&self, event: Value) {
-        let process = match self.process.lock() {
-            Ok(mut guard) => guard.take(),
-            Err(error) => {
-                tracing::warn!(plugin = self.name, error = %error, "worker process lock poisoned");
-                None
-            }
+impl TypeScriptWorkerBridge {
+    /// Starts the shared worker process when it has not been started yet.
+    async fn ensure_started(&self) -> Result<(), String> {
+        let mut guard = self.process.lock().await;
+        if guard.is_some() {
+            return Ok(());
+        }
+
+        *guard = Some(start_worker_process(self.name, &self.config).await?);
+        Ok(())
+    }
+
+    /// Delivers one packet event into the bound TypeScript worker.
+    async fn deliver_packet(&self, event: RuntimePacketEvent) {
+        let mut guard = self.process.lock().await;
+        let Some(process) = guard.as_mut() else {
+            tracing::warn!(
+                extension = self.name,
+                "worker process is not available for packet"
+            );
+            return;
         };
-        let Some(mut process) = process else {
+
+        if let Err(error) = send_worker_message(
+            process,
+            json!({
+                "tag": 3,
+                "event": runtime_packet_event_wire(&event),
+            }),
+        )
+        .await
+        {
+            tracing::warn!(extension = self.name, error = %error, "failed to deliver packet to worker");
+        } else {
+            match read_worker_response(process, RESPONSE_TAG_EVENT_HANDLED).await {
+                Ok(response) => {
+                    if let Err(error) = response_result_ok(self.name, &response) {
+                        tracing::warn!(extension = self.name, error = %error, "worker rejected packet");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(extension = self.name, error = %error, "worker did not acknowledge packet");
+                }
+            }
+        }
+    }
+
+    /// Delivers one provider event into the bound TypeScript worker.
+    #[cfg(feature = "provider-grpc")]
+    async fn deliver_provider_event(&self, event: Value) {
+        let mut guard = self.process.lock().await;
+        let Some(process) = guard.as_mut() else {
             tracing::warn!(
                 plugin = self.name,
                 "worker process is not available for provider event"
@@ -1243,7 +1417,7 @@ impl TypeScriptObserverPlugin {
         };
 
         if let Err(error) = send_worker_message(
-            &mut process,
+            process,
             json!({
                 "tag": 5,
                 "event": event,
@@ -1253,7 +1427,7 @@ impl TypeScriptObserverPlugin {
         {
             tracing::warn!(plugin = self.name, error = %error, "failed to deliver provider event to worker");
         } else {
-            match read_worker_response(&mut process, RESPONSE_TAG_PROVIDER_EVENT_HANDLED).await {
+            match read_worker_response(process, RESPONSE_TAG_PROVIDER_EVENT_HANDLED).await {
                 Ok(response) => {
                     if let Err(error) = response_result_ok(self.name, &response) {
                         tracing::warn!(plugin = self.name, error = %error, "worker rejected provider event");
@@ -1264,10 +1438,38 @@ impl TypeScriptObserverPlugin {
                 }
             }
         }
+    }
 
-        if let Ok(mut guard) = self.process.lock() {
-            *guard = Some(process);
+    /// Requests shutdown for the worker process when it is still running.
+    async fn shutdown(&self) {
+        let mut guard = self.process.lock().await;
+        let Some(process) = guard.as_mut() else {
+            return;
+        };
+
+        if let Err(error) = send_worker_message(
+            process,
+            json!({
+                "tag": 4,
+                "context": WorkerContext {
+                    extension_name: self.name,
+                },
+            }),
+        )
+        .await
+        {
+            tracing::warn!(extension = self.name, error = %error, "failed to request worker shutdown");
+        } else if let Err(error) = read_worker_response(process, RESPONSE_TAG_SHUTDOWN_COMPLETE)
+            .await
+            .and_then(|response| response_result_ok(self.name, &response))
+        {
+            tracing::warn!(extension = self.name, error = %error, "worker shutdown was not acknowledged");
         }
+
+        if let Err(error) = process.child.wait().await {
+            tracing::warn!(extension = self.name, error = %error, "failed to wait for worker process");
+        }
+        *guard = None;
     }
 }
 
@@ -1295,47 +1497,6 @@ async fn start_worker_process(
     response_result_ok(extension_name, &start_response)?;
 
     Ok(process)
-}
-
-#[cfg(feature = "provider-grpc")]
-/// Requests shutdown for one worker process when it is still running.
-async fn shutdown_worker_process(
-    extension_name: &'static str,
-    process: &Mutex<Option<TypeScriptWorkerProcess>>,
-) {
-    let process = match process.lock() {
-        Ok(mut guard) => guard.take(),
-        Err(error) => {
-            tracing::warn!(extension = extension_name, error = %error, "worker process lock poisoned");
-            None
-        }
-    };
-    let Some(mut process) = process else {
-        return;
-    };
-
-    if let Err(error) = send_worker_message(
-        &mut process,
-        json!({
-            "tag": 4,
-            "context": WorkerContext {
-                extension_name,
-            },
-        }),
-    )
-    .await
-    {
-        tracing::warn!(extension = extension_name, error = %error, "failed to request worker shutdown");
-    } else if let Err(error) = read_worker_response(&mut process, RESPONSE_TAG_SHUTDOWN_COMPLETE)
-        .await
-        .and_then(|response| response_result_ok(extension_name, &response))
-    {
-        tracing::warn!(extension = extension_name, error = %error, "worker shutdown was not acknowledged");
-    }
-
-    if let Err(error) = process.child.wait().await {
-        tracing::warn!(extension = extension_name, error = %error, "failed to wait for worker process");
-    }
 }
 
 /// Spawns one stdio worker process from the provided launch config.
@@ -1846,5 +2007,121 @@ const fn runtime_websocket_frame_type_to_wire(value: RuntimeWebSocketFrameType) 
         RuntimeWebSocketFrameType::Binary => 2,
         RuntimeWebSocketFrameType::Ping => 3,
         RuntimeWebSocketFrameType::Pong => 4,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn websocket_ingress(name: &str) -> IngressConfig {
+        IngressConfig {
+            kind: INGRESS_KIND_WEB_SOCKET,
+            name: name.to_owned(),
+            bind_address: None,
+            #[cfg(feature = "provider-grpc")]
+            endpoint: None,
+            #[cfg(feature = "provider-grpc")]
+            stream: None,
+            #[cfg(feature = "provider-grpc")]
+            x_token: None,
+            #[cfg(feature = "provider-grpc")]
+            commitment: None,
+            #[cfg(feature = "provider-grpc")]
+            vote: None,
+            #[cfg(feature = "provider-grpc")]
+            failed: None,
+            #[cfg(feature = "provider-grpc")]
+            signature: None,
+            #[cfg(feature = "provider-grpc")]
+            account_include: None,
+            #[cfg(feature = "provider-grpc")]
+            account_exclude: None,
+            #[cfg(feature = "provider-grpc")]
+            account_required: None,
+            #[cfg(feature = "provider-grpc")]
+            accounts: None,
+            #[cfg(feature = "provider-grpc")]
+            owners: None,
+            #[cfg(feature = "provider-grpc")]
+            require_transaction_signature: None,
+            #[cfg(feature = "provider-grpc")]
+            readiness: None,
+            #[cfg(feature = "provider-grpc")]
+            role: None,
+            #[cfg(feature = "provider-grpc")]
+            priority: None,
+            url: Some("wss://example.invalid".to_owned()),
+            #[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
+            requests: Some(vec![]),
+            entrypoints: None,
+            #[cfg(feature = "gossip-bootstrap")]
+            runtime_mode: None,
+            entrypoint_pinned: None,
+            kernel_bypass: None,
+        }
+    }
+
+    fn direct_shreds_ingress(name: &str) -> IngressConfig {
+        IngressConfig {
+            kind: INGRESS_KIND_DIRECT_SHREDS,
+            name: name.to_owned(),
+            bind_address: Some("127.0.0.1:20000".to_owned()),
+            #[cfg(feature = "provider-grpc")]
+            endpoint: None,
+            #[cfg(feature = "provider-grpc")]
+            stream: None,
+            #[cfg(feature = "provider-grpc")]
+            x_token: None,
+            #[cfg(feature = "provider-grpc")]
+            commitment: None,
+            #[cfg(feature = "provider-grpc")]
+            vote: None,
+            #[cfg(feature = "provider-grpc")]
+            failed: None,
+            #[cfg(feature = "provider-grpc")]
+            signature: None,
+            #[cfg(feature = "provider-grpc")]
+            account_include: None,
+            #[cfg(feature = "provider-grpc")]
+            account_exclude: None,
+            #[cfg(feature = "provider-grpc")]
+            account_required: None,
+            #[cfg(feature = "provider-grpc")]
+            accounts: None,
+            #[cfg(feature = "provider-grpc")]
+            owners: None,
+            #[cfg(feature = "provider-grpc")]
+            require_transaction_signature: None,
+            #[cfg(feature = "provider-grpc")]
+            readiness: None,
+            #[cfg(feature = "provider-grpc")]
+            role: None,
+            #[cfg(feature = "provider-grpc")]
+            priority: None,
+            url: None,
+            #[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
+            requests: None,
+            entrypoints: None,
+            #[cfg(feature = "gossip-bootstrap")]
+            runtime_mode: None,
+            entrypoint_pinned: None,
+            kernel_bypass: None,
+        }
+    }
+
+    #[test]
+    fn validate_ingress_accepts_mixed_websocket_and_raw_runtime_config() {
+        let config = RuntimeHostConfig {
+            app_name: "mixed-app".to_owned(),
+            runtime_environment: HashMap::new(),
+            ingress: vec![websocket_ingress("ws-a"), direct_shreds_ingress("direct-a")],
+            #[cfg(feature = "provider-grpc")]
+            fan_in: Some(FanInConfig { strategy: 2 }),
+            plugin_workers: vec![],
+        };
+
+        let result = validate_ingress(&config);
+        assert!(result.is_ok());
     }
 }

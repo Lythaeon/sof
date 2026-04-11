@@ -13,6 +13,8 @@ import {
   ProviderIngressRole,
   RuntimePacketSourceKind,
   createBalancedRuntime,
+  ok,
+  runtimeExtensionAck,
 } from "./index.js";
 
 test("app derives a stable default name from the first plugin", () => {
@@ -25,7 +27,7 @@ test("app derives a stable default name from the first plugin", () => {
         url: "wss://example.invalid",
       },
     ],
-    plugins: [new Plugin({ name: "tx-logger", logPackets: true })],
+    plugins: [new Plugin({ name: "tx-logger", onProviderEvent: () => ok(runtimeExtensionAck()) })],
   });
 
   assert.equal(app.name, "tx-logger-app");
@@ -35,7 +37,6 @@ test("app derives a stable default name from the first plugin", () => {
       kind: IngressKind.WebSocket,
       name: "solana-websocket",
       url: "wss://example.invalid",
-      requests: [],
     },
   ]);
 });
@@ -303,81 +304,71 @@ test("app rejects invalid provider ingress priority", () => {
   );
 });
 
-test("app reports mixed websocket and native ingress before starting a host", async () => {
-  const result = await new App({
-    ingress: [
-      {
-        kind: IngressKind.WebSocket,
-        url: "wss://example.invalid",
+test("app delegates mixed websocket and native ingress to the runtime host", async () => {
+  const previousRuntimeHost = process.env.SOF_SDK_RUNTIME_HOST_BINARY;
+  process.env.SOF_SDK_RUNTIME_HOST_BINARY = "/bin/true";
+  try {
+    const result = await new App({
+      ingress: [
+        {
+          kind: IngressKind.WebSocket,
+          url: "wss://example.invalid",
+        },
+        {
+          kind: IngressKind.DirectShreds,
+          bindAddress: "127.0.0.1:20000",
+        },
+      ],
+      fanIn: {
+        strategy: FanInStrategy.FirstSeen,
       },
-      {
-        kind: IngressKind.DirectShreds,
-        bindAddress: "127.0.0.1:20000",
-      },
-    ],
-    fanIn: {
-      strategy: FanInStrategy.FirstSeen,
-    },
-    plugins: [new Plugin({ name: "packet-extension", logPackets: false })],
-  }).run();
+      plugins: [new Plugin({ name: "packet-extension", logPackets: false })],
+    }).run();
 
-  assert.equal(isErr(result), true);
-  if (isErr(result)) {
-    assert.equal(result.error.field, "ingress");
-    assert.match(result.error.message, /mixed websocket and native-host ingress/);
+    assert.equal(isOk(result), true);
+  } finally {
+    if (previousRuntimeHost === undefined) {
+      delete process.env.SOF_SDK_RUNTIME_HOST_BINARY;
+    } else {
+      process.env.SOF_SDK_RUNTIME_HOST_BINARY = previousRuntimeHost;
+    }
   }
 });
 
-test("app reports multi-websocket ingress fan-in as unsupported today", async () => {
-  const result = await new App({
-    ingress: [
-      {
-        kind: IngressKind.WebSocket,
-        name: "ws-a",
-        url: "wss://one.example.invalid",
+test("app accepts multi-websocket ingress with explicit fanIn", async () => {
+  const previousRuntimeHost = process.env.SOF_SDK_RUNTIME_HOST_BINARY;
+  process.env.SOF_SDK_RUNTIME_HOST_BINARY = "/bin/true";
+  try {
+    const result = await new App({
+      ingress: [
+        {
+          kind: IngressKind.WebSocket,
+          name: "ws-a",
+          url: "wss://one.example.invalid",
+        },
+        {
+          kind: IngressKind.WebSocket,
+          name: "ws-b",
+          url: "wss://two.example.invalid",
+        },
+      ],
+      fanIn: {
+        strategy: FanInStrategy.FirstSeenThenPromote,
       },
-      {
-        kind: IngressKind.WebSocket,
-        name: "ws-b",
-        url: "wss://two.example.invalid",
-      },
-    ],
-    fanIn: {
-      strategy: FanInStrategy.FirstSeen,
-    },
-    plugins: [new Plugin({ name: "packet-extension", logPackets: false })],
-  }).run();
+      plugins: [new Plugin({ name: "packet-extension", logPackets: false })],
+    }).run();
 
-  assert.equal(isErr(result), true);
-  if (isErr(result)) {
-    assert.equal(result.error.field, "ingress");
-    assert.match(result.error.message, /multi-websocket ingress fan-in/);
+    assert.equal(isOk(result), true);
+  } finally {
+    if (previousRuntimeHost === undefined) {
+      delete process.env.SOF_SDK_RUNTIME_HOST_BINARY;
+    } else {
+      process.env.SOF_SDK_RUNTIME_HOST_BINARY = previousRuntimeHost;
+    }
   }
 });
 
 test("app accepts typed kernel-bypass config for direct shreds", async () => {
-  if (process.platform !== "linux") {
-    const result = await new App({
-      ingress: [
-        {
-          kind: IngressKind.DirectShreds,
-          bindAddress: "127.0.0.1:20000",
-          kernelBypass: {
-            interface: "eth0",
-          },
-        },
-      ],
-      plugins: [new Plugin({ name: "packet-extension", logPackets: false })],
-    }).run();
-
-    assert.equal(isErr(result), true);
-    if (isErr(result)) {
-      assert.equal(result.error.field, "ingress.kernelBypass");
-      assert.match(result.error.message, /only supported on Linux/);
-    }
-    return;
-  }
-
   const previousRuntimeHost = process.env.SOF_SDK_RUNTIME_HOST_BINARY;
   process.env.SOF_SDK_RUNTIME_HOST_BINARY = "/bin/true";
   try {
@@ -458,29 +449,35 @@ test("app rejects fanIn for direct shreds plus gossip composition", () => {
   );
 });
 
-test("app reports multiple direct shred native ingress sources as unsupported today", async () => {
-  const result = await new App({
-    ingress: [
-      {
-        kind: IngressKind.DirectShreds,
-        name: "direct-a",
-        bindAddress: "127.0.0.1:20000",
+test("app delegates multiple direct shred sources to the runtime host", async () => {
+  const previousRuntimeHost = process.env.SOF_SDK_RUNTIME_HOST_BINARY;
+  process.env.SOF_SDK_RUNTIME_HOST_BINARY = "/bin/true";
+  try {
+    const result = await new App({
+      ingress: [
+        {
+          kind: IngressKind.DirectShreds,
+          name: "direct-a",
+          bindAddress: "127.0.0.1:20000",
+        },
+        {
+          kind: IngressKind.DirectShreds,
+          name: "direct-b",
+          bindAddress: "127.0.0.1:20001",
+        },
+      ],
+      fanIn: {
+        strategy: FanInStrategy.FirstSeen,
       },
-      {
-        kind: IngressKind.DirectShreds,
-        name: "direct-b",
-        bindAddress: "127.0.0.1:20001",
-      },
-    ],
-    fanIn: {
-      strategy: FanInStrategy.FirstSeen,
-    },
-    plugins: [new Plugin({ name: "packet-extension", logPackets: false })],
-  }).run();
+      plugins: [new Plugin({ name: "packet-extension", logPackets: false })],
+    }).run();
 
-  assert.equal(isErr(result), true);
-  if (isErr(result)) {
-    assert.equal(result.error.field, "ingress");
-    assert.match(result.error.message, /one direct shred ingress source/);
+    assert.equal(isOk(result), true);
+  } finally {
+    if (previousRuntimeHost === undefined) {
+      delete process.env.SOF_SDK_RUNTIME_HOST_BINARY;
+    } else {
+      process.env.SOF_SDK_RUNTIME_HOST_BINARY = previousRuntimeHost;
+    }
   }
 });
