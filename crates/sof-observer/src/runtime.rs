@@ -3650,6 +3650,7 @@ mod tests {
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
+        thread,
         time::Instant,
     };
 
@@ -3660,9 +3661,9 @@ mod tests {
         DatasetEvent, DerivedStateCheckpoint, DerivedStateConsumer, DerivedStateConsumerConfig,
         DerivedStateConsumerContext, DerivedStateConsumerFault, DerivedStateFeedEnvelope,
         DerivedStateFeedEvent, ExtensionCapability, ExtensionContext, ExtensionManifest,
-        ObserverPlugin, PacketSubscription, PluginConfig, PluginContext, RawPacketEvent,
-        RuntimeExtension, RuntimePacketEvent, RuntimePacketSourceKind, TransactionInterest,
-        TransactionPrefilter,
+        ExtensionSetupError, ObserverPlugin, PacketSubscription, PluginConfig, PluginContext,
+        RawPacketEvent, RuntimeExtension, RuntimePacketEvent, RuntimePacketSourceKind,
+        TransactionInterest, TransactionPrefilter,
     };
     use async_trait::async_trait;
     use sof_gossip_tuning::{GossipTuningProfile, HostProfilePreset, IngestQueueMode};
@@ -3672,6 +3673,7 @@ mod tests {
     use solana_signature::Signature;
     use solana_signer::Signer;
     use solana_transaction::versioned::VersionedTransaction;
+    use tokio::time::sleep;
 
     fn with_runtime_env_overrides<T>(
         overrides: impl IntoIterator<Item = (String, String)>,
@@ -3856,7 +3858,7 @@ mod tests {
         async fn setup(
             &self,
             _ctx: ExtensionContext,
-        ) -> Result<ExtensionManifest, framework::extension::ExtensionSetupError> {
+        ) -> Result<ExtensionManifest, ExtensionSetupError> {
             self.counter.fetch_add(1, Ordering::Relaxed);
             Ok(ExtensionManifest::default())
         }
@@ -3867,7 +3869,7 @@ mod tests {
         async fn setup(
             &self,
             _ctx: ExtensionContext,
-        ) -> Result<ExtensionManifest, framework::extension::ExtensionSetupError> {
+        ) -> Result<ExtensionManifest, ExtensionSetupError> {
             Ok(ExtensionManifest {
                 capabilities: vec![ExtensionCapability::ObserveObserverIngress],
                 subscriptions: vec![PacketSubscription {
@@ -5152,7 +5154,7 @@ mod tests {
             if counter.load(Ordering::Relaxed) >= expected {
                 return true;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            thread::sleep(Duration::from_millis(10));
         }
         counter.load(Ordering::Relaxed) >= expected
     }
@@ -5167,7 +5169,7 @@ mod tests {
             if counter.load(Ordering::Relaxed) >= expected {
                 return true;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            sleep(Duration::from_millis(10)).await;
         }
         counter.load(Ordering::Relaxed) >= expected
     }
