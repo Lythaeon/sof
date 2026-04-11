@@ -135,6 +135,7 @@
                         <nav class="book-top-nav" aria-label="Primary">
                             <a href="{{ "/"|resolveFile }}" data-nav-match="docs">Documentation</a>
                             <a href="{{ "use-sof/"|resolveFile }}" data-nav-match="use">Use SOF</a>
+                            <a href="{{ "sdk/"|resolveFile }}" data-nav-match="sdk">SDKs</a>
                             <a href="{{ "operations/"|resolveFile }}" data-nav-match="operations">Operations</a>
                             <a href="{{ "architecture/"|resolveFile }}" data-nav-match="architecture">Architecture</a>
                             <a href="{{ "maintainers/"|resolveFile }}" data-nav-match="maintain">Maintain SOF</a>
@@ -224,6 +225,9 @@
                     path.indexOf("/crates/") !== -1
                 ) {
                     return "use";
+                }
+                if (path.indexOf("/sdk/") !== -1) {
+                    return "sdk";
                 }
                 if (path.indexOf("/operations/") !== -1) {
                     return "operations";

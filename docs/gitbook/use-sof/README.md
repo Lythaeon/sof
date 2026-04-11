@@ -15,6 +15,9 @@ This section is for:
 - operators choosing between direct UDP, gossip, private raw ingress, or processed providers
 - services combining local observation with local submission
 
+If you already know you want to author the app itself in Node.js, go to [SDKs](../sdk/README.md)
+instead.
+
 ## Read These First
 
 1. [Why SOF Exists](why-sof-exists.md)
