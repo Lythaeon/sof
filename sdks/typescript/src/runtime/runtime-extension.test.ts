@@ -25,7 +25,7 @@ import {
   tryCreateRuntimeExtensionWorkerManifest,
   tryCreateRuntimeExtensionWorkerRuntime,
   udpListenerResource,
-} from "../runtime.js";
+} from "./runtime-extension.js";
 
 test("runtime extension manifest creation validates stable typed metadata", () => {
   const parsedExtensionName = extensionName("demo-extension");

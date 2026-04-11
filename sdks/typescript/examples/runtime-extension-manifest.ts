@@ -1,6 +1,7 @@
 import {
   ExtensionCapability,
   ExtensionStreamVisibilityTag,
+  Plugin,
   RuntimePacketSourceKind,
   RuntimePacketTransport,
   type Result,
@@ -9,7 +10,6 @@ import {
   isErr,
   sharedExtensionStream,
   socketAddress,
-  tryCreateRuntimeExtensionWorkerManifest,
   udpListenerResource,
 } from "../dist/index.js";
 
@@ -30,27 +30,24 @@ const sharedVisibility = expectOk(sharedExtensionStream("demo-stream"));
 
 const udpResource = expectOk(udpListenerResource(resourceId, bindAddress, sharedVisibility));
 
-const manifest = expectOk(
-  tryCreateRuntimeExtensionWorkerManifest({
-    sdkVersion: "0.1.0",
-    extensionName: extension,
-    capabilities: [ExtensionCapability.BindUdp, ExtensionCapability.ObserveSharedExtensionStream],
-    resources: [udpResource],
-    subscriptions: [
-      {
-        sourceKind: RuntimePacketSourceKind.ExtensionResource,
-        transport: RuntimePacketTransport.Udp,
-        ownerExtension: extension,
-        resourceId,
-      },
-      {
-        sourceKind: RuntimePacketSourceKind.ExtensionResource,
-        ...(sharedVisibility.tag === ExtensionStreamVisibilityTag.Shared
-          ? { sharedTag: sharedVisibility.sharedTag }
-          : {}),
-      },
-    ],
-  }),
-);
+const plugin = new Plugin({
+  name: extension,
+  capabilities: [ExtensionCapability.BindUdp, ExtensionCapability.ObserveSharedExtensionStream],
+  resources: [udpResource],
+  subscriptions: [
+    {
+      sourceKind: RuntimePacketSourceKind.ExtensionResource,
+      transport: RuntimePacketTransport.Udp,
+      ownerExtension: extension,
+      resourceId,
+    },
+    {
+      sourceKind: RuntimePacketSourceKind.ExtensionResource,
+      ...(sharedVisibility.tag === ExtensionStreamVisibilityTag.Shared
+        ? { sharedTag: sharedVisibility.sharedTag }
+        : {}),
+    },
+  ],
+});
 
-process.stdout.write(`${JSON.stringify(manifest, undefined, 2)}\n`);
+process.stdout.write(`${JSON.stringify(plugin.manifest, undefined, 2)}\n`);

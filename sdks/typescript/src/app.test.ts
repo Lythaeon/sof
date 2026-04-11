@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import { isErr, isOk } from "./result.js";
@@ -99,10 +102,8 @@ test("plugin packet handlers default to observer ingress manifest access", () =>
     },
   });
 
-  assert.deepEqual(plugin.manifest.manifest.capabilities, [
-    ExtensionCapability.ObserveObserverIngress,
-  ]);
-  assert.deepEqual(plugin.manifest.manifest.subscriptions, [
+  assert.deepEqual(plugin.manifest.capabilities, [ExtensionCapability.ObserveObserverIngress]);
+  assert.deepEqual(plugin.manifest.subscriptions, [
     {
       sourceKind: RuntimePacketSourceKind.ObserverIngress,
     },
@@ -119,8 +120,20 @@ test("plugin explicit manifest access is preserved", () => {
     },
   });
 
-  assert.deepEqual(plugin.manifest.manifest.capabilities, [ExtensionCapability.ConnectWebSocket]);
-  assert.deepEqual(plugin.manifest.manifest.subscriptions, []);
+  assert.deepEqual(plugin.manifest.capabilities, [ExtensionCapability.ConnectWebSocket]);
+  assert.deepEqual(plugin.manifest.subscriptions, []);
+});
+
+test("plugin create preserves the validated auto-generated name", () => {
+  const plugin = Plugin.create({
+    onPacket: () => ok(runtimeExtensionAck()),
+  });
+
+  assert.equal(isErr(plugin), false);
+  if (!isErr(plugin)) {
+    assert.match(plugin.value.name, /^plugin-\d+$/);
+    assert.equal(plugin.value.name, "plugin-1");
+  }
 });
 
 test("app requires fanIn when multiple ingress sources are configured", () => {
@@ -302,6 +315,130 @@ test("app rejects invalid provider ingress priority", () => {
       }),
     /ingress.priority must be an integer between 0 and 65535/,
   );
+});
+
+test("app rejects unsupported ingress kinds from plain JavaScript input", () => {
+  const invalidInit: unknown = JSON.parse(`{
+    "ingress": [
+      {
+        "kind": 999,
+        "url": "wss://example.invalid"
+      }
+    ]
+  }`);
+  assert.notEqual(invalidInit, null);
+  assert.equal(typeof invalidInit, "object");
+  if (invalidInit === null || typeof invalidInit !== "object") {
+    return;
+  }
+
+  const result = App.create({
+    ...invalidInit,
+    plugins: [new Plugin({ name: "packet-extension", logPackets: false })],
+  });
+
+  assert.equal(isErr(result), true);
+  if (isErr(result)) {
+    assert.equal(result.error.field, "ingress.kind");
+  }
+});
+
+test("app runtime host config does not serialize the full process environment", async () => {
+  const previousRuntimeHost = process.env.SOF_SDK_RUNTIME_HOST_BINARY;
+  const previousSnapshot = process.env.SOF_SDK_CONFIG_SNAPSHOT;
+  const previousSecret = process.env.SOF_SDK_SHOULD_NOT_BE_SERIALIZED;
+  const tempDir = await mkdtemp(join(tmpdir(), "sof-sdk-host-test-"));
+  const hostPath = join(tempDir, "host.mjs");
+  const snapshotPath = join(tempDir, "snapshot.json");
+  await writeFile(
+    hostPath,
+    `#!/usr/bin/env node
+import { readFileSync, writeFileSync } from "node:fs";
+const configPath = process.argv[2];
+const snapshotPath = process.env.SOF_SDK_CONFIG_SNAPSHOT;
+if (configPath === undefined || snapshotPath === undefined) process.exit(2);
+const config = JSON.parse(readFileSync(configPath, "utf8"));
+writeFileSync(snapshotPath, JSON.stringify(config.pluginWorkers[0].environment));
+`,
+    "utf8",
+  );
+  await chmod(hostPath, 0o755);
+  process.env.SOF_SDK_RUNTIME_HOST_BINARY = hostPath;
+  process.env.SOF_SDK_CONFIG_SNAPSHOT = snapshotPath;
+  process.env.SOF_SDK_SHOULD_NOT_BE_SERIALIZED = "secret";
+  try {
+    const result = await new App({
+      ingress: [
+        {
+          kind: IngressKind.DirectShreds,
+          bindAddress: "127.0.0.1:20000",
+        },
+      ],
+      plugins: [new Plugin({ name: "packet-extension", logPackets: false })],
+    }).run();
+
+    assert.equal(isOk(result), true);
+    const environment = JSON.parse(await readFile(snapshotPath, "utf8")) as Record<string, string>;
+    assert.deepEqual(environment, {
+      SOF_SDK_INTERNAL_PLUGIN_WORKER: "packet-extension",
+      SOF_SDK_INTERNAL_PLUGIN_WORKER_MODE: "1",
+    });
+  } finally {
+    if (previousRuntimeHost === undefined) {
+      delete process.env.SOF_SDK_RUNTIME_HOST_BINARY;
+    } else {
+      process.env.SOF_SDK_RUNTIME_HOST_BINARY = previousRuntimeHost;
+    }
+    if (previousSnapshot === undefined) {
+      delete process.env.SOF_SDK_CONFIG_SNAPSHOT;
+    } else {
+      process.env.SOF_SDK_CONFIG_SNAPSHOT = previousSnapshot;
+    }
+    if (previousSecret === undefined) {
+      delete process.env.SOF_SDK_SHOULD_NOT_BE_SERIALIZED;
+    } else {
+      process.env.SOF_SDK_SHOULD_NOT_BE_SERIALIZED = previousSecret;
+    }
+    await rm(tempDir, { force: true, recursive: true });
+  }
+});
+
+test("app ignores internal worker env without the internal worker mode flag", async () => {
+  const previousWorker = process.env.SOF_SDK_INTERNAL_PLUGIN_WORKER;
+  const previousMode = process.env.SOF_SDK_INTERNAL_PLUGIN_WORKER_MODE;
+  const previousRuntimeHost = process.env.SOF_SDK_RUNTIME_HOST_BINARY;
+  process.env.SOF_SDK_INTERNAL_PLUGIN_WORKER = "packet-extension";
+  delete process.env.SOF_SDK_INTERNAL_PLUGIN_WORKER_MODE;
+  process.env.SOF_SDK_RUNTIME_HOST_BINARY = "/bin/true";
+  try {
+    const result = await new App({
+      ingress: [
+        {
+          kind: IngressKind.DirectShreds,
+          bindAddress: "127.0.0.1:20000",
+        },
+      ],
+      plugins: [new Plugin({ name: "packet-extension", logPackets: false })],
+    }).run();
+
+    assert.equal(isOk(result), true);
+  } finally {
+    if (previousWorker === undefined) {
+      delete process.env.SOF_SDK_INTERNAL_PLUGIN_WORKER;
+    } else {
+      process.env.SOF_SDK_INTERNAL_PLUGIN_WORKER = previousWorker;
+    }
+    if (previousMode === undefined) {
+      delete process.env.SOF_SDK_INTERNAL_PLUGIN_WORKER_MODE;
+    } else {
+      process.env.SOF_SDK_INTERNAL_PLUGIN_WORKER_MODE = previousMode;
+    }
+    if (previousRuntimeHost === undefined) {
+      delete process.env.SOF_SDK_RUNTIME_HOST_BINARY;
+    } else {
+      process.env.SOF_SDK_RUNTIME_HOST_BINARY = previousRuntimeHost;
+    }
+  }
 });
 
 test("app delegates mixed websocket and native ingress to the runtime host", async () => {

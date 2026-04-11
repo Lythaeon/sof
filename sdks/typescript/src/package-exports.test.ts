@@ -14,7 +14,6 @@ test("package exports resolve the documented public entry points", async () => {
   const derivedState = await importPackageEntry("@sof/sdk/runtime/derived-state");
   const deliveryProfile = await importPackageEntry("@sof/sdk/runtime/delivery-profile");
   const extension = await importPackageEntry("@sof/sdk/runtime/extension");
-  const extensionStdio = await importPackageEntry("@sof/sdk/runtime/extension-stdio");
 
   assert.equal((root as { App: unknown }).App, (app as { App: unknown }).App);
   assert.equal((root as { Plugin: unknown }).Plugin, (app as { Plugin: unknown }).Plugin);
@@ -29,14 +28,6 @@ test("package exports resolve the documented public entry points", async () => {
   assert.equal(
     (root as { observerRuntimeConfig: unknown }).observerRuntimeConfig,
     (config as { observerRuntimeConfig: unknown }).observerRuntimeConfig,
-  );
-  assert.equal(
-    (root as { tryObserverRuntimeConfig: unknown }).tryObserverRuntimeConfig,
-    (config as { tryObserverRuntimeConfig: unknown }).tryObserverRuntimeConfig,
-  );
-  assert.equal(
-    (root as { tryCreateRuntimeConfig: unknown }).tryCreateRuntimeConfig,
-    (config as { tryCreateRuntimeConfig: unknown }).tryCreateRuntimeConfig,
   );
   assert.equal(
     (runtime as { ObserverRuntimeConfig: unknown }).ObserverRuntimeConfig,
@@ -55,15 +46,21 @@ test("package exports resolve the documented public entry points", async () => {
     (deliveryProfile as { RuntimeDeliveryProfile: unknown }).RuntimeDeliveryProfile,
   );
   assert.equal(
-    (runtime as { createRuntimeExtensionWorkerManifest: unknown })
-      .createRuntimeExtensionWorkerManifest,
-    (extension as { createRuntimeExtensionWorkerManifest: unknown })
-      .createRuntimeExtensionWorkerManifest,
+    (runtime as { runtimeExtensionAck: unknown }).runtimeExtensionAck,
+    (extension as { runtimeExtensionAck: unknown }).runtimeExtensionAck,
+  );
+  assert.equal("tryCreateRuntimeConfig" in (root as Record<string, unknown>), false);
+  assert.equal("tryObserverRuntimeConfig" in (root as Record<string, unknown>), false);
+  assert.equal("tryCreateRuntimeConfig" in (runtime as Record<string, unknown>), false);
+  assert.equal("createRuntimeExtensionWorkerManifest" in (root as Record<string, unknown>), false);
+  assert.equal(
+    "createRuntimeExtensionWorkerManifest" in (runtime as Record<string, unknown>),
+    false,
   );
   assert.equal(
-    typeof (extensionStdio as { runRuntimeExtensionWorkerStdio: unknown })
-      .runRuntimeExtensionWorkerStdio,
-    "function",
+    "createRuntimeExtensionWorkerManifest" in (extension as Record<string, unknown>),
+    false,
   );
   assert.equal("runRuntimeExtensionWorkerStdio" in (root as Record<string, unknown>), false);
+  await assert.rejects(() => importPackageEntry("@sof/sdk/runtime/extension-stdio"));
 });

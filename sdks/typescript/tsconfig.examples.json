@@ -7,6 +7,10 @@
     "sourceMap": false
   },
   "include": [
-    "examples/**/*.ts"
+    "examples/app-config.ts",
+    "examples/app-entrypoint.ts",
+    "examples/runtime-config-balanced.ts",
+    "examples/runtime-config-parse.ts",
+    "examples/runtime-extension-manifest.ts"
   ]
 }

@@ -13,7 +13,7 @@ import {
   socketAddress,
   tryCreateRuntimeExtensionWorkerManifest,
   tryDefineRuntimeExtension,
-} from "../runtime.js";
+} from "./runtime-extension.js";
 import {
   runRuntimeExtensionWorkerStdio,
   serializeRuntimeExtensionWorkerHostMessageWire,

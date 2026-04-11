@@ -9,6 +9,7 @@ import { err, isErr, ok, type Result } from "./result.js";
 import {
   ExtensionCapability,
   type ExtensionContext,
+  type ExtensionManifest,
   type ExtensionName,
   type ExtensionResourceSpec,
   extensionName,
@@ -18,21 +19,23 @@ import {
   type PacketSubscription,
   type RuntimeExtensionAck,
   runtimeExtensionAck,
-  type RuntimeExtensionDefinition,
   type RuntimeExtensionError,
-  type RuntimeExtensionWorkerManifest,
   RuntimePacketSourceKind,
   type RuntimePacketEvent,
   type RuntimeProviderEvent,
   RuntimeDeliveryProfile,
   type ShredTrustMode,
   socketAddress,
+  webSocketUrl,
+} from "./runtime.js";
+import {
+  type RuntimeExtensionDefinition,
+  type RuntimeExtensionWorkerManifest,
+  runRuntimeExtensionWorkerStdio,
   tryCreateRuntimeConfig,
   tryCreateRuntimeExtensionWorkerManifest,
   tryDefineRuntimeExtension,
-  webSocketUrl,
-} from "./runtime.js";
-import { runRuntimeExtensionWorkerStdio } from "./runtime/runtime-extension-stdio.js";
+} from "./runtime/app-internal.js";
 
 export enum AppErrorKind {
   ValidationError = 1,
@@ -271,6 +274,8 @@ export const typeScriptSdkVersion = "0.1.0";
 const defaultAppName = "app";
 const autoPluginNamePrefix = "plugin";
 const internalPluginWorkerEnvVarName = "SOF_SDK_INTERNAL_PLUGIN_WORKER";
+const internalPluginWorkerModeEnvVarName = "SOF_SDK_INTERNAL_PLUGIN_WORKER_MODE";
+const internalPluginWorkerModeEnvValue = "1";
 const runtimeHostBinaryEnvVarName = "SOF_SDK_RUNTIME_HOST_BINARY";
 const runtimeHostBinaryBaseName = "sof_ts_runtime_host";
 const grpcIngressStreams = [
@@ -307,6 +312,7 @@ const defaultKernelBypassRingDepth = 2_048;
 const defaultKernelBypassPollTimeoutMs = 100;
 
 let nextAutoPluginOrdinal = 1;
+const pluginDefinitions = new WeakMap<Plugin, RuntimeExtensionDefinition>();
 
 function appError(
   kind: AppErrorKind,
@@ -485,6 +491,23 @@ function createPluginDefinition(init: PluginInit): Result<RuntimeExtensionDefini
       : { onProviderEvent: handlers.onProviderEvent }),
     ...(handlers.onStop === undefined ? {} : { onShutdown: handlers.onStop }),
   });
+}
+
+function setPluginDefinition(plugin: Plugin, definition: RuntimeExtensionDefinition): void {
+  pluginDefinitions.set(plugin, definition);
+}
+
+function pluginDefinition(plugin: Plugin): RuntimeExtensionDefinition {
+  const definition = pluginDefinitions.get(plugin);
+  if (definition === undefined) {
+    throw new RangeError("plugin definition is not initialized");
+  }
+
+  return definition;
+}
+
+function isRuntimeExtensionDefinition(value: unknown): value is RuntimeExtensionDefinition {
+  return typeof value === "object" && value !== null && "manifest" in value;
 }
 
 function parseIngressName(value: string, field: string): Result<string, AppError> {
@@ -860,6 +883,15 @@ function validateIngress(
       case IngressKind.DirectShreds:
         parsed = validateDirectShredsIngress(value, index);
         break;
+      default:
+        return err(
+          appError(
+            AppErrorKind.ValidationError,
+            "ingress.kind",
+            "ingress.kind must be WebSocket, Grpc, Gossip, or DirectShreds",
+            String((value as { readonly kind?: unknown }).kind),
+          ),
+        );
     }
 
     if (isErr(parsed)) {
@@ -1052,7 +1084,7 @@ function waitForChildExit(child: ChildProcess): Promise<Result<ChildExit, Error>
 }
 
 function invokePluginReady(plugin: Plugin): Promise<Result<RuntimeExtensionAck, PluginError>> {
-  const onReady = plugin.toDefinition().onReady;
+  const onReady = pluginDefinition(plugin).onReady;
   if (onReady === undefined) {
     return Promise.resolve(ok(runtimeExtensionAck()));
   }
@@ -1065,7 +1097,7 @@ function invokePluginReady(plugin: Plugin): Promise<Result<RuntimeExtensionAck, 
 }
 
 function invokePluginShutdown(plugin: Plugin): Promise<Result<RuntimeExtensionAck, PluginError>> {
-  const onShutdown = plugin.toDefinition().onShutdown;
+  const onShutdown = pluginDefinition(plugin).onShutdown;
   if (onShutdown === undefined) {
     return Promise.resolve(ok(runtimeExtensionAck()));
   }
@@ -1090,19 +1122,6 @@ async function shutdownPlugins(
   }
 
   return ok(runtimeExtensionAck());
-}
-
-function stringEnvironmentRecord(
-  env: NodeJS.ProcessEnv = process.env,
-): Readonly<Record<string, string>> {
-  const record: Record<string, string> = {};
-  for (const [key, value] of Object.entries(env)) {
-    if (value !== undefined) {
-      record[key] = value;
-    }
-  }
-
-  return record;
 }
 
 function currentNodeAppArgs(): Result<readonly string[], AppError> {
@@ -1134,12 +1153,12 @@ function createRuntimeHostConfig(state: AppState): Result<RuntimeHostConfig, App
     fanIn: state.fanIn,
     pluginWorkers: state.plugins.map((plugin) => ({
       name: plugin.name,
-      manifest: plugin.manifest,
+      manifest: pluginDefinition(plugin).manifest,
       command: process.execPath,
       args: appArgs.value,
       environment: {
-        ...stringEnvironmentRecord(),
         [internalPluginWorkerEnvVarName]: plugin.name,
+        [internalPluginWorkerModeEnvVarName]: internalPluginWorkerModeEnvValue,
       },
     })),
   });
@@ -1340,20 +1359,19 @@ function createAppState(init: AppInit): Result<AppState, AppError> {
 }
 
 export class Plugin {
-  private readonly definition: RuntimeExtensionDefinition;
-
-  constructor(init: Plugin | PluginInit | RuntimeExtensionDefinition) {
-    if (init instanceof Plugin) {
-      this.definition = init.definition;
+  constructor(init: Plugin | PluginInit);
+  constructor(init: RuntimeExtensionDefinition, internalDefinition: true);
+  constructor(init: Plugin | PluginInit | RuntimeExtensionDefinition, _internalDefinition?: true) {
+    if (arguments[1] === true) {
+      if (!isRuntimeExtensionDefinition(init)) {
+        throw new RangeError("plugin definition is not initialized");
+      }
+      setPluginDefinition(this, init);
       return;
     }
 
-    if (typeof init === "object" && init !== null && "manifest" in init) {
-      const validated = tryDefineRuntimeExtension(init);
-      if (isErr(validated)) {
-        throw new RangeError(validated.error.message);
-      }
-      this.definition = validated.value;
+    if (init instanceof Plugin) {
+      setPluginDefinition(this, pluginDefinition(init));
       return;
     }
 
@@ -1362,35 +1380,24 @@ export class Plugin {
       throw new RangeError(definition.error.message);
     }
 
-    this.definition = definition.value;
+    setPluginDefinition(this, definition.value);
   }
 
-  static create(
-    init: Plugin | PluginInit | RuntimeExtensionDefinition,
-  ): Result<Plugin, PluginError> {
+  static create(init: Plugin | PluginInit): Result<Plugin, PluginError> {
     if (init instanceof Plugin) {
       return ok(init);
     }
 
-    if (typeof init === "object" && init !== null && "manifest" in init) {
-      const validated = tryDefineRuntimeExtension(init);
-      return isErr(validated) ? validated : ok(new Plugin(validated.value));
-    }
-
     const definition = createPluginDefinition(init);
-    return isErr(definition) ? definition : ok(new Plugin(definition.value));
+    return isErr(definition) ? definition : ok(new Plugin(definition.value, true));
   }
 
   get name(): ExtensionName {
-    return this.definition.manifest.extensionName;
+    return pluginDefinition(this).manifest.extensionName;
   }
 
-  get manifest(): RuntimeExtensionWorkerManifest {
-    return this.definition.manifest;
-  }
-
-  toDefinition(): RuntimeExtensionDefinition {
-    return this.definition;
+  get manifest(): ExtensionManifest {
+    return pluginDefinition(this).manifest.manifest;
   }
 }
 
@@ -1511,7 +1518,7 @@ export class App {
       return Promise.resolve(plugin);
     }
 
-    return runRuntimeExtensionWorkerStdio(plugin.value.toDefinition());
+    return runRuntimeExtensionWorkerStdio(pluginDefinition(plugin.value));
   }
 
   run(options: AppRunOptions = {}): Promise<Result<RuntimeExtensionAck, AppRunError>> {
@@ -1526,7 +1533,10 @@ export class App {
     }
 
     const internalWorkerPluginName = process.env[internalPluginWorkerEnvVarName];
-    if (internalWorkerPluginName !== undefined) {
+    if (
+      internalWorkerPluginName !== undefined &&
+      process.env[internalPluginWorkerModeEnvVarName] === internalPluginWorkerModeEnvValue
+    ) {
       return this.#runInternalPluginWorker(internalWorkerPluginName);
     }
 
