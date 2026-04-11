@@ -5142,10 +5142,10 @@ mod tests {
     }
 
     fn runtime_delivery_transaction_event() -> TransactionEvent {
-        match sample_provider_transaction_update() {
-            ProviderStreamUpdate::Transaction(event) => event,
-            _ => unreachable!("sample transaction helper returns transaction update"),
-        }
+        let ProviderStreamUpdate::Transaction(event) = sample_provider_transaction_update() else {
+            panic!("sample transaction helper returns transaction update");
+        };
+        event
     }
 
     fn wait_until_counter(counter: &AtomicUsize, expected: usize, timeout: Duration) -> bool {
