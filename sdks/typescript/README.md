@@ -5,8 +5,10 @@ Unified TypeScript SDK surface for SOF.
 This initial package slice provides:
 
 - checked `Result<T, E>` primitives
+- branded/value-object types for domain strings
 - enum-backed runtime delivery profile types
 - typed SOF runtime config serialization for `SOF_RUNTIME_DELIVERY_PROFILE`
+- typed environment entry helpers instead of only raw string maps
 
 ## Example
 
@@ -14,7 +16,8 @@ This initial package slice provides:
 import {
   ObserverRuntimeConfig,
   RuntimeDeliveryProfile,
-  runtimeDeliveryProfileToEnvValue,
+  runtimeDeliveryProfileEnvValues,
+  runtimeDeliveryProfileEnvVarName,
 } from "@sof/sdk";
 
 const config = new ObserverRuntimeConfig({
@@ -22,8 +25,11 @@ const config = new ObserverRuntimeConfig({
 });
 
 const env = config.toEnvironment();
+// [{ name: "SOF_RUNTIME_DELIVERY_PROFILE", value: "balanced" }]
+
+const envRecord = config.toEnvironmentRecord();
 // { SOF_RUNTIME_DELIVERY_PROFILE: "balanced" }
 
-runtimeDeliveryProfileToEnvValue(RuntimeDeliveryProfile.DeliveryDisciplined);
-// "delivery_disciplined"
+runtimeDeliveryProfileEnvVarName;
+runtimeDeliveryProfileEnvValues.deliveryDisciplined;
 ```

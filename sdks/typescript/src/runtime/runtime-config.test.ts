@@ -1,15 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { environmentVariable } from "../environment.js";
 import { ValidationErrorKind } from "../errors.js";
 import { isErr, isOk, ResultTag } from "../result.js";
 import {
   ObserverRuntimeConfig,
   RuntimeDeliveryProfile,
   parseRuntimeDeliveryProfile,
-  runtimeDeliveryProfileEnvKey,
+  runtimeDeliveryProfileAllowedValues,
+  runtimeDeliveryProfileEnvValues,
+  runtimeDeliveryProfileEnvVarName,
   runtimeDeliveryProfileToEnvValue,
-} from "./index.js";
+} from "../runtime.js";
 
 test("result and runtime delivery profile discriminants stay stable", () => {
   assert.equal(ResultTag.Ok, 1);
@@ -22,15 +25,15 @@ test("result and runtime delivery profile discriminants stay stable", () => {
 test("runtime delivery profile maps to the documented env values", () => {
   assert.equal(
     runtimeDeliveryProfileToEnvValue(RuntimeDeliveryProfile.LatencyOptimized),
-    "latency_optimized",
+    runtimeDeliveryProfileEnvValues.latencyOptimized,
   );
   assert.equal(
     runtimeDeliveryProfileToEnvValue(RuntimeDeliveryProfile.Balanced),
-    "balanced",
+    runtimeDeliveryProfileEnvValues.balanced,
   );
   assert.equal(
     runtimeDeliveryProfileToEnvValue(RuntimeDeliveryProfile.DeliveryDisciplined),
-    "delivery_disciplined",
+    runtimeDeliveryProfileEnvValues.deliveryDisciplined,
   );
 });
 
@@ -55,9 +58,10 @@ test("runtime delivery profile parser accepts documented aliases", () => {
 test("runtime config omits the default profile unless requested", () => {
   const config = new ObserverRuntimeConfig();
 
-  assert.deepEqual(config.toEnvironment(), {});
-  assert.deepEqual(config.toEnvironment({ includeDefaults: true }), {
-    [runtimeDeliveryProfileEnvKey]: "latency_optimized",
+  assert.deepEqual(config.toEnvironment(), []);
+  assert.deepEqual(config.toEnvironmentRecord({ includeDefaults: true }), {
+    [runtimeDeliveryProfileEnvVarName]:
+      runtimeDeliveryProfileEnvValues.latencyOptimized,
   });
 });
 
@@ -66,14 +70,18 @@ test("runtime config serializes explicit profile selection", () => {
     runtimeDeliveryProfile: RuntimeDeliveryProfile.Balanced,
   });
 
-  assert.deepEqual(config.toEnvironment(), {
-    [runtimeDeliveryProfileEnvKey]: "balanced",
-  });
+  assert.deepEqual(config.toEnvironment(), [
+    environmentVariable(
+      runtimeDeliveryProfileEnvVarName,
+      runtimeDeliveryProfileEnvValues.balanced,
+    ),
+  ]);
 });
 
 test("runtime config parses environment values into typed config", () => {
   const config = ObserverRuntimeConfig.fromEnvironment({
-    [runtimeDeliveryProfileEnvKey]: "delivery_disciplined",
+    [runtimeDeliveryProfileEnvVarName]:
+      runtimeDeliveryProfileEnvValues.deliveryDisciplined,
   });
 
   assert.equal(isOk(config), true);
@@ -85,9 +93,26 @@ test("runtime config parses environment values into typed config", () => {
   }
 });
 
+test("runtime config parses typed environment variables into typed config", () => {
+  const config = ObserverRuntimeConfig.fromEnvironmentVariables([
+    environmentVariable(
+      runtimeDeliveryProfileEnvVarName,
+      runtimeDeliveryProfileEnvValues.balanced,
+    ),
+  ]);
+
+  assert.equal(isOk(config), true);
+  if (isOk(config)) {
+    assert.equal(
+      config.value.runtimeDeliveryProfile,
+      RuntimeDeliveryProfile.Balanced,
+    );
+  }
+});
+
 test("runtime config rejects invalid delivery profile values", () => {
   const config = ObserverRuntimeConfig.fromEnvironment({
-    [runtimeDeliveryProfileEnvKey]: "fastest",
+    [runtimeDeliveryProfileEnvVarName]: "fastest",
   });
 
   assert.equal(isErr(config), true);
@@ -96,12 +121,11 @@ test("runtime config rejects invalid delivery profile values", () => {
       config.error.kind,
       ValidationErrorKind.InvalidRuntimeDeliveryProfile,
     );
-    assert.equal(config.error.field, runtimeDeliveryProfileEnvKey);
+    assert.equal(config.error.field, runtimeDeliveryProfileEnvVarName);
     assert.equal(config.error.received, "fastest");
-    assert.deepEqual(config.error.allowedValues, [
-      "latency_optimized",
-      "balanced",
-      "delivery_disciplined",
-    ]);
+    assert.deepEqual(
+      config.error.allowedValues,
+      runtimeDeliveryProfileAllowedValues,
+    );
   }
 });
