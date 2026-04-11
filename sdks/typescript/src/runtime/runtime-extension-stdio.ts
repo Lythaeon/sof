@@ -43,6 +43,12 @@ const runtimeProviderEventKinds = [
   1, 2, 3, 4, 5, 6, 7,
 ] as const satisfies readonly RuntimeProviderEventKind[];
 const workerFrameHeaderBytes = 5;
+const packetSourceOwnerExtensionFlag = 1;
+const packetSourceResourceIdFlag = 2;
+const packetSourceSharedTagFlag = 4;
+const packetSourceWebSocketFrameTypeFlag = 8;
+const packetSourceLocalAddressFlag = 16;
+const packetSourceRemoteAddressFlag = 32;
 
 type JsonRecord = Record<string, unknown>;
 
@@ -558,30 +564,426 @@ export function tryParseRuntimeProviderEventWire(
   return ok(eventRecord.value);
 }
 
-function parseRuntimePacketEventBatchWire(
-  value: unknown,
-): Result<readonly RuntimePacketEvent[], RuntimeExtensionError> {
-  const batchRecord = parseJsonRecord(value, "message");
-  if (isErr(batchRecord)) {
-    return batchRecord;
+class PacketBatchBinaryReader {
+  readonly #payload: Buffer;
+  #offset = 0;
+
+  constructor(payload: Uint8Array) {
+    this.#payload = Buffer.from(payload);
   }
-  if (!Array.isArray(batchRecord.value.events)) {
-    return err(
-      runtimeExtensionProtocolError(
-        "message.events",
-        "message.events must be an array",
-        JSON.stringify(batchRecord.value.events),
-      ),
-    );
+
+  get consumed(): boolean {
+    return this.#offset === this.#payload.length;
+  }
+
+  readU8(field: string): Result<number, RuntimeExtensionError> {
+    if (this.#offset >= this.#payload.length) {
+      return err(
+        runtimeExtensionProtocolError(field, `${field} is missing from packet batch payload`),
+      );
+    }
+
+    const value = this.#payload[this.#offset];
+    this.#offset += 1;
+    return value === undefined
+      ? err(runtimeExtensionProtocolError(field, `${field} is missing from packet batch payload`))
+      : ok(value);
+  }
+
+  readU32(field: string): Result<number, RuntimeExtensionError> {
+    const nextOffset = this.#offset + 4;
+    if (nextOffset > this.#payload.length) {
+      return err(
+        runtimeExtensionProtocolError(field, `${field} is truncated in packet batch payload`),
+      );
+    }
+
+    const value = this.#payload.readUInt32LE(this.#offset);
+    this.#offset = nextOffset;
+    return ok(value);
+  }
+
+  readU64AsSafeNumber(field: string): Result<number, RuntimeExtensionError> {
+    const nextOffset = this.#offset + 8;
+    if (nextOffset > this.#payload.length) {
+      return err(
+        runtimeExtensionProtocolError(field, `${field} is truncated in packet batch payload`),
+      );
+    }
+
+    const value = this.#payload.readBigUInt64LE(this.#offset);
+    this.#offset = nextOffset;
+    if (value > BigInt(Number.MAX_SAFE_INTEGER)) {
+      return err(
+        runtimeExtensionProtocolError(
+          field,
+          `${field} must be <= Number.MAX_SAFE_INTEGER`,
+          value.toString(),
+        ),
+      );
+    }
+    return ok(Number(value));
+  }
+
+  readString(field: string): Result<string, RuntimeExtensionError> {
+    const length = this.readU32(`${field}.length`);
+    if (isErr(length)) {
+      return length;
+    }
+
+    const nextOffset = this.#offset + length.value;
+    if (nextOffset > this.#payload.length) {
+      return err(
+        runtimeExtensionProtocolError(field, `${field} is truncated in packet batch payload`),
+      );
+    }
+
+    const value = this.#payload.subarray(this.#offset, nextOffset).toString("utf8");
+    this.#offset = nextOffset;
+    return ok(value);
+  }
+
+  readBytes(field: string): Result<Uint8Array, RuntimeExtensionError> {
+    const length = this.readU32(`${field}.length`);
+    if (isErr(length)) {
+      return length;
+    }
+
+    const nextOffset = this.#offset + length.value;
+    if (nextOffset > this.#payload.length) {
+      return err(
+        runtimeExtensionProtocolError(field, `${field} is truncated in packet batch payload`),
+      );
+    }
+
+    const value = Uint8Array.from(this.#payload.subarray(this.#offset, nextOffset));
+    this.#offset = nextOffset;
+    return ok(value);
+  }
+}
+
+function hasPacketSourceFlag(flags: number, flag: number): boolean {
+  return (flags & flag) === flag;
+}
+
+function readOptionalPacketString(
+  reader: PacketBatchBinaryReader,
+  flags: number,
+  flag: number,
+  field: string,
+): Result<string | undefined, RuntimeExtensionError> {
+  return hasPacketSourceFlag(flags, flag) ? reader.readString(field) : okMissing();
+}
+
+function parseRuntimePacketSourceKindValue(
+  value: number,
+  field: string,
+): Result<RuntimePacketSourceKind, RuntimeExtensionError> {
+  const parsed = parseNumericEnumValue(value, field, runtimePacketSourceKinds);
+  if (isErr(parsed)) {
+    return parsed;
+  }
+
+  switch (parsed.value) {
+    case 1:
+      return ok(1);
+    case 2:
+      return ok(2);
+    default:
+      return err(runtimeExtensionProtocolError(field, `${field} must be a packet source kind`));
+  }
+}
+
+function parseRuntimePacketTransportValue(
+  value: number,
+  field: string,
+): Result<RuntimePacketTransport, RuntimeExtensionError> {
+  const parsed = parseNumericEnumValue(value, field, runtimePacketTransports);
+  if (isErr(parsed)) {
+    return parsed;
+  }
+
+  switch (parsed.value) {
+    case 1:
+      return ok(1);
+    case 2:
+      return ok(2);
+    case 3:
+      return ok(3);
+    default:
+      return err(runtimeExtensionProtocolError(field, `${field} must be a packet transport`));
+  }
+}
+
+function parseRuntimePacketEventClassValue(
+  value: number,
+  field: string,
+): Result<RuntimePacketEventClass, RuntimeExtensionError> {
+  const parsed = parseNumericEnumValue(value, field, runtimePacketEventClasses);
+  if (isErr(parsed)) {
+    return parsed;
+  }
+
+  switch (parsed.value) {
+    case 1:
+      return ok(1);
+    case 2:
+      return ok(2);
+    default:
+      return err(runtimeExtensionProtocolError(field, `${field} must be a packet event class`));
+  }
+}
+
+function parseRuntimeWebSocketFrameTypeValue(
+  value: number,
+  field: string,
+): Result<RuntimeWebSocketFrameType, RuntimeExtensionError> {
+  const parsed = parseNumericEnumValue(value, field, runtimeWebSocketFrameTypes);
+  if (isErr(parsed)) {
+    return parsed;
+  }
+
+  switch (parsed.value) {
+    case 1:
+      return ok(1);
+    case 2:
+      return ok(2);
+    case 3:
+      return ok(3);
+    case 4:
+      return ok(4);
+    default:
+      return err(runtimeExtensionProtocolError(field, `${field} must be a websocket frame type`));
+  }
+}
+
+function readOptionalWebSocketFrameType(
+  reader: PacketBatchBinaryReader,
+  flags: number,
+  field: string,
+): Result<RuntimeWebSocketFrameType | undefined, RuntimeExtensionError> {
+  if (!hasPacketSourceFlag(flags, packetSourceWebSocketFrameTypeFlag)) {
+    return okMissing();
+  }
+
+  const value = reader.readU8(field);
+  if (isErr(value)) {
+    return value;
+  }
+
+  return parseRuntimeWebSocketFrameTypeValue(value.value, field);
+}
+
+function parseOptionalPacketExtensionName(
+  value: string | undefined,
+  field: string,
+): Result<ExtensionName | undefined, RuntimeExtensionError> {
+  return parseOptionalExtensionName(value, field);
+}
+
+function parseOptionalPacketResourceId(
+  value: string | undefined,
+  field: string,
+): Result<ExtensionResourceId | undefined, RuntimeExtensionError> {
+  return parseOptionalResourceId(value, field);
+}
+
+function parseOptionalPacketSharedTag(
+  value: string | undefined,
+  field: string,
+): Result<SharedStreamTag | undefined, RuntimeExtensionError> {
+  return parseOptionalSharedStreamTag(value, field);
+}
+
+function parseOptionalPacketSocketAddress(
+  value: string | undefined,
+  field: string,
+): Result<SocketAddress | undefined, RuntimeExtensionError> {
+  return parseOptionalSocketAddress(value, field);
+}
+
+function parseRuntimePacketEventBatchFrame(
+  payload: Uint8Array,
+): Result<readonly RuntimePacketEvent[], RuntimeExtensionError> {
+  const reader = new PacketBatchBinaryReader(payload);
+  const eventCount = reader.readU32("message.events.length");
+  if (isErr(eventCount)) {
+    return eventCount;
   }
 
   const events: RuntimePacketEvent[] = [];
-  for (const eventValue of batchRecord.value.events) {
-    const event = tryParseRuntimePacketEventWire(eventValue);
-    if (isErr(event)) {
-      return event;
+  for (let index = 0; index < eventCount.value; index += 1) {
+    const kindValue = reader.readU8(`message.events.${index}.source.kind`);
+    if (isErr(kindValue)) {
+      return kindValue;
     }
-    events.push(event.value);
+    const kind = parseRuntimePacketSourceKindValue(
+      kindValue.value,
+      `message.events.${index}.source.kind`,
+    );
+    if (isErr(kind)) {
+      return kind;
+    }
+
+    const transportValue = reader.readU8(`message.events.${index}.source.transport`);
+    if (isErr(transportValue)) {
+      return transportValue;
+    }
+    const transport = parseRuntimePacketTransportValue(
+      transportValue.value,
+      `message.events.${index}.source.transport`,
+    );
+    if (isErr(transport)) {
+      return transport;
+    }
+
+    const eventClassValue = reader.readU8(`message.events.${index}.source.eventClass`);
+    if (isErr(eventClassValue)) {
+      return eventClassValue;
+    }
+    const eventClass = parseRuntimePacketEventClassValue(
+      eventClassValue.value,
+      `message.events.${index}.source.eventClass`,
+    );
+    if (isErr(eventClass)) {
+      return eventClass;
+    }
+
+    const flags = reader.readU8(`message.events.${index}.source.flags`);
+    if (isErr(flags)) {
+      return flags;
+    }
+
+    const observedUnixMs = reader.readU64AsSafeNumber(`message.events.${index}.observedUnixMs`);
+    if (isErr(observedUnixMs)) {
+      return observedUnixMs;
+    }
+
+    const webSocketFrameType = readOptionalWebSocketFrameType(
+      reader,
+      flags.value,
+      `message.events.${index}.source.webSocketFrameType`,
+    );
+    if (isErr(webSocketFrameType)) {
+      return webSocketFrameType;
+    }
+
+    const ownerExtension = readOptionalPacketString(
+      reader,
+      flags.value,
+      packetSourceOwnerExtensionFlag,
+      `message.events.${index}.source.ownerExtension`,
+    );
+    if (isErr(ownerExtension)) {
+      return ownerExtension;
+    }
+    const resourceId = readOptionalPacketString(
+      reader,
+      flags.value,
+      packetSourceResourceIdFlag,
+      `message.events.${index}.source.resourceId`,
+    );
+    if (isErr(resourceId)) {
+      return resourceId;
+    }
+    const sharedTag = readOptionalPacketString(
+      reader,
+      flags.value,
+      packetSourceSharedTagFlag,
+      `message.events.${index}.source.sharedTag`,
+    );
+    if (isErr(sharedTag)) {
+      return sharedTag;
+    }
+    const localAddress = readOptionalPacketString(
+      reader,
+      flags.value,
+      packetSourceLocalAddressFlag,
+      `message.events.${index}.source.localAddress`,
+    );
+    if (isErr(localAddress)) {
+      return localAddress;
+    }
+    const remoteAddress = readOptionalPacketString(
+      reader,
+      flags.value,
+      packetSourceRemoteAddressFlag,
+      `message.events.${index}.source.remoteAddress`,
+    );
+    if (isErr(remoteAddress)) {
+      return remoteAddress;
+    }
+
+    const bytes = reader.readBytes(`message.events.${index}.bytes`);
+    if (isErr(bytes)) {
+      return bytes;
+    }
+
+    const parsedOwnerExtension = parseOptionalPacketExtensionName(
+      ownerExtension.value,
+      `message.events.${index}.source.ownerExtension`,
+    );
+    if (isErr(parsedOwnerExtension)) {
+      return parsedOwnerExtension;
+    }
+    const parsedResourceId = parseOptionalPacketResourceId(
+      resourceId.value,
+      `message.events.${index}.source.resourceId`,
+    );
+    if (isErr(parsedResourceId)) {
+      return parsedResourceId;
+    }
+    const parsedSharedTag = parseOptionalPacketSharedTag(
+      sharedTag.value,
+      `message.events.${index}.source.sharedTag`,
+    );
+    if (isErr(parsedSharedTag)) {
+      return parsedSharedTag;
+    }
+    const parsedLocalAddress = parseOptionalPacketSocketAddress(
+      localAddress.value,
+      `message.events.${index}.source.localAddress`,
+    );
+    if (isErr(parsedLocalAddress)) {
+      return parsedLocalAddress;
+    }
+    const parsedRemoteAddress = parseOptionalPacketSocketAddress(
+      remoteAddress.value,
+      `message.events.${index}.source.remoteAddress`,
+    );
+    if (isErr(parsedRemoteAddress)) {
+      return parsedRemoteAddress;
+    }
+
+    events.push({
+      source: {
+        kind: kind.value,
+        transport: transport.value,
+        eventClass: eventClass.value,
+        ...(parsedOwnerExtension.value === undefined
+          ? {}
+          : { ownerExtension: parsedOwnerExtension.value }),
+        ...(parsedResourceId.value === undefined ? {} : { resourceId: parsedResourceId.value }),
+        ...(parsedSharedTag.value === undefined ? {} : { sharedTag: parsedSharedTag.value }),
+        ...(webSocketFrameType.value === undefined
+          ? {}
+          : { webSocketFrameType: webSocketFrameType.value }),
+        ...(parsedLocalAddress.value === undefined
+          ? {}
+          : { localAddress: parsedLocalAddress.value }),
+        ...(parsedRemoteAddress.value === undefined
+          ? {}
+          : { remoteAddress: parsedRemoteAddress.value }),
+      },
+      bytes: bytes.value,
+      observedUnixMs: observedUnixMs.value,
+    });
+  }
+
+  if (!reader.consumed) {
+    return err(
+      runtimeExtensionProtocolError("message", "packet batch payload contained trailing bytes"),
+    );
   }
 
   return ok(events);
@@ -1009,11 +1411,6 @@ export async function runRuntimeExtensionWorkerStdio(
       );
     }
 
-    const payload = parseJsonPayload(frame.value.payload);
-    if (isErr(payload)) {
-      return payload;
-    }
-
     const frameTag = parseRuntimeExtensionWorkerHostMessageTag(frame.value.tag);
     if (isErr(frameTag)) {
       return frameTag;
@@ -1028,6 +1425,10 @@ export async function runRuntimeExtensionWorkerStdio(
         return processNextFrame();
       }
       case RuntimeExtensionWorkerHostMessageTag.Start: {
+        const payload = parseJsonPayload(frame.value.payload);
+        if (isErr(payload)) {
+          return payload;
+        }
         const payloadRecord = parseJsonRecord(payload.value, "message");
         if (isErr(payloadRecord)) {
           return payloadRecord;
@@ -1044,7 +1445,7 @@ export async function runRuntimeExtensionWorkerStdio(
         return processNextFrame();
       }
       case RuntimeExtensionWorkerHostMessageTag.DeliverPacket: {
-        const events = parseRuntimePacketEventBatchWire(payload.value);
+        const events = parseRuntimePacketEventBatchFrame(frame.value.payload);
         if (isErr(events)) {
           return events;
         }
@@ -1052,6 +1453,10 @@ export async function runRuntimeExtensionWorkerStdio(
         return processNextFrame();
       }
       case RuntimeExtensionWorkerHostMessageTag.DeliverProviderEvent: {
+        const payload = parseJsonPayload(frame.value.payload);
+        if (isErr(payload)) {
+          return payload;
+        }
         const events = parseRuntimeProviderEventBatchWire(payload.value);
         if (isErr(events)) {
           return events;
@@ -1060,6 +1465,10 @@ export async function runRuntimeExtensionWorkerStdio(
         return processNextFrame();
       }
       case RuntimeExtensionWorkerHostMessageTag.Shutdown: {
+        const payload = parseJsonPayload(frame.value.payload);
+        if (isErr(payload)) {
+          return payload;
+        }
         const payloadRecord = parseJsonRecord(payload.value, "message");
         if (isErr(payloadRecord)) {
           return payloadRecord;

@@ -25,12 +25,49 @@ import {
 
 const workerFrameHeaderBytes = 5;
 
+interface TestRuntimePacketEvent {
+  readonly source: {
+    readonly kind: number;
+    readonly transport: number;
+    readonly eventClass: number;
+  };
+  readonly bytes: Uint8Array;
+  readonly observedUnixMs: number;
+}
+
 function encodeJsonFrame(tag: number, payload: unknown): Buffer {
   const payloadBytes = Buffer.from(JSON.stringify(payload), "utf8");
   const frame = Buffer.alloc(workerFrameHeaderBytes + payloadBytes.length);
   frame[0] = tag;
   frame.writeUInt32LE(payloadBytes.length, 1);
   payloadBytes.copy(frame, workerFrameHeaderBytes);
+  return frame;
+}
+
+function encodePacketBatchFrame(events: readonly TestRuntimePacketEvent[]): Buffer {
+  const chunks: Buffer[] = [];
+  const count = Buffer.alloc(4);
+  count.writeUInt32LE(events.length);
+  chunks.push(count);
+
+  for (const event of events) {
+    const header = Buffer.alloc(12);
+    header[0] = event.source.kind;
+    header[1] = event.source.transport;
+    header[2] = event.source.eventClass;
+    header[3] = 0;
+    header.writeBigUInt64LE(BigInt(event.observedUnixMs), 4);
+    const bytes = Buffer.from(event.bytes);
+    const bytesLength = Buffer.alloc(4);
+    bytesLength.writeUInt32LE(bytes.length);
+    chunks.push(header, bytesLength, bytes);
+  }
+
+  const payload = Buffer.concat(chunks);
+  const frame = Buffer.alloc(workerFrameHeaderBytes + payload.length);
+  frame[0] = RuntimeExtensionWorkerHostMessageTag.DeliverPacket;
+  frame.writeUInt32LE(payload.length, 1);
+  payload.copy(frame, workerFrameHeaderBytes);
   return frame;
 }
 
@@ -179,19 +216,17 @@ test("runtime extension stdio worker processes framed batch protocol messages", 
     }),
   );
   input.write(
-    encodeJsonFrame(RuntimeExtensionWorkerHostMessageTag.DeliverPacket, {
-      events: [
-        serializeRuntimePacketEventWire({
-          source: {
-            kind: 1,
-            transport: 1,
-            eventClass: 1,
-          },
-          bytes: Uint8Array.from([1, 2, 3, 4]),
-          observedUnixMs: 100,
-        }),
-      ],
-    }),
+    encodePacketBatchFrame([
+      {
+        source: {
+          kind: 1,
+          transport: 1,
+          eventClass: 1,
+        },
+        bytes: Uint8Array.from([1, 2, 3, 4]),
+        observedUnixMs: 100,
+      },
+    ]),
   );
   input.write(
     encodeJsonFrame(RuntimeExtensionWorkerHostMessageTag.DeliverProviderEvent, {
@@ -259,15 +294,17 @@ test("runtime extension stdio worker rejects malformed framed protocol messages"
   });
 
   input.write(
-    encodeJsonFrame(RuntimeExtensionWorkerHostMessageTag.DeliverPacket, {
-      events: [
-        {
-          source: { kind: 99 },
-          bytesBase64: Buffer.from([1]).toString("base64"),
-          observedUnixMs: 1,
+    encodePacketBatchFrame([
+      {
+        source: {
+          kind: 99,
+          transport: 1,
+          eventClass: 1,
         },
-      ],
-    }),
+        bytes: Uint8Array.from([1]),
+        observedUnixMs: 1,
+      },
+    ]),
   );
   input.end();
 
@@ -276,7 +313,7 @@ test("runtime extension stdio worker rejects malformed framed protocol messages"
   if (!isErr(runnerResult)) {
     return;
   }
-  assert.match(runnerResult.error.field, /event\.source\.kind/);
+  assert.match(runnerResult.error.field, /source\.kind/);
 });
 
 test("runtime extension stdio worker hard-blocks stdout writes inside callbacks", async () => {
@@ -325,19 +362,17 @@ test("runtime extension stdio worker hard-blocks stdout writes inside callbacks"
   });
 
   input.write(
-    encodeJsonFrame(RuntimeExtensionWorkerHostMessageTag.DeliverPacket, {
-      events: [
-        serializeRuntimePacketEventWire({
-          source: {
-            kind: 1,
-            transport: 1,
-            eventClass: 1,
-          },
-          bytes: Uint8Array.from([1, 2, 3, 4]),
-          observedUnixMs: 100,
-        }),
-      ],
-    }),
+    encodePacketBatchFrame([
+      {
+        source: {
+          kind: 1,
+          transport: 1,
+          eventClass: 1,
+        },
+        bytes: Uint8Array.from([1, 2, 3, 4]),
+        observedUnixMs: 100,
+      },
+    ]),
   );
   input.write(
     encodeJsonFrame(RuntimeExtensionWorkerHostMessageTag.Shutdown, {

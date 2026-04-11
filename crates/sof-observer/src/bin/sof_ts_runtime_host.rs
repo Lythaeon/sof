@@ -14,6 +14,7 @@ use std::time::Duration;
 use std::{collections::HashMap, env, fs, net::SocketAddr, path::PathBuf};
 
 use async_trait::async_trait;
+#[cfg(feature = "provider-grpc")]
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -51,9 +52,9 @@ use sof::{
     framework::{
         ExtensionCapability, ExtensionContext, ExtensionManifest, ExtensionResourceSpec,
         ExtensionSetupError, ExtensionStreamVisibility, PacketSubscription, RuntimeExtension,
-        RuntimeExtensionHost, RuntimePacketEvent, RuntimePacketEventClass, RuntimePacketSourceKind,
-        RuntimePacketTransport, RuntimeWebSocketFrameType, TcpConnectorSpec, TcpListenerSpec,
-        UdpListenerSpec, WsConnectorSpec,
+        RuntimeExtensionHost, RuntimePacketEvent, RuntimePacketEventClass, RuntimePacketSource,
+        RuntimePacketSourceKind, RuntimePacketTransport, RuntimeWebSocketFrameType,
+        TcpConnectorSpec, TcpListenerSpec, UdpListenerSpec, WsConnectorSpec,
     },
     runtime::{ObserverRuntime, RuntimeError, RuntimeSetup},
 };
@@ -1983,10 +1984,8 @@ async fn send_packet_batch(
     process: &mut TypeScriptWorkerProcess,
     events: &[RuntimePacketEvent],
 ) -> Result<(), String> {
-    let payload = json!({
-        "events": events.iter().map(runtime_packet_event_wire).collect::<Vec<_>>(),
-    });
-    send_worker_json_frame(process, WORKER_FRAME_PACKET_BATCH, &payload).await
+    let payload = encode_packet_batch(events)?;
+    send_worker_frame(process, WORKER_FRAME_PACKET_BATCH, &payload).await
 }
 
 /// Sends one provider-event batch frame without waiting for an acknowledgement.
@@ -2208,23 +2207,124 @@ fn runtime_websocket_frame_type_from_wire(value: u8) -> Result<RuntimeWebSocketF
     }
 }
 
-/// Serializes one runtime packet event for the worker protocol.
-fn runtime_packet_event_wire(event: &RuntimePacketEvent) -> Value {
-    json!({
-        "source": {
-            "kind": runtime_packet_source_kind_to_wire(event.source.kind),
-            "transport": runtime_packet_transport_to_wire(event.source.transport),
-            "eventClass": runtime_packet_event_class_to_wire(event.source.event_class),
-            "ownerExtension": event.source.owner_extension,
-            "resourceId": event.source.resource_id,
-            "sharedTag": event.source.shared_tag,
-            "webSocketFrameType": event.source.websocket_frame_type.map(runtime_websocket_frame_type_to_wire),
-            "localAddress": event.source.local_addr.map(|addr| addr.to_string()),
-            "remoteAddress": event.source.remote_addr.map(|addr| addr.to_string()),
-        },
-        "bytesBase64": BASE64_STANDARD.encode(event.bytes.as_ref()),
-        "observedUnixMs": event.observed_unix_ms,
-    })
+/// Packet-source flag indicating that an owner extension string follows.
+const PACKET_SOURCE_OWNER_EXTENSION: u8 = 1 << 0;
+/// Packet-source flag indicating that a resource identifier string follows.
+const PACKET_SOURCE_RESOURCE_ID: u8 = 1 << 1;
+/// Packet-source flag indicating that a shared stream tag string follows.
+const PACKET_SOURCE_SHARED_TAG: u8 = 1 << 2;
+/// Packet-source flag indicating that a websocket frame type byte follows.
+const PACKET_SOURCE_WEBSOCKET_FRAME_TYPE: u8 = 1 << 3;
+/// Packet-source flag indicating that a local socket address string follows.
+const PACKET_SOURCE_LOCAL_ADDR: u8 = 1 << 4;
+/// Packet-source flag indicating that a remote socket address string follows.
+const PACKET_SOURCE_REMOTE_ADDR: u8 = 1 << 5;
+
+/// Serializes runtime packet events into a compact worker-only binary batch.
+fn encode_packet_batch(events: &[RuntimePacketEvent]) -> Result<Vec<u8>, String> {
+    let mut payload = Vec::new();
+    encode_u32(&mut payload, events.len(), "packet batch event count")?;
+
+    for event in events {
+        payload.push(runtime_packet_source_kind_to_wire(event.source.kind));
+        payload.push(runtime_packet_transport_to_wire(event.source.transport));
+        payload.push(runtime_packet_event_class_to_wire(event.source.event_class));
+        payload.push(packet_source_flags(&event.source));
+        payload.extend_from_slice(&event.observed_unix_ms.to_le_bytes());
+
+        if let Some(frame_type) = event.source.websocket_frame_type {
+            payload.push(runtime_websocket_frame_type_to_wire(frame_type));
+        }
+        encode_optional_string(
+            &mut payload,
+            event.source.owner_extension.as_deref(),
+            "packet source owner extension",
+        )?;
+        encode_optional_string(
+            &mut payload,
+            event.source.resource_id.as_deref(),
+            "packet source resource id",
+        )?;
+        encode_optional_string(
+            &mut payload,
+            event.source.shared_tag.as_deref(),
+            "packet source shared tag",
+        )?;
+        encode_optional_string(
+            &mut payload,
+            event
+                .source
+                .local_addr
+                .map(|addr| addr.to_string())
+                .as_deref(),
+            "packet source local address",
+        )?;
+        encode_optional_string(
+            &mut payload,
+            event
+                .source
+                .remote_addr
+                .map(|addr| addr.to_string())
+                .as_deref(),
+            "packet source remote address",
+        )?;
+        encode_u32(&mut payload, event.bytes.len(), "packet bytes length")?;
+        payload.extend_from_slice(event.bytes.as_ref());
+    }
+
+    Ok(payload)
+}
+
+/// Computes the optional-field bitset for one packet source.
+const fn packet_source_flags(source: &RuntimePacketSource) -> u8 {
+    let mut flags = 0_u8;
+    if source.owner_extension.is_some() {
+        flags |= PACKET_SOURCE_OWNER_EXTENSION;
+    }
+    if source.resource_id.is_some() {
+        flags |= PACKET_SOURCE_RESOURCE_ID;
+    }
+    if source.shared_tag.is_some() {
+        flags |= PACKET_SOURCE_SHARED_TAG;
+    }
+    if source.websocket_frame_type.is_some() {
+        flags |= PACKET_SOURCE_WEBSOCKET_FRAME_TYPE;
+    }
+    if source.local_addr.is_some() {
+        flags |= PACKET_SOURCE_LOCAL_ADDR;
+    }
+    if source.remote_addr.is_some() {
+        flags |= PACKET_SOURCE_REMOTE_ADDR;
+    }
+    flags
+}
+
+/// Encodes an optional string field when its packet-source flag is present.
+fn encode_optional_string(
+    payload: &mut Vec<u8>,
+    value: Option<&str>,
+    field: &str,
+) -> Result<(), String> {
+    if let Some(value) = value {
+        encode_string(payload, value, field)?;
+    }
+    Ok(())
+}
+
+/// Encodes one length-prefixed UTF-8 string.
+fn encode_string(payload: &mut Vec<u8>, value: &str, field: &str) -> Result<(), String> {
+    let bytes = value.as_bytes();
+    encode_u32(payload, bytes.len(), field)?;
+    payload.extend_from_slice(bytes);
+    Ok(())
+}
+
+/// Encodes one little-endian `u32` after bounds checking a `usize`.
+fn encode_u32(payload: &mut Vec<u8>, value: usize, field: &str) -> Result<(), String> {
+    let value =
+        u32::try_from(value).map_err(|_error| format!("{field} exceeded u32 length: {value}"))?;
+    payload.extend_from_slice(&value.to_le_bytes());
+    Ok(())
 }
 
 #[cfg(feature = "provider-grpc")]
