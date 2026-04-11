@@ -3,7 +3,9 @@ use std::{num::NonZeroUsize, path::PathBuf};
 use super::{read_bool_env, read_env_var};
 use crate::{
     framework::{DerivedStateReplayBackend, DerivedStateReplayDurability},
-    runtime::{DerivedStateReplayConfig, DerivedStateRuntimeConfig, ShredTrustMode},
+    runtime::{
+        DerivedStateReplayConfig, DerivedStateRuntimeConfig, RuntimeDeliveryProfile, ShredTrustMode,
+    },
 };
 
 fn read_optional_bool_env(name: &str) -> Option<bool> {
@@ -32,6 +34,14 @@ pub fn read_worker_threads() -> usize {
 
 pub fn read_runtime_current_thread() -> bool {
     read_bool_env("SOF_RUNTIME_CURRENT_THREAD", false)
+}
+
+pub fn read_runtime_delivery_profile() -> RuntimeDeliveryProfile {
+    read_env_var("SOF_RUNTIME_DELIVERY_PROFILE")
+        .filter(|value| !value.trim().is_empty())
+        .as_deref()
+        .and_then(RuntimeDeliveryProfile::from_config_value)
+        .unwrap_or_default()
 }
 
 pub fn read_runtime_core() -> Option<usize> {

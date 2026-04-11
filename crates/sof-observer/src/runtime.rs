@@ -1,7 +1,5 @@
 #![allow(clippy::missing_docs_in_private_items)]
 
-#[cfg(feature = "gossip-bootstrap")]
-use std::time::Duration;
 use std::{
     collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher, hash_map::Entry},
     future::Future,
@@ -11,7 +9,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 #[cfg(feature = "gossip-bootstrap")]
@@ -20,8 +18,8 @@ use crate::app::config::read_observability_bind_addr;
 use crate::framework::host::TransactionDispatchScope;
 use crate::framework::{
     DerivedStateHost, DerivedStateReplayBackend, DerivedStateReplayDurability,
-    ObservedRecentBlockhashEvent, PluginHost, RuntimeExtensionHost, SignatureBytes,
-    TransactionEvent,
+    ObservedRecentBlockhashEvent, PluginDispatchMode, PluginHost, PluginHostBuilder,
+    RuntimeExtensionHost, RuntimeExtensionHostBuilder, SignatureBytes, TransactionEvent,
 };
 #[cfg(feature = "kernel-bypass")]
 use crate::ingest::{RawPacketBatchReceiver, RawPacketBatchSender, create_raw_packet_batch_queue};
@@ -52,6 +50,12 @@ type ShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 const PROVIDER_REPLAY_DEDUPE_CAPACITY: usize = 65_536;
 const PROVIDER_REPLAY_DEDUPE_SLOT_WINDOW: u64 = 4_096;
 const MAX_PROVIDER_SERIALIZED_TRANSACTION_BYTES: usize = PACKET_DATA_SIZE;
+const DEFAULT_RUNTIME_DELIVERY_EVENT_QUEUE_CAPACITY: usize = 8_192;
+const DEFAULT_RUNTIME_DELIVERY_TRANSACTION_DISPATCH_WORKERS_CAP: usize = 8;
+const DEFAULT_DERIVED_STATE_REPLAY_MAX_ENVELOPES: usize = 8_192;
+const DEFAULT_DERIVED_STATE_REPLAY_MAX_SESSIONS: usize = 4;
+const DEFAULT_RUNTIME_EXTENSION_QUEUE_DEPTH_WARN: u64 = 4_096;
+const DEFAULT_RUNTIME_EXTENSION_DROP_WARN_DELTA: u64 = 100;
 #[cfg(feature = "gossip-bootstrap")]
 const PROVIDER_GOSSIP_CONTROL_PLANE_POLL_MS: u64 = 250;
 #[cfg(feature = "gossip-bootstrap")]
@@ -189,6 +193,31 @@ pub enum RuntimeDeliveryProfile {
     DeliveryDisciplined,
 }
 
+/// Concrete runtime defaults selected by one [`RuntimeDeliveryProfile`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuntimeDeliveryProfileSettings {
+    /// Bounded queue capacity used for async plugin dispatch lanes.
+    pub plugin_event_queue_capacity: usize,
+    /// Callback execution strategy used by plugin dispatch workers.
+    pub plugin_dispatch_mode: PluginDispatchMode,
+    /// Accepted-transaction dispatch workers per transaction priority lane.
+    pub plugin_transaction_dispatch_workers: usize,
+    /// Bounded queue capacity used for runtime extension packet dispatch.
+    pub extension_event_queue_capacity: usize,
+    /// Deadline applied to extension startup hooks.
+    pub extension_startup_timeout: Duration,
+    /// Deadline applied to extension shutdown hooks.
+    pub extension_shutdown_timeout: Duration,
+    /// Runtime-owned derived-state replay tail size.
+    pub derived_state_replay_max_envelopes: usize,
+    /// Runtime-owned derived-state replay session retention.
+    pub derived_state_replay_max_sessions: usize,
+    /// Runtime extension queue-depth warning threshold.
+    pub runtime_extension_queue_depth_warn: u64,
+    /// Runtime extension drop-count warning delta.
+    pub runtime_extension_drop_warn_delta: u64,
+}
+
 impl RuntimeDeliveryProfile {
     /// Returns env-string representation used by `SOF_RUNTIME_DELIVERY_PROFILE`.
     #[must_use]
@@ -210,6 +239,104 @@ impl RuntimeDeliveryProfile {
             _ => None,
         }
     }
+
+    /// Returns concrete runtime defaults for this profile.
+    #[must_use]
+    pub fn settings(self) -> RuntimeDeliveryProfileSettings {
+        let default_transaction_workers = default_runtime_delivery_transaction_workers();
+        match self {
+            Self::LatencyOptimized => RuntimeDeliveryProfileSettings {
+                plugin_event_queue_capacity: DEFAULT_RUNTIME_DELIVERY_EVENT_QUEUE_CAPACITY,
+                plugin_dispatch_mode: PluginDispatchMode::Sequential,
+                plugin_transaction_dispatch_workers: default_transaction_workers,
+                extension_event_queue_capacity: DEFAULT_RUNTIME_DELIVERY_EVENT_QUEUE_CAPACITY,
+                extension_startup_timeout: Duration::from_secs(5),
+                extension_shutdown_timeout: Duration::from_secs(3),
+                derived_state_replay_max_envelopes: DEFAULT_DERIVED_STATE_REPLAY_MAX_ENVELOPES,
+                derived_state_replay_max_sessions: DEFAULT_DERIVED_STATE_REPLAY_MAX_SESSIONS,
+                runtime_extension_queue_depth_warn: DEFAULT_RUNTIME_EXTENSION_QUEUE_DEPTH_WARN,
+                runtime_extension_drop_warn_delta: DEFAULT_RUNTIME_EXTENSION_DROP_WARN_DELTA,
+            },
+            Self::Balanced => RuntimeDeliveryProfileSettings {
+                plugin_event_queue_capacity: DEFAULT_RUNTIME_DELIVERY_EVENT_QUEUE_CAPACITY * 2,
+                plugin_dispatch_mode: PluginDispatchMode::Sequential,
+                plugin_transaction_dispatch_workers: default_transaction_workers,
+                extension_event_queue_capacity: DEFAULT_RUNTIME_DELIVERY_EVENT_QUEUE_CAPACITY * 2,
+                extension_startup_timeout: Duration::from_secs(5),
+                extension_shutdown_timeout: Duration::from_secs(6),
+                derived_state_replay_max_envelopes: DEFAULT_DERIVED_STATE_REPLAY_MAX_ENVELOPES * 2,
+                derived_state_replay_max_sessions: DEFAULT_DERIVED_STATE_REPLAY_MAX_SESSIONS + 2,
+                runtime_extension_queue_depth_warn: DEFAULT_RUNTIME_EXTENSION_QUEUE_DEPTH_WARN * 2,
+                runtime_extension_drop_warn_delta: DEFAULT_RUNTIME_EXTENSION_DROP_WARN_DELTA / 2,
+            },
+            Self::DeliveryDisciplined => RuntimeDeliveryProfileSettings {
+                plugin_event_queue_capacity: DEFAULT_RUNTIME_DELIVERY_EVENT_QUEUE_CAPACITY * 4,
+                plugin_dispatch_mode: PluginDispatchMode::Sequential,
+                plugin_transaction_dispatch_workers: 1,
+                extension_event_queue_capacity: DEFAULT_RUNTIME_DELIVERY_EVENT_QUEUE_CAPACITY * 4,
+                extension_startup_timeout: Duration::from_secs(10),
+                extension_shutdown_timeout: Duration::from_secs(15),
+                derived_state_replay_max_envelopes: DEFAULT_DERIVED_STATE_REPLAY_MAX_ENVELOPES * 4,
+                derived_state_replay_max_sessions: DEFAULT_DERIVED_STATE_REPLAY_MAX_SESSIONS * 2,
+                runtime_extension_queue_depth_warn: DEFAULT_RUNTIME_EXTENSION_QUEUE_DEPTH_WARN * 4,
+                runtime_extension_drop_warn_delta: DEFAULT_RUNTIME_EXTENSION_DROP_WARN_DELTA / 10,
+            },
+        }
+    }
+
+    /// Applies this profile to one plugin-host builder.
+    #[must_use]
+    pub fn apply_to_plugin_host_builder(self, builder: PluginHostBuilder) -> PluginHostBuilder {
+        let settings = self.settings();
+        builder
+            .with_event_queue_capacity(settings.plugin_event_queue_capacity)
+            .with_dispatch_mode(settings.plugin_dispatch_mode)
+            .with_transaction_dispatch_workers(settings.plugin_transaction_dispatch_workers)
+    }
+
+    /// Returns a plugin-host builder using this profile's dispatch defaults.
+    #[must_use]
+    pub fn plugin_host_builder(self) -> PluginHostBuilder {
+        self.apply_to_plugin_host_builder(PluginHostBuilder::new())
+    }
+
+    /// Applies this profile to one runtime-extension-host builder.
+    #[must_use]
+    pub fn apply_to_extension_host_builder(
+        self,
+        builder: RuntimeExtensionHostBuilder,
+    ) -> RuntimeExtensionHostBuilder {
+        let settings = self.settings();
+        builder
+            .with_event_queue_capacity(settings.extension_event_queue_capacity)
+            .with_startup_timeout(settings.extension_startup_timeout)
+            .with_shutdown_timeout(settings.extension_shutdown_timeout)
+    }
+
+    /// Returns a runtime-extension-host builder using this profile's dispatch defaults.
+    #[must_use]
+    pub fn extension_host_builder(self) -> RuntimeExtensionHostBuilder {
+        self.apply_to_extension_host_builder(RuntimeExtensionHostBuilder::new())
+    }
+
+    /// Applies this profile's env-backed defaults to one setup bundle.
+    #[must_use]
+    pub fn apply_to_setup(self, setup: RuntimeSetup) -> RuntimeSetup {
+        let settings = self.settings();
+        setup
+            .with_runtime_delivery_profile(self)
+            .with_derived_state_replay_max_envelopes(settings.derived_state_replay_max_envelopes)
+            .with_derived_state_replay_max_sessions(settings.derived_state_replay_max_sessions)
+            .with_runtime_extension_queue_depth_warn(settings.runtime_extension_queue_depth_warn)
+            .with_runtime_extension_drop_warn_delta(settings.runtime_extension_drop_warn_delta)
+    }
+}
+
+fn default_runtime_delivery_transaction_workers() -> usize {
+    thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .clamp(1, DEFAULT_RUNTIME_DELIVERY_TRANSACTION_DISPATCH_WORKERS_CAP)
 }
 
 /// Explicit trust posture for raw-shred ingest.
@@ -688,6 +815,24 @@ impl RuntimeSetup {
     #[must_use]
     pub fn with_log_dataset_reconstruction(self, enabled: bool) -> Self {
         self.with_env("SOF_LOG_DATASET_RECONSTRUCTION", enabled.to_string())
+    }
+
+    /// Sets `SOF_RUNTIME_EXTENSION_QUEUE_DEPTH_WARN`.
+    #[must_use]
+    pub fn with_runtime_extension_queue_depth_warn(self, queue_depth: u64) -> Self {
+        self.with_env(
+            "SOF_RUNTIME_EXTENSION_QUEUE_DEPTH_WARN",
+            queue_depth.to_string(),
+        )
+    }
+
+    /// Sets `SOF_RUNTIME_EXTENSION_DROP_WARN_DELTA`.
+    #[must_use]
+    pub fn with_runtime_extension_drop_warn_delta(self, drop_delta: u64) -> Self {
+        self.with_env(
+            "SOF_RUNTIME_EXTENSION_DROP_WARN_DELTA",
+            drop_delta.to_string(),
+        )
     }
 
     /// Sets `SOF_DERIVED_STATE_CHECKPOINT_INTERVAL_MS`.
@@ -1518,8 +1663,12 @@ pub fn run_with_hosts_and_setup(
 pub struct ObserverRuntime {
     /// Plugin host invoked by the packaged observer runtime.
     plugin_host: PluginHost,
+    /// Whether the plugin host was supplied explicitly by the embedder.
+    custom_plugin_host: bool,
     /// Runtime extension host invoked by the packaged observer runtime.
     extension_host: RuntimeExtensionHost,
+    /// Whether the extension host was supplied explicitly by the embedder.
+    custom_extension_host: bool,
     /// Derived-state host invoked by the packaged observer runtime.
     derived_state_host: DerivedStateHost,
     /// Programmatic setup overrides applied before startup.
@@ -1560,6 +1709,7 @@ impl ObserverRuntime {
     #[must_use]
     pub fn with_plugin_host(mut self, plugin_host: PluginHost) -> Self {
         self.plugin_host = plugin_host;
+        self.custom_plugin_host = true;
         self
     }
 
@@ -1567,6 +1717,7 @@ impl ObserverRuntime {
     #[must_use]
     pub fn with_extension_host(mut self, extension_host: RuntimeExtensionHost) -> Self {
         self.extension_host = extension_host;
+        self.custom_extension_host = true;
         self
     }
 
@@ -1581,6 +1732,22 @@ impl ObserverRuntime {
     #[must_use]
     pub fn with_setup(mut self, setup: RuntimeSetup) -> Self {
         self.setup = setup;
+        self
+    }
+
+    /// Applies one runtime-level downstream delivery profile.
+    ///
+    /// This updates SOF-owned default hosts and env-backed runtime defaults. Explicitly supplied
+    /// plugin or extension hosts keep their caller-provided configuration.
+    #[must_use]
+    pub fn with_runtime_delivery_profile(mut self, profile: RuntimeDeliveryProfile) -> Self {
+        self.setup = profile.apply_to_setup(self.setup);
+        if !self.custom_plugin_host {
+            self.plugin_host = profile.plugin_host_builder().build();
+        }
+        if !self.custom_extension_host {
+            self.extension_host = profile.extension_host_builder().build();
+        }
         self
     }
 
@@ -4581,6 +4748,110 @@ mod tests {
                 String::from("SOF_RUNTIME_DELIVERY_PROFILE"),
                 String::from("balanced"),
             ))
+        );
+    }
+
+    #[test]
+    fn runtime_delivery_profile_reads_env_override() {
+        with_runtime_env_overrides(
+            [(
+                String::from("SOF_RUNTIME_DELIVERY_PROFILE"),
+                String::from("delivery-disciplined"),
+            )],
+            || {
+                assert_eq!(
+                    crate::app::config::read_runtime_delivery_profile(),
+                    RuntimeDeliveryProfile::DeliveryDisciplined
+                );
+            },
+        );
+
+        with_runtime_env_overrides(
+            [(
+                String::from("SOF_RUNTIME_DELIVERY_PROFILE"),
+                String::from("unknown"),
+            )],
+            || {
+                assert_eq!(
+                    crate::app::config::read_runtime_delivery_profile(),
+                    RuntimeDeliveryProfile::LatencyOptimized
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn runtime_delivery_profile_settings_preserve_default_and_scale_discipline() {
+        let latency = RuntimeDeliveryProfile::LatencyOptimized.settings();
+        let balanced = RuntimeDeliveryProfile::Balanced.settings();
+        let disciplined = RuntimeDeliveryProfile::DeliveryDisciplined.settings();
+
+        assert_eq!(
+            latency.plugin_event_queue_capacity,
+            DEFAULT_RUNTIME_DELIVERY_EVENT_QUEUE_CAPACITY
+        );
+        assert_eq!(
+            latency.derived_state_replay_max_envelopes,
+            DEFAULT_DERIVED_STATE_REPLAY_MAX_ENVELOPES
+        );
+        assert!(balanced.plugin_event_queue_capacity > latency.plugin_event_queue_capacity);
+        assert!(disciplined.plugin_event_queue_capacity > balanced.plugin_event_queue_capacity);
+        assert!(balanced.extension_shutdown_timeout > latency.extension_shutdown_timeout);
+        assert!(disciplined.extension_shutdown_timeout > balanced.extension_shutdown_timeout);
+        assert_eq!(disciplined.plugin_transaction_dispatch_workers, 1);
+        assert_eq!(
+            disciplined.plugin_dispatch_mode,
+            PluginDispatchMode::Sequential
+        );
+    }
+
+    #[test]
+    fn runtime_delivery_profile_applies_env_backed_defaults_to_setup() {
+        let setup = RuntimeDeliveryProfile::DeliveryDisciplined.apply_to_setup(RuntimeSetup::new());
+        let overrides = setup.env_overrides.into_iter().collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            overrides.get("SOF_RUNTIME_DELIVERY_PROFILE"),
+            Some(&"delivery_disciplined".to_owned())
+        );
+        assert_eq!(
+            overrides.get("SOF_DERIVED_STATE_REPLAY_MAX_ENVELOPES"),
+            Some(&"32768".to_owned())
+        );
+        assert_eq!(
+            overrides.get("SOF_DERIVED_STATE_REPLAY_MAX_SESSIONS"),
+            Some(&"8".to_owned())
+        );
+        assert_eq!(
+            overrides.get("SOF_RUNTIME_EXTENSION_QUEUE_DEPTH_WARN"),
+            Some(&"16384".to_owned())
+        );
+        assert_eq!(
+            overrides.get("SOF_RUNTIME_EXTENSION_DROP_WARN_DELTA"),
+            Some(&"10".to_owned())
+        );
+    }
+
+    #[test]
+    fn observer_runtime_profile_preserves_explicit_plugin_and_extension_hosts() {
+        let plugin_host = PluginHost::builder().build();
+        let extension_host = RuntimeExtensionHost::builder().build();
+
+        let runtime = ObserverRuntime::new()
+            .with_plugin_host(plugin_host)
+            .with_extension_host(extension_host)
+            .with_runtime_delivery_profile(RuntimeDeliveryProfile::DeliveryDisciplined);
+        let overrides = runtime
+            .setup
+            .env_overrides
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+
+        assert!(runtime.custom_plugin_host);
+        assert!(runtime.custom_extension_host);
+        assert_eq!(
+            overrides.get("SOF_RUNTIME_DELIVERY_PROFILE"),
+            Some(&"delivery_disciplined".to_owned())
         );
     }
 

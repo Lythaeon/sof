@@ -13,18 +13,44 @@ pub(crate) enum RuntimeEntrypointError {
     Runloop { reason: String },
 }
 
-pub(crate) fn run() -> Result<(), RuntimeEntrypointError> {
-    run_with_hosts(
-        PluginHostBuilder::new().build(),
-        RuntimeExtensionHostBuilder::new().build(),
+fn profiled_default_plugin_and_extension_hosts() -> (PluginHost, RuntimeExtensionHost) {
+    let profile = read_runtime_delivery_profile();
+    (
+        profile.plugin_host_builder().build(),
+        profile.extension_host_builder().build(),
+    )
+}
+
+fn profiled_default_hosts() -> (PluginHost, RuntimeExtensionHost, DerivedStateHost) {
+    let (plugin_host, extension_host) = profiled_default_plugin_and_extension_hosts();
+    (
+        plugin_host,
+        extension_host,
         DerivedStateHost::builder().build(),
     )
+}
+
+fn profiled_default_plugin_host() -> PluginHost {
+    read_runtime_delivery_profile()
+        .plugin_host_builder()
+        .build()
+}
+
+fn profiled_default_extension_host() -> RuntimeExtensionHost {
+    read_runtime_delivery_profile()
+        .extension_host_builder()
+        .build()
+}
+
+pub(crate) fn run() -> Result<(), RuntimeEntrypointError> {
+    let (plugin_host, extension_host, derived_state_host) = profiled_default_hosts();
+    run_with_hosts(plugin_host, extension_host, derived_state_host)
 }
 
 pub(crate) fn run_with_plugin_host(plugin_host: PluginHost) -> Result<(), RuntimeEntrypointError> {
     run_with_hosts(
         plugin_host,
-        RuntimeExtensionHostBuilder::new().build(),
+        profiled_default_extension_host(),
         DerivedStateHost::builder().build(),
     )
 }
@@ -33,7 +59,7 @@ pub(crate) fn run_with_extension_host(
     extension_host: RuntimeExtensionHost,
 ) -> Result<(), RuntimeEntrypointError> {
     run_with_hosts(
-        PluginHostBuilder::new().build(),
+        profiled_default_plugin_host(),
         extension_host,
         DerivedStateHost::builder().build(),
     )
@@ -42,11 +68,8 @@ pub(crate) fn run_with_extension_host(
 pub(crate) fn run_with_derived_state_host(
     derived_state_host: DerivedStateHost,
 ) -> Result<(), RuntimeEntrypointError> {
-    run_with_hosts(
-        PluginHostBuilder::new().build(),
-        RuntimeExtensionHostBuilder::new().build(),
-        derived_state_host,
-    )
+    let (plugin_host, extension_host) = profiled_default_plugin_and_extension_hosts();
+    run_with_hosts(plugin_host, extension_host, derived_state_host)
 }
 
 pub(crate) fn run_with_hosts(
@@ -204,13 +227,8 @@ fn pin_runtime_thread_if_requested() {
 }
 
 pub(crate) async fn run_async() -> Result<(), RuntimeEntrypointError> {
-    run_async_with_hosts(
-        PluginHostBuilder::new().build(),
-        RuntimeExtensionHostBuilder::new().build(),
-        DerivedStateHost::builder().build(),
-        None,
-    )
-    .await
+    let (plugin_host, extension_host, derived_state_host) = profiled_default_hosts();
+    run_async_with_hosts(plugin_host, extension_host, derived_state_host, None).await
 }
 
 pub(crate) async fn run_async_with_plugin_host(
@@ -218,7 +236,7 @@ pub(crate) async fn run_async_with_plugin_host(
 ) -> Result<(), RuntimeEntrypointError> {
     run_async_with_hosts(
         plugin_host,
-        RuntimeExtensionHostBuilder::new().build(),
+        profiled_default_extension_host(),
         DerivedStateHost::builder().build(),
         None,
     )
@@ -229,7 +247,7 @@ pub(crate) async fn run_async_with_extension_host(
     extension_host: RuntimeExtensionHost,
 ) -> Result<(), RuntimeEntrypointError> {
     run_async_with_hosts(
-        PluginHostBuilder::new().build(),
+        profiled_default_plugin_host(),
         extension_host,
         DerivedStateHost::builder().build(),
         None,
@@ -240,13 +258,8 @@ pub(crate) async fn run_async_with_extension_host(
 pub(crate) async fn run_async_with_derived_state_host(
     derived_state_host: DerivedStateHost,
 ) -> Result<(), RuntimeEntrypointError> {
-    run_async_with_hosts(
-        PluginHostBuilder::new().build(),
-        RuntimeExtensionHostBuilder::new().build(),
-        derived_state_host,
-        None,
-    )
-    .await
+    let (plugin_host, extension_host) = profiled_default_plugin_and_extension_hosts();
+    run_async_with_hosts(plugin_host, extension_host, derived_state_host, None).await
 }
 
 pub(crate) async fn run_async_with_hosts(
@@ -313,9 +326,10 @@ async fn run_async_with_hosts_and_optional_shutdown(
 pub(crate) async fn run_async_with_kernel_bypass_ingress(
     packet_ingest_rx: ingest::RawPacketBatchReceiver,
 ) -> Result<(), RuntimeEntrypointError> {
+    let (plugin_host, extension_host) = profiled_default_plugin_and_extension_hosts();
     run_async_with_hosts_and_kernel_bypass_ingress(
-        PluginHostBuilder::new().build(),
-        RuntimeExtensionHostBuilder::new().build(),
+        plugin_host,
+        extension_host,
         DerivedStateHost::builder().build(),
         None,
         packet_ingest_rx,
@@ -330,7 +344,7 @@ pub(crate) async fn run_async_with_plugin_host_and_kernel_bypass_ingress(
 ) -> Result<(), RuntimeEntrypointError> {
     run_async_with_hosts_and_kernel_bypass_ingress(
         plugin_host,
-        RuntimeExtensionHostBuilder::new().build(),
+        profiled_default_extension_host(),
         DerivedStateHost::builder().build(),
         None,
         packet_ingest_rx,
@@ -344,7 +358,7 @@ pub(crate) async fn run_async_with_extension_host_and_kernel_bypass_ingress(
     packet_ingest_rx: ingest::RawPacketBatchReceiver,
 ) -> Result<(), RuntimeEntrypointError> {
     run_async_with_hosts_and_kernel_bypass_ingress(
-        PluginHostBuilder::new().build(),
+        profiled_default_plugin_host(),
         extension_host,
         DerivedStateHost::builder().build(),
         None,
@@ -358,9 +372,10 @@ pub(crate) async fn run_async_with_derived_state_host_and_kernel_bypass_ingress(
     derived_state_host: DerivedStateHost,
     packet_ingest_rx: ingest::RawPacketBatchReceiver,
 ) -> Result<(), RuntimeEntrypointError> {
+    let (plugin_host, extension_host) = profiled_default_plugin_and_extension_hosts();
     run_async_with_hosts_and_kernel_bypass_ingress(
-        PluginHostBuilder::new().build(),
-        RuntimeExtensionHostBuilder::new().build(),
+        plugin_host,
+        extension_host,
         derived_state_host,
         None,
         packet_ingest_rx,
