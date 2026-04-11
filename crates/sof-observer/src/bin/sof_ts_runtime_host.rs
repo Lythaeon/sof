@@ -20,7 +20,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 #[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
 use sof::provider_stream::websocket::{
-    WebsocketTransactionCommitment, WebsocketTransactionConfig, spawn_websocket_source,
+    WebsocketLogsConfig, WebsocketLogsFilter, WebsocketPrimaryStream,
+    WebsocketTransactionCommitment, WebsocketTransactionConfig, spawn_websocket_logs_source,
+    spawn_websocket_source,
 };
 #[cfg(feature = "provider-grpc")]
 use sof::provider_stream::yellowstone::{
@@ -93,6 +95,27 @@ const GRPC_STREAM_BLOCK_META: u8 = 4;
 #[cfg(feature = "provider-grpc")]
 /// Wire tag for Yellowstone slot stream selection.
 const GRPC_STREAM_SLOTS: u8 = 5;
+#[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
+/// Wire tag for websocket `transactionSubscribe`.
+const WEBSOCKET_STREAM_TRANSACTIONS: u8 = 1;
+#[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
+/// Wire tag for websocket `logsSubscribe`.
+const WEBSOCKET_STREAM_LOGS: u8 = 2;
+#[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
+/// Wire tag for websocket `accountSubscribe`.
+const WEBSOCKET_STREAM_ACCOUNT: u8 = 3;
+#[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
+/// Wire tag for websocket `programSubscribe`.
+const WEBSOCKET_STREAM_PROGRAM: u8 = 4;
+#[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
+/// Wire tag for websocket logs `all` filter.
+const WEBSOCKET_LOGS_FILTER_ALL: u8 = 1;
+#[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
+/// Wire tag for websocket logs `allWithVotes` filter.
+const WEBSOCKET_LOGS_FILTER_ALL_WITH_VOTES: u8 = 2;
+#[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
+/// Wire tag for websocket logs `mentions` filter.
+const WEBSOCKET_LOGS_FILTER_MENTIONS: u8 = 3;
 #[cfg(feature = "provider-grpc")]
 /// Provider-stream channel capacity used by the native host.
 const PROVIDER_STREAM_QUEUE_CAPACITY: usize = 4096;
@@ -232,6 +255,17 @@ struct IngressConfig {
     priority: Option<u16>,
     /// Websocket URL for SDK-side validation errors.
     url: Option<String>,
+    /// Account pubkey for `accountSubscribe`.
+    account: Option<String>,
+    #[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
+    /// Program pubkey for `programSubscribe`.
+    program_id: Option<String>,
+    #[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
+    /// Logs filter selector for `logsSubscribe`.
+    logs_filter: Option<u8>,
+    #[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
+    /// Mention pubkey for websocket logs mention filters.
+    mentions: Option<String>,
     #[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
     /// Legacy custom JSON-RPC subscribe messages rejected by the native host.
     requests: Option<Vec<String>>,
@@ -278,6 +312,8 @@ struct PluginWorkerConfig {
     args: Vec<String>,
     /// Environment variables passed to the worker.
     environment: HashMap<String, String>,
+    /// Whether the worker expects provider-event callbacks.
+    provider_events: bool,
 }
 
 /// Worker manifest envelope received from the TypeScript SDK.
@@ -371,6 +407,8 @@ struct TypeScriptRuntimeExtension {
 struct TypeScriptObserverPlugin {
     /// Shared worker bridge used for lifecycle and provider-event delivery.
     bridge: Arc<TypeScriptWorkerBridge>,
+    /// Hook contract derived from the active provider ingress modes.
+    config: PluginConfig,
 }
 
 /// Shared worker bridge for one TypeScript plugin process.
@@ -500,7 +538,7 @@ async fn run_config(config: RuntimeHostConfig) -> Result<(), HostError> {
         drop(provider_stream_tx);
 
         runtime = runtime
-            .with_plugin_host(plugin_host_from_worker_bridges(&worker_bridges))
+            .with_plugin_host(plugin_host_from_worker_bridges(&worker_bridges, &modes))
             .with_provider_stream_ingress(
                 provider_stream_mode(modes.as_slice()),
                 provider_stream_rx,
@@ -571,11 +609,19 @@ fn build_worker_bridges(
 
 #[cfg(feature = "provider-grpc")]
 /// Builds a plugin host that reuses the shared TypeScript worker bridges.
-fn plugin_host_from_worker_bridges(bridges: &[Arc<TypeScriptWorkerBridge>]) -> PluginHost {
+fn plugin_host_from_worker_bridges(
+    bridges: &[Arc<TypeScriptWorkerBridge>],
+    modes: &[ProviderStreamMode],
+) -> PluginHost {
     let mut plugin_host_builder = PluginHost::builder();
     for bridge in bridges {
+        if !bridge.config.provider_events {
+            continue;
+        }
+
         plugin_host_builder = plugin_host_builder.add_plugin(TypeScriptObserverPlugin {
             bridge: Arc::clone(bridge),
+            config: provider_plugin_config(modes),
         });
     }
 
@@ -1000,46 +1046,126 @@ async fn spawn_websocket_provider_ingress(
             ingress.name
         ))
     })?;
-    let mut config =
-        WebsocketTransactionConfig::new(endpoint).with_source_instance(ingress.name.clone());
-    config = apply_websocket_source_policy(config, ingress)?;
-    config = apply_websocket_fan_in(config, fan_in)?;
-    if let Some(commitment) = ingress.commitment {
-        config = config.with_commitment(websocket_commitment_from_wire(commitment)?);
-    }
-    if let Some(vote) = ingress.vote {
-        config = config.with_vote(vote);
-    }
-    if let Some(failed) = ingress.failed {
-        config = config.with_failed(failed);
-    }
-    if let Some(signature) = non_empty_optional(ingress.signature.as_deref()) {
-        config = config.with_signature(parse_signature(signature, "ingress.signature")?);
-    }
-    config = config
-        .with_account_include(parse_pubkeys(
-            ingress.account_include.as_deref().unwrap_or(&[]),
-            "ingress.accountInclude",
-        )?)
-        .with_account_exclude(parse_pubkeys(
-            ingress.account_exclude.as_deref().unwrap_or(&[]),
-            "ingress.accountExclude",
-        )?)
-        .with_account_required(parse_pubkeys(
-            ingress.account_required.as_deref().unwrap_or(&[]),
-            "ingress.accountRequired",
-        )?);
+    match ingress.stream.unwrap_or(WEBSOCKET_STREAM_TRANSACTIONS) {
+        WEBSOCKET_STREAM_TRANSACTIONS => {
+            let mut config =
+                WebsocketTransactionConfig::new(endpoint).with_source_instance(ingress.name.clone());
+            config = apply_websocket_source_policy(config, ingress)?;
+            config = apply_websocket_fan_in(config, fan_in)?;
+            if let Some(commitment) = ingress.commitment {
+                config = config.with_commitment(websocket_commitment_from_wire(commitment)?);
+            }
+            if let Some(vote) = ingress.vote {
+                config = config.with_vote(vote);
+            }
+            if let Some(failed) = ingress.failed {
+                config = config.with_failed(failed);
+            }
+            if let Some(signature) = non_empty_optional(ingress.signature.as_deref()) {
+                config = config.with_signature(parse_signature(signature, "ingress.signature")?);
+            }
+            config = config
+                .with_account_include(parse_pubkeys(
+                    ingress.account_include.as_deref().unwrap_or(&[]),
+                    "ingress.accountInclude",
+                )?)
+                .with_account_exclude(parse_pubkeys(
+                    ingress.account_exclude.as_deref().unwrap_or(&[]),
+                    "ingress.accountExclude",
+                )?)
+                .with_account_required(parse_pubkeys(
+                    ingress.account_required.as_deref().unwrap_or(&[]),
+                    "ingress.accountRequired",
+                )?);
 
-    let mode = config.runtime_mode();
-    let handle = spawn_websocket_source(&config, sender)
-        .await
-        .map_err(|error| HostError::InvalidConfig(error.to_string()))?;
-    let (abort_handle, join_guard) = spawn_provider_source_join_guard(&ingress.name, handle);
-    Ok(ProviderSourceHandle {
-        mode,
-        abort_handle,
-        join_guard,
-    })
+            let mode = config.runtime_mode();
+            let handle = spawn_websocket_source(&config, sender)
+                .await
+                .map_err(|error| HostError::InvalidConfig(error.to_string()))?;
+            let (abort_handle, join_guard) = spawn_provider_source_join_guard(&ingress.name, handle);
+            Ok(ProviderSourceHandle {
+                mode,
+                abort_handle,
+                join_guard,
+            })
+        }
+        WEBSOCKET_STREAM_LOGS => {
+            let mut config =
+                WebsocketLogsConfig::new(endpoint).with_source_instance(ingress.name.clone());
+            config = apply_websocket_logs_source_policy(config, ingress)?;
+            config = apply_websocket_logs_fan_in(config, fan_in)?;
+            if let Some(commitment) = ingress.commitment {
+                config = config.with_commitment(websocket_commitment_from_wire(commitment)?);
+            }
+            config = config.with_filter(websocket_logs_filter_from_wire(ingress)?);
+
+            let mode = config.runtime_mode();
+            let handle = spawn_websocket_logs_source(&config, sender)
+                .await
+                .map_err(|error| HostError::InvalidConfig(error.to_string()))?;
+            let (abort_handle, join_guard) = spawn_provider_source_join_guard(&ingress.name, handle);
+            Ok(ProviderSourceHandle {
+                mode,
+                abort_handle,
+                join_guard,
+            })
+        }
+        WEBSOCKET_STREAM_ACCOUNT => {
+            let account = parse_pubkey(
+                ingress.account.as_deref(),
+                "ingress.account",
+                "websocket account stream",
+            )?;
+            let mut config = WebsocketTransactionConfig::new(endpoint)
+                .with_source_instance(ingress.name.clone())
+                .with_stream(WebsocketPrimaryStream::Account(account));
+            config = apply_websocket_source_policy(config, ingress)?;
+            config = apply_websocket_fan_in(config, fan_in)?;
+            if let Some(commitment) = ingress.commitment {
+                config = config.with_commitment(websocket_commitment_from_wire(commitment)?);
+            }
+
+            let mode = config.runtime_mode();
+            let handle = spawn_websocket_source(&config, sender)
+                .await
+                .map_err(|error| HostError::InvalidConfig(error.to_string()))?;
+            let (abort_handle, join_guard) = spawn_provider_source_join_guard(&ingress.name, handle);
+            Ok(ProviderSourceHandle {
+                mode,
+                abort_handle,
+                join_guard,
+            })
+        }
+        WEBSOCKET_STREAM_PROGRAM => {
+            let program_id = parse_pubkey(
+                ingress.program_id.as_deref(),
+                "ingress.programId",
+                "websocket program stream",
+            )?;
+            let mut config = WebsocketTransactionConfig::new(endpoint)
+                .with_source_instance(ingress.name.clone())
+                .with_stream(WebsocketPrimaryStream::Program(program_id));
+            config = apply_websocket_source_policy(config, ingress)?;
+            config = apply_websocket_fan_in(config, fan_in)?;
+            if let Some(commitment) = ingress.commitment {
+                config = config.with_commitment(websocket_commitment_from_wire(commitment)?);
+            }
+
+            let mode = config.runtime_mode();
+            let handle = spawn_websocket_source(&config, sender)
+                .await
+                .map_err(|error| HostError::InvalidConfig(error.to_string()))?;
+            let (abort_handle, join_guard) = spawn_provider_source_join_guard(&ingress.name, handle);
+            Ok(ProviderSourceHandle {
+                mode,
+                abort_handle,
+                join_guard,
+            })
+        }
+        other => Err(HostError::InvalidConfig(format!(
+            "unsupported websocket stream kind {other}"
+        ))),
+    }
 }
 
 #[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
@@ -1066,6 +1192,33 @@ fn apply_websocket_fan_in(
     config: WebsocketTransactionConfig,
     fan_in: Option<&FanInConfig>,
 ) -> Result<WebsocketTransactionConfig, HostError> {
+    Ok(config.with_source_arbitration(provider_source_arbitration(fan_in)?))
+}
+
+#[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
+/// Applies per-source readiness, role, and priority to one websocket logs config.
+fn apply_websocket_logs_source_policy(
+    mut config: WebsocketLogsConfig,
+    ingress: &IngressConfig,
+) -> Result<WebsocketLogsConfig, HostError> {
+    if let Some(readiness) = ingress.readiness {
+        config = config.with_readiness(provider_readiness_from_wire(readiness)?);
+    }
+    if let Some(role) = ingress.role {
+        config = config.with_source_role(provider_role_from_wire(role)?);
+    }
+    if let Some(priority) = ingress.priority {
+        config = config.with_source_priority(priority);
+    }
+    Ok(config)
+}
+
+#[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
+/// Applies fan-in arbitration to one websocket logs config.
+fn apply_websocket_logs_fan_in(
+    config: WebsocketLogsConfig,
+    fan_in: Option<&FanInConfig>,
+) -> Result<WebsocketLogsConfig, HostError> {
     Ok(config.with_source_arbitration(provider_source_arbitration(fan_in)?))
 }
 
@@ -1177,6 +1330,70 @@ fn provider_stream_mode(modes: &[ProviderStreamMode]) -> ProviderStreamMode {
 }
 
 #[cfg(feature = "provider-grpc")]
+/// Derives one observer hook mask from the active provider ingress modes.
+fn provider_plugin_config(modes: &[ProviderStreamMode]) -> PluginConfig {
+    let mut config = PluginConfig::new();
+    for mode in modes {
+        match mode {
+            ProviderStreamMode::Generic => {
+                config = config
+                    .with_transaction()
+                    .with_transaction_status()
+                    .with_account_update()
+                    .with_block_meta()
+                    .with_slot_status()
+                    .with_recent_blockhash();
+                config.transaction_log = true;
+            }
+            ProviderStreamMode::YellowstoneGrpc => {
+                config = config.with_transaction().with_recent_blockhash();
+            }
+            ProviderStreamMode::YellowstoneGrpcTransactionStatus => {
+                config = config.with_transaction_status();
+            }
+            ProviderStreamMode::YellowstoneGrpcAccounts => {
+                config = config.with_account_update();
+            }
+            ProviderStreamMode::YellowstoneGrpcBlockMeta => {
+                config = config.with_block_meta();
+            }
+            ProviderStreamMode::YellowstoneGrpcSlots => {
+                config = config.with_slot_status();
+            }
+            ProviderStreamMode::LaserStream => {
+                config = config.with_transaction().with_recent_blockhash();
+            }
+            ProviderStreamMode::LaserStreamTransactionStatus => {
+                config = config.with_transaction_status();
+            }
+            ProviderStreamMode::LaserStreamAccounts => {
+                config = config.with_account_update();
+            }
+            ProviderStreamMode::LaserStreamBlockMeta => {
+                config = config.with_block_meta();
+            }
+            ProviderStreamMode::LaserStreamSlots => {
+                config = config.with_slot_status();
+            }
+            #[cfg(feature = "provider-websocket")]
+            ProviderStreamMode::WebsocketTransaction => {
+                config = config.with_transaction().with_recent_blockhash();
+            }
+            #[cfg(feature = "provider-websocket")]
+            ProviderStreamMode::WebsocketLogs => {
+                config.transaction_log = true;
+            }
+            #[cfg(feature = "provider-websocket")]
+            ProviderStreamMode::WebsocketAccount | ProviderStreamMode::WebsocketProgram => {
+                config = config.with_account_update();
+            }
+        }
+    }
+
+    config
+}
+
+#[cfg(feature = "provider-grpc")]
 /// Maps the wire Yellowstone stream selector into the Rust enum.
 fn yellowstone_stream_from_wire(value: u8) -> Result<YellowstoneGrpcStream, HostError> {
     match value {
@@ -1216,6 +1433,23 @@ fn websocket_commitment_from_wire(value: u8) -> Result<WebsocketTransactionCommi
     }
 }
 
+#[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
+/// Maps the wire websocket logs filter selector into the Rust enum.
+fn websocket_logs_filter_from_wire(ingress: &IngressConfig) -> Result<WebsocketLogsFilter, HostError> {
+    match ingress.logs_filter.unwrap_or(WEBSOCKET_LOGS_FILTER_ALL) {
+        WEBSOCKET_LOGS_FILTER_ALL => Ok(WebsocketLogsFilter::All),
+        WEBSOCKET_LOGS_FILTER_ALL_WITH_VOTES => Ok(WebsocketLogsFilter::AllWithVotes),
+        WEBSOCKET_LOGS_FILTER_MENTIONS => Ok(WebsocketLogsFilter::Mentions(parse_pubkey(
+            ingress.mentions.as_deref(),
+            "ingress.mentions",
+            "websocket logs mention filter",
+        )?)),
+        other => Err(HostError::InvalidConfig(format!(
+            "unsupported websocket logs filter {other}"
+        ))),
+    }
+}
+
 #[cfg(feature = "provider-grpc")]
 /// Trims and filters empty optional string values.
 fn non_empty_optional(value: Option<&str>) -> Option<&str> {
@@ -1227,6 +1461,17 @@ fn non_empty_optional(value: Option<&str>) -> Option<&str> {
 fn parse_signature(value: &str, field: &str) -> Result<Signature, HostError> {
     Signature::from_str(value).map_err(|error| {
         HostError::InvalidConfig(format!("{field} is not a valid signature: {error}"))
+    })
+}
+
+#[cfg(feature = "provider-grpc")]
+/// Parses one required pubkey from the wire config.
+fn parse_pubkey(value: Option<&str>, field: &str, context: &str) -> Result<Pubkey, HostError> {
+    let value = non_empty_optional(value).ok_or_else(|| {
+        HostError::InvalidConfig(format!("{field} is required for {context}"))
+    })?;
+    Pubkey::from_str(value).map_err(|error| {
+        HostError::InvalidConfig(format!("{field} is not a valid pubkey `{value}`: {error}"))
     })
 }
 
@@ -1292,14 +1537,26 @@ impl ObserverPlugin for TypeScriptObserverPlugin {
 
     fn config(&self) -> PluginConfig {
         PluginConfig {
-            transaction_log: true,
-            ..PluginConfig::new()
-                .with_transaction()
-                .with_transaction_status()
-                .with_account_update()
-                .with_block_meta()
-                .with_slot_status()
-                .with_recent_blockhash()
+            transaction_log: self.config.transaction_log,
+            raw_packet: self.config.raw_packet,
+            shred: self.config.shred,
+            dataset: self.config.dataset,
+            transaction: self.config.transaction,
+            transaction_status: self.config.transaction_status,
+            transaction_commitment: self.config.transaction_commitment,
+            transaction_dispatch_mode: self.config.transaction_dispatch_mode,
+            transaction_batch: self.config.transaction_batch,
+            transaction_batch_dispatch_mode: self.config.transaction_batch_dispatch_mode,
+            transaction_view_batch: self.config.transaction_view_batch,
+            transaction_view_batch_dispatch_mode: self.config.transaction_view_batch_dispatch_mode,
+            account_touch: self.config.account_touch,
+            account_update: self.config.account_update,
+            block_meta: self.config.block_meta,
+            slot_status: self.config.slot_status,
+            reorg: self.config.reorg,
+            recent_blockhash: self.config.recent_blockhash,
+            cluster_topology: self.config.cluster_topology,
+            leader_schedule: self.config.leader_schedule,
         }
     }
 
@@ -2052,6 +2309,13 @@ mod tests {
             #[cfg(feature = "provider-grpc")]
             priority: None,
             url: Some("wss://example.invalid".to_owned()),
+            account: None,
+            #[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
+            program_id: None,
+            #[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
+            logs_filter: None,
+            #[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
+            mentions: None,
             #[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
             requests: Some(vec![]),
             entrypoints: None,
@@ -2100,6 +2364,13 @@ mod tests {
             #[cfg(feature = "provider-grpc")]
             priority: None,
             url: None,
+            account: None,
+            #[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
+            program_id: None,
+            #[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
+            logs_filter: None,
+            #[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
+            mentions: None,
             #[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
             requests: None,
             entrypoints: None,
@@ -2123,5 +2394,36 @@ mod tests {
 
         let result = validate_ingress(&config);
         assert!(result.is_ok());
+    }
+
+    #[cfg(feature = "provider-grpc")]
+    #[test]
+    fn provider_plugin_config_matches_websocket_logs_mode() {
+        let config = provider_plugin_config(&[ProviderStreamMode::WebsocketLogs]);
+
+        assert!(config.transaction_log);
+        assert!(!config.transaction);
+        assert!(!config.transaction_status);
+        assert!(!config.account_update);
+        assert!(!config.block_meta);
+        assert!(!config.slot_status);
+        assert!(!config.recent_blockhash);
+    }
+
+    #[cfg(feature = "provider-grpc")]
+    #[test]
+    fn provider_plugin_config_unions_multiple_provider_modes() {
+        let config = provider_plugin_config(&[
+            ProviderStreamMode::YellowstoneGrpcTransactionStatus,
+            ProviderStreamMode::YellowstoneGrpcAccounts,
+        ]);
+
+        assert!(!config.transaction);
+        assert!(config.transaction_status);
+        assert!(config.account_update);
+        assert!(!config.block_meta);
+        assert!(!config.slot_status);
+        assert!(!config.recent_blockhash);
+        assert!(!config.transaction_log);
     }
 }

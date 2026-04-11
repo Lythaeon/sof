@@ -1,0 +1,224 @@
+name: Release TypeScript SDK
+
+on:
+  push:
+    tags:
+      - "ts-sdk-v*.*.*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish to npm instead of packing artifacts only"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: release-typescript-sdk-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: "22"
+  SDK_DIRECTORY: sdks/typescript
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      sdk_version: ${{ steps.sdk-version.outputs.value }}
+      publish_release: ${{ steps.release-mode.outputs.value }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+          registry-url: https://registry.npmjs.org
+
+      - name: Decide release mode
+        id: release-mode
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            echo "value=true" >> "${GITHUB_OUTPUT}"
+          elif [[ "${{ inputs.publish }}" == "true" ]]; then
+            echo "value=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "value=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Read SDK version
+        id: sdk-version
+        shell: bash
+        run: |
+          set -euo pipefail
+          value="$(node -p "require('./${SDK_DIRECTORY}/package.json').version")"
+          echo "value=${value}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify tagged commit is on main
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" "FETCH_HEAD"; then
+            echo "Tag ${GITHUB_REF_NAME} points to commit ${GITHUB_SHA} which is not on origin/main"
+            exit 1
+          fi
+
+      - name: Verify tag matches SDK version
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_tag="ts-sdk-v${{ steps.sdk-version.outputs.value }}"
+          if [[ "${GITHUB_REF_NAME}" != "${expected_tag}" ]]; then
+            echo "Expected tag ${expected_tag}, got ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run TypeScript SDK checks
+        run: pnpm --dir "${SDK_DIRECTORY}" run check
+
+  publish-native:
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package_dir: sdks/typescript/native/linux-x64
+            package_name: "@sof/sdk-native-linux-x64"
+            runner: ubuntu-24.04
+          - package_dir: sdks/typescript/native/linux-arm64
+            package_name: "@sof/sdk-native-linux-arm64"
+            runner: ubuntu-24.04-arm
+          - package_dir: sdks/typescript/native/darwin-x64
+            package_name: "@sof/sdk-native-darwin-x64"
+            runner: macos-15-intel
+          - package_dir: sdks/typescript/native/darwin-arm64
+            package_name: "@sof/sdk-native-darwin-arm64"
+            runner: macos-15
+          - package_dir: sdks/typescript/native/win32-x64
+            package_name: "@sof/sdk-native-win32-x64"
+            runner: windows-2025
+          - package_dir: sdks/typescript/native/win32-arm64
+            package_name: "@sof/sdk-native-win32-arm64"
+            runner: windows-11-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust CI toolchain and tools
+        uses: ./.github/actions/rust-ci-setup
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+          registry-url: https://registry.npmjs.org
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Publish native runtime package
+        if: needs.verify.outputs.publish_release == 'true'
+        working-directory: ${{ matrix.package_dir }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: pnpm publish --access public --no-git-checks
+
+      - name: Pack native runtime package
+        if: needs.verify.outputs.publish_release != 'true'
+        working-directory: ${{ matrix.package_dir }}
+        shell: bash
+        run: pnpm pack --pack-destination ../../../dist/npm
+
+  publish-sdk:
+    needs:
+      - verify
+      - publish-native
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+          registry-url: https://registry.npmjs.org
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Wait for native packages to index on npm
+        if: needs.verify.outputs.publish_release == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.verify.outputs.sdk_version }}"
+          packages="$(node -p "JSON.stringify(Object.keys(require('./${SDK_DIRECTORY}/package.json').optionalDependencies).sort())")"
+
+          wait_until_indexed() {
+            local pkg="$1"
+            local attempt
+            for attempt in $(seq 1 30); do
+              if npm view "${pkg}@${version}" version >/dev/null 2>&1; then
+                echo ">>> ${pkg}@${version} is visible on npm"
+                return 0
+              fi
+              echo ">>> Waiting for ${pkg}@${version} to appear on npm (${attempt}/30)..."
+              sleep 10
+            done
+            echo ">>> ${pkg}@${version} did not appear on npm in time"
+            return 1
+          }
+
+          node -e "for (const pkg of ${packages}) console.log(pkg)" | while IFS= read -r package_name; do
+            wait_until_indexed "${package_name}"
+          done
+
+      - name: Publish TypeScript SDK
+        if: needs.verify.outputs.publish_release == 'true'
+        working-directory: ${{ env.SDK_DIRECTORY }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: pnpm publish --access public --no-git-checks
+
+      - name: Pack TypeScript SDK
+        if: needs.verify.outputs.publish_release != 'true'
+        working-directory: ${{ env.SDK_DIRECTORY }}
+        shell: bash
+        run: pnpm pack --pack-destination ../dist/npm

@@ -6,9 +6,19 @@ TypeScript SDK for building apps with a typed `App`, `Plugin`, `runtime`, and `d
 
 - Use `pnpm` for this package.
 - `pnpm run build` produces minified ESM output plus `.d.ts` files.
+- `pnpm run build:native` builds the current platform native runtime host package in the workspace.
 - `pnpm run format:check` verifies Biome formatting.
 - `pnpm run lint` runs the type-aware `oxlint` profile.
 - `pnpm run check` runs format, lint, typecheck, tests, examples, and package validation.
+- SDK release tags and npm publish order are documented in `RELEASING.md`.
+
+## Install
+
+```sh
+pnpm add @sof/sdk
+```
+
+For published releases, npm installs the matching optional native runtime package for the current platform automatically. App authors only import `@sof/sdk` and run Node.
 
 ## Mental Model
 
@@ -24,7 +34,7 @@ TypeScript SDK for building apps with a typed `App`, `Plugin`, `runtime`, and `d
 ## Quick Start
 
 ```ts
-import { App, IngressKind, Plugin } from "@sof/sdk";
+import { App, IngressKind, Plugin, ok, runtimeExtensionAck } from "@sof/sdk";
 
 const app = new App({
   ingress: [
@@ -38,7 +48,8 @@ const app = new App({
     new Plugin({
       name: "tx-logger",
       onProviderEvent: (event) => {
-        console.log(event);
+        console.error(event);
+        return ok(runtimeExtensionAck());
       },
     }),
   ],
@@ -58,7 +69,8 @@ Current executable coverage:
 - Direct shreds can enable kernel bypass on Linux through a typed `kernelBypass` object.
 - One `DirectShreds` ingress plus one `Gossip` ingress run together as one raw runtime composition without `fanIn`.
 - Multi-provider fan-in uses the Rust arbitration model: `EmitAll`, `FirstSeen`, or `FirstSeenThenPromote`.
-- The package build includes the native host under `dist/native/<platform>-<arch>/`; `SOF_SDK_RUNTIME_HOST_BINARY` is only an override for development or custom deployments.
+- Published installs resolve the native host from the matching optional platform package such as `@sof/sdk-native-linux-x64`.
+- `SOF_SDK_RUNTIME_HOST_BINARY` is only an override for development or custom deployments.
 - If the host is missing, `app.run()` returns a typed `Result` error instead of throwing.
 
 ## Runtime
@@ -129,7 +141,7 @@ const app = new App({
       name: "provider-logger",
       onProviderEvent: (event) => {
         if (event.kind === RuntimeProviderEventKind.TransactionStatus) {
-          process.stdout.write(`${event.slot} ${event.signature}\n`);
+          process.stderr.write(`${event.slot} ${event.signature}\n`);
         }
         return ok(runtimeExtensionAck());
       },
@@ -224,7 +236,7 @@ const plugin = new Plugin({
   name: "packet-audit",
   onStart: () => ok(runtimeExtensionAck()),
   onProviderEvent: (event) => {
-    process.stdout.write(`${event.kind}\n`);
+    process.stderr.write(`${event.kind}\n`);
     return ok(runtimeExtensionAck());
   },
   onStop: () => ok(runtimeExtensionAck()),

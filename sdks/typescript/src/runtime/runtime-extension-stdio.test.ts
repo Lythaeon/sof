@@ -259,3 +259,96 @@ test("runtime extension stdio worker rejects malformed protocol messages", async
   assert.equal(isErr(runnerResult), true);
   assert.match(errorText, /event\.source\.kind/);
 });
+
+test("runtime extension stdio worker hard-blocks stdout writes inside callbacks", async () => {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const errorOutput = new PassThrough();
+  let outputText = "";
+
+  output.setEncoding("utf8");
+  output.on("data", (chunk: string) => {
+    outputText += chunk;
+  });
+
+  const manifest = tryCreateRuntimeExtensionWorkerManifest({
+    sdkVersion: "0.1.0",
+    extensionName: "stdout-guard-demo",
+    capabilities: [ExtensionCapability.ObserveObserverIngress],
+  });
+  assert.equal(manifest.tag, ResultTag.Ok);
+  if (manifest.tag !== ResultTag.Ok) {
+    return;
+  }
+
+  const definition = tryDefineRuntimeExtension({
+    manifest: manifest.value,
+    onPacketReceived: () => {
+      process.stdout.write("forbidden\n");
+      return ok(runtimeExtensionAck());
+    },
+    onShutdown: () => ok(runtimeExtensionAck()),
+  });
+  assert.equal(definition.tag, ResultTag.Ok);
+  if (definition.tag !== ResultTag.Ok) {
+    return;
+  }
+
+  const runner = runRuntimeExtensionWorkerStdio(definition.value, {
+    input,
+    output,
+    error: errorOutput,
+    guardProcessStdout: true,
+  });
+
+  input.write(
+    `${JSON.stringify({
+      tag: RuntimeExtensionWorkerHostMessageTag.DeliverPacket,
+      event: {
+        source: {
+          kind: 1,
+          transport: 1,
+          eventClass: 1,
+        },
+        bytes: [1, 2, 3, 4],
+        observedUnixMs: 100,
+      },
+    })}\n`,
+  );
+  input.write(
+    `${JSON.stringify(
+      serializeRuntimeExtensionWorkerHostMessageWire({
+        tag: RuntimeExtensionWorkerHostMessageTag.Shutdown,
+        context: {
+          extensionName: manifest.value.extensionName,
+        },
+      }),
+    )}\n`,
+  );
+  input.end();
+
+  const runnerResult = await runner;
+  assert.equal(runnerResult.tag, ResultTag.Ok);
+
+  const responses = outputText
+    .trim()
+    .split("\n")
+    .filter((line) => line !== "")
+    .map(
+      (line) =>
+        JSON.parse(line) as {
+          tag: number;
+          result?: { tag: number; error?: { message?: string; cause?: string } };
+        },
+    );
+
+  assert.equal(responses.length, 2);
+  assert.equal(responses[0]?.tag, RuntimeExtensionWorkerResponseTag.EventHandled);
+  assert.equal(responses[0]?.result?.tag, ResultTag.Err);
+  assert.match(
+    responses[0]?.result?.error?.cause ?? "",
+    /stdout is reserved for protocol messages/i,
+  );
+  assert.equal(responses[1]?.tag, RuntimeExtensionWorkerResponseTag.ShutdownComplete);
+  assert.equal(responses[1]?.result?.tag, ResultTag.Ok);
+});

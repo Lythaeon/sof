@@ -30,9 +30,6 @@ jobs:
   typescript-sdk:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    defaults:
-      run:
-        working-directory: sdks/typescript
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -45,13 +42,13 @@ jobs:
         with:
           node-version: "22"
           cache: pnpm
-          cache-dependency-path: sdks/typescript/pnpm-lock.yaml
+          cache-dependency-path: pnpm-lock.yaml
 
       - name: Install SDK dependencies
         run: pnpm install --frozen-lockfile
 
       - name: Run TypeScript SDK checks
-        run: pnpm run check
+        run: pnpm --dir sdks/typescript run check
 
   fuzz-smoke:
     runs-on: ubuntu-latest

@@ -15,7 +15,16 @@
   },
   "homepage": "https://github.com/Lythaeon/sof/tree/main/sdks/typescript",
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "provenance": true
+  },
+  "optionalDependencies": {
+    "@sof/sdk-native-darwin-arm64": "workspace:*",
+    "@sof/sdk-native-darwin-x64": "workspace:*",
+    "@sof/sdk-native-linux-arm64": "workspace:*",
+    "@sof/sdk-native-linux-x64": "workspace:*",
+    "@sof/sdk-native-win32-arm64": "workspace:*",
+    "@sof/sdk-native-win32-x64": "workspace:*"
   },
   "type": "module",
   "main": "./dist/index.js",
@@ -69,10 +78,11 @@
     "lint:fix": "oxlint --config .oxlintrc.json --tsconfig tsconfig.lint.json --type-aware --fix --fix-suggestions src tsdown.config.ts && oxlint --config .oxlintrc.json --fix --fix-suggestions examples scripts",
     "check:examples": "pnpm run build:examples && node dist-examples/runtime-config-balanced.js && node dist-examples/runtime-config-parse.js && node dist-examples/app-entrypoint.js && node dist-examples/app-config.js",
     "check:package": "publint run --strict --pack pnpm",
-    "check": "pnpm run format:check && pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run check:examples && pnpm run check:package",
+    "check:release-metadata": "node scripts/check-release-metadata.mjs",
+    "check": "pnpm run format:check && pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run check:examples && pnpm run check:package && pnpm run check:release-metadata",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "pnpm run build && pnpm run build:test && node --test dist-test/*.test.js dist-test/**/*.test.js",
-    "prepack": "pnpm run build && pnpm run build:native"
+    "prepack": "pnpm run build"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",

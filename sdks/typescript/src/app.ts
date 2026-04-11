@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { chmodSync, existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -98,6 +99,19 @@ export enum GrpcIngressStream {
   Slots = 5,
 }
 
+export enum WebSocketIngressStream {
+  Transactions = 1,
+  Logs = 2,
+  Account = 3,
+  Program = 4,
+}
+
+export enum WebSocketLogsFilterKind {
+  All = 1,
+  AllWithVotes = 2,
+  Mentions = 3,
+}
+
 export enum ProviderCommitment {
   Processed = 1,
   Confirmed = 2,
@@ -126,6 +140,21 @@ export interface WebSocketIngressInit {
   readonly kind: IngressKind.WebSocket;
   readonly name?: string;
   readonly url: string;
+  readonly stream?: WebSocketIngressStream;
+  readonly commitment?: ProviderCommitment;
+  readonly vote?: boolean;
+  readonly failed?: boolean;
+  readonly signature?: string;
+  readonly accountInclude?: readonly string[];
+  readonly accountExclude?: readonly string[];
+  readonly accountRequired?: readonly string[];
+  readonly account?: string;
+  readonly programId?: string;
+  readonly logsFilter?: WebSocketLogsFilterKind;
+  readonly mentions?: string;
+  readonly readiness?: ProviderIngressReadiness;
+  readonly role?: ProviderIngressRole;
+  readonly priority?: number;
 }
 
 export interface GrpcIngressInit {
@@ -196,6 +225,21 @@ export interface WebSocketIngress {
   readonly kind: IngressKind.WebSocket;
   readonly name: string;
   readonly url: string;
+  readonly stream: WebSocketIngressStream;
+  readonly commitment?: ProviderCommitment;
+  readonly vote?: boolean;
+  readonly failed?: boolean;
+  readonly signature?: string;
+  readonly accountInclude?: readonly string[];
+  readonly accountExclude?: readonly string[];
+  readonly accountRequired?: readonly string[];
+  readonly account?: string;
+  readonly programId?: string;
+  readonly logsFilter?: WebSocketLogsFilterKind;
+  readonly mentions?: string;
+  readonly readiness: ProviderIngressReadiness;
+  readonly role: ProviderIngressRole;
+  readonly priority?: number;
 }
 
 export interface GrpcIngress {
@@ -271,6 +315,8 @@ export type ExtensionError = PluginError;
 export type ExtensionInit = PluginInit;
 export const typeScriptSdkVersion = "0.1.0";
 
+const require = createRequire(import.meta.url);
+
 const defaultAppName = "app";
 const autoPluginNamePrefix = "plugin";
 const internalPluginWorkerEnvVarName = "SOF_SDK_INTERNAL_PLUGIN_WORKER";
@@ -285,6 +331,17 @@ const grpcIngressStreams = [
   GrpcIngressStream.BlockMeta,
   GrpcIngressStream.Slots,
 ] as const satisfies readonly GrpcIngressStream[];
+const webSocketIngressStreams = [
+  WebSocketIngressStream.Transactions,
+  WebSocketIngressStream.Logs,
+  WebSocketIngressStream.Account,
+  WebSocketIngressStream.Program,
+] as const satisfies readonly WebSocketIngressStream[];
+const webSocketLogsFilters = [
+  WebSocketLogsFilterKind.All,
+  WebSocketLogsFilterKind.AllWithVotes,
+  WebSocketLogsFilterKind.Mentions,
+] as const satisfies readonly WebSocketLogsFilterKind[];
 const providerCommitments = [
   ProviderCommitment.Processed,
   ProviderCommitment.Confirmed,
@@ -530,11 +587,333 @@ function validateWebSocketIngress(
     );
   }
 
-  return ok({
+  const stream = ingress.stream ?? WebSocketIngressStream.Transactions;
+  if (!webSocketIngressStreams.includes(stream)) {
+    return err(
+      appError(
+        AppErrorKind.ValidationError,
+        "ingress.stream",
+        "ingress.stream must be a supported websocket stream",
+        String(stream),
+      ),
+    );
+  }
+  if (ingress.commitment !== undefined && !providerCommitments.includes(ingress.commitment)) {
+    return err(
+      appError(
+        AppErrorKind.ValidationError,
+        "ingress.commitment",
+        "ingress.commitment must be a supported provider commitment",
+        String(ingress.commitment),
+      ),
+    );
+  }
+  if (ingress.readiness !== undefined && !providerIngressReadiness.includes(ingress.readiness)) {
+    return err(
+      appError(
+        AppErrorKind.ValidationError,
+        "ingress.readiness",
+        "ingress.readiness must be a supported provider readiness policy",
+        String(ingress.readiness),
+      ),
+    );
+  }
+  if (ingress.role !== undefined && !providerIngressRoles.includes(ingress.role)) {
+    return err(
+      appError(
+        AppErrorKind.ValidationError,
+        "ingress.role",
+        "ingress.role must be a supported provider ingress role",
+        String(ingress.role),
+      ),
+    );
+  }
+  if (
+    ingress.priority !== undefined &&
+    (!Number.isInteger(ingress.priority) || ingress.priority < 0 || ingress.priority > 65_535)
+  ) {
+    return err(
+      appError(
+        AppErrorKind.ValidationError,
+        "ingress.priority",
+        "ingress.priority must be an integer between 0 and 65535",
+        String(ingress.priority),
+      ),
+    );
+  }
+
+  const parseOptionalField = (
+    value: string | undefined,
+    field: string,
+  ): Result<string | undefined, AppError> => {
+    if (value === undefined) {
+      return ok(value);
+    }
+
+    const parsed = parseNonEmptyValue(value, field, (normalized) => normalized);
+    if (isErr(parsed)) {
+      return parsed;
+    }
+
+    return ok(parsed.value);
+  };
+  const signature = parseOptionalField(ingress.signature, "ingress.signature");
+  if (isErr(signature)) {
+    return signature;
+  }
+  const account = parseOptionalField(ingress.account, "ingress.account");
+  if (isErr(account)) {
+    return account;
+  }
+  const programId = parseOptionalField(ingress.programId, "ingress.programId");
+  if (isErr(programId)) {
+    return programId;
+  }
+  const mentions = parseOptionalField(ingress.mentions, "ingress.mentions");
+  if (isErr(mentions)) {
+    return mentions;
+  }
+
+  const parseFilterList = (
+    values: readonly string[] | undefined,
+    field: string,
+  ): Result<readonly string[], AppError> => {
+    const normalized: string[] = [];
+    for (const value of values ?? []) {
+      const parsed = parseNonEmptyValue(value, field, (normalizedValue) => normalizedValue);
+      if (isErr(parsed)) {
+        return parsed;
+      }
+      normalized.push(parsed.value);
+    }
+
+    return ok(normalized);
+  };
+  const accountInclude = parseFilterList(ingress.accountInclude, "ingress.accountInclude");
+  if (isErr(accountInclude)) {
+    return accountInclude;
+  }
+  const accountExclude = parseFilterList(ingress.accountExclude, "ingress.accountExclude");
+  if (isErr(accountExclude)) {
+    return accountExclude;
+  }
+  const accountRequired = parseFilterList(ingress.accountRequired, "ingress.accountRequired");
+  if (isErr(accountRequired)) {
+    return accountRequired;
+  }
+
+  const base = {
     kind: IngressKind.WebSocket,
     name: name.value,
     url: url.value,
-  });
+    stream,
+    ...(ingress.commitment === undefined ? {} : { commitment: ingress.commitment }),
+    readiness: ingress.readiness ?? ProviderIngressReadiness.Required,
+    role: ingress.role ?? ProviderIngressRole.Primary,
+    ...(ingress.priority === undefined ? {} : { priority: ingress.priority }),
+  } as const;
+
+  const rejectUnsupportedField = (field: string, message: string, received?: string) =>
+    err(appError(AppErrorKind.ValidationError, field, message, received));
+
+  switch (stream) {
+    case WebSocketIngressStream.Transactions:
+      if (account.value !== undefined) {
+        return rejectUnsupportedField(
+          "ingress.account",
+          "ingress.account is only supported for websocket account streams",
+          account.value,
+        );
+      }
+      if (programId.value !== undefined) {
+        return rejectUnsupportedField(
+          "ingress.programId",
+          "ingress.programId is only supported for websocket program streams",
+          programId.value,
+        );
+      }
+      if (mentions.value !== undefined) {
+        return rejectUnsupportedField(
+          "ingress.mentions",
+          "ingress.mentions is only supported for websocket logs mention filters",
+          mentions.value,
+        );
+      }
+      if (ingress.logsFilter !== undefined) {
+        return rejectUnsupportedField(
+          "ingress.logsFilter",
+          "ingress.logsFilter is only supported for websocket logs streams",
+          String(ingress.logsFilter),
+        );
+      }
+
+      return ok({
+        ...base,
+        ...(ingress.vote === undefined ? {} : { vote: ingress.vote }),
+        ...(ingress.failed === undefined ? {} : { failed: ingress.failed }),
+        ...(signature.value === undefined ? {} : { signature: signature.value }),
+        accountInclude: accountInclude.value,
+        accountExclude: accountExclude.value,
+        accountRequired: accountRequired.value,
+      });
+    case WebSocketIngressStream.Logs: {
+      if (account.value !== undefined) {
+        return rejectUnsupportedField(
+          "ingress.account",
+          "ingress.account is only supported for websocket account streams",
+          account.value,
+        );
+      }
+      if (programId.value !== undefined) {
+        return rejectUnsupportedField(
+          "ingress.programId",
+          "ingress.programId is only supported for websocket program streams",
+          programId.value,
+        );
+      }
+      if (ingress.vote !== undefined) {
+        return rejectUnsupportedField(
+          "ingress.vote",
+          "ingress.vote is only supported for websocket transaction streams",
+          String(ingress.vote),
+        );
+      }
+      if (ingress.failed !== undefined) {
+        return rejectUnsupportedField(
+          "ingress.failed",
+          "ingress.failed is only supported for websocket transaction streams",
+          String(ingress.failed),
+        );
+      }
+      if (signature.value !== undefined) {
+        return rejectUnsupportedField(
+          "ingress.signature",
+          "ingress.signature is only supported for websocket transaction streams",
+          signature.value,
+        );
+      }
+      if (
+        accountInclude.value.length > 0 ||
+        accountExclude.value.length > 0 ||
+        accountRequired.value.length > 0
+      ) {
+        return rejectUnsupportedField(
+          "ingress.accountInclude",
+          "transaction account filters are only supported for websocket transaction streams",
+        );
+      }
+
+      const logsFilter = ingress.logsFilter ?? WebSocketLogsFilterKind.All;
+      if (!webSocketLogsFilters.includes(logsFilter)) {
+        return rejectUnsupportedField(
+          "ingress.logsFilter",
+          "ingress.logsFilter must be a supported websocket logs filter",
+          String(logsFilter),
+        );
+      }
+      if (logsFilter === WebSocketLogsFilterKind.Mentions && mentions.value === undefined) {
+        return rejectUnsupportedField(
+          "ingress.mentions",
+          "ingress.mentions is required when ingress.logsFilter is Mentions",
+        );
+      }
+      if (logsFilter !== WebSocketLogsFilterKind.Mentions && mentions.value !== undefined) {
+        return rejectUnsupportedField(
+          "ingress.mentions",
+          "ingress.mentions is only supported when ingress.logsFilter is Mentions",
+          mentions.value,
+        );
+      }
+
+      return ok({
+        ...base,
+        logsFilter,
+        ...(mentions.value === undefined ? {} : { mentions: mentions.value }),
+      });
+    }
+    case WebSocketIngressStream.Account:
+      if (account.value === undefined) {
+        return rejectUnsupportedField(
+          "ingress.account",
+          "ingress.account is required for websocket account streams",
+        );
+      }
+      if (programId.value !== undefined) {
+        return rejectUnsupportedField(
+          "ingress.programId",
+          "ingress.programId is only supported for websocket program streams",
+          programId.value,
+        );
+      }
+      if (mentions.value !== undefined || ingress.logsFilter !== undefined) {
+        return rejectUnsupportedField(
+          "ingress.logsFilter",
+          "websocket logs filters are only supported for websocket logs streams",
+        );
+      }
+      if (
+        ingress.vote !== undefined ||
+        ingress.failed !== undefined ||
+        signature.value !== undefined ||
+        accountInclude.value.length > 0 ||
+        accountExclude.value.length > 0 ||
+        accountRequired.value.length > 0
+      ) {
+        return rejectUnsupportedField(
+          "ingress.vote",
+          "transaction-only websocket filters are not supported for websocket account streams",
+        );
+      }
+
+      return ok({
+        ...base,
+        account: account.value,
+      });
+    case WebSocketIngressStream.Program:
+      if (programId.value === undefined) {
+        return rejectUnsupportedField(
+          "ingress.programId",
+          "ingress.programId is required for websocket program streams",
+        );
+      }
+      if (account.value !== undefined) {
+        return rejectUnsupportedField(
+          "ingress.account",
+          "ingress.account is only supported for websocket account streams",
+          account.value,
+        );
+      }
+      if (mentions.value !== undefined || ingress.logsFilter !== undefined) {
+        return rejectUnsupportedField(
+          "ingress.logsFilter",
+          "websocket logs filters are only supported for websocket logs streams",
+        );
+      }
+      if (
+        ingress.vote !== undefined ||
+        ingress.failed !== undefined ||
+        signature.value !== undefined ||
+        accountInclude.value.length > 0 ||
+        accountExclude.value.length > 0 ||
+        accountRequired.value.length > 0
+      ) {
+        return rejectUnsupportedField(
+          "ingress.vote",
+          "transaction-only websocket filters are not supported for websocket program streams",
+        );
+      }
+
+      return ok({
+        ...base,
+        programId: programId.value,
+      });
+    default:
+      return rejectUnsupportedField(
+        "ingress.stream",
+        "ingress.stream must be a supported websocket stream",
+        String(stream),
+      );
+  }
 }
 
 function validateGrpcIngress(
@@ -1051,6 +1430,7 @@ interface RuntimeHostPluginWorkerConfig {
   readonly command: string;
   readonly args: readonly string[];
   readonly environment: Readonly<Record<string, string>>;
+  readonly providerEvents: boolean;
 }
 
 interface RuntimeHostConfig {
@@ -1160,6 +1540,7 @@ function createRuntimeHostConfig(state: AppState): Result<RuntimeHostConfig, App
         [internalPluginWorkerEnvVarName]: plugin.name,
         [internalPluginWorkerModeEnvVarName]: internalPluginWorkerModeEnvValue,
       },
+      providerEvents: pluginDefinition(plugin).onProviderEvent !== undefined,
     })),
   });
 }
@@ -1184,6 +1565,53 @@ function repoRuntimeHostPaths(): readonly string[] {
     join(import.meta.dirname, "..", "..", "..", "target", "debug", runtimeHostExecutableName()),
     join(import.meta.dirname, "..", "..", "..", "target", "release", runtimeHostExecutableName()),
   ];
+}
+
+function runtimeHostPackageName(): string | undefined {
+  if (process.platform === "darwin") {
+    if (process.arch === "arm64") {
+      return "@sof/sdk-native-darwin-arm64";
+    }
+    if (process.arch === "x64") {
+      return "@sof/sdk-native-darwin-x64";
+    }
+    return undefined;
+  }
+
+  if (process.platform === "linux") {
+    if (process.arch === "arm64") {
+      return "@sof/sdk-native-linux-arm64";
+    }
+    if (process.arch === "x64") {
+      return "@sof/sdk-native-linux-x64";
+    }
+    return undefined;
+  }
+
+  if (process.platform === "win32") {
+    if (process.arch === "arm64") {
+      return "@sof/sdk-native-win32-arm64";
+    }
+    if (process.arch === "x64") {
+      return "@sof/sdk-native-win32-x64";
+    }
+  }
+
+  return undefined;
+}
+
+function installedRuntimeHostPath(): string | undefined {
+  const packageName = runtimeHostPackageName();
+  if (packageName === undefined) {
+    return undefined;
+  }
+
+  try {
+    const packageJsonPath = require.resolve(`${packageName}/package.json`);
+    return join(packageJsonPath, "..", "vendor", runtimeHostExecutableName());
+  } catch {
+    return undefined;
+  }
 }
 
 function makeRuntimeHostExecutable(candidate: string): Result<string, AppError> {
@@ -1212,7 +1640,11 @@ function runtimeHostBinary(): Result<string, AppError> {
     return ok(binary);
   }
 
-  const candidates = [packagedRuntimeHostPath(), ...repoRuntimeHostPaths()];
+  const candidates = [
+    installedRuntimeHostPath(),
+    packagedRuntimeHostPath(),
+    ...repoRuntimeHostPaths(),
+  ].filter((candidate): candidate is string => candidate !== undefined);
   for (const candidate of candidates) {
     if (existsSync(candidate)) {
       return makeRuntimeHostExecutable(candidate);
@@ -1223,7 +1655,9 @@ function runtimeHostBinary(): Result<string, AppError> {
     appError(
       AppErrorKind.ValidationError,
       runtimeHostBinaryEnvVarName,
-      `a compatible runtime host binary was not found; expected one of ${candidates.join(", ")}`,
+      runtimeHostPackageName() === undefined
+        ? `a compatible runtime host binary was not found for ${process.platform}-${process.arch}; set ${runtimeHostBinaryEnvVarName} or provide one of ${candidates.join(", ")}`
+        : `a compatible runtime host binary was not found; expected optional dependency ${runtimeHostPackageName()} or one of ${candidates.join(", ")}`,
     ),
   );
 }

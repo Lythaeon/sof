@@ -79,6 +79,18 @@ export interface RuntimeExtensionWorkerStdioOptions {
   readonly input?: NodeJS.ReadableStream;
   readonly output?: NodeJS.WritableStream;
   readonly error?: NodeJS.WritableStream;
+  readonly guardProcessStdout?: boolean;
+}
+
+interface WorkerStdoutGuard {
+  readonly writeProtocolText: (text: string) => Promise<void>;
+  readonly restore: () => void;
+}
+
+function stdoutReservedError(): Error {
+  return new Error(
+    "SOF SDK worker stdout is reserved for protocol messages; use stderr, console.error, or console.warn instead",
+  );
 }
 
 function runtimeExtensionProtocolError(
@@ -664,6 +676,73 @@ async function writeText(output: NodeJS.WritableStream, text: string): Promise<v
   await once(output, "drain");
 }
 
+function createWorkerStdoutGuard(
+  output: NodeJS.WritableStream,
+  enabled: boolean,
+): WorkerStdoutGuard {
+  if (!enabled) {
+    return {
+      writeProtocolText: (text: string) => writeText(output, text),
+      restore: () => {},
+    };
+  }
+
+  const originalWrite = process.stdout.write.bind(process.stdout);
+  const originalConsoleLog = globalThis.console.log;
+  const originalConsoleInfo = globalThis.console.info;
+  const originalConsoleDebug = globalThis.console.debug;
+  const originalConsoleDir = globalThis.console.dir;
+  let protocolWriteDepth = 0;
+  const writeGuard: typeof process.stdout.write = (
+    buffer: string | Uint8Array,
+    encodingOrCallback?: BufferEncoding | ((err?: Error | null) => void),
+    callback?: (err?: Error | null) => void,
+  ) => {
+    if (protocolWriteDepth > 0) {
+      if (typeof encodingOrCallback === "function") {
+        return originalWrite(buffer, encodingOrCallback);
+      }
+
+      return originalWrite(buffer, encodingOrCallback, callback);
+    }
+
+    throw stdoutReservedError();
+  };
+  const blockedConsoleWrite = (..._args: readonly unknown[]) => {
+    throw stdoutReservedError();
+  };
+  const blockedConsoleDir: typeof globalThis.console.dir = (
+    _item?: unknown,
+    _options?: unknown,
+  ) => {
+    throw stdoutReservedError();
+  };
+
+  process.stdout.write = writeGuard;
+  globalThis.console.log = blockedConsoleWrite;
+  globalThis.console.info = blockedConsoleWrite;
+  globalThis.console.debug = blockedConsoleWrite;
+  globalThis.console.dir = blockedConsoleDir;
+
+  return {
+    writeProtocolText: async (text: string) => {
+      protocolWriteDepth += 1;
+      try {
+        await writeText(output, text);
+      } finally {
+        protocolWriteDepth -= 1;
+      }
+    },
+    restore: () => {
+      process.stdout.write = originalWrite;
+      globalThis.console.log = originalConsoleLog;
+      globalThis.console.info = originalConsoleInfo;
+      globalThis.console.debug = originalConsoleDebug;
+      globalThis.console.dir = originalConsoleDir;
+    },
+  };
+}
+
 export async function runRuntimeExtensionWorkerStdio(
   definition: RuntimeExtensionDefinition,
   options: RuntimeExtensionWorkerStdioOptions = {},
@@ -676,6 +755,10 @@ export async function runRuntimeExtensionWorkerStdio(
   const input = options.input ?? process.stdin;
   const output = options.output ?? process.stdout;
   const errorOutput = options.error ?? process.stderr;
+  const stdoutGuard = createWorkerStdoutGuard(
+    output,
+    options.guardProcessStdout ?? output === process.stdout,
+  );
   const lineReader = createInterface({
     input,
     crlfDelay: Infinity,
@@ -710,8 +793,7 @@ export async function runRuntimeExtensionWorkerStdio(
       }
 
       const response = await runtime.value.handleMessage(message.value);
-      await writeText(
-        output,
+      await stdoutGuard.writeProtocolText(
         `${JSON.stringify(serializeRuntimeExtensionWorkerResponseWire(response))}\n`,
       );
 
@@ -721,6 +803,7 @@ export async function runRuntimeExtensionWorkerStdio(
     }
   } finally {
     lineReader.close();
+    stdoutGuard.restore();
   }
 
   return err(

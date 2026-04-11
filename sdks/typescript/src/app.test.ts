@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -40,6 +40,12 @@ test("app derives a stable default name from the first plugin", () => {
       kind: IngressKind.WebSocket,
       name: "solana-websocket",
       url: "wss://example.invalid",
+      stream: 1,
+      readiness: 1,
+      role: 1,
+      accountInclude: [],
+      accountExclude: [],
+      accountRequired: [],
     },
   ]);
 });
@@ -200,6 +206,47 @@ test("app reports invalid runtime host override for non-websocket ingress", asyn
       assert.match(result.error.message, /failed to start runtime host/);
     }
   } finally {
+    if (previousRuntimeHost === undefined) {
+      delete process.env.SOF_SDK_RUNTIME_HOST_BINARY;
+    } else {
+      process.env.SOF_SDK_RUNTIME_HOST_BINARY = previousRuntimeHost;
+    }
+  }
+});
+
+test("app resolves the runtime host from the installed native package", async () => {
+  if (process.platform === "win32") {
+    return;
+  }
+
+  const nativePackageDirectory = join(
+    process.cwd(),
+    "native",
+    `${process.platform}-${process.arch}`,
+  );
+  const vendorDirectory = join(nativePackageDirectory, "vendor");
+  const binaryPath = join(vendorDirectory, "sof_ts_runtime_host");
+  const previousRuntimeHost = process.env.SOF_SDK_RUNTIME_HOST_BINARY;
+  delete process.env.SOF_SDK_RUNTIME_HOST_BINARY;
+
+  await mkdir(vendorDirectory, { recursive: true });
+  await writeFile(binaryPath, "#!/bin/sh\nexit 0\n", "utf8");
+  await chmod(binaryPath, 0o755);
+
+  try {
+    const result = await new App({
+      ingress: [
+        {
+          kind: IngressKind.DirectShreds,
+          bindAddress: "127.0.0.1:20000",
+        },
+      ],
+      plugins: [new Plugin({ name: "packet-extension", logPackets: false })],
+    }).run();
+
+    assert.equal(isOk(result), true);
+  } finally {
+    await rm(vendorDirectory, { force: true, recursive: true });
     if (previousRuntimeHost === undefined) {
       delete process.env.SOF_SDK_RUNTIME_HOST_BINARY;
     } else {
@@ -398,6 +445,71 @@ writeFileSync(snapshotPath, JSON.stringify(config.pluginWorkers[0].environment))
       delete process.env.SOF_SDK_SHOULD_NOT_BE_SERIALIZED;
     } else {
       process.env.SOF_SDK_SHOULD_NOT_BE_SERIALIZED = previousSecret;
+    }
+    await rm(tempDir, { force: true, recursive: true });
+  }
+});
+
+test("app runtime host config marks provider-event workers explicitly", async () => {
+  const previousRuntimeHost = process.env.SOF_SDK_RUNTIME_HOST_BINARY;
+  const previousSnapshot = process.env.SOF_SDK_CONFIG_SNAPSHOT;
+  const tempDir = await mkdtemp(join(tmpdir(), "sof-sdk-host-test-"));
+  const hostPath = join(tempDir, "host.mjs");
+  const snapshotPath = join(tempDir, "snapshot.json");
+  await writeFile(
+    hostPath,
+    `#!/usr/bin/env node
+import { readFileSync, writeFileSync } from "node:fs";
+const configPath = process.argv[2];
+const snapshotPath = process.env.SOF_SDK_CONFIG_SNAPSHOT;
+if (configPath === undefined || snapshotPath === undefined) process.exit(2);
+const config = JSON.parse(readFileSync(configPath, "utf8"));
+writeFileSync(snapshotPath, JSON.stringify(config.pluginWorkers.map((worker) => ({
+  name: worker.name,
+  providerEvents: worker.providerEvents,
+}))));
+`,
+    "utf8",
+  );
+  await chmod(hostPath, 0o755);
+  process.env.SOF_SDK_RUNTIME_HOST_BINARY = hostPath;
+  process.env.SOF_SDK_CONFIG_SNAPSHOT = snapshotPath;
+  try {
+    const result = await new App({
+      ingress: [
+        {
+          kind: IngressKind.Grpc,
+          endpoint: "https://example.invalid",
+        },
+      ],
+      plugins: [
+        new Plugin({ name: "packet-extension", logPackets: false }),
+        new Plugin({
+          name: "provider-extension",
+          onProviderEvent: () => ok(runtimeExtensionAck()),
+        }),
+      ],
+    }).run();
+
+    assert.equal(isOk(result), true);
+    const workers = JSON.parse(await readFile(snapshotPath, "utf8")) as Array<{
+      name: string;
+      providerEvents: boolean;
+    }>;
+    assert.deepEqual(workers, [
+      { name: "packet-extension", providerEvents: false },
+      { name: "provider-extension", providerEvents: true },
+    ]);
+  } finally {
+    if (previousRuntimeHost === undefined) {
+      delete process.env.SOF_SDK_RUNTIME_HOST_BINARY;
+    } else {
+      process.env.SOF_SDK_RUNTIME_HOST_BINARY = previousRuntimeHost;
+    }
+    if (previousSnapshot === undefined) {
+      delete process.env.SOF_SDK_CONFIG_SNAPSHOT;
+    } else {
+      process.env.SOF_SDK_CONFIG_SNAPSHOT = previousSnapshot;
     }
     await rm(tempDir, { force: true, recursive: true });
   }
