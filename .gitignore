@@ -3,6 +3,7 @@
 **/dist/
 **/dist-test/
 **/dist-examples/
+sdks/typescript/native/*/vendor/
 
 # Editor/OS noise
 .DS_Store
