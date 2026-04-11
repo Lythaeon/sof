@@ -2,6 +2,9 @@ import type { EnvVarName } from "./environment.js";
 
 export enum ValidationErrorKind {
   InvalidRuntimeDeliveryProfile = 1,
+  InvalidShredTrustMode = 2,
+  InvalidProviderStreamCapabilityPolicy = 3,
+  InvalidProviderStreamAllowEof = 4,
 }
 
 export interface ValidationError<AllowedValue extends string = string> {
