@@ -291,6 +291,16 @@ Configuration guidance:
 - Use `DeliveryDisciplined` for stateful or analytical consumers that want stronger lane-local
   drain discipline and can pay the extra memory and latency budget.
 
+Manual soak/benchmark fixtures:
+
+```sh
+cargo test -p sof runtime_delivery_profile_plugin_dataset_dispatch_profile_fixture --lib -- --ignored --nocapture
+cargo test -p sof runtime_delivery_profile_transaction_dispatch_profile_fixture --lib -- --ignored --nocapture
+cargo test -p sof runtime_delivery_profile_extension_dispatch_profile_fixture --lib -- --ignored --nocapture
+```
+
+Set `SOF_PROFILE_ITERATIONS` to raise or lower the event count for local soak runs.
+
 ## Guarantees and Non-Guarantees
 
 The docs for this feature must define, per profile:

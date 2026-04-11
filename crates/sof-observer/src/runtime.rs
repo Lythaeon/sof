@@ -3657,10 +3657,12 @@ mod tests {
     use crate::app::config::read_runtime_delivery_profile;
     use crate::event::TxKind;
     use crate::framework::{
-        DerivedStateCheckpoint, DerivedStateConsumer, DerivedStateConsumerConfig,
+        DatasetEvent, DerivedStateCheckpoint, DerivedStateConsumer, DerivedStateConsumerConfig,
         DerivedStateConsumerContext, DerivedStateConsumerFault, DerivedStateFeedEnvelope,
-        DerivedStateFeedEvent, ExtensionContext, ExtensionManifest, ObserverPlugin, PluginConfig,
-        PluginContext, RawPacketEvent, RuntimeExtension, TransactionInterest, TransactionPrefilter,
+        DerivedStateFeedEvent, ExtensionCapability, ExtensionContext, ExtensionManifest,
+        ObserverPlugin, PacketSubscription, PluginConfig, PluginContext, RawPacketEvent,
+        RuntimeExtension, RuntimePacketEvent, RuntimePacketSourceKind, TransactionInterest,
+        TransactionPrefilter,
     };
     use async_trait::async_trait;
     use sof_gossip_tuning::{GossipTuningProfile, HostProfilePreset, IngestQueueMode};
@@ -3721,12 +3723,21 @@ mod tests {
         transaction_count: Arc<AtomicUsize>,
         recent_blockhash_count: Arc<AtomicUsize>,
     }
+    struct RuntimeDeliveryDatasetCounterPlugin {
+        counter: Arc<AtomicUsize>,
+    }
+    struct RuntimeDeliveryTransactionCounterPlugin {
+        counter: Arc<AtomicUsize>,
+    }
     #[cfg(feature = "gossip-bootstrap")]
     struct ClusterTopologyOnlyPlugin;
     struct StartupCounterPlugin {
         counter: Arc<AtomicUsize>,
     }
     struct StartupCounterExtension {
+        counter: Arc<AtomicUsize>,
+    }
+    struct RuntimeDeliveryPacketCounterExtension {
         counter: Arc<AtomicUsize>,
     }
     struct AccountTouchDerivedStateConsumer;
@@ -3805,6 +3816,28 @@ mod tests {
     }
 
     #[async_trait]
+    impl ObserverPlugin for RuntimeDeliveryDatasetCounterPlugin {
+        fn config(&self) -> PluginConfig {
+            PluginConfig::new().with_dataset()
+        }
+
+        async fn on_dataset(&self, _event: DatasetEvent) {
+            self.counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[async_trait]
+    impl ObserverPlugin for RuntimeDeliveryTransactionCounterPlugin {
+        fn config(&self) -> PluginConfig {
+            PluginConfig::new().with_transaction()
+        }
+
+        async fn on_transaction(&self, _event: &TransactionEvent) {
+            self.counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[async_trait]
     impl ObserverPlugin for StartupCounterPlugin {
         fn config(&self) -> PluginConfig {
             PluginConfig::new().with_raw_packet()
@@ -3826,6 +3859,27 @@ mod tests {
         ) -> Result<ExtensionManifest, framework::extension::ExtensionSetupError> {
             self.counter.fetch_add(1, Ordering::Relaxed);
             Ok(ExtensionManifest::default())
+        }
+    }
+
+    #[async_trait]
+    impl RuntimeExtension for RuntimeDeliveryPacketCounterExtension {
+        async fn setup(
+            &self,
+            _ctx: ExtensionContext,
+        ) -> Result<ExtensionManifest, framework::extension::ExtensionSetupError> {
+            Ok(ExtensionManifest {
+                capabilities: vec![ExtensionCapability::ObserveObserverIngress],
+                subscriptions: vec![PacketSubscription {
+                    source_kind: Some(RuntimePacketSourceKind::ObserverIngress),
+                    ..PacketSubscription::default()
+                }],
+                ..ExtensionManifest::default()
+            })
+        }
+
+        async fn on_packet_received(&self, _event: RuntimePacketEvent) {
+            self.counter.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -4912,6 +4966,210 @@ mod tests {
             overrides.get("SOF_RUNTIME_DELIVERY_PROFILE"),
             Some(&"delivery_disciplined".to_owned())
         );
+    }
+
+    #[test]
+    #[ignore = "soak/benchmark fixture for runtime delivery profile plugin dataset dispatch"]
+    fn runtime_delivery_profile_plugin_dataset_dispatch_profile_fixture() {
+        let iterations = profile_iterations(20_000);
+        for profile in runtime_delivery_profiles() {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let settings = profile.settings();
+            let host = profile
+                .plugin_host_builder()
+                .add_plugin(RuntimeDeliveryDatasetCounterPlugin {
+                    counter: Arc::clone(&counter),
+                })
+                .build();
+            let chunk_size = settings
+                .plugin_event_queue_capacity
+                .saturating_div(2)
+                .max(1);
+
+            let started_at = Instant::now();
+            for iteration in 0..iterations {
+                host.on_dataset(runtime_delivery_dataset_event(iteration as u64));
+                if (iteration + 1) % chunk_size == 0 {
+                    assert!(wait_until_counter(
+                        counter.as_ref(),
+                        iteration + 1,
+                        Duration::from_secs(10),
+                    ));
+                }
+            }
+            assert!(wait_until_counter(
+                counter.as_ref(),
+                iterations,
+                Duration::from_secs(10),
+            ));
+            let elapsed = started_at.elapsed();
+
+            assert_eq!(host.dropped_event_count(), 0);
+            println!(
+                "runtime_delivery_profile_plugin_dataset_dispatch_profile_fixture profile={:?} iterations={} elapsed_us={} avg_ns_per_iteration={}",
+                profile,
+                iterations,
+                elapsed.as_micros(),
+                avg_ns_per_iteration(elapsed, iterations),
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "soak/benchmark fixture for runtime delivery profile transaction dispatch"]
+    fn runtime_delivery_profile_transaction_dispatch_profile_fixture() {
+        let iterations = profile_iterations(20_000);
+        let event = runtime_delivery_transaction_event();
+        for profile in runtime_delivery_profiles() {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let settings = profile.settings();
+            let host = profile
+                .plugin_host_builder()
+                .add_plugin(RuntimeDeliveryTransactionCounterPlugin {
+                    counter: Arc::clone(&counter),
+                })
+                .build();
+            let chunk_size = settings
+                .plugin_event_queue_capacity
+                .saturating_div(2)
+                .max(1);
+
+            let started_at = Instant::now();
+            for iteration in 0..iterations {
+                host.on_transaction(event.clone());
+                if (iteration + 1) % chunk_size == 0 {
+                    assert!(wait_until_counter(
+                        counter.as_ref(),
+                        iteration + 1,
+                        Duration::from_secs(10),
+                    ));
+                }
+            }
+            assert!(wait_until_counter(
+                counter.as_ref(),
+                iterations,
+                Duration::from_secs(10),
+            ));
+            let elapsed = started_at.elapsed();
+
+            assert_eq!(host.dropped_event_count(), 0);
+            println!(
+                "runtime_delivery_profile_transaction_dispatch_profile_fixture profile={:?} iterations={} transaction_workers={} elapsed_us={} avg_ns_per_iteration={}",
+                profile,
+                iterations,
+                settings.plugin_transaction_dispatch_workers,
+                elapsed.as_micros(),
+                avg_ns_per_iteration(elapsed, iterations),
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "soak/benchmark fixture for runtime delivery profile extension dispatch"]
+    async fn runtime_delivery_profile_extension_dispatch_profile_fixture() {
+        let iterations = profile_iterations(20_000);
+        let source = "127.0.0.1:9001"
+            .parse::<SocketAddr>()
+            .expect("valid packet source");
+        for profile in runtime_delivery_profiles() {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let settings = profile.settings();
+            let host = profile
+                .extension_host_builder()
+                .add_extension(RuntimeDeliveryPacketCounterExtension {
+                    counter: Arc::clone(&counter),
+                })
+                .build();
+            let startup = host.startup().await;
+            assert_eq!(startup.active_extensions, 1);
+            let chunk_size = settings
+                .extension_event_queue_capacity
+                .saturating_div(2)
+                .max(1);
+
+            let started_at = Instant::now();
+            for iteration in 0..iterations {
+                host.on_observer_packet(source, &[7_u8; 32]);
+                if (iteration + 1) % chunk_size == 0 {
+                    assert!(
+                        wait_until_counter_async(
+                            counter.as_ref(),
+                            iteration + 1,
+                            Duration::from_secs(10),
+                        )
+                        .await
+                    );
+                }
+            }
+            assert!(
+                wait_until_counter_async(counter.as_ref(), iterations, Duration::from_secs(10),)
+                    .await
+            );
+            let elapsed = started_at.elapsed();
+
+            assert_eq!(host.dropped_event_count(), 0);
+            host.shutdown().await;
+            println!(
+                "runtime_delivery_profile_extension_dispatch_profile_fixture profile={:?} iterations={} elapsed_us={} avg_ns_per_iteration={}",
+                profile,
+                iterations,
+                elapsed.as_micros(),
+                avg_ns_per_iteration(elapsed, iterations),
+            );
+        }
+    }
+
+    const fn runtime_delivery_profiles() -> [RuntimeDeliveryProfile; 3] {
+        [
+            RuntimeDeliveryProfile::LatencyOptimized,
+            RuntimeDeliveryProfile::Balanced,
+            RuntimeDeliveryProfile::DeliveryDisciplined,
+        ]
+    }
+
+    fn runtime_delivery_dataset_event(slot: u64) -> DatasetEvent {
+        DatasetEvent {
+            slot,
+            start_index: 0,
+            end_index: 0,
+            last_in_slot: false,
+            shreds: 1,
+            payload_len: 1,
+            tx_count: 1,
+        }
+    }
+
+    fn runtime_delivery_transaction_event() -> TransactionEvent {
+        match sample_provider_transaction_update() {
+            ProviderStreamUpdate::Transaction(event) => event,
+            _ => unreachable!("sample transaction helper returns transaction update"),
+        }
+    }
+
+    fn wait_until_counter(counter: &AtomicUsize, expected: usize, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if counter.load(Ordering::Relaxed) >= expected {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        counter.load(Ordering::Relaxed) >= expected
+    }
+
+    async fn wait_until_counter_async(
+        counter: &AtomicUsize,
+        expected: usize,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if counter.load(Ordering::Relaxed) >= expected {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        counter.load(Ordering::Relaxed) >= expected
     }
 
     #[test]
