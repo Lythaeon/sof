@@ -9,16 +9,17 @@ import {
   ok,
   runtimeExtensionAck,
   serializeRuntimeExtensionWorkerHostMessageWire,
+  sofRuntimeExtensionNameEnvVarName,
   socketAddress,
   tryDefineApp,
   tryDefinePlugin,
-  tryRunPlugin,
+  tryRunSelectedPlugin,
 } from "../dist/index.js";
 
 async function main(): Promise<number> {
-  const extension = extensionName("demo-extension-worker");
-  if (isErr(extension)) {
-    process.stderr.write(`${extension.error.message}\n`);
+  const pluginName = extensionName("demo-plugin");
+  if (isErr(pluginName)) {
+    process.stderr.write(`${pluginName.error.message}\n`);
     return 1;
   }
 
@@ -30,7 +31,7 @@ async function main(): Promise<number> {
 
   let observedPacketLog = "";
   const plugin = tryDefinePlugin({
-    name: extension.value,
+    name: pluginName.value,
     capabilities: [ExtensionCapability.ObserveObserverIngress],
     onStart: () => ok(runtimeExtensionAck()),
     onPacket: (event) => {
@@ -68,18 +69,24 @@ async function main(): Promise<number> {
     protocolErrors += chunk;
   });
 
-  const runner = tryRunPlugin(app.value, extension.value, {
-    input,
-    output,
-    error: errorOutput,
-  });
+  const runner = tryRunSelectedPlugin(
+    app.value,
+    {
+      [sofRuntimeExtensionNameEnvVarName]: pluginName.value,
+    },
+    {
+      input,
+      output,
+      error: errorOutput,
+    },
+  );
 
   input.write(
     `${JSON.stringify(
       serializeRuntimeExtensionWorkerHostMessageWire({
         tag: RuntimeExtensionWorkerHostMessageTag.Start,
         context: {
-          extensionName: extension.value,
+          extensionName: pluginName.value,
         },
       }),
     )}\n`,
@@ -104,7 +111,7 @@ async function main(): Promise<number> {
       serializeRuntimeExtensionWorkerHostMessageWire({
         tag: RuntimeExtensionWorkerHostMessageTag.Shutdown,
         context: {
-          extensionName: extension.value,
+          extensionName: pluginName.value,
         },
       }),
     )}\n`,

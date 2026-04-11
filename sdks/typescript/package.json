@@ -25,6 +25,10 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./app": {
+      "types": "./dist/app.d.ts",
+      "import": "./dist/app.js"
+    },
     "./runtime": {
       "types": "./dist/runtime.d.ts",
       "import": "./dist/runtime.js"
@@ -66,7 +70,7 @@
     "format:check": "biome format --config-path biome.json src examples tsdown.config.ts",
     "lint": "oxlint --config .oxlintrc.json --tsconfig tsconfig.lint.json --type-aware --deny-warnings --report-unused-disable-directives src tsdown.config.ts",
     "lint:fix": "oxlint --config .oxlintrc.json --tsconfig tsconfig.lint.json --type-aware --fix --fix-suggestions src tsdown.config.ts",
-    "check:examples": "pnpm run build:examples && node dist-examples/runtime-config-balanced.js && node dist-examples/runtime-config-parse.js && node dist-examples/runtime-extension-manifest.js && node dist-examples/runtime-extension-worker.js",
+    "check:examples": "pnpm run build:examples && node dist-examples/runtime-config-balanced.js && node dist-examples/runtime-config-parse.js && node dist-examples/runtime-extension-manifest.js && node dist-examples/runtime-extension-worker.js && node dist-examples/sof-app-entrypoint.js && node dist-examples/sof-app-launch-spec.js",
     "check:package": "publint run --strict --pack pnpm",
     "check": "pnpm run format:check && pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run check:examples && pnpm run check:package",
     "typecheck": "tsc -p tsconfig.json --noEmit",

@@ -7,6 +7,7 @@ export default defineConfig({
     neverBundle: [/^node:/],
   },
   entry: {
+    app: "src/app.ts",
     index: "src/index.ts",
     runtime: "src/runtime.ts",
     "runtime/config": "src/runtime/runtime-config.ts",

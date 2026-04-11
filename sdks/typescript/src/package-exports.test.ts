@@ -7,6 +7,7 @@ function importPackageEntry(moduleName: string): Promise<unknown> {
 
 test("package exports resolve the documented public entry points", async () => {
   const root = await importPackageEntry("@sof/sdk");
+  const app = await importPackageEntry("@sof/sdk/app");
   const runtime = await importPackageEntry("@sof/sdk/runtime");
   const config = await importPackageEntry("@sof/sdk/runtime/config");
   const policy = await importPackageEntry("@sof/sdk/runtime/policy");
@@ -15,6 +16,44 @@ test("package exports resolve the documented public entry points", async () => {
   const extension = await importPackageEntry("@sof/sdk/runtime/extension");
   const extensionStdio = await importPackageEntry("@sof/sdk/runtime/extension-stdio");
 
+  assert.equal(
+    (root as { defineSofApplication: unknown }).defineSofApplication,
+    (app as { defineSofApplication: unknown }).defineSofApplication,
+  );
+  assert.equal(
+    (root as { defineApp: unknown }).defineApp,
+    (app as { defineApp: unknown }).defineApp,
+  );
+  assert.equal(
+    (root as { tryDefineApp: unknown }).tryDefineApp,
+    (app as { tryDefineApp: unknown }).tryDefineApp,
+  );
+  assert.equal(
+    (root as { definePlugin: unknown }).definePlugin,
+    (app as { definePlugin: unknown }).definePlugin,
+  );
+  assert.equal(
+    (root as { tryDefinePlugin: unknown }).tryDefinePlugin,
+    (app as { tryDefinePlugin: unknown }).tryDefinePlugin,
+  );
+  assert.equal(
+    (root as { createAppLaunch: unknown }).createAppLaunch,
+    (app as { createAppLaunch: unknown }).createAppLaunch,
+  );
+  assert.equal(
+    (root as { runSelectedPlugin: unknown }).runSelectedPlugin,
+    (app as { runSelectedPlugin: unknown }).runSelectedPlugin,
+  );
+  assert.equal(
+    (root as { createSofNodeLaunchSpec: unknown }).createSofNodeLaunchSpec,
+    (app as { createSofNodeLaunchSpec: unknown }).createSofNodeLaunchSpec,
+  );
+  assert.equal(
+    (root as { runSofApplicationRuntimeExtensionWorkerFromEnvironment: unknown })
+      .runSofApplicationRuntimeExtensionWorkerFromEnvironment,
+    (app as { runSofApplicationRuntimeExtensionWorkerFromEnvironment: unknown })
+      .runSofApplicationRuntimeExtensionWorkerFromEnvironment,
+  );
   assert.equal(
     (root as { ObserverRuntimeConfig: unknown }).ObserverRuntimeConfig,
     (config as { ObserverRuntimeConfig: unknown }).ObserverRuntimeConfig,
