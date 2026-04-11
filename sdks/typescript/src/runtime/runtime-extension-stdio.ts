@@ -1,5 +1,5 @@
+import { Buffer } from "node:buffer";
 import { once } from "node:events";
-import { createInterface } from "node:readline";
 
 import { ResultTag, err, isErr, ok, type Result } from "../result.js";
 import {
@@ -42,14 +42,22 @@ const runtimeWebSocketFrameTypes = [
 const runtimeProviderEventKinds = [
   1, 2, 3, 4, 5, 6, 7,
 ] as const satisfies readonly RuntimeProviderEventKind[];
-const maxPacketByteValue = 255;
+const workerFrameHeaderBytes = 5;
 
 type JsonRecord = Record<string, unknown>;
 
 export interface RuntimePacketEventWire {
   readonly source: RuntimePacketSource;
-  readonly bytes: readonly number[];
+  readonly bytesBase64: string;
   readonly observedUnixMs: number;
+}
+
+export interface RuntimePacketEventBatchWire {
+  readonly events: readonly RuntimePacketEventWire[];
+}
+
+export interface RuntimeProviderEventBatchWire {
+  readonly events: readonly RuntimeProviderEvent[];
 }
 
 export type RuntimeExtensionWorkerWireHostMessage =
@@ -83,7 +91,7 @@ export interface RuntimeExtensionWorkerStdioOptions {
 }
 
 interface WorkerStdoutGuard {
-  readonly writeProtocolText: (text: string) => Promise<void>;
+  readonly writeProtocolBytes: (payload: Uint8Array) => Promise<void>;
   readonly restore: () => void;
 }
 
@@ -343,37 +351,29 @@ function parseOptionalSharedStreamTag(
   return ok(tag.value);
 }
 
-function parsePacketBytes(value: unknown): Result<Uint8Array, RuntimeExtensionError> {
-  if (!Array.isArray(value)) {
+function parsePacketBytesBase64(value: unknown): Result<Uint8Array, RuntimeExtensionError> {
+  if (typeof value !== "string") {
     return err(
       runtimeExtensionProtocolError(
-        "event.bytes",
-        "event.bytes must be an array of byte values",
+        "event.bytesBase64",
+        "event.bytesBase64 must be a base64 string",
         JSON.stringify(value),
       ),
     );
   }
 
-  const bytes = new Uint8Array(value.length);
-  for (const [index, packetByte] of value.entries()) {
-    if (
-      typeof packetByte !== "number" ||
-      !Number.isInteger(packetByte) ||
-      packetByte < 0 ||
-      packetByte > maxPacketByteValue
-    ) {
-      return err(
-        runtimeExtensionProtocolError(
-          `event.bytes[${index}]`,
-          `event.bytes[${index}] must be an integer between 0 and ${maxPacketByteValue}`,
-          JSON.stringify(packetByte),
-        ),
-      );
-    }
-    bytes[index] = packetByte;
+  try {
+    return ok(Uint8Array.from(Buffer.from(value, "base64")));
+  } catch (error) {
+    return err(
+      runtimeExtensionProtocolError(
+        "event.bytesBase64",
+        "event.bytesBase64 must be valid base64",
+        JSON.stringify(value),
+        error instanceof Error ? error.message : String(error),
+      ),
+    );
   }
-
-  return ok(bytes);
 }
 
 function parseRuntimePacketSource(
@@ -493,7 +493,7 @@ function isRuntimeProviderEvent(value: unknown): value is RuntimeProviderEvent {
 export function serializeRuntimePacketEventWire(event: RuntimePacketEvent): RuntimePacketEventWire {
   return {
     source: event.source,
-    bytes: Array.from(event.bytes),
+    bytesBase64: Buffer.from(event.bytes).toString("base64"),
     observedUnixMs: event.observedUnixMs,
   };
 }
@@ -511,7 +511,7 @@ export function tryParseRuntimePacketEventWire(
     return source;
   }
 
-  const bytes = parsePacketBytes(eventRecord.value.bytes);
+  const bytes = parsePacketBytesBase64(eventRecord.value.bytesBase64);
   if (isErr(bytes)) {
     return bytes;
   }
@@ -556,6 +556,64 @@ export function tryParseRuntimeProviderEventWire(
   }
 
   return ok(eventRecord.value);
+}
+
+function parseRuntimePacketEventBatchWire(
+  value: unknown,
+): Result<readonly RuntimePacketEvent[], RuntimeExtensionError> {
+  const batchRecord = parseJsonRecord(value, "message");
+  if (isErr(batchRecord)) {
+    return batchRecord;
+  }
+  if (!Array.isArray(batchRecord.value.events)) {
+    return err(
+      runtimeExtensionProtocolError(
+        "message.events",
+        "message.events must be an array",
+        JSON.stringify(batchRecord.value.events),
+      ),
+    );
+  }
+
+  const events: RuntimePacketEvent[] = [];
+  for (const eventValue of batchRecord.value.events) {
+    const event = tryParseRuntimePacketEventWire(eventValue);
+    if (isErr(event)) {
+      return event;
+    }
+    events.push(event.value);
+  }
+
+  return ok(events);
+}
+
+function parseRuntimeProviderEventBatchWire(
+  value: unknown,
+): Result<readonly RuntimeProviderEvent[], RuntimeExtensionError> {
+  const batchRecord = parseJsonRecord(value, "message");
+  if (isErr(batchRecord)) {
+    return batchRecord;
+  }
+  if (!Array.isArray(batchRecord.value.events)) {
+    return err(
+      runtimeExtensionProtocolError(
+        "message.events",
+        "message.events must be an array",
+        JSON.stringify(batchRecord.value.events),
+      ),
+    );
+  }
+
+  const events: RuntimeProviderEvent[] = [];
+  for (const eventValue of batchRecord.value.events) {
+    const event = tryParseRuntimeProviderEventWire(eventValue);
+    if (isErr(event)) {
+      return event;
+    }
+    events.push(event.value);
+  }
+
+  return ok(events);
 }
 
 export function serializeRuntimeExtensionWorkerHostMessageWire(
@@ -668,12 +726,151 @@ export function serializeRuntimeExtensionWorkerResponseWire(
   return response;
 }
 
-async function writeText(output: NodeJS.WritableStream, text: string): Promise<void> {
-  if (output.write(text)) {
+function encodeRuntimeExtensionWorkerFrame(tag: number, payload: Uint8Array): Uint8Array {
+  const frame = new Uint8Array(workerFrameHeaderBytes + payload.length);
+  const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
+  frame[0] = tag;
+  view.setUint32(1, payload.length, true);
+  frame.set(payload, workerFrameHeaderBytes);
+  return frame;
+}
+
+function encodeRuntimeExtensionWorkerJsonFrame(tag: number, payload: unknown): Uint8Array {
+  const jsonBytes = new TextEncoder().encode(JSON.stringify(payload));
+  return encodeRuntimeExtensionWorkerFrame(tag, jsonBytes);
+}
+
+async function writeBytes(output: NodeJS.WritableStream, bytes: Uint8Array): Promise<void> {
+  if (output.write(bytes)) {
     return;
   }
 
   await once(output, "drain");
+}
+
+async function writeText(output: NodeJS.WritableStream, text: string): Promise<void> {
+  await writeBytes(output, new TextEncoder().encode(text));
+}
+
+function bytesFromChunk(chunk: string | Uint8Array): Uint8Array {
+  return typeof chunk === "string" ? new TextEncoder().encode(chunk) : Uint8Array.from(chunk);
+}
+
+class RuntimeExtensionFrameReader {
+  readonly #iterator: AsyncIterator<string | Uint8Array>;
+  #buffer = new Uint8Array(0);
+
+  constructor(input: NodeJS.ReadableStream) {
+    this.#iterator = input[Symbol.asyncIterator]() as AsyncIterator<string | Uint8Array>;
+  }
+
+  async nextFrame(): Promise<
+    Result<
+      { readonly tag: number; readonly payload: Uint8Array } | undefined,
+      RuntimeExtensionError
+    >
+  > {
+    const headerReady = await this.#fillHeader();
+    if (isErr(headerReady)) {
+      return headerReady;
+    }
+    if (!headerReady.value) {
+      return okMissing();
+    }
+
+    const view = new DataView(
+      this.#buffer.buffer,
+      this.#buffer.byteOffset,
+      this.#buffer.byteLength,
+    );
+    const tag = this.#buffer[0] ?? 0;
+    const payloadLength = view.getUint32(1, true);
+    const totalFrameLength = workerFrameHeaderBytes + payloadLength;
+
+    const payloadReady = await this.#fillPayload(totalFrameLength);
+    if (isErr(payloadReady)) {
+      return payloadReady;
+    }
+
+    const payload = this.#buffer.slice(workerFrameHeaderBytes, totalFrameLength);
+    this.#buffer = this.#buffer.slice(totalFrameLength);
+    return ok({ tag, payload });
+  }
+
+  async #fillHeader(): Promise<Result<boolean, RuntimeExtensionError>> {
+    if (this.#buffer.length >= workerFrameHeaderBytes) {
+      return ok(true);
+    }
+
+    const next = await this.#iterator.next();
+    if (next.done === true) {
+      return this.#buffer.length === 0
+        ? ok(false)
+        : err(
+            runtimeExtensionProtocolError(
+              "message",
+              "worker stdin closed while reading a framed message header",
+            ),
+          );
+    }
+
+    this.#buffer = new Uint8Array(appendChunk(this.#buffer, bytesFromChunk(next.value)));
+    return this.#fillHeader();
+  }
+
+  async #fillPayload(totalFrameLength: number): Promise<Result<true, RuntimeExtensionError>> {
+    if (this.#buffer.length >= totalFrameLength) {
+      return ok(true);
+    }
+
+    const next = await this.#iterator.next();
+    if (next.done === true) {
+      return err(
+        runtimeExtensionProtocolError(
+          "message",
+          "worker stdin closed while reading a framed message payload",
+        ),
+      );
+    }
+
+    this.#buffer = new Uint8Array(appendChunk(this.#buffer, bytesFromChunk(next.value)));
+    return this.#fillPayload(totalFrameLength);
+  }
+}
+
+function appendChunk(left: Uint8Array, right: Uint8Array): Uint8Array {
+  const merged = new Uint8Array(left.length + right.length);
+  merged.set(left, 0);
+  merged.set(right, left.length);
+  return merged;
+}
+
+function parseJsonPayload(payload: Uint8Array): Result<unknown, RuntimeExtensionError> {
+  const jsonText = new TextDecoder().decode(payload);
+  try {
+    return ok(JSON.parse(jsonText));
+  } catch (error) {
+    return err(
+      runtimeExtensionProtocolError(
+        "message",
+        "worker stdin frame payload must be valid JSON",
+        jsonText,
+        error instanceof Error ? error.message : String(error),
+      ),
+    );
+  }
+}
+
+async function reportRuntimeHookError(
+  errorOutput: NodeJS.WritableStream,
+  result: Result<RuntimeExtensionAck, RuntimeExtensionError>,
+): Promise<void> {
+  if (!isErr(result)) {
+    return;
+  }
+
+  const cause = result.error.cause === undefined ? "" : ` (${result.error.cause})`;
+  await writeText(errorOutput, `${result.error.message}${cause}\n`);
 }
 
 function createWorkerStdoutGuard(
@@ -682,7 +879,7 @@ function createWorkerStdoutGuard(
 ): WorkerStdoutGuard {
   if (!enabled) {
     return {
-      writeProtocolText: (text: string) => writeText(output, text),
+      writeProtocolBytes: (payload: Uint8Array) => writeBytes(output, payload),
       restore: () => {},
     };
   }
@@ -725,10 +922,10 @@ function createWorkerStdoutGuard(
   globalThis.console.dir = blockedConsoleDir;
 
   return {
-    writeProtocolText: async (text: string) => {
+    writeProtocolBytes: async (payload: Uint8Array) => {
       protocolWriteDepth += 1;
       try {
-        await writeText(output, text);
+        await writeBytes(output, payload);
       } finally {
         protocolWriteDepth -= 1;
       }
@@ -759,57 +956,139 @@ export async function runRuntimeExtensionWorkerStdio(
     output,
     options.guardProcessStdout ?? output === process.stdout,
   );
-  const lineReader = createInterface({
-    input,
-    crlfDelay: Infinity,
-  });
+  const frameReader = new RuntimeExtensionFrameReader(input);
 
-  try {
-    for await (const line of lineReader) {
-      const trimmed = line.trim();
-      if (trimmed === "") {
-        continue;
-      }
+  const writeResponse = async (response: RuntimeExtensionWorkerResponse): Promise<void> => {
+    await stdoutGuard.writeProtocolBytes(
+      encodeRuntimeExtensionWorkerJsonFrame(
+        response.tag,
+        serializeRuntimeExtensionWorkerResponseWire(response),
+      ),
+    );
+  };
 
-      let parsedJson: unknown;
-      try {
-        parsedJson = JSON.parse(trimmed);
-      } catch (error) {
-        const cause = error instanceof Error ? error.message : String(error);
-        return err(
-          runtimeExtensionProtocolError(
-            "message",
-            "worker stdin line must be valid JSON",
-            trimmed,
-            cause,
-          ),
-        );
-      }
+  const processPacketEvents = async (
+    events: readonly RuntimePacketEvent[],
+    index = 0,
+  ): Promise<void> => {
+    const event = events[index];
+    if (event === undefined) {
+      return;
+    }
 
-      const message = tryParseRuntimeExtensionWorkerHostMessageWire(parsedJson);
-      if (isErr(message)) {
-        await writeText(errorOutput, `${message.error.message}\n`);
-        return message;
-      }
+    await reportRuntimeHookError(errorOutput, await runtime.value.handlePacketEvent(event));
+    await processPacketEvents(events, index + 1);
+  };
 
-      const response = await runtime.value.handleMessage(message.value);
-      await stdoutGuard.writeProtocolText(
-        `${JSON.stringify(serializeRuntimeExtensionWorkerResponseWire(response))}\n`,
+  const processProviderEvents = async (
+    events: readonly RuntimeProviderEvent[],
+    index = 0,
+  ): Promise<void> => {
+    const event = events[index];
+    if (event === undefined) {
+      return;
+    }
+
+    await reportRuntimeHookError(errorOutput, await runtime.value.handleProviderEvent(event));
+    await processProviderEvents(events, index + 1);
+  };
+
+  const processNextFrame = async (): Promise<
+    Result<RuntimeExtensionAck, RuntimeExtensionError>
+  > => {
+    const frame = await frameReader.nextFrame();
+    if (isErr(frame)) {
+      return frame;
+    }
+    if (frame.value === undefined) {
+      return err(
+        runtimeExtensionProtocolError(
+          "message",
+          "worker stdin closed before a shutdown frame was received",
+        ),
       );
+    }
 
-      if (message.value.tag === RuntimeExtensionWorkerHostMessageTag.Shutdown) {
+    const payload = parseJsonPayload(frame.value.payload);
+    if (isErr(payload)) {
+      return payload;
+    }
+
+    const frameTag = parseRuntimeExtensionWorkerHostMessageTag(frame.value.tag);
+    if (isErr(frameTag)) {
+      return frameTag;
+    }
+
+    switch (frameTag.value) {
+      case RuntimeExtensionWorkerHostMessageTag.GetManifest: {
+        const response = await runtime.value.handleMessage({
+          tag: RuntimeExtensionWorkerHostMessageTag.GetManifest,
+        });
+        await writeResponse(response);
+        return processNextFrame();
+      }
+      case RuntimeExtensionWorkerHostMessageTag.Start: {
+        const payloadRecord = parseJsonRecord(payload.value, "message");
+        if (isErr(payloadRecord)) {
+          return payloadRecord;
+        }
+        const message = tryParseRuntimeExtensionWorkerHostMessageWire({
+          tag: RuntimeExtensionWorkerHostMessageTag.Start,
+          context: payloadRecord.value.context,
+        });
+        if (isErr(message)) {
+          return message;
+        }
+        const response = await runtime.value.handleMessage(message.value);
+        await writeResponse(response);
+        return processNextFrame();
+      }
+      case RuntimeExtensionWorkerHostMessageTag.DeliverPacket: {
+        const events = parseRuntimePacketEventBatchWire(payload.value);
+        if (isErr(events)) {
+          return events;
+        }
+        await processPacketEvents(events.value);
+        return processNextFrame();
+      }
+      case RuntimeExtensionWorkerHostMessageTag.DeliverProviderEvent: {
+        const events = parseRuntimeProviderEventBatchWire(payload.value);
+        if (isErr(events)) {
+          return events;
+        }
+        await processProviderEvents(events.value);
+        return processNextFrame();
+      }
+      case RuntimeExtensionWorkerHostMessageTag.Shutdown: {
+        const payloadRecord = parseJsonRecord(payload.value, "message");
+        if (isErr(payloadRecord)) {
+          return payloadRecord;
+        }
+        const message = tryParseRuntimeExtensionWorkerHostMessageWire({
+          tag: RuntimeExtensionWorkerHostMessageTag.Shutdown,
+          context: payloadRecord.value.context,
+        });
+        if (isErr(message)) {
+          return message;
+        }
+        const response = await runtime.value.handleMessage(message.value);
+        await writeResponse(response);
         return ok(runtimeExtensionAck());
       }
     }
+
+    return err(
+      runtimeExtensionProtocolError(
+        "message.tag",
+        "message.tag must be a supported runtime extension worker message tag",
+        JSON.stringify(frameTag.value),
+      ),
+    );
+  };
+
+  try {
+    return await processNextFrame();
   } finally {
-    lineReader.close();
     stdoutGuard.restore();
   }
-
-  return err(
-    runtimeExtensionProtocolError(
-      "message",
-      "worker stdin closed before a shutdown message was received",
-    ),
-  );
 }

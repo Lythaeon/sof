@@ -14,7 +14,6 @@ use std::time::Duration;
 use std::{collections::HashMap, env, fs, net::SocketAddr, path::PathBuf};
 
 use async_trait::async_trait;
-#[cfg(feature = "provider-grpc")]
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -67,9 +66,9 @@ use tokio::task::JoinHandle;
 #[cfg(all(target_os = "linux", feature = "kernel-bypass"))]
 use tokio::task::spawn_blocking;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
+    io::{AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
-    sync::Mutex,
+    sync::{Mutex, mpsc, oneshot},
 };
 
 /// Wire tag for websocket ingress handoff.
@@ -123,17 +122,26 @@ const PROVIDER_STREAM_QUEUE_CAPACITY: usize = 4096;
 const RESPONSE_TAG_MANIFEST: u8 = 1;
 /// Worker response tag for startup acknowledgement.
 const RESPONSE_TAG_STARTED: u8 = 2;
-/// Worker response tag for packet delivery acknowledgement.
-const RESPONSE_TAG_EVENT_HANDLED: u8 = 3;
 /// Worker response tag for shutdown acknowledgement.
 const RESPONSE_TAG_SHUTDOWN_COMPLETE: u8 = 4;
-#[cfg(feature = "provider-grpc")]
-/// Worker response tag for provider-event acknowledgement.
-const RESPONSE_TAG_PROVIDER_EVENT_HANDLED: u8 = 5;
 /// Successful worker result tag.
 const RESULT_TAG_OK: u8 = 1;
 /// Error worker result tag.
 const RESULT_TAG_ERR: u8 = 2;
+/// Framed worker protocol payload size prefix width in bytes.
+const WORKER_FRAME_HEADER_LEN: usize = 5;
+/// Maximum number of events coalesced into one batch frame.
+const WORKER_BATCH_MAX_EVENTS: usize = 64;
+/// Frame tag for manifest request.
+const WORKER_FRAME_GET_MANIFEST: u8 = 1;
+/// Frame tag for startup request.
+const WORKER_FRAME_START: u8 = 2;
+/// Frame tag for packet batch delivery.
+const WORKER_FRAME_PACKET_BATCH: u8 = 3;
+/// Frame tag for shutdown request.
+const WORKER_FRAME_SHUTDOWN: u8 = 4;
+/// Frame tag for provider-event batch delivery.
+const WORKER_FRAME_PROVIDER_BATCH: u8 = 5;
 
 /// Errors returned by the native TypeScript runtime host.
 #[derive(Debug, thiserror::Error)]
@@ -419,8 +427,16 @@ struct TypeScriptWorkerBridge {
     name: &'static str,
     /// Worker launch configuration.
     config: PluginWorkerConfig,
-    /// Live worker process handle.
-    process: Mutex<Option<TypeScriptWorkerProcess>>,
+    /// Live worker command bridge.
+    process: Mutex<Option<TypeScriptWorkerHandle>>,
+}
+
+/// Shared worker command sender and background task.
+struct TypeScriptWorkerHandle {
+    /// Command sender used by packet and provider callbacks.
+    commands: mpsc::UnboundedSender<TypeScriptWorkerCommand>,
+    /// Background task driving framed worker I/O.
+    task: tokio::task::JoinHandle<()>,
 }
 
 /// Spawned stdio worker process state.
@@ -429,8 +445,22 @@ struct TypeScriptWorkerProcess {
     child: Child,
     /// Worker stdin used for protocol messages.
     stdin: ChildStdin,
-    /// Newline-delimited worker stdout reader.
-    stdout: Lines<BufReader<ChildStdout>>,
+    /// Framed worker stdout reader.
+    stdout: BufReader<ChildStdout>,
+}
+
+/// Command sent into the background worker bridge task.
+enum TypeScriptWorkerCommand {
+    /// Deliver one packet event.
+    Packet(RuntimePacketEvent),
+    #[cfg(feature = "provider-grpc")]
+    /// Deliver one provider event.
+    ProviderEvent(Value),
+    /// Request worker shutdown and wait for process exit.
+    Shutdown {
+        /// Completion notifier for shutdown callers.
+        completed: oneshot::Sender<()>,
+    },
 }
 
 /// Lifecycle context passed into the TypeScript worker protocol.
@@ -1629,14 +1659,20 @@ impl TypeScriptWorkerBridge {
             return Ok(());
         }
 
-        *guard = Some(start_worker_process(self.name, &self.config).await?);
+        let process = start_worker_process(self.name, &self.config).await?;
+        let (commands, receiver) = mpsc::unbounded_channel();
+        let extension_name = self.name;
+        let task = tokio::spawn(async move {
+            run_worker_process_loop(extension_name, process, receiver).await;
+        });
+        *guard = Some(TypeScriptWorkerHandle { commands, task });
         Ok(())
     }
 
     /// Delivers one packet event into the bound TypeScript worker.
     async fn deliver_packet(&self, event: RuntimePacketEvent) {
         let mut guard = self.process.lock().await;
-        let Some(process) = guard.as_mut() else {
+        let Some(handle) = guard.as_mut() else {
             tracing::warn!(
                 extension = self.name,
                 "worker process is not available for packet"
@@ -1644,27 +1680,13 @@ impl TypeScriptWorkerBridge {
             return;
         };
 
-        if let Err(error) = send_worker_message(
-            process,
-            json!({
-                "tag": 3,
-                "event": runtime_packet_event_wire(&event),
-            }),
-        )
-        .await
-        {
-            tracing::warn!(extension = self.name, error = %error, "failed to deliver packet to worker");
-        } else {
-            match read_worker_response(process, RESPONSE_TAG_EVENT_HANDLED).await {
-                Ok(response) => {
-                    if let Err(error) = response_result_ok(self.name, &response) {
-                        tracing::warn!(extension = self.name, error = %error, "worker rejected packet");
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(extension = self.name, error = %error, "worker did not acknowledge packet");
-                }
-            }
+        if let Err(error) = handle.commands.send(TypeScriptWorkerCommand::Packet(event)) {
+            tracing::warn!(
+                extension = self.name,
+                error = %error,
+                "failed to enqueue packet for worker"
+            );
+            *guard = None;
         }
     }
 
@@ -1672,7 +1694,7 @@ impl TypeScriptWorkerBridge {
     #[cfg(feature = "provider-grpc")]
     async fn deliver_provider_event(&self, event: Value) {
         let mut guard = self.process.lock().await;
-        let Some(process) = guard.as_mut() else {
+        let Some(handle) = guard.as_mut() else {
             tracing::warn!(
                 plugin = self.name,
                 "worker process is not available for provider event"
@@ -1680,60 +1702,135 @@ impl TypeScriptWorkerBridge {
             return;
         };
 
-        if let Err(error) = send_worker_message(
-            process,
-            json!({
-                "tag": 5,
-                "event": event,
-            }),
-        )
-        .await
+        if let Err(error) = handle
+            .commands
+            .send(TypeScriptWorkerCommand::ProviderEvent(event))
         {
-            tracing::warn!(plugin = self.name, error = %error, "failed to deliver provider event to worker");
-        } else {
-            match read_worker_response(process, RESPONSE_TAG_PROVIDER_EVENT_HANDLED).await {
-                Ok(response) => {
-                    if let Err(error) = response_result_ok(self.name, &response) {
-                        tracing::warn!(plugin = self.name, error = %error, "worker rejected provider event");
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(plugin = self.name, error = %error, "worker did not acknowledge provider event");
-                }
-            }
+            tracing::warn!(
+                plugin = self.name,
+                error = %error,
+                "failed to enqueue provider event for worker"
+            );
+            *guard = None;
         }
     }
 
     /// Requests shutdown for the worker process when it is still running.
     async fn shutdown(&self) {
         let mut guard = self.process.lock().await;
-        let Some(process) = guard.as_mut() else {
+        let Some(handle) = guard.take() else {
             return;
         };
 
-        if let Err(error) = send_worker_message(
-            process,
-            json!({
-                "tag": 4,
-                "context": WorkerContext {
-                    extension_name: self.name,
-                },
-            }),
-        )
-        .await
-        {
-            tracing::warn!(extension = self.name, error = %error, "failed to request worker shutdown");
-        } else if let Err(error) = read_worker_response(process, RESPONSE_TAG_SHUTDOWN_COMPLETE)
-            .await
-            .and_then(|response| response_result_ok(self.name, &response))
-        {
-            tracing::warn!(extension = self.name, error = %error, "worker shutdown was not acknowledged");
+        let (completed_tx, completed_rx) = oneshot::channel();
+        if let Err(error) = handle.commands.send(TypeScriptWorkerCommand::Shutdown {
+            completed: completed_tx,
+        }) {
+            tracing::warn!(
+                extension = self.name,
+                error = %error,
+                "failed to request worker shutdown"
+            );
+        } else if let Err(error) = completed_rx.await {
+            tracing::warn!(
+                extension = self.name,
+                error = %error,
+                "worker shutdown task did not complete cleanly"
+            );
         }
 
-        if let Err(error) = process.child.wait().await {
+        if let Err(error) = handle.task.await {
             tracing::warn!(extension = self.name, error = %error, "failed to wait for worker process");
         }
-        *guard = None;
+    }
+}
+
+/// Owns the child process after startup and batches normal event delivery.
+async fn run_worker_process_loop(
+    extension_name: &'static str,
+    mut process: TypeScriptWorkerProcess,
+    mut receiver: mpsc::UnboundedReceiver<TypeScriptWorkerCommand>,
+) {
+    let mut pending = None;
+
+    loop {
+        let command = match pending.take() {
+            Some(command) => command,
+            None => match receiver.recv().await {
+                Some(command) => command,
+                None => break,
+            },
+        };
+
+        match command {
+            TypeScriptWorkerCommand::Packet(first_event) => {
+                let mut events = vec![first_event];
+                while events.len() < WORKER_BATCH_MAX_EVENTS {
+                    match receiver.try_recv() {
+                        Ok(TypeScriptWorkerCommand::Packet(event)) => events.push(event),
+                        Ok(other) => {
+                            pending = Some(other);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if let Err(error) = send_packet_batch(&mut process, &events).await {
+                    tracing::warn!(extension = extension_name, error = %error, "failed to deliver packet batch to worker");
+                    break;
+                }
+            }
+            #[cfg(feature = "provider-grpc")]
+            TypeScriptWorkerCommand::ProviderEvent(first_event) => {
+                let mut events = vec![first_event];
+                while events.len() < WORKER_BATCH_MAX_EVENTS {
+                    match receiver.try_recv() {
+                        Ok(TypeScriptWorkerCommand::ProviderEvent(event)) => events.push(event),
+                        Ok(other) => {
+                            pending = Some(other);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if let Err(error) = send_provider_event_batch(&mut process, &events).await {
+                    tracing::warn!(plugin = extension_name, error = %error, "failed to deliver provider batch to worker");
+                    break;
+                }
+            }
+            TypeScriptWorkerCommand::Shutdown { completed } => {
+                if let Err(error) = send_worker_json_frame(
+                    &mut process,
+                    WORKER_FRAME_SHUTDOWN,
+                    &json!({
+                        "context": WorkerContext {
+                            extension_name,
+                        },
+                    }),
+                )
+                .await
+                {
+                    tracing::warn!(extension = extension_name, error = %error, "failed to request worker shutdown");
+                } else if let Err(error) =
+                    read_worker_response(&mut process, RESPONSE_TAG_SHUTDOWN_COMPLETE)
+                        .await
+                        .and_then(|response| response_result_ok(extension_name, &response))
+                {
+                    tracing::warn!(extension = extension_name, error = %error, "worker shutdown was not acknowledged");
+                }
+
+                if let Err(error) = process.child.wait().await {
+                    tracing::warn!(extension = extension_name, error = %error, "failed to wait for worker process");
+                }
+                if completed.send(()).is_err() {
+                    tracing::debug!(
+                        extension = extension_name,
+                        "worker shutdown completion receiver was dropped"
+                    );
+                }
+                break;
+            }
+        }
     }
 }
 
@@ -1743,14 +1840,14 @@ async fn start_worker_process(
     config: &PluginWorkerConfig,
 ) -> Result<TypeScriptWorkerProcess, String> {
     let mut process = spawn_worker(extension_name, config).await?;
-    send_worker_message(&mut process, json!({ "tag": 1 })).await?;
+    send_worker_json_frame(&mut process, WORKER_FRAME_GET_MANIFEST, &json!({})).await?;
     let manifest_response = read_worker_response(&mut process, RESPONSE_TAG_MANIFEST).await?;
     response_result_ok(extension_name, &manifest_response)?;
 
-    send_worker_message(
+    send_worker_json_frame(
         &mut process,
-        json!({
-            "tag": 2,
+        WORKER_FRAME_START,
+        &json!({
             "context": WorkerContext {
                 extension_name,
             },
@@ -1797,21 +1894,48 @@ async fn spawn_worker(
     Ok(TypeScriptWorkerProcess {
         child,
         stdin,
-        stdout: BufReader::new(stdout).lines(),
+        stdout: BufReader::new(stdout),
     })
 }
 
-/// Serializes and writes one protocol message to the worker stdin.
-async fn send_worker_message(
+/// Serializes and writes one framed JSON message to the worker stdin.
+async fn send_worker_json_frame(
     process: &mut TypeScriptWorkerProcess,
-    message: Value,
+    tag: u8,
+    message: &Value,
 ) -> Result<(), String> {
-    let mut line = serde_json::to_vec(&message)
+    let payload = serde_json::to_vec(message)
         .map_err(|error| format!("failed to encode worker message: {error}"))?;
-    line.push(b'\n');
+    send_worker_frame(process, tag, &payload).await
+}
+
+/// Writes one framed message to the worker stdin.
+async fn send_worker_frame(
+    process: &mut TypeScriptWorkerProcess,
+    tag: u8,
+    payload: &[u8],
+) -> Result<(), String> {
+    let payload_len = u32::try_from(payload.len()).map_err(|_error| {
+        format!(
+            "worker frame payload exceeded u32 length: {}",
+            payload.len()
+        )
+    })?;
+    let frame_capacity = WORKER_FRAME_HEADER_LEN
+        .checked_add(payload.len())
+        .ok_or_else(|| {
+            format!(
+                "worker frame payload exceeded usize length: {}",
+                payload.len()
+            )
+        })?;
+    let mut frame = Vec::with_capacity(frame_capacity);
+    frame.push(tag);
+    frame.extend_from_slice(&payload_len.to_le_bytes());
+    frame.extend_from_slice(payload);
     process
         .stdin
-        .write_all(&line)
+        .write_all(&frame)
         .await
         .map_err(|error| format!("failed to write worker message: {error}"))?;
     process
@@ -1821,30 +1945,60 @@ async fn send_worker_message(
         .map_err(|error| format!("failed to flush worker message: {error}"))
 }
 
-/// Reads one worker response line and validates its protocol tag.
+/// Reads one framed worker response and validates its protocol tag.
 async fn read_worker_response(
     process: &mut TypeScriptWorkerProcess,
     expected_tag: u8,
 ) -> Result<Value, String> {
-    let line = process
-        .stdout
-        .next_line()
-        .await
-        .map_err(|error| format!("failed to read worker response: {error}"))?
-        .ok_or_else(|| "worker stdout closed before response".to_owned())?;
-    let response: Value = serde_json::from_str(&line)
-        .map_err(|error| format!("worker response was invalid JSON: {error}; line={line}"))?;
-    let received_tag = response
-        .get("tag")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| "worker response did not contain numeric tag".to_owned())?;
-    if received_tag != u64::from(expected_tag) {
+    let (received_tag, payload) = read_worker_frame(process).await?;
+    if received_tag != expected_tag {
         return Err(format!(
             "worker response tag {received_tag} did not match expected tag {expected_tag}",
         ));
     }
+    serde_json::from_slice(&payload)
+        .map_err(|error| format!("worker response was invalid JSON: {error}"))
+}
 
-    Ok(response)
+/// Reads one framed worker response from stdout.
+async fn read_worker_frame(process: &mut TypeScriptWorkerProcess) -> Result<(u8, Vec<u8>), String> {
+    let mut header = [0_u8; WORKER_FRAME_HEADER_LEN];
+    process
+        .stdout
+        .read_exact(&mut header)
+        .await
+        .map_err(|error| format!("failed to read worker response header: {error}"))?;
+    let payload_len = u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    let mut payload = vec![0_u8; payload_len];
+    process
+        .stdout
+        .read_exact(&mut payload)
+        .await
+        .map_err(|error| format!("failed to read worker response payload: {error}"))?;
+    Ok((header[0], payload))
+}
+
+/// Sends one packet batch frame without waiting for an acknowledgement.
+async fn send_packet_batch(
+    process: &mut TypeScriptWorkerProcess,
+    events: &[RuntimePacketEvent],
+) -> Result<(), String> {
+    let payload = json!({
+        "events": events.iter().map(runtime_packet_event_wire).collect::<Vec<_>>(),
+    });
+    send_worker_json_frame(process, WORKER_FRAME_PACKET_BATCH, &payload).await
+}
+
+/// Sends one provider-event batch frame without waiting for an acknowledgement.
+#[cfg(feature = "provider-grpc")]
+async fn send_provider_event_batch(
+    process: &mut TypeScriptWorkerProcess,
+    events: &[Value],
+) -> Result<(), String> {
+    let payload = json!({
+        "events": events,
+    });
+    send_worker_json_frame(process, WORKER_FRAME_PROVIDER_BATCH, &payload).await
 }
 
 /// Checks whether one worker response contains an OK result tag.
@@ -2068,7 +2222,7 @@ fn runtime_packet_event_wire(event: &RuntimePacketEvent) -> Value {
             "localAddress": event.source.local_addr.map(|addr| addr.to_string()),
             "remoteAddress": event.source.remote_addr.map(|addr| addr.to_string()),
         },
-        "bytes": event.bytes.as_ref(),
+        "bytesBase64": BASE64_STANDARD.encode(event.bytes.as_ref()),
         "observedUnixMs": event.observed_unix_ms,
     })
 }

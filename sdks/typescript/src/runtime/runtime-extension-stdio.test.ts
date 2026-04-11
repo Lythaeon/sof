@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 import test from "node:test";
@@ -21,6 +22,35 @@ import {
   tryParseRuntimeExtensionWorkerHostMessageWire,
   tryParseRuntimePacketEventWire,
 } from "./runtime-extension-stdio.js";
+
+const workerFrameHeaderBytes = 5;
+
+function encodeJsonFrame(tag: number, payload: unknown): Buffer {
+  const payloadBytes = Buffer.from(JSON.stringify(payload), "utf8");
+  const frame = Buffer.alloc(workerFrameHeaderBytes + payloadBytes.length);
+  frame[0] = tag;
+  frame.writeUInt32LE(payloadBytes.length, 1);
+  payloadBytes.copy(frame, workerFrameHeaderBytes);
+  return frame;
+}
+
+function decodeFrames(buffer: Buffer): Array<{ tag: number; payload: unknown }> {
+  const frames: Array<{ tag: number; payload: unknown }> = [];
+  let offset = 0;
+
+  while (offset < buffer.length) {
+    const tag = buffer[offset] ?? 0;
+    const payloadLength = buffer.readUInt32LE(offset + 1);
+    const frameEnd = offset + workerFrameHeaderBytes + payloadLength;
+    const payload = JSON.parse(
+      buffer.subarray(offset + workerFrameHeaderBytes, frameEnd).toString("utf8"),
+    ) as unknown;
+    frames.push({ tag, payload });
+    offset = frameEnd;
+  }
+
+  return frames;
+}
 
 test("runtime extension wire helpers round-trip packet delivery messages", () => {
   const parsedExtensionName = extensionName("wire-demo");
@@ -97,18 +127,17 @@ test("runtime extension wire helpers round-trip provider events", () => {
   assert.equal(parsedWireMessage.value.event.slot, 1);
 });
 
-test("runtime extension stdio worker processes newline-delimited protocol messages", async () => {
+test("runtime extension stdio worker processes framed batch protocol messages", async () => {
   const input = new PassThrough();
   const output = new PassThrough();
   const errorOutput = new PassThrough();
-  let outputText = "";
+  const outputChunks: Buffer[] = [];
   let errorText = "";
 
-  output.setEncoding("utf8");
-  errorOutput.setEncoding("utf8");
-  output.on("data", (chunk: string) => {
-    outputText += chunk;
+  output.on("data", (chunk: Buffer | string) => {
+    outputChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   });
+  errorOutput.setEncoding("utf8");
   errorOutput.on("data", (chunk: string) => {
     errorText += chunk;
   });
@@ -141,58 +170,48 @@ test("runtime extension stdio worker processes newline-delimited protocol messag
     error: errorOutput,
   });
 
+  input.write(encodeJsonFrame(RuntimeExtensionWorkerHostMessageTag.GetManifest, {}));
   input.write(
-    `${JSON.stringify(
-      serializeRuntimeExtensionWorkerHostMessageWire({
-        tag: RuntimeExtensionWorkerHostMessageTag.GetManifest,
-      }),
-    )}\n`,
-  );
-  input.write(
-    `${JSON.stringify(
-      serializeRuntimeExtensionWorkerHostMessageWire({
-        tag: RuntimeExtensionWorkerHostMessageTag.Start,
-        context: {
-          extensionName: manifest.value.extensionName,
-        },
-      }),
-    )}\n`,
-  );
-  input.write(
-    `${JSON.stringify({
-      tag: RuntimeExtensionWorkerHostMessageTag.DeliverPacket,
-      event: {
-        source: {
-          kind: 1,
-          transport: 1,
-          eventClass: 1,
-        },
-        bytes: [1, 2, 3, 4],
-        observedUnixMs: 100,
+    encodeJsonFrame(RuntimeExtensionWorkerHostMessageTag.Start, {
+      context: {
+        extensionName: manifest.value.extensionName,
       },
-    })}\n`,
+    }),
   );
   input.write(
-    `${JSON.stringify({
-      tag: RuntimeExtensionWorkerHostMessageTag.DeliverProviderEvent,
-      event: {
-        kind: RuntimeProviderEventKind.TransactionStatus,
-        slot: 100,
-        commitmentStatus: 1,
-        signature: "sig",
-        isVote: false,
-      },
-    })}\n`,
+    encodeJsonFrame(RuntimeExtensionWorkerHostMessageTag.DeliverPacket, {
+      events: [
+        serializeRuntimePacketEventWire({
+          source: {
+            kind: 1,
+            transport: 1,
+            eventClass: 1,
+          },
+          bytes: Uint8Array.from([1, 2, 3, 4]),
+          observedUnixMs: 100,
+        }),
+      ],
+    }),
   );
   input.write(
-    `${JSON.stringify(
-      serializeRuntimeExtensionWorkerHostMessageWire({
-        tag: RuntimeExtensionWorkerHostMessageTag.Shutdown,
-        context: {
-          extensionName: manifest.value.extensionName,
+    encodeJsonFrame(RuntimeExtensionWorkerHostMessageTag.DeliverProviderEvent, {
+      events: [
+        {
+          kind: RuntimeProviderEventKind.TransactionStatus,
+          slot: 100,
+          commitmentStatus: 1,
+          signature: "sig",
+          isVote: false,
         },
-      }),
-    )}\n`,
+      ],
+    }),
+  );
+  input.write(
+    encodeJsonFrame(RuntimeExtensionWorkerHostMessageTag.Shutdown, {
+      context: {
+        extensionName: manifest.value.extensionName,
+      },
+    }),
   );
   input.end();
 
@@ -200,30 +219,17 @@ test("runtime extension stdio worker processes newline-delimited protocol messag
   assert.equal(runnerResult.tag, ResultTag.Ok);
   assert.equal(errorText, "");
 
-  const responses = outputText
-    .trim()
-    .split("\n")
-    .filter((line) => line !== "")
-    .map((line) => JSON.parse(line) as { tag: number });
-
-  assert.equal(responses.length, 5);
+  const responses = decodeFrames(Buffer.concat(outputChunks));
+  assert.equal(responses.length, 3);
   assert.equal(responses[0]?.tag, RuntimeExtensionWorkerResponseTag.Manifest);
   assert.equal(responses[1]?.tag, RuntimeExtensionWorkerResponseTag.Started);
-  assert.equal(responses[2]?.tag, RuntimeExtensionWorkerResponseTag.EventHandled);
-  assert.equal(responses[3]?.tag, RuntimeExtensionWorkerResponseTag.ProviderEventHandled);
-  assert.equal(responses[4]?.tag, RuntimeExtensionWorkerResponseTag.ShutdownComplete);
+  assert.equal(responses[2]?.tag, RuntimeExtensionWorkerResponseTag.ShutdownComplete);
 });
 
-test("runtime extension stdio worker rejects malformed protocol messages", async () => {
+test("runtime extension stdio worker rejects malformed framed protocol messages", async () => {
   const input = new PassThrough();
   const output = new PassThrough();
   const errorOutput = new PassThrough();
-  let errorText = "";
-
-  errorOutput.setEncoding("utf8");
-  errorOutput.on("data", (chunk: string) => {
-    errorText += chunk;
-  });
 
   const manifest = tryCreateRuntimeExtensionWorkerManifest({
     sdkVersion: "0.1.0",
@@ -252,23 +258,40 @@ test("runtime extension stdio worker rejects malformed protocol messages", async
     error: errorOutput,
   });
 
-  input.write('{"tag":3,"event":{"source":{"kind":99},"bytes":[1],"observedUnixMs":1}}\n');
+  input.write(
+    encodeJsonFrame(RuntimeExtensionWorkerHostMessageTag.DeliverPacket, {
+      events: [
+        {
+          source: { kind: 99 },
+          bytesBase64: Buffer.from([1]).toString("base64"),
+          observedUnixMs: 1,
+        },
+      ],
+    }),
+  );
   input.end();
 
   const runnerResult = await runner;
   assert.equal(isErr(runnerResult), true);
-  assert.match(errorText, /event\.source\.kind/);
+  if (!isErr(runnerResult)) {
+    return;
+  }
+  assert.match(runnerResult.error.field, /event\.source\.kind/);
 });
 
 test("runtime extension stdio worker hard-blocks stdout writes inside callbacks", async () => {
   const input = new PassThrough();
   const output = new PassThrough();
   const errorOutput = new PassThrough();
-  let outputText = "";
+  const outputChunks: Buffer[] = [];
+  let errorText = "";
 
-  output.setEncoding("utf8");
-  output.on("data", (chunk: string) => {
-    outputText += chunk;
+  output.on("data", (chunk: Buffer | string) => {
+    outputChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  });
+  errorOutput.setEncoding("utf8");
+  errorOutput.on("data", (chunk: string) => {
+    errorText += chunk;
   });
 
   const manifest = tryCreateRuntimeExtensionWorkerManifest({
@@ -302,53 +325,43 @@ test("runtime extension stdio worker hard-blocks stdout writes inside callbacks"
   });
 
   input.write(
-    `${JSON.stringify({
-      tag: RuntimeExtensionWorkerHostMessageTag.DeliverPacket,
-      event: {
-        source: {
-          kind: 1,
-          transport: 1,
-          eventClass: 1,
-        },
-        bytes: [1, 2, 3, 4],
-        observedUnixMs: 100,
-      },
-    })}\n`,
+    encodeJsonFrame(RuntimeExtensionWorkerHostMessageTag.DeliverPacket, {
+      events: [
+        serializeRuntimePacketEventWire({
+          source: {
+            kind: 1,
+            transport: 1,
+            eventClass: 1,
+          },
+          bytes: Uint8Array.from([1, 2, 3, 4]),
+          observedUnixMs: 100,
+        }),
+      ],
+    }),
   );
   input.write(
-    `${JSON.stringify(
-      serializeRuntimeExtensionWorkerHostMessageWire({
-        tag: RuntimeExtensionWorkerHostMessageTag.Shutdown,
-        context: {
-          extensionName: manifest.value.extensionName,
-        },
-      }),
-    )}\n`,
+    encodeJsonFrame(RuntimeExtensionWorkerHostMessageTag.Shutdown, {
+      context: {
+        extensionName: manifest.value.extensionName,
+      },
+    }),
   );
   input.end();
 
   const runnerResult = await runner;
   assert.equal(runnerResult.tag, ResultTag.Ok);
+  assert.match(errorText, /stdout is reserved for protocol messages/i);
 
-  const responses = outputText
-    .trim()
-    .split("\n")
-    .filter((line) => line !== "")
-    .map(
-      (line) =>
-        JSON.parse(line) as {
-          tag: number;
-          result?: { tag: number; error?: { message?: string; cause?: string } };
-        },
-    );
-
-  assert.equal(responses.length, 2);
-  assert.equal(responses[0]?.tag, RuntimeExtensionWorkerResponseTag.EventHandled);
-  assert.equal(responses[0]?.result?.tag, ResultTag.Err);
-  assert.match(
-    responses[0]?.result?.error?.cause ?? "",
-    /stdout is reserved for protocol messages/i,
+  const responses = decodeFrames(Buffer.concat(outputChunks));
+  assert.equal(responses.length, 1);
+  const shutdownResponse = responses[0];
+  assert.notEqual(shutdownResponse, undefined);
+  if (shutdownResponse === undefined) {
+    return;
+  }
+  assert.equal(shutdownResponse.tag, RuntimeExtensionWorkerResponseTag.ShutdownComplete);
+  assert.equal(
+    (shutdownResponse.payload as { result?: { tag?: number } }).result?.tag,
+    ResultTag.Ok,
   );
-  assert.equal(responses[1]?.tag, RuntimeExtensionWorkerResponseTag.ShutdownComplete);
-  assert.equal(responses[1]?.result?.tag, ResultTag.Ok);
 });

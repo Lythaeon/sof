@@ -819,6 +819,50 @@ export class RuntimeExtensionWorkerRuntime {
     this.definition = defineRuntimeExtension(definition);
   }
 
+  handleStart(
+    context: ExtensionContext,
+  ): Promise<Result<RuntimeExtensionAck, RuntimeExtensionError>> {
+    return this.definition.onReady === undefined
+      ? Promise.resolve(ok(runtimeExtensionAck()))
+      : settleExtensionHook(
+          "onReady",
+          () => this.definition.onReady?.(context) ?? ok(runtimeExtensionAck()),
+        );
+  }
+
+  handlePacketEvent(
+    event: RuntimePacketEvent,
+  ): Promise<Result<RuntimeExtensionAck, RuntimeExtensionError>> {
+    return this.definition.onPacketReceived === undefined
+      ? Promise.resolve(ok(runtimeExtensionAck()))
+      : settleExtensionHook(
+          "onPacketReceived",
+          () => this.definition.onPacketReceived?.(event) ?? ok(runtimeExtensionAck()),
+        );
+  }
+
+  handleProviderEvent(
+    event: RuntimeProviderEvent,
+  ): Promise<Result<RuntimeExtensionAck, RuntimeExtensionError>> {
+    return this.definition.onProviderEvent === undefined
+      ? Promise.resolve(ok(runtimeExtensionAck()))
+      : settleExtensionHook(
+          "onProviderEvent",
+          () => this.definition.onProviderEvent?.(event) ?? ok(runtimeExtensionAck()),
+        );
+  }
+
+  handleShutdown(
+    context: ExtensionContext,
+  ): Promise<Result<RuntimeExtensionAck, RuntimeExtensionError>> {
+    return this.definition.onShutdown === undefined
+      ? Promise.resolve(ok(runtimeExtensionAck()))
+      : settleExtensionHook(
+          "onShutdown",
+          () => this.definition.onShutdown?.(context) ?? ok(runtimeExtensionAck()),
+        );
+  }
+
   async handleMessage(
     message: RuntimeExtensionWorkerHostMessage,
   ): Promise<RuntimeExtensionWorkerResponse> {
@@ -831,48 +875,22 @@ export class RuntimeExtensionWorkerRuntime {
       case RuntimeExtensionWorkerHostMessageTag.Start:
         return {
           tag: RuntimeExtensionWorkerResponseTag.Started,
-          result:
-            this.definition.onReady === undefined
-              ? ok(runtimeExtensionAck())
-              : await settleExtensionHook(
-                  "onReady",
-                  () => this.definition.onReady?.(message.context) ?? ok(runtimeExtensionAck()),
-                ),
+          result: await this.handleStart(message.context),
         };
       case RuntimeExtensionWorkerHostMessageTag.DeliverPacket:
         return {
           tag: RuntimeExtensionWorkerResponseTag.EventHandled,
-          result:
-            this.definition.onPacketReceived === undefined
-              ? ok(runtimeExtensionAck())
-              : await settleExtensionHook(
-                  "onPacketReceived",
-                  () =>
-                    this.definition.onPacketReceived?.(message.event) ?? ok(runtimeExtensionAck()),
-                ),
+          result: await this.handlePacketEvent(message.event),
         };
       case RuntimeExtensionWorkerHostMessageTag.DeliverProviderEvent:
         return {
           tag: RuntimeExtensionWorkerResponseTag.ProviderEventHandled,
-          result:
-            this.definition.onProviderEvent === undefined
-              ? ok(runtimeExtensionAck())
-              : await settleExtensionHook(
-                  "onProviderEvent",
-                  () =>
-                    this.definition.onProviderEvent?.(message.event) ?? ok(runtimeExtensionAck()),
-                ),
+          result: await this.handleProviderEvent(message.event),
         };
       case RuntimeExtensionWorkerHostMessageTag.Shutdown:
         return {
           tag: RuntimeExtensionWorkerResponseTag.ShutdownComplete,
-          result:
-            this.definition.onShutdown === undefined
-              ? ok(runtimeExtensionAck())
-              : await settleExtensionHook(
-                  "onShutdown",
-                  () => this.definition.onShutdown?.(message.context) ?? ok(runtimeExtensionAck()),
-                ),
+          result: await this.handleShutdown(message.context),
         };
     }
 
