@@ -8,7 +8,7 @@ use std::{
     path::PathBuf,
     pin::Pin,
     sync::Arc,
-    thread,
+    thread::{self, available_parallelism},
     time::{Duration, Instant},
 };
 
@@ -232,7 +232,7 @@ impl RuntimeDeliveryProfile {
     /// Parses config/env string into one typed delivery profile.
     #[must_use]
     pub fn from_config_value(value: &str) -> Option<Self> {
-        match value {
+        match value.trim().to_ascii_lowercase().as_str() {
             "latency_optimized" | "latency-optimized" => Some(Self::LatencyOptimized),
             "balanced" => Some(Self::Balanced),
             "delivery_disciplined" | "delivery-disciplined" => Some(Self::DeliveryDisciplined),
@@ -333,7 +333,7 @@ impl RuntimeDeliveryProfile {
 }
 
 fn default_runtime_delivery_transaction_workers() -> usize {
-    thread::available_parallelism()
+    available_parallelism()
         .map(usize::from)
         .unwrap_or(1)
         .clamp(1, DEFAULT_RUNTIME_DELIVERY_TRANSACTION_DISPATCH_WORKERS_CAP)
@@ -3654,6 +3654,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::app::config::read_runtime_delivery_profile;
     use crate::event::TxKind;
     use crate::framework::{
         DerivedStateCheckpoint, DerivedStateConsumer, DerivedStateConsumerConfig,
@@ -4752,6 +4753,23 @@ mod tests {
     }
 
     #[test]
+    fn runtime_delivery_profile_parses_config_values_tolerantly() {
+        assert_eq!(
+            RuntimeDeliveryProfile::from_config_value("LATENCY-OPTIMIZED"),
+            Some(RuntimeDeliveryProfile::LatencyOptimized)
+        );
+        assert_eq!(
+            RuntimeDeliveryProfile::from_config_value(" balanced "),
+            Some(RuntimeDeliveryProfile::Balanced)
+        );
+        assert_eq!(
+            RuntimeDeliveryProfile::from_config_value("DELIVERY_DISCIPLINED"),
+            Some(RuntimeDeliveryProfile::DeliveryDisciplined)
+        );
+        assert_eq!(RuntimeDeliveryProfile::from_config_value("lossless"), None);
+    }
+
+    #[test]
     fn runtime_delivery_profile_reads_env_override() {
         with_runtime_env_overrides(
             [(
@@ -4760,7 +4778,7 @@ mod tests {
             )],
             || {
                 assert_eq!(
-                    crate::app::config::read_runtime_delivery_profile(),
+                    read_runtime_delivery_profile(),
                     RuntimeDeliveryProfile::DeliveryDisciplined
                 );
             },
@@ -4773,7 +4791,7 @@ mod tests {
             )],
             || {
                 assert_eq!(
-                    crate::app::config::read_runtime_delivery_profile(),
+                    read_runtime_delivery_profile(),
                     RuntimeDeliveryProfile::LatencyOptimized
                 );
             },
@@ -4798,11 +4816,52 @@ mod tests {
         assert!(disciplined.plugin_event_queue_capacity > balanced.plugin_event_queue_capacity);
         assert!(balanced.extension_shutdown_timeout > latency.extension_shutdown_timeout);
         assert!(disciplined.extension_shutdown_timeout > balanced.extension_shutdown_timeout);
+        assert!(latency.plugin_transaction_dispatch_workers >= 1);
+        assert!(
+            latency.plugin_transaction_dispatch_workers
+                <= DEFAULT_RUNTIME_DELIVERY_TRANSACTION_DISPATCH_WORKERS_CAP
+        );
+        assert!(balanced.plugin_transaction_dispatch_workers >= 1);
+        assert!(
+            balanced.plugin_transaction_dispatch_workers
+                <= DEFAULT_RUNTIME_DELIVERY_TRANSACTION_DISPATCH_WORKERS_CAP
+        );
         assert_eq!(disciplined.plugin_transaction_dispatch_workers, 1);
         assert_eq!(
             disciplined.plugin_dispatch_mode,
             PluginDispatchMode::Sequential
         );
+    }
+
+    #[test]
+    fn runtime_delivery_profile_settings_have_coherent_pressure_defaults() {
+        let profiles = [
+            RuntimeDeliveryProfile::LatencyOptimized,
+            RuntimeDeliveryProfile::Balanced,
+            RuntimeDeliveryProfile::DeliveryDisciplined,
+        ];
+
+        for profile in profiles {
+            let settings = profile.settings();
+            assert_eq!(
+                settings.plugin_event_queue_capacity,
+                settings.extension_event_queue_capacity
+            );
+            assert_eq!(
+                settings.derived_state_replay_max_envelopes,
+                settings.plugin_event_queue_capacity
+            );
+            assert!(settings.derived_state_replay_max_sessions > 0);
+            assert!(settings.runtime_extension_queue_depth_warn > 0);
+            assert!(
+                settings.runtime_extension_queue_depth_warn
+                    < u64::try_from(settings.extension_event_queue_capacity)
+                        .expect("profile queue capacity should fit in u64")
+            );
+            assert!(settings.runtime_extension_drop_warn_delta > 0);
+            assert!(settings.extension_startup_timeout >= Duration::from_secs(5));
+            assert!(settings.extension_shutdown_timeout >= Duration::from_secs(3));
+        }
     }
 
     #[test]

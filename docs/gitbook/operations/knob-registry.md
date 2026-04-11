@@ -74,6 +74,7 @@ Snapshot date:
 | `SOF_WORKER_THREADS` | host parallelism | all builds | Base worker parallelism used by the runtime. |
 | `SOF_RUNTIME_CURRENT_THREAD` | `false` | all builds | Run SOF on a dedicated current-thread Tokio runtime. |
 | `SOF_RUNTIME_CORE` | unset | all builds | Optional CPU core pin for the dedicated runtime thread when current-thread mode is enabled. |
+| `SOF_RUNTIME_DELIVERY_PROFILE` | `latency_optimized` | all builds | Runtime-owned downstream delivery profile. Supported values: `latency_optimized`, `balanced`, `delivery_disciplined`. |
 | `SOF_DATASET_WORKERS` | `SOF_WORKER_THREADS` | all builds | Number of dataset reconstruction workers. |
 | `SOF_PACKET_WORKERS` | `SOF_WORKER_THREADS` | all builds | Number of packet verify/FEC/reassembly workers. |
 | `SOF_PACKET_WORKER_QUEUE_CAPACITY` | `256` | all builds | Queue depth per packet worker. |

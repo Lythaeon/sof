@@ -37,11 +37,19 @@ pub fn read_runtime_current_thread() -> bool {
 }
 
 pub fn read_runtime_delivery_profile() -> RuntimeDeliveryProfile {
-    read_env_var("SOF_RUNTIME_DELIVERY_PROFILE")
-        .filter(|value| !value.trim().is_empty())
-        .as_deref()
-        .and_then(RuntimeDeliveryProfile::from_config_value)
-        .unwrap_or_default()
+    let Some(value) =
+        read_env_var("SOF_RUNTIME_DELIVERY_PROFILE").filter(|value| !value.trim().is_empty())
+    else {
+        return RuntimeDeliveryProfile::default();
+    };
+    RuntimeDeliveryProfile::from_config_value(&value).unwrap_or_else(|| {
+        tracing::warn!(
+            value,
+            default = RuntimeDeliveryProfile::default().as_str(),
+            "unknown runtime delivery profile; using default"
+        );
+        RuntimeDeliveryProfile::default()
+    })
 }
 
 pub fn read_runtime_core() -> Option<usize> {
