@@ -21,6 +21,7 @@ This initial package slice provides:
   - `SOF_DERIVED_STATE_REPLAY_MAX_SESSIONS`
 - nested derived-state runtime config with safe defaults and checkpoint-only replay helper
 - typed environment entry helpers instead of only raw string maps
+- plain-object nested config construction, so common cases do not require chained `new` calls
 
 ## Example
 
@@ -29,12 +30,10 @@ import {
   DerivedStateReplayBackend,
   DerivedStateReplayConfig,
   DerivedStateReplayDurability,
-  DerivedStateRuntimeConfig,
   ObserverRuntimeConfig,
   ProviderStreamCapabilityPolicy,
   RuntimeDeliveryProfile,
   ShredTrustMode,
-  derivedStateReplayDirectory,
   providerStreamAllowEofEnvVarName,
   providerStreamCapabilityPolicyEnvVarName,
   runtimeDeliveryProfileEnvValues,
@@ -47,17 +46,17 @@ const config = new ObserverRuntimeConfig({
   shredTrustMode: ShredTrustMode.TrustedRawShredProvider,
   providerStreamCapabilityPolicy: ProviderStreamCapabilityPolicy.Strict,
   providerStreamAllowEof: true,
-  derivedState: new DerivedStateRuntimeConfig({
+  derivedState: {
     checkpointIntervalMs: 60_000,
     recoveryIntervalMs: 10_000,
-    replay: new DerivedStateReplayConfig({
+    replay: {
       backend: DerivedStateReplayBackend.Disk,
-      replayDirectory: derivedStateReplayDirectory(".sof-replay"),
+      replayDirectory: ".sof-replay",
       durability: DerivedStateReplayDurability.Fsync,
       maxEnvelopes: 1024,
       maxSessions: 2,
-    }),
-  }),
+    },
+  },
 });
 
 const env = config.toEnvironment();

@@ -13,6 +13,11 @@ export enum ProviderStreamCapabilityPolicy {
   Strict = 2,
 }
 
+export const defaultShredTrustMode = ShredTrustMode.PublicUntrusted;
+export const defaultProviderStreamCapabilityPolicy =
+  ProviderStreamCapabilityPolicy.Warn;
+export const defaultProviderStreamAllowEof = false;
+
 export type ShredTrustModeEnvValue = Brand<string, "ShredTrustModeEnvValue">;
 export type ProviderStreamCapabilityPolicyEnvValue = Brand<
   string,
@@ -79,10 +84,52 @@ export const runtimeBooleanAllowedValues: readonly RuntimeBooleanEnvValue[] = [
   runtimeBooleanEnvValues.false,
 ];
 
+export function isShredTrustMode(value: ShredTrustMode): value is ShredTrustMode {
+  switch (value) {
+    case ShredTrustMode.PublicUntrusted:
+    case ShredTrustMode.TrustedRawShredProvider:
+      return true;
+    default:
+      return false;
+  }
+}
+
+export function isProviderStreamCapabilityPolicy(
+  value: ProviderStreamCapabilityPolicy,
+): value is ProviderStreamCapabilityPolicy {
+  switch (value) {
+    case ProviderStreamCapabilityPolicy.Warn:
+    case ProviderStreamCapabilityPolicy.Strict:
+      return true;
+    default:
+      return false;
+  }
+}
+
+function requireShredTrustMode(value: ShredTrustMode): ShredTrustMode {
+  if (!isShredTrustMode(value)) {
+    throw new RangeError(`unknown shred trust mode: ${String(value)}`);
+  }
+
+  return value;
+}
+
+function requireProviderStreamCapabilityPolicy(
+  value: ProviderStreamCapabilityPolicy,
+): ProviderStreamCapabilityPolicy {
+  if (!isProviderStreamCapabilityPolicy(value)) {
+    throw new RangeError(
+      `unknown provider stream capability policy: ${String(value)}`,
+    );
+  }
+
+  return value;
+}
+
 export function shredTrustModeToEnvValue(
   mode: ShredTrustMode,
 ): ShredTrustModeEnvValue {
-  switch (mode) {
+  switch (requireShredTrustMode(mode)) {
     case ShredTrustMode.PublicUntrusted:
       return shredTrustModeEnvValues.publicUntrusted;
     case ShredTrustMode.TrustedRawShredProvider:
@@ -93,7 +140,7 @@ export function shredTrustModeToEnvValue(
 export function providerStreamCapabilityPolicyToEnvValue(
   policy: ProviderStreamCapabilityPolicy,
 ): ProviderStreamCapabilityPolicyEnvValue {
-  switch (policy) {
+  switch (requireProviderStreamCapabilityPolicy(policy)) {
     case ProviderStreamCapabilityPolicy.Warn:
       return providerStreamCapabilityPolicyEnvValues.warn;
     case ProviderStreamCapabilityPolicy.Strict:

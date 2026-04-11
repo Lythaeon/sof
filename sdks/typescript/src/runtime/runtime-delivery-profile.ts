@@ -9,6 +9,9 @@ export enum RuntimeDeliveryProfile {
   DeliveryDisciplined = 3,
 }
 
+export const defaultRuntimeDeliveryProfile =
+  RuntimeDeliveryProfile.LatencyOptimized;
+
 export type RuntimeDeliveryProfileEnvValue = Brand<
   string,
   "RuntimeDeliveryProfileEnvValue"
@@ -39,10 +42,33 @@ export const runtimeDeliveryProfileAllowedValues: readonly RuntimeDeliveryProfil
     runtimeDeliveryProfileEnvValues.deliveryDisciplined,
   ];
 
+export function isRuntimeDeliveryProfile(
+  value: RuntimeDeliveryProfile,
+): value is RuntimeDeliveryProfile {
+  switch (value) {
+    case RuntimeDeliveryProfile.LatencyOptimized:
+    case RuntimeDeliveryProfile.Balanced:
+    case RuntimeDeliveryProfile.DeliveryDisciplined:
+      return true;
+    default:
+      return false;
+  }
+}
+
+function requireRuntimeDeliveryProfile(
+  value: RuntimeDeliveryProfile,
+): RuntimeDeliveryProfile {
+  if (!isRuntimeDeliveryProfile(value)) {
+    throw new RangeError(`unknown runtime delivery profile: ${String(value)}`);
+  }
+
+  return value;
+}
+
 export function runtimeDeliveryProfileToEnvValue(
   profile: RuntimeDeliveryProfile,
 ): RuntimeDeliveryProfileEnvValue {
-  switch (profile) {
+  switch (requireRuntimeDeliveryProfile(profile)) {
     case RuntimeDeliveryProfile.LatencyOptimized:
       return runtimeDeliveryProfileEnvValues.latencyOptimized;
     case RuntimeDeliveryProfile.Balanced:

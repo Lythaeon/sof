@@ -13,6 +13,14 @@ export enum DerivedStateReplayDurability {
   Fsync = 2,
 }
 
+export const defaultDerivedStateCheckpointIntervalMs = 30_000;
+export const defaultDerivedStateRecoveryIntervalMs = 5_000;
+export const defaultDerivedStateReplayBackend = DerivedStateReplayBackend.Memory;
+export const defaultDerivedStateReplayDurability =
+  DerivedStateReplayDurability.Flush;
+export const defaultDerivedStateReplayMaxEnvelopes = 8_192;
+export const defaultDerivedStateReplayMaxSessions = 4;
+
 export type DerivedStateReplayBackendEnvValue = Brand<
   string,
   "DerivedStateReplayBackendEnvValue"
@@ -105,13 +113,66 @@ export const defaultDerivedStateReplayDirectory = asDerivedStateReplayDirectory(
 export function derivedStateReplayDirectory(
   value: string,
 ): DerivedStateReplayDirectory {
+  if (value.trim() === "") {
+    throw new RangeError("replayDirectory must not be empty");
+  }
+  if (value.includes("\u0000")) {
+    throw new RangeError("replayDirectory must not contain NUL bytes");
+  }
+
   return asDerivedStateReplayDirectory(value);
+}
+
+export function isDerivedStateReplayBackend(
+  value: DerivedStateReplayBackend,
+): value is DerivedStateReplayBackend {
+  switch (value) {
+    case DerivedStateReplayBackend.Memory:
+    case DerivedStateReplayBackend.Disk:
+      return true;
+    default:
+      return false;
+  }
+}
+
+export function isDerivedStateReplayDurability(
+  value: DerivedStateReplayDurability,
+): value is DerivedStateReplayDurability {
+  switch (value) {
+    case DerivedStateReplayDurability.Flush:
+    case DerivedStateReplayDurability.Fsync:
+      return true;
+    default:
+      return false;
+  }
+}
+
+function requireDerivedStateReplayBackend(
+  value: DerivedStateReplayBackend,
+): DerivedStateReplayBackend {
+  if (!isDerivedStateReplayBackend(value)) {
+    throw new RangeError(`unknown derived-state replay backend: ${String(value)}`);
+  }
+
+  return value;
+}
+
+function requireDerivedStateReplayDurability(
+  value: DerivedStateReplayDurability,
+): DerivedStateReplayDurability {
+  if (!isDerivedStateReplayDurability(value)) {
+    throw new RangeError(
+      `unknown derived-state replay durability: ${String(value)}`,
+    );
+  }
+
+  return value;
 }
 
 export function derivedStateReplayBackendToEnvValue(
   backend: DerivedStateReplayBackend,
 ): DerivedStateReplayBackendEnvValue {
-  switch (backend) {
+  switch (requireDerivedStateReplayBackend(backend)) {
     case DerivedStateReplayBackend.Memory:
       return derivedStateReplayBackendEnvValues.memory;
     case DerivedStateReplayBackend.Disk:
@@ -122,7 +183,7 @@ export function derivedStateReplayBackendToEnvValue(
 export function derivedStateReplayDurabilityToEnvValue(
   durability: DerivedStateReplayDurability,
 ): DerivedStateReplayDurabilityEnvValue {
-  switch (durability) {
+  switch (requireDerivedStateReplayDurability(durability)) {
     case DerivedStateReplayDurability.Flush:
       return derivedStateReplayDurabilityEnvValues.flush;
     case DerivedStateReplayDurability.Fsync:
@@ -212,6 +273,16 @@ function requireNonNegativeInteger(field: string, value: number): number {
   return value;
 }
 
+function normalizeReplayDirectory(
+  value: DerivedStateReplayDirectory | string | undefined,
+): DerivedStateReplayDirectory {
+  if (value === undefined) {
+    return defaultDerivedStateReplayDirectory;
+  }
+
+  return derivedStateReplayDirectory(value);
+}
+
 export function nonNegativeIntegerToEnvValue(
   value: number,
 ): NonNegativeIntegerEnvValue {
@@ -220,7 +291,7 @@ export function nonNegativeIntegerToEnvValue(
 
 export interface DerivedStateReplayConfigInit {
   readonly backend?: DerivedStateReplayBackend;
-  readonly replayDirectory?: DerivedStateReplayDirectory;
+  readonly replayDirectory?: DerivedStateReplayDirectory | string;
   readonly durability?: DerivedStateReplayDurability;
   readonly maxEnvelopes?: number;
   readonly maxSessions?: number;
@@ -234,17 +305,20 @@ export class DerivedStateReplayConfig {
   readonly maxSessions: number;
 
   constructor(init: DerivedStateReplayConfigInit = {}) {
-    this.backend = init.backend ?? DerivedStateReplayBackend.Memory;
-    this.replayDirectory =
-      init.replayDirectory ?? defaultDerivedStateReplayDirectory;
-    this.durability = init.durability ?? DerivedStateReplayDurability.Flush;
+    this.backend = requireDerivedStateReplayBackend(
+      init.backend ?? defaultDerivedStateReplayBackend,
+    );
+    this.replayDirectory = normalizeReplayDirectory(init.replayDirectory);
+    this.durability = requireDerivedStateReplayDurability(
+      init.durability ?? defaultDerivedStateReplayDurability,
+    );
     this.maxEnvelopes = requireNonNegativeInteger(
       "maxEnvelopes",
-      init.maxEnvelopes ?? 8_192,
+      init.maxEnvelopes ?? defaultDerivedStateReplayMaxEnvelopes,
     );
     this.maxSessions = requireNonNegativeInteger(
       "maxSessions",
-      init.maxSessions ?? 4,
+      init.maxSessions ?? defaultDerivedStateReplayMaxSessions,
     );
   }
 
@@ -263,7 +337,7 @@ export class DerivedStateReplayConfig {
 export interface DerivedStateRuntimeConfigInit {
   readonly checkpointIntervalMs?: number;
   readonly recoveryIntervalMs?: number;
-  readonly replay?: DerivedStateReplayConfig;
+  readonly replay?: DerivedStateReplayConfig | DerivedStateReplayConfigInit;
 }
 
 export class DerivedStateRuntimeConfig {
@@ -274,12 +348,15 @@ export class DerivedStateRuntimeConfig {
   constructor(init: DerivedStateRuntimeConfigInit = {}) {
     this.checkpointIntervalMs = requireNonNegativeInteger(
       "checkpointIntervalMs",
-      init.checkpointIntervalMs ?? 30_000,
+      init.checkpointIntervalMs ?? defaultDerivedStateCheckpointIntervalMs,
     );
     this.recoveryIntervalMs = requireNonNegativeInteger(
       "recoveryIntervalMs",
-      init.recoveryIntervalMs ?? 5_000,
+      init.recoveryIntervalMs ?? defaultDerivedStateRecoveryIntervalMs,
     );
-    this.replay = init.replay ?? new DerivedStateReplayConfig();
+    this.replay =
+      init.replay instanceof DerivedStateReplayConfig
+        ? init.replay
+        : new DerivedStateReplayConfig(init.replay);
   }
 }

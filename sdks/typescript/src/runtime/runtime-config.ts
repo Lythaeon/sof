@@ -8,6 +8,8 @@ import {
 import type { ValidationError } from "../errors.js";
 import { isErr, ok, type Result } from "../result.js";
 import {
+  defaultRuntimeDeliveryProfile,
+  isRuntimeDeliveryProfile,
   parseRuntimeDeliveryProfile,
   RuntimeDeliveryProfile,
   type RuntimeDeliveryProfileEnvValue,
@@ -15,14 +17,18 @@ import {
   runtimeDeliveryProfileToEnvValue,
 } from "./runtime-delivery-profile.js";
 import {
+  defaultDerivedStateCheckpointIntervalMs,
+  defaultDerivedStateRecoveryIntervalMs,
+  defaultDerivedStateReplayBackend,
   defaultDerivedStateReplayDirectory,
+  defaultDerivedStateReplayDurability,
+  defaultDerivedStateReplayMaxEnvelopes,
+  defaultDerivedStateReplayMaxSessions,
   derivedStateCheckpointIntervalEnvVarName,
   derivedStateRecoveryIntervalEnvVarName,
-  DerivedStateReplayBackend,
   derivedStateReplayBackendEnvVarName,
   derivedStateReplayBackendToEnvValue,
   derivedStateReplayDirEnvVarName,
-  DerivedStateReplayDurability,
   derivedStateReplayDurabilityEnvVarName,
   derivedStateReplayDurabilityToEnvValue,
   derivedStateReplayMaxEnvelopesEnvVarName,
@@ -32,6 +38,7 @@ import {
   type DerivedStateReplayDirectory,
   type DerivedStateReplayDurabilityEnvValue,
   DerivedStateRuntimeConfig,
+  type DerivedStateRuntimeConfigInit,
   type NonNegativeIntegerEnvValue,
   nonNegativeIntegerToEnvValue,
   parseDerivedStateReplayBackend,
@@ -40,6 +47,11 @@ import {
   derivedStateReplayDirectory,
 } from "./derived-state.js";
 import {
+  defaultProviderStreamAllowEof,
+  defaultProviderStreamCapabilityPolicy,
+  defaultShredTrustMode,
+  isProviderStreamCapabilityPolicy,
+  isShredTrustMode,
   parseProviderStreamCapabilityPolicy,
   parseRuntimeBoolean,
   parseShredTrustMode,
@@ -61,7 +73,7 @@ export interface ObserverRuntimeConfigInit {
   readonly shredTrustMode?: ShredTrustMode;
   readonly providerStreamCapabilityPolicy?: ProviderStreamCapabilityPolicy;
   readonly providerStreamAllowEof?: boolean;
-  readonly derivedState?: DerivedStateRuntimeConfig;
+  readonly derivedState?: DerivedStateRuntimeConfig | DerivedStateRuntimeConfigInit;
 }
 
 export interface ObserverRuntimeEnvironmentOptions {
@@ -117,6 +129,52 @@ export type ObserverRuntimeValidationError =
   | ValidationError<DerivedStateReplayDurabilityEnvValue>
   | ValidationError;
 
+function requireBoolean(field: string, value: boolean): boolean {
+  if (typeof value !== "boolean") {
+    throw new TypeError(`${field} must be a boolean`);
+  }
+
+  return value;
+}
+
+function requireObserverRuntimeDeliveryProfile(
+  value: RuntimeDeliveryProfile,
+): RuntimeDeliveryProfile {
+  if (!isRuntimeDeliveryProfile(value)) {
+    throw new RangeError(`unknown runtime delivery profile: ${String(value)}`);
+  }
+
+  return value;
+}
+
+function requireObserverShredTrustMode(value: ShredTrustMode): ShredTrustMode {
+  if (!isShredTrustMode(value)) {
+    throw new RangeError(`unknown shred trust mode: ${String(value)}`);
+  }
+
+  return value;
+}
+
+function requireObserverProviderStreamCapabilityPolicy(
+  value: ProviderStreamCapabilityPolicy,
+): ProviderStreamCapabilityPolicy {
+  if (!isProviderStreamCapabilityPolicy(value)) {
+    throw new RangeError(
+      `unknown provider stream capability policy: ${String(value)}`,
+    );
+  }
+
+  return value;
+}
+
+function shouldIncludeValue<T>(
+  currentValue: T,
+  defaultValue: T,
+  options: ObserverRuntimeEnvironmentOptions,
+): boolean {
+  return options.includeDefaults === true || currentValue !== defaultValue;
+}
+
 export class ObserverRuntimeConfig {
   readonly runtimeDeliveryProfile: RuntimeDeliveryProfile;
   readonly shredTrustMode: ShredTrustMode;
@@ -125,13 +183,25 @@ export class ObserverRuntimeConfig {
   readonly derivedState: DerivedStateRuntimeConfig;
 
   constructor(init: ObserverRuntimeConfigInit = {}) {
-    this.runtimeDeliveryProfile =
-      init.runtimeDeliveryProfile ?? RuntimeDeliveryProfile.LatencyOptimized;
-    this.shredTrustMode = init.shredTrustMode ?? ShredTrustMode.PublicUntrusted;
+    this.runtimeDeliveryProfile = requireObserverRuntimeDeliveryProfile(
+      init.runtimeDeliveryProfile ?? defaultRuntimeDeliveryProfile,
+    );
+    this.shredTrustMode = requireObserverShredTrustMode(
+      init.shredTrustMode ?? defaultShredTrustMode,
+    );
     this.providerStreamCapabilityPolicy =
-      init.providerStreamCapabilityPolicy ?? ProviderStreamCapabilityPolicy.Warn;
-    this.providerStreamAllowEof = init.providerStreamAllowEof ?? false;
-    this.derivedState = init.derivedState ?? new DerivedStateRuntimeConfig();
+      requireObserverProviderStreamCapabilityPolicy(
+        init.providerStreamCapabilityPolicy ??
+          defaultProviderStreamCapabilityPolicy,
+      );
+    this.providerStreamAllowEof = requireBoolean(
+      "providerStreamAllowEof",
+      init.providerStreamAllowEof ?? defaultProviderStreamAllowEof,
+    );
+    this.derivedState =
+      init.derivedState instanceof DerivedStateRuntimeConfig
+        ? init.derivedState
+        : new DerivedStateRuntimeConfig(init.derivedState);
   }
 
   toEnvironment(
@@ -140,9 +210,12 @@ export class ObserverRuntimeConfig {
     const environment: ObserverRuntimeEnvironmentVariable[] = [];
 
     if (
-      options.includeDefaults !== true &&
-      this.runtimeDeliveryProfile === RuntimeDeliveryProfile.LatencyOptimized
-    ) {} else {
+      shouldIncludeValue(
+        this.runtimeDeliveryProfile,
+        defaultRuntimeDeliveryProfile,
+        options,
+      )
+    ) {
       environment.push(
         environmentVariable(
           runtimeDeliveryProfileEnvVarName,
@@ -152,9 +225,8 @@ export class ObserverRuntimeConfig {
     }
 
     if (
-      options.includeDefaults !== true &&
-      this.shredTrustMode === ShredTrustMode.PublicUntrusted
-    ) {} else {
+      shouldIncludeValue(this.shredTrustMode, defaultShredTrustMode, options)
+    ) {
       environment.push(
         environmentVariable(
           shredTrustModeEnvVarName,
@@ -164,9 +236,12 @@ export class ObserverRuntimeConfig {
     }
 
     if (
-      options.includeDefaults !== true &&
-      this.providerStreamCapabilityPolicy === ProviderStreamCapabilityPolicy.Warn
-    ) {} else {
+      shouldIncludeValue(
+        this.providerStreamCapabilityPolicy,
+        defaultProviderStreamCapabilityPolicy,
+        options,
+      )
+    ) {
       environment.push(
         environmentVariable(
           providerStreamCapabilityPolicyEnvVarName,
@@ -177,7 +252,13 @@ export class ObserverRuntimeConfig {
       );
     }
 
-    if (options.includeDefaults === true || this.providerStreamAllowEof) {
+    if (
+      shouldIncludeValue(
+        this.providerStreamAllowEof,
+        defaultProviderStreamAllowEof,
+        options,
+      )
+    ) {
       environment.push(
         environmentVariable(
           providerStreamAllowEofEnvVarName,
@@ -187,8 +268,11 @@ export class ObserverRuntimeConfig {
     }
 
     if (
-      options.includeDefaults === true ||
-      this.derivedState.checkpointIntervalMs !== 30_000
+      shouldIncludeValue(
+        this.derivedState.checkpointIntervalMs,
+        defaultDerivedStateCheckpointIntervalMs,
+        options,
+      )
     ) {
       environment.push(
         environmentVariable(
@@ -199,8 +283,11 @@ export class ObserverRuntimeConfig {
     }
 
     if (
-      options.includeDefaults === true ||
-      this.derivedState.recoveryIntervalMs !== 5_000
+      shouldIncludeValue(
+        this.derivedState.recoveryIntervalMs,
+        defaultDerivedStateRecoveryIntervalMs,
+        options,
+      )
     ) {
       environment.push(
         environmentVariable(
@@ -211,8 +298,11 @@ export class ObserverRuntimeConfig {
     }
 
     if (
-      options.includeDefaults === true ||
-      this.derivedState.replay.backend !== DerivedStateReplayBackend.Memory
+      shouldIncludeValue(
+        this.derivedState.replay.backend,
+        defaultDerivedStateReplayBackend,
+        options,
+      )
     ) {
       environment.push(
         environmentVariable(
@@ -223,9 +313,11 @@ export class ObserverRuntimeConfig {
     }
 
     if (
-      options.includeDefaults === true ||
-      this.derivedState.replay.replayDirectory !==
-        defaultDerivedStateReplayDirectory
+      shouldIncludeValue(
+        this.derivedState.replay.replayDirectory,
+        defaultDerivedStateReplayDirectory,
+        options,
+      )
     ) {
       environment.push(
         environmentVariable(
@@ -236,8 +328,11 @@ export class ObserverRuntimeConfig {
     }
 
     if (
-      options.includeDefaults === true ||
-      this.derivedState.replay.durability !== DerivedStateReplayDurability.Flush
+      shouldIncludeValue(
+        this.derivedState.replay.durability,
+        defaultDerivedStateReplayDurability,
+        options,
+      )
     ) {
       environment.push(
         environmentVariable(
@@ -250,8 +345,11 @@ export class ObserverRuntimeConfig {
     }
 
     if (
-      options.includeDefaults === true ||
-      this.derivedState.replay.maxEnvelopes !== 8_192
+      shouldIncludeValue(
+        this.derivedState.replay.maxEnvelopes,
+        defaultDerivedStateReplayMaxEnvelopes,
+        options,
+      )
     ) {
       environment.push(
         environmentVariable(
@@ -262,8 +360,11 @@ export class ObserverRuntimeConfig {
     }
 
     if (
-      options.includeDefaults === true ||
-      this.derivedState.replay.maxSessions !== 4
+      shouldIncludeValue(
+        this.derivedState.replay.maxSessions,
+        defaultDerivedStateReplayMaxSessions,
+        options,
+      )
     ) {
       environment.push(
         environmentVariable(
@@ -327,7 +428,7 @@ export class ObserverRuntimeConfig {
       derivedStateReplayMaxSessionsEnvVarName,
     );
 
-    let parsedRuntimeDeliveryProfile = RuntimeDeliveryProfile.LatencyOptimized;
+    let parsedRuntimeDeliveryProfile = defaultRuntimeDeliveryProfile;
     if (
       runtimeDeliveryProfile !== undefined &&
       runtimeDeliveryProfile.trim() !== ""
@@ -339,7 +440,7 @@ export class ObserverRuntimeConfig {
       parsedRuntimeDeliveryProfile = parsed.value;
     }
 
-    let parsedShredTrustMode = ShredTrustMode.PublicUntrusted;
+    let parsedShredTrustMode = defaultShredTrustMode;
     if (shredTrustMode !== undefined && shredTrustMode.trim() !== "") {
       const parsed = parseShredTrustMode(shredTrustMode);
       if (isErr(parsed)) {
@@ -349,7 +450,7 @@ export class ObserverRuntimeConfig {
     }
 
     let parsedProviderStreamCapabilityPolicy =
-      ProviderStreamCapabilityPolicy.Warn;
+      defaultProviderStreamCapabilityPolicy;
     if (
       providerStreamCapabilityPolicy !== undefined &&
       providerStreamCapabilityPolicy.trim() !== ""
@@ -363,7 +464,7 @@ export class ObserverRuntimeConfig {
       parsedProviderStreamCapabilityPolicy = parsed.value;
     }
 
-    let parsedProviderStreamAllowEof = false;
+    let parsedProviderStreamAllowEof = defaultProviderStreamAllowEof;
     if (
       providerStreamAllowEof !== undefined &&
       providerStreamAllowEof.trim() !== ""
@@ -378,7 +479,7 @@ export class ObserverRuntimeConfig {
       parsedProviderStreamAllowEof = parsed.value;
     }
 
-    let parsedCheckpointIntervalMs = 30_000;
+    let parsedCheckpointIntervalMs = defaultDerivedStateCheckpointIntervalMs;
     if (
       derivedStateCheckpointInterval !== undefined &&
       derivedStateCheckpointInterval.trim() !== ""
@@ -393,7 +494,7 @@ export class ObserverRuntimeConfig {
       parsedCheckpointIntervalMs = parsed.value;
     }
 
-    let parsedRecoveryIntervalMs = 5_000;
+    let parsedRecoveryIntervalMs = defaultDerivedStateRecoveryIntervalMs;
     if (
       derivedStateRecoveryInterval !== undefined &&
       derivedStateRecoveryInterval.trim() !== ""
@@ -408,7 +509,7 @@ export class ObserverRuntimeConfig {
       parsedRecoveryIntervalMs = parsed.value;
     }
 
-    let parsedDerivedStateReplayBackend = DerivedStateReplayBackend.Memory;
+    let parsedDerivedStateReplayBackend = defaultDerivedStateReplayBackend;
     if (
       derivedStateReplayBackend !== undefined &&
       derivedStateReplayBackend.trim() !== ""
@@ -427,7 +528,7 @@ export class ObserverRuntimeConfig {
       );
     }
 
-    let parsedDerivedStateReplayDurability = DerivedStateReplayDurability.Flush;
+    let parsedDerivedStateReplayDurability = defaultDerivedStateReplayDurability;
     if (
       derivedStateReplayDurability !== undefined &&
       derivedStateReplayDurability.trim() !== ""
@@ -441,7 +542,8 @@ export class ObserverRuntimeConfig {
       parsedDerivedStateReplayDurability = parsed.value;
     }
 
-    let parsedDerivedStateReplayMaxEnvelopes = 8_192;
+    let parsedDerivedStateReplayMaxEnvelopes =
+      defaultDerivedStateReplayMaxEnvelopes;
     if (
       derivedStateReplayMaxEnvelopes !== undefined &&
       derivedStateReplayMaxEnvelopes.trim() !== ""
@@ -456,7 +558,8 @@ export class ObserverRuntimeConfig {
       parsedDerivedStateReplayMaxEnvelopes = parsed.value;
     }
 
-    let parsedDerivedStateReplayMaxSessions = 4;
+    let parsedDerivedStateReplayMaxSessions =
+      defaultDerivedStateReplayMaxSessions;
     if (
       derivedStateReplayMaxSessions !== undefined &&
       derivedStateReplayMaxSessions.trim() !== ""

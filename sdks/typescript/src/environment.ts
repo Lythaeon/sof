@@ -28,9 +28,16 @@ export function environmentVariable<
 export function environmentVariablesToRecord(
   variables: readonly EnvironmentVariable[],
 ): Readonly<Record<string, string>> {
-  return Object.fromEntries(
-    variables.map((variable) => [variable.name, variable.value]),
-  );
+  const record: Record<string, string> = Object.create(null) as Record<
+    string,
+    string
+  >;
+
+  for (const variable of variables) {
+    record[variable.name] = variable.value;
+  }
+
+  return record;
 }
 
 export function readEnvironmentVariable(
@@ -48,5 +55,9 @@ export function readEnvironmentVariable(
   }
 
   const record = input as Readonly<Record<string, string | undefined>>;
+  if (!Object.prototype.hasOwnProperty.call(record, name)) {
+    return undefined;
+  }
+
   return record[name];
 }
