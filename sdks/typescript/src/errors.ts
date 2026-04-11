@@ -5,6 +5,9 @@ export enum ValidationErrorKind {
   InvalidShredTrustMode = 2,
   InvalidProviderStreamCapabilityPolicy = 3,
   InvalidProviderStreamAllowEof = 4,
+  InvalidDerivedStateReplayBackend = 5,
+  InvalidDerivedStateReplayDurability = 6,
+  InvalidNonNegativeInteger = 7,
 }
 
 export interface ValidationError<AllowedValue extends string = string> {
