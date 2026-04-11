@@ -3,9 +3,7 @@ use std::{num::NonZeroUsize, path::PathBuf};
 use super::{read_bool_env, read_env_var};
 use crate::{
     framework::{DerivedStateReplayBackend, DerivedStateReplayDurability},
-    runtime::{
-        DerivedStateReplayConfig, DerivedStateRuntimeConfig, RuntimeDeliveryProfile, ShredTrustMode,
-    },
+    runtime::{DerivedStateReplayConfig, DerivedStateRuntimeConfig, ShredTrustMode},
 };
 
 fn read_optional_bool_env(name: &str) -> Option<bool> {
@@ -19,13 +17,6 @@ pub fn read_shred_trust_mode() -> ShredTrustMode {
         }
         _ => ShredTrustMode::PublicUntrusted,
     }
-}
-
-pub fn read_runtime_delivery_profile() -> Option<RuntimeDeliveryProfile> {
-    read_env_var("SOF_RUNTIME_DELIVERY_PROFILE")
-        .filter(|value| !value.trim().is_empty())
-        .as_deref()
-        .and_then(RuntimeDeliveryProfile::from_config_value)
 }
 
 pub fn read_worker_threads() -> usize {
@@ -367,42 +358,5 @@ pub fn read_derived_state_runtime_config() -> DerivedStateRuntimeConfig {
             max_envelopes: read_derived_state_replay_max_envelopes(),
             max_sessions: read_derived_state_replay_max_sessions(),
         },
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::read_runtime_delivery_profile;
-    use crate::{
-        runtime::RuntimeDeliveryProfile, runtime_env::with_runtime_env_overrides_for_test,
-    };
-
-    #[test]
-    fn runtime_delivery_profile_parses_known_values() {
-        with_runtime_env_overrides_for_test(
-            [(
-                "SOF_RUNTIME_DELIVERY_PROFILE".to_owned(),
-                "delivery_disciplined".to_owned(),
-            )],
-            || {
-                assert_eq!(
-                    read_runtime_delivery_profile(),
-                    Some(RuntimeDeliveryProfile::DeliveryDisciplined)
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn runtime_delivery_profile_rejects_unknown_values() {
-        with_runtime_env_overrides_for_test(
-            [(
-                "SOF_RUNTIME_DELIVERY_PROFILE".to_owned(),
-                "unknown".to_owned(),
-            )],
-            || {
-                assert_eq!(read_runtime_delivery_profile(), None);
-            },
-        );
     }
 }
