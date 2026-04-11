@@ -22,6 +22,8 @@ This initial package slice provides:
 - nested derived-state runtime config with safe defaults and checkpoint-only replay helper
 - typed environment entry helpers instead of only raw string maps
 - plain-object nested config construction, so common cases do not require chained `new` calls
+- one-line runtime profile presets such as `ObserverRuntimeConfig.balanced()`
+- focused subpath imports when you only want one SDK slice, for example `@sof/sdk/runtime/config`
 
 ## Example
 
@@ -41,8 +43,7 @@ import {
   shredTrustModeEnvVarName,
 } from "@sof/sdk";
 
-const config = new ObserverRuntimeConfig({
-  runtimeDeliveryProfile: RuntimeDeliveryProfile.Balanced,
+const config = ObserverRuntimeConfig.balanced({
   shredTrustMode: ShredTrustMode.TrustedRawShredProvider,
   providerStreamCapabilityPolicy: ProviderStreamCapabilityPolicy.Strict,
   providerStreamAllowEof: true,
@@ -99,4 +100,39 @@ providerStreamCapabilityPolicyEnvVarName;
 providerStreamAllowEofEnvVarName;
 parsed;
 checkpointOnly;
+```
+
+## Focused Imports
+
+```ts
+import {
+  ObserverRuntimeConfig,
+  observerRuntimeConfigForProfile,
+} from "@sof/sdk/runtime/config";
+import {
+  ProviderStreamCapabilityPolicy,
+  ShredTrustMode,
+} from "@sof/sdk/runtime/policy";
+import {
+  DerivedStateReplayBackend,
+  DerivedStateReplayDurability,
+} from "@sof/sdk/runtime/derived-state";
+import { RuntimeDeliveryProfile } from "@sof/sdk/runtime/delivery-profile";
+
+const config = observerRuntimeConfigForProfile(
+  RuntimeDeliveryProfile.DeliveryDisciplined,
+  {
+    shredTrustMode: ShredTrustMode.TrustedRawShredProvider,
+    providerStreamCapabilityPolicy: ProviderStreamCapabilityPolicy.Strict,
+    derivedState: {
+      replay: {
+        backend: DerivedStateReplayBackend.Disk,
+        durability: DerivedStateReplayDurability.Fsync,
+      },
+    },
+  },
+);
+
+ObserverRuntimeConfig.latencyOptimized();
+config;
 ```

@@ -27,7 +27,11 @@ import {
   derivedStateReplayMaxEnvelopesEnvVarName,
   derivedStateReplayMaxSessionsEnvVarName,
   DerivedStateRuntimeConfig,
+  derivedStateReplayConfig,
+  derivedStateRuntimeConfig,
   nonNegativeIntegerToEnvValue,
+  observerRuntimeConfig,
+  observerRuntimeConfigForProfile,
   parseDerivedStateReplayBackend,
   parseDerivedStateReplayDurability,
   parseNonNegativeInteger,
@@ -381,6 +385,49 @@ test("runtime config parses typed environment variables into typed config", () =
   }
 });
 
+test("runtime config preset helpers create one-line common profiles", () => {
+  const latency = ObserverRuntimeConfig.latencyOptimized();
+  const balanced = ObserverRuntimeConfig.balanced({
+    providerStreamAllowEof: true,
+  });
+  const disciplined = ObserverRuntimeConfig.deliveryDisciplined({
+    shredTrustMode: ShredTrustMode.TrustedRawShredProvider,
+  });
+  const explicit = ObserverRuntimeConfig.forProfile(
+    RuntimeDeliveryProfile.Balanced,
+    {
+      providerStreamCapabilityPolicy: ProviderStreamCapabilityPolicy.Strict,
+    },
+  );
+  const functionPreset = observerRuntimeConfigForProfile(
+    RuntimeDeliveryProfile.DeliveryDisciplined,
+  );
+
+  assert.equal(
+    latency.runtimeDeliveryProfile,
+    RuntimeDeliveryProfile.LatencyOptimized,
+  );
+  assert.equal(balanced.runtimeDeliveryProfile, RuntimeDeliveryProfile.Balanced);
+  assert.equal(balanced.providerStreamAllowEof, true);
+  assert.equal(
+    disciplined.runtimeDeliveryProfile,
+    RuntimeDeliveryProfile.DeliveryDisciplined,
+  );
+  assert.equal(
+    disciplined.shredTrustMode,
+    ShredTrustMode.TrustedRawShredProvider,
+  );
+  assert.equal(explicit.runtimeDeliveryProfile, RuntimeDeliveryProfile.Balanced);
+  assert.equal(
+    explicit.providerStreamCapabilityPolicy,
+    ProviderStreamCapabilityPolicy.Strict,
+  );
+  assert.equal(
+    functionPreset.runtimeDeliveryProfile,
+    RuntimeDeliveryProfile.DeliveryDisciplined,
+  );
+});
+
 test("runtime config supports nested plain-object construction", () => {
   const config = new ObserverRuntimeConfig({
     runtimeDeliveryProfile: RuntimeDeliveryProfile.Balanced,
@@ -404,6 +451,45 @@ test("runtime config supports nested plain-object construction", () => {
   );
   assert.equal(config.derivedState.replay.maxEnvelopes, 256);
   assert.equal(config.derivedState.replay.maxSessions, 3);
+});
+
+test("derived-state factory helpers reduce nested constructor ceremony", () => {
+  const replay = DerivedStateReplayConfig.disk({
+    replayDirectory: ".sof-disk",
+    durability: DerivedStateReplayDurability.Fsync,
+    maxEnvelopes: 512,
+  });
+  const runtime = DerivedStateRuntimeConfig.checkpointOnly({
+    checkpointIntervalMs: 20_000,
+  });
+  const replayFromFunction = derivedStateReplayConfig({
+    backend: DerivedStateReplayBackend.Memory,
+    maxEnvelopes: 128,
+  });
+  const runtimeFromFunction = derivedStateRuntimeConfig({
+    replay: {
+      backend: DerivedStateReplayBackend.Disk,
+      replayDirectory: ".sof-function",
+    },
+  });
+  const observer = observerRuntimeConfig({
+    derivedState: runtimeFromFunction,
+  });
+
+  assert.equal(replay.backend, DerivedStateReplayBackend.Disk);
+  assert.equal(replay.replayDirectory, derivedStateReplayDirectory(".sof-disk"));
+  assert.equal(replay.maxEnvelopes, 512);
+  assert.equal(runtime.replay.isEnabled(), false);
+  assert.equal(runtime.checkpointIntervalMs, 20_000);
+  assert.equal(replayFromFunction.maxEnvelopes, 128);
+  assert.equal(
+    runtimeFromFunction.replay.replayDirectory,
+    derivedStateReplayDirectory(".sof-function"),
+  );
+  assert.equal(
+    observer.derivedState.replay.replayDirectory,
+    derivedStateReplayDirectory(".sof-function"),
+  );
 });
 
 test("environment helpers ignore inherited env values and use a null-prototype record", () => {

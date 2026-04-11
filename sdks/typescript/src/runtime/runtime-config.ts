@@ -38,6 +38,7 @@ import {
   type DerivedStateReplayDirectory,
   type DerivedStateReplayDurabilityEnvValue,
   DerivedStateRuntimeConfig,
+  derivedStateRuntimeConfig,
   type DerivedStateRuntimeConfigInit,
   type NonNegativeIntegerEnvValue,
   nonNegativeIntegerToEnvValue,
@@ -75,6 +76,13 @@ export interface ObserverRuntimeConfigInit {
   readonly providerStreamAllowEof?: boolean;
   readonly derivedState?: DerivedStateRuntimeConfig | DerivedStateRuntimeConfigInit;
 }
+
+export interface ObserverRuntimeProfileInit
+  extends Omit<ObserverRuntimeConfigInit, "runtimeDeliveryProfile"> {}
+
+export type ObserverRuntimeConfigInput =
+  | ObserverRuntimeConfig
+  | ObserverRuntimeConfigInit;
 
 export interface ObserverRuntimeEnvironmentOptions {
   readonly includeDefaults?: boolean;
@@ -175,6 +183,24 @@ function shouldIncludeValue<T>(
   return options.includeDefaults === true || currentValue !== defaultValue;
 }
 
+export function observerRuntimeConfig(
+  init: ObserverRuntimeConfigInput = {},
+): ObserverRuntimeConfig {
+  return init instanceof ObserverRuntimeConfig
+    ? init
+    : new ObserverRuntimeConfig(init);
+}
+
+export function observerRuntimeConfigForProfile(
+  profile: RuntimeDeliveryProfile,
+  init: ObserverRuntimeProfileInit = {},
+): ObserverRuntimeConfig {
+  return new ObserverRuntimeConfig({
+    ...init,
+    runtimeDeliveryProfile: profile,
+  });
+}
+
 export class ObserverRuntimeConfig {
   readonly runtimeDeliveryProfile: RuntimeDeliveryProfile;
   readonly shredTrustMode: ShredTrustMode;
@@ -198,10 +224,40 @@ export class ObserverRuntimeConfig {
       "providerStreamAllowEof",
       init.providerStreamAllowEof ?? defaultProviderStreamAllowEof,
     );
-    this.derivedState =
-      init.derivedState instanceof DerivedStateRuntimeConfig
-        ? init.derivedState
-        : new DerivedStateRuntimeConfig(init.derivedState);
+    this.derivedState = derivedStateRuntimeConfig(init.derivedState);
+  }
+
+  static create(init: ObserverRuntimeConfigInput = {}): ObserverRuntimeConfig {
+    return observerRuntimeConfig(init);
+  }
+
+  static forProfile(
+    profile: RuntimeDeliveryProfile,
+    init: ObserverRuntimeProfileInit = {},
+  ): ObserverRuntimeConfig {
+    return observerRuntimeConfigForProfile(profile, init);
+  }
+
+  static latencyOptimized(
+    init: ObserverRuntimeProfileInit = {},
+  ): ObserverRuntimeConfig {
+    return observerRuntimeConfigForProfile(
+      RuntimeDeliveryProfile.LatencyOptimized,
+      init,
+    );
+  }
+
+  static balanced(init: ObserverRuntimeProfileInit = {}): ObserverRuntimeConfig {
+    return observerRuntimeConfigForProfile(RuntimeDeliveryProfile.Balanced, init);
+  }
+
+  static deliveryDisciplined(
+    init: ObserverRuntimeProfileInit = {},
+  ): ObserverRuntimeConfig {
+    return observerRuntimeConfigForProfile(
+      RuntimeDeliveryProfile.DeliveryDisciplined,
+      init,
+    );
   }
 
   toEnvironment(

@@ -297,6 +297,10 @@ export interface DerivedStateReplayConfigInit {
   readonly maxSessions?: number;
 }
 
+export type DerivedStateReplayConfigInput =
+  | DerivedStateReplayConfig
+  | DerivedStateReplayConfigInit;
+
 export class DerivedStateReplayConfig {
   readonly backend: DerivedStateReplayBackend;
   readonly replayDirectory: DerivedStateReplayDirectory;
@@ -329,6 +333,30 @@ export class DerivedStateReplayConfig {
     });
   }
 
+  static create(
+    init: DerivedStateReplayConfigInput = {},
+  ): DerivedStateReplayConfig {
+    return derivedStateReplayConfig(init);
+  }
+
+  static memory(
+    init: Omit<DerivedStateReplayConfigInit, "backend"> = {},
+  ): DerivedStateReplayConfig {
+    return new DerivedStateReplayConfig({
+      ...init,
+      backend: DerivedStateReplayBackend.Memory,
+    });
+  }
+
+  static disk(
+    init: Omit<DerivedStateReplayConfigInit, "backend"> = {},
+  ): DerivedStateReplayConfig {
+    return new DerivedStateReplayConfig({
+      ...init,
+      backend: DerivedStateReplayBackend.Disk,
+    });
+  }
+
   isEnabled(): boolean {
     return this.maxEnvelopes > 0;
   }
@@ -339,6 +367,10 @@ export interface DerivedStateRuntimeConfigInit {
   readonly recoveryIntervalMs?: number;
   readonly replay?: DerivedStateReplayConfig | DerivedStateReplayConfigInit;
 }
+
+export type DerivedStateRuntimeConfigInput =
+  | DerivedStateRuntimeConfig
+  | DerivedStateRuntimeConfigInit;
 
 export class DerivedStateRuntimeConfig {
   readonly checkpointIntervalMs: number;
@@ -359,4 +391,43 @@ export class DerivedStateRuntimeConfig {
         ? init.replay
         : new DerivedStateReplayConfig(init.replay);
   }
+
+  static create(
+    init: DerivedStateRuntimeConfigInput = {},
+  ): DerivedStateRuntimeConfig {
+    return derivedStateRuntimeConfig(init);
+  }
+
+  static checkpointOnly(
+    init: Omit<DerivedStateRuntimeConfigInit, "replay"> = {},
+  ): DerivedStateRuntimeConfig {
+    return new DerivedStateRuntimeConfig({
+      ...init,
+      replay: DerivedStateReplayConfig.checkpointOnly(),
+    });
+  }
+}
+
+export function derivedStateReplayConfig(
+  init?: DerivedStateReplayConfigInput,
+): DerivedStateReplayConfig {
+  if (init === undefined) {
+    return new DerivedStateReplayConfig();
+  }
+
+  return init instanceof DerivedStateReplayConfig
+    ? init
+    : new DerivedStateReplayConfig(init);
+}
+
+export function derivedStateRuntimeConfig(
+  init?: DerivedStateRuntimeConfigInput,
+): DerivedStateRuntimeConfig {
+  if (init === undefined) {
+    return new DerivedStateRuntimeConfig();
+  }
+
+  return init instanceof DerivedStateRuntimeConfig
+    ? init
+    : new DerivedStateRuntimeConfig(init);
 }
