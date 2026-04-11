@@ -1,8 +1,17 @@
 {
   "name": "@sof/sdk",
   "version": "0.1.0",
-  "private": true,
   "description": "Unified SOF TypeScript SDK",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Lythaeon/sof.git",
+    "directory": "sdks/typescript"
+  },
+  "bugs": {
+    "url": "https://github.com/Lythaeon/sof/issues"
+  },
+  "homepage": "https://github.com/Lythaeon/sof/tree/main/sdks/typescript",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -36,9 +45,12 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true }); rmSync('dist-test', { recursive: true, force: true });\"",
+    "build": "npm run clean && tsc -p tsconfig.build.json",
+    "build:test": "tsc -p tsconfig.test.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test dist/*.test.js dist/**/*.test.js"
+    "test": "npm run build && npm run build:test && node --test dist-test/*.test.js dist-test/**/*.test.js",
+    "prepack": "npm run build"
   },
   "devDependencies": {
     "@types/node": "^24.6.0",

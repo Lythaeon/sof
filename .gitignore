@@ -1,6 +1,7 @@
 /target/
 **/node_modules/
 **/dist/
+**/dist-test/
 
 # Editor/OS noise
 .DS_Store
