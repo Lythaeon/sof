@@ -65,7 +65,8 @@ The profile selection MUST:
 
 - be represented as a typed enum in Rust
 - be mirrored as a typed enum in TypeScript and Python SDKs
-- fail configuration loading on unknown values instead of silently falling back
+- parse unknown values as invalid at the typed parser boundary
+- make any environment/default fallback explicit and test-covered instead of hidden
 - apply at the runtime-instance level, not per hook or per plugin in the first version
 
 The profile selection MUST NOT:
@@ -257,17 +258,48 @@ Allowed configuration entry points:
 
 - Rust config builders and typed config structs
 - generated TypeScript and Python SDK config types
-- environment or file decoding layers that parse into the typed enum and reject unknown values
+- environment or file decoding layers that parse into the typed enum before applying defaults
 
 The first version MUST NOT add:
 
 - per-hook profile selection
 - per-plugin fairness toggles
 - arbitrary queue-policy combinators
-- hidden fallback from one profile to another
+- undocumented fallback from one profile to another
 
 Future narrower overrides, if ever added, require a follow-up ADR and must be justified by a real
 measured workload rather than speculative flexibility.
+
+### First Implementation Defaults
+
+The first Rust implementation maps the profiles to the following tested runtime defaults. These
+values are implementation defaults, not wire-protocol guarantees, but they define the intended
+operational shape of the initial profile set.
+
+| Profile | Plugin queue | Plugin dispatch | Transaction dispatch workers | Extension queue | Extension startup | Extension shutdown | Derived-state replay envelopes | Derived-state replay sessions | Extension queue warning | Extension drop warning |
+| --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `LatencyOptimized` | `8192` | sequential | `min(host parallelism, 8)` | `8192` | `5s` | `3s` | `8192` | `4` | `4096` | `100` |
+| `Balanced` | `16384` | sequential | `min(host parallelism, 8)` | `16384` | `5s` | `6s` | `16384` | `6` | `8192` | `50` |
+| `DeliveryDisciplined` | `32768` | sequential | `1` | `32768` | `10s` | `15s` | `32768` | `8` | `16384` | `10` |
+
+Configuration guidance:
+
+- Use `LatencyOptimized` when callback latency and newest-state freshness matter more than
+  downstream retention under pressure.
+- Use `Balanced` for mixed services that can afford more buffering and want earlier drop warnings
+  without changing ingest ownership.
+- Use `DeliveryDisciplined` for stateful or analytical consumers that want stronger lane-local
+  drain discipline and can pay the extra memory and latency budget.
+
+Manual soak/benchmark fixtures:
+
+```sh
+cargo test -p sof runtime_delivery_profile_plugin_dataset_dispatch_profile_fixture --lib -- --ignored --nocapture
+cargo test -p sof runtime_delivery_profile_transaction_dispatch_profile_fixture --lib -- --ignored --nocapture
+cargo test -p sof runtime_delivery_profile_extension_dispatch_profile_fixture --lib -- --ignored --nocapture
+```
+
+Set `SOF_PROFILE_ITERATIONS` to raise or lower the event count for local soak runs.
 
 ## Guarantees and Non-Guarantees
 
@@ -354,7 +386,7 @@ Implementation work for this ADR is not complete until the following exist:
 - regression tests that prove the documented drop or drain behavior for each profile
 - explicit observability for pressure escalation and shedding decisions
 - docs that define profile guarantees and non-guarantees without marketing language
-- TS/Python enum generation that preserves typed selection and typed failure on unknown values
+- TS/Python enum generation that preserves typed selection and invalid-value handling
 - validation that no profile allows ingest to be stalled by slow downstream consumers
 - behavioral regression scenarios covering burst pressure on plugin lanes, slow consumer on a
   non-hot lane, shutdown with queued work, provider reconnect plus backlog, mixed transaction and

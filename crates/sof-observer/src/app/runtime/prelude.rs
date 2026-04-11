@@ -34,8 +34,8 @@ pub(super) use crate::{
     framework::{
         CheckpointBarrierReason, DatasetEvent, DerivedStateHost, DiskDerivedStateReplaySource,
         FeedWatermarks, InMemoryDerivedStateReplaySource, ObservedRecentBlockhashEvent, PluginHost,
-        PluginHostBuilder, RawPacketEvent, ReorgEvent, RuntimeExtensionDispatchMetrics,
-        RuntimeExtensionHost, RuntimeExtensionHostBuilder, ShredEvent, SlotStatusEvent,
+        RawPacketEvent, ReorgEvent, RuntimeExtensionDispatchMetrics, RuntimeExtensionHost,
+        ShredEvent, SlotStatusEvent,
     },
     ingest,
     reassembly::dataset::DataSetReassembler,

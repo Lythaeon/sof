@@ -81,6 +81,7 @@ Duplicate-shred mode guidance:
 | `SOF_WORKER_THREADS` | host parallelism | Oversizing can add contention and context-switch overhead. |
 | `SOF_RUNTIME_CURRENT_THREAD` | `false` | Runs SOF on a dedicated current-thread Tokio runtime instead of the default multithreaded runtime. Useful only when you are explicitly isolating one observer thread and measuring the result. |
 | `SOF_RUNTIME_CORE` | unset | Optional CPU core pin for the dedicated runtime thread when `SOF_RUNTIME_CURRENT_THREAD=true`. Incorrect pinning can hurt overall throughput on small hosts. |
+| `SOF_RUNTIME_DELIVERY_PROFILE` | `latency_optimized` | Selects a tested downstream delivery posture: `latency_optimized` for freshest low-latency callbacks, `balanced` for more buffering and earlier drop warnings, or `delivery_disciplined` for stronger lane-local drain discipline with higher memory and latency cost. |
 | `SOF_DATASET_WORKERS` | `SOF_WORKER_THREADS` | Dataset reconstruction runs on Tokio's blocking pool; too high can still cause queue churn, extra memory pressure, and CPU contention without higher throughput. |
 | `SOF_PACKET_WORKERS` | `SOF_WORKER_THREADS` | Packet verification/FEC/reassembly fanout; too low underuses multi-core hosts, too high adds scheduling and cache overhead. |
 | `SOF_PACKET_WORKER_QUEUE_CAPACITY` | `256` | Queue depth per packet worker. Current full-queue policy is `drop_newest`, so raising this mostly trades packet loss for extra latency/memory unless workers also get faster. |
