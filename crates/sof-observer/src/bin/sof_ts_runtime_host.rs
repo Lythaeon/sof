@@ -133,6 +133,8 @@ const RESULT_TAG_ERR: u8 = 2;
 const WORKER_FRAME_HEADER_LEN: usize = 5;
 /// Maximum number of events coalesced into one batch frame.
 const WORKER_BATCH_MAX_EVENTS: usize = 64;
+/// Bounded worker command queue capacity before runtime callbacks apply backpressure.
+const WORKER_COMMAND_QUEUE_CAPACITY: usize = 4096;
 /// Frame tag for manifest request.
 const WORKER_FRAME_GET_MANIFEST: u8 = 1;
 /// Frame tag for startup request.
@@ -435,7 +437,7 @@ struct TypeScriptWorkerBridge {
 /// Shared worker command sender and background task.
 struct TypeScriptWorkerHandle {
     /// Command sender used by packet and provider callbacks.
-    commands: mpsc::UnboundedSender<TypeScriptWorkerCommand>,
+    commands: mpsc::Sender<TypeScriptWorkerCommand>,
     /// Background task driving framed worker I/O.
     task: tokio::task::JoinHandle<()>,
 }
@@ -1661,7 +1663,7 @@ impl TypeScriptWorkerBridge {
         }
 
         let process = start_worker_process(self.name, &self.config).await?;
-        let (commands, receiver) = mpsc::unbounded_channel();
+        let (commands, receiver) = mpsc::channel(WORKER_COMMAND_QUEUE_CAPACITY);
         let extension_name = self.name;
         let task = tokio::spawn(async move {
             run_worker_process_loop(extension_name, process, receiver).await;
@@ -1672,21 +1674,25 @@ impl TypeScriptWorkerBridge {
 
     /// Delivers one packet event into the bound TypeScript worker.
     async fn deliver_packet(&self, event: RuntimePacketEvent) {
-        let mut guard = self.process.lock().await;
-        let Some(handle) = guard.as_mut() else {
-            tracing::warn!(
-                extension = self.name,
-                "worker process is not available for packet"
-            );
-            return;
+        let commands = {
+            let guard = self.process.lock().await;
+            let Some(handle) = guard.as_ref() else {
+                tracing::warn!(
+                    extension = self.name,
+                    "worker process is not available for packet"
+                );
+                return;
+            };
+            handle.commands.clone()
         };
 
-        if let Err(error) = handle.commands.send(TypeScriptWorkerCommand::Packet(event)) {
+        if let Err(error) = commands.send(TypeScriptWorkerCommand::Packet(event)).await {
             tracing::warn!(
                 extension = self.name,
                 error = %error,
                 "failed to enqueue packet for worker"
             );
+            let mut guard = self.process.lock().await;
             *guard = None;
         }
     }
@@ -1694,24 +1700,28 @@ impl TypeScriptWorkerBridge {
     /// Delivers one provider event into the bound TypeScript worker.
     #[cfg(feature = "provider-grpc")]
     async fn deliver_provider_event(&self, event: Value) {
-        let mut guard = self.process.lock().await;
-        let Some(handle) = guard.as_mut() else {
-            tracing::warn!(
-                plugin = self.name,
-                "worker process is not available for provider event"
-            );
-            return;
+        let commands = {
+            let guard = self.process.lock().await;
+            let Some(handle) = guard.as_ref() else {
+                tracing::warn!(
+                    plugin = self.name,
+                    "worker process is not available for provider event"
+                );
+                return;
+            };
+            handle.commands.clone()
         };
 
-        if let Err(error) = handle
-            .commands
+        if let Err(error) = commands
             .send(TypeScriptWorkerCommand::ProviderEvent(event))
+            .await
         {
             tracing::warn!(
                 plugin = self.name,
                 error = %error,
                 "failed to enqueue provider event for worker"
             );
+            let mut guard = self.process.lock().await;
             *guard = None;
         }
     }
@@ -1724,9 +1734,13 @@ impl TypeScriptWorkerBridge {
         };
 
         let (completed_tx, completed_rx) = oneshot::channel();
-        if let Err(error) = handle.commands.send(TypeScriptWorkerCommand::Shutdown {
-            completed: completed_tx,
-        }) {
+        if let Err(error) = handle
+            .commands
+            .send(TypeScriptWorkerCommand::Shutdown {
+                completed: completed_tx,
+            })
+            .await
+        {
             tracing::warn!(
                 extension = self.name,
                 error = %error,
@@ -1750,7 +1764,7 @@ impl TypeScriptWorkerBridge {
 async fn run_worker_process_loop(
     extension_name: &'static str,
     mut process: TypeScriptWorkerProcess,
-    mut receiver: mpsc::UnboundedReceiver<TypeScriptWorkerCommand>,
+    mut receiver: mpsc::Receiver<TypeScriptWorkerCommand>,
 ) {
     let mut pending = None;
 

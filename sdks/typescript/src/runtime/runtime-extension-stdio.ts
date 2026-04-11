@@ -569,7 +569,10 @@ class PacketBatchBinaryReader {
   #offset = 0;
 
   constructor(payload: Uint8Array) {
-    this.#payload = Buffer.from(payload);
+    this.#payload =
+      payload.buffer instanceof ArrayBuffer
+        ? Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength)
+        : Buffer.from(payload);
   }
 
   get consumed(): boolean {
@@ -656,7 +659,7 @@ class PacketBatchBinaryReader {
       );
     }
 
-    const value = Uint8Array.from(this.#payload.subarray(this.#offset, nextOffset));
+    const value = this.#payload.subarray(this.#offset, nextOffset);
     this.#offset = nextOffset;
     return ok(value);
   }
