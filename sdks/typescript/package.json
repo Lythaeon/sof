@@ -44,19 +44,25 @@
     "./runtime/delivery-profile": {
       "types": "./dist/runtime/delivery-profile.d.ts",
       "import": "./dist/runtime/delivery-profile.js"
+    },
+    "./runtime/extension": {
+      "types": "./dist/runtime/extension.d.ts",
+      "import": "./dist/runtime/extension.js"
     }
   },
   "files": [
     "dist"
   ],
   "scripts": {
-    "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true }); rmSync('dist-test', { recursive: true, force: true });\"",
+    "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true }); rmSync('dist-test', { recursive: true, force: true }); rmSync('dist-examples', { recursive: true, force: true });\"",
     "build": "pnpm run clean && tsdown --config tsdown.config.ts",
     "build:test": "tsc -p tsconfig.test.json",
+    "build:examples": "pnpm run build && tsc -p tsconfig.examples.json",
     "lint": "oxlint --config .oxlintrc.json --tsconfig tsconfig.json --type-aware --deny-warnings --report-unused-disable-directives src tsdown.config.ts",
     "lint:fix": "oxlint --config .oxlintrc.json --tsconfig tsconfig.json --type-aware --fix --fix-suggestions src tsdown.config.ts",
+    "check:examples": "pnpm run build:examples && node dist-examples/runtime-config-balanced.js && node dist-examples/runtime-config-parse.js && node dist-examples/runtime-extension-manifest.js && node dist-examples/runtime-extension-worker.js",
     "check:package": "publint run --strict --pack pnpm",
-    "check": "pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run check:package",
+    "check": "pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run check:examples && pnpm run check:package",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "pnpm run build && pnpm run build:test && node --test dist-test/*.test.js dist-test/**/*.test.js",
     "prepack": "pnpm run build"

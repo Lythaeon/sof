@@ -10,6 +10,7 @@ export default defineConfig({
     "runtime/policy": "src/runtime/runtime-policy.ts",
     "runtime/derived-state": "src/runtime/derived-state.ts",
     "runtime/delivery-profile": "src/runtime/runtime-delivery-profile.ts",
+    "runtime/extension": "src/runtime/runtime-extension.ts",
   },
   format: ["esm"],
   minify: true,

@@ -2,6 +2,7 @@
 **/node_modules/
 **/dist/
 **/dist-test/
+**/dist-examples/
 
 # Editor/OS noise
 .DS_Store

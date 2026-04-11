@@ -41,6 +41,7 @@ This initial package slice provides:
 - one-line runtime profile presets such as `ObserverRuntimeConfig.balanced()`
 - small functional helpers for the common create/serialize/parse path, so most consumers do not need to learn the class API first
 - result-return factory and serialization helpers for programmatic validation, so SDK consumers do not need to rely on exceptions for normal invalid-input handling
+- typed runtime-extension manifest and worker-authoring primitives for TS-side extension contracts
 - focused subpath imports when you only want one SDK slice, for example `@sof/sdk/runtime/config`
 
 ## Quick Start
@@ -127,6 +128,39 @@ const config = ObserverRuntimeConfig.deliveryDisciplined();
 const env = config.toEnvironmentRecord();
 
 env;
+```
+
+## Extension Runtime
+
+The TS SDK now includes a typed extension-worker authoring surface under
+`@sof/sdk/runtime/extension`.
+
+Use it for:
+
+- typed extension manifests
+- typed packet-subscription matching
+- typed in-memory worker lifecycle/runtime
+- runnable TS examples for future Rust-host integration
+
+Important boundary:
+
+- Rust still owns the actual runtime, queues, sockets, and packet dispatch.
+- The current TS SDK extension surface is the TS-side contract and worker model.
+- It does not yet mean the Rust binary can already spawn TS workers directly.
+
+## Examples
+
+Runnable examples live in `sdks/typescript/examples`:
+
+- `runtime-config-balanced.ts`
+- `runtime-config-parse.ts`
+- `runtime-extension-manifest.ts`
+- `runtime-extension-worker.ts`
+
+Verify them with:
+
+```bash
+pnpm run check:examples
 ```
 
 ## Focused Imports
