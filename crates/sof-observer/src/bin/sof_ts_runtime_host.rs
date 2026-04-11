@@ -255,6 +255,7 @@ struct IngressConfig {
     priority: Option<u16>,
     /// Websocket URL for SDK-side validation errors.
     url: Option<String>,
+    #[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
     /// Account pubkey for `accountSubscribe`.
     account: Option<String>,
     #[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
@@ -312,6 +313,7 @@ struct PluginWorkerConfig {
     args: Vec<String>,
     /// Environment variables passed to the worker.
     environment: HashMap<String, String>,
+    #[cfg(feature = "provider-grpc")]
     /// Whether the worker expects provider-event callbacks.
     provider_events: bool,
 }
@@ -1048,8 +1050,8 @@ async fn spawn_websocket_provider_ingress(
     })?;
     match ingress.stream.unwrap_or(WEBSOCKET_STREAM_TRANSACTIONS) {
         WEBSOCKET_STREAM_TRANSACTIONS => {
-            let mut config =
-                WebsocketTransactionConfig::new(endpoint).with_source_instance(ingress.name.clone());
+            let mut config = WebsocketTransactionConfig::new(endpoint)
+                .with_source_instance(ingress.name.clone());
             config = apply_websocket_source_policy(config, ingress)?;
             config = apply_websocket_fan_in(config, fan_in)?;
             if let Some(commitment) = ingress.commitment {
@@ -1082,7 +1084,8 @@ async fn spawn_websocket_provider_ingress(
             let handle = spawn_websocket_source(&config, sender)
                 .await
                 .map_err(|error| HostError::InvalidConfig(error.to_string()))?;
-            let (abort_handle, join_guard) = spawn_provider_source_join_guard(&ingress.name, handle);
+            let (abort_handle, join_guard) =
+                spawn_provider_source_join_guard(&ingress.name, handle);
             Ok(ProviderSourceHandle {
                 mode,
                 abort_handle,
@@ -1103,7 +1106,8 @@ async fn spawn_websocket_provider_ingress(
             let handle = spawn_websocket_logs_source(&config, sender)
                 .await
                 .map_err(|error| HostError::InvalidConfig(error.to_string()))?;
-            let (abort_handle, join_guard) = spawn_provider_source_join_guard(&ingress.name, handle);
+            let (abort_handle, join_guard) =
+                spawn_provider_source_join_guard(&ingress.name, handle);
             Ok(ProviderSourceHandle {
                 mode,
                 abort_handle,
@@ -1129,7 +1133,8 @@ async fn spawn_websocket_provider_ingress(
             let handle = spawn_websocket_source(&config, sender)
                 .await
                 .map_err(|error| HostError::InvalidConfig(error.to_string()))?;
-            let (abort_handle, join_guard) = spawn_provider_source_join_guard(&ingress.name, handle);
+            let (abort_handle, join_guard) =
+                spawn_provider_source_join_guard(&ingress.name, handle);
             Ok(ProviderSourceHandle {
                 mode,
                 abort_handle,
@@ -1155,7 +1160,8 @@ async fn spawn_websocket_provider_ingress(
             let handle = spawn_websocket_source(&config, sender)
                 .await
                 .map_err(|error| HostError::InvalidConfig(error.to_string()))?;
-            let (abort_handle, join_guard) = spawn_provider_source_join_guard(&ingress.name, handle);
+            let (abort_handle, join_guard) =
+                spawn_provider_source_join_guard(&ingress.name, handle);
             Ok(ProviderSourceHandle {
                 mode,
                 abort_handle,
@@ -1435,7 +1441,9 @@ fn websocket_commitment_from_wire(value: u8) -> Result<WebsocketTransactionCommi
 
 #[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
 /// Maps the wire websocket logs filter selector into the Rust enum.
-fn websocket_logs_filter_from_wire(ingress: &IngressConfig) -> Result<WebsocketLogsFilter, HostError> {
+fn websocket_logs_filter_from_wire(
+    ingress: &IngressConfig,
+) -> Result<WebsocketLogsFilter, HostError> {
     match ingress.logs_filter.unwrap_or(WEBSOCKET_LOGS_FILTER_ALL) {
         WEBSOCKET_LOGS_FILTER_ALL => Ok(WebsocketLogsFilter::All),
         WEBSOCKET_LOGS_FILTER_ALL_WITH_VOTES => Ok(WebsocketLogsFilter::AllWithVotes),
@@ -1467,9 +1475,8 @@ fn parse_signature(value: &str, field: &str) -> Result<Signature, HostError> {
 #[cfg(feature = "provider-grpc")]
 /// Parses one required pubkey from the wire config.
 fn parse_pubkey(value: Option<&str>, field: &str, context: &str) -> Result<Pubkey, HostError> {
-    let value = non_empty_optional(value).ok_or_else(|| {
-        HostError::InvalidConfig(format!("{field} is required for {context}"))
-    })?;
+    let value = non_empty_optional(value)
+        .ok_or_else(|| HostError::InvalidConfig(format!("{field} is required for {context}")))?;
     Pubkey::from_str(value).map_err(|error| {
         HostError::InvalidConfig(format!("{field} is not a valid pubkey `{value}`: {error}"))
     })
@@ -2309,6 +2316,7 @@ mod tests {
             #[cfg(feature = "provider-grpc")]
             priority: None,
             url: Some("wss://example.invalid".to_owned()),
+            #[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
             account: None,
             #[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
             program_id: None,
@@ -2364,6 +2372,7 @@ mod tests {
             #[cfg(feature = "provider-grpc")]
             priority: None,
             url: None,
+            #[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
             account: None,
             #[cfg(all(feature = "provider-grpc", feature = "provider-websocket"))]
             program_id: None,
