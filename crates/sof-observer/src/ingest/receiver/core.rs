@@ -1,6 +1,8 @@
 #![allow(clippy::indexing_slicing)]
 
-use std::io::{Error as IoError, ErrorKind, IoSliceMut};
+use std::io::{Error as IoError, ErrorKind};
+#[cfg(target_os = "linux")]
+use std::io::IoSliceMut;
 use std::net::SocketAddr;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsFd, AsRawFd};
@@ -621,7 +623,6 @@ fn should_shutdown(shutdown: Option<&Arc<AtomicBool>>) -> bool {
 
 #[path = "io.rs"]
 mod io;
-use io::{
-    flush_batch, maybe_pin_receiver_thread, recv_udp_batch_coalesced, recv_udp_packet,
-    tune_udp_socket,
-};
+use io::{flush_batch, maybe_pin_receiver_thread, recv_udp_packet, tune_udp_socket};
+#[cfg(target_os = "linux")]
+use io::recv_udp_batch_coalesced;
