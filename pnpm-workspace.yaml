@@ -1,3 +1,6 @@
 packages:
   - sdks/typescript
   - sdks/typescript/native/*
+
+onlyBuiltDependencies:
+  - "@biomejs/biome"

@@ -8,7 +8,7 @@ use std::{
     path::PathBuf,
     pin::Pin,
     sync::Arc,
-    thread::{self, available_parallelism},
+    thread::available_parallelism,
     time::{Duration, Instant},
 };
 
@@ -3449,7 +3449,7 @@ async fn wait_for_termination_signal() {
     #[cfg(unix)]
     {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        thread::spawn(move || {
+        std::thread::spawn(move || {
             let mut signals = match signal_hook::iterator::Signals::new([
                 signal_hook::consts::signal::SIGTERM,
                 signal_hook::consts::signal::SIGINT,
@@ -3822,7 +3822,6 @@ mod tests {
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
-        thread,
         time::Instant,
     };
 
@@ -5326,7 +5325,7 @@ mod tests {
             if counter.load(Ordering::Relaxed) >= expected {
                 return true;
             }
-            thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(10));
         }
         counter.load(Ordering::Relaxed) >= expected
     }
