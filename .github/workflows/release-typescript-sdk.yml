@@ -103,6 +103,7 @@ jobs:
     needs: verify
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -131,6 +132,8 @@ jobs:
 
       - name: Setup Rust CI toolchain and tools
         uses: ./.github/actions/rust-ci-setup
+        with:
+          cargo-tools: cargo-make,cargo-nextest
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -154,7 +157,7 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         shell: bash
-        run: pnpm publish --access public --no-git-checks
+        run: node ../../scripts/publish-package.mjs
 
       - name: Pack native runtime package
         if: needs.verify.outputs.publish_release != 'true'
@@ -239,7 +242,7 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         shell: bash
-        run: pnpm publish --access public --no-git-checks
+        run: node scripts/publish-package.mjs
 
       - name: Pack TypeScript SDK
         if: needs.verify.outputs.publish_release != 'true'

@@ -142,6 +142,7 @@ impl RawPacketBatch {
         storage.packets.reserve(additional);
     }
 
+    #[cfg(target_os = "linux")]
     pub(super) fn ensure_receive_slots(&mut self, additional: usize) -> usize {
         let Some(storage) = self.storage.as_mut() else {
             return 0;
@@ -156,6 +157,7 @@ impl RawPacketBatch {
         start_index
     }
 
+    #[cfg(target_os = "linux")]
     pub(super) fn receive_buffer_mut(
         &mut self,
         buffer_index: usize,
@@ -163,6 +165,7 @@ impl RawPacketBatch {
         self.storage.as_mut()?.buffers.get_mut(buffer_index)
     }
 
+    #[cfg(target_os = "linux")]
     pub(super) fn push_received_metadata(
         &mut self,
         source: SocketAddr,
@@ -366,6 +369,7 @@ impl ReceiverTelemetry {
             .store(current_unix_ms(), Ordering::Relaxed);
     }
 
+    #[cfg(target_os = "linux")]
     fn record_packets(&self, packet_count: usize) {
         self.packets.fetch_add(
             u64::try_from(packet_count).unwrap_or(u64::MAX),
