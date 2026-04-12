@@ -121,14 +121,16 @@
             <div class="body-inner">
                 <div class="book-header" role="navigation">
                     <div class="book-header-inner">
-                        <a class="sof-brand" href="{{ "/"|resolveFile }}">
-                            <span class="sof-brand-mark" aria-hidden="true"></span>
-                            <span class="sof-brand-text">SOF</span>
-                        </a>
+                        <div class="book-header-left">
+                            <a class="sof-brand" href="{{ "/"|resolveFile }}">
+                                <span class="sof-brand-mark" aria-hidden="true"></span>
+                                <span class="sof-brand-text">SOF</span>
+                            </a>
 
-                        <div class="book-header-search">
-                            <div id="book-search-input" role="search">
-                                <input type="text" placeholder="{{ 'SEARCH_PLACEHOLDER'|t }}" />
+                            <div class="book-header-search">
+                                <div id="book-search-input" role="search">
+                                    <input type="text" placeholder="{{ 'SEARCH_PLACEHOLDER'|t }}" />
+                                </div>
                             </div>
                         </div>
 
@@ -141,11 +143,13 @@
                             <a href="{{ "maintainers/"|resolveFile }}" data-nav-match="maintain">Maintain SOF</a>
                         </nav>
 
-                        <button class="book-mobile-toggle" type="button" aria-label="Toggle navigation" aria-expanded="false">
-                            <span></span>
-                            <span></span>
-                            <span></span>
-                        </button>
+                        <div class="book-header-right">
+                            <button class="book-mobile-toggle" type="button" aria-label="Toggle navigation" aria-expanded="false">
+                                <span></span>
+                                <span></span>
+                                <span></span>
+                            </button>
+                        </div>
                     </div>
 
                     <h1 class="book-header-page-title">

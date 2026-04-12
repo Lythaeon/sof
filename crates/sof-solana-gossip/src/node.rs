@@ -21,15 +21,16 @@ use {
     solana_streamer::quic::DEFAULT_QUIC_ENDPOINTS,
     solana_time_utils::timestamp,
     std::{
-        env,
         io,
         iter::once,
         net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
         num::NonZero,
-        os::fd::AsRawFd,
         sync::Arc,
     },
 };
+
+#[cfg(target_os = "linux")]
+use std::{env, os::fd::AsRawFd};
 
 // Socket addresses for each protocol across all interfaces
 #[derive(Debug, Clone)]
