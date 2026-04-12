@@ -19,7 +19,7 @@ if (typeof packageVersion !== "string" || packageVersion.length === 0) {
 }
 
 const packageSpec = `${packageName}@${packageVersion}`;
-const view = spawnSync("npm", ["view", packageSpec, "version"], {
+const view = spawnSync("pnpm", ["view", packageSpec, "version"], {
   stdio: "ignore",
 });
 
