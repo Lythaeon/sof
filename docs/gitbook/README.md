@@ -11,6 +11,10 @@ The public crates are:
 - `sof-tx`: transaction construction and submission
 - `sof-gossip-tuning`: typed tuning profiles for `sof`
 
+The public application-facing SDK is:
+
+- `@lythaeon-sof/sdk`: TypeScript app SDK backed by the SOF native runtime host
+
 There is also one internal backend crate:
 
 - `sof-solana-gossip`: vendored gossip bootstrap backend used by optional gossip mode
@@ -42,6 +46,7 @@ If you are evaluating SOF as a product, read these first:
 
 - [Why SOF Exists](use-sof/why-sof-exists.md)
 - [SOF Compared To The Usual Alternatives](use-sof/sof-compared.md)
+- [TypeScript SDK](sdk/typescript.md)
 - [Before You Start](getting-started/before-you-start.md)
 - [Common Questions](getting-started/common-questions.md)
 - [System Overview](architecture/system-overview.md)
@@ -58,6 +63,16 @@ Choose this track if you want to:
 - decide whether SOF fits your service at all
 
 Start here: [Use SOF](use-sof/README.md)
+
+### SDKs
+
+Choose this track if you want to:
+
+- build a SOF app from Node.js
+- use the Rust runtime underneath without managing it directly
+- understand the TypeScript package and native runtime host model
+
+Start here: [SDKs](sdk/README.md)
 
 ### Maintain SOF
 

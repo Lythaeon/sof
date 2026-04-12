@@ -881,13 +881,30 @@ body {
 }
 
 @media screen and (min-width: 1201px) {
+  .book .book-header-inner {
+    display: grid;
+    grid-template-columns: auto minmax(220px, 320px) minmax(0, 1fr) auto;
+    align-items: center;
+    column-gap: 24px;
+  }
+
   .book-top-nav {
-    position: absolute;
-    left: 50%;
-    transform: translateX(-50%);
+    position: static;
+    transform: none;
     justify-content: center;
-    width: max-content;
-    max-width: min(52vw, 760px);
+    width: 100%;
+    max-width: none;
+    margin: 0;
+  }
+
+  .book-header-search {
+    width: 100%;
+    max-width: 320px;
+    min-width: 220px;
+  }
+
+  .book-mobile-toggle {
+    justify-self: end;
   }
 }
 

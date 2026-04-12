@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "examples",
+    "outDir": "dist-examples",
+    "declaration": false,
+    "sourceMap": false
+  },
+  "include": [
+    "examples/app-config.ts",
+    "examples/app-entrypoint.ts",
+    "examples/runtime-config-balanced.ts",
+    "examples/runtime-config-parse.ts",
+    "examples/runtime-extension-manifest.ts"
+  ]
+}

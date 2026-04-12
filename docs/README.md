@@ -2,7 +2,8 @@
 
 This folder is the documentation index for the SOF workspace.
 
-Use it as the entry point for architecture references, operations guides, and crate-level setup docs.
+Use it as the entry point for architecture references, operations guides, crate-level setup docs,
+and SDK docs.
 The project is aimed at low-latency Solana infrastructure: ingest, replayable state, execution
 control planes, and deployment/tuning concerns that matter in real trading and market-data systems.
 
@@ -25,6 +26,11 @@ Transaction SDK users:
 
 - `../crates/sof-tx/README.md`
 - `architecture/adr/0006-transaction-sdk-and-dual-submit-routing.md`
+
+TypeScript SDK users:
+
+- `gitbook/sdk/README.md`
+- `../sdks/typescript/README.md`
 
 Contributors:
 

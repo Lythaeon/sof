@@ -1,0 +1,31 @@
+{
+  "name": "@lythaeon-sof/sdk-native-linux-arm64",
+  "version": "0.1.0",
+  "license": "MIT OR Apache-2.0",
+  "description": "Native SOF runtime host for @lythaeon-sof/sdk on Linux arm64",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Lythaeon/sof.git",
+    "directory": "sdks/typescript/native/linux-arm64"
+  },
+  "bugs": {
+    "url": "https://github.com/Lythaeon/sof/issues"
+  },
+  "homepage": "https://github.com/Lythaeon/sof/tree/main/sdks/typescript",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "vendor"
+  ],
+  "scripts": {
+    "prepack": "node ../../scripts/build-native-host.mjs"
+  }
+}

@@ -13,6 +13,9 @@ The other thing to get clear early:
 - ingress determines how early your host sees traffic
 - SOF is useful because it gives you one reusable runtime across those ingress choices
 
+If your entrypoint is a TypeScript app rather than a Rust crate or a host-first deployment, start
+with [SDKs](../sdk/README.md).
+
 Use [Before You Start](before-you-start.md) for the full latency and trust model.
 
 ## Recommended Reading Order

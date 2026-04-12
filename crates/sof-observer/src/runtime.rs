@@ -27,12 +27,12 @@ use crate::{
     app::runtime as app_runtime, event::TxCommitmentStatus, framework, provider_stream, runtime_env,
 };
 use agave_transaction_view::transaction_view::SanitizedTransactionView;
-use app_runtime::RuntimeObservabilityService;
 #[cfg(feature = "gossip-bootstrap")]
 use app_runtime::{
     ClusterTopologyTracker, ProviderStreamGossipControlPlane,
     start_provider_stream_gossip_control_plane,
 };
+use app_runtime::{RuntimeObservabilityHandle, RuntimeObservabilityService};
 use provider_stream::{
     ProviderSourceHealthEvent, ProviderSourceHealthStatus, ProviderSourceId,
     ProviderSourceIdentity, ProviderStreamMode, ProviderStreamReceiver, ProviderStreamUpdate,
@@ -1678,6 +1678,8 @@ pub struct ObserverRuntime {
     packet_ingest_rx: Option<KernelBypassIngressReceiver>,
     /// Optional externally supplied processed provider-stream receiver.
     provider_stream: Option<(ProviderStreamMode, ProviderStreamReceiver)>,
+    /// Whether processed provider-stream ingress should run alongside raw packet ingress.
+    run_raw_ingress_with_provider_stream: bool,
 }
 
 impl ObserverRuntime {
@@ -1779,6 +1781,16 @@ impl ObserverRuntime {
         self
     }
 
+    /// Keeps raw packet ingress active when provider-stream ingress is also configured.
+    ///
+    /// Provider-stream ingress normally replaces raw packet ingress. Use this only when a runtime
+    /// composition intentionally needs both raw packets and processed provider updates.
+    #[must_use]
+    pub const fn with_raw_ingress_alongside_provider_stream(mut self) -> Self {
+        self.run_raw_ingress_with_provider_stream = true;
+        self
+    }
+
     #[cfg(feature = "kernel-bypass")]
     /// Replaces the built-in UDP ingress with an externally supplied kernel-bypass ingress receiver.
     #[must_use]
@@ -1805,6 +1817,19 @@ impl ObserverRuntime {
         runtime_env::clear_runtime_env_overrides();
         self.setup.apply();
         if let Some((mode, provider_stream_rx)) = self.provider_stream {
+            if self.run_raw_ingress_with_provider_stream {
+                return run_raw_and_provider_stream_runtime(
+                    self.plugin_host,
+                    self.extension_host,
+                    self.derived_state_host,
+                    shutdown_signal,
+                    mode,
+                    provider_stream_rx,
+                    #[cfg(feature = "kernel-bypass")]
+                    self.packet_ingest_rx,
+                )
+                .await;
+            }
             return run_provider_stream_runtime(
                 self.plugin_host,
                 self.extension_host,
@@ -1892,11 +1917,11 @@ async fn run_provider_stream_runtime(
     derived_state_host: DerivedStateHost,
     shutdown_signal: Option<ShutdownSignal>,
     mode: ProviderStreamMode,
-    mut provider_stream_rx: ProviderStreamReceiver,
+    provider_stream_rx: ProviderStreamReceiver,
 ) -> Result<(), RuntimeError> {
     let capability_check =
         enforce_provider_stream_capability_policy(mode, &plugin_host, &derived_state_host)?;
-    let mut gossip_control_plane =
+    let gossip_control_plane =
         bootstrap_provider_stream_gossip_control_plane(mode, &plugin_host, &derived_state_host)
             .await?;
     let observability = if let Some(bind_addr) = read_observability_bind_addr() {
@@ -1946,6 +1971,158 @@ async fn run_provider_stream_runtime(
     derived_state_host.initialize();
     tracing::info!(mode = mode.as_str(), "starting SOF provider-stream runtime");
 
+    let result = run_provider_stream_loop(
+        plugin_host.clone(),
+        derived_state_host.clone(),
+        shutdown_signal,
+        mode,
+        provider_stream_rx,
+        observability_handle,
+        gossip_control_plane,
+    )
+    .await;
+
+    plugin_host.shutdown().await;
+    extension_host.shutdown().await;
+    if let Some(service) = observability {
+        service.shutdown().await;
+    }
+    result
+}
+
+async fn run_raw_and_provider_stream_runtime(
+    plugin_host: PluginHost,
+    extension_host: RuntimeExtensionHost,
+    derived_state_host: DerivedStateHost,
+    shutdown_signal: Option<ShutdownSignal>,
+    mode: ProviderStreamMode,
+    provider_stream_rx: ProviderStreamReceiver,
+    #[cfg(feature = "kernel-bypass")] packet_ingest_rx: Option<KernelBypassIngressReceiver>,
+) -> Result<(), RuntimeError> {
+    enforce_provider_stream_capability_policy(mode, &plugin_host, &derived_state_host)?;
+    let gossip_control_plane =
+        bootstrap_provider_stream_gossip_control_plane(mode, &plugin_host, &derived_state_host)
+            .await?;
+    plugin_host
+        .startup()
+        .await
+        .map_err(|error| ProviderStreamRuntimeError::Startup {
+            message: error.to_string(),
+        })?;
+    derived_state_host.initialize();
+    tracing::info!(
+        mode = mode.as_str(),
+        "starting SOF combined raw and provider-stream runtime"
+    );
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    if let Some(signal) = shutdown_signal {
+        let external_shutdown_tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            signal.await;
+            let _ignored = external_shutdown_tx.send(true);
+        });
+    }
+    let raw_shutdown = Some(shared_shutdown_signal(shutdown_rx.clone()));
+    let provider_shutdown = Some(shared_shutdown_signal(shutdown_rx));
+    let provider_shutdown_tx = shutdown_tx.clone();
+    let provider_task = tokio::spawn(run_provider_stream_loop(
+        plugin_host.clone(),
+        derived_state_host.clone(),
+        provider_shutdown,
+        mode,
+        provider_stream_rx,
+        None,
+        gossip_control_plane,
+    ));
+    let provider_shutdown_notifier = tokio::spawn(async move {
+        let result = provider_task.await;
+        let _ignored = provider_shutdown_tx.send(true);
+        result
+    });
+
+    let raw_result = {
+        #[cfg(feature = "kernel-bypass")]
+        {
+            if let Some(packet_ingest_rx) = packet_ingest_rx {
+                app_runtime::run_async_with_hosts_and_kernel_bypass_ingress(
+                    plugin_host,
+                    extension_host,
+                    derived_state_host,
+                    raw_shutdown,
+                    packet_ingest_rx,
+                )
+                .await
+            } else {
+                app_runtime::run_async_with_hosts(
+                    plugin_host,
+                    extension_host,
+                    derived_state_host,
+                    raw_shutdown,
+                )
+                .await
+            }
+        }
+        #[cfg(not(feature = "kernel-bypass"))]
+        {
+            app_runtime::run_async_with_hosts(
+                plugin_host,
+                extension_host,
+                derived_state_host,
+                raw_shutdown,
+            )
+            .await
+        }
+    }
+    .map_err(RuntimeError::from);
+
+    let _ignored = shutdown_tx.send(true);
+    let provider_result = provider_shutdown_notifier.await.map_err(|error| {
+        RuntimeError::Runloop(format!(
+            "combined provider-stream runtime task join failed: {error}"
+        ))
+    })?;
+    let provider_result = provider_result.map_err(|error| {
+        RuntimeError::Runloop(format!(
+            "combined provider-stream runtime task join failed: {error}"
+        ))
+    })?;
+
+    raw_result?;
+    provider_result?;
+    tracing::info!(
+        mode = mode.as_str(),
+        "SOF combined raw and provider-stream runtime stopped"
+    );
+    Ok(())
+}
+
+fn shared_shutdown_signal(mut shutdown_rx: tokio::sync::watch::Receiver<bool>) -> ShutdownSignal {
+    Box::pin(async move {
+        loop {
+            if *shutdown_rx.borrow() {
+                return;
+            }
+            if shutdown_rx.changed().await.is_err() {
+                return;
+            }
+        }
+    })
+}
+
+async fn run_provider_stream_loop(
+    plugin_host: PluginHost,
+    derived_state_host: DerivedStateHost,
+    shutdown_signal: Option<ShutdownSignal>,
+    mode: ProviderStreamMode,
+    mut provider_stream_rx: ProviderStreamReceiver,
+    observability_handle: Option<RuntimeObservabilityHandle>,
+    mut gossip_control_plane: ProviderRuntimeGossipControlPlane,
+) -> Result<(), RuntimeError> {
+    tracing::info!(
+        mode = mode.as_str(),
+        "starting SOF provider-stream event loop"
+    );
     let mut shutdown_signal = shutdown_signal;
     let mut replay_dedupe = ProviderReplayDedupe::new(PROVIDER_REPLAY_DEDUPE_CAPACITY);
     let mut provider_health = ProviderStreamHealth::default();
@@ -2016,11 +2193,6 @@ async fn run_provider_stream_runtime(
         }
     };
 
-    plugin_host.shutdown().await;
-    extension_host.shutdown().await;
-    if let Some(service) = observability {
-        service.shutdown().await;
-    }
     gossip_control_plane.shutdown().await;
     if result.is_ok() {
         tracing::info!(mode = mode.as_str(), "SOF provider-stream runtime stopped");
