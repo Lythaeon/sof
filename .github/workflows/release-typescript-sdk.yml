@@ -163,6 +163,7 @@ jobs:
         run: pnpm pack --pack-destination ../../../dist/npm
 
   publish-sdk:
+    if: ${{ always() && needs.verify.result == 'success' }}
     needs:
       - verify
       - publish-native
@@ -195,6 +196,8 @@ jobs:
           set -euo pipefail
           version="${{ needs.verify.outputs.sdk_version }}"
           packages="$(node -p "JSON.stringify(Object.keys(require('./${SDK_DIRECTORY}/package.json').optionalDependencies).sort())")"
+          missing_packages=()
+          indexed_packages=()
 
           wait_until_indexed() {
             local pkg="$1"
@@ -211,9 +214,24 @@ jobs:
             return 1
           }
 
-          node -e "for (const pkg of ${packages}) console.log(pkg)" | while IFS= read -r package_name; do
-            wait_until_indexed "${package_name}"
+          mapfile -t native_packages < <(node -e "for (const pkg of ${packages}) console.log(pkg)")
+
+          for package_name in "${native_packages[@]}"; do
+            if wait_until_indexed "${package_name}"; then
+              indexed_packages+=("${package_name}")
+            else
+              missing_packages+=("${package_name}")
+            fi
           done
+
+          if ((${#indexed_packages[@]} > 0)); then
+            printf 'Indexed native packages: %s\n' "${indexed_packages[*]}"
+          fi
+
+          if ((${#missing_packages[@]} > 0)); then
+            printf 'Missing native packages: %s\n' "${missing_packages[*]}"
+            echo "::warning::Proceeding with SDK publish even though some native runtime packages are still missing or failed to publish."
+          fi
 
       - name: Publish TypeScript SDK
         if: needs.verify.outputs.publish_release == 'true'
