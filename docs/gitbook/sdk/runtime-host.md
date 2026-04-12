@@ -1,6 +1,6 @@
 # Runtime Host and Packaging
 
-`@sof/sdk` is not a pure JavaScript runtime.
+`@lythaeon-sof/sdk` is not a pure JavaScript runtime.
 
 It is a thin TypeScript application layer over the SOF Rust runtime host.
 
@@ -20,15 +20,15 @@ This keeps the hot path in Rust while making application code simpler.
 
 The publish model is:
 
-- `@sof/sdk` for the TypeScript API surface
-- one native package per platform, for example `@sof/sdk-native-linux-x64`
+- `@lythaeon-sof/sdk` for the TypeScript API surface
+- one native package per platform, for example `@lythaeon-sof/sdk-native-linux-x64`
 
 The main package declares those native packages as optional dependencies.
 
 That means a normal app author should only do:
 
 ```sh
-pnpm add @sof/sdk
+pnpm add @lythaeon-sof/sdk
 ```
 
 and then run their Node app.

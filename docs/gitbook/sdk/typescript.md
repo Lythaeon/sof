@@ -4,7 +4,7 @@ The TypeScript SDK is now the normal way to author a SOF app in Node.js.
 
 The intended user experience is:
 
-1. install `@sof/sdk`
+1. install `@lythaeon-sof/sdk`
 2. create an `App`
 3. register one or more `Plugin`s
 4. call `await app.run()`
@@ -36,7 +36,7 @@ Compared to the earlier TS wrapper state, the SDK is materially easier to reason
 ## Example
 
 ```ts
-import { App, IngressKind, Plugin, ok, runtimeExtensionAck } from "@sof/sdk";
+import { App, IngressKind, Plugin, ok, runtimeExtensionAck } from "@lythaeon-sof/sdk";
 
 const app = new App({
   ingress: [

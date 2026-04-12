@@ -14,7 +14,10 @@ function nativePackageDirectory() {
   const cwdPackagePath = join(process.cwd(), "package.json");
   if (existsSync(cwdPackagePath)) {
     const cwdPackage = JSON.parse(readFileSync(cwdPackagePath, "utf8"));
-    if (typeof cwdPackage.name === "string" && cwdPackage.name.startsWith("@sof/sdk-native-")) {
+    if (
+      typeof cwdPackage.name === "string" &&
+      cwdPackage.name.startsWith("@lythaeon-sof/sdk-native-")
+    ) {
       return process.cwd();
     }
   }

@@ -5,7 +5,7 @@ Rust runtime manually.
 
 Right now the public SDK story is:
 
-- `@sof/sdk` for TypeScript application authoring
+- `@lythaeon-sof/sdk` for TypeScript application authoring
 - native runtime host packages that the TypeScript SDK resolves automatically at install/runtime
 
 The important boundary is simple:

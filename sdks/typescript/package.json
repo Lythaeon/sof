@@ -1,5 +1,5 @@
 {
-  "name": "@sof/sdk",
+  "name": "@lythaeon-sof/sdk",
   "version": "0.1.0",
   "description": "TypeScript App SDK",
   "license": "MIT OR Apache-2.0",
@@ -19,12 +19,12 @@
     "provenance": true
   },
   "optionalDependencies": {
-    "@sof/sdk-native-darwin-arm64": "workspace:*",
-    "@sof/sdk-native-darwin-x64": "workspace:*",
-    "@sof/sdk-native-linux-arm64": "workspace:*",
-    "@sof/sdk-native-linux-x64": "workspace:*",
-    "@sof/sdk-native-win32-arm64": "workspace:*",
-    "@sof/sdk-native-win32-x64": "workspace:*"
+    "@lythaeon-sof/sdk-native-darwin-arm64": "workspace:*",
+    "@lythaeon-sof/sdk-native-darwin-x64": "workspace:*",
+    "@lythaeon-sof/sdk-native-linux-arm64": "workspace:*",
+    "@lythaeon-sof/sdk-native-linux-x64": "workspace:*",
+    "@lythaeon-sof/sdk-native-win32-arm64": "workspace:*",
+    "@lythaeon-sof/sdk-native-win32-x64": "workspace:*"
   },
   "type": "module",
   "main": "./dist/index.js",

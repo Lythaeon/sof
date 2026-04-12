@@ -1,8 +1,8 @@
 {
-  "name": "@sof/sdk-native-win32-x64",
+  "name": "@lythaeon-sof/sdk-native-win32-x64",
   "version": "0.1.0",
   "license": "MIT OR Apache-2.0",
-  "description": "Native SOF runtime host for @sof/sdk on Windows x64",
+  "description": "Native SOF runtime host for @lythaeon-sof/sdk on Windows x64",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Lythaeon/sof.git",

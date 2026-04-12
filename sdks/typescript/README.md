@@ -1,4 +1,4 @@
-# `@sof/sdk`
+# `@lythaeon-sof/sdk`
 
 TypeScript SDK for building apps with a typed `App`, `Plugin`, `runtime`, and `derivedState` model.
 
@@ -15,10 +15,10 @@ TypeScript SDK for building apps with a typed `App`, `Plugin`, `runtime`, and `d
 ## Install
 
 ```sh
-pnpm add @sof/sdk
+pnpm add @lythaeon-sof/sdk
 ```
 
-For published releases, npm installs the matching optional native runtime package for the current platform automatically. App authors only import `@sof/sdk` and run Node.
+For published releases, npm installs the matching optional native runtime package for the current platform automatically. App authors only import `@lythaeon-sof/sdk` and run Node.
 
 ## Mental Model
 
@@ -34,7 +34,7 @@ For published releases, npm installs the matching optional native runtime packag
 ## Quick Start
 
 ```ts
-import { App, IngressKind, Plugin, ok, runtimeExtensionAck } from "@sof/sdk";
+import { App, IngressKind, Plugin, ok, runtimeExtensionAck } from "@lythaeon-sof/sdk";
 
 const app = new App({
   ingress: [
@@ -69,7 +69,7 @@ Current executable coverage:
 - Direct shreds can enable kernel bypass on Linux through a typed `kernelBypass` object.
 - One `DirectShreds` ingress plus one `Gossip` ingress run together as one raw runtime composition without `fanIn`.
 - Multi-provider fan-in uses the Rust arbitration model: `EmitAll`, `FirstSeen`, or `FirstSeenThenPromote`.
-- Published installs resolve the native host from the matching optional platform package such as `@sof/sdk-native-linux-x64`.
+- Published installs resolve the native host from the matching optional platform package such as `@lythaeon-sof/sdk-native-linux-x64`.
 - `SOF_SDK_RUNTIME_HOST_BINARY` is only an override for development or custom deployments.
 - If the host is missing, `app.run()` returns a typed `Result` error instead of throwing.
 
@@ -85,7 +85,7 @@ import {
   IngressKind,
   Plugin,
   createBalancedRuntime,
-} from "@sof/sdk";
+} from "@lythaeon-sof/sdk";
 
 const app = new App({
   runtime: createBalancedRuntime({
@@ -124,7 +124,7 @@ import {
   RuntimeProviderEventKind,
   ok,
   runtimeExtensionAck,
-} from "@sof/sdk";
+} from "@lythaeon-sof/sdk";
 
 const app = new App({
   ingress: [
@@ -163,7 +163,7 @@ import {
   IngressKind,
   Plugin,
   ProviderIngressRole,
-} from "@sof/sdk";
+} from "@lythaeon-sof/sdk";
 
 const app = new App({
   ingress: [
@@ -199,7 +199,7 @@ import {
   IngressKind,
   Plugin,
   ShredTrustMode,
-} from "@sof/sdk";
+} from "@lythaeon-sof/sdk";
 
 const app = new App({
   ingress: [
@@ -230,7 +230,7 @@ import {
   Plugin,
   ok,
   runtimeExtensionAck,
-} from "@sof/sdk";
+} from "@lythaeon-sof/sdk";
 
 const plugin = new Plugin({
   name: "packet-audit",
@@ -269,7 +269,7 @@ import {
   IngressKind,
   Plugin,
   createBalancedRuntime,
-} from "@sof/sdk";
+} from "@lythaeon-sof/sdk";
 
 const app = new App({
   runtime: createBalancedRuntime({
@@ -291,14 +291,14 @@ app;
 ## Focused Imports
 
 ```ts
-import { App, IngressKind, Plugin } from "@sof/sdk/app";
-import { ObserverRuntimeConfig } from "@sof/sdk/runtime/config";
-import { ShredTrustMode } from "@sof/sdk/runtime/policy";
+import { App, IngressKind, Plugin } from "@lythaeon-sof/sdk/app";
+import { ObserverRuntimeConfig } from "@lythaeon-sof/sdk/runtime/config";
+import { ShredTrustMode } from "@lythaeon-sof/sdk/runtime/policy";
 import {
   DerivedStateReplayBackend,
   DerivedStateReplayDurability,
-} from "@sof/sdk/runtime/derived-state";
-import { RuntimeDeliveryProfile } from "@sof/sdk/runtime/delivery-profile";
+} from "@lythaeon-sof/sdk/runtime/derived-state";
+import { RuntimeDeliveryProfile } from "@lythaeon-sof/sdk/runtime/delivery-profile";
 
 const runtime = ObserverRuntimeConfig.forProfile(RuntimeDeliveryProfile.Balanced, {
   shredTrustMode: ShredTrustMode.TrustedRawShredProvider,

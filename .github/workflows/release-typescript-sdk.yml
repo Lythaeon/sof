@@ -108,22 +108,22 @@ jobs:
       matrix:
         include:
           - package_dir: sdks/typescript/native/linux-x64
-            package_name: "@sof/sdk-native-linux-x64"
+            package_name: "@lythaeon-sof/sdk-native-linux-x64"
             runner: ubuntu-24.04
           - package_dir: sdks/typescript/native/linux-arm64
-            package_name: "@sof/sdk-native-linux-arm64"
+            package_name: "@lythaeon-sof/sdk-native-linux-arm64"
             runner: ubuntu-24.04-arm
           - package_dir: sdks/typescript/native/darwin-x64
-            package_name: "@sof/sdk-native-darwin-x64"
+            package_name: "@lythaeon-sof/sdk-native-darwin-x64"
             runner: macos-15-intel
           - package_dir: sdks/typescript/native/darwin-arm64
-            package_name: "@sof/sdk-native-darwin-arm64"
+            package_name: "@lythaeon-sof/sdk-native-darwin-arm64"
             runner: macos-15
           - package_dir: sdks/typescript/native/win32-x64
-            package_name: "@sof/sdk-native-win32-x64"
+            package_name: "@lythaeon-sof/sdk-native-win32-x64"
             runner: windows-2025
           - package_dir: sdks/typescript/native/win32-arm64
-            package_name: "@sof/sdk-native-win32-arm64"
+            package_name: "@lythaeon-sof/sdk-native-win32-arm64"
             runner: windows-11-arm
     steps:
       - name: Checkout

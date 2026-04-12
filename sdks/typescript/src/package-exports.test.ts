@@ -6,14 +6,14 @@ function importPackageEntry(moduleName: string): Promise<unknown> {
 }
 
 test("package exports resolve the documented public entry points", async () => {
-  const root = await importPackageEntry("@sof/sdk");
-  const app = await importPackageEntry("@sof/sdk/app");
-  const runtime = await importPackageEntry("@sof/sdk/runtime");
-  const config = await importPackageEntry("@sof/sdk/runtime/config");
-  const policy = await importPackageEntry("@sof/sdk/runtime/policy");
-  const derivedState = await importPackageEntry("@sof/sdk/runtime/derived-state");
-  const deliveryProfile = await importPackageEntry("@sof/sdk/runtime/delivery-profile");
-  const extension = await importPackageEntry("@sof/sdk/runtime/extension");
+  const root = await importPackageEntry("@lythaeon-sof/sdk");
+  const app = await importPackageEntry("@lythaeon-sof/sdk/app");
+  const runtime = await importPackageEntry("@lythaeon-sof/sdk/runtime");
+  const config = await importPackageEntry("@lythaeon-sof/sdk/runtime/config");
+  const policy = await importPackageEntry("@lythaeon-sof/sdk/runtime/policy");
+  const derivedState = await importPackageEntry("@lythaeon-sof/sdk/runtime/derived-state");
+  const deliveryProfile = await importPackageEntry("@lythaeon-sof/sdk/runtime/delivery-profile");
+  const extension = await importPackageEntry("@lythaeon-sof/sdk/runtime/extension");
 
   assert.equal((root as { App: unknown }).App, (app as { App: unknown }).App);
   assert.equal((root as { Plugin: unknown }).Plugin, (app as { Plugin: unknown }).Plugin);
@@ -62,5 +62,5 @@ test("package exports resolve the documented public entry points", async () => {
     false,
   );
   assert.equal("runRuntimeExtensionWorkerStdio" in (root as Record<string, unknown>), false);
-  await assert.rejects(() => importPackageEntry("@sof/sdk/runtime/extension-stdio"));
+  await assert.rejects(() => importPackageEntry("@lythaeon-sof/sdk/runtime/extension-stdio"));
 });

@@ -13,7 +13,7 @@ The public crates are:
 
 The public application-facing SDK is:
 
-- `@sof/sdk`: TypeScript app SDK backed by the SOF native runtime host
+- `@lythaeon-sof/sdk`: TypeScript app SDK backed by the SOF native runtime host
 
 There is also one internal backend crate:
 

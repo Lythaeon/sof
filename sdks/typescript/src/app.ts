@@ -1570,30 +1570,30 @@ function repoRuntimeHostPaths(): readonly string[] {
 function runtimeHostPackageName(): string | undefined {
   if (process.platform === "darwin") {
     if (process.arch === "arm64") {
-      return "@sof/sdk-native-darwin-arm64";
+      return "@lythaeon-sof/sdk-native-darwin-arm64";
     }
     if (process.arch === "x64") {
-      return "@sof/sdk-native-darwin-x64";
+      return "@lythaeon-sof/sdk-native-darwin-x64";
     }
     return undefined;
   }
 
   if (process.platform === "linux") {
     if (process.arch === "arm64") {
-      return "@sof/sdk-native-linux-arm64";
+      return "@lythaeon-sof/sdk-native-linux-arm64";
     }
     if (process.arch === "x64") {
-      return "@sof/sdk-native-linux-x64";
+      return "@lythaeon-sof/sdk-native-linux-x64";
     }
     return undefined;
   }
 
   if (process.platform === "win32") {
     if (process.arch === "arm64") {
-      return "@sof/sdk-native-win32-arm64";
+      return "@lythaeon-sof/sdk-native-win32-arm64";
     }
     if (process.arch === "x64") {
-      return "@sof/sdk-native-win32-x64";
+      return "@lythaeon-sof/sdk-native-win32-x64";
     }
   }
 
