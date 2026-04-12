@@ -53,7 +53,7 @@ test("runtime extension manifest creation validates stable typed metadata", () =
     assert.equal(isOk(resource), true);
     if (isOk(resource)) {
       const manifest = createRuntimeExtensionWorkerManifest({
-        sdkVersion: "0.1.0",
+        sdkVersion: "0.1.1",
         extensionName: parsedExtensionName.value,
         capabilities: [
           ExtensionCapability.BindUdp,
@@ -156,7 +156,7 @@ test("runtime extension worker runtime handles manifest lifecycle and exceptions
   const runtime = tryCreateRuntimeExtensionWorkerRuntime(
     defineRuntimeExtension({
       manifest: createRuntimeExtensionWorkerManifest({
-        sdkVersion: "0.1.0",
+        sdkVersion: "0.1.1",
         extensionName: parsedExtensionName.value,
         capabilities: [ExtensionCapability.ObserveObserverIngress],
       }),
