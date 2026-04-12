@@ -197,7 +197,7 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         shell: bash
-        run: node ../../scripts/publish-package.mjs
+        run: pnpm publish --access public --no-git-checks
 
       - name: Pack native runtime package
         if: needs.verify.outputs.publish_release != 'true'
@@ -351,7 +351,7 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         shell: bash
-        run: node scripts/publish-package.mjs
+        run: pnpm publish --access public --no-git-checks
 
       - name: Pack TypeScript SDK
         if: needs.verify.outputs.publish_release != 'true'
