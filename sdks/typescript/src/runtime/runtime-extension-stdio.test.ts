@@ -180,7 +180,7 @@ test("runtime extension stdio worker processes framed batch protocol messages", 
   });
 
   const manifest = tryCreateRuntimeExtensionWorkerManifest({
-    sdkVersion: "0.1.0",
+    sdkVersion: "0.1.1",
     extensionName: "stdio-demo",
     capabilities: [ExtensionCapability.ObserveObserverIngress],
   });
@@ -267,7 +267,7 @@ test("runtime extension stdio worker rejects malformed framed protocol messages"
   const errorOutput = new PassThrough();
 
   const manifest = tryCreateRuntimeExtensionWorkerManifest({
-    sdkVersion: "0.1.0",
+    sdkVersion: "0.1.1",
     extensionName: "bad-wire-demo",
     capabilities: [ExtensionCapability.ObserveObserverIngress],
   });
@@ -332,7 +332,7 @@ test("runtime extension stdio worker hard-blocks stdout writes inside callbacks"
   });
 
   const manifest = tryCreateRuntimeExtensionWorkerManifest({
-    sdkVersion: "0.1.0",
+    sdkVersion: "0.1.1",
     extensionName: "stdout-guard-demo",
     capabilities: [ExtensionCapability.ObserveObserverIngress],
   });

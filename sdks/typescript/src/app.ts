@@ -313,7 +313,7 @@ export type AppRunError = AppError | RuntimeExtensionError;
 export type ExtensionHandler = PluginHandler;
 export type ExtensionError = PluginError;
 export type ExtensionInit = PluginInit;
-export const typeScriptSdkVersion = "0.1.0";
+export const typeScriptSdkVersion = "0.1.1";
 
 const require = createRequire(import.meta.url);
 

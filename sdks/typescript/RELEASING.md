@@ -21,8 +21,8 @@ Use `ts-sdk-vX.Y.Z` tags for npm releases.
 Examples:
 
 ```sh
-git tag ts-sdk-v0.1.0
-git push origin ts-sdk-v0.1.0
+git tag ts-sdk-v0.1.1
+git push origin ts-sdk-v0.1.1
 ```
 
 The release workflow rejects tags that do not match `sdks/typescript/package.json`.

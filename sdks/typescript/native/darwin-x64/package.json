@@ -1,6 +1,6 @@
 {
   "name": "@lythaeon-sof/sdk-native-darwin-x64",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "license": "MIT OR Apache-2.0",
   "description": "Native SOF runtime host for @lythaeon-sof/sdk on macOS x64",
   "repository": {
