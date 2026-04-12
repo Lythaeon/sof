@@ -1,6 +1,6 @@
 {
   "name": "@lythaeon-sof/sdk-native-win32-x64",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "license": "MIT OR Apache-2.0",
   "description": "Native SOF runtime host for @lythaeon-sof/sdk on Windows x64",
   "repository": {

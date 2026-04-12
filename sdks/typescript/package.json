@@ -1,7 +1,7 @@
 {
   "name": "@lythaeon-sof/sdk",
-  "version": "0.1.1",
-  "description": "TypeScript App SDK",
+  "version": "0.1.2",
+  "description": "TypeScript SDK for Node.js Solana observer apps on SOF",
   "license": "MIT OR Apache-2.0",
   "sideEffects": false,
   "packageManager": "pnpm@10.28.2",
