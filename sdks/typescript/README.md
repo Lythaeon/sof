@@ -1,6 +1,8 @@
 # `@lythaeon-sof/sdk`
 
-TypeScript SDK for building apps with a typed `App`, `Plugin`, `runtime`, and `derivedState` model.
+TypeScript SDK for building Node.js Solana observer apps on top of SOF.
+
+These apps ingest Solana data from websocket, gRPC, gossip, or direct-shred sources, run typed plugins and derived state, and execute on the packaged SOF runtime host without requiring app authors to touch the Rust code underneath.
 
 ## Tooling
 
