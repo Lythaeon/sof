@@ -46,6 +46,27 @@ runs:
           fi
         fi
 
+    - name: Install Perl for vendored OpenSSL (Windows)
+      if: runner.os == 'Windows'
+      shell: powershell
+      run: |
+        choco install strawberryperl --yes --no-progress
+        $perlBin = 'C:\Strawberry\perl\bin'
+        if (-not (Test-Path $perlBin)) {
+          throw "expected Strawberry Perl at $perlBin"
+        }
+        $perlExe = Join-Path $perlBin 'perl.exe'
+        if (-not (Test-Path $perlExe)) {
+          throw "expected Perl executable at $perlExe"
+        }
+        $cBin = 'C:\Strawberry\c\bin'
+        Add-Content -Path $env:GITHUB_PATH -Value $perlBin
+        if (Test-Path $cBin) {
+          Add-Content -Path $env:GITHUB_PATH -Value $cBin
+        }
+        Add-Content -Path $env:GITHUB_ENV -Value "PERL=$perlExe"
+        & $perlExe -MLocale::Maketext::Simple -e "exit 0"
+
     - name: Install Rust toolchain
       if: ${{ inputs.install-rust-toolchain == 'true' }}
       uses: dtolnay/rust-toolchain@stable

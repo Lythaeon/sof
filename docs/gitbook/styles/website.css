@@ -152,6 +152,23 @@ body {
   position: relative;
 }
 
+.book-header-left,
+.book-header-right {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.book-header-left {
+  gap: 18px;
+  flex: 1 1 auto;
+}
+
+.book-header-right {
+  flex: 1 1 auto;
+  justify-content: flex-end;
+}
+
 .sof-brand {
   display: inline-flex;
   align-items: center;
@@ -883,18 +900,32 @@ body {
 @media screen and (min-width: 1201px) {
   .book .book-header-inner {
     display: grid;
-    grid-template-columns: auto minmax(220px, 320px) minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
     align-items: center;
     column-gap: 24px;
   }
 
+  .book-header-left {
+    grid-column: 1;
+    justify-self: start;
+    width: 100%;
+    max-width: 430px;
+  }
+
   .book-top-nav {
+    grid-column: 2;
     position: static;
     transform: none;
     justify-content: center;
-    width: 100%;
+    width: auto;
     max-width: none;
     margin: 0;
+  }
+
+  .book-header-right {
+    grid-column: 3;
+    justify-self: end;
+    width: 100%;
   }
 
   .book-header-search {
@@ -905,6 +936,35 @@ body {
 
   .book-mobile-toggle {
     justify-self: end;
+  }
+}
+
+@media screen and (min-width: 1201px) and (max-width: 1460px) {
+  .book .book-header {
+    padding: 0 20px;
+  }
+
+  .book .book-header-inner {
+    column-gap: 16px;
+  }
+
+  .book-header-left {
+    max-width: 360px;
+    gap: 12px;
+  }
+
+  .book-top-nav {
+    gap: 0;
+  }
+
+  .book-top-nav a {
+    font-size: 1.3rem;
+    padding: 20px 10px 18px;
+  }
+
+  .book-header-search {
+    max-width: 260px;
+    min-width: 180px;
   }
 }
 
@@ -919,6 +979,18 @@ body {
     padding: 0 16px;
   }
 
+  .book .book-header-inner {
+    gap: 14px;
+  }
+
+  .book-header-left {
+    gap: 12px;
+  }
+
+  .book-header-right {
+    flex: 0 0 auto;
+  }
+
   .book-top-nav {
     display: none;
   }
@@ -931,6 +1003,23 @@ body {
 
   .book .book-header > .font-settings {
     display: none;
+  }
+}
+
+@media screen and (max-width: 1360px) {
+  .book-top-nav a {
+    font-size: 1.26rem;
+    padding: 20px 9px 18px;
+  }
+}
+
+@media screen and (max-width: 1320px) {
+  .book-top-nav {
+    display: none;
+  }
+
+  .book-header-left {
+    max-width: none;
   }
 }
 

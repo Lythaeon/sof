@@ -3,16 +3,18 @@
 #![allow(clippy::arithmetic_side_effects)]
 
 use super::*;
+use std::{io, net::UdpSocket};
+#[cfg(target_os = "linux")]
 use std::{
-    io,
     mem::{size_of, zeroed},
-    net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6, UdpSocket},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
     ptr::null_mut,
 };
 
 use crate::ingest::RawPacketBatchSender;
 #[cfg(test)]
 use crate::ingest::config::read_udp_drop_on_channel_full;
+#[cfg(target_os = "linux")]
 use crate::ingest::config::{
     read_udp_busy_poll_budget, read_udp_busy_poll_us, read_udp_prefer_busy_poll,
 };
@@ -135,6 +137,8 @@ pub(super) fn recv_udp_packet(
             rxq_ovfl_counter,
         });
     }
+    #[cfg(not(target_os = "linux"))]
+    let _ = track_rxq_ovfl;
 
     let (len, source) = retry_on_interrupted(|| socket.recv_from(buffer))?;
     Ok(UdpReceive {
